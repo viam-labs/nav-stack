@@ -1,0 +1,61 @@
+{
+  "modules": [
+    {
+      "type": "registry",
+      "name": "viam-labs_nav-stack",
+      "module_id": "viam-labs:nav-stack",
+      "version": "latest",
+      "env": {
+        "AUTO_INSTALL_DEPS": "1"
+      }
+    }
+  ],
+  "components": [
+    {
+      "name": "my-base",
+      "api": "rdk:component:base",
+      "model": "viam:viam:fake"
+    },
+    {
+      "name": "front-lidar",
+      "api": "rdk:component:camera",
+      "model": "viam:viam:fake"
+    },
+    {
+      "name": "odometry",
+      "api": "rdk:component:movement_sensor",
+      "model": "viam:viam:fake"
+    }
+  ],
+  "services": [
+    {
+      "name": "slam",
+      "api": "rdk:service:slam",
+      "model": "viam-labs:nav-stack:slam",
+      "attributes": {
+        "base": "my-base",
+        "movement_sensor": "odometry",
+        "lidars": [
+          { "name": "front-lidar", "mount": { "x": 0.2, "y": 0.0, "theta": 0.0 } }
+        ],
+        "mode": "mapping",
+        "maps_dir": "/root/.viam/nav-stack/maps",
+        "active_map": "ground-floor"
+      }
+    },
+    {
+      "name": "nav",
+      "api": "rdk:service:generic",
+      "model": "viam-labs:nav-stack:navigation",
+      "attributes": {
+        "slam_service": "slam",
+        "base": "my-base",
+        "kinematics": "differential",
+        "robot_radius": 0.22,
+        "max_vel_x": 0.4,
+        "max_vel_theta": 1.0,
+        "inflation_radius": 0.45
+      }
+    }
+  ]
+}

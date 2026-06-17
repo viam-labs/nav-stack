@@ -1,0 +1,20 @@
+{
+  "module_id": "viam-labs:nav-stack",
+  "visibility": "public",
+  "url": "https://github.com/viam-labs/nav-stack",
+  "description": "A Viam navigation stack wrapping the ROS2 Nav2 and slam_toolbox packages for mapping, localization, and obstacle-aware navigation on any Viam base.",
+  "models": [
+    {
+      "api": "rdk:service:slam",
+      "model": "viam-labs:nav-stack:slam",
+      "short_description": "SLAM service wrapping slam_toolbox for mapping and localization on a Viam base."
+    },
+    {
+      "api": "rdk:service:generic",
+      "model": "viam-labs:nav-stack:navigation",
+      "short_description": "Navigation service wrapping ROS2 Nav2: named locations, go-to-point, keepout/speed zones, and obstacle avoidance via DoCommand."
+    }
+  ],
+  "entrypoint": "run.sh",
+  "first_run": "setup.sh"
+}

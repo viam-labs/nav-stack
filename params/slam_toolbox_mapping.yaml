@@ -1,0 +1,22 @@
+# Reference slam_toolbox parameters for MAPPING mode.
+#
+# The module generates an effective params file at runtime (see ros/manager.py),
+# overriding mode/frames/scan_topic and merging any user `slam_params`. This file
+# documents the defaults and can be copied/tuned.
+slam_toolbox:
+  ros__parameters:
+    mode: mapping
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+    use_map_saver: true
+    resolution: 0.05
+    transform_publish_period: 0.05
+    map_update_interval: 1.0
+    minimum_travel_distance: 0.3
+    minimum_travel_heading: 0.3
+    max_laser_range: 25.0
+    # When continuing an existing map, the module sets:
+    #   map_file_name: <maps_dir>/<map>/map
+    #   map_start_at_dock: true

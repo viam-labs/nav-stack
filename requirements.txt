@@ -1,0 +1,9 @@
+# Python dependencies for the nav-stack module.
+#
+# NOTE: rclpy and the ROS2 message packages (nav_msgs, sensor_msgs, geometry_msgs,
+# tf2_ros, slam_toolbox, nav2_*) are NOT installed via pip. They are provided by the
+# system ROS2 installation that is sourced via the ROS_ENV environment variable
+# (see setup.sh / run.sh). Only pure-Python deps belong here.
+viam-sdk>=0.30.0
+numpy>=1.24
+PyYAML>=6.0

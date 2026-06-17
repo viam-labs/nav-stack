@@ -1,0 +1,20 @@
+# Reference slam_toolbox parameters for LOCALIZATION mode.
+#
+# The module generates an effective params file at runtime (see ros/manager.py).
+# Localization mode loads a previously serialized pose-graph and localizes within it
+# using a rolling window of recent scans (it does not modify the saved map).
+slam_toolbox:
+  ros__parameters:
+    mode: localization
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+    resolution: 0.05
+    transform_publish_period: 0.05
+    max_laser_range: 25.0
+    # The module sets these for the active map:
+    #   map_file_name: <maps_dir>/<map>/map
+    #   map_start_at_dock: true
+    # Use the SLAM service `set_initial_pose` DoCommand to seed the starting pose,
+    # or publish to /initialpose (AMCL-compatible) from RViz.
