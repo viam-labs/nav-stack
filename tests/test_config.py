@@ -54,3 +54,58 @@ def test_nav_config_omni():
 def test_nav_config_bad_kinematics():
     with pytest.raises(ValueError):
         NavConfig.from_dict({"slam_service": "s", "base": "b", "kinematics": "legs"})
+
+
+def test_slam_toolbox_config_from_attributes():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "f",
+            "mode": "localizing",
+            "slam_toolbox": {
+                "resolution": 0.1,
+                "max_laser_range": 30.0,
+                "minimum_travel_distance": 0.5,
+            },
+        }
+    )
+    assert cfg.mode == "localizing"
+    assert cfg.slam_toolbox.resolution == 0.1
+    assert cfg.slam_toolbox.max_laser_range == 30.0
+    assert cfg.slam_toolbox.minimum_travel_distance == 0.5
+
+
+def test_slam_params_use_viam_config(tmp_path):
+    from pathlib import Path
+
+    from src.ros.manager import RosManager
+
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "f",
+            "maps_dir": str(tmp_path),
+            "slam_toolbox": {"resolution": 0.08, "scan_topic": "/scan_merged"},
+            "slam_params": {"map_update_interval": 2.0},
+        }
+    )
+    params = RosManager(cfg)._slam_params(Path(tmp_path) / "map", "mapping")
+    rp = params["slam_toolbox"]["ros__parameters"]
+    assert rp["mode"] == "mapping"
+    assert rp["resolution"] == 0.08
+    assert rp["scan_topic"] == "/scan_merged"
+    assert rp["map_update_interval"] == 2.0
+
+
+def test_nav2_config_from_attributes():
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "nav2": {"xy_goal_tolerance": 0.4, "local_costmap_width": 6.0},
+        }
+    )
+    assert cfg.nav2.xy_goal_tolerance == 0.4
+    assert cfg.nav2.local_costmap_width == 6.0
+    assert cfg.nav2.to_override_dict()["width"] == 6.0
+

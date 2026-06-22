@@ -51,6 +51,100 @@ class LidarConfig:
 
 
 @dataclass
+class SlamToolboxConfig:
+    """Common slam_toolbox ROS parameters exposed via Viam config.
+
+    Top-level ``mode`` on the SLAM service (``mapping`` / ``localizing``) selects
+    the slam_toolbox node and sets its ``mode`` parameter. Additional tuning lives
+    under the ``slam_toolbox`` attribute block. Use ``slam_params`` for any other
+    slam_toolbox keys not listed here.
+    """
+
+    resolution: float = 0.05  # meters/cell
+    transform_publish_period: float = 0.05  # seconds
+    map_update_interval: float = 1.0  # seconds
+    minimum_travel_distance: float = 0.3  # meters before adding a new scan
+    minimum_travel_heading: float = 0.3  # radians before adding a new scan
+    max_laser_range: float = 25.0  # meters
+    scan_topic: str = "/scan"
+    use_map_saver: bool = True
+
+    def to_ros_dict(self) -> dict:
+        return {
+            "resolution": self.resolution,
+            "transform_publish_period": self.transform_publish_period,
+            "map_update_interval": self.map_update_interval,
+            "minimum_travel_distance": self.minimum_travel_distance,
+            "minimum_travel_heading": self.minimum_travel_heading,
+            "max_laser_range": self.max_laser_range,
+            "scan_topic": self.scan_topic,
+            "use_map_saver": self.use_map_saver,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "SlamToolboxConfig":
+        if not d:
+            return cls()
+        return cls(
+            resolution=float(d.get("resolution", 0.05)),
+            transform_publish_period=float(d.get("transform_publish_period", 0.05)),
+            map_update_interval=float(d.get("map_update_interval", 1.0)),
+            minimum_travel_distance=float(d.get("minimum_travel_distance", 0.3)),
+            minimum_travel_heading=float(d.get("minimum_travel_heading", 0.3)),
+            max_laser_range=float(d.get("max_laser_range", 25.0)),
+            scan_topic=str(d.get("scan_topic", "/scan")),
+            use_map_saver=bool(d.get("use_map_saver", True)),
+        )
+
+
+@dataclass
+class Nav2Config:
+    """Common Nav2 ROS parameters exposed via Viam config.
+
+    Velocity, footprint, and inflation defaults remain top-level on the navigation
+    service for convenience. Additional tuning lives under the ``nav2`` attribute
+    block. Use ``nav2_params`` for any other Nav2 keys not listed here.
+    """
+
+    xy_goal_tolerance: float = 0.25  # meters
+    yaw_goal_tolerance: float = 0.25  # radians
+    planner_tolerance: float = 0.5  # meters
+    cost_scaling_factor: float = 3.0
+    local_costmap_width: float = 4.0  # meters
+    local_costmap_height: float = 4.0  # meters
+    costmap_resolution: float = 0.05  # meters/cell
+    controller_frequency: float = 20.0  # Hz
+
+    def to_override_dict(self) -> dict:
+        """Flat leaf keys applied to the generated Nav2 params template."""
+        return {
+            "xy_goal_tolerance": self.xy_goal_tolerance,
+            "yaw_goal_tolerance": self.yaw_goal_tolerance,
+            "tolerance": self.planner_tolerance,
+            "cost_scaling_factor": self.cost_scaling_factor,
+            "width": self.local_costmap_width,
+            "height": self.local_costmap_height,
+            "resolution": self.costmap_resolution,
+            "controller_frequency": self.controller_frequency,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "Nav2Config":
+        if not d:
+            return cls()
+        return cls(
+            xy_goal_tolerance=float(d.get("xy_goal_tolerance", 0.25)),
+            yaw_goal_tolerance=float(d.get("yaw_goal_tolerance", 0.25)),
+            planner_tolerance=float(d.get("planner_tolerance", 0.5)),
+            cost_scaling_factor=float(d.get("cost_scaling_factor", 3.0)),
+            local_costmap_width=float(d.get("local_costmap_width", 4.0)),
+            local_costmap_height=float(d.get("local_costmap_height", 4.0)),
+            costmap_resolution=float(d.get("costmap_resolution", 0.05)),
+            controller_frequency=float(d.get("controller_frequency", 20.0)),
+        )
+
+
+@dataclass
 class Frames:
     map: str = "map"
     odom: str = "odom"
@@ -70,6 +164,7 @@ class SlamConfig:
     odom_rate_hz: float = 20.0
     scan_bins: int = 720
     ros_env: Optional[str] = None
+    slam_toolbox: SlamToolboxConfig = field(default_factory=SlamToolboxConfig)
     slam_params: Mapping = field(default_factory=dict)
 
     @classmethod
@@ -98,6 +193,7 @@ class SlamConfig:
             odom_rate_hz=float(d.get("odom_rate_hz", 20.0)),
             scan_bins=int(d.get("scan_bins", 720)),
             ros_env=d.get("ros_env"),
+            slam_toolbox=SlamToolboxConfig.from_dict(d.get("slam_toolbox", {}) or {}),
             slam_params=d.get("slam_params", {}) or {},
         )
 
@@ -121,6 +217,8 @@ class NavConfig:
     acc_lim_theta: float = 2.0
     inflation_radius: float = 0.45
     cmd_vel_timeout: float = 0.5  # seconds (watchdog)
+    nav2: Nav2Config = field(default_factory=Nav2Config)
+    nav2_params: Mapping = field(default_factory=dict)
     nav2_params_path: Optional[str] = None
     ros_env: Optional[str] = None
 
@@ -141,6 +239,8 @@ class NavConfig:
             acc_lim_theta=float(d.get("acc_lim_theta", 2.0)),
             inflation_radius=float(d.get("inflation_radius", 0.45)),
             cmd_vel_timeout=float(d.get("cmd_vel_timeout", 0.5)),
+            nav2=Nav2Config.from_dict(d.get("nav2", {}) or {}),
+            nav2_params=d.get("nav2_params", {}) or {},
             nav2_params_path=d.get("nav2_params_path"),
             ros_env=d.get("ros_env"),
         )

@@ -87,7 +87,7 @@ class RosSlam(SLAM):
 
         self._map_store = MapStore(cfg.maps_dir)
         active = cfg.active_map or self._map_store.get_active_map_name() or "default"
-        self._map_store.get_or_create_map(active)
+        self._map_store.get_or_create_map(active, resolution=cfg.slam_toolbox.resolution)
         self._map_store.set_active_map(active)
 
         # (Re)start the ROS stack.

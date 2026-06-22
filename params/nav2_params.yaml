@@ -1,10 +1,9 @@
 # Nav2 parameter template for the nav-stack module.
 #
-# The navigation model loads this file, applies kinematics-specific overrides
-# (robot_radius, velocity/accel limits, inflation_radius, holonomic vy limits) and
-# injects one obstacle observation source per configured lidar, then writes the
-# result to the module scratch dir before launching navigation_launch.py.
-#
+# Runtime params are generated from Viam navigation service attributes:
+#   robot_radius, max_vel_x, …  -> top-level tuning
+#   nav2.*                      -> common Nav2 ROS params (see README)
+#   nav2_params                 -> advanced nested overrides merged last
 # Map + map->odom TF are provided by slam_toolbox (no map_server needed). Keepout
 # and speed-limit zones are applied via costmap filters whose masks are published by
 # the module bridge on /keepout_filter_mask and /speed_filter_mask, with

@@ -112,8 +112,11 @@ class RosNavigation(Generic):
             "acc_lim_x": cfg.acc_lim_x,
             "acc_lim_theta": cfg.acc_lim_theta,
             "holonomic_robot": cfg.kinematics == OMNI,
+            **cfg.nav2.to_override_dict(),
         }
         _apply_overrides(params, overrides)
+        if cfg.nav2_params:
+            _deep_merge(params, dict(cfg.nav2_params))
 
         runtime = get_slam(cfg.slam_service)
         _set_obstacle_sources(params, len(runtime.slam_cfg.lidars))
@@ -275,6 +278,19 @@ def _set_obstacle_sources(params: Mapping, n_lidars: int) -> None:
             entry = dict(template)
             entry["topic"] = f"/scan_{i}"
             obstacle[name] = entry
+
+
+def _deep_merge(obj: dict, overrides: Mapping) -> None:
+    """Recursively merge ``overrides`` into nested Nav2 param dicts."""
+    for key, value in overrides.items():
+        if (
+            key in obj
+            and isinstance(obj[key], dict)
+            and isinstance(value, Mapping)
+        ):
+            _deep_merge(obj[key], value)
+        else:
+            obj[key] = value
 
 
 def _apply_overrides(obj, overrides: Mapping) -> None:

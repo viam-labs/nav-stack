@@ -131,6 +131,7 @@ class RosManager:
 
     def _slam_params(self, map_stem: Path, mode: str) -> Dict:
         node = "mapping" if mode == MODE_MAPPING else "localization"
+        stb = self._slam_cfg.slam_toolbox
         params = {
             "slam_toolbox": {
                 "ros__parameters": {
@@ -138,11 +139,7 @@ class RosManager:
                     "odom_frame": self._slam_cfg.frames.odom,
                     "map_frame": self._slam_cfg.frames.map,
                     "base_frame": self._slam_cfg.frames.base_link,
-                    "scan_topic": "/scan",
-                    "use_map_saver": True,
-                    "resolution": 0.05,
-                    "transform_publish_period": 0.05,
-                    "map_update_interval": 1.0,
+                    **stb.to_ros_dict(),
                     **dict(self._slam_cfg.slam_params),
                 }
             }

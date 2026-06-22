@@ -99,6 +99,42 @@ If `viam-server` runs as root and DDS shared-memory fails, point
 
 A single lidar can be given as `"lidar": "front-lidar"`.
 
+**Tuning via Viam config (no YAML editing required):**
+
+| Attribute | Service | Description |
+| --- | --- | --- |
+| `mode` | SLAM | `mapping` or `localizing` — selects slam_toolbox node and sets its mode |
+| `slam_toolbox` | SLAM | Common slam_toolbox params (resolution, max_laser_range, etc.) |
+| `slam_params` | SLAM | Advanced: any other slam_toolbox ROS param (merged last) |
+| `robot_radius`, `max_vel_x`, … | Nav | Top-level Nav2 footprint / velocity limits |
+| `nav2` | Nav | Common Nav2 params (goal tolerance, costmap size, etc.) |
+| `nav2_params` | Nav | Advanced: nested Nav2 param overrides (merged last) |
+
+Example with slam_toolbox tuning:
+
+```json
+{
+  "name": "slam",
+  "model": "viam-labs:nav-stack:slam",
+  "attributes": {
+    "base": "my-base",
+    "movement_sensor": "odometry",
+    "lidars": [{ "name": "front-lidar" }],
+    "mode": "localizing",
+    "maps_dir": "/root/.viam/nav-stack/maps",
+    "active_map": "ground-floor",
+    "slam_toolbox": {
+      "resolution": 0.05,
+      "max_laser_range": 25.0,
+      "minimum_travel_distance": 0.3,
+      "map_update_interval": 1.0
+    }
+  }
+}
+```
+
+`mode` changes take effect on reconfigure (or via `start_mapping` / `start_localizing` DoCommands).
+
 ### Navigation service
 
 ```json
@@ -113,12 +149,19 @@ A single lidar can be given as `"lidar": "front-lidar"`.
     "robot_radius": 0.22,
     "max_vel_x": 0.4,
     "max_vel_theta": 1.0,
-    "inflation_radius": 0.45
+    "inflation_radius": 0.45,
+    "nav2": {
+      "xy_goal_tolerance": 0.25,
+      "local_costmap_width": 4.0,
+      "cost_scaling_factor": 3.0
+    }
   }
 }
 ```
 
 Set `"kinematics": "omni"` and a non-zero `max_vel_y` for omnidirectional bases.
+
+The files under [`params/`](params/) are **reference defaults** shipped with the module; runtime params are generated from your Viam service attributes.
 
 ## Workflows
 

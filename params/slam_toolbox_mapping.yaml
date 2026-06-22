@@ -1,8 +1,9 @@
 # Reference slam_toolbox parameters for MAPPING mode.
 #
-# The module generates an effective params file at runtime (see ros/manager.py),
-# overriding mode/frames/scan_topic and merging any user `slam_params`. This file
-# documents the defaults and can be copied/tuned.
+# Runtime params are generated from Viam SLAM service attributes:
+#   mode              -> slam_toolbox mode + node selection
+#   slam_toolbox.*    -> common ROS params (see README)
+#   slam_params       -> advanced overrides merged last
 slam_toolbox:
   ros__parameters:
     mode: mapping
