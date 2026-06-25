@@ -10,6 +10,7 @@
 # Environment:
 #   AUTO_INSTALL_DEPS=1   apt-install missing ROS/Nav2 packages (default: 1)
 #   ROS_DISTRO            force a distro (e.g. kilted on Ubuntu 24.04)
+#   ROS_APT_TESTING=1     use ros-testing apt repo when Nav2 debs are missing
 #   ROS_ENV               if already set and valid, skip distro auto-selection
 set -euo pipefail
 
@@ -23,6 +24,16 @@ PYTHON=${PYTHON:-python3}
 log() { echo "[nav-stack setup] $*"; }
 warn() { echo "[nav-stack setup] WARNING: $*" >&2; }
 die() { echo "[nav-stack setup] ERROR: $*" >&2; exit 1; }
+
+# ROS setup.bash scripts reference optional vars (e.g. AMENT_TRACE_SETUP_FILES) that
+# are unset on a fresh shell; set -u would abort while sourcing them.
+source_ros_setup() {
+    local setup_file="$1"
+    set +u
+    # shellcheck disable=SC1090
+    source "${setup_file}"
+    set -u
+}
 
 need_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
@@ -102,22 +113,64 @@ apt_pkg_installed() {
     dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
 }
 
+apt_pkg_available() {
+    apt-cache show "$1" >/dev/null 2>&1
+}
+
+nav_packages_available() {
+    apt_pkg_available "ros-${ROS_DISTRO}-nav2-bringup" \
+        && apt_pkg_available "ros-${ROS_DISTRO}-slam-toolbox"
+}
+
+install_ros_apt_source_deb() {
+    local deb_name="$1"
+    need_cmd curl
+    local version url deb
+    version="$(curl -fsSL https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest \
+        | grep -F '"tag_name"' | head -1 | awk -F'"' '{print $4}')"
+    [ -n "${version}" ] || die "could not determine ros-apt-source release version"
+    url="https://github.com/ros-infrastructure/ros-apt-source/releases/download/${version}/${deb_name}_${version}.${UBUNTU_CODENAME}_all.deb"
+    deb="/tmp/${deb_name}_${UBUNTU_CODENAME}.deb"
+    curl -fsSL -o "${deb}" "${url}" || die "failed to download ${deb_name} for ${UBUNTU_CODENAME}"
+    as_root dpkg -i "${deb}"
+    as_root apt-get update -qq
+}
+
 ensure_ros_apt_source() {
     # Skip if any ros-$ROS_DISTRO-* package is already known to apt.
     if apt-cache show "ros-${ROS_DISTRO}-ros-base" >/dev/null 2>&1; then
         return
     fi
     log "configuring ROS 2 apt source for ${ROS_DISTRO} on ${UBUNTU_CODENAME}"
-    need_cmd curl
-    local version url deb
-    version="$(curl -fsSL https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest \
-        | grep -F '"tag_name"' | head -1 | awk -F'"' '{print $4}')"
-    [ -n "${version}" ] || die "could not determine ros-apt-source release version"
-    url="https://github.com/ros-infrastructure/ros-apt-source/releases/download/${version}/ros2-apt-source_${version}.${UBUNTU_CODENAME}_all.deb"
-    deb="/tmp/ros2-apt-source_${UBUNTU_CODENAME}.deb"
-    curl -fsSL -o "${deb}" "${url}" || die "failed to download ros-apt-source for ${UBUNTU_CODENAME}"
-    as_root dpkg -i "${deb}"
-    as_root apt-get update -qq
+    install_ros_apt_source_deb "ros2-apt-source"
+}
+
+ensure_ros_testing_apt_source() {
+    if apt_pkg_available "ros-${ROS_DISTRO}-ros-base"; then
+        # ros-testing replaces ros-apt-source; packages may already be indexed.
+        if nav_packages_available; then
+            return
+        fi
+    fi
+    log "configuring ROS 2 testing apt source for ${ROS_DISTRO} on ${UBUNTU_CODENAME}"
+    install_ros_apt_source_deb "ros2-testing-apt-source"
+}
+
+nav_packages_unavailable_message() {
+    cat >&2 <<EOF
+[nav-stack setup] ERROR: Nav2 / slam_toolbox deb packages are not available for ROS 2 ${ROS_DISTRO} on Ubuntu ${UBUNTU_VERSION}.
+
+  apt could not find:
+    ros-${ROS_DISTRO}-navigation2
+    ros-${ROS_DISTRO}-nav2-bringup
+    ros-${ROS_DISTRO}-slam-toolbox
+
+  Nav2 and slam_toolbox are not yet published for Lyrical on Pi-class arm64 images.
+  Recommended: re-image the Pi with Ubuntu 24.04 LTS and use Jazzy (setup.sh default).
+
+  Optional: set ROS_APT_TESTING=1 in the module env and re-run setup to try ros-testing.
+  Otherwise install Nav2 + slam_toolbox yourself and set AUTO_INSTALL_DEPS=0.
+EOF
 }
 
 ros_base_installed() {
@@ -135,7 +188,23 @@ install_ros_base() {
         "ros-${ROS_DISTRO}-ros-base"
 }
 
+ensure_nav_packages_in_apt() {
+    if nav_packages_available; then
+        return
+    fi
+    if [ "${ROS_APT_TESTING:-0}" = "1" ] || [ "${UBUNTU_VERSION}" = "26.04" ]; then
+        warn "Nav2 packages missing from main ROS apt repo; trying ros-testing"
+        ensure_ros_testing_apt_source
+    fi
+    if nav_packages_available; then
+        return
+    fi
+    nav_packages_unavailable_message
+    exit 1
+}
+
 install_nav_packages() {
+    ensure_nav_packages_in_apt
     log "installing Nav2 + slam_toolbox for ${ROS_DISTRO}"
     as_root apt-get install -y --no-install-recommends \
         "ros-${ROS_DISTRO}-navigation2" \
@@ -144,8 +213,7 @@ install_nav_packages() {
 }
 
 verify_ros_packages() {
-    # shellcheck disable=SC1090
-    source "${ROS_SETUP}"
+    source_ros_setup "${ROS_SETUP}"
     local pkg
     for pkg in slam_toolbox nav2_bringup; do
         if ! ros2 pkg prefix "${pkg}" >/dev/null 2>&1; then

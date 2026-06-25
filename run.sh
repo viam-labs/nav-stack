@@ -6,6 +6,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# ROS setup.bash scripts reference optional vars (e.g. AMENT_TRACE_SETUP_FILES) that
+# are unset on a fresh shell; set -u would abort while sourcing them.
+source_ros_setup() {
+    local setup_file="$1"
+    set +u
+    # shellcheck disable=SC1090
+    source "${setup_file}"
+    set -u
+}
+
 # Load ROS paths written by setup.sh when the module env block omits ROS_ENV.
 if [ -f ".ros_env" ]; then
     # shellcheck disable=SC1091
@@ -19,8 +29,7 @@ if [ -n "${ROS_ENV:-}" ]; then
     IFS=':' read -ra _ros_setups <<< "${ROS_ENV}"
     for _setup in "${_ros_setups[@]}"; do
         if [ -f "${_setup}" ]; then
-            # shellcheck disable=SC1090
-            source "${_setup}"
+            source_ros_setup "${_setup}"
         fi
     done
 fi
@@ -28,8 +37,7 @@ if [ -n "${OVERLAYS:-}" ]; then
     IFS=':' read -ra _overlays <<< "${OVERLAYS}"
     for _setup in "${_overlays[@]}"; do
         if [ -f "${_setup}" ]; then
-            # shellcheck disable=SC1090
-            source "${_setup}"
+            source_ros_setup "${_setup}"
         fi
     done
 fi

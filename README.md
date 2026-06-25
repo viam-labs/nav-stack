@@ -38,6 +38,7 @@ flowchart LR
 ## Prerequisites
 
 - A Linux host (arm64 or x86_64) running `viam-server` on **Ubuntu 22.04, 24.04, or 26.04**.
+  **Pi 5 recommendation:** Ubuntu **24.04 LTS** (Jazzy). Ubuntu 26.04 (Lyrical) may install `ros-base` but Nav2 / slam_toolbox apt packages are often missing on arm64 until ROS publishes them for that distro.
 - On first deploy, `setup.sh` runs automatically (`first_run` in `meta.json`) and will:
   1. Verify the Ubuntu version and pick a matching ROS 2 distro (LTS default):
      - 22.04 → **Humble**
@@ -104,6 +105,7 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 | Attribute | Service | Description |
 | --- | --- | --- |
 | `mode` | SLAM | `mapping` or `localizing` — selects slam_toolbox node and sets its mode |
+| `base_velocity_convention` | SLAM | `ros` (default) or `mir` — maps Nav2 `/cmd_vel` to Viam base `SetVelocity` axes |
 | `slam_toolbox` | SLAM | Common slam_toolbox params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced: any other slam_toolbox ROS param (merged last) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level Nav2 footprint / velocity limits |
@@ -134,6 +136,8 @@ Example with slam_toolbox tuning:
 ```
 
 `mode` changes take effect on reconfigure (or via `start_mapping` / `start_localizing` DoCommands).
+
+For **MiR250** bases (`viam-labs:mir-base`), set `"base_velocity_convention": "mir"` so forward Nav2 commands map to Viam `linear.y` (MiR expects forward on Y, not X). Odometry from `viam-labs:mir-base:movement` stays in ROS convention and does not need swapping.
 
 ### Navigation service
 

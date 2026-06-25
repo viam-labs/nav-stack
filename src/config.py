@@ -16,6 +16,28 @@ MODE_MAPPING = "mapping"
 MODE_LOCALIZING = "localizing"
 SLAM_MODES = {MODE_MAPPING, MODE_LOCALIZING}
 
+BASE_VELOCITY_ROS = "ros"
+BASE_VELOCITY_MIR = "mir"
+BASE_VELOCITY_CONVENTIONS = {BASE_VELOCITY_ROS, BASE_VELOCITY_MIR}
+
+
+def ros_cmd_vel_to_viam_linear_mm_s(
+    vx_mps: float,
+    vy_mps: float,
+    convention: str = BASE_VELOCITY_ROS,
+) -> tuple[float, float]:
+    """Convert ROS body-frame linear speeds (m/s) to Viam base ``SetVelocity`` mm/s.
+
+    Default ``ros`` convention: Viam ``linear.x`` = ROS forward (``vx``),
+    Viam ``linear.y`` = ROS lateral (``vy``).
+
+    ``mir`` convention (MiR250 via ``viam-labs:mir-base``): Viam ``linear.y`` is
+    forward and ``linear.x`` is lateral — see mir_rosbridge_velocity.viam_velocity_to_ros.
+    """
+    if convention == BASE_VELOCITY_MIR:
+        vx_mps, vy_mps = vy_mps, vx_mps
+    return vx_mps * 1000.0, vy_mps * 1000.0
+
 
 @dataclass
 class LidarConfig:
@@ -164,6 +186,8 @@ class SlamConfig:
     odom_rate_hz: float = 20.0
     scan_bins: int = 720
     ros_env: Optional[str] = None
+    # How ROS /cmd_vel (vx forward, vy lateral) maps to the Viam base SetVelocity axes.
+    base_velocity_convention: str = BASE_VELOCITY_ROS
     slam_toolbox: SlamToolboxConfig = field(default_factory=SlamToolboxConfig)
     slam_params: Mapping = field(default_factory=dict)
 
@@ -176,6 +200,11 @@ class SlamConfig:
         mode = d.get("mode", MODE_MAPPING)
         if mode not in SLAM_MODES:
             raise ValueError(f"mode must be one of {sorted(SLAM_MODES)}")
+        convention = d.get("base_velocity_convention", BASE_VELOCITY_ROS)
+        if convention not in BASE_VELOCITY_CONVENTIONS:
+            raise ValueError(
+                f"base_velocity_convention must be one of {sorted(BASE_VELOCITY_CONVENTIONS)}"
+            )
         frames_d = d.get("frames", {}) or {}
         return cls(
             base=d["base"],
@@ -193,6 +222,7 @@ class SlamConfig:
             odom_rate_hz=float(d.get("odom_rate_hz", 20.0)),
             scan_bins=int(d.get("scan_bins", 720)),
             ros_env=d.get("ros_env"),
+            base_velocity_convention=convention,
             slam_toolbox=SlamToolboxConfig.from_dict(d.get("slam_toolbox", {}) or {}),
             slam_params=d.get("slam_params", {}) or {},
         )

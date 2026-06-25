@@ -25,7 +25,12 @@ from viam.resource.types import Model, ModelFamily
 from viam.services.slam import SLAM, MappingMode, Pose
 from viam.utils import ValueTypes, struct_to_dict
 
-from ..config import MODE_LOCALIZING, MODE_MAPPING, SlamConfig
+from ..config import (
+    MODE_LOCALIZING,
+    MODE_MAPPING,
+    SlamConfig,
+    ros_cmd_vel_to_viam_linear_mm_s,
+)
 from ..nav.maps import MapStore
 from ..ros import conversions as conv
 from ..ros.bridge import IOProvider
@@ -118,8 +123,14 @@ class RosSlam(SLAM):
             return (float(lin.x), float(lin.y), math.radians(float(ang.z)))
 
         async def drive_base(vx: float, vy: float, vtheta: float):
+            assert self._cfg is not None
+            lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(
+                vx,
+                vy,
+                self._cfg.base_velocity_convention,
+            )
             await self._base.set_velocity(
-                linear=Vector3(x=vx * 1000.0, y=vy * 1000.0, z=0.0),
+                linear=Vector3(x=lx_mm, y=ly_mm, z=0.0),
                 angular=Vector3(x=0.0, y=0.0, z=math.degrees(vtheta)),
             )
 

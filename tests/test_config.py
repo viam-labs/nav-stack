@@ -1,6 +1,6 @@
 import pytest
 
-from src.config import DIFFERENTIAL, OMNI, NavConfig, SlamConfig
+from src.config import DIFFERENTIAL, OMNI, NavConfig, SlamConfig, ros_cmd_vel_to_viam_linear_mm_s
 
 
 def test_slam_config_single_lidar_string():
@@ -108,4 +108,28 @@ def test_nav2_config_from_attributes():
     assert cfg.nav2.xy_goal_tolerance == 0.4
     assert cfg.nav2.local_costmap_width == 6.0
     assert cfg.nav2.to_override_dict()["width"] == 6.0
+
+
+def test_base_velocity_convention_ros_default():
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "f"})
+    assert cfg.base_velocity_convention == "ros"
+    lx, ly = ros_cmd_vel_to_viam_linear_mm_s(0.5, -0.1, cfg.base_velocity_convention)
+    assert lx == pytest.approx(500.0)
+    assert ly == pytest.approx(-100.0)
+
+
+def test_base_velocity_convention_mir_swaps_axes():
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "base_velocity_convention": "mir"}
+    )
+    lx, ly = ros_cmd_vel_to_viam_linear_mm_s(0.5, -0.1, cfg.base_velocity_convention)
+    assert lx == pytest.approx(-100.0)
+    assert ly == pytest.approx(500.0)
+
+
+def test_base_velocity_convention_invalid():
+    with pytest.raises(ValueError):
+        SlamConfig.from_dict(
+            {"base": "b", "lidar": "f", "base_velocity_convention": "sideways"}
+        )
 
