@@ -61,7 +61,7 @@ class RosManager:
         if self._started:
             return
         import rclpy
-        from rclpy.executors import SingleThreadedExecutor
+        from rclpy.executors import MultiThreadedExecutor
 
         from .bridge import BridgeNode
 
@@ -69,7 +69,8 @@ class RosManager:
             rclpy.init()
         self._loop = loop
         self._node = BridgeNode(self._slam_cfg, io, loop, nav_cfg=nav_cfg)
-        self._executor = SingleThreadedExecutor()
+        # Run callbacks concurrently so slow scan reads do not starve odom/tf updates.
+        self._executor = MultiThreadedExecutor(num_threads=4)
         self._executor.add_node(self._node)
         self._spin_thread = threading.Thread(target=self._spin, daemon=True)
         self._spin_thread.start()

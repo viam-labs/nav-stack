@@ -122,15 +122,63 @@ class BridgeNode(Node):
 
         # Latest occupancy map published by slam_toolbox.
         self._latest_map: Optional[Dict] = None
+        # Last successful map->base pose; used when TF lookup transiently fails.
+        self._last_pose_in_map: Optional[conv.Pose2D] = None
+
+        # Callback groups --------------------------------------------------
+        self._cb_scan = None
+        self._cb_odom = None
+        self._cb_misc = None
+        try:
+            from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+
+            self._cb_scan = MutuallyExclusiveCallbackGroup()
+            self._cb_odom = MutuallyExclusiveCallbackGroup()
+            self._cb_misc = MutuallyExclusiveCallbackGroup()
+        except Exception:
+            # Older/minimal test environments may not expose callback_groups.
+            pass
 
         # Subscriptions ----------------------------------------------------
-        self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, 10)
-        self.create_subscription(OccupancyGrid, "map", self._on_map, _LATCHED_QOS)
+        sub_kwargs = (
+            {"callback_group": self._cb_misc}
+            if self._cb_misc is not None
+            else {}
+        )
+        self.create_subscription(
+            Twist, "cmd_vel", self._on_cmd_vel, 10, **sub_kwargs
+        )
+        self.create_subscription(
+            OccupancyGrid, "map", self._on_map, _LATCHED_QOS, **sub_kwargs
+        )
 
         # Timers -----------------------------------------------------------
-        self.create_timer(1.0 / max(slam_cfg.scan_rate_hz, 1.0), self._on_scan_timer)
-        self.create_timer(1.0 / max(slam_cfg.odom_rate_hz, 1.0), self._on_odom_timer)
-        self.create_timer(0.1, self._on_watchdog)
+        scan_timer_kwargs = (
+            {"callback_group": self._cb_scan}
+            if self._cb_scan is not None
+            else {}
+        )
+        odom_timer_kwargs = (
+            {"callback_group": self._cb_odom}
+            if self._cb_odom is not None
+            else {}
+        )
+        misc_timer_kwargs = (
+            {"callback_group": self._cb_misc}
+            if self._cb_misc is not None
+            else {}
+        )
+        self.create_timer(
+            1.0 / max(slam_cfg.scan_rate_hz, 1.0),
+            self._on_scan_timer,
+            **scan_timer_kwargs,
+        )
+        self.create_timer(
+            1.0 / max(slam_cfg.odom_rate_hz, 1.0),
+            self._on_odom_timer,
+            **odom_timer_kwargs,
+        )
+        self.create_timer(0.1, self._on_watchdog, **misc_timer_kwargs)
 
         # Action client ----------------------------------------------------
         self._nav_action: Optional[ActionClient] = None
@@ -469,10 +517,12 @@ class BridgeNode(Node):
                 self._frames.map, self._frames.base_link, rclpy.time.Time()
             )
         except Exception:  # noqa: BLE001 - transform may not be available yet
-            return None
+            return self._last_pose_in_map
         t = tf.transform.translation
         q = tf.transform.rotation
-        return conv.Pose2D(t.x, t.y, conv.quaternion_to_yaw(q.x, q.y, q.z, q.w))
+        pose = conv.Pose2D(t.x, t.y, conv.quaternion_to_yaw(q.x, q.y, q.z, q.w))
+        self._last_pose_in_map = pose
+        return pose
 
 
 class _ZeroDuration:

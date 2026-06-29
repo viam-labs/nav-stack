@@ -126,3 +126,25 @@ def test_bridge_clamps_integration_for_stale_dt(monkeypatch):
     # stale_dt = max(8/15, 0.5) = 0.533...
     assert math.isclose(bridge._odom.x, 8.0 / 15.0, abs_tol=1e-6)
     assert math.isclose(bridge._odom.theta, 0.0, abs_tol=1e-6)
+
+
+def test_get_pose_in_map_returns_cached_pose_on_lookup_failure():
+    translation = SimpleNamespace(x=1.2, y=-0.4)
+    rotation = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+    tf = SimpleNamespace(transform=SimpleNamespace(translation=translation, rotation=rotation))
+    bridge = SimpleNamespace(
+        _frames=SimpleNamespace(map="map", base_link="base_link"),
+        _tf_buffer=SimpleNamespace(lookup_transform=MagicMock(return_value=tf)),
+        _last_pose_in_map=None,
+    )
+
+    pose = BridgeNode.get_pose_in_map(bridge)
+    assert pose is not None
+    assert math.isclose(pose.x, 1.2)
+    assert math.isclose(pose.y, -0.4)
+
+    bridge._tf_buffer.lookup_transform = MagicMock(side_effect=RuntimeError("tf unavailable"))
+    cached = BridgeNode.get_pose_in_map(bridge)
+    assert cached is not None
+    assert math.isclose(cached.x, 1.2)
+    assert math.isclose(cached.y, -0.4)
