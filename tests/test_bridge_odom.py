@@ -17,6 +17,7 @@ sys.modules.setdefault("rclpy.node", MagicMock(Node=_FakeNode))
 sys.modules.setdefault("rclpy.qos", MagicMock())
 sys.modules.setdefault("rclpy.action", MagicMock())
 sys.modules.setdefault("rclpy.time", MagicMock())
+sys.modules.setdefault("rclpy.duration", MagicMock(Duration=MagicMock()))
 for _mod in (
     "geometry_msgs",
     "geometry_msgs.msg",
@@ -167,6 +168,30 @@ def test_on_map_tags_generation():
     )
     BridgeNode._on_map(bridge, msg)
     assert bridge._latest_map["generation"] == 3
+
+
+def test_set_initial_pose_publishes_to_initialpose():
+    published = []
+
+    class _Pub:
+        def publish(self, msg):
+            published.append(msg)
+
+    bridge = SimpleNamespace(
+        _frames=SimpleNamespace(map="map"),
+        _initialpose_pub=_Pub(),
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: "stamp")),
+    )
+
+    BridgeNode.set_initial_pose(bridge, conv.Pose2D(1.0, 2.0, 0.5))
+
+    assert len(published) == 1
+    msg = published[0]
+    assert msg.header.frame_id == "map"
+    assert math.isclose(msg.pose.pose.position.x, 1.0)
+    assert math.isclose(msg.pose.pose.position.y, 2.0)
+    assert math.isclose(bridge._last_pose_in_map.x, 1.0)
+    assert math.isclose(bridge._last_pose_in_map.y, 2.0)
 
 
 def test_get_pose_in_map_returns_cached_pose_on_lookup_failure():

@@ -404,7 +404,7 @@ class RosManager:
         node.publish_mask("speed", speed_mask, resolution, origin_x, origin_y)
 
     def set_initial_pose(self, pose: conv.Pose2D) -> None:
-        self._require_node().set_initial_odom(pose)
+        self._require_node().set_initial_pose(pose)
 
     def set_nav_config(self, nav_cfg: NavConfig) -> None:
         self._require_node().set_nav_config(nav_cfg)
