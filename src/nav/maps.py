@@ -95,6 +95,17 @@ class MapHandle:
     def has_serialized_map(self) -> bool:
         return self.posegraph_path.exists()
 
+    def clear_serialized_data(self) -> None:
+        """Remove slam_toolbox serialization and exported occupancy grid files."""
+        for path in (
+            self.posegraph_path,
+            Path(str(self.serialization_stem) + ".data"),
+            self.occupancy_yaml_path,
+            self.root / "map.pgm",
+        ):
+            if path.exists():
+                path.unlink()
+
     def metadata(self) -> MapMetadata:
         if self.metadata_path.exists():
             return MapMetadata.from_dict(json.loads(self.metadata_path.read_text()))

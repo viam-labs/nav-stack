@@ -122,6 +122,7 @@ class BridgeNode(Node):
 
         # Latest occupancy map published by slam_toolbox.
         self._latest_map: Optional[Dict] = None
+        self._map_updates_enabled = True
         # Last successful map->base pose; used when TF lookup transiently fails.
         self._last_pose_in_map: Optional[conv.Pose2D] = None
 
@@ -148,9 +149,10 @@ class BridgeNode(Node):
         self.create_subscription(
             Twist, "cmd_vel", self._on_cmd_vel, 10, **sub_kwargs
         )
-        self.create_subscription(
+        self._map_sub = self.create_subscription(
             OccupancyGrid, "map", self._on_map, _LATCHED_QOS, **sub_kwargs
         )
+        self._map_generation = 0
 
         # Timers -----------------------------------------------------------
         scan_timer_kwargs = (
@@ -498,6 +500,8 @@ class BridgeNode(Node):
 
     # -- map + pose queries --------------------------------------------------
     def _on_map(self, msg: OccupancyGrid) -> None:
+        if not self._map_updates_enabled:
+            return
         width = msg.info.width
         height = msg.info.height
         grid = np.array(msg.data, dtype=np.int16).reshape(height, width)
@@ -506,10 +510,41 @@ class BridgeNode(Node):
             "resolution": msg.info.resolution,
             "origin_x": msg.info.origin.position.x,
             "origin_y": msg.info.origin.position.y,
+            "generation": self._map_generation,
         }
+
+    def map_generation(self) -> int:
+        return self._map_generation
+
+    def flush_map_subscription(self) -> int:
+        """Drop latched /map history and ignore grids from before this call."""
+        sub_kwargs = (
+            {"callback_group": self._cb_misc}
+            if self._cb_misc is not None
+            else {}
+        )
+        if self._map_sub is not None:
+            self.destroy_subscription(self._map_sub)
+        self._map_generation += 1
+        self._latest_map = None
+        self._map_sub = self.create_subscription(
+            OccupancyGrid, "map", self._on_map, _LATCHED_QOS, **sub_kwargs
+        )
+        return self._map_generation
 
     def get_map(self) -> Optional[Dict]:
         return self._latest_map
+
+    def clear_map(self) -> None:
+        """Drop cached occupancy grid so clients stop showing a deleted map."""
+        self._latest_map = None
+        self._last_pose_in_map = None
+
+    def set_map_updates_enabled(self, enabled: bool) -> None:
+        """Ignore or accept incoming ``/map`` messages (used during SLAM reset)."""
+        self._map_updates_enabled = enabled
+        if not enabled:
+            self._latest_map = None
 
     def get_pose_in_map(self) -> Optional[conv.Pose2D]:
         try:

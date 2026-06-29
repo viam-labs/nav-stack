@@ -128,6 +128,47 @@ def test_bridge_clamps_integration_for_stale_dt(monkeypatch):
     assert math.isclose(bridge._odom.theta, 0.0, abs_tol=1e-6)
 
 
+def test_map_updates_can_be_disabled():
+    bridge = SimpleNamespace(
+        _map_updates_enabled=True,
+        _latest_map={"grid": "old"},
+    )
+    BridgeNode.set_map_updates_enabled(bridge, False)
+    assert bridge._map_updates_enabled is False
+    assert bridge._latest_map is None
+
+    msg = SimpleNamespace(
+        info=SimpleNamespace(
+            width=1,
+            height=1,
+            resolution=0.05,
+            origin=SimpleNamespace(position=SimpleNamespace(x=0.0, y=0.0)),
+        ),
+        data=[0],
+    )
+    BridgeNode._on_map(bridge, msg)
+    assert bridge._latest_map is None
+
+
+def test_on_map_tags_generation():
+    bridge = SimpleNamespace(
+        _map_updates_enabled=True,
+        _map_generation=3,
+        _latest_map=None,
+    )
+    msg = SimpleNamespace(
+        info=SimpleNamespace(
+            width=1,
+            height=1,
+            resolution=0.05,
+            origin=SimpleNamespace(position=SimpleNamespace(x=0.0, y=0.0)),
+        ),
+        data=[0],
+    )
+    BridgeNode._on_map(bridge, msg)
+    assert bridge._latest_map["generation"] == 3
+
+
 def test_get_pose_in_map_returns_cached_pose_on_lookup_failure():
     translation = SimpleNamespace(x=1.2, y=-0.4)
     rotation = SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)

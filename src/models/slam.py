@@ -31,7 +31,7 @@ from ..config import (
     SlamConfig,
     ros_cmd_vel_to_viam_linear_mm_s,
 )
-from ..nav.maps import MapStore
+from ..nav.maps import MapStore, validate_map_name
 from ..ros import conversions as conv
 from ..ros.bridge import IOProvider
 from ..ros.manager import RosManager
@@ -51,6 +51,8 @@ class RosSlam(SLAM):
         self._base: Optional[Base] = None
         self._cameras: dict = {}
         self._movement_sensor: Optional[MovementSensor] = None
+        self._map_display_hold = False
+        self._visible_map_generation = 0
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -145,6 +147,45 @@ class RosSlam(SLAM):
         self._manager.start_slam(stem, mode)
         self._cfg.mode = mode
 
+    def _reset_live_slam(self, mode: str) -> None:
+        """Reset slam_toolbox in place when possible; full restart as fallback."""
+        assert self._manager is not None
+        mgr = self._manager
+        if mode == MODE_MAPPING and mgr.slam_running() and mgr.reset_slam_map():
+            if self._cfg is not None:
+                self._cfg.mode = mode
+            return
+        self._start_mode(mode)
+
+    def _begin_map_reset(self) -> None:
+        """Blank the control-tab map immediately."""
+        self._map_display_hold = True
+        mgr = self._manager
+        node = mgr.node if mgr else None
+        if node is not None:
+            node.set_map_updates_enabled(False)
+            self._visible_map_generation = node.flush_map_subscription()
+
+    def _end_map_reset(self) -> None:
+        mgr = self._manager
+        node = mgr.node if mgr else None
+        if node is not None:
+            self._visible_map_generation = node.flush_map_subscription()
+            node.set_map_updates_enabled(True)
+        self._map_display_hold = False
+
+    def _map_grid_visible(self, grid: Optional[Dict]) -> bool:
+        if not grid:
+            return False
+        return int(grid.get("generation", 0)) >= self._visible_map_generation
+
+    def _map_is_live(self, name: str, store: MapStore) -> bool:
+        """True when ``name`` is the map currently driving the SLAM session."""
+        active = store.get_active_map_name()
+        if active is not None:
+            return active == name
+        return self._cfg is not None and self._cfg.active_map == name
+
     # -- SLAM API ------------------------------------------------------------
     async def get_position(self, *, timeout: Optional[float] = None, **kwargs) -> Pose:
         node = self._manager.node if self._manager else None
@@ -157,9 +198,11 @@ class RosSlam(SLAM):
     async def get_point_cloud_map(
         self, return_edited_map: bool = False, *, timeout: Optional[float] = None, **kwargs
     ) -> List[bytes]:
+        if self._map_display_hold:
+            return [conv.points_to_pcd(np.empty((0, 3)))]
         node = self._manager.node if self._manager else None
         grid = node.get_map() if node else None
-        if not grid:
+        if not self._map_grid_visible(grid):
             return [conv.points_to_pcd(np.empty((0, 3)))]
         pcd = conv.occupancy_grid_to_pcd(
             grid["grid"], grid["resolution"], grid["origin_x"], grid["origin_y"]
@@ -169,6 +212,10 @@ class RosSlam(SLAM):
     async def get_internal_state(
         self, *, timeout: Optional[float] = None, **kwargs
     ) -> List[bytes]:
+        if self._map_display_hold or not self._map_grid_visible(
+            self._manager.node.get_map() if self._manager and self._manager.node else None
+        ):
+            return [b""]
         handle = self._map_store.active_handle() if self._map_store else None
         if handle and handle.posegraph_path.exists():
             return conv.chunk_bytes(handle.posegraph_path.read_bytes())
@@ -244,9 +291,50 @@ class RosSlam(SLAM):
         if cmd == "rename_map":
             handle = store.rename_map(str(command["map"]), str(command["new_name"]))
             return {"map": handle.name}
+        if cmd == "clear_map":
+            handle = store.active_handle()
+            if not handle:
+                raise ValueError("no active map")
+            self._begin_map_reset()
+            try:
+                handle.clear_serialized_data()
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._reset_live_slam, MODE_MAPPING)
+            finally:
+                self._end_map_reset()
+            return {"status": "cleared", "map": handle.name, "mode": MODE_MAPPING}
         if cmd == "delete_map":
-            store.delete_map(str(command["map"]))
-            return {"status": "deleted"}
+            name = validate_map_name(
+                str(command.get("map") or store.get_active_map_name() or "")
+            )
+            if not name:
+                raise ValueError("no map specified and no active map")
+            was_live = self._map_is_live(name, store)
+            if was_live:
+                self._begin_map_reset()
+            try:
+                store.delete_map(name)
+                if was_live:
+                    resolution = (
+                        self._cfg.slam_toolbox.resolution if self._cfg else 0.05
+                    )
+                    store.get_or_create_map(name, resolution=resolution)
+                    store.set_active_map(name)
+                    if self._cfg is not None:
+                        self._cfg.active_map = name
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None, self._reset_live_slam, MODE_MAPPING
+                    )
+            finally:
+                if was_live:
+                    self._end_map_reset()
+            return {
+                "status": "deleted",
+                "map": name,
+                "active_map": store.get_active_map_name(),
+                "mode": MODE_MAPPING if was_live else (self._cfg.mode if self._cfg else None),
+            }
 
         raise ValueError(f"unknown command: {cmd!r}")
 
