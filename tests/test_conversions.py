@@ -94,3 +94,91 @@ def test_parse_pcd_malformed_missing_xyz():
     )
     pts = conv.parse_pcd(raw)
     assert pts.shape == (0, 3)
+
+
+def test_parse_odom_pose_from_readings_flat():
+    pose = conv.parse_odom_pose_from_readings(
+        {"x": 1.5, "y": -2.0, "theta": 90.0}
+    )
+    assert pose is not None
+    assert pose.x == 1.5
+    assert pose.y == -2.0
+    assert math.isclose(pose.theta, math.radians(90.0))
+
+
+def test_parse_odom_pose_from_readings_nested_pose():
+    pose = conv.parse_odom_pose_from_readings(
+        {"pose": {"x": 0.5, "y": 1.0, "theta": 0.25}}
+    )
+    assert pose is not None
+    assert math.isclose(pose.theta, 0.25)
+
+
+def test_parse_odom_pose_from_readings_quaternion():
+    x, y, z, w = conv.yaw_to_quaternion(math.pi / 2)
+    pose = conv.parse_odom_pose_from_readings(
+        {"x": 0.0, "y": 0.0, "orientation": {"x": x, "y": y, "z": z, "w": w}}
+    )
+    assert pose is not None
+    assert math.isclose(pose.theta, math.pi / 2, abs_tol=1e-6)
+
+
+def test_parse_odom_from_readings_mir_base():
+    """mir-base yaw_deg is map-fused; must not drive /odom without odom_* fields."""
+    reading = conv.parse_odom_from_readings(
+        {
+            "source": "odom+/odom+/status",
+            "position_x_m": 10.0,
+            "position_y_m": 20.0,
+            "yaw_deg": 45.0,
+            "linear_velocity_mps": {"x": 0.5, "y": 0.1, "z": 0.0},
+            "angular_velocity_dps": {"x": 0.0, "y": 0.0, "z": 5.0},
+        }
+    )
+    assert reading.pose is None
+    assert reading.heading_rad is None
+    assert reading.vx == 0.5
+    assert reading.vy == 0.1
+    assert math.isclose(reading.vtheta, math.radians(5.0))
+
+
+def test_parse_odom_from_readings_mir_base_odom_fields():
+    reading = conv.parse_odom_from_readings(
+        {
+            "odom_position_x_m": 1.0,
+            "odom_position_y_m": 2.0,
+            "odom_yaw_deg": 90.0,
+            "linear_velocity_mps": {"x": 0.2, "y": 0.0, "z": 0.0},
+            "angular_velocity_dps": {"x": 0.0, "y": 0.0, "z": 0.0},
+        }
+    )
+    assert reading.pose is not None
+    assert reading.pose.x == 1.0
+    assert reading.pose.y == 2.0
+    assert math.isclose(reading.pose.theta, math.radians(90.0))
+    assert reading.heading_rad is None
+
+
+def test_parse_odom_from_readings_ros_odom_message():
+    reading = conv.parse_odom_from_readings(
+        {
+            "pose": {
+                "pose": {
+                    "position": {"x": 1.0, "y": 2.0, "z": 0.0},
+                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                }
+            },
+            "twist": {
+                "twist": {
+                    "linear": {"x": 0.3, "y": 0.0, "z": 0.0},
+                    "angular": {"x": 0.0, "y": 0.0, "z": 0.2},
+                }
+            },
+        }
+    )
+    assert reading.pose is not None
+    assert reading.pose.x == 1.0
+    assert reading.pose.y == 2.0
+    assert reading.heading_rad is None
+    assert reading.vx == 0.3
+    assert math.isclose(reading.vtheta, 0.2)

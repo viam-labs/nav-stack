@@ -25,6 +25,8 @@ import numpy as np
 from ..config import MODE_MAPPING, NavConfig, SlamConfig
 from . import conversions as conv
 
+SLAM_LIFECYCLE_NODE = "/slam_toolbox"
+
 
 def _yaml_dump(data: Dict) -> str:
     """Tiny YAML emitter for the nested ROS params we generate (avoids a PyYAML dep
@@ -108,6 +110,77 @@ class RosManager:
         self._log("launch: " + " ".join(args))
         return subprocess.Popen(args, env=os.environ.copy())
 
+    def _run_ros(self, args: List[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            args,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+        )
+
+    def _wait_for_ros_node(self, node_name: str, timeout: float = 30.0) -> bool:
+        """Wait until ``node_name`` appears in ``ros2 node list``."""
+        bare = node_name.lstrip("/")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._slam_proc is not None and self._slam_proc.poll() is not None:
+                self._log(f"{node_name} process exited before the node registered")
+                return False
+            proc = self._run_ros(["ros2", "node", "list"])
+            if proc.returncode == 0 and bare in (proc.stdout or ""):
+                return True
+            time.sleep(0.25)
+        self._log(f"timed out waiting for ROS node {node_name}")
+        return False
+
+    def _lifecycle_get_state(self, node_name: str) -> Optional[str]:
+        proc = self._run_ros(["ros2", "lifecycle", "get", node_name])
+        if proc.returncode != 0:
+            return None
+        text = (proc.stdout or "").strip().lower()
+        for state in ("unconfigured", "inactive", "active", "finalized"):
+            if state in text:
+                return state
+        return text or None
+
+    def _lifecycle_set(self, node_name: str, transition: str) -> bool:
+        proc = self._run_ros(["ros2", "lifecycle", "set", node_name, transition])
+        if proc.returncode == 0:
+            return True
+        detail = (proc.stderr or proc.stdout or "").strip()
+        self._log(f"slam lifecycle {transition} failed: {detail}")
+        return False
+
+    def _activate_slam_lifecycle(self, timeout: float = 30.0) -> None:
+        """Configure + activate slam_toolbox when it is a lifecycle node (Jazzy+).
+
+        Older distros expose a plain node that starts active; in that case the
+        lifecycle CLI fails and we leave the node as-is.
+        """
+        node = SLAM_LIFECYCLE_NODE
+        if not self._wait_for_ros_node(node, timeout=timeout):
+            raise RuntimeError(f"{node} did not register with ROS")
+
+        state = self._lifecycle_get_state(node)
+        if state is None:
+            self._log(
+                f"{node} is not lifecycle-managed; skipping configure/activate"
+            )
+            return
+        if state == "active":
+            self._log("slam_toolbox already active")
+            return
+        if state == "unconfigured":
+            if not self._lifecycle_set(node, "configure"):
+                raise RuntimeError(f"failed to configure {node}")
+            state = self._lifecycle_get_state(node)
+        if state == "inactive":
+            if not self._lifecycle_set(node, "activate"):
+                raise RuntimeError(f"failed to activate {node}")
+            self._log("slam_toolbox lifecycle activated")
+            return
+        raise RuntimeError(f"unexpected slam_toolbox lifecycle state: {state}")
+
     # -- slam_toolbox --------------------------------------------------------
     def start_slam(self, map_stem: Path, mode: str) -> None:
         """Launch slam_toolbox in mapping or localization mode.
@@ -126,8 +199,10 @@ class RosManager:
         )
         self._slam_proc = self._popen(
             ["ros2", "run", "slam_toolbox", node_exe,
-             "--ros-args", "--params-file", str(params_file)]
+             "--ros-args", "-r", "__node:=slam_toolbox",
+             "--params-file", str(params_file)]
         )
+        self._activate_slam_lifecycle()
 
     def _slam_params(self, map_stem: Path, mode: str) -> Dict:
         node = "mapping" if mode == MODE_MAPPING else "localization"

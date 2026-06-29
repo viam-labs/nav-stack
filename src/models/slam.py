@@ -115,12 +115,11 @@ class RosSlam(SLAM):
             raw = data[0] if isinstance(data, tuple) else data
             return conv.parse_pcd(raw)
 
-        async def read_twist():
+        async def read_odometry() -> conv.OdomReading:
             if self._movement_sensor is None:
-                return (0.0, 0.0, 0.0)
-            lin = await self._movement_sensor.get_linear_velocity()
-            ang = await self._movement_sensor.get_angular_velocity()
-            return (float(lin.x), float(lin.y), math.radians(float(ang.z)))
+                return conv.OdomReading(0.0, 0.0, 0.0)
+            readings = await self._movement_sensor.get_readings()
+            return conv.parse_odom_from_readings(readings)
 
         async def drive_base(vx: float, vy: float, vtheta: float):
             assert self._cfg is not None
@@ -137,7 +136,7 @@ class RosSlam(SLAM):
         async def stop_base():
             await self._base.stop()
 
-        return IOProvider(read_lidar_points, read_twist, drive_base, stop_base)
+        return IOProvider(read_lidar_points, read_odometry, drive_base, stop_base)
 
     def _start_mode(self, mode: str) -> None:
         assert self._manager and self._map_store and self._cfg

@@ -67,9 +67,9 @@ class IOProvider:
     free of any Viam SDK imports.
     """
 
-    def __init__(self, read_lidar_points, read_twist, drive_base, stop_base):
+    def __init__(self, read_lidar_points, read_odometry, drive_base, stop_base):
         self.read_lidar_points = read_lidar_points  # async (name) -> (N,3) np.ndarray
-        self.read_twist = read_twist  # async () -> (vx, vy, vtheta)
+        self.read_odometry = read_odometry  # async () -> conv.OdomReading
         self.drive_base = drive_base  # async (vx, vy, vtheta) -> None
         self.stop_base = stop_base  # async () -> None
 
@@ -94,9 +94,10 @@ class BridgeNode(Node):
         self._last_cmd_time = 0.0
         self._cmd_timeout = nav_cfg.cmd_vel_timeout if nav_cfg else 0.5
 
-        # Dead-reckoned odom pose (corrected by slam_toolbox's map->odom).
+        # Odom pose: prefer the movement sensor's absolute /odom pose when available.
         self._odom = conv.Pose2D(0.0, 0.0, 0.0)
-        self._last_odom_time = time.time()
+        self._last_odom_time = time.monotonic()
+        self._odom_integrate_warned = False
 
         # Publishers -------------------------------------------------------
         self._scan_pubs: List = []
@@ -144,6 +145,22 @@ class BridgeNode(Node):
         """Run an async Viam call on the module loop from this ROS thread."""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
+
+    def _bounded_odom_dt(self, dt: float) -> float:
+        """Bound odom integration dt to avoid large stale-velocity jumps."""
+        if dt <= 0.0:
+            return 0.0
+        hz = max(float(self._slam_cfg.odom_rate_hz), 1.0)
+        # Keep a generous cap so slower rosbridge cycles still integrate, while
+        # preventing single very-late samples from creating huge pose jumps.
+        stale_dt = max(8.0 / hz, 0.5)
+        if dt > stale_dt:
+            self.get_logger().warn(
+                f"odom integration dt {dt:.3f}s exceeds stale threshold "
+                f"{stale_dt:.3f}s; clamping integration step"
+            )
+            return stale_dt
+        return dt
 
     def _now_msg(self) -> Header:
         return Header(stamp=self.get_clock().now().to_msg(), frame_id=self._frames.base_link)
@@ -221,21 +238,51 @@ class BridgeNode(Node):
     # -- odometry ------------------------------------------------------------
     def _on_odom_timer(self) -> None:
         try:
-            vx, vy, vtheta = self._run(self._io.read_twist())
+            sample = self._run(self._io.read_odometry())
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f"odometry read failed: {exc}")
             return
-        now = time.time()
-        dt = now - self._last_odom_time
+        now = time.monotonic()
+        raw_dt = now - self._last_odom_time
         self._last_odom_time = now
-        if dt <= 0 or dt > 1.0:
-            return
-        # Integrate body-frame twist into the odom-frame pose (dead reckoning).
-        th = self._odom.theta
-        dx = (vx * math.cos(th) - vy * math.sin(th)) * dt
-        dy = (vx * math.sin(th) + vy * math.cos(th)) * dt
-        self._odom = conv.Pose2D(self._odom.x + dx, self._odom.y + dy, th + vtheta * dt)
+        if sample.pose is not None:
+            self._odom = sample.pose
+        elif sample.heading_rad is not None:
+            dt = self._bounded_odom_dt(raw_dt)
+            if dt <= 0:
+                self._odom = conv.Pose2D(
+                    self._odom.x, self._odom.y, sample.heading_rad
+                )
+            else:
+                th = sample.heading_rad
+                vx, vy, _vtheta = sample.vx, sample.vy, sample.vtheta
+                dx = (vx * math.cos(th) - vy * math.sin(th)) * dt
+                dy = (vx * math.sin(th) + vy * math.cos(th)) * dt
+                self._odom = conv.Pose2D(
+                    self._odom.x + dx,
+                    self._odom.y + dy,
+                    sample.heading_rad,
+                )
+        else:
+            dt = self._bounded_odom_dt(raw_dt)
+            if not self._odom_integrate_warned:
+                self.get_logger().warn(
+                    "movement sensor did not provide odom pose or heading in "
+                    "get_readings(); dead-reckoning from velocity — orientation "
+                    "drift likely"
+                )
+                self._odom_integrate_warned = True
+            if dt <= 0:
+                return
+            th = self._odom.theta
+            vx, vy, vtheta = sample.vx, sample.vy, sample.vtheta
+            dx = (vx * math.cos(th) - vy * math.sin(th)) * dt
+            dy = (vx * math.sin(th) + vy * math.cos(th)) * dt
+            self._odom = conv.Pose2D(
+                self._odom.x + dx, self._odom.y + dy, th + vtheta * dt
+            )
 
+        vx, vy, vtheta = sample.vx, sample.vy, sample.vtheta
         stamp = self.get_clock().now().to_msg()
         odom = Odometry()
         odom.header.stamp = stamp

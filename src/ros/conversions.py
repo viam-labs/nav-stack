@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -55,6 +55,174 @@ class Pose2D:
     def to_matrix(self) -> np.ndarray:
         c, s = math.cos(self.theta), math.sin(self.theta)
         return np.array([[c, -s, self.x], [s, c, self.y], [0.0, 0.0, 1.0]])
+
+
+@dataclass(frozen=True)
+class OdomReading:
+    """Body-frame twist plus optional pose/heading hints from the sensor."""
+
+    vx: float  # m/s, ROS forward
+    vy: float  # m/s, ROS lateral
+    vtheta: float  # rad/s about +Z
+    pose: Optional[Pose2D] = None  # full odom-frame pose; replaces integration
+    heading_rad: Optional[float] = None  # snap yaw while integrating x/y (MiR-style)
+
+
+def _angle_to_rad(value: float) -> float:
+    """Convert a heading/yaw that may be radians or degrees into radians."""
+    if abs(value) > 2.0 * math.pi + 0.01:
+        return math.radians(value)
+    return float(value)
+
+
+def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
+    return quaternion_to_yaw(float(x), float(y), float(z), float(w))
+
+
+def _parse_ros_odom_pose_block(readings: Mapping) -> Optional[Pose2D]:
+    """Parse a nested ROS ``nav_msgs/Odometry``-style pose from readings."""
+    pose_block = readings.get("pose")
+    if not isinstance(pose_block, Mapping):
+        return None
+    inner = pose_block.get("pose")
+    if not isinstance(inner, Mapping):
+        return None
+    position = inner.get("position")
+    orientation = inner.get("orientation")
+    if not isinstance(position, Mapping) or not isinstance(orientation, Mapping):
+        return None
+    if not all(k in position for k in ("x", "y")):
+        return None
+    if not all(k in orientation for k in ("x", "y", "z", "w")):
+        return None
+    theta = _yaw_from_quaternion(
+        orientation["x"], orientation["y"], orientation["z"], orientation["w"]
+    )
+    return Pose2D(float(position["x"]), float(position["y"]), theta)
+
+
+def _parse_heading_rad_from_readings(
+    readings: Mapping,
+    *,
+    odom_only: bool = False,
+) -> Optional[float]:
+    """Extract yaw in radians from movement-sensor readings.
+
+    When ``odom_only`` is True (for publishing ``/odom``), only ``odom_yaw_deg`` /
+    explicit odom aliases are accepted. ``yaw_deg`` from ``viam-labs:mir-base`` is
+    map-fused heading and must not drive the odom TF.
+    """
+    if odom_only:
+        for tk in ("odom_yaw_deg", "odom_theta", "odom_yaw"):
+            if tk in readings:
+                return _angle_to_rad(float(readings[tk]))
+        return None
+
+    for tk in ("odom_yaw_deg", "odom_theta", "odom_yaw", "yaw_deg", "theta", "yaw", "heading", "pose_theta"):
+        if tk in readings:
+            return _angle_to_rad(float(readings[tk]))
+    for qprefix in ("orientation", "rotation"):
+        block = readings.get(qprefix)
+        if isinstance(block, Mapping):
+            if all(k in block for k in ("x", "y", "z", "w")):
+                return _yaw_from_quaternion(
+                    block["x"], block["y"], block["z"], block["w"]
+                )
+            if all(k in block for k in ("o_x", "o_y", "o_z")):
+                return _angle_to_rad(float(block.get("theta", 0.0)))
+    return None
+
+
+def parse_odom_twist_from_readings(readings: Mapping) -> Tuple[float, float, float]:
+    """Extract body-frame twist (vx, vy, vtheta rad/s) from ``get_readings``."""
+    lin = readings.get("linear_velocity_mps")
+    ang = readings.get("angular_velocity_dps")
+    if isinstance(lin, Mapping) and isinstance(ang, Mapping):
+        return (
+            float(lin.get("x", 0.0)),
+            float(lin.get("y", 0.0)),
+            math.radians(float(ang.get("z", 0.0))),
+        )
+
+    twist_block = readings.get("twist")
+    if isinstance(twist_block, Mapping):
+        inner = twist_block.get("twist", twist_block)
+        if isinstance(inner, Mapping):
+            linear = inner.get("linear")
+            angular = inner.get("angular")
+            if isinstance(linear, Mapping) and isinstance(angular, Mapping):
+                return (
+                    float(linear.get("x", 0.0)),
+                    float(linear.get("y", 0.0)),
+                    float(angular.get("z", 0.0)),
+                )
+
+    for prefix in ("linear_velocity", "velocity"):
+        block = readings.get(prefix)
+        if isinstance(block, Mapping) and all(k in block for k in ("x", "y", "z")):
+            return (
+                float(block["x"]),
+                float(block["y"]),
+                math.radians(float(block.get("z", 0.0))),
+            )
+    return 0.0, 0.0, 0.0
+
+
+def parse_odom_pose_from_readings(readings: Mapping) -> Optional[Pose2D]:
+    """Extract a full odom-frame 2D pose from movement-sensor ``get_readings`` data.
+
+    Supports nested ROS odometry messages, flat ``x``/``y``/``theta`` keys, and
+    ``odom_x``/``odom_y`` aliases. Does **not** treat ``viam-labs:mir-base``
+    ``position_x_m``/``position_y_m`` as odom position (those are map-frame).
+    """
+    if not readings:
+        return None
+
+    ros_pose = _parse_ros_odom_pose_block(readings)
+    if ros_pose is not None:
+        return ros_pose
+
+    flat: dict = dict(readings)
+    pose_block = readings.get("pose")
+    if isinstance(pose_block, Mapping) and "pose" not in pose_block:
+        flat.update(pose_block)
+    position_block = readings.get("position")
+    if isinstance(position_block, Mapping):
+        flat.update(position_block)
+
+    xy_pairs = (
+        ("odom_position_x_m", "odom_position_y_m"),
+        ("odom_x", "odom_y"),
+        ("x", "y"),
+        ("position_x", "position_y"),
+        ("pose_x", "pose_y"),
+    )
+    x = y = None
+    for xk, yk in xy_pairs:
+        if xk in flat and yk in flat:
+            x = float(flat[xk])
+            y = float(flat[yk])
+            break
+
+    theta = _parse_heading_rad_from_readings(flat, odom_only=True)
+    if theta is None:
+        theta = _parse_heading_rad_from_readings(flat, odom_only=False)
+        # Map-frame aliases from mir-base must not populate /odom position.
+        if x is None and "position_x_m" in flat and "position_y_m" in flat:
+            theta = None
+    if x is not None and y is not None and theta is not None:
+        return Pose2D(x, y, theta)
+    return None
+
+
+def parse_odom_from_readings(readings: Mapping) -> OdomReading:
+    """Build an ``OdomReading`` from a single movement-sensor ``get_readings`` call."""
+    vx, vy, vtheta = parse_odom_twist_from_readings(readings)
+    pose = parse_odom_pose_from_readings(readings)
+    heading_rad = None
+    if pose is None:
+        heading_rad = _parse_heading_rad_from_readings(readings, odom_only=True)
+    return OdomReading(vx, vy, vtheta, pose=pose, heading_rad=heading_rad)
 
 
 def viam_pose_to_pose2d(x_mm: float, y_mm: float, theta_deg: float) -> Pose2D:
