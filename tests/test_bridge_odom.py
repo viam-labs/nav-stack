@@ -54,7 +54,30 @@ def _odom_bridge_stub(*, sample: conv.OdomReading):
         _run=lambda coro: coro,
     )
     bridge._bounded_odom_dt = lambda dt: BridgeNode._bounded_odom_dt(bridge, dt)
+    bridge._publish_odom_snapshot = lambda stamp, vx, vy, vtheta: BridgeNode._publish_odom_snapshot(
+        bridge, stamp, vx, vy, vtheta
+    )
+    bridge._last_twist = (0.0, 0.0, 0.0)
     return bridge
+
+
+def test_publish_odom_snapshot_updates_twist_and_publishes():
+    bridge = SimpleNamespace(
+        _odom=conv.Pose2D(1.0, 2.0, 0.25),
+        _frames=SimpleNamespace(odom="odom", base_link="base_link"),
+        _last_odom_stamp=None,
+        _last_twist=(0.0, 0.0, 0.0),
+        _odom_pub=MagicMock(),
+        _tf_broadcaster=MagicMock(),
+    )
+
+    stamp = MagicMock()
+    BridgeNode._publish_odom_snapshot(bridge, stamp, 0.5, 0.0, 0.1)
+
+    assert bridge._last_odom_stamp is stamp
+    assert bridge._last_twist == (0.5, 0.0, 0.1)
+    bridge._odom_pub.publish.assert_called_once()
+    bridge._tf_broadcaster.sendTransform.assert_called_once()
 
 
 def test_bridge_uses_odom_pose_when_available(monkeypatch):
@@ -192,6 +215,27 @@ def test_set_initial_pose_publishes_to_initialpose():
     assert math.isclose(msg.pose.pose.position.y, 2.0)
     assert math.isclose(bridge._last_pose_in_map.x, 1.0)
     assert math.isclose(bridge._last_pose_in_map.y, 2.0)
+
+
+def test_set_initial_pose_does_not_rewrite_odom_pose():
+    published = []
+
+    class _Pub:
+        def publish(self, msg):
+            published.append(msg)
+
+    bridge = SimpleNamespace(
+        _odom=conv.Pose2D(9.0, 8.0, 0.2),
+        _frames=SimpleNamespace(map="map"),
+        _initialpose_pub=_Pub(),
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: "stamp")),
+    )
+
+    BridgeNode.set_initial_pose(bridge, conv.Pose2D(1.0, 2.0, 0.5))
+
+    assert math.isclose(bridge._odom.x, 9.0)
+    assert math.isclose(bridge._odom.y, 8.0)
+    assert len(published) == 1
 
 
 def test_get_pose_in_map_returns_cached_pose_on_lookup_failure():

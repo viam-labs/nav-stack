@@ -306,6 +306,15 @@ def chunk_bytes(data: bytes, chunk_size: int = 1 << 20) -> List[bytes]:
 # LaserScan <-> points, and multi-lidar merge
 # ---------------------------------------------------------------------------
 @dataclass
+class LidarPoints:
+    """Lidar returns in sensor frame and in base_link (meters)."""
+
+    sensor: np.ndarray  # (N, 3) in the scanner frame
+    base_link: np.ndarray  # (N, 3) in base_link
+    sensor_scan: Optional["LaserScan2D"] = None  # native MiR scan for /scan_0
+
+
+@dataclass
 class LaserScan2D:
     """A minimal, ROS-agnostic representation of a 2D laser scan."""
 
@@ -419,6 +428,154 @@ def pointcloud_to_scan(
         xy = (sensor_pose.to_matrix() @ homog.T).T[:, :2]
     scan = points_to_scan(xy, **scan_kwargs)
     return scan
+
+
+def scan_has_returns(scan: LaserScan2D) -> bool:
+    """True when the scan contains at least one finite in-range return."""
+    r = np.asarray(scan.ranges, dtype=float)
+    return bool(
+        np.any(np.isfinite(r) & (r >= scan.range_min) & (r <= scan.range_max))
+    )
+
+
+# MiR250 laser mounts (meters, radians) — keep in sync with viam-mir-base mir_rosbridge.py.
+_MIR250_FRONT_MOUNT = Pose2D(0.315 - 0.004485, 0.205, 0.25 * math.pi)
+_MIR250_BACK_MOUNT = Pose2D(-0.315 - 0.004485, -0.205, -0.75 * math.pi)
+
+
+def _mir_mount_for_scan(frame_id: str, topic: str = "") -> Pose2D:
+    normalized = (frame_id or "").strip().lower()
+    if "front" in normalized and "laser" in normalized:
+        return _MIR250_FRONT_MOUNT
+    if "back" in normalized and "laser" in normalized:
+        return _MIR250_BACK_MOUNT
+    key = (topic or "").rsplit("/", 1)[-1].lower()
+    if key in {"f_raw_scan", "f_scan"}:
+        return _MIR250_FRONT_MOUNT
+    if key in {"b_raw_scan", "b_scan"}:
+        return _MIR250_BACK_MOUNT
+    return Pose2D(0.0, 0.0, 0.0)
+
+
+def _transform_xy(points_xy: np.ndarray, mount: Pose2D) -> np.ndarray:
+    if points_xy.size == 0:
+        return np.empty((0, 2))
+    c, s = math.cos(mount.theta), math.sin(mount.theta)
+    xs = points_xy[:, 0]
+    ys = points_xy[:, 1]
+    out_x = mount.x + c * xs - s * ys
+    out_y = mount.y + s * xs + c * ys
+    return np.stack([out_x, out_y], axis=1)
+
+
+def _laser_scan_dict_to_points(
+    scan: Mapping,
+    *,
+    topic: str = "",
+) -> LidarPoints:
+    """Convert a MiR/rosbridge LaserScan dict into sensor- and base-frame points."""
+    ranges = scan.get("ranges") or []
+    if not ranges:
+        return LidarPoints(sensor=np.empty((0, 3)), base_link=np.empty((0, 3)))
+
+    angle_min = float(scan.get("angle_min", 0.0))
+    angle_increment = float(scan.get("angle_increment", 0.0))
+    range_min = float(scan.get("range_min", 0.05))
+    range_max = float(scan.get("range_max", 25.0))
+    header = scan.get("header") or {}
+    frame_id = str(header.get("frame_id") or "")
+    mount = _mir_mount_for_scan(frame_id, topic)
+
+    sensor_xy: List[Tuple[float, float]] = []
+    for index, raw_range in enumerate(ranges):
+        if raw_range is None:
+            continue
+        try:
+            distance_m = float(raw_range)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(distance_m) or distance_m <= 0.0:
+            continue
+        if distance_m < range_min or distance_m > range_max:
+            continue
+        angle = angle_min + index * angle_increment
+        sensor_xy.append(
+            (distance_m * math.cos(angle), distance_m * math.sin(angle))
+        )
+
+    if not sensor_xy:
+        return LidarPoints(sensor=np.empty((0, 3)), base_link=np.empty((0, 3)))
+
+    sensor_arr = np.asarray(sensor_xy, dtype=float)
+    sensor = np.column_stack([sensor_arr[:, 0], sensor_arr[:, 1], np.zeros(len(sensor_arr))])
+    base_xy = _transform_xy(sensor_arr, mount)
+    base_link = np.column_stack([base_xy[:, 0], base_xy[:, 1], np.zeros(len(base_xy))])
+    return LidarPoints(sensor=sensor, base_link=base_link)
+
+
+def mir_laser_scan_message_to_scan2d(scan: Mapping) -> LaserScan2D:
+    """Convert a rosbridge LaserScan dict to ``LaserScan2D`` (keeps native angles)."""
+    raw_ranges = scan.get("ranges") or []
+    n = len(raw_ranges)
+    ranges = np.full(n, np.inf, dtype=float)
+    range_min = float(scan.get("range_min", 0.05))
+    range_max = float(scan.get("range_max", 25.0))
+    for index, raw_range in enumerate(raw_ranges):
+        if raw_range is None:
+            continue
+        try:
+            distance_m = float(raw_range)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(distance_m) or distance_m <= 0.0:
+            continue
+        if distance_m < range_min or distance_m > range_max:
+            continue
+        ranges[index] = distance_m
+    return LaserScan2D(
+        ranges=ranges,
+        angle_min=float(scan.get("angle_min", -math.pi)),
+        angle_increment=float(scan.get("angle_increment", 2 * math.pi / max(n, 1))),
+        range_min=range_min,
+        range_max=range_max,
+    )
+
+
+def ndarray_as_base_link_points(points: np.ndarray) -> LidarPoints:
+    """Wrap a base_link-frame point cloud for the bridge (PCD fallback path)."""
+    points = np.asarray(points, dtype=float)
+    if points.size == 0:
+        empty = np.empty((0, 3))
+        return LidarPoints(sensor=empty, base_link=empty)
+    if points.shape[1] == 2:
+        points = np.column_stack([points[:, 0], points[:, 1], np.zeros(len(points))])
+    return LidarPoints(sensor=points, base_link=points)
+
+
+def points_from_mir_laser_scan_payload(payload: Mapping) -> LidarPoints:
+    """Parse ``viam-labs:mir-base:lidar`` ``get_laser_scan`` output into points."""
+    sensor_chunks: List[np.ndarray] = []
+    base_chunks: List[np.ndarray] = []
+    sensor_scan: Optional[LaserScan2D] = None
+    for entry in payload.get("scans") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        msg = entry.get("message")
+        if not isinstance(msg, Mapping):
+            msg = entry
+        topic = str(entry.get("topic") or "")
+        if sensor_scan is None:
+            candidate = mir_laser_scan_message_to_scan2d(msg)
+            if scan_has_returns(candidate):
+                sensor_scan = candidate
+        chunk = _laser_scan_dict_to_points(msg, topic=topic)
+        if chunk.sensor.size:
+            sensor_chunks.append(chunk.sensor)
+        if chunk.base_link.size:
+            base_chunks.append(chunk.base_link)
+    sensor = np.vstack(sensor_chunks) if sensor_chunks else np.empty((0, 3))
+    base_link = np.vstack(base_chunks) if base_chunks else np.empty((0, 3))
+    return LidarPoints(sensor=sensor, base_link=base_link, sensor_scan=sensor_scan)
 
 
 def parse_pcd(raw: bytes) -> np.ndarray:

@@ -64,10 +64,12 @@ class RosSlam(SLAM):
         return svc
 
     @classmethod
-    def validate_config(cls, config: ServiceConfig) -> Sequence[str]:
+    def validate_config(
+        cls, config: ServiceConfig
+    ) -> tuple[Sequence[str], Sequence[str]]:
         attrs = struct_to_dict(config.attributes)
         cfg = SlamConfig.from_dict(attrs)
-        return cfg.required_dependencies()
+        return cfg.required_dependencies(), []
 
     def reconfigure(
         self, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -112,10 +114,33 @@ class RosSlam(SLAM):
 
     # -- ROS IO --------------------------------------------------------------
     def _build_io(self) -> IOProvider:
-        async def read_lidar_points(name: str):
-            data = await self._cameras[name].get_point_cloud()
+        async def read_lidar_points(name: str) -> conv.LidarPoints:
+            assert self._cfg is not None
+            timeout = max(float(self._cfg.sensor_read_timeout_s), 1.0)
+            cam = self._cameras[name]
+            # MiR lidar: get_laser_scan is more reliable than the PCD round-trip.
+            try:
+                raw_payload = await cam.do_command({"command": "get_laser_scan"})
+                payload = (
+                    struct_to_dict(raw_payload)
+                    if not isinstance(raw_payload, dict)
+                    else raw_payload
+                )
+                mir_pts = conv.points_from_mir_laser_scan_payload(payload)
+                if mir_pts.base_link.size > 0 or (
+                    mir_pts.sensor_scan is not None
+                    and conv.scan_has_returns(mir_pts.sensor_scan)
+                ):
+                    return mir_pts
+                LOGGER.warning(
+                    "lidar %s get_laser_scan returned no valid ranges", name
+                )
+            except Exception as exc:
+                LOGGER.warning("lidar %s get_laser_scan failed: %s", name, exc)
+            data = await cam.get_point_cloud(timeout=timeout)
             raw = data[0] if isinstance(data, tuple) else data
-            return conv.parse_pcd(raw)
+            pts = conv.parse_pcd(raw)
+            return conv.ndarray_as_base_link_points(pts)
 
         async def read_odometry() -> conv.OdomReading:
             if self._movement_sensor is None:

@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
+import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -52,6 +55,9 @@ class RosManager:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._slam_proc: Optional[subprocess.Popen] = None
         self._nav2_procs: List[subprocess.Popen] = []
+        self._nav_cfg: Optional[NavConfig] = None
+        self._nav_params_path: Optional[Path] = None
+        self._nav_action_ok_until = 0.0
         self._started = False
         self._scratch = Path(slam_cfg.maps_dir).expanduser() / ".runtime"
         self._scratch.mkdir(parents=True, exist_ok=True)
@@ -107,17 +113,106 @@ class RosManager:
         if self._logger:
             self._logger.info(msg)
 
-    def _popen(self, args: List[str]) -> subprocess.Popen:
-        self._log("launch: " + " ".join(args))
-        return subprocess.Popen(args, env=os.environ.copy())
+    def _ros_env(self) -> dict:
+        env = os.environ.copy()
+        env.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
+        env.setdefault("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")
+        env.setdefault("RCUTILS_LOGGING_USE_STDOUT", "1")
+        distro = env.get("ROS_DISTRO", "jazzy")
+        ros_bin = f"/opt/ros/{distro}/bin"
+        path = env.get("PATH", "")
+        if ros_bin not in path.split(os.pathsep):
+            env["PATH"] = ros_bin + os.pathsep + path
+        return env
 
-    def _run_ros(self, args: List[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(
+    def _ros2_cmd(self) -> str:
+        distro = os.environ.get("ROS_DISTRO", "jazzy")
+        return shutil.which("ros2") or f"/opt/ros/{distro}/bin/ros2"
+
+    def _ros_setup(self) -> str:
+        return os.environ.get("ROS_ENV", f"/opt/ros/{os.environ.get('ROS_DISTRO', 'jazzy')}/setup.bash")
+
+    def _popen(self, args: List[str]) -> subprocess.Popen:
+        ros2 = self._ros2_cmd()
+        if args and args[0] == "ros2":
+            args = [ros2, *args[1:]]
+        self._log("launch: " + " ".join(args))
+        log_path = self._scratch / "nav2_launch.log"
+        log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - long-lived child log
+        log_fh.write(f"\n--- launch {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        log_fh.write(" ".join(args) + "\n")
+        log_fh.flush()
+        return subprocess.Popen(
             args,
-            env=os.environ.copy(),
-            capture_output=True,
-            text=True,
+            env=self._ros_env(),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
+
+    def _run_ros(
+        self, args: List[str], *, timeout: float = 5.0
+    ) -> subprocess.CompletedProcess:
+        ros2 = self._ros2_cmd()
+        if args and args[0] == "ros2":
+            cmd = [ros2, *args[1:]]
+        else:
+            cmd = list(args)
+        setup = self._ros_setup()
+        shell_cmd = f"source {shlex.quote(setup)} && " + " ".join(shlex.quote(a) for a in cmd)
+        try:
+            return subprocess.run(
+                ["bash", "-lc", shell_cmd],
+                env=self._ros_env(),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            self._log(f"ros2 command timed out after {timeout:.0f}s: {' '.join(cmd)}")
+            return subprocess.CompletedProcess(
+                cmd,
+                returncode=-1,
+                stdout=(exc.stdout or "") if isinstance(exc.stdout, str) else "",
+                stderr=(exc.stderr or "timeout") if isinstance(exc.stderr, str) else "timeout",
+            )
+
+    def _nav_action_visible(self) -> bool:
+        proc = self._run_ros(["ros2", "action", "list"])
+        return proc.returncode == 0 and "navigate_to_pose" in (proc.stdout or "")
+
+    def nav_action_ready(self) -> bool:
+        now = time.monotonic()
+        if now < self._nav_action_ok_until and self.nav2_running():
+            return True
+        if not self.nav2_running():
+            self._nav_action_ok_until = 0.0
+        ok = self._nav_action_visible()
+        if ok:
+            self._nav_action_ok_until = now + 30.0
+        return ok
+
+    def wait_for_nav_action(self, timeout: float = 90.0) -> bool:
+        return self._wait_for_nav_action(timeout=timeout)
+
+    def _wait_for_nav_action(self, timeout: float = 90.0) -> bool:
+        """Wait until Nav2 exposes ``/navigate_to_pose``."""
+        deadline = time.monotonic() + timeout
+        last_detail = ""
+        while time.monotonic() < deadline:
+            if self._nav2_procs and not any(p.poll() is None for p in self._nav2_procs):
+                self._log("Nav2 launch process exited before action server appeared")
+                return False
+            action_proc = self._run_ros(["ros2", "action", "list"])
+            if action_proc.returncode == 0 and "navigate_to_pose" in (action_proc.stdout or ""):
+                return True
+            last_detail = (
+                f"ros2={self._ros2_cmd()} rc={action_proc.returncode} "
+                f"stdout={action_proc.stdout!r} stderr={action_proc.stderr!r}"
+            )
+            time.sleep(0.5)
+        self._log(f"timed out waiting for Nav2 action server ({timeout:.0f}s): {last_detail}")
+        return False
 
     def _wait_for_ros_node(self, node_name: str, timeout: float = 30.0) -> bool:
         """Wait until ``node_name`` appears in ``ros2 node list``."""
@@ -266,10 +361,14 @@ class RosManager:
             }
         }
         rp = params["slam_toolbox"]["ros__parameters"]
+        rp.setdefault("transform_timeout", 2.0)
+        rp.setdefault("tf_buffer_duration", 60.0)
+        rp.setdefault("transform_publish_period", 0.02)
         if map_stem and Path(str(map_stem) + ".posegraph").exists():
             rp["map_file_name"] = str(map_stem)
-            # Start localizing/continuing from the saved graph's stored pose.
-            rp["map_start_at_dock"] = True
+            # Keep localization startup robust for saved posegraphs. Allow user
+            # overrides in slam_params to disable this if needed.
+            rp.setdefault("map_start_at_dock", True)
         return params
 
     def save_map(self, map_stem: Path) -> None:
@@ -321,13 +420,16 @@ class RosManager:
 
     # -- Nav2 ----------------------------------------------------------------
     def start_nav2(self, nav_cfg: NavConfig, params_path: Path) -> None:
+        self._nav_cfg = nav_cfg
+        self._nav_params_path = params_path
         self.stop_nav2()
         # Core Nav2 (planner, controller, costmaps, BT, behaviors). slam_toolbox
         # supplies /map and map->odom, so no map_server/AMCL here.
         self._nav2_procs.append(
             self._popen(
                 ["ros2", "launch", "nav2_bringup", "navigation_launch.py",
-                 f"params_file:={params_path}", "use_sim_time:=false"]
+                 f"params_file:={params_path}", "use_sim_time:=false",
+                 "autostart:=false", "use_collision_monitor:=False"]
             )
         )
         # Costmap filter info servers for keepout + speed zones. The mask
@@ -368,18 +470,129 @@ class RosManager:
                  "--params-file", str(lm_params)]
             )
         )
+        nav_lm_params = self._scratch / "nav_lifecycle.yaml"
+        nav_lm_params.write_text(
+            _yaml_dump(
+                {
+                    "navigation_lifecycle_manager_override": {
+                        "ros__parameters": {
+                            "autostart": True,
+                            "node_names": [
+                                "controller_server",
+                                "smoother_server",
+                                "planner_server",
+                                "behavior_server",
+                                "bt_navigator",
+                                "waypoint_follower",
+                                "velocity_smoother",
+                                "route_server",
+                                "docking_server",
+                            ],
+                        }
+                    }
+                }
+            )
+        )
+        self._nav2_procs.append(
+            self._popen(
+                [
+                    "ros2",
+                    "run",
+                    "nav2_lifecycle_manager",
+                    "lifecycle_manager",
+                    "--ros-args",
+                    "-r",
+                    "__node:=navigation_lifecycle_manager_override",
+                    "--params-file",
+                    str(nav_lm_params),
+                ]
+            )
+        )
+        if self._wait_for_nav_action():
+            if self._node is not None:
+                self._node.reset_nav_action_client()
+        else:
+            self._log("Nav2 started but /navigate_to_pose is not ready yet")
 
     def stop_nav2(self) -> None:
+        self._nav_action_ok_until = 0.0
         for proc in self._nav2_procs:
             self._terminate(proc)
         self._nav2_procs = []
+        # Orphaned ros2 launch / Nav2 nodes survive a parent terminate after crashes.
+        subprocess.run(
+            ["pkill", "-f", "nav2_bringup/navigation_launch.py"],
+            env=self._ros_env(),
+            check=False,
+        )
+        time.sleep(0.5)
 
     def nav2_running(self) -> bool:
         return any(p.poll() is None for p in self._nav2_procs)
 
+    def nav2_diagnostics(self) -> Dict:
+        action_proc = self._run_ros(["ros2", "action", "list"])
+        node_proc = self._run_ros(["ros2", "node", "list"])
+        lifecycle_proc = self._run_ros(["ros2", "lifecycle", "get", "/bt_navigator"])
+        controller_proc = self._run_ros(["ros2", "lifecycle", "get", "/controller_server"])
+        log_path = self._scratch / "nav2_launch.log"
+        log_tail = ""
+        if log_path.exists():
+            try:
+                log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+            except OSError:
+                log_tail = ""
+        return {
+            "nav2_processes_running": self.nav2_running(),
+            "nav_action_ready": self.nav_action_ready(),
+            "actions": (action_proc.stdout or "").strip(),
+            "actions_rc": action_proc.returncode,
+            "actions_stderr": (action_proc.stderr or "").strip(),
+            "nodes": (node_proc.stdout or "").strip(),
+            "controller_server_lifecycle": (
+                controller_proc.stdout or controller_proc.stderr or ""
+            ).strip(),
+            "bt_navigator_lifecycle": (lifecycle_proc.stdout or lifecycle_proc.stderr or "").strip(),
+            "nav2_log_tail": log_tail,
+            "nav2_log_path": str(log_path),
+        }
+
+    def ensure_nav2(self, nav_cfg: NavConfig, params_path: Path) -> None:
+        """Start or restart Nav2 until ``/navigate_to_pose`` is available."""
+        if self.nav_action_ready():
+            return
+        if self.nav2_running():
+            self._log("Nav2 processes running but action server missing; waiting briefly")
+            if self.wait_for_nav_action(timeout=15.0):
+                return
+            self._log("Nav2 action server still missing; restarting Nav2")
+        else:
+            self._log("Nav2 action server not ready; launching Nav2")
+        self.start_nav2(nav_cfg, params_path)
+        if not self.wait_for_nav_action(timeout=90.0):
+            detail = self.nav2_diagnostics()
+            self._log(f"Nav2 failed to start: {detail}")
+            raise RuntimeError(
+                "Nav2 failed to start (no /navigate_to_pose after 90s). "
+                f"See {detail.get('nav2_log_path')} and viam-server logs."
+            )
+
     # -- navigation delegation ----------------------------------------------
     def navigate(self, x: float, y: float, theta: float) -> None:
-        self._require_node().send_nav_goal(x, y, theta)
+        node = self._require_node()
+        try:
+            node.send_nav_goal(x, y, theta)
+            return
+        except RuntimeError as exc:
+            if "Nav2 action server not available" not in str(exc):
+                raise
+        if self._nav_cfg is None or self._nav_params_path is None:
+            raise RuntimeError(
+                "Nav2 action server not available and Nav2 has no saved startup config"
+            )
+        self._log("Nav2 action unavailable during navigate; ensuring Nav2 and retrying")
+        self.ensure_nav2(self._nav_cfg, self._nav_params_path)
+        node.send_nav_goal(x, y, theta)
 
     def cancel(self) -> None:
         if self._node is not None:
@@ -404,6 +617,7 @@ class RosManager:
         node.publish_mask("speed", speed_mask, resolution, origin_x, origin_y)
 
     def set_initial_pose(self, pose: conv.Pose2D) -> None:
+        self._clear_localization_buffer()
         self._require_node().set_initial_pose(pose)
 
     def set_nav_config(self, nav_cfg: NavConfig) -> None:
@@ -419,9 +633,30 @@ class RosManager:
     def _terminate(proc: Optional[subprocess.Popen]) -> None:
         if proc is None or proc.poll() is not None:
             return
-        proc.terminate()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.terminate()
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
             time.sleep(0.2)
+
+    def _clear_localization_buffer(self) -> None:
+        """Best-effort clear of stale localization history before reseeding."""
+        self._run_ros(
+            [
+                "ros2",
+                "service",
+                "call",
+                "/slam_toolbox/clear_localization_buffer",
+                "std_srvs/srv/Empty",
+                "{}",
+            ],
+            timeout=2.0,
+        )
+

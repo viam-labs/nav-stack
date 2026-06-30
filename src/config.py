@@ -138,14 +138,16 @@ class Nav2Config:
     controller_frequency: float = 20.0  # Hz
 
     def to_override_dict(self) -> dict:
-        """Flat leaf keys applied to the generated Nav2 params template."""
+        """Flat leaf keys applied to the generated Nav2 params template.
+
+        Costmap width/height are applied separately as integers (Jazzy rejects
+        doubles for those parameters).
+        """
         return {
             "xy_goal_tolerance": self.xy_goal_tolerance,
             "yaw_goal_tolerance": self.yaw_goal_tolerance,
             "tolerance": self.planner_tolerance,
             "cost_scaling_factor": self.cost_scaling_factor,
-            "width": self.local_costmap_width,
-            "height": self.local_costmap_height,
             "resolution": self.costmap_resolution,
             "controller_frequency": self.controller_frequency,
         }
@@ -184,6 +186,7 @@ class SlamConfig:
     frames: Frames = field(default_factory=Frames)
     scan_rate_hz: float = 10.0
     odom_rate_hz: float = 20.0
+    sensor_read_timeout_s: float = 10.0
     scan_bins: int = 720
     ros_env: Optional[str] = None
     # How ROS /cmd_vel (vx forward, vy lateral) maps to the Viam base SetVelocity axes.
@@ -220,6 +223,7 @@ class SlamConfig:
             ),
             scan_rate_hz=float(d.get("scan_rate_hz", 10.0)),
             odom_rate_hz=float(d.get("odom_rate_hz", 20.0)),
+            sensor_read_timeout_s=float(d.get("sensor_read_timeout_s", 10.0)),
             scan_bins=int(d.get("scan_bins", 720)),
             ros_env=d.get("ros_env"),
             base_velocity_convention=convention,
@@ -246,7 +250,7 @@ class NavConfig:
     acc_lim_x: float = 1.0
     acc_lim_theta: float = 2.0
     inflation_radius: float = 0.45
-    cmd_vel_timeout: float = 0.5  # seconds (watchdog)
+    cmd_vel_timeout: float = 2.0  # seconds (watchdog)
     nav2: Nav2Config = field(default_factory=Nav2Config)
     nav2_params: Mapping = field(default_factory=dict)
     nav2_params_path: Optional[str] = None
@@ -268,7 +272,7 @@ class NavConfig:
             acc_lim_x=float(d.get("acc_lim_x", 1.0)),
             acc_lim_theta=float(d.get("acc_lim_theta", 2.0)),
             inflation_radius=float(d.get("inflation_radius", 0.45)),
-            cmd_vel_timeout=float(d.get("cmd_vel_timeout", 0.5)),
+            cmd_vel_timeout=float(d.get("cmd_vel_timeout", 2.0)),
             nav2=Nav2Config.from_dict(d.get("nav2", {}) or {}),
             nav2_params=d.get("nav2_params", {}) or {},
             nav2_params_path=d.get("nav2_params_path"),

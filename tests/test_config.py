@@ -107,7 +107,28 @@ def test_nav2_config_from_attributes():
     )
     assert cfg.nav2.xy_goal_tolerance == 0.4
     assert cfg.nav2.local_costmap_width == 6.0
-    assert cfg.nav2.to_override_dict()["width"] == 6.0
+    assert "width" not in cfg.nav2.to_override_dict()
+
+
+def test_local_costmap_width_height_are_integers():
+    from src.models.navigation import _apply_local_costmap_size
+
+    params = {
+        "local_costmap": {
+            "local_costmap": {
+                "ros__parameters": {"width": 4, "height": 4},
+            }
+        }
+    }
+    nav2 = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "nav2": {"local_costmap_width": 6.0}}
+    ).nav2
+    _apply_local_costmap_size(params, nav2)
+    lc = params["local_costmap"]["local_costmap"]["ros__parameters"]
+    assert lc["width"] == 6
+    assert lc["height"] == 4
+    assert isinstance(lc["width"], int)
+    assert isinstance(lc["height"], int)
 
 
 def test_base_velocity_convention_ros_default():
@@ -132,4 +153,14 @@ def test_base_velocity_convention_invalid():
         SlamConfig.from_dict(
             {"base": "b", "lidar": "f", "base_velocity_convention": "sideways"}
         )
+
+
+def test_nav2_template_lifecycle_manager_excludes_collision_monitor():
+    yaml = pytest.importorskip("yaml")
+    from pathlib import Path
+
+    params_file = Path(__file__).resolve().parents[1] / "params" / "nav2_params.yaml"
+    data = yaml.safe_load(params_file.read_text(encoding="utf-8"))
+    nodes = data["lifecycle_manager_navigation"]["ros__parameters"]["node_names"]
+    assert "collision_monitor" not in nodes
 

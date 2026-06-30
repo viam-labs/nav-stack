@@ -19,7 +19,9 @@ source_ros_setup() {
 # Load ROS paths written by setup.sh when the module env block omits ROS_ENV.
 if [ -f ".ros_env" ]; then
     # shellcheck disable=SC1091
+    set -a
     source ".ros_env"
+    set +a
 fi
 
 # Source ROS2 if provided. ROS_ENV is the path to the ROS2 setup.bash, optionally
@@ -41,6 +43,14 @@ if [ -n "${OVERLAYS:-}" ]; then
         fi
     done
 fi
+
+# Keep DDS settings consistent for the in-process bridge and Nav2 child processes.
+# viam-server often runs as root; LOCALHOST discovery avoids root/non-root SHM splits.
+export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+export ROS_AUTOMATIC_DISCOVERY_RANGE="${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}"
+# ROS logs default to stderr; route to stdout so WARN lines do not appear as
+# modmanager StdErr "error" stream entries.
+export RCUTILS_LOGGING_USE_STDOUT="${RCUTILS_LOGGING_USE_STDOUT:-1}"
 
 # Work around shared-memory transport issues when viam-server runs as root by
 # defaulting to a UDP-only FastDDS profile if the user supplied one.

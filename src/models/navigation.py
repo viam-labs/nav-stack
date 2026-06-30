@@ -11,6 +11,7 @@ Physical obstacle avoidance is automatic via Nav2's costmaps (live ``/scan`` dat
 """
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import ClassVar, Mapping, Optional, Sequence, cast
 
@@ -26,7 +27,7 @@ from viam.resource.types import Model, ModelFamily
 from viam.services.generic import Generic
 from viam.utils import ValueTypes, struct_to_dict
 
-from ..config import OMNI, NavConfig
+from ..config import OMNI, Nav2Config, NavConfig
 from ..nav import zones as zones_mod
 from ..nav.locations import LocationStore
 from ..nav.maps import MapHandle
@@ -56,9 +57,11 @@ class RosNavigation(Generic):
         return svc
 
     @classmethod
-    def validate_config(cls, config: ServiceConfig) -> Sequence[str]:
+    def validate_config(
+        cls, config: ServiceConfig
+    ) -> tuple[Sequence[str], Sequence[str]]:
         cfg = NavConfig.from_dict(struct_to_dict(config.attributes))
-        return cfg.required_dependencies()
+        return cfg.required_dependencies(), []
 
     def reconfigure(
         self, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -117,6 +120,7 @@ class RosNavigation(Generic):
         _apply_overrides(params, overrides)
         if cfg.nav2_params:
             _deep_merge(params, dict(cfg.nav2_params))
+        _apply_local_costmap_size(params, cfg.nav2)
 
         runtime = get_slam(cfg.slam_service)
         _set_obstacle_sources(params, len(runtime.slam_cfg.lidars))
@@ -236,7 +240,15 @@ class RosNavigation(Generic):
             mgr.cancel()
             return {"status": "canceled"}
         if cmd == "get_status":
-            return mgr.nav_status()
+            status = mgr.nav_status()
+            status.update(mgr.nav2_diagnostics())
+            return status
+        if cmd == "start_nav2":
+            cfg = self._require_cfg()
+            runtime.manager.set_nav_config(cfg)
+            params_path = self._write_nav2_params(cfg)
+            await asyncio.to_thread(runtime.manager.ensure_nav2, cfg, params_path)
+            return {"status": "nav2_started", **runtime.manager.nav2_diagnostics()}
 
         raise ValueError(f"unknown command: {cmd!r}")
 
@@ -256,6 +268,15 @@ class RosNavigation(Generic):
         if cur is None:
             raise RuntimeError("current pose unavailable; provide an explicit pose")
         return store.add(str(command["name"]), cur.x, cur.y, cur.theta)
+
+def _apply_local_costmap_size(params: dict, nav2_cfg: Nav2Config) -> None:
+    """Set rolling local costmap dimensions (Jazzy requires integer width/height)."""
+    try:
+        lc = params["local_costmap"]["local_costmap"]["ros__parameters"]
+    except (KeyError, TypeError):
+        return
+    lc["width"] = int(nav2_cfg.local_costmap_width)
+    lc["height"] = int(nav2_cfg.local_costmap_height)
 
 
 def _set_obstacle_sources(params: Mapping, n_lidars: int) -> None:

@@ -182,3 +182,44 @@ def test_parse_odom_from_readings_ros_odom_message():
     assert reading.heading_rad is None
     assert reading.vx == 0.3
     assert math.isclose(reading.vtheta, 0.2)
+
+
+def test_mir_laser_scan_payload_skips_zero_and_out_of_range():
+    payload = {
+        "scans": [
+            {
+                "topic": "/f_raw_scan",
+                "frame_id": "front_laser_link",
+                "message": {
+                    "header": {"frame_id": "front_laser_link"},
+                    "angle_min": 0.0,
+                    "angle_increment": math.pi / 2,
+                    "range_min": 0.1,
+                    "range_max": 40.0,
+                    "ranges": [0, 0, 2.0, 41.0],
+                },
+            }
+        ]
+    }
+    pts = conv.points_from_mir_laser_scan_payload(payload)
+    assert pts.sensor.shape[0] == 1
+    assert pts.base_link.shape[0] == 1
+    assert pts.sensor_scan is not None
+    assert conv.scan_has_returns(pts.sensor_scan)
+    scan = conv.pointcloud_to_scan(pts.base_link, num_bins=720)
+    assert conv.scan_has_returns(scan)
+
+
+def test_mir_native_scan_preserves_negative_angle_increment():
+    msg = {
+        "header": {"frame_id": "front_laser_link"},
+        "angle_min": 2.4,
+        "angle_max": -2.4,
+        "angle_increment": -0.01,
+        "range_min": 0.1,
+        "range_max": 40.0,
+        "ranges": [0, 0, 6.0, 0],
+    }
+    scan = conv.mir_laser_scan_message_to_scan2d(msg)
+    assert conv.scan_has_returns(scan)
+    assert math.isclose(float(scan.ranges[2]), 6.0)

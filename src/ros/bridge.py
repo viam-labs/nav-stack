@@ -19,6 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
+import shutil
+import subprocess
+import threading
 import time
 from typing import Dict, List, Optional
 
@@ -53,6 +57,9 @@ _LATCHED_QOS = QoSProfile(
     reliability=QoSReliabilityPolicy.RELIABLE,
     durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
 )
+
+_NAV_ACTION_NAME = "/navigate_to_pose"
+_NAV_ACTION_CLIENT_NAME = "navigate_to_pose"
 
 
 def _quat_msg(yaw: float) -> Quaternion:
@@ -92,12 +99,15 @@ class BridgeNode(Node):
         self._frames = slam_cfg.frames
         self._nav_active = False
         self._last_cmd_time = 0.0
+        self._last_odom_stamp = None
         self._cmd_timeout = nav_cfg.cmd_vel_timeout if nav_cfg else 0.5
 
         # Odom pose: prefer the movement sensor's absolute /odom pose when available.
         self._odom = conv.Pose2D(0.0, 0.0, 0.0)
+        self._last_twist = (0.0, 0.0, 0.0)
         self._last_odom_time = time.monotonic()
         self._odom_integrate_warned = False
+        self._empty_scan_warned = False
 
         # Publishers -------------------------------------------------------
         self._scan_pubs: List = []
@@ -152,6 +162,15 @@ class BridgeNode(Node):
         self.create_subscription(
             Twist, "cmd_vel", self._on_cmd_vel, 10, **sub_kwargs
         )
+        # Nav2 topic chain differs depending on collision monitor / velocity
+        # smoother wiring. Accept all common variants and apply only while a nav
+        # goal is active.
+        self.create_subscription(
+            Twist, "cmd_vel_smoothed", self._on_cmd_vel, 10, **sub_kwargs
+        )
+        self.create_subscription(
+            Twist, "cmd_vel_nav", self._on_cmd_vel, 10, **sub_kwargs
+        )
         self._map_sub = self.create_subscription(
             OccupancyGrid, "map", self._on_map, _LATCHED_QOS, **sub_kwargs
         )
@@ -185,19 +204,50 @@ class BridgeNode(Node):
         )
         self.create_timer(0.1, self._on_watchdog, **misc_timer_kwargs)
 
-        # Action client ----------------------------------------------------
+        # Action client (created lazily once Nav2 is running) ----------------
         self._nav_action: Optional[ActionClient] = None
         self._goal_handle = None
+        self._nav_cli_proc: Optional[subprocess.Popen] = None
+        self._nav_goal_lock = threading.Lock()
+        self._pending_nav_goal: Optional[tuple] = None
+        self._executor_lock = threading.Lock()
+        self._executor_queue: List = []
         self._last_feedback: Dict = {}
         self._last_result_status: Optional[str] = None
-        if NavigateToPose is not None:
-            self._nav_action = ActionClient(self, NavigateToPose, "navigate_to_pose")
 
     # -- helpers -------------------------------------------------------------
     def _run(self, coro, timeout: float = 2.0):
         """Run an async Viam call on the module loop from this ROS thread."""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
+
+    def _submit_on_executor(self, fn, timeout: float = 10.0):
+        """Run ``fn`` on the rclpy executor thread (safe for publishers/actions)."""
+        done = threading.Event()
+        outcome: Dict[str, object] = {}
+
+        def wrapped() -> None:
+            try:
+                outcome["result"] = fn()
+            except Exception as exc:  # noqa: BLE001 - propagate to caller thread
+                outcome["exc"] = exc
+            finally:
+                done.set()
+
+        with self._executor_lock:
+            self._executor_queue.append(wrapped)
+        if not done.wait(timeout=timeout):
+            raise RuntimeError("ROS executor dispatch timed out")
+        if "exc" in outcome:
+            raise outcome["exc"]  # type: ignore[misc]
+        return outcome.get("result")
+
+    def _flush_executor_queue(self) -> None:
+        with self._executor_lock:
+            queue = self._executor_queue[:]
+            self._executor_queue.clear()
+        for fn in queue:
+            fn()
 
     def _bounded_odom_dt(self, dt: float) -> float:
         """Bound odom integration dt to avoid large stale-velocity jumps."""
@@ -237,40 +287,82 @@ class BridgeNode(Node):
     # -- scans ---------------------------------------------------------------
     def _on_scan_timer(self) -> None:
         merged_points = []
-        stamp = self.get_clock().now().to_msg()
+        per_lidar_scans = []
+        lidar_timeout = max(float(self._slam_cfg.sensor_read_timeout_s), 1.0)
         for i, lidar in enumerate(self._slam_cfg.lidars):
             try:
-                points = self._run(self._io.read_lidar_points(lidar.name))
+                lidar_data = self._run(
+                    self._io.read_lidar_points(lidar.name), timeout=lidar_timeout
+                )
             except Exception as exc:  # noqa: BLE001 - keep bridge alive on sensor hiccups
                 self.get_logger().warn(f"lidar {lidar.name} read failed: {exc}")
                 continue
-            if points is None:
-                continue
-            points = np.asarray(points, dtype=float)
 
-            # Per-lidar scan in its own frame for Nav2's obstacle layer.
-            scan = conv.pointcloud_to_scan(
-                points,
-                z_min=lidar.z_min,
-                z_max=lidar.z_max,
-                num_bins=self._slam_cfg.scan_bins,
-                range_min=lidar.min_range,
-                range_max=lidar.max_range,
-            )
+            sensor_scan = None
+            base_pts_arr = np.empty((0, 3))
+            if isinstance(lidar_data, conv.LidarPoints):
+                sensor_scan = lidar_data.sensor_scan
+                base_pts_arr = np.asarray(lidar_data.base_link, dtype=float)
+            else:
+                base_pts_arr = np.asarray(lidar_data, dtype=float)
+
+            if sensor_scan is None or not conv.scan_has_returns(sensor_scan):
+                sensor_pts = (
+                    np.asarray(lidar_data.sensor, dtype=float)
+                    if isinstance(lidar_data, conv.LidarPoints)
+                    else base_pts_arr
+                )
+                if sensor_pts.size == 0 and base_pts_arr.size == 0:
+                    continue
+                sensor_scan = conv.pointcloud_to_scan(
+                    sensor_pts,
+                    z_min=lidar.z_min,
+                    z_max=lidar.z_max,
+                    num_bins=self._slam_cfg.scan_bins,
+                    range_min=lidar.min_range,
+                    range_max=lidar.max_range,
+                )
+                if not conv.scan_has_returns(sensor_scan):
+                    continue
+
+            per_lidar_scans.append((i, sensor_scan))
+
+            if base_pts_arr.size:
+                merged_points.append(base_pts_arr[:, :2])
+
+        if not per_lidar_scans:
+            if not self._empty_scan_warned:
+                self.get_logger().error(
+                    "no lidar data available; /scan not published — check MiR lidar "
+                    "rosbridge (scan_mode, mir_rosbridge_timeout_s) and "
+                    "slam sensor_read_timeout_s"
+                )
+                self._empty_scan_warned = True
+            return
+        self._empty_scan_warned = False
+
+        # Stamp at publish time and refresh odom TF to match so Nav2 accepts scans.
+        stamp = self.get_clock().now().to_msg()
+        self._publish_odom_snapshot(stamp, *self._last_twist)
+        for i, scan in per_lidar_scans:
             self._scan_pubs[i].publish(self._to_ros_scan(scan, f"laser_{i}", stamp))
 
-            # Accumulate base_link-frame points for the merged SLAM scan.
-            mount = conv.Pose2D(lidar.x, lidar.y, lidar.theta)
-            base_pts = conv.pointcloud_to_scan(
-                points, z_min=lidar.z_min, z_max=lidar.z_max, sensor_pose=mount,
-                num_bins=self._slam_cfg.scan_bins, range_min=lidar.min_range,
-                range_max=lidar.max_range,
-            ).to_points()
-            if base_pts.size:
-                merged_points.append(base_pts)
-
         stacked = np.vstack(merged_points) if merged_points else np.empty((0, 2))
-        merged = conv.points_to_scan(stacked, num_bins=self._slam_cfg.scan_bins)
+        ref = self._slam_cfg.lidars[0]
+        merged = conv.points_to_scan(
+            stacked,
+            num_bins=self._slam_cfg.scan_bins,
+            range_min=ref.min_range,
+            range_max=ref.max_range,
+        )
+        if not conv.scan_has_returns(merged):
+            if not self._empty_scan_warned:
+                self.get_logger().error(
+                    "lidar points received but /scan has no valid returns"
+                )
+                self._empty_scan_warned = True
+            return
+        self._empty_scan_warned = False
         self._merged_scan_pub.publish(
             self._to_ros_scan(merged, self._frames.base_link, stamp)
         )
@@ -337,6 +429,14 @@ class BridgeNode(Node):
 
         vx, vy, vtheta = sample.vx, sample.vy, sample.vtheta
         stamp = self.get_clock().now().to_msg()
+        self._publish_odom_snapshot(stamp, vx, vy, vtheta)
+
+    def _publish_odom_snapshot(
+        self, stamp, vx: float, vy: float, vtheta: float
+    ) -> None:
+        """Publish cached odom pose + TF at ``stamp`` (also used to sync with scans)."""
+        self._last_odom_stamp = stamp
+        self._last_twist = (vx, vy, vtheta)
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = self._frames.odom
@@ -372,6 +472,8 @@ class BridgeNode(Node):
             self.get_logger().warn(f"drive_base failed: {exc}")
 
     def _on_watchdog(self) -> None:
+        self._flush_executor_queue()
+        self._flush_pending_nav_goal()
         if not self._nav_active:
             return
         if time.time() - self._last_cmd_time > self._cmd_timeout:
@@ -389,7 +491,10 @@ class BridgeNode(Node):
 
     def set_nav_active(self, active: bool) -> None:
         self._nav_active = active
-        if not active:
+        if active:
+            # Avoid the watchdog calling stop_base before Nav2 publishes the first cmd_vel.
+            self._last_cmd_time = time.time()
+        else:
             try:
                 self._run(self._io.stop_base())
             except Exception:  # noqa: BLE001
@@ -421,11 +526,203 @@ class BridgeNode(Node):
             raise ValueError(f"unknown mask {which!r}")
 
     # -- navigation action ---------------------------------------------------
-    def send_nav_goal(self, x: float, y: float, theta: float) -> bool:
+    def reset_nav_action_client(self) -> None:
+        """Drop and recreate the action client (call after Nav2 starts)."""
+        if self._nav_action is not None:
+            try:
+                self._nav_action.destroy()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            self._nav_action = None
+
+    def _ensure_nav_action_client(self) -> None:
+        if NavigateToPose is None:
+            return
         if self._nav_action is None:
-            raise RuntimeError("Nav2 action 'navigate_to_pose' unavailable")
+            self._nav_action = ActionClient(self, NavigateToPose, _NAV_ACTION_CLIENT_NAME)
+
+    def send_nav_goal(self, x: float, y: float, theta: float) -> bool:
+        """Send a map-frame goal to Nav2."""
+        if NavigateToPose is None:
+            raise RuntimeError(f"Nav2 action {_NAV_ACTION_NAME!r} unavailable")
+        self._ensure_nav_action_client()
+        if self._nav_action is None:
+            raise RuntimeError(f"Nav2 action {_NAV_ACTION_NAME!r} unavailable")
         if not self._nav_action.wait_for_server(timeout_sec=5.0):
+            self._log_nav_action_diagnostics()
             raise RuntimeError("Nav2 action server not available")
+        self._cancel_inflight_nav()
+        return self._publish_nav_goal(x, y, theta)
+
+    def _cancel_inflight_nav(self) -> None:
+        if self._nav_cli_proc is not None and self._nav_cli_proc.poll() is None:
+            self._nav_cli_proc.terminate()
+            self._nav_cli_proc = None
+        if self._goal_handle is not None:
+            try:
+                self._goal_handle.cancel_goal_async()
+            except Exception:  # noqa: BLE001 - best-effort cancel before new goal
+                pass
+            self._goal_handle = None
+
+    def _flush_pending_nav_goal(self) -> None:
+        with self._nav_goal_lock:
+            pending = self._pending_nav_goal
+            if pending is None:
+                return
+            x, y, theta, done, outcome = pending
+            self._pending_nav_goal = None
+        try:
+            self._cancel_inflight_nav()
+            self._ensure_nav_action_client()
+            outcome["ok"] = self._publish_nav_goal(x, y, theta)
+        except Exception as exc:  # noqa: BLE001 - propagate to caller thread
+            outcome["exc"] = exc
+        finally:
+            done.set()
+
+    def _dispatch_rclpy_nav_goal(self, x: float, y: float, theta: float) -> bool:
+        # Force dispatch onto executor and wait briefly so we fail fast instead
+        # of reporting "navigating" for a goal that never left this process.
+        res = self._submit_on_executor(
+            lambda: self._publish_nav_goal(x, y, theta), timeout=3.0
+        )
+        return bool(res)
+
+    def _wait_for_rclpy_action_server(self) -> bool:
+        if self._nav_action is None:
+            return False
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if self._nav_action.server_is_ready():
+                return True
+            time.sleep(0.2)
+        return False
+
+    def _ros_env(self) -> dict:
+        env = os.environ.copy()
+        env.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
+        env.setdefault("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")
+        distro = env.get("ROS_DISTRO", "jazzy")
+        ros_bin = f"/opt/ros/{distro}/bin"
+        path = env.get("PATH", "")
+        if ros_bin not in path.split(os.pathsep):
+            env["PATH"] = ros_bin + os.pathsep + path
+        return env
+
+    def _ros2_cmd(self) -> str:
+        distro = os.environ.get("ROS_DISTRO", "jazzy")
+        return shutil.which("ros2") or f"/opt/ros/{distro}/bin/ros2"
+
+    def _cli_nav_action_visible(self, timeout: float = 5.0) -> bool:
+        proc = subprocess.run(
+            [self._ros2_cmd(), "action", "list"],
+            env=self._ros_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+        return proc.returncode == 0 and "navigate_to_pose" in (proc.stdout or "")
+
+    def _log_nav_action_diagnostics(self) -> None:
+        try:
+            proc = subprocess.run(
+                [self._ros2_cmd(), "action", "list"],
+                env=self._ros_env(),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5.0,
+            )
+        except subprocess.TimeoutExpired:
+            cli_actions = "timeout"
+            proc = subprocess.CompletedProcess([], returncode=-1)
+        else:
+            cli_actions = (proc.stdout or "").strip() if proc.returncode == 0 else "unavailable"
+        self.get_logger().error(
+            f"Nav2 action {_NAV_ACTION_NAME!r} not ready "
+            f"(ros2={self._ros2_cmd()}, rc={proc.returncode}, "
+            f"ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')}, "
+            f"RMW={os.environ.get('RMW_IMPLEMENTATION', 'default')}, "
+            f"cli_actions={cli_actions!r}, cli_stderr={(proc.stderr or '').strip()!r})"
+        )
+
+    def _send_nav_goal_via_cli(self, x: float, y: float, theta: float) -> bool:
+        q = _quat_msg(theta)
+        goal_yaml = (
+            "{pose: {header: {frame_id: '"
+            + self._frames.map
+            + "'}, pose: {position: {x: "
+            + str(float(x))
+            + ", y: "
+            + str(float(y))
+            + ", z: 0.0}, orientation: {x: "
+            + str(q.x)
+            + ", y: "
+            + str(q.y)
+            + ", z: "
+            + str(q.z)
+            + ", w: "
+            + str(q.w)
+            + "}}}}}"
+        )
+        if self._nav_cli_proc is not None and self._nav_cli_proc.poll() is None:
+            self._nav_cli_proc.terminate()
+        self._nav_cli_proc = subprocess.Popen(
+            [
+                self._ros2_cmd(),
+                "action",
+                "send_goal",
+                _NAV_ACTION_NAME,
+                "nav2_msgs/action/NavigateToPose",
+                goal_yaml,
+            ],
+            env=self._ros_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        self._last_result_status = "active"
+        self.set_nav_active(True)
+        threading.Thread(
+            target=self._watch_cli_nav_proc,
+            args=(self._nav_cli_proc,),
+            daemon=True,
+        ).start()
+        return True
+
+    def _watch_cli_nav_proc(self, proc: subprocess.Popen) -> None:
+        try:
+            output = proc.communicate(timeout=20.0)[0] or ""
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            self.get_logger().warn(
+                "nav CLI goal send timed out waiting for action server/result"
+            )
+            self._last_result_status = "failed"
+            self.set_nav_active(False)
+            return
+        except Exception as exc:  # noqa: BLE001 - keep bridge alive on CLI errors
+            self.get_logger().warn(f"nav CLI goal failed: {exc}")
+            self._last_result_status = "failed"
+            self.set_nav_active(False)
+            return
+        lowered = output.lower()
+        if proc.returncode == 0 and "succeeded" in lowered:
+            self._last_result_status = "succeeded"
+        elif "canceled" in lowered:
+            self._last_result_status = "canceled"
+        elif "aborted" in lowered:
+            self._last_result_status = "aborted"
+        elif proc.returncode == 0:
+            self._last_result_status = "succeeded"
+        else:
+            self.get_logger().warn(f"nav CLI goal exited {proc.returncode}: {output.strip()}")
+            self._last_result_status = "failed"
+        self.set_nav_active(False)
+
+    def _publish_nav_goal(self, x: float, y: float, theta: float) -> bool:
         goal = NavigateToPose.Goal()
         pose = PoseStamped()
         pose.header.frame_id = self._frames.map
@@ -486,6 +783,11 @@ class BridgeNode(Node):
         self.set_nav_active(False)
 
     def cancel_nav(self) -> None:
+        with self._nav_goal_lock:
+            self._pending_nav_goal = None
+        if self._nav_cli_proc is not None and self._nav_cli_proc.poll() is None:
+            self._nav_cli_proc.terminate()
+            self._nav_cli_proc = None
         if self._goal_handle is not None:
             self._goal_handle.cancel_goal_async()
         self.set_nav_active(False)

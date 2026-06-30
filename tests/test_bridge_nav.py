@@ -88,3 +88,22 @@ def test_on_nav_result_maps_success_status():
 
     assert bridge._last_result_status == "succeeded"
     bridge.set_nav_active.assert_called_once_with(False)
+
+
+def test_flush_pending_nav_goal_runs_on_watchdog():
+    bridge = _nav_bridge_stub()
+    bridge._nav_goal_lock = __import__("threading").Lock()
+    bridge._pending_nav_goal = None
+    bridge._cancel_inflight_nav = MagicMock()
+    bridge._ensure_nav_action_client = MagicMock()
+    bridge._publish_nav_goal = MagicMock(return_value=True)
+    done = __import__("threading").Event()
+    outcome: dict = {}
+    bridge._pending_nav_goal = (1.0, 2.0, 0.5, done, outcome)
+
+    BridgeNode._flush_pending_nav_goal(bridge)
+
+    assert bridge._pending_nav_goal is None
+    assert outcome["ok"] is True
+    assert done.is_set()
+    bridge._publish_nav_goal.assert_called_once_with(1.0, 2.0, 0.5)
