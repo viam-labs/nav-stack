@@ -1,11 +1,12 @@
 from pathlib import Path
 import asyncio
+import math
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.config import MODE_MAPPING
+from src.config import MODE_LOCALIZING, MODE_MAPPING
 
 # Stub ROS 2 Python deps so model tests run without a ROS install.
 for _mod in (
@@ -31,6 +32,7 @@ pytest.importorskip("viam")
 
 from src.models.slam import RosSlam
 from src.nav.maps import MapStore
+from src.ros import conversions as conv
 
 
 def test_resolve_pose_by_location_requires_active_map(tmp_path: Path):
@@ -180,6 +182,210 @@ def test_clear_map_requires_active_map(tmp_path: Path):
     slam._manager = MagicMock()
     with pytest.raises(ValueError, match="no active map"):
         asyncio.run(slam.do_command({"command": "clear_map"}))
+
+
+def test_relocalize_uses_current_map_pose(tmp_path: Path):
+    slam = RosSlam("slam")
+    slam._map_store = MapStore(str(tmp_path))
+    slam._cfg = MagicMock(mode=MODE_LOCALIZING)
+    mgr = MagicMock()
+    mgr.get_pose_in_map.return_value = conv.Pose2D(1.0, 2.0, 0.5)
+    slam._manager = mgr
+
+    result = asyncio.run(slam.do_command({"command": "relocalize"}))
+
+    assert result == {
+        "status": "relocalizing",
+        "seed_pose": {"x": 1.0, "y": 2.0, "theta": 0.5},
+    }
+    mgr.relocalize.assert_called_once()
+    pose_arg = mgr.relocalize.call_args.args[0]
+    assert pose_arg.x == 1.0
+    assert pose_arg.y == 2.0
+    assert pose_arg.theta == 0.5
+
+
+def test_relocalize_use_mir_pose_from_movement_sensor(tmp_path: Path):
+    slam = RosSlam("slam")
+    slam._map_store = MapStore(str(tmp_path))
+    slam._cfg = MagicMock(mode=MODE_LOCALIZING)
+    slam._manager = MagicMock()
+    movement = MagicMock()
+
+    async def _readings():
+        return {
+            "position_x_m": 3.0,
+            "position_y_m": 4.0,
+            "yaw_deg": 90.0,
+        }
+
+    movement.get_readings = _readings
+    slam._movement_sensor = movement
+
+    result = asyncio.run(
+        slam.do_command({"command": "relocalize", "use_mir_pose": True})
+    )
+
+    assert result["seed_pose"]["x"] == 3.0
+    assert result["seed_pose"]["y"] == 4.0
+    assert result["seed_pose"]["theta"] == pytest.approx(math.pi / 2)
+    slam._manager.relocalize.assert_called_once()
+
+
+def test_relocalize_requires_localizing_mode(tmp_path: Path):
+    slam = RosSlam("slam")
+    slam._map_store = MapStore(str(tmp_path))
+    slam._cfg = MagicMock(mode=MODE_MAPPING)
+    slam._manager = MagicMock()
+    with pytest.raises(ValueError, match="localizing"):
+        asyncio.run(slam.do_command({"command": "relocalize"}))
+
+
+def test_schedule_startup_global_localize_skips_when_disabled():
+    slam = RosSlam("slam")
+    slam._cfg = MagicMock(mode=MODE_LOCALIZING, global_localize_on_start=False)
+    loop = MagicMock()
+
+    slam._schedule_startup_global_localize(loop)
+
+    loop.create_task.assert_not_called()
+
+
+def test_run_startup_global_localize_retries_then_succeeds():
+    slam = RosSlam("slam")
+    slam.do_command = AsyncMock(
+        side_effect=[
+            RuntimeError("slam not ready"),
+            {
+                "status": "matched",
+                "score": 0.7,
+                "ray_mae_m": 0.4,
+                "pose": {"x": 1.0, "y": 2.0, "theta": 0.3},
+            },
+            {"status": "relocalizing"},
+        ]
+    )
+
+    asyncio.run(
+        slam._run_startup_global_localize(
+            {"full_map": True},
+            delay_s=0.0,
+            max_attempts=2,
+            retry_delay_s=0.0,
+            run_post_apply_refine=False,
+        )
+    )
+
+    assert slam.do_command.await_count == 3
+    first_cmd = slam.do_command.await_args_list[0].args[0]
+    second_cmd = slam.do_command.await_args_list[1].args[0]
+    third_cmd = slam.do_command.await_args_list[2].args[0]
+    assert first_cmd["command"] == "global_localize"
+    assert first_cmd["apply"] is False
+    assert first_cmd["full_map"] is True
+    assert second_cmd["command"] == "global_localize"
+    assert second_cmd["apply"] is False
+    assert third_cmd["command"] == "relocalize"
+    assert third_cmd["pose"]["x"] == pytest.approx(1.0)
+
+
+def test_run_startup_global_localize_runs_refinement_pass():
+    slam = RosSlam("slam")
+    slam.do_command = AsyncMock(
+        side_effect=[
+            {
+                "status": "matched",
+                "score": 0.52,
+                "ray_mae_m": 0.9,
+                "pose": {"x": 1.0, "y": 2.0, "theta": 0.1},
+            },
+            {
+                "status": "matched",
+                "score": 0.71,
+                "ray_mae_m": 0.35,
+                "pose": {"x": 3.0, "y": 4.0, "theta": 0.2},
+            },
+            {"status": "relocalizing"},
+        ]
+    )
+
+    asyncio.run(
+        slam._run_startup_global_localize(
+            {"full_map": True},
+            delay_s=0.0,
+            max_attempts=1,
+            retry_delay_s=0.0,
+            run_refine_pass=True,
+            refine_delay_s=0.0,
+            refine_max_passes=1,
+            target_score=0.95,
+            target_ray_mae_m=0.2,
+            refine_options={"local_yaw_window_deg": 90.0},
+            run_post_apply_refine=False,
+        )
+    )
+
+    assert slam.do_command.await_count == 3
+    first_cmd = slam.do_command.await_args_list[0].args[0]
+    second_cmd = slam.do_command.await_args_list[1].args[0]
+    third_cmd = slam.do_command.await_args_list[2].args[0]
+    assert first_cmd["full_map"] is True
+    assert first_cmd["apply"] is False
+    assert second_cmd["full_map"] is False
+    assert second_cmd["local_yaw_window_deg"] == 90.0
+    assert second_cmd["apply"] is False
+    assert second_cmd["pose"]["x"] == pytest.approx(1.0)
+    assert third_cmd["command"] == "relocalize"
+    assert third_cmd["pose"]["x"] == pytest.approx(3.0)
+
+
+def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
+    slam = RosSlam("slam")
+    slam.do_command = AsyncMock(
+        side_effect=[
+            {
+                "status": "matched",
+                "score": 0.58,
+                "ray_mae_m": 0.82,
+                "pose": {"x": 0.5, "y": 1.2, "theta": 0.1},
+            },
+            {"status": "relocalizing"},
+            {
+                "status": "matched",
+                "score": 0.73,
+                "ray_mae_m": 0.36,
+                "pose": {"x": 0.7, "y": 1.0, "theta": 0.08},
+            },
+            {"status": "relocalizing"},
+        ]
+    )
+
+    asyncio.run(
+        slam._run_startup_global_localize(
+            {"full_map": True},
+            delay_s=0.0,
+            max_attempts=1,
+            retry_delay_s=0.0,
+            run_refine_pass=False,
+            run_post_apply_refine=True,
+            post_apply_refine_delay_s=0.0,
+            post_apply_refine_options={"map_source": "live"},
+        )
+    )
+
+    assert slam.do_command.await_count == 4
+    first_cmd = slam.do_command.await_args_list[0].args[0]
+    second_cmd = slam.do_command.await_args_list[1].args[0]
+    third_cmd = slam.do_command.await_args_list[2].args[0]
+    fourth_cmd = slam.do_command.await_args_list[3].args[0]
+    assert first_cmd["command"] == "global_localize"
+    assert first_cmd["apply"] is False
+    assert second_cmd["command"] == "relocalize"
+    assert third_cmd["command"] == "global_localize"
+    assert third_cmd["apply"] is False
+    assert third_cmd["map_source"] == "live"
+    assert fourth_cmd["command"] == "relocalize"
+    assert fourth_cmd["pose"]["x"] == pytest.approx(0.7)
 
 
 def test_get_point_cloud_map_hides_stale_generation():

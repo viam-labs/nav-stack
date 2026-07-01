@@ -193,6 +193,33 @@ class SlamConfig:
     base_velocity_convention: str = BASE_VELOCITY_ROS
     slam_toolbox: SlamToolboxConfig = field(default_factory=SlamToolboxConfig)
     slam_params: Mapping = field(default_factory=dict)
+    # Automatically run global_localize shortly after starting in localizing mode.
+    global_localize_on_start: bool = True
+    global_localize_on_start_delay_s: float = 4.0
+    global_localize_on_start_options: Mapping = field(
+        default_factory=lambda: {
+            "full_map": True,
+            "map_source": "live",
+        }
+    )
+    global_localize_on_start_refine: bool = True
+    global_localize_on_start_refine_delay_s: float = 8.0
+    global_localize_on_start_refine_max_passes: int = 3
+    global_localize_on_start_target_score: float = 0.7
+    global_localize_on_start_target_ray_mae_m: float = 0.4
+    global_localize_on_start_post_apply_refine: bool = True
+    global_localize_on_start_post_apply_refine_delay_s: float = 3.0
+    global_localize_on_start_post_apply_refine_options: Mapping = field(
+        default_factory=lambda: {"map_source": "live"}
+    )
+    global_localize_on_start_refine_options: Mapping = field(
+        default_factory=lambda: {
+            "full_map": False,
+            "map_source": "live",
+            "local_yaw_window_deg": 120.0,
+            "search_radius_m": 6.0,
+        }
+    )
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "SlamConfig":
@@ -229,6 +256,62 @@ class SlamConfig:
             base_velocity_convention=convention,
             slam_toolbox=SlamToolboxConfig.from_dict(d.get("slam_toolbox", {}) or {}),
             slam_params=d.get("slam_params", {}) or {},
+            global_localize_on_start=bool(d.get("global_localize_on_start", True)),
+            global_localize_on_start_delay_s=float(
+                d.get("global_localize_on_start_delay_s", 4.0)
+            ),
+            global_localize_on_start_options=d.get(
+                "global_localize_on_start_options",
+                {
+                    "full_map": True,
+                    "map_source": "live",
+                },
+            )
+            or {
+                "full_map": True,
+                "map_source": "live",
+            },
+            global_localize_on_start_refine=bool(
+                d.get("global_localize_on_start_refine", True)
+            ),
+            global_localize_on_start_refine_delay_s=float(
+                d.get("global_localize_on_start_refine_delay_s", 8.0)
+            ),
+            global_localize_on_start_refine_max_passes=int(
+                d.get("global_localize_on_start_refine_max_passes", 3)
+            ),
+            global_localize_on_start_target_score=float(
+                d.get("global_localize_on_start_target_score", 0.7)
+            ),
+            global_localize_on_start_target_ray_mae_m=float(
+                d.get("global_localize_on_start_target_ray_mae_m", 0.4)
+            ),
+            global_localize_on_start_post_apply_refine=bool(
+                d.get("global_localize_on_start_post_apply_refine", True)
+            ),
+            global_localize_on_start_post_apply_refine_delay_s=float(
+                d.get("global_localize_on_start_post_apply_refine_delay_s", 3.0)
+            ),
+            global_localize_on_start_post_apply_refine_options=d.get(
+                "global_localize_on_start_post_apply_refine_options",
+                {"map_source": "live"},
+            )
+            or {"map_source": "live"},
+            global_localize_on_start_refine_options=d.get(
+                "global_localize_on_start_refine_options",
+                {
+                    "full_map": False,
+                    "map_source": "live",
+                    "local_yaw_window_deg": 120.0,
+                    "search_radius_m": 6.0,
+                },
+            )
+            or {
+                "full_map": False,
+                "map_source": "live",
+                "local_yaw_window_deg": 120.0,
+                "search_radius_m": 6.0,
+            },
         )
 
     def required_dependencies(self) -> List[str]:

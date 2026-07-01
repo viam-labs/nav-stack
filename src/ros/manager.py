@@ -13,6 +13,7 @@ over DDS.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import shlex
 import shutil
@@ -619,6 +620,24 @@ class RosManager:
     def set_initial_pose(self, pose: conv.Pose2D) -> None:
         self._clear_localization_buffer()
         self._require_node().set_initial_pose(pose)
+
+    def relocalize(
+        self,
+        pose: conv.Pose2D,
+        *,
+        position_variance_m2: float = 4.0,
+        yaw_variance_rad2: float = (math.pi / 4) ** 2,
+    ) -> None:
+        """Trigger scan-to-map matching from an approximate map pose."""
+        self._clear_localization_buffer()
+        self._require_node().set_initial_pose(
+            pose,
+            position_variance_m2=position_variance_m2,
+            yaw_variance_rad2=yaw_variance_rad2,
+        )
+
+    def get_pose_in_map(self) -> Optional[conv.Pose2D]:
+        return self._require_node().get_pose_in_map()
 
     def set_nav_config(self, nav_cfg: NavConfig) -> None:
         self._require_node().set_nav_config(nav_cfg)

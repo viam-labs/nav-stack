@@ -804,7 +804,13 @@ class BridgeNode(Node):
         """Reset wheel odometry (``odom -> base_link``). Not a map-frame pose."""
         self._odom = pose
 
-    def set_initial_pose(self, pose: conv.Pose2D) -> None:
+    def set_initial_pose(
+        self,
+        pose: conv.Pose2D,
+        *,
+        position_variance_m2: float = 0.25,
+        yaw_variance_rad2: float = 0.06853891945200942,
+    ) -> None:
         """Seed slam_toolbox with a map-frame pose via ``/initialpose``."""
         msg = PoseWithCovarianceStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -813,9 +819,9 @@ class BridgeNode(Node):
         msg.pose.pose.position.y = pose.y
         msg.pose.pose.orientation = _quat_msg(pose.theta)
         # AMCL/slam_toolbox-compatible diagonal covariance (x, y, yaw).
-        msg.pose.covariance[0] = 0.25
-        msg.pose.covariance[7] = 0.25
-        msg.pose.covariance[35] = 0.06853891945200942
+        msg.pose.covariance[0] = position_variance_m2
+        msg.pose.covariance[7] = position_variance_m2
+        msg.pose.covariance[35] = yaw_variance_rad2
         self._initialpose_pub.publish(msg)
         self._last_pose_in_map = conv.Pose2D(pose.x, pose.y, pose.theta)
 

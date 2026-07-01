@@ -27,6 +27,65 @@ def test_slam_config_multi_lidar_with_mounts():
     assert "odom" in cfg.required_dependencies()
 
 
+def test_slam_config_global_localize_on_start_options():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "mode": "localizing",
+            "global_localize_on_start": True,
+            "global_localize_on_start_delay_s": 4.5,
+            "global_localize_on_start_options": {
+                "full_map": True,
+                "map_source": "live",
+            },
+            "global_localize_on_start_refine": True,
+            "global_localize_on_start_refine_delay_s": 6.0,
+            "global_localize_on_start_refine_options": {
+                "full_map": False,
+                "local_yaw_window_deg": 90.0,
+            },
+        }
+    )
+    assert cfg.global_localize_on_start is True
+    assert cfg.global_localize_on_start_delay_s == pytest.approx(4.5)
+    assert cfg.global_localize_on_start_options["full_map"] is True
+    assert cfg.global_localize_on_start_options["map_source"] == "live"
+    assert cfg.global_localize_on_start_refine is True
+    assert cfg.global_localize_on_start_refine_delay_s == pytest.approx(6.0)
+    assert cfg.global_localize_on_start_refine_max_passes == 3
+    assert cfg.global_localize_on_start_target_score == pytest.approx(0.7)
+    assert cfg.global_localize_on_start_target_ray_mae_m == pytest.approx(0.4)
+    assert cfg.global_localize_on_start_post_apply_refine is True
+    assert cfg.global_localize_on_start_post_apply_refine_delay_s == pytest.approx(3.0)
+    assert cfg.global_localize_on_start_post_apply_refine_options["map_source"] == "live"
+    assert cfg.global_localize_on_start_refine_options["full_map"] is False
+
+
+def test_slam_config_global_localize_on_start_defaults_enabled():
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front", "mode": "localizing"})
+    assert cfg.global_localize_on_start is True
+    assert cfg.global_localize_on_start_delay_s == pytest.approx(4.0)
+    assert cfg.global_localize_on_start_options == {
+        "full_map": True,
+        "map_source": "live",
+    }
+    assert cfg.global_localize_on_start_refine is True
+    assert cfg.global_localize_on_start_refine_delay_s == pytest.approx(8.0)
+    assert cfg.global_localize_on_start_refine_max_passes == 3
+    assert cfg.global_localize_on_start_target_score == pytest.approx(0.7)
+    assert cfg.global_localize_on_start_target_ray_mae_m == pytest.approx(0.4)
+    assert cfg.global_localize_on_start_post_apply_refine is True
+    assert cfg.global_localize_on_start_post_apply_refine_delay_s == pytest.approx(3.0)
+    assert cfg.global_localize_on_start_post_apply_refine_options == {"map_source": "live"}
+    assert cfg.global_localize_on_start_refine_options == {
+        "full_map": False,
+        "map_source": "live",
+        "local_yaw_window_deg": 120.0,
+        "search_radius_m": 6.0,
+    }
+
+
 def test_slam_config_requires_lidar():
     with pytest.raises(ValueError):
         SlamConfig.from_dict({"base": "b"})

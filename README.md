@@ -105,6 +105,18 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 | Attribute | Service | Description |
 | --- | --- | --- |
 | `mode` | SLAM | `mapping` or `localizing` — selects slam_toolbox node and sets its mode |
+| `global_localize_on_start` | SLAM | When `true` in `localizing` mode, run `global_localize` automatically after startup (default `true`) |
+| `global_localize_on_start_delay_s` | SLAM | Delay before startup auto-localize (default `4.0`) |
+| `global_localize_on_start_options` | SLAM | Optional args merged into startup `global_localize` command; defaults prefer robust boot localization (`full_map: true`, `map_source: live`) |
+| `global_localize_on_start_refine` | SLAM | Run a second auto `global_localize` pass after startup (default `true`) |
+| `global_localize_on_start_refine_delay_s` | SLAM | Delay before second refine pass (default `8.0`) |
+| `global_localize_on_start_refine_max_passes` | SLAM | Max startup refine passes while quality is below target (default `3`) |
+| `global_localize_on_start_target_score` | SLAM | Stop refining once score reaches this threshold (default `0.7`) |
+| `global_localize_on_start_target_ray_mae_m` | SLAM | Stop refining once ray MAE is at or below this threshold (default `0.4`) |
+| `global_localize_on_start_post_apply_refine` | SLAM | Run one delayed post-apply `global_localize` check and apply it only if quality improves (default `true`) |
+| `global_localize_on_start_post_apply_refine_delay_s` | SLAM | Delay before post-apply refine pass (default `3.0`) |
+| `global_localize_on_start_post_apply_refine_options` | SLAM | Optional args for post-apply refine (default `{ \"map_source\": \"live\" }`) |
+| `global_localize_on_start_refine_options` | SLAM | Optional args for refine passes; defaults to local refinement (`full_map: false`, `map_source: live`, `local_yaw_window_deg: 120`, `search_radius_m: 6`) |
 | `base_velocity_convention` | SLAM | `ros` (default) or `mir` — maps Nav2 `/cmd_vel` to Viam base `SetVelocity` axes |
 | `slam_toolbox` | SLAM | Common slam_toolbox params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced: any other slam_toolbox ROS param (merged last) |
@@ -125,6 +137,24 @@ Example with slam_toolbox tuning:
     "mode": "localizing",
     "maps_dir": "/root/.viam/nav-stack/maps",
     "active_map": "ground-floor",
+    "global_localize_on_start": true,
+    "global_localize_on_start_options": {
+      "map_source": "live",
+      "full_map": true
+    },
+    "global_localize_on_start_refine": true,
+    "global_localize_on_start_refine_delay_s": 8.0,
+    "global_localize_on_start_refine_max_passes": 3,
+    "global_localize_on_start_target_score": 0.7,
+    "global_localize_on_start_target_ray_mae_m": 0.4,
+    "global_localize_on_start_post_apply_refine": true,
+    "global_localize_on_start_post_apply_refine_delay_s": 3.0,
+    "global_localize_on_start_post_apply_refine_options": {
+      "map_source": "live"
+    },
+    "global_localize_on_start_refine_options": {
+      "local_yaw_window_deg": 120.0
+    },
     "slam_toolbox": {
       "resolution": 0.05,
       "max_laser_range": 25.0,
@@ -134,6 +164,9 @@ Example with slam_toolbox tuning:
   }
 }
 ```
+
+Startup auto-localize evaluates candidate poses first (`apply: false`) and only
+publishes the best pose at the end, so early weak passes do not lock in a bad seed.
 
 `mode` changes take effect on reconfigure (or via `start_mapping` / `start_localizing` DoCommands).
 
@@ -186,6 +219,54 @@ await slam.do_command({"command": "start_localizing", "map": "ground-floor"})
 await slam.do_command({"command": "set_initial_pose", "pose": {"x": 0, "y": 0, "theta": 0}})
 ```
 
+If the nav-stack map is aligned with the MiR onboard map, seed from the MiR pose instead
+(continuous laser matching on the MiR side; nav-stack still needs one `/initialpose` seed):
+
+```python
+await slam.do_command({
+    "command": "start_localizing",
+    "map": "ground-floor",
+    "use_mir_pose": True,
+})
+# or after localizing:
+await slam.do_command({"command": "relocalize", "use_mir_pose": True})
+```
+
+**Preferred:** match live lidar against the saved nav-stack occupancy map (no MiR map pose):
+
+```python
+await slam.do_command({"command": "global_localize"})
+# search the whole map when pose is unknown:
+await slam.do_command({"command": "global_localize", "full_map": True})
+# narrow search around a rough guess (meters):
+await slam.do_command({
+    "command": "global_localize",
+    "pose": {"x": 1.0, "y": 2.0, "theta": 0.0},
+    "search_radius_m": 6.0,
+})
+# preview-only (do not publish /initialpose yet):
+await slam.do_command({"command": "global_localize", "apply": False})
+```
+
+Returned fields include `pose`, `score`, `candidates_evaluated`, `scan_points_used`,
+`in_map_points`, `hit_rate`, `ray_score`, and `ray_mae_m`. If `in_map_points` is
+low or `ray_mae_m` is high, the match is unreliable.
+Speed/robustness knobs: `local_yaw_window_deg`, `coarse_position_step_m`,
+`coarse_yaw_step_deg`, `max_scan_points`, `min_in_map_points`,
+`min_in_map_ratio`, `hit_radius_cells`, `ray_refine_candidates`,
+`ray_refine_beams`, `ray_step_m`, `ray_weight`.
+
+By default, `global_localize` now auto-falls back to full-map search when local
+search quality is weak. Tune or disable with `auto_full_map_fallback`,
+`fallback_score_threshold`, and `fallback_hit_rate_threshold`.
+
+When you are roughly in the right place but nav-stack drifted (~2 m), trigger scan-to-map
+matching with wider covariance:
+
+```python
+await slam.do_command({"command": "relocalize"})
+```
+
 ### 3. Create and use locations
 
 ```python
@@ -228,7 +309,11 @@ Zones CRUD: `add_zone`, `get_zone`, `list_zones`, `update_zone`, `delete_zone`,
 ### Map management (SLAM service)
 
 `list_maps`, `get_active_map`, `set_active_map`, `rename_map`, `delete_map`,
-`start_mapping`, `start_localizing`, `save_map`, `get_mode`, `set_initial_pose`.
+`start_mapping`, `start_localizing`, `save_map`, `get_mode`, `set_initial_pose`,
+`global_localize` (lidar scan match against saved map; optional `full_map`,
+`search_radius_m`, `apply`, `local_yaw_window_deg`, `max_scan_points`,
+`auto_full_map_fallback`),
+`relocalize` (alias `refine_localization`; optional `pose`, `location`).
 
 ## Development
 
