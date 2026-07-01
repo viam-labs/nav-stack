@@ -113,8 +113,8 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 | `global_localize_on_start_refine_max_passes` | SLAM | Max startup refine passes while quality is below target (default `3`) |
 | `global_localize_on_start_target_score` | SLAM | Stop refining once score reaches this threshold (default `0.7`) |
 | `global_localize_on_start_target_ray_mae_m` | SLAM | Stop refining once ray MAE is at or below this threshold (default `0.4`) |
-| `global_localize_on_start_post_apply_refine` | SLAM | Run one delayed post-apply `global_localize` check and apply it only if quality improves (default `true`) |
-| `global_localize_on_start_post_apply_refine_delay_s` | SLAM | Delay before post-apply refine pass (default `3.0`) |
+| `global_localize_on_start_post_apply_refine` | SLAM | Run one delayed post-apply `global_localize` pass (manual-equivalent) after startup (default `true`) |
+| `global_localize_on_start_post_apply_refine_delay_s` | SLAM | Delay before post-apply refine pass (default `8.0`) |
 | `global_localize_on_start_post_apply_refine_options` | SLAM | Optional args for post-apply refine (default `{ \"map_source\": \"live\" }`) |
 | `global_localize_on_start_refine_options` | SLAM | Optional args for refine passes; defaults to local refinement (`full_map: false`, `map_source: live`, `local_yaw_window_deg: 120`, `search_radius_m: 6`) |
 | `base_velocity_convention` | SLAM | `ros` (default) or `mir` — maps Nav2 `/cmd_vel` to Viam base `SetVelocity` axes |
@@ -148,7 +148,7 @@ Example with slam_toolbox tuning:
     "global_localize_on_start_target_score": 0.7,
     "global_localize_on_start_target_ray_mae_m": 0.4,
     "global_localize_on_start_post_apply_refine": true,
-    "global_localize_on_start_post_apply_refine_delay_s": 3.0,
+    "global_localize_on_start_post_apply_refine_delay_s": 8.0,
     "global_localize_on_start_post_apply_refine_options": {
       "map_source": "live"
     },

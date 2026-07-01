@@ -351,12 +351,11 @@ def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
             },
             {"status": "relocalizing"},
             {
-                "status": "matched",
+                "status": "localized",
                 "score": 0.73,
                 "ray_mae_m": 0.36,
                 "pose": {"x": 0.7, "y": 1.0, "theta": 0.08},
             },
-            {"status": "relocalizing"},
         ]
     )
 
@@ -373,19 +372,34 @@ def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
         )
     )
 
-    assert slam.do_command.await_count == 4
+    assert slam.do_command.await_count == 3
     first_cmd = slam.do_command.await_args_list[0].args[0]
     second_cmd = slam.do_command.await_args_list[1].args[0]
     third_cmd = slam.do_command.await_args_list[2].args[0]
-    fourth_cmd = slam.do_command.await_args_list[3].args[0]
     assert first_cmd["command"] == "global_localize"
     assert first_cmd["apply"] is False
     assert second_cmd["command"] == "relocalize"
     assert third_cmd["command"] == "global_localize"
-    assert third_cmd["apply"] is False
+    assert third_cmd["apply"] is True
     assert third_cmd["map_source"] == "live"
-    assert fourth_cmd["command"] == "relocalize"
-    assert fourth_cmd["pose"]["x"] == pytest.approx(0.7)
+
+
+def test_run_startup_global_localize_skips_when_navigation_active():
+    slam = RosSlam("slam")
+    slam._manager = MagicMock()
+    slam._manager.nav_status.return_value = {"active": True}
+    slam.do_command = AsyncMock()
+
+    asyncio.run(
+        slam._run_startup_global_localize(
+            {"full_map": True},
+            delay_s=0.0,
+            max_attempts=1,
+            retry_delay_s=0.0,
+        )
+    )
+
+    assert slam.do_command.await_count == 0
 
 
 def test_get_point_cloud_map_hides_stale_generation():

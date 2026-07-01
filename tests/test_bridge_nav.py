@@ -107,3 +107,40 @@ def test_flush_pending_nav_goal_runs_on_watchdog():
     assert outcome["ok"] is True
     assert done.is_set()
     bridge._publish_nav_goal.assert_called_once_with(1.0, 2.0, 0.5)
+
+
+def test_send_nav_goal_recreates_stale_action_client_then_publishes():
+    bridge = _nav_bridge_stub()
+    bridge._ensure_nav_action_client = MagicMock()
+    bridge._wait_for_rclpy_action_server = MagicMock(side_effect=[False, True])
+    bridge.reset_nav_action_client = MagicMock()
+    bridge._cancel_inflight_nav = MagicMock()
+    bridge._publish_nav_goal = MagicMock(return_value=True)
+    bridge._cli_nav_action_visible = MagicMock(return_value=False)
+    bridge._send_nav_goal_via_cli = MagicMock()
+    bridge._log_nav_action_diagnostics = MagicMock()
+
+    ok = BridgeNode.send_nav_goal(bridge, 1.0, 2.0, 0.5)
+
+    assert ok is True
+    bridge.reset_nav_action_client.assert_called_once()
+    bridge._publish_nav_goal.assert_called_once_with(1.0, 2.0, 0.5)
+    bridge._send_nav_goal_via_cli.assert_not_called()
+
+
+def test_send_nav_goal_falls_back_to_cli_when_rclpy_not_ready():
+    bridge = _nav_bridge_stub()
+    bridge._ensure_nav_action_client = MagicMock()
+    bridge._wait_for_rclpy_action_server = MagicMock(side_effect=[False, False])
+    bridge.reset_nav_action_client = MagicMock()
+    bridge._cancel_inflight_nav = MagicMock()
+    bridge._publish_nav_goal = MagicMock(return_value=True)
+    bridge._cli_nav_action_visible = MagicMock(return_value=True)
+    bridge._send_nav_goal_via_cli = MagicMock(return_value=True)
+    bridge._log_nav_action_diagnostics = MagicMock()
+
+    ok = BridgeNode.send_nav_goal(bridge, 1.0, 2.0, 0.5)
+
+    assert ok is True
+    bridge._publish_nav_goal.assert_not_called()
+    bridge._send_nav_goal_via_cli.assert_called_once_with(1.0, 2.0, 0.5)

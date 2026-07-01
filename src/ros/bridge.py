@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -546,13 +547,21 @@ class BridgeNode(Node):
         if NavigateToPose is None:
             raise RuntimeError(f"Nav2 action {_NAV_ACTION_NAME!r} unavailable")
         self._ensure_nav_action_client()
-        if self._nav_action is None:
-            raise RuntimeError(f"Nav2 action {_NAV_ACTION_NAME!r} unavailable")
-        if not self._nav_action.wait_for_server(timeout_sec=5.0):
-            self._log_nav_action_diagnostics()
-            raise RuntimeError("Nav2 action server not available")
-        self._cancel_inflight_nav()
-        return self._publish_nav_goal(x, y, theta)
+        if self._wait_for_rclpy_action_server():
+            self._cancel_inflight_nav()
+            return self._publish_nav_goal(x, y, theta)
+        # rclpy action clients can become stale after Nav2 restarts; recreate once.
+        self.reset_nav_action_client()
+        self._ensure_nav_action_client()
+        if self._wait_for_rclpy_action_server():
+            self._cancel_inflight_nav()
+            return self._publish_nav_goal(x, y, theta)
+        # Last-resort fallback to CLI send if discovery sees the action.
+        if self._cli_nav_action_visible(timeout=2.0):
+            self._cancel_inflight_nav()
+            return self._send_nav_goal_via_cli(x, y, theta)
+        self._log_nav_action_diagnostics()
+        raise RuntimeError("Nav2 action server not available")
 
     def _cancel_inflight_nav(self) -> None:
         if self._nav_cli_proc is not None and self._nav_cli_proc.poll() is None:
@@ -615,6 +624,19 @@ class BridgeNode(Node):
         return shutil.which("ros2") or f"/opt/ros/{distro}/bin/ros2"
 
     def _cli_nav_action_visible(self, timeout: float = 5.0) -> bool:
+        info_proc = subprocess.run(
+            [self._ros2_cmd(), "action", "info", _NAV_ACTION_NAME],
+            env=self._ros_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+        if info_proc.returncode == 0:
+            match = re.search(r"Action servers:\s*(\d+)", info_proc.stdout or "")
+            if match:
+                return int(match.group(1)) > 0
+            return True
         proc = subprocess.run(
             [self._ros2_cmd(), "action", "list"],
             env=self._ros_env(),

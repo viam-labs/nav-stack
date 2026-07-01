@@ -57,7 +57,7 @@ def test_slam_config_global_localize_on_start_options():
     assert cfg.global_localize_on_start_target_score == pytest.approx(0.7)
     assert cfg.global_localize_on_start_target_ray_mae_m == pytest.approx(0.4)
     assert cfg.global_localize_on_start_post_apply_refine is True
-    assert cfg.global_localize_on_start_post_apply_refine_delay_s == pytest.approx(3.0)
+    assert cfg.global_localize_on_start_post_apply_refine_delay_s == pytest.approx(8.0)
     assert cfg.global_localize_on_start_post_apply_refine_options["map_source"] == "live"
     assert cfg.global_localize_on_start_refine_options["full_map"] is False
 
@@ -76,7 +76,7 @@ def test_slam_config_global_localize_on_start_defaults_enabled():
     assert cfg.global_localize_on_start_target_score == pytest.approx(0.7)
     assert cfg.global_localize_on_start_target_ray_mae_m == pytest.approx(0.4)
     assert cfg.global_localize_on_start_post_apply_refine is True
-    assert cfg.global_localize_on_start_post_apply_refine_delay_s == pytest.approx(3.0)
+    assert cfg.global_localize_on_start_post_apply_refine_delay_s == pytest.approx(8.0)
     assert cfg.global_localize_on_start_post_apply_refine_options == {"map_source": "live"}
     assert cfg.global_localize_on_start_refine_options == {
         "full_map": False,
@@ -223,3 +223,135 @@ def test_nav2_template_lifecycle_manager_excludes_collision_monitor():
     nodes = data["lifecycle_manager_navigation"]["ros__parameters"]["node_names"]
     assert "collision_monitor" not in nodes
 
+
+
+def test_normalize_nav2_user_params_wraps_missing_ros_parameters():
+    from src.models.navigation import _normalize_nav2_user_params
+
+    template = {
+        "controller_server": {"ros__parameters": {"controller_frequency": 20.0}},
+        "local_costmap": {
+            "local_costmap": {"ros__parameters": {"width": 4}}
+        },
+    }
+    user = {
+        "controller_server": {"controller_frequency": 5.0},
+        "local_costmap": {"width": 6},
+    }
+
+    normalized = _normalize_nav2_user_params(user, template)
+
+    assert normalized["controller_server"] == {
+        "ros__parameters": {"controller_frequency": 5.0}
+    }
+    assert normalized["local_costmap"] == {
+        "local_costmap": {"ros__parameters": {"width": 6}}
+    }
+
+
+def test_normalize_nav2_user_params_keeps_wrapped_form():
+    from src.models.navigation import _normalize_nav2_user_params
+
+    template = {
+        "controller_server": {"ros__parameters": {"controller_frequency": 20.0}},
+    }
+    user = {"controller_server": {"ros__parameters": {"controller_frequency": 5.0}}}
+
+    normalized = _normalize_nav2_user_params(user, template)
+
+    assert normalized == user
+
+
+def test_validate_nav2_params_structure_rejects_bad_tree():
+    from src.models.navigation import _validate_nav2_params_structure
+
+    with pytest.raises(ValueError, match="before 'ros__parameters'"):
+        _validate_nav2_params_structure(
+            {"controller_server": {"controller_frequency": 5.0}}
+        )
+    with pytest.raises(ValueError, match="outside"):
+        _validate_nav2_params_structure(
+            {
+                "controller_server": {
+                    "ros__parameters": {"a": 1},
+                    "stray": 2,
+                }
+            }
+        )
+
+
+def test_validate_nav2_params_structure_accepts_template():
+    yaml = pytest.importorskip("yaml")
+    from pathlib import Path
+
+    from src.models.navigation import _validate_nav2_params_structure
+
+    params_file = Path(__file__).resolve().parents[1] / "params" / "nav2_params.yaml"
+    _validate_nav2_params_structure(yaml.safe_load(params_file.read_text()))
+
+
+def test_normalize_nav2_user_params_relocates_plugin_sections():
+    from src.models.navigation import _normalize_nav2_user_params
+
+    template = {
+        "controller_server": {
+            "ros__parameters": {
+                "controller_frequency": 20.0,
+                "FollowPath": {"vx_max": 0.4, "vy_max": 0.0},
+            }
+        },
+        "local_costmap": {
+            "local_costmap": {
+                "ros__parameters": {
+                    "inflation_layer": {"inflation_radius": 0.45}
+                }
+            }
+        },
+        "global_costmap": {
+            "global_costmap": {
+                "ros__parameters": {
+                    "inflation_layer": {"inflation_radius": 0.45}
+                }
+            }
+        },
+    }
+    user = {
+        "FollowPath": {"vy_max": 0.2},
+        "inflation_layer": {"inflation_radius": 0.6},
+    }
+
+    normalized = _normalize_nav2_user_params(user, template)
+
+    assert normalized["controller_server"]["ros__parameters"]["FollowPath"] == {
+        "vy_max": 0.2
+    }
+    for costmap in ("local_costmap", "global_costmap"):
+        assert (
+            normalized[costmap][costmap]["ros__parameters"]["inflation_layer"][
+                "inflation_radius"
+            ]
+            == 0.6
+        )
+
+
+def test_normalize_nav2_user_params_relocation_merges_with_node_override():
+    from src.models.navigation import _normalize_nav2_user_params
+
+    template = {
+        "controller_server": {
+            "ros__parameters": {
+                "controller_frequency": 20.0,
+                "FollowPath": {"vx_max": 0.4},
+            }
+        },
+    }
+    user = {
+        "controller_server": {"controller_frequency": 10.0},
+        "FollowPath": {"vx_max": 0.7},
+    }
+
+    normalized = _normalize_nav2_user_params(user, template)
+
+    rp = normalized["controller_server"]["ros__parameters"]
+    assert rp["controller_frequency"] == 10.0
+    assert rp["FollowPath"] == {"vx_max": 0.7}

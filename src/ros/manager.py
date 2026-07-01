@@ -30,6 +30,7 @@ from ..config import MODE_MAPPING, NavConfig, SlamConfig
 from . import conversions as conv
 
 SLAM_LIFECYCLE_NODE = "/slam_toolbox"
+_REQUIRED_NAV_NODES = ("controller_server", "bt_navigator")
 
 
 def _yaml_dump(data: Dict) -> str:
@@ -95,8 +96,13 @@ class RosManager:
         self.stop_slam()
         if self._executor is not None:
             self._executor.shutdown()
+        if self._spin_thread is not None and self._spin_thread.is_alive():
+            self._spin_thread.join(timeout=2.0)
         if self._node is not None:
             self._node.destroy_node()
+        self._node = None
+        self._executor = None
+        self._spin_thread = None
         try:
             import rclpy
 
@@ -182,13 +188,41 @@ class RosManager:
         proc = self._run_ros(["ros2", "action", "list"])
         return proc.returncode == 0 and "navigate_to_pose" in (proc.stdout or "")
 
+    def _nav_action_server_visible(self) -> bool:
+        proc = self._run_ros(["ros2", "action", "info", "/navigate_to_pose"])
+        if proc.returncode == 0:
+            for line in (proc.stdout or "").splitlines():
+                if "Action servers:" in line:
+                    try:
+                        count = int(line.split(":", 1)[1].strip())
+                        return count > 0
+                    except ValueError:
+                        break
+            # Older ROS tools may not print server counts; treat successful info
+            # output as server visibility.
+            return True
+        # Fallback for environments where `action info` is unavailable.
+        return self._nav_action_visible()
+
+    def _missing_required_nav_nodes(self) -> List[str]:
+        proc = self._run_ros(["ros2", "node", "list"])
+        if proc.returncode != 0:
+            return list(_REQUIRED_NAV_NODES)
+        nodes = proc.stdout or ""
+        return [name for name in _REQUIRED_NAV_NODES if name not in nodes]
+
+    def _required_nav_nodes_present(self) -> bool:
+        return len(self._missing_required_nav_nodes()) == 0
+
     def nav_action_ready(self) -> bool:
         now = time.monotonic()
         if now < self._nav_action_ok_until and self.nav2_running():
-            return True
+            if self._required_nav_nodes_present():
+                return True
+            self._nav_action_ok_until = 0.0
         if not self.nav2_running():
             self._nav_action_ok_until = 0.0
-        ok = self._nav_action_visible()
+        ok = self._nav_action_server_visible() and self._required_nav_nodes_present()
         if ok:
             self._nav_action_ok_until = now + 30.0
         return ok
@@ -204,12 +238,14 @@ class RosManager:
             if self._nav2_procs and not any(p.poll() is None for p in self._nav2_procs):
                 self._log("Nav2 launch process exited before action server appeared")
                 return False
-            action_proc = self._run_ros(["ros2", "action", "list"])
-            if action_proc.returncode == 0 and "navigate_to_pose" in (action_proc.stdout or ""):
+            action_ok = self._nav_action_server_visible()
+            missing = self._missing_required_nav_nodes()
+            nodes_ok = len(missing) == 0
+            if action_ok and nodes_ok:
                 return True
             last_detail = (
-                f"ros2={self._ros2_cmd()} rc={action_proc.returncode} "
-                f"stdout={action_proc.stdout!r} stderr={action_proc.stderr!r}"
+                f"ros2={self._ros2_cmd()} action_ok={action_ok} "
+                f"nodes_ok={nodes_ok} missing_nodes={missing}"
             )
             time.sleep(0.5)
         self._log(f"timed out waiting for Nav2 action server ({timeout:.0f}s): {last_detail}")
@@ -430,7 +466,8 @@ class RosManager:
             self._popen(
                 ["ros2", "launch", "nav2_bringup", "navigation_launch.py",
                  f"params_file:={params_path}", "use_sim_time:=false",
-                 "autostart:=false", "use_collision_monitor:=False"]
+                 "autostart:=false", "use_collision_monitor:=False",
+                 "use_composition:=False"]
             )
         )
         # Costmap filter info servers for keepout + speed zones. The mask
@@ -517,22 +554,77 @@ class RosManager:
 
     def stop_nav2(self) -> None:
         self._nav_action_ok_until = 0.0
+        if self._node is not None:
+            try:
+                self._node.cancel_nav()
+            except Exception:
+                pass
+            try:
+                self._node.reset_nav_action_client()
+            except Exception:
+                pass
         for proc in self._nav2_procs:
             self._terminate(proc)
         self._nav2_procs = []
-        # Orphaned ros2 launch / Nav2 nodes survive a parent terminate after crashes.
-        subprocess.run(
-            ["pkill", "-f", "nav2_bringup/navigation_launch.py"],
-            env=self._ros_env(),
-            check=False,
-        )
+        # Orphaned ros2 launch / Nav2 nodes can survive parent termination after
+        # crashes or abrupt service restarts; clean up common leftovers. Patterns
+        # use the slash form because that is how the executables appear in
+        # process command lines (e.g. /opt/ros/jazzy/lib/nav2_controller/controller_server).
+        for pattern in (
+            "nav2_bringup/navigation_launch.py",
+            "nav2_lifecycle_manager/lifecycle_manager",
+            "nav2_map_server/costmap_filter_info_server",
+            "nav2_collision_monitor/collision_monitor",
+            "nav2_controller/controller_server",
+            "nav2_bt_navigator/bt_navigator",
+            "nav2_planner/planner_server",
+            "nav2_behaviors/behavior_server",
+            "nav2_smoother/smoother_server",
+            "nav2_velocity_smoother/velocity_smoother",
+            "nav2_waypoint_follower/waypoint_follower",
+            "nav2_route/route_server",
+            "opennav_docking/opennav_docking",
+        ):
+            subprocess.run(
+                ["pkill", "-f", pattern],
+                env=self._ros_env(),
+                check=False,
+            )
         time.sleep(0.5)
 
     def nav2_running(self) -> bool:
         return any(p.poll() is None for p in self._nav2_procs)
 
+    def _nav2_log_errors(self, max_lines: int = 40) -> str:
+        """Extract crash/error lines from the Nav2 launch log.
+
+        The raw tail is usually dominated by lifecycle-manager wait spam, hiding
+        the actual reason server nodes died.
+        """
+        log_path = self._scratch / "nav2_launch.log"
+        if not log_path.exists():
+            return ""
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
+        markers = (
+            "[ERROR]",
+            "[FATAL]",
+            "process has died",
+            "Traceback",
+            "Caught exception",
+            "what():",
+            "exited with code",
+            "Failed to parse",
+            "InvalidParameter",
+        )
+        interesting = [ln for ln in lines if any(m in ln for m in markers)]
+        return "\n".join(interesting[-max_lines:])
+
     def nav2_diagnostics(self) -> Dict:
         action_proc = self._run_ros(["ros2", "action", "list"])
+        action_info_proc = self._run_ros(["ros2", "action", "info", "/navigate_to_pose"])
         node_proc = self._run_ros(["ros2", "node", "list"])
         lifecycle_proc = self._run_ros(["ros2", "lifecycle", "get", "/bt_navigator"])
         controller_proc = self._run_ros(["ros2", "lifecycle", "get", "/controller_server"])
@@ -549,11 +641,17 @@ class RosManager:
             "actions": (action_proc.stdout or "").strip(),
             "actions_rc": action_proc.returncode,
             "actions_stderr": (action_proc.stderr or "").strip(),
+            "action_info": (action_info_proc.stdout or "").strip(),
+            "action_info_rc": action_info_proc.returncode,
+            "action_info_stderr": (action_info_proc.stderr or "").strip(),
             "nodes": (node_proc.stdout or "").strip(),
+            "core_nodes_present": self._required_nav_nodes_present(),
+            "missing_core_nodes": self._missing_required_nav_nodes(),
             "controller_server_lifecycle": (
                 controller_proc.stdout or controller_proc.stderr or ""
             ).strip(),
             "bt_navigator_lifecycle": (lifecycle_proc.stdout or lifecycle_proc.stderr or "").strip(),
+            "nav2_log_errors": self._nav2_log_errors(),
             "nav2_log_tail": log_tail,
             "nav2_log_path": str(log_path),
         }
@@ -562,25 +660,40 @@ class RosManager:
         """Start or restart Nav2 until ``/navigate_to_pose`` is available."""
         if self.nav_action_ready():
             return
-        if self.nav2_running():
-            self._log("Nav2 processes running but action server missing; waiting briefly")
-            if self.wait_for_nav_action(timeout=15.0):
+
+        last_detail: Optional[Dict] = None
+        for attempt in range(1, 4):
+            if self.nav2_running():
+                self._log(
+                    f"Nav2 unhealthy (attempt {attempt}/3); waiting briefly before restart"
+                )
+                if self.wait_for_nav_action(timeout=15.0):
+                    return
+                self._log("Nav2 still unhealthy; restarting Nav2")
+            else:
+                self._log(f"Nav2 not running (attempt {attempt}/3); launching Nav2")
+
+            self.start_nav2(nav_cfg, params_path)
+            if self.wait_for_nav_action(timeout=60.0):
                 return
-            self._log("Nav2 action server still missing; restarting Nav2")
-        else:
-            self._log("Nav2 action server not ready; launching Nav2")
-        self.start_nav2(nav_cfg, params_path)
-        if not self.wait_for_nav_action(timeout=90.0):
-            detail = self.nav2_diagnostics()
-            self._log(f"Nav2 failed to start: {detail}")
-            raise RuntimeError(
-                "Nav2 failed to start (no /navigate_to_pose after 90s). "
-                f"See {detail.get('nav2_log_path')} and viam-server logs."
-            )
+            last_detail = self.nav2_diagnostics()
+            self._log(f"Nav2 startup attempt {attempt}/3 failed: {last_detail}")
+            self.stop_nav2()
+            time.sleep(1.0 * attempt)
+
+        detail = last_detail or self.nav2_diagnostics()
+        raise RuntimeError(
+            "Nav2 failed to reach healthy state after 3 attempts "
+            f"(missing: {detail.get('missing_core_nodes')}). "
+            f"See {detail.get('nav2_log_path')} and viam-server logs."
+        )
 
     # -- navigation delegation ----------------------------------------------
     def navigate(self, x: float, y: float, theta: float) -> None:
         node = self._require_node()
+        if self._nav_cfg is not None and self._nav_params_path is not None and not self.nav_action_ready():
+            self._log("Nav2 not healthy during navigate; ensuring Nav2 before sending goal")
+            self.ensure_nav2(self._nav_cfg, self._nav_params_path)
         try:
             node.send_nav_goal(x, y, theta)
             return

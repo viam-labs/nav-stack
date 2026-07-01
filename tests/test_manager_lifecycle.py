@@ -87,7 +87,9 @@ def test_navigate_retries_after_ensuring_nav2_when_action_unavailable():
     mgr._nav_cfg = MagicMock()
     mgr._nav_params_path = MagicMock()
 
-    with patch.object(mgr, "ensure_nav2") as ensure:
+    with patch.object(mgr, "ensure_nav2") as ensure, patch.object(
+        mgr, "nav_action_ready", return_value=True
+    ):
         mgr.navigate(1.0, 2.0, 0.5)
 
     ensure.assert_called_once_with(mgr._nav_cfg, mgr._nav_params_path)
@@ -113,7 +115,47 @@ def test_start_nav2_disables_collision_monitor_launch_arg(tmp_path):
     launch_args = popen.call_args_list[0].args[0]
     assert "autostart:=false" in launch_args
     assert "use_collision_monitor:=False" in launch_args
+    assert "use_composition:=False" in launch_args
     assert any(
         "__node:=navigation_lifecycle_manager_override" in call.args[0]
         for call in popen.call_args_list
     )
+
+
+def test_nav_action_ready_requires_core_nodes():
+    mgr = _manager()
+    mgr._nav2_procs = [MagicMock()]
+    mgr._nav2_procs[0].poll.return_value = None
+    with patch.object(mgr, "_nav_action_server_visible", return_value=True), patch.object(
+        mgr, "_required_nav_nodes_present", return_value=False
+    ):
+        assert mgr.nav_action_ready() is False
+
+
+def test_nav_action_ready_invalidates_cache_when_nodes_missing():
+    mgr = _manager()
+    mgr._nav2_procs = [MagicMock()]
+    mgr._nav2_procs[0].poll.return_value = None
+    mgr._nav_action_ok_until = __import__("time").monotonic() + 60.0
+    with patch.object(mgr, "_required_nav_nodes_present", return_value=False), patch.object(
+        mgr, "_nav_action_server_visible", return_value=True
+    ):
+        assert mgr.nav_action_ready() is False
+    assert mgr._nav_action_ok_until == 0.0
+
+
+def test_ensure_nav2_retries_three_times_then_raises():
+    mgr = _manager()
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    params_path = MagicMock()
+    with patch.object(mgr, "nav_action_ready", return_value=False), patch.object(
+        mgr, "nav2_running", return_value=False
+    ), patch.object(mgr, "start_nav2") as start, patch.object(
+        mgr, "wait_for_nav_action", return_value=False
+    ), patch.object(mgr, "stop_nav2") as stop, patch.object(
+        mgr, "nav2_diagnostics", return_value={"missing_core_nodes": ["controller_server"]}
+    ), patch("time.sleep"):
+        with pytest.raises(RuntimeError, match="after 3 attempts"):
+            mgr.ensure_nav2(nav_cfg, params_path)
+    assert start.call_count == 3
+    assert stop.call_count == 3

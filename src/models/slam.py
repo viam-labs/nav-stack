@@ -164,6 +164,15 @@ class RosSlam(SLAM):
             )
         )
 
+    def _is_navigation_active(self) -> bool:
+        mgr = self._manager
+        if mgr is None:
+            return False
+        try:
+            return bool(mgr.nav_status().get("active", False))
+        except Exception:  # noqa: BLE001 - nav stack may not be up yet
+            return False
+
     @staticmethod
     def _startup_global_localize_quality(
         result: Mapping[str, ValueTypes],
@@ -207,6 +216,9 @@ class RosSlam(SLAM):
     ) -> None:
         if delay_s > 0.0:
             await asyncio.sleep(delay_s)
+        if self._is_navigation_active():
+            LOGGER.info("startup global_localize skipped: navigation already active")
+            return
         command: dict = {
             "command": "global_localize",
             # Evaluate candidates first; apply only the best pose at the end.
@@ -229,6 +241,11 @@ class RosSlam(SLAM):
                 if run_refine_pass:
                     passes = max(0, int(refine_max_passes))
                     for refine_pass in range(1, passes + 1):
+                        if self._is_navigation_active():
+                            LOGGER.info(
+                                "startup global_localize refinement aborted: navigation active"
+                            )
+                            break
                         if self._startup_global_localize_meets_target(
                             best_result,
                             target_score=target_score,
@@ -285,35 +302,23 @@ class RosSlam(SLAM):
                 if run_post_apply_refine and best_result is not None:
                     if post_apply_refine_delay_s > 0.0:
                         await asyncio.sleep(post_apply_refine_delay_s)
+                    if self._is_navigation_active():
+                        LOGGER.info(
+                            "startup global_localize post-apply skipped: navigation active"
+                        )
+                        return
                     post_command: dict = {
                         "command": "global_localize",
-                        # Manual-like follow-up check; only apply if better.
-                        "apply": False,
+                        # Match known-good manual behavior exactly.
+                        "apply": True,
                     }
                     if post_apply_refine_options:
                         post_command.update(dict(post_apply_refine_options))
+                    post_command["apply"] = True
                     post_result = await self.do_command(post_command)
-                    if (
-                        self._startup_global_localize_quality(post_result)
-                        > self._startup_global_localize_quality(best_result)
-                    ):
-                        post_pose = post_result.get("pose")
-                        if isinstance(post_pose, Mapping):
-                            await self.do_command(
-                                {
-                                    "command": "relocalize",
-                                    "pose": {
-                                        "x": float(post_pose.get("x", 0.0)),
-                                        "y": float(post_pose.get("y", 0.0)),
-                                        "theta": float(post_pose.get("theta", 0.0)),
-                                    },
-                                    "position_variance_m2": 0.25,
-                                    "yaw_variance_rad2": 0.06853891945200942,
-                                }
-                            )
-                            best_result = post_result
+                    best_result = post_result
                     LOGGER.info(
-                        "startup global_localize post-apply check: score=%s ray_mae=%s",
+                        "startup global_localize post-apply pass: score=%s ray_mae=%s",
                         post_result.get("score"),
                         post_result.get("ray_mae_m"),
                     )

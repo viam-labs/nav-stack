@@ -78,7 +78,7 @@ class RosNavigation(Generic):
             )
         runtime.manager.set_nav_config(cfg)
         params_path = self._write_nav2_params(cfg)
-        runtime.manager.start_nav2(cfg, params_path)
+        runtime.manager.ensure_nav2(cfg, params_path)
         self._refresh_zone_masks()
         LOGGER.info(f"nav-stack navigation '{self.name}' configured ({cfg.kinematics})")
 
@@ -119,11 +119,14 @@ class RosNavigation(Generic):
         }
         _apply_overrides(params, overrides)
         if cfg.nav2_params:
-            _deep_merge(params, dict(cfg.nav2_params))
+            _deep_merge(
+                params, _normalize_nav2_user_params(dict(cfg.nav2_params), params)
+            )
         _apply_local_costmap_size(params, cfg.nav2)
 
         runtime = get_slam(cfg.slam_service)
         _set_obstacle_sources(params, len(runtime.slam_cfg.lidars))
+        _validate_nav2_params_structure(params)
         out = Path(runtime.slam_cfg.maps_dir).expanduser() / ".runtime" / "nav2_params.yaml"
         out.parent.mkdir(parents=True, exist_ok=True)
         with open(out, "w") as fh:
@@ -268,6 +271,121 @@ class RosNavigation(Generic):
         if cur is None:
             raise RuntimeError("current pose unavailable; provide an explicit pose")
         return store.add(str(command["name"]), cur.x, cur.y, cur.theta)
+
+def _find_template_section_paths(template: Mapping, key: str) -> list:
+    """Return paths to every nested mapping named ``key`` inside the template.
+
+    Used to relocate plugin-section overrides (e.g. ``FollowPath``,
+    ``inflation_layer``) that users put at the top level of ``nav2_params``.
+    """
+    paths: list = []
+
+    def _walk(node: Mapping, path: tuple) -> None:
+        for k, v in node.items():
+            if not isinstance(v, Mapping):
+                continue
+            if k == key:
+                paths.append(path + (k,))
+            else:
+                _walk(v, path + (k,))
+
+    _walk(template, ())
+    return paths
+
+
+def _normalize_nav2_user_params(user_params: dict, template: Mapping) -> dict:
+    """Rewrite user ``nav2_params`` into the strict rcl-compatible structure.
+
+    Handles the two natural-but-invalid forms config authors write:
+
+    * node overrides missing the ``ros__parameters`` wrapper, e.g.
+      ``{"controller_server": {"max_vel_x": 1}}``
+    * plugin sections hoisted to the top level, e.g. ``{"FollowPath": {...}}``
+      which really lives at ``controller_server/ros__parameters/FollowPath``
+
+    Merging either form unfixed corrupts the generated params file and crashes
+    every Nav2 node at startup (rcl: "Cannot have a value before ros__parameters").
+    """
+    normalized: dict = {}
+    relocated: dict = {}
+    for key, value in user_params.items():
+        if not isinstance(value, Mapping):
+            normalized[key] = value
+            continue
+        value = dict(value)
+        template_node = template.get(key)
+        if template_node is None:
+            # Not a top-level node: relocate plugin sections (FollowPath,
+            # inflation_layer, ...) to wherever they live in the template.
+            section_paths = _find_template_section_paths(template, key)
+            if section_paths:
+                for path in section_paths:
+                    cursor = relocated
+                    for part in path[:-1]:
+                        cursor = cursor.setdefault(part, {})
+                    _deep_merge(
+                        cursor.setdefault(path[-1], {}), value
+                    )
+                continue
+            normalized[key] = value
+            continue
+        doubled = (
+            isinstance(template_node, Mapping) and key in template_node
+        )  # local_costmap/global_costmap use a doubled namespace
+        if doubled and "ros__parameters" not in value and key not in value:
+            value = {key: value}
+        inner_template = template_node.get(key) if doubled else template_node
+        target = value.get(key) if doubled and key in value else value
+        if (
+            isinstance(inner_template, Mapping)
+            and "ros__parameters" in inner_template
+            and isinstance(target, dict)
+            and "ros__parameters" not in target
+        ):
+            wrapped = {"ros__parameters": target}
+            if doubled:
+                value = {key: wrapped}
+            else:
+                value = wrapped
+        normalized[key] = value
+    if relocated:
+        _deep_merge(normalized, relocated)
+    return normalized
+
+
+def _validate_nav2_params_structure(params: Mapping) -> None:
+    """Reject param trees the rcl YAML parser would refuse to load.
+
+    Every top-level node entry must nest all values under ``ros__parameters``
+    (possibly through namespace dicts). Failing fast here surfaces the offending
+    key instead of letting every Nav2 server die at launch with a parse error.
+    """
+
+    def _check(node, path: str) -> None:
+        if not isinstance(node, Mapping):
+            raise ValueError(
+                f"invalid nav2_params: {path!r} must be a mapping that nests values "
+                "under 'ros__parameters'"
+            )
+        if "ros__parameters" in node:
+            extras = [k for k in node if k != "ros__parameters"]
+            if extras:
+                raise ValueError(
+                    f"invalid nav2_params: {path!r} has keys {extras} outside "
+                    "'ros__parameters'"
+                )
+            return
+        for key, value in node.items():
+            if not isinstance(value, Mapping):
+                raise ValueError(
+                    f"invalid nav2_params: value {path + '/' + str(key)!r} appears "
+                    "before 'ros__parameters'"
+                )
+            _check(value, path + "/" + str(key))
+
+    for top, value in params.items():
+        _check(value, str(top))
+
 
 def _apply_local_costmap_size(params: dict, nav2_cfg: Nav2Config) -> None:
     """Set rolling local costmap dimensions (Jazzy requires integer width/height)."""

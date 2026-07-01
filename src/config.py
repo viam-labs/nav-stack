@@ -208,7 +208,7 @@ class SlamConfig:
     global_localize_on_start_target_score: float = 0.7
     global_localize_on_start_target_ray_mae_m: float = 0.4
     global_localize_on_start_post_apply_refine: bool = True
-    global_localize_on_start_post_apply_refine_delay_s: float = 3.0
+    global_localize_on_start_post_apply_refine_delay_s: float = 8.0
     global_localize_on_start_post_apply_refine_options: Mapping = field(
         default_factory=lambda: {"map_source": "live"}
     )
@@ -290,7 +290,7 @@ class SlamConfig:
                 d.get("global_localize_on_start_post_apply_refine", True)
             ),
             global_localize_on_start_post_apply_refine_delay_s=float(
-                d.get("global_localize_on_start_post_apply_refine_delay_s", 3.0)
+                d.get("global_localize_on_start_post_apply_refine_delay_s", 8.0)
             ),
             global_localize_on_start_post_apply_refine_options=d.get(
                 "global_localize_on_start_post_apply_refine_options",
