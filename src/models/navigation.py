@@ -78,9 +78,14 @@ class RosNavigation(Generic):
             )
         runtime.manager.set_nav_config(cfg)
         params_path = self._write_nav2_params(cfg)
-        runtime.manager.ensure_nav2(cfg, params_path)
+        # Nav2 bringup (with retries) can take minutes on a Pi; run it in the
+        # background so reconfigure returns within viam-server's deadline.
+        runtime.manager.ensure_nav2_async(cfg, params_path)
         self._refresh_zone_masks()
-        LOGGER.info(f"nav-stack navigation '{self.name}' configured ({cfg.kinematics})")
+        LOGGER.info(
+            f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}); "
+            "Nav2 starting in background"
+        )
 
     def _require_cfg(self) -> NavConfig:
         if self._cfg is None:

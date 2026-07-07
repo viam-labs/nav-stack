@@ -258,3 +258,31 @@ def test_get_pose_in_map_returns_cached_pose_on_lookup_failure():
     assert cached is not None
     assert math.isclose(cached.x, 1.2)
     assert math.isclose(cached.y, -0.4)
+
+
+def test_keep_odom_tf_alive_republishes_after_stall(monkeypatch):
+    bridge = SimpleNamespace(
+        _slam_cfg=SimpleNamespace(odom_rate_hz=5.0),
+        _last_odom_pub_wall=0.0,
+        _publish_odom_snapshot=MagicMock(),
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: "stamp")),
+    )
+    monkeypatch.setattr("src.ros.bridge.time.monotonic", lambda: 10.0)
+
+    BridgeNode._keep_odom_tf_alive(bridge)
+
+    bridge._publish_odom_snapshot.assert_called_once_with("stamp", 0.0, 0.0, 0.0)
+
+
+def test_keep_odom_tf_alive_noop_when_recent(monkeypatch):
+    bridge = SimpleNamespace(
+        _slam_cfg=SimpleNamespace(odom_rate_hz=5.0),
+        _last_odom_pub_wall=9.9,
+        _publish_odom_snapshot=MagicMock(),
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: "stamp")),
+    )
+    monkeypatch.setattr("src.ros.bridge.time.monotonic", lambda: 10.0)
+
+    BridgeNode._keep_odom_tf_alive(bridge)
+
+    bridge._publish_odom_snapshot.assert_not_called()

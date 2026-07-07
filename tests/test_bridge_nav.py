@@ -144,3 +144,93 @@ def test_send_nav_goal_falls_back_to_cli_when_rclpy_not_ready():
     assert ok is True
     bridge._publish_nav_goal.assert_not_called()
     bridge._send_nav_goal_via_cli.assert_called_once_with(1.0, 2.0, 0.5)
+
+
+def _twist(vx=0.0, vy=0.0, wz=0.0):
+    return SimpleNamespace(
+        linear=SimpleNamespace(x=vx, y=vy),
+        angular=SimpleNamespace(z=wz),
+    )
+
+
+def test_on_cmd_vel_stashes_latest_without_blocking():
+    lock = __import__("threading").Lock()
+    bridge = SimpleNamespace(
+        _nav_active=True,
+        _last_cmd_time=0.0,
+        _cmd_vel_lock=lock,
+        _pending_cmd_vel=None,
+        _is_omni=lambda: False,
+        _run=MagicMock(),
+    )
+
+    BridgeNode._on_cmd_vel(bridge, _twist(0.1, 0.0, 0.2))
+    BridgeNode._on_cmd_vel(bridge, _twist(0.3, 0.0, 0.4))
+
+    assert bridge._pending_cmd_vel == (0.3, 0.0, 0.4)
+    bridge._run.assert_not_called()
+
+
+def test_on_drive_timer_sends_latest_and_clears():
+    lock = __import__("threading").Lock()
+    io = SimpleNamespace(drive_base=MagicMock(return_value="coro"))
+    bridge = SimpleNamespace(
+        _nav_active=True,
+        _cmd_vel_lock=lock,
+        _pending_cmd_vel=(0.3, 0.0, 0.4),
+        _io=io,
+        _run=MagicMock(),
+        get_logger=MagicMock(return_value=MagicMock()),
+    )
+
+    BridgeNode._on_drive_timer(bridge)
+
+    io.drive_base.assert_called_once_with(0.3, 0.0, 0.4)
+    bridge._run.assert_called_once_with("coro")
+    assert bridge._pending_cmd_vel is None
+
+    # Nothing pending -> no base call.
+    bridge._run.reset_mock()
+    BridgeNode._on_drive_timer(bridge)
+    bridge._run.assert_not_called()
+
+
+def test_on_drive_timer_noop_when_nav_inactive():
+    lock = __import__("threading").Lock()
+    io = SimpleNamespace(drive_base=MagicMock())
+    bridge = SimpleNamespace(
+        _nav_active=False,
+        _cmd_vel_lock=lock,
+        _pending_cmd_vel=(0.3, 0.0, 0.4),
+        _io=io,
+        _run=MagicMock(),
+        get_logger=MagicMock(return_value=MagicMock()),
+    )
+
+    BridgeNode._on_drive_timer(bridge)
+
+    bridge._run.assert_not_called()
+
+
+def test_guarded_callback_swallows_exception_and_logs():
+    logger = MagicMock()
+    bridge = SimpleNamespace(get_logger=MagicMock(return_value=logger))
+
+    def boom():
+        raise RuntimeError("kaput")
+
+    wrapped = BridgeNode._guarded(bridge, boom)
+    wrapped()  # must not raise
+
+    logger.error.assert_called_once()
+    assert "kaput" in logger.error.call_args.args[0]
+
+
+def test_guarded_callback_passes_arguments():
+    bridge = SimpleNamespace(get_logger=MagicMock(return_value=MagicMock()))
+    seen = []
+
+    wrapped = BridgeNode._guarded(bridge, seen.append)
+    wrapped("msg")
+
+    assert seen == ["msg"]

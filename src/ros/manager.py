@@ -60,6 +60,8 @@ class RosManager:
         self._nav_cfg: Optional[NavConfig] = None
         self._nav_params_path: Optional[Path] = None
         self._nav_action_ok_until = 0.0
+        self._nav2_ensure_lock = threading.Lock()
+        self._nav2_ensure_thread: Optional[threading.Thread] = None
         self._started = False
         self._scratch = Path(slam_cfg.maps_dir).expanduser() / ".runtime"
         self._scratch.mkdir(parents=True, exist_ok=True)
@@ -86,10 +88,16 @@ class RosManager:
         self._log("ROS bridge started")
 
     def _spin(self) -> None:
-        try:
-            self._executor.spin()
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"executor stopped: {exc}")
+        # A single misbehaving callback must not silently kill every timer and
+        # subscription (frozen TF/odom/scans -> Nav2 "Robot pose is not
+        # available"); log and resume spinning.
+        while self._started or self._executor is not None:
+            try:
+                self._executor.spin()
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"executor crashed (resuming): {exc!r}")
+                time.sleep(0.2)
 
     def shutdown(self) -> None:
         self.stop_nav2()
@@ -214,6 +222,17 @@ class RosManager:
     def _required_nav_nodes_present(self) -> bool:
         return len(self._missing_required_nav_nodes()) == 0
 
+    def _required_nav_nodes_active(self) -> bool:
+        """True when core Nav2 lifecycle nodes are in the ``active`` state.
+
+        An inactive bt_navigator still advertises /navigate_to_pose but rejects
+        every goal, so action visibility alone is not sufficient readiness.
+        """
+        for name in _REQUIRED_NAV_NODES:
+            if self._lifecycle_get_state("/" + name) != "active":
+                return False
+        return True
+
     def nav_action_ready(self) -> bool:
         now = time.monotonic()
         if now < self._nav_action_ok_until and self.nav2_running():
@@ -222,7 +241,11 @@ class RosManager:
             self._nav_action_ok_until = 0.0
         if not self.nav2_running():
             self._nav_action_ok_until = 0.0
-        ok = self._nav_action_server_visible() and self._required_nav_nodes_present()
+        ok = (
+            self._nav_action_server_visible()
+            and self._required_nav_nodes_present()
+            and self._required_nav_nodes_active()
+        )
         if ok:
             self._nav_action_ok_until = now + 30.0
         return ok
@@ -241,11 +264,12 @@ class RosManager:
             action_ok = self._nav_action_server_visible()
             missing = self._missing_required_nav_nodes()
             nodes_ok = len(missing) == 0
-            if action_ok and nodes_ok:
+            active_ok = nodes_ok and self._required_nav_nodes_active()
+            if action_ok and nodes_ok and active_ok:
                 return True
             last_detail = (
                 f"ros2={self._ros2_cmd()} action_ok={action_ok} "
-                f"nodes_ok={nodes_ok} missing_nodes={missing}"
+                f"nodes_ok={nodes_ok} active_ok={active_ok} missing_nodes={missing}"
             )
             time.sleep(0.5)
         self._log(f"timed out waiting for Nav2 action server ({timeout:.0f}s): {last_detail}")
@@ -398,7 +422,10 @@ class RosManager:
             }
         }
         rp = params["slam_toolbox"]["ros__parameters"]
-        rp.setdefault("transform_timeout", 2.0)
+        # slam_toolbox stamps map->odom as last-scan-time + transform_timeout.
+        # Slow MiR lidar reads can gap scans by ~10s; future-stamp the transform
+        # so Nav2's controller does not reject it as stale between scans.
+        rp.setdefault("transform_timeout", 5.0)
         rp.setdefault("tf_buffer_duration", 60.0)
         rp.setdefault("transform_publish_period", 0.02)
         if map_stem and Path(str(map_stem) + ".posegraph").exists():
@@ -492,6 +519,9 @@ class RosManager:
                     "filter_lifecycle_manager": {
                         "ros__parameters": {
                             "autostart": True,
+                            # Bond heartbeats miss on a loaded Pi and the manager
+                            # then deactivates every node; disable them.
+                            "bond_timeout": 0.0,
                             "node_names": [
                                 "costmap_filter_info_server_keepout",
                                 "costmap_filter_info_server_speed",
@@ -515,6 +545,10 @@ class RosManager:
                     "navigation_lifecycle_manager_override": {
                         "ros__parameters": {
                             "autostart": True,
+                            # Bond heartbeats miss on a loaded Pi and the manager
+                            # then deactivates every Nav2 node mid-run ("CRITICAL
+                            # FAILURE: SERVER ... IS DOWN"); disable them.
+                            "bond_timeout": 0.0,
                             "node_names": [
                                 "controller_server",
                                 "smoother_server",
@@ -635,8 +669,18 @@ class RosManager:
                 log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
             except OSError:
                 log_tail = ""
+        odom_tf_age = None
+        if self._node is not None:
+            try:
+                odom_tf_age = self._node.odom_tf_age_s()
+            except Exception:  # noqa: BLE001 - diagnostics must not raise
+                pass
         return {
             "nav2_processes_running": self.nav2_running(),
+            "nav2_startup_in_progress": self.nav2_startup_in_progress(),
+            # Age of the bridge's last odom/TF publish; more than a few seconds
+            # means the bridge executor is stalled or dead.
+            "odom_tf_age_s": odom_tf_age,
             "nav_action_ready": self.nav_action_ready(),
             "actions": (action_proc.stdout or "").strip(),
             "actions_rc": action_proc.returncode,
@@ -688,9 +732,43 @@ class RosManager:
             f"See {detail.get('nav2_log_path')} and viam-server logs."
         )
 
+    def nav2_startup_in_progress(self) -> bool:
+        thread = self._nav2_ensure_thread
+        return thread is not None and thread.is_alive()
+
+    def ensure_nav2_async(self, nav_cfg: NavConfig, params_path: Path) -> None:
+        """Run ``ensure_nav2`` in a background thread.
+
+        Reconfigure must return within viam-server's deadline; Nav2 bringup with
+        retries can take minutes on a Pi, so it cannot run inline.
+        """
+        self._nav_cfg = nav_cfg
+        self._nav_params_path = params_path
+        with self._nav2_ensure_lock:
+            if self.nav2_startup_in_progress():
+                self._log("Nav2 startup already in progress; skipping duplicate request")
+                return
+
+            def _run() -> None:
+                try:
+                    self.ensure_nav2(nav_cfg, params_path)
+                    self._log("background Nav2 startup finished")
+                except Exception as exc:  # noqa: BLE001 - surfaced via logs + get_status
+                    self._log(f"background Nav2 startup failed: {exc}")
+
+            self._nav2_ensure_thread = threading.Thread(
+                target=_run, name="nav2-ensure", daemon=True
+            )
+            self._nav2_ensure_thread.start()
+
     # -- navigation delegation ----------------------------------------------
     def navigate(self, x: float, y: float, theta: float) -> None:
         node = self._require_node()
+        if self.nav2_startup_in_progress():
+            raise RuntimeError(
+                "Nav2 is still starting up in the background; retry in a few seconds "
+                "(check progress with the get_status command)"
+            )
         if self._nav_cfg is not None and self._nav_params_path is not None and not self.nav_action_ready():
             self._log("Nav2 not healthy during navigate; ensuring Nav2 before sending goal")
             self.ensure_nav2(self._nav_cfg, self._nav_params_path)

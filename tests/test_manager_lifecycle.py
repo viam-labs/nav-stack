@@ -159,3 +159,95 @@ def test_ensure_nav2_retries_three_times_then_raises():
             mgr.ensure_nav2(nav_cfg, params_path)
     assert start.call_count == 3
     assert stop.call_count == 3
+
+
+def test_lifecycle_manager_params_disable_bond_timeout(tmp_path):
+    yaml = pytest.importorskip("yaml")
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "maps_dir": str(tmp_path)})
+    mgr = RosManager(cfg, logger=MagicMock())
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    params_path = tmp_path / "nav2_params.yaml"
+    params_path.write_text("{}", encoding="utf-8")
+
+    proc = MagicMock()
+    proc.poll.return_value = None
+    with patch.object(mgr, "stop_nav2"), patch.object(
+        mgr, "_popen", return_value=proc
+    ), patch.object(mgr, "_wait_for_nav_action", return_value=True):
+        mgr.start_nav2(nav_cfg, params_path)
+
+    scratch = tmp_path / ".runtime"
+    filter_params = yaml.safe_load((scratch / "filter_lifecycle.yaml").read_text())
+    nav_params = yaml.safe_load((scratch / "nav_lifecycle.yaml").read_text())
+    assert (
+        filter_params["filter_lifecycle_manager"]["ros__parameters"]["bond_timeout"]
+        == 0.0
+    )
+    assert (
+        nav_params["navigation_lifecycle_manager_override"]["ros__parameters"][
+            "bond_timeout"
+        ]
+        == 0.0
+    )
+
+
+def test_nav_action_ready_requires_active_lifecycle_nodes():
+    mgr = _manager()
+    proc = MagicMock()
+    proc.poll.return_value = None
+    mgr._nav2_procs = [proc]
+
+    with patch.object(mgr, "_nav_action_server_visible", return_value=True), \
+        patch.object(mgr, "_required_nav_nodes_present", return_value=True), \
+        patch.object(mgr, "_lifecycle_get_state", return_value="inactive"):
+        assert mgr.nav_action_ready() is False
+
+    with patch.object(mgr, "_nav_action_server_visible", return_value=True), \
+        patch.object(mgr, "_required_nav_nodes_present", return_value=True), \
+        patch.object(mgr, "_lifecycle_get_state", return_value="active"):
+        assert mgr.nav_action_ready() is True
+
+
+def test_ensure_nav2_async_runs_in_background_and_deduplicates():
+    import threading
+
+    mgr = _manager()
+    started = threading.Event()
+    release = threading.Event()
+
+    def _slow_ensure(cfg, path):
+        started.set()
+        release.wait(timeout=5.0)
+
+    nav_cfg = MagicMock()
+    params_path = MagicMock()
+    with patch.object(mgr, "ensure_nav2", side_effect=_slow_ensure) as ensure:
+        mgr.ensure_nav2_async(nav_cfg, params_path)
+        assert started.wait(timeout=2.0)
+        assert mgr.nav2_startup_in_progress() is True
+        # Duplicate request while running is a no-op.
+        mgr.ensure_nav2_async(nav_cfg, params_path)
+        release.set()
+        mgr._nav2_ensure_thread.join(timeout=2.0)
+
+    assert ensure.call_count == 1
+    assert mgr.nav2_startup_in_progress() is False
+    assert mgr._nav_cfg is nav_cfg
+    assert mgr._nav_params_path is params_path
+
+
+def test_ensure_nav2_async_swallows_background_failure():
+    mgr = _manager()
+    with patch.object(mgr, "ensure_nav2", side_effect=RuntimeError("boom")):
+        mgr.ensure_nav2_async(MagicMock(), MagicMock())
+        mgr._nav2_ensure_thread.join(timeout=2.0)
+    assert mgr.nav2_startup_in_progress() is False
+
+
+def test_navigate_rejects_while_nav2_startup_in_progress():
+    mgr = _manager()
+    mgr._node = MagicMock()
+    with patch.object(mgr, "nav2_startup_in_progress", return_value=True):
+        with pytest.raises(RuntimeError, match="still starting up"):
+            mgr.navigate(1.0, 2.0, 0.5)
+    mgr._node.send_nav_goal.assert_not_called()

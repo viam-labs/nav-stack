@@ -107,6 +107,7 @@ class BridgeNode(Node):
         self._odom = conv.Pose2D(0.0, 0.0, 0.0)
         self._last_twist = (0.0, 0.0, 0.0)
         self._last_odom_time = time.monotonic()
+        self._last_odom_pub_wall = time.monotonic()
         self._odom_integrate_warned = False
         self._empty_scan_warned = False
 
@@ -161,19 +162,19 @@ class BridgeNode(Node):
             else {}
         )
         self.create_subscription(
-            Twist, "cmd_vel", self._on_cmd_vel, 10, **sub_kwargs
+            Twist, "cmd_vel", self._guarded(self._on_cmd_vel), 10, **sub_kwargs
         )
         # Nav2 topic chain differs depending on collision monitor / velocity
         # smoother wiring. Accept all common variants and apply only while a nav
         # goal is active.
         self.create_subscription(
-            Twist, "cmd_vel_smoothed", self._on_cmd_vel, 10, **sub_kwargs
+            Twist, "cmd_vel_smoothed", self._guarded(self._on_cmd_vel), 10, **sub_kwargs
         )
         self.create_subscription(
-            Twist, "cmd_vel_nav", self._on_cmd_vel, 10, **sub_kwargs
+            Twist, "cmd_vel_nav", self._guarded(self._on_cmd_vel), 10, **sub_kwargs
         )
         self._map_sub = self.create_subscription(
-            OccupancyGrid, "map", self._on_map, _LATCHED_QOS, **sub_kwargs
+            OccupancyGrid, "map", self._guarded(self._on_map), _LATCHED_QOS, **sub_kwargs
         )
         self._map_generation = 0
 
@@ -195,15 +196,28 @@ class BridgeNode(Node):
         )
         self.create_timer(
             1.0 / max(slam_cfg.scan_rate_hz, 1.0),
-            self._on_scan_timer,
+            self._guarded(self._on_scan_timer),
             **scan_timer_kwargs,
         )
         self.create_timer(
             1.0 / max(slam_cfg.odom_rate_hz, 1.0),
-            self._on_odom_timer,
+            self._guarded(self._on_odom_timer),
             **odom_timer_kwargs,
         )
-        self.create_timer(0.1, self._on_watchdog, **misc_timer_kwargs)
+        self.create_timer(0.1, self._guarded(self._on_watchdog), **misc_timer_kwargs)
+
+        # Dedicated group so a slow base call can never back up cmd_vel
+        # subscription callbacks (latest-wins dispatch, see _on_drive_timer).
+        drive_timer_kwargs: Dict = {}
+        try:
+            from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+
+            drive_timer_kwargs = {"callback_group": MutuallyExclusiveCallbackGroup()}
+        except Exception:
+            pass
+        self._pending_cmd_vel: Optional[tuple] = None
+        self._cmd_vel_lock = threading.Lock()
+        self.create_timer(0.1, self._guarded(self._on_drive_timer), **drive_timer_kwargs)
 
         # Action client (created lazily once Nav2 is running) ----------------
         self._nav_action: Optional[ActionClient] = None
@@ -217,6 +231,27 @@ class BridgeNode(Node):
         self._last_result_status: Optional[str] = None
 
     # -- helpers -------------------------------------------------------------
+    def _guarded(self, fn):
+        """Wrap a timer/subscription callback so exceptions cannot kill the executor.
+
+        An uncaught exception in any callback aborts ``executor.spin()``, which
+        silently freezes every timer and subscription (TF/odom/scans stop and
+        Nav2 loses the robot pose).
+        """
+
+        def wrapped(*args):
+            try:
+                fn(*args)
+            except Exception as exc:  # noqa: BLE001 - keep the executor alive
+                try:
+                    self.get_logger().error(
+                        f"callback {getattr(fn, '__name__', fn)!r} crashed: {exc!r}"
+                    )
+                except Exception:  # noqa: BLE001 - logging must never re-raise
+                    pass
+
+        return wrapped
+
     def _run(self, coro, timeout: float = 2.0):
         """Run an async Viam call on the module loop from this ROS thread."""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -296,7 +331,8 @@ class BridgeNode(Node):
                     self._io.read_lidar_points(lidar.name), timeout=lidar_timeout
                 )
             except Exception as exc:  # noqa: BLE001 - keep bridge alive on sensor hiccups
-                self.get_logger().warn(f"lidar {lidar.name} read failed: {exc}")
+                # repr() because timeout errors often have an empty str().
+                self.get_logger().warn(f"lidar {lidar.name} read failed: {exc!r}")
                 continue
 
             sensor_scan = None
@@ -386,7 +422,7 @@ class BridgeNode(Node):
         try:
             sample = self._run(self._io.read_odometry())
         except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn(f"odometry read failed: {exc}")
+            self.get_logger().warn(f"odometry read failed: {exc!r}")
             return
         now = time.monotonic()
         raw_dt = now - self._last_odom_time
@@ -437,6 +473,7 @@ class BridgeNode(Node):
     ) -> None:
         """Publish cached odom pose + TF at ``stamp`` (also used to sync with scans)."""
         self._last_odom_stamp = stamp
+        self._last_odom_pub_wall = time.monotonic()
         self._last_twist = (vx, vy, vtheta)
         odom = Odometry()
         odom.header.stamp = stamp
@@ -461,20 +498,38 @@ class BridgeNode(Node):
 
     # -- cmd_vel + watchdog --------------------------------------------------
     def _on_cmd_vel(self, msg: Twist) -> None:
+        """Stash the newest velocity command; never block in the callback.
+
+        Nav2 publishes on cmd_vel_nav and cmd_vel_smoothed at ~20 Hz each while
+        a Viam->base call can take 100-300 ms. Driving the base inline made
+        callbacks queue up, so the robot executed velocity commands that were
+        seconds stale. Latest-wins dispatch happens on _on_drive_timer.
+        """
         self._last_cmd_time = time.time()
         if not self._nav_active:
             return
         vx = msg.linear.x
         vy = msg.linear.y if self._is_omni() else 0.0
         vtheta = msg.angular.z
+        with self._cmd_vel_lock:
+            self._pending_cmd_vel = (vx, vy, vtheta)
+
+    def _on_drive_timer(self) -> None:
+        """Send only the freshest cmd_vel to the base (drops superseded ones)."""
+        with self._cmd_vel_lock:
+            pending = self._pending_cmd_vel
+            self._pending_cmd_vel = None
+        if pending is None or not self._nav_active:
+            return
         try:
-            self._run(self._io.drive_base(vx, vy, vtheta))
+            self._run(self._io.drive_base(*pending))
         except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn(f"drive_base failed: {exc}")
+            self.get_logger().warn(f"drive_base failed: {exc!r}")
 
     def _on_watchdog(self) -> None:
         self._flush_executor_queue()
         self._flush_pending_nav_goal()
+        self._keep_odom_tf_alive()
         if not self._nav_active:
             return
         if time.time() - self._last_cmd_time > self._cmd_timeout:
@@ -482,6 +537,23 @@ class BridgeNode(Node):
                 self._run(self._io.stop_base())
             except Exception:  # noqa: BLE001
                 pass
+
+    def odom_tf_age_s(self) -> float:
+        """Seconds since the bridge last published odom + TF (liveness signal)."""
+        return round(time.monotonic() - self._last_odom_pub_wall, 2)
+
+    def _keep_odom_tf_alive(self) -> None:
+        """Republish last-known odom pose when odometry reads stall.
+
+        Nav2 costmaps refuse to (re)activate without a recent base_link->odom
+        transform; a stretch of failed movement-sensor reads must not take the
+        whole TF chain down with it. Velocity is zeroed so stale twists cannot
+        leak into the velocity smoother.
+        """
+        gap = max(3.0 / max(float(self._slam_cfg.odom_rate_hz), 1.0), 1.0)
+        if time.monotonic() - self._last_odom_pub_wall < gap:
+            return
+        self._publish_odom_snapshot(self.get_clock().now().to_msg(), 0.0, 0.0, 0.0)
 
     def _is_omni(self) -> bool:
         return bool(self._nav_cfg and self._nav_cfg.kinematics == "omni")
