@@ -122,7 +122,7 @@ class RosNavigation(Generic):
             "holonomic_robot": cfg.kinematics == OMNI,
             **cfg.nav2.to_override_dict(),
         }
-        _apply_overrides(params, overrides)
+        _apply_nav2_tuning(params, overrides)
         if cfg.nav2_params:
             _deep_merge(
                 params, _normalize_nav2_user_params(dict(cfg.nav2_params), params)
@@ -234,29 +234,49 @@ class RosNavigation(Generic):
             return {"status": "deleted"}
 
         # -- navigation --
+        # navigate/cancel/status run ros2 CLI subprocesses and TF waits (seconds
+        # on a Pi). They must not run on the module event loop: the bridge
+        # marshals odom/lidar reads and cmd_vel onto this loop, so blocking here
+        # stalls TF/scans (Nav2 extrapolation errors) and deadlocks stop_base.
         if cmd == "navigate_to_location":
             loc = self._locations().get(str(command["name"]))
-            mgr.navigate(loc.x, loc.y, loc.theta)
+            await asyncio.to_thread(mgr.navigate, loc.x, loc.y, loc.theta)
             return {"status": "navigating", "target": loc.to_dict()}
         if cmd == "navigate_to_point":
             x = float(command["x"])
             y = float(command["y"])
             theta = float(command.get("theta", 0.0))
-            mgr.navigate(x, y, theta)
+            await asyncio.to_thread(mgr.navigate, x, y, theta)
             return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
         if cmd == "cancel":
-            mgr.cancel()
+            await asyncio.to_thread(mgr.cancel)
             return {"status": "canceled"}
         if cmd == "get_status":
-            status = mgr.nav_status()
-            status.update(mgr.nav2_diagnostics())
-            return status
+            def _status():
+                status = mgr.nav_status()
+                status.update(mgr.nav2_diagnostics())
+                return status
+
+            return await asyncio.to_thread(_status)
         if cmd == "start_nav2":
             cfg = self._require_cfg()
             runtime.manager.set_nav_config(cfg)
             params_path = self._write_nav2_params(cfg)
             await asyncio.to_thread(runtime.manager.ensure_nav2, cfg, params_path)
             return {"status": "nav2_started", **runtime.manager.nav2_diagnostics()}
+        if cmd == "restart_nav2":
+            # Unconditional stop + start: guarantees regenerated params are
+            # loaded even when Nav2 currently looks healthy.
+            cfg = self._require_cfg()
+            runtime.manager.set_nav_config(cfg)
+            params_path = self._write_nav2_params(cfg)
+
+            def _restart():
+                runtime.manager.stop_nav2()
+                runtime.manager.ensure_nav2(cfg, params_path)
+
+            await asyncio.to_thread(_restart)
+            return {"status": "nav2_restarted", **runtime.manager.nav2_diagnostics()}
 
         raise ValueError(f"unknown command: {cmd!r}")
 
@@ -435,6 +455,20 @@ def _deep_merge(obj: dict, overrides: Mapping) -> None:
             _deep_merge(obj[key], value)
         else:
             obj[key] = value
+
+
+def _apply_nav2_tuning(params: dict, overrides: Mapping) -> None:
+    """Apply user tuning without clobbering unrelated ``tolerance`` keys."""
+    leaf_overrides = dict(overrides)
+    planner_tol = leaf_overrides.pop("tolerance", None)
+    _apply_overrides(params, leaf_overrides)
+    if planner_tol is not None:
+        try:
+            params["planner_server"]["ros__parameters"]["GridBased"]["tolerance"] = (
+                planner_tol
+            )
+        except (KeyError, TypeError):
+            pass
 
 
 def _apply_overrides(obj, overrides: Mapping) -> None:

@@ -131,9 +131,16 @@ class BridgeNode(Node):
         self._static_tf = StaticTransformBroadcaster(self)
         self._publish_static_lidar_tfs()
 
-        # TF listener for map-frame pose queries.
+        # TF listener for map-frame pose queries. spin_thread=True gives the
+        # /tf subscription its own executor thread so blocked timer callbacks
+        # (slow MiR rosbridge reads) can never starve it and stale the buffer.
         self._tf_buffer = Buffer()
-        self._tf_listener = TransformListener(self._tf_buffer, self)
+        try:
+            self._tf_listener = TransformListener(
+                self._tf_buffer, self, spin_thread=True
+            )
+        except TypeError:  # pragma: no cover - older tf2_ros without the kwarg
+            self._tf_listener = TransformListener(self._tf_buffer, self)
 
         # Latest occupancy map published by slam_toolbox.
         self._latest_map: Optional[Dict] = None
@@ -161,17 +168,11 @@ class BridgeNode(Node):
             if self._cb_misc is not None
             else {}
         )
-        self.create_subscription(
-            Twist, "cmd_vel", self._guarded(self._on_cmd_vel), 10, **sub_kwargs
-        )
-        # Nav2 topic chain differs depending on collision monitor / velocity
-        # smoother wiring. Accept all common variants and apply only while a nav
-        # goal is active.
+        # Drive only from the velocity smoother output. Subscribing to cmd_vel_nav
+        # (raw MPPI) as well made latest-wins pick unsmoothed commands and caused
+        # overshoot on momentum-heavy bases like the MiR.
         self.create_subscription(
             Twist, "cmd_vel_smoothed", self._guarded(self._on_cmd_vel), 10, **sub_kwargs
-        )
-        self.create_subscription(
-            Twist, "cmd_vel_nav", self._guarded(self._on_cmd_vel), 10, **sub_kwargs
         )
         self._map_sub = self.create_subscription(
             OccupancyGrid, "map", self._guarded(self._on_map), _LATCHED_QOS, **sub_kwargs
@@ -217,7 +218,7 @@ class BridgeNode(Node):
             pass
         self._pending_cmd_vel: Optional[tuple] = None
         self._cmd_vel_lock = threading.Lock()
-        self.create_timer(0.1, self._guarded(self._on_drive_timer), **drive_timer_kwargs)
+        self.create_timer(0.05, self._guarded(self._on_drive_timer), **drive_timer_kwargs)
 
         # Action client (created lazily once Nav2 is running) ----------------
         self._nav_action: Optional[ActionClient] = None
@@ -378,9 +379,12 @@ class BridgeNode(Node):
             return
         self._empty_scan_warned = False
 
-        # Stamp at publish time and refresh odom TF to match so Nav2 accepts scans.
+        # Fresh stamp + synchronized odom TF. Lidar reads block the module asyncio
+        # loop (MiR rosbridge), so _last_odom_stamp can lag seconds behind the TF
+        # cache while scans still carry that stale time — Nav2 then drops them.
         stamp = self.get_clock().now().to_msg()
-        self._publish_odom_snapshot(stamp, *self._last_twist)
+        vx, vy, vtheta = self._last_twist
+        self._publish_odom_snapshot(stamp, vx, vy, vtheta)
         for i, scan in per_lidar_scans:
             self._scan_pubs[i].publish(self._to_ros_scan(scan, f"laser_{i}", stamp))
 
@@ -472,6 +476,9 @@ class BridgeNode(Node):
         self, stamp, vx: float, vy: float, vtheta: float
     ) -> None:
         """Publish cached odom pose + TF at ``stamp`` (also used to sync with scans)."""
+        # Snapshot the reference once: the scan timer and odom timer run on
+        # different executor threads, and Pose2D is reassigned atomically.
+        pose = self._odom
         self._last_odom_stamp = stamp
         self._last_odom_pub_wall = time.monotonic()
         self._last_twist = (vx, vy, vtheta)
@@ -479,9 +486,9 @@ class BridgeNode(Node):
         odom.header.stamp = stamp
         odom.header.frame_id = self._frames.odom
         odom.child_frame_id = self._frames.base_link
-        odom.pose.pose.position.x = self._odom.x
-        odom.pose.pose.position.y = self._odom.y
-        odom.pose.pose.orientation = _quat_msg(self._odom.theta)
+        odom.pose.pose.position.x = pose.x
+        odom.pose.pose.position.y = pose.y
+        odom.pose.pose.orientation = _quat_msg(pose.theta)
         odom.twist.twist.linear.x = vx
         odom.twist.twist.linear.y = vy
         odom.twist.twist.angular.z = vtheta
@@ -491,17 +498,17 @@ class BridgeNode(Node):
         t.header.stamp = stamp
         t.header.frame_id = self._frames.odom
         t.child_frame_id = self._frames.base_link
-        t.transform.translation.x = self._odom.x
-        t.transform.translation.y = self._odom.y
-        t.transform.rotation = _quat_msg(self._odom.theta)
+        t.transform.translation.x = pose.x
+        t.transform.translation.y = pose.y
+        t.transform.rotation = _quat_msg(pose.theta)
         self._tf_broadcaster.sendTransform(t)
 
     # -- cmd_vel + watchdog --------------------------------------------------
     def _on_cmd_vel(self, msg: Twist) -> None:
         """Stash the newest velocity command; never block in the callback.
 
-        Nav2 publishes on cmd_vel_nav and cmd_vel_smoothed at ~20 Hz each while
-        a Viam->base call can take 100-300 ms. Driving the base inline made
+        Nav2's velocity_smoother publishes ramped velocities on cmd_vel_smoothed.
+        A Viam->base call can take 100-300 ms. Driving the base inline made
         callbacks queue up, so the robot executed velocity commands that were
         seconds stale. Latest-wins dispatch happens on _on_drive_timer.
         """
@@ -521,8 +528,12 @@ class BridgeNode(Node):
             self._pending_cmd_vel = None
         if pending is None or not self._nav_active:
             return
+        vx, vy, vtheta = pending
+        # Snap near-zero commands so the MiR does not creep past the goal.
+        if abs(vx) < 0.03 and abs(vy) < 0.03 and abs(vtheta) < 0.05:
+            vx, vy, vtheta = 0.0, 0.0, 0.0
         try:
-            self._run(self._io.drive_base(*pending))
+            self._run(self._io.drive_base(vx, vy, vtheta))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f"drive_base failed: {exc!r}")
 
@@ -568,6 +579,8 @@ class BridgeNode(Node):
             # Avoid the watchdog calling stop_base before Nav2 publishes the first cmd_vel.
             self._last_cmd_time = time.time()
         else:
+            with self._cmd_vel_lock:
+                self._pending_cmd_vel = None
             try:
                 self._run(self._io.stop_base())
             except Exception:  # noqa: BLE001
@@ -614,10 +627,49 @@ class BridgeNode(Node):
         if self._nav_action is None:
             self._nav_action = ActionClient(self, NavigateToPose, _NAV_ACTION_CLIENT_NAME)
 
+    def _wait_for_map_tf(self, timeout_s: float = 8.0) -> bool:
+        """Block until map->base_link is available (post-localize / set_initial_pose).
+
+        Uses a raw TF lookup, not get_pose_in_map(): that helper falls back to a
+        cached pose on lookup failure, which would defeat this readiness check.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self._lookup_pose_in_map() is not None:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _goal_pose_stamp(self):
+        """Use latest-available TF; avoids extrapolation when slam lags scan stamps."""
+        try:
+            from builtin_interfaces.msg import Time as TimeMsg
+
+            return TimeMsg(sec=0, nanosec=0)
+        except ImportError:
+            return self.get_clock().now().to_msg()
+
     def send_nav_goal(self, x: float, y: float, theta: float) -> bool:
         """Send a map-frame goal to Nav2."""
         if NavigateToPose is None:
             raise RuntimeError(f"Nav2 action {_NAV_ACTION_NAME!r} unavailable")
+        # Shorter wait once localization has succeeded before: we would proceed
+        # anyway, so do not add 8s of latency to every goal on a stale buffer.
+        tf_wait_s = 8.0 if self._last_pose_in_map is None else 3.0
+        if not self._wait_for_map_tf(timeout_s=tf_wait_s):
+            # Only hard-fail when localization has never succeeded. A stale
+            # bridge-local TF buffer must not block goals: bt_navigator has its
+            # own buffer and is the real authority, and will abort visibly if
+            # the map pose is truly unavailable.
+            if self._last_pose_in_map is None:
+                raise RuntimeError(
+                    "map->base_link transform not available; run set_initial_pose "
+                    "or global_localize and wait for localization before navigating"
+                )
+            self.get_logger().warn(
+                "map->base_link lookup timed out but localization previously "
+                "succeeded; sending goal anyway (Nav2 aborts if pose is unavailable)"
+            )
         self._ensure_nav_action_client()
         if self._wait_for_rclpy_action_server():
             self._cancel_inflight_nav()
@@ -820,7 +872,7 @@ class BridgeNode(Node):
         goal = NavigateToPose.Goal()
         pose = PoseStamped()
         pose.header.frame_id = self._frames.map
-        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.header.stamp = self._goal_pose_stamp()
         pose.pose.position.x = float(x)
         pose.pose.position.y = float(y)
         pose.pose.orientation = _quat_msg(theta)
@@ -967,7 +1019,8 @@ class BridgeNode(Node):
         if not enabled:
             self._latest_map = None
 
-    def get_pose_in_map(self) -> Optional[conv.Pose2D]:
+    def _lookup_pose_in_map(self) -> Optional[conv.Pose2D]:
+        """Raw map->base_link TF lookup; None when unavailable (no cache fallback)."""
         try:
             lookup_kwargs: Dict = {}
             try:
@@ -983,10 +1036,15 @@ class BridgeNode(Node):
                 **lookup_kwargs,
             )
         except Exception:  # noqa: BLE001 - transform may not be available yet
-            return self._last_pose_in_map
+            return None
         t = tf.transform.translation
         q = tf.transform.rotation
-        pose = conv.Pose2D(t.x, t.y, conv.quaternion_to_yaw(q.x, q.y, q.z, q.w))
+        return conv.Pose2D(t.x, t.y, conv.quaternion_to_yaw(q.x, q.y, q.z, q.w))
+
+    def get_pose_in_map(self) -> Optional[conv.Pose2D]:
+        pose = self._lookup_pose_in_map()
+        if pose is None:
+            return self._last_pose_in_map
         self._last_pose_in_map = pose
         return pose
 

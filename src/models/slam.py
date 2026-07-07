@@ -384,7 +384,13 @@ class RosSlam(SLAM):
             )
 
         async def stop_base():
-            await self._base.stop()
+            # MiR base.stop() also calls REST stop_immediately (PAUSE), which
+            # drops Manualcontrol and kills the rosbridge /cmd_vel session — breaking
+            # go_to_position and the next navigate_to_location. Nav2 only needs zeros.
+            await self._base.set_velocity(
+                linear=Vector3(x=0.0, y=0.0, z=0.0),
+                angular=Vector3(x=0.0, y=0.0, z=0.0),
+            )
 
         return IOProvider(read_lidar_points, read_odometry, drive_base, stop_base)
 
@@ -503,7 +509,10 @@ class RosSlam(SLAM):
             if name:
                 store.get_or_create_map(str(name))
                 store.set_active_map(str(name))
-            self._start_mode(MODE_MAPPING)
+            # Subprocess-heavy manager calls must stay off the module event
+            # loop: the bridge marshals odom/lidar/cmd_vel onto it, so blocking
+            # here stalls TF and scans.
+            await asyncio.to_thread(self._start_mode, MODE_MAPPING)
             return {"status": "mapping", "map": store.get_active_map_name()}
 
         if cmd == "start_localizing":
@@ -513,7 +522,7 @@ class RosSlam(SLAM):
             handle = store.active_handle()
             if not handle or not handle.has_serialized_map():
                 raise ValueError("active map has no saved data; map it first")
-            self._start_mode(MODE_LOCALIZING)
+            await asyncio.to_thread(self._start_mode, MODE_LOCALIZING)
             result: dict[str, ValueTypes] = {
                 "status": "localizing",
                 "map": store.get_active_map_name(),
@@ -530,12 +539,14 @@ class RosSlam(SLAM):
             handle = store.active_handle()
             if not handle:
                 raise ValueError("no active map")
-            mgr.save_map(handle.serialization_stem)
+            # save_map runs ros2 CLI subprocesses (30-40s timeouts); keep the
+            # event loop free so mapping TF/scans continue while saving.
+            await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
             return {"status": "saved", "map": handle.name}
 
         if cmd == "set_initial_pose":
             pose = self._resolve_pose(command)
-            mgr.set_initial_pose(pose)
+            await asyncio.to_thread(mgr.set_initial_pose, pose)
             return {"status": "ok"}
 
         if cmd in ("relocalize", "refine_localization"):

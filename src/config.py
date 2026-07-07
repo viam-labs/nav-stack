@@ -131,11 +131,14 @@ class Nav2Config:
     xy_goal_tolerance: float = 0.25  # meters
     yaw_goal_tolerance: float = 0.25  # radians
     planner_tolerance: float = 0.5  # meters
-    cost_scaling_factor: float = 3.0
+    cost_scaling_factor: float = 4.0
     local_costmap_width: float = 4.0  # meters
     local_costmap_height: float = 4.0  # meters
     costmap_resolution: float = 0.05  # meters/cell
-    controller_frequency: float = 20.0  # Hz
+    # Must match the params template default: this dict always overrides the
+    # template, so a stale default here silently clobbers template retuning.
+    # 10 Hz (not Nav2's stock 20) keeps MPPI within a Pi 5's budget.
+    controller_frequency: float = 10.0  # Hz
 
     def to_override_dict(self) -> dict:
         """Flat leaf keys applied to the generated Nav2 params template.
@@ -160,11 +163,11 @@ class Nav2Config:
             xy_goal_tolerance=float(d.get("xy_goal_tolerance", 0.25)),
             yaw_goal_tolerance=float(d.get("yaw_goal_tolerance", 0.25)),
             planner_tolerance=float(d.get("planner_tolerance", 0.5)),
-            cost_scaling_factor=float(d.get("cost_scaling_factor", 3.0)),
+            cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),
             local_costmap_width=float(d.get("local_costmap_width", 4.0)),
             local_costmap_height=float(d.get("local_costmap_height", 4.0)),
             costmap_resolution=float(d.get("costmap_resolution", 0.05)),
-            controller_frequency=float(d.get("controller_frequency", 20.0)),
+            controller_frequency=float(d.get("controller_frequency", 10.0)),
         )
 
 
@@ -332,7 +335,7 @@ class NavConfig:
     max_vel_theta: float = 1.0  # rad/s
     acc_lim_x: float = 1.0
     acc_lim_theta: float = 2.0
-    inflation_radius: float = 0.45
+    inflation_radius: float = 0.55
     cmd_vel_timeout: float = 2.0  # seconds (watchdog)
     nav2: Nav2Config = field(default_factory=Nav2Config)
     nav2_params: Mapping = field(default_factory=dict)
@@ -354,7 +357,7 @@ class NavConfig:
             max_vel_theta=float(d.get("max_vel_theta", 1.0)),
             acc_lim_x=float(d.get("acc_lim_x", 1.0)),
             acc_lim_theta=float(d.get("acc_lim_theta", 2.0)),
-            inflation_radius=float(d.get("inflation_radius", 0.45)),
+            inflation_radius=float(d.get("inflation_radius", 0.55)),
             cmd_vel_timeout=float(d.get("cmd_vel_timeout", 2.0)),
             nav2=Nav2Config.from_dict(d.get("nav2", {}) or {}),
             nav2_params=d.get("nav2_params", {}) or {},

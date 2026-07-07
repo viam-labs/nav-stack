@@ -39,6 +39,8 @@ def _nav_bridge_stub():
         _nav_active=True,
         get_logger=MagicMock(return_value=MagicMock()),
         set_nav_active=MagicMock(),
+        _wait_for_map_tf=MagicMock(return_value=True),
+        _last_pose_in_map=None,
     )
     return bridge
 
@@ -106,6 +108,31 @@ def test_flush_pending_nav_goal_runs_on_watchdog():
     assert bridge._pending_nav_goal is None
     assert outcome["ok"] is True
     assert done.is_set()
+    bridge._publish_nav_goal.assert_called_once_with(1.0, 2.0, 0.5)
+
+
+def test_send_nav_goal_fails_without_map_tf():
+    bridge = _nav_bridge_stub()
+    bridge._wait_for_map_tf = MagicMock(return_value=False)
+
+    with pytest.raises(RuntimeError, match="map->base_link transform not available"):
+        BridgeNode.send_nav_goal(bridge, 1.0, 2.0, 0.5)
+
+
+def test_send_nav_goal_proceeds_on_stale_tf_when_previously_localized():
+    from src.ros import conversions as conv
+
+    bridge = _nav_bridge_stub()
+    bridge._wait_for_map_tf = MagicMock(return_value=False)
+    bridge._last_pose_in_map = conv.Pose2D(1.0, 2.0, 0.0)
+    bridge._ensure_nav_action_client = MagicMock()
+    bridge._wait_for_rclpy_action_server = MagicMock(return_value=True)
+    bridge._cancel_inflight_nav = MagicMock()
+    bridge._publish_nav_goal = MagicMock(return_value=True)
+
+    ok = BridgeNode.send_nav_goal(bridge, 1.0, 2.0, 0.5)
+
+    assert ok is True
     bridge._publish_nav_goal.assert_called_once_with(1.0, 2.0, 0.5)
 
 
@@ -193,6 +220,40 @@ def test_on_drive_timer_sends_latest_and_clears():
     bridge._run.reset_mock()
     BridgeNode._on_drive_timer(bridge)
     bridge._run.assert_not_called()
+
+
+def test_on_drive_timer_snaps_near_zero_to_stop():
+    lock = __import__("threading").Lock()
+    io = SimpleNamespace(drive_base=MagicMock(return_value="coro"))
+    bridge = SimpleNamespace(
+        _nav_active=True,
+        _cmd_vel_lock=lock,
+        _pending_cmd_vel=(0.01, 0.0, 0.02),
+        _io=io,
+        _run=MagicMock(),
+        get_logger=MagicMock(return_value=MagicMock()),
+    )
+
+    BridgeNode._on_drive_timer(bridge)
+
+    io.drive_base.assert_called_once_with(0.0, 0.0, 0.0)
+
+
+def test_set_nav_active_false_clears_pending_cmd_vel():
+    lock = __import__("threading").Lock()
+    io = SimpleNamespace(stop_base=MagicMock(return_value="coro"))
+    bridge = SimpleNamespace(
+        _nav_active=True,
+        _cmd_vel_lock=lock,
+        _pending_cmd_vel=(0.3, 0.0, 0.4),
+        _io=io,
+        _run=MagicMock(),
+    )
+
+    BridgeNode.set_nav_active(bridge, False)
+
+    assert bridge._pending_cmd_vel is None
+    bridge._run.assert_called_once_with("coro")
 
 
 def test_on_drive_timer_noop_when_nav_inactive():

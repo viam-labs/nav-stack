@@ -13,6 +13,7 @@ over DDS.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import os
 import shlex
@@ -60,6 +61,7 @@ class RosManager:
         self._nav_cfg: Optional[NavConfig] = None
         self._nav_params_path: Optional[Path] = None
         self._nav_action_ok_until = 0.0
+        self._nav2_params_sig = ""
         self._nav2_ensure_lock = threading.Lock()
         self._nav2_ensure_thread: Optional[threading.Thread] = None
         self._started = False
@@ -79,8 +81,13 @@ class RosManager:
             rclpy.init()
         self._loop = loop
         self._node = BridgeNode(self._slam_cfg, io, loop, nav_cfg=nav_cfg)
-        # Run callbacks concurrently so slow scan reads do not starve odom/tf updates.
-        self._executor = MultiThreadedExecutor(num_threads=4)
+        # The bridge has 4 callback sources that block on Viam IO (scan, odom,
+        # drive, watchdog/misc — each capped at 1 in-flight by its mutually
+        # exclusive callback group). With only 4 threads they can all be blocked
+        # at once, starving the TF listener subscription: the local TF buffer
+        # then goes stale and map->base_link lookups fail even while
+        # slam_toolbox publishes normally. Keep threads > max blocked callbacks.
+        self._executor = MultiThreadedExecutor(num_threads=8)
         self._executor.add_node(self._node)
         self._spin_thread = threading.Thread(target=self._spin, daemon=True)
         self._spin_thread.start()
@@ -235,20 +242,30 @@ class RosManager:
 
     def nav_action_ready(self) -> bool:
         now = time.monotonic()
-        if now < self._nav_action_ok_until and self.nav2_running():
+        if not self.nav2_running():
+            self._nav_action_ok_until = 0.0
+            return False
+        # Recently verified fully healthy: run only the cheapest check (one
+        # `ros2 node list`) instead of the ~7 CLI subprocesses (seconds each on
+        # a Pi). A vanished core node is a real crash and resets the grace
+        # window; action/lifecycle CLI flake alone must not block goals.
+        if now < self._nav_action_ok_until:
             if self._required_nav_nodes_present():
                 return True
             self._nav_action_ok_until = 0.0
-        if not self.nav2_running():
+        action_ok = self._nav_action_server_visible()
+        nodes_ok = self._required_nav_nodes_present()
+        if not (action_ok and nodes_ok):
             self._nav_action_ok_until = 0.0
-        ok = (
-            self._nav_action_server_visible()
-            and self._required_nav_nodes_present()
-            and self._required_nav_nodes_active()
-        )
-        if ok:
-            self._nav_action_ok_until = now + 30.0
-        return ok
+            return False
+        if self._required_nav_nodes_active():
+            self._nav_action_ok_until = now + 60.0
+            return True
+        # Lifecycle CLI is slow on Pi; keep accepting goals briefly if we were
+        # recently healthy so a transient lifecycle query does not block nav.
+        if now < self._nav_action_ok_until:
+            return True
+        return False
 
     def wait_for_nav_action(self, timeout: float = 90.0) -> bool:
         return self._wait_for_nav_action(timeout=timeout)
@@ -381,6 +398,7 @@ class RosManager:
             try:
                 self._launch_slam(map_stem, mode)
                 self._activate_slam_lifecycle()
+                self._apply_slam_tf_params()
                 return
             except RuntimeError as exc:
                 last_error = exc
@@ -422,10 +440,10 @@ class RosManager:
             }
         }
         rp = params["slam_toolbox"]["ros__parameters"]
-        # slam_toolbox stamps map->odom as last-scan-time + transform_timeout.
-        # Slow MiR lidar reads can gap scans by ~10s; future-stamp the transform
-        # so Nav2's controller does not reject it as stale between scans.
-        rp.setdefault("transform_timeout", 5.0)
+        # slam_toolbox stamps map->odom at scan_time + transform_timeout. Any
+        # positive value makes map->odom newer than odom->base_link (same scan
+        # stamp) and Nav2 TF lookups fail with extrapolation errors.
+        rp.setdefault("transform_timeout", 0.0)
         rp.setdefault("tf_buffer_duration", 60.0)
         rp.setdefault("transform_publish_period", 0.02)
         if map_stem and Path(str(map_stem) + ".posegraph").exists():
@@ -483,10 +501,42 @@ class RosManager:
         return self._slam_proc is not None and self._slam_proc.poll() is None
 
     # -- Nav2 ----------------------------------------------------------------
+    def _wait_for_map_tf_before_nav2(self, timeout: float = 30.0) -> None:
+        """Delay Nav2 launch until localization publishes map->base_link.
+
+        Launching earlier makes global_costmap activation wait on a transform
+        stamped at its own start time; if TF appears later, that fixed stamp
+        ages out of the buffer and bringup spins for minutes before aborting.
+        """
+        node = self._node
+        if node is None:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if node._lookup_pose_in_map() is not None:
+                    return
+            except Exception:  # noqa: BLE001 - lookup is best-effort
+                pass
+            time.sleep(0.5)
+        self._log(
+            "map->base_link TF not available before Nav2 launch; launching anyway "
+            "(costmaps may fail to activate until localization is running)"
+        )
+
+    @staticmethod
+    def _params_file_sig(params_path: Path) -> str:
+        try:
+            return hashlib.sha256(Path(params_path).read_bytes()).hexdigest()
+        except OSError:
+            return ""
+
     def start_nav2(self, nav_cfg: NavConfig, params_path: Path) -> None:
         self._nav_cfg = nav_cfg
         self._nav_params_path = params_path
+        self._nav2_params_sig = self._params_file_sig(params_path)
         self.stop_nav2()
+        self._wait_for_map_tf_before_nav2()
         # Core Nav2 (planner, controller, costmaps, BT, behaviors). slam_toolbox
         # supplies /map and map->odom, so no map_server/AMCL here.
         self._nav2_procs.append(
@@ -497,6 +547,12 @@ class RosManager:
                  "use_composition:=False"]
             )
         )
+        # Jazzy navigation_launch.py always starts collision_monitor and a
+        # built-in lifecycle manager anyway (no use_collision_monitor arg).
+        # collision_monitor crashes on our disabled config; the built-in manager
+        # then waits forever. Our override lifecycle manager owns activation.
+        self._suppress_jazzy_nav2_extras()
+        self._apply_slam_tf_params()
         # Costmap filter info servers for keepout + speed zones. The mask
         # OccupancyGrids themselves are published by the bridge; these servers
         # publish the matching CostmapFilterInfo. They are lifecycle nodes, managed
@@ -586,6 +642,35 @@ class RosManager:
         else:
             self._log("Nav2 started but /navigate_to_pose is not ready yet")
 
+    def _apply_slam_tf_params(self) -> None:
+        """Push slam_toolbox TF timing params onto a running node (no restart needed)."""
+        if not self.slam_running():
+            return
+        self._run_ros(
+            [
+                "ros2",
+                "param",
+                "set",
+                "/slam_toolbox",
+                "transform_timeout",
+                "0.0",
+            ],
+            timeout=5.0,
+        )
+
+    def _suppress_jazzy_nav2_extras(self) -> None:
+        """Remove Nav2 bringup nodes that conflict with our lifecycle override."""
+        time.sleep(3.0)
+        for pattern in (
+            "nav2_collision_monitor/collision_monitor",
+            "__node:=lifecycle_manager_navigation",
+        ):
+            subprocess.run(
+                ["pkill", "-f", pattern],
+                env=self._ros_env(),
+                check=False,
+            )
+
     def stop_nav2(self) -> None:
         self._nav_action_ok_until = 0.0
         if self._node is not None:
@@ -662,6 +747,11 @@ class RosManager:
         node_proc = self._run_ros(["ros2", "node", "list"])
         lifecycle_proc = self._run_ros(["ros2", "lifecycle", "get", "/bt_navigator"])
         controller_proc = self._run_ros(["ros2", "lifecycle", "get", "/controller_server"])
+        # Read back the frequency the running controller actually loaded, so a
+        # stale Nav2 running old params is visible directly in get_status.
+        freq_proc = self._run_ros(
+            ["ros2", "param", "get", "/controller_server", "controller_frequency"]
+        )
         log_path = self._scratch / "nav2_launch.log"
         log_tail = ""
         if log_path.exists():
@@ -694,6 +784,9 @@ class RosManager:
             "controller_server_lifecycle": (
                 controller_proc.stdout or controller_proc.stderr or ""
             ).strip(),
+            "controller_frequency_loaded": (
+                freq_proc.stdout or freq_proc.stderr or ""
+            ).strip(),
             "bt_navigator_lifecycle": (lifecycle_proc.stdout or lifecycle_proc.stderr or "").strip(),
             "nav2_log_errors": self._nav2_log_errors(),
             "nav2_log_tail": log_tail,
@@ -703,7 +796,13 @@ class RosManager:
     def ensure_nav2(self, nav_cfg: NavConfig, params_path: Path) -> None:
         """Start or restart Nav2 until ``/navigate_to_pose`` is available."""
         if self.nav_action_ready():
-            return
+            # Nav2 params are only read at process start. If the generated
+            # params changed (retuning, module update), a healthy Nav2 is still
+            # running with stale settings and must be restarted to apply them.
+            if self._nav2_params_sig and self._params_file_sig(params_path) == self._nav2_params_sig:
+                return
+            self._log("Nav2 params changed since launch; restarting Nav2 to apply them")
+            self.stop_nav2()
 
         last_detail: Optional[Dict] = None
         for attempt in range(1, 4):
@@ -769,6 +868,13 @@ class RosManager:
                 "Nav2 is still starting up in the background; retry in a few seconds "
                 "(check progress with the get_status command)"
             )
+        self._apply_slam_tf_params()
+        # Cancel any stuck recovery / prior goal so a second navigate_to_location
+        # cannot appear to do nothing while BT is still busy.
+        try:
+            node.cancel_nav()
+        except Exception:  # noqa: BLE001
+            pass
         if self._nav_cfg is not None and self._nav_params_path is not None and not self.nav_action_ready():
             self._log("Nav2 not healthy during navigate; ensuring Nav2 before sending goal")
             self.ensure_nav2(self._nav_cfg, self._nav_params_path)

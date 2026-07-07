@@ -66,6 +66,12 @@ def test_activate_slam_lifecycle_raises_when_node_missing():
             mgr._activate_slam_lifecycle()
 
 
+def test_slam_params_use_small_transform_timeout(tmp_path):
+    mgr = _manager()
+    params = mgr._slam_params(tmp_path / "map", "localizing")
+    assert params["slam_toolbox"]["ros__parameters"]["transform_timeout"] == 0.0
+
+
 def test_set_initial_pose_delegates_to_bridge_node():
     mgr = _manager()
     mgr._node = MagicMock()
@@ -75,6 +81,17 @@ def test_set_initial_pose_delegates_to_bridge_node():
 
     run.assert_called_once()
     mgr._node.set_initial_pose.assert_called_once()
+
+
+def test_navigate_cancels_prior_goal():
+    mgr = _manager()
+    mgr._node = MagicMock()
+    mgr._node.send_nav_goal.return_value = True
+    with patch.object(mgr, "nav_action_ready", return_value=True), patch.object(
+        mgr, "_apply_slam_tf_params"
+    ):
+        mgr.navigate(1.0, 2.0, 0.5)
+    mgr._node.cancel_nav.assert_called_once()
 
 
 def test_navigate_retries_after_ensuring_nav2_when_action_unavailable():
@@ -89,11 +106,51 @@ def test_navigate_retries_after_ensuring_nav2_when_action_unavailable():
 
     with patch.object(mgr, "ensure_nav2") as ensure, patch.object(
         mgr, "nav_action_ready", return_value=True
-    ):
+    ), patch.object(mgr, "_apply_slam_tf_params"):
         mgr.navigate(1.0, 2.0, 0.5)
 
+    mgr._node.cancel_nav.assert_called_once()
     ensure.assert_called_once_with(mgr._nav_cfg, mgr._nav_params_path)
     assert mgr._node.send_nav_goal.call_count == 2
+
+
+def test_apply_slam_tf_params_sets_transform_timeout():
+    mgr = _manager()
+    mgr._slam_proc = MagicMock()
+    mgr._slam_proc.poll.return_value = None
+    with patch.object(mgr, "_run_ros") as run:
+        mgr._apply_slam_tf_params()
+    run.assert_called_once()
+    assert run.call_args.args[0][-1] == "0.0"
+
+
+def test_suppress_jazzy_nav2_extras_pkill_patterns():
+    mgr = _manager()
+    with patch.object(mgr, "_ros_env", return_value={"PATH": "/usr/bin"}), patch(
+        "src.ros.manager.time.sleep"
+    ), patch("src.ros.manager.subprocess.run") as run:
+        mgr._suppress_jazzy_nav2_extras()
+    assert run.call_count == 2
+    patterns = [call.args[0][2] for call in run.call_args_list]
+    assert "nav2_collision_monitor/collision_monitor" in patterns
+    assert "__node:=lifecycle_manager_navigation" in patterns
+
+
+def test_wait_for_map_tf_before_nav2_returns_once_tf_available():
+    mgr = _manager()
+    node = MagicMock()
+    node._lookup_pose_in_map.side_effect = [None, MagicMock()]
+    mgr._node = node
+
+    mgr._wait_for_map_tf_before_nav2(timeout=5.0)
+
+    assert node._lookup_pose_in_map.call_count == 2
+
+
+def test_wait_for_map_tf_before_nav2_noop_without_node():
+    mgr = _manager()
+    mgr._node = None
+    mgr._wait_for_map_tf_before_nav2(timeout=0.1)
 
 
 def test_start_nav2_disables_collision_monitor_launch_arg(tmp_path):
@@ -108,9 +165,16 @@ def test_start_nav2_disables_collision_monitor_launch_arg(tmp_path):
     with patch.object(mgr, "stop_nav2"), patch.object(
         mgr, "_popen", return_value=proc
     ) as popen, patch.object(mgr, "_wait_for_nav_action", return_value=False), patch.object(
+        mgr, "_suppress_jazzy_nav2_extras"
+    ) as suppress, patch.object(
+        mgr, "_apply_slam_tf_params"
+    ) as apply_tf, patch.object(
         mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout="", stderr="")
     ):
         mgr.start_nav2(nav_cfg, params_path)
+
+    suppress.assert_called_once()
+    apply_tf.assert_called_once()
 
     launch_args = popen.call_args_list[0].args[0]
     assert "autostart:=false" in launch_args
@@ -142,6 +206,40 @@ def test_nav_action_ready_invalidates_cache_when_nodes_missing():
     ):
         assert mgr.nav_action_ready() is False
     assert mgr._nav_action_ok_until == 0.0
+
+
+def test_ensure_nav2_returns_early_when_params_unchanged(tmp_path):
+    mgr = _manager()
+    params_path = tmp_path / "nav2_params.yaml"
+    params_path.write_text("a: 1", encoding="utf-8")
+    mgr._nav2_params_sig = mgr._params_file_sig(params_path)
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+
+    with patch.object(mgr, "nav_action_ready", return_value=True), patch.object(
+        mgr, "stop_nav2"
+    ) as stop, patch.object(mgr, "start_nav2") as start:
+        mgr.ensure_nav2(nav_cfg, params_path)
+
+    stop.assert_not_called()
+    start.assert_not_called()
+
+
+def test_ensure_nav2_restarts_when_params_changed(tmp_path):
+    mgr = _manager()
+    params_path = tmp_path / "nav2_params.yaml"
+    params_path.write_text("a: 1", encoding="utf-8")
+    mgr._nav2_params_sig = "stale-signature-from-old-params"
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+
+    with patch.object(mgr, "nav_action_ready", return_value=True), patch.object(
+        mgr, "stop_nav2"
+    ) as stop, patch.object(mgr, "nav2_running", return_value=False), patch.object(
+        mgr, "start_nav2"
+    ) as start, patch.object(mgr, "wait_for_nav_action", return_value=True):
+        mgr.ensure_nav2(nav_cfg, params_path)
+
+    stop.assert_called_once()
+    start.assert_called_once_with(nav_cfg, params_path)
 
 
 def test_ensure_nav2_retries_three_times_then_raises():

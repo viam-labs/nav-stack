@@ -170,7 +170,9 @@ publishes the best pose at the end, so early weak passes do not lock in a bad se
 
 `mode` changes take effect on reconfigure (or via `start_mapping` / `start_localizing` DoCommands).
 
-For **MiR250** bases (`viam-labs:mir-base`), set `"base_velocity_convention": "mir"` so forward Nav2 commands map to Viam `linear.y` (MiR expects forward on Y, not X). Odometry from `viam-labs:mir-base:movement` stays in ROS convention and does not need swapping.
+For **MiR250** bases (`viam-labs:mir-base`), set `"base_velocity_convention": "mir"` so forward Nav2 commands map to Viam `linear.y` (MiR expects forward on Y, not X). Odometry from `viam-labs:mir-base:movement` stays in ROS convention and does not need swapping. Nav-stack stops Nav2 motion with `set_velocity(0)` (not `Base.stop()`), so MiR Manualcontrol and `go_to_position` keep working after a navigation cancel or goal completion.
+
+The MiR250 is **differential drive** — use `"kinematics": "differential"` (the default). Configuring `omni` (or an `Omni` MPPI motion model) makes Nav2 command lateral velocities the robot cannot execute, which stalls progress near goals and triggers endless spin recoveries. Also avoid `"vx_min": 0`: with reverse disabled, a diff-drive robot must rotate fully around to correct small overshoots.
 
 For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a single `get_readings()` per odom tick. It uses **`odom_position_x_m` / `odom_position_y_m` / `odom_yaw_deg`** when present (true `/odom` frame from mir-base ≥ the odom-fields update). Map-frame `position_x_m`/`position_y_m` and fused `yaw_deg` are **not** used for `/odom` — slam_toolbox needs a smooth odom frame. Until mir-base exposes the odom fields, orientation falls back to velocity integration; upgrade mir-base or patch it to publish `odom_*` keys from the parsed `/odom` message. Raise `mir_rosbridge_timeout_s` (≥5) and `odom_rate_hz` (≥15) if updates lag.
 
@@ -280,6 +282,11 @@ await nav.do_command({"command": "navigate_to_location", "name": "kitchen"})
 await nav.do_command({"command": "navigate_to_point", "x": 3.5, "y": -1.0})
 await nav.do_command({"command": "get_status"})
 await nav.do_command({"command": "cancel"})
+
+# Force Nav2 to stop and relaunch with freshly generated params (param
+# changes normally apply automatically on reconfigure; this is the manual
+# override). get_status includes "controller_frequency_loaded" to verify.
+await nav.do_command({"command": "restart_nav2"})
 ```
 
 Locations CRUD: `add_location`, `get_location`, `list_locations`,

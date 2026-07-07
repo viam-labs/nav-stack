@@ -436,3 +436,21 @@ def test_get_point_cloud_map_shows_current_generation():
 
     chunks = asyncio.run(slam.get_point_cloud_map())
     assert b"POINTS 4" in chunks[0]
+
+
+def test_stop_base_zeros_velocity_without_full_stop():
+    slam = RosSlam("slam")
+    slam._cfg = MagicMock(base_velocity_convention="mir")
+    slam._base = AsyncMock()
+    slam._movement_sensor = None
+    slam._lidars = {}
+
+    io = slam._build_io()
+    asyncio.run(io.stop_base())
+
+    slam._base.stop.assert_not_called()
+    slam._base.set_velocity.assert_awaited_once()
+    kwargs = slam._base.set_velocity.await_args.kwargs
+    assert kwargs["linear"].x == 0.0
+    assert kwargs["linear"].y == 0.0
+    assert kwargs["angular"].z == 0.0

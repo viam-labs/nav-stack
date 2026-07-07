@@ -61,6 +61,52 @@ def _odom_bridge_stub(*, sample: conv.OdomReading):
     return bridge
 
 
+def test_scan_timer_syncs_odom_and_scan_stamp(monkeypatch):
+    import numpy as np
+
+    stamp = MagicMock(name="stamp")
+    clock = MagicMock(now=MagicMock(return_value=MagicMock(to_msg=MagicMock(return_value=stamp))))
+    scan = conv.LaserScan2D(
+        ranges=np.array([1.0, 2.0]),
+        angle_min=-1.0,
+        angle_increment=0.1,
+        range_min=0.1,
+        range_max=10.0,
+    )
+    lidar_pts = conv.LidarPoints(
+        sensor=np.array([[1.0, 0.0, 0.0]]),
+        base_link=np.array([[1.0, 0.0, 0.0]]),
+        sensor_scan=scan,
+    )
+    bridge = SimpleNamespace(
+        _io=SimpleNamespace(read_lidar_points=MagicMock()),
+        _slam_cfg=SimpleNamespace(
+            lidars=[MagicMock(name="l0", z_min=-0.5, z_max=0.5, min_range=0.1, max_range=10.0)],
+            scan_bins=360,
+            sensor_read_timeout_s=1.0,
+        ),
+        _run=lambda coro, timeout=None: lidar_pts,
+        _empty_scan_warned=False,
+        _last_twist=(0.2, 0.0, 0.1),
+        _frames=SimpleNamespace(base_link="base_link"),
+        get_clock=MagicMock(return_value=clock),
+        _publish_odom_snapshot=MagicMock(),
+        _scan_pubs=[MagicMock()],
+        _merged_scan_pub=MagicMock(),
+        get_logger=MagicMock(return_value=MagicMock()),
+    )
+    bridge._to_ros_scan = lambda s, frame, st: SimpleNamespace(
+        header=SimpleNamespace(stamp=st, frame_id=frame)
+    )
+    monkeypatch.setattr("src.ros.bridge.conv.points_to_scan", lambda *a, **k: scan)
+
+    BridgeNode._on_scan_timer(bridge)
+
+    bridge._publish_odom_snapshot.assert_called_once_with(stamp, 0.2, 0.0, 0.1)
+    published = bridge._merged_scan_pub.publish.call_args[0][0]
+    assert published.header.stamp is stamp
+
+
 def test_publish_odom_snapshot_updates_twist_and_publishes():
     bridge = SimpleNamespace(
         _odom=conv.Pose2D(1.0, 2.0, 0.25),
@@ -247,6 +293,7 @@ def test_get_pose_in_map_returns_cached_pose_on_lookup_failure():
         _tf_buffer=SimpleNamespace(lookup_transform=MagicMock(return_value=tf)),
         _last_pose_in_map=None,
     )
+    bridge._lookup_pose_in_map = lambda: BridgeNode._lookup_pose_in_map(bridge)
 
     pose = BridgeNode.get_pose_in_map(bridge)
     assert pose is not None

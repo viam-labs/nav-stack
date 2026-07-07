@@ -156,6 +156,27 @@ def test_slam_params_use_viam_config(tmp_path):
     assert rp["map_update_interval"] == 2.0
 
 
+def test_apply_nav2_tuning_only_updates_planner_tolerance():
+    from src.models.navigation import _apply_nav2_tuning
+
+    params = {
+        "planner_server": {"ros__parameters": {"GridBased": {"tolerance": 0.5}}},
+        "smoother_server": {
+            "ros__parameters": {"simple_smoother": {"tolerance": 1.0e-10}}
+        },
+        "general_goal_checker": {"xy_goal_tolerance": 0.25},
+    }
+    _apply_nav2_tuning(
+        params, {"tolerance": 0.35, "xy_goal_tolerance": 0.4, "robot_radius": 0.3}
+    )
+    assert params["planner_server"]["ros__parameters"]["GridBased"]["tolerance"] == 0.35
+    assert (
+        params["smoother_server"]["ros__parameters"]["simple_smoother"]["tolerance"]
+        == 1.0e-10
+    )
+    assert params["general_goal_checker"]["xy_goal_tolerance"] == 0.4
+
+
 def test_nav2_config_from_attributes():
     cfg = NavConfig.from_dict(
         {
