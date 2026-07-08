@@ -12,7 +12,7 @@
     {
       "api": "rdk:service:generic",
       "model": "viam-labs:nav-stack:navigation",
-      "short_description": "Navigation service wrapping ROS2 Nav2: named locations, go-to-point, keepout/speed zones, and obstacle avoidance via DoCommand."
+      "short_description": "Nav2 navigation: named locations, go-to-point, zones, obstacle avoidance via DoCommand."
     }
   ],
   "entrypoint": "run.sh",
