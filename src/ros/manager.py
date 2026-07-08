@@ -531,11 +531,26 @@ class RosManager:
         except OSError:
             return ""
 
+    def _rotate_nav2_log(self) -> None:
+        """Start each Nav2 launch with a fresh log.
+
+        The log is opened in append mode by every child process; without
+        rotation, get_status diagnostics surface error lines from launches that
+        happened hours or days ago, which is badly misleading.
+        """
+        log_path = self._scratch / "nav2_launch.log"
+        if log_path.exists():
+            try:
+                log_path.replace(log_path.with_name("nav2_launch.log.prev"))
+            except OSError:
+                pass
+
     def start_nav2(self, nav_cfg: NavConfig, params_path: Path) -> None:
         self._nav_cfg = nav_cfg
         self._nav_params_path = params_path
         self._nav2_params_sig = self._params_file_sig(params_path)
         self.stop_nav2()
+        self._rotate_nav2_log()
         self._wait_for_map_tf_before_nav2()
         # Core Nav2 (planner, controller, costmaps, BT, behaviors). slam_toolbox
         # supplies /map and map->odom, so no map_server/AMCL here.
@@ -658,18 +673,50 @@ class RosManager:
             timeout=5.0,
         )
 
+    _SUPPRESS_WINDOW_S = 25.0
+
     def _suppress_jazzy_nav2_extras(self) -> None:
-        """Remove Nav2 bringup nodes that conflict with our lifecycle override."""
-        time.sleep(3.0)
-        for pattern in (
+        """Remove Nav2 bringup nodes that conflict with our lifecycle override.
+
+        navigation_launch.py always spawns collision_monitor and a built-in
+        ``lifecycle_manager_navigation``. collision_monitor crashes on our
+        disabled config; the built-in manager (autostart) then fights our
+        override for control of the same nodes, so no node ever activates.
+
+        A single delayed pkill races: on a loaded Pi (e.g. during reconfigure)
+        bringup is slow, the built-in manager appears *after* the kill, dodges
+        it, and survives — the exact "all nodes present, none active" hang seen
+        on restart. Reap repeatedly for a window so late arrivals are caught.
+        The patterns match by node name / package path, so our own
+        ``navigation_lifecycle_manager_override`` and ``filter_lifecycle_manager``
+        are never touched.
+        """
+        patterns = (
             "nav2_collision_monitor/collision_monitor",
             "__node:=lifecycle_manager_navigation",
-        ):
-            subprocess.run(
-                ["pkill", "-f", pattern],
-                env=self._ros_env(),
-                check=False,
-            )
+        )
+
+        def _reap_once() -> None:
+            for pattern in patterns:
+                subprocess.run(
+                    ["pkill", "-f", pattern],
+                    env=self._ros_env(),
+                    check=False,
+                )
+
+        # Initial synchronous sweep preserves prior startup timing/ordering.
+        time.sleep(3.0)
+        _reap_once()
+
+        def _reap_window() -> None:
+            deadline = time.monotonic() + self._SUPPRESS_WINDOW_S
+            while time.monotonic() < deadline:
+                time.sleep(1.0)
+                _reap_once()
+
+        threading.Thread(
+            target=_reap_window, name="nav2-suppress", daemon=True
+        ).start()
 
     def stop_nav2(self) -> None:
         self._nav_action_ok_until = 0.0
@@ -935,6 +982,12 @@ class RosManager:
 
     def get_pose_in_map(self) -> Optional[conv.Pose2D]:
         return self._require_node().get_pose_in_map()
+
+    def get_base_scan(self, max_age_s: float = 1.0) -> Optional[conv.LaserScan2D]:
+        node = self._node
+        if node is None:
+            return None
+        return node.get_base_scan(max_age_s)
 
     def set_nav_config(self, nav_cfg: NavConfig) -> None:
         self._require_node().set_nav_config(nav_cfg)

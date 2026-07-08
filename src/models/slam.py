@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from typing import ClassVar, List, Mapping, Optional, Sequence, cast
 
 import numpy as np
@@ -49,6 +50,11 @@ RELOCALIZE_POSITION_VARIANCE_M2 = 4.0
 RELOCALIZE_YAW_VARIANCE_RAD2 = (math.pi / 4) ** 2
 
 
+def _normalize_angle(rad: float) -> float:
+    """Wrap an angle to [-pi, pi]."""
+    return math.atan2(math.sin(rad), math.cos(rad))
+
+
 class RosSlam(SLAM):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "nav-stack"), "slam")
 
@@ -63,6 +69,8 @@ class RosSlam(SLAM):
         self._map_display_hold = False
         self._visible_map_generation = 0
         self._startup_global_localize_task: Optional[asyncio.Task] = None
+        self._periodic_relocalize_task: Optional[asyncio.Task] = None
+        self._last_relocalize_check: dict = {"status": "idle"}
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -85,6 +93,7 @@ class RosSlam(SLAM):
         self, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
         self._cancel_startup_global_localize_task()
+        self._cancel_periodic_relocalize_task()
         attrs = struct_to_dict(config.attributes)
         cfg = SlamConfig.from_dict(attrs)
         self._cfg = cfg
@@ -118,9 +127,11 @@ class RosSlam(SLAM):
         self._manager.start(self._build_io(), loop)
         self._start_mode(cfg.mode)
         self._schedule_startup_global_localize(loop)
+        self._schedule_periodic_relocalize(loop)
 
         register_slam(
-            self.name, SlamRuntime(self._manager, self._map_store, cfg)
+            self.name,
+            SlamRuntime(self._manager, self._map_store, cfg, self._last_relocalize_check),
         )
         LOGGER.info(f"nav-stack SLAM '{self.name}' configured in {cfg.mode} mode")
 
@@ -129,6 +140,251 @@ class RosSlam(SLAM):
         if task is not None and not task.done():
             task.cancel()
         self._startup_global_localize_task = None
+
+    def _cancel_periodic_relocalize_task(self) -> None:
+        task = self._periodic_relocalize_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._periodic_relocalize_task = None
+
+    def _schedule_periodic_relocalize(self, loop: asyncio.AbstractEventLoop) -> None:
+        cfg = self._cfg
+        if (
+            cfg is None
+            or cfg.mode != MODE_LOCALIZING
+            or not cfg.periodic_relocalize
+        ):
+            return
+        self._periodic_relocalize_task = loop.create_task(
+            self._run_periodic_relocalize(
+                interval_s=max(1.0, float(cfg.periodic_relocalize_interval_s)),
+            )
+        )
+
+    async def _run_periodic_relocalize(self, *, interval_s: float) -> None:
+        """Background drift watchdog: periodically re-localize when pose drifts.
+
+        slam_toolbox tracks pose per-scan but has no automatic global correction;
+        on long runs (or after CPU-starved navigation) the map->odom estimate can
+        slide with no recovery. Uses a cheap local match each cycle, escalating
+        to full-map global_localize (like a manual command) when the local match
+        is untrusted or Nav2 is struggling with recoveries.
+        """
+        while True:
+            cfg = self._cfg
+            sleep_s = interval_s
+            if cfg is not None and self._is_navigation_active():
+                sleep_s = max(1.0, float(cfg.periodic_relocalize_nav_interval_s))
+            await asyncio.sleep(sleep_s)
+            try:
+                await self._periodic_relocalize_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - watchdog must survive hiccups
+                LOGGER.warning("periodic relocalize cycle failed: %s", exc)
+                self._publish_relocalize_check({"status": "error", "error": str(exc)})
+
+    def _publish_relocalize_check(self, result: Mapping[str, ValueTypes]) -> dict:
+        self._last_relocalize_check.clear()
+        self._last_relocalize_check.update(result)
+        return dict(self._last_relocalize_check)
+
+    def _localization_match_quality(
+        self, match: Mapping[str, ValueTypes], cfg: SlamConfig
+    ) -> tuple[bool, float, Optional[float]]:
+        score = float(match.get("score", float("-inf")))
+        ray_mae_raw = match.get("ray_mae_m")
+        ray_mae = float(ray_mae_raw) if ray_mae_raw is not None else None
+        good = score >= cfg.periodic_relocalize_min_score and (
+            ray_mae is None or ray_mae <= cfg.periodic_relocalize_max_ray_mae_m
+        )
+        return good, score, ray_mae
+
+    @staticmethod
+    def _pose_shift_from_current(
+        current: Optional[conv.Pose2D], matched_pose: Optional[Mapping]
+    ) -> tuple[float, float]:
+        if current is None or not isinstance(matched_pose, Mapping):
+            return float("inf"), float("inf")
+        shift_m = math.hypot(
+            float(matched_pose.get("x", 0.0)) - current.x,
+            float(matched_pose.get("y", 0.0)) - current.y,
+        )
+        shift_deg = abs(
+            math.degrees(
+                _normalize_angle(
+                    float(matched_pose.get("theta", 0.0)) - current.theta
+                )
+            )
+        )
+        return shift_m, shift_deg
+
+    async def _periodic_relocalize_cycle(
+        self, *, apply_override: Optional[bool] = None
+    ) -> Mapping[str, ValueTypes]:
+        """Run one drift check; correct pose when a trusted match has moved.
+
+        Escalates to full-map ``global_localize`` when the local match is weak
+        (the usual failure mode when manual global_localize is what fixes drift)
+        or when Nav2 reports multiple recoveries on the active goal.
+        """
+        cfg = self._cfg
+        mgr = self._manager
+        if cfg is None or mgr is None:
+            return self._publish_relocalize_check({"status": "unconfigured"})
+        if cfg.mode != MODE_LOCALIZING:
+            return self._publish_relocalize_check(
+                {"status": "skipped", "reason": "not_localizing"}
+            )
+        startup = self._startup_global_localize_task
+        if startup is not None and not startup.done():
+            return self._publish_relocalize_check(
+                {"status": "skipped", "reason": "startup_localize_running"}
+            )
+
+        nav_active = self._is_navigation_active()
+        if (
+            apply_override is not True
+            and nav_active
+            and not cfg.periodic_relocalize_during_navigation
+        ):
+            return self._publish_relocalize_check(
+                {"status": "skipped", "reason": "navigation_active"}
+            )
+
+        nav_recoveries = 0
+        if nav_active:
+            try:
+                nav_recoveries = int(mgr.nav_status().get("number_of_recoveries", 0))
+            except Exception:  # noqa: BLE001
+                nav_recoveries = 0
+
+        force_full_map = nav_recoveries >= cfg.periodic_relocalize_nav_recoveries_threshold
+        current = mgr.get_pose_in_map()
+
+        base_command: dict = {"command": "global_localize"}
+        base_command.update(dict(cfg.periodic_relocalize_options))
+        base_command["apply"] = False
+
+        match_mode = "full_map" if force_full_map else "local"
+        match_command = dict(base_command)
+        if force_full_map:
+            match_command["full_map"] = True
+        match = await self._global_localize(match_command)
+
+        good_match, score, ray_mae = self._localization_match_quality(match, cfg)
+        matched_pose = match.get("pose")
+        shift_m, shift_deg = self._pose_shift_from_current(current, matched_pose)
+
+        if (
+            not good_match
+            and not force_full_map
+            and cfg.periodic_relocalize_full_map_on_low_quality
+            and apply_override is not True
+        ):
+            full_command = dict(base_command)
+            full_command["full_map"] = True
+            full_command["auto_full_map_fallback"] = False
+            full_match = await self._global_localize(full_command)
+            full_good, full_score, full_ray_mae = self._localization_match_quality(
+                full_match, cfg
+            )
+            if full_good or full_score > score:
+                match = full_match
+                good_match = full_good
+                score = full_score
+                ray_mae = full_ray_mae
+                matched_pose = full_match.get("pose")
+                shift_m, shift_deg = self._pose_shift_from_current(current, matched_pose)
+                match_mode = "full_map_after_low_quality"
+
+        drifted = (
+            shift_m >= cfg.periodic_relocalize_min_shift_m
+            or shift_deg >= cfg.periodic_relocalize_min_shift_deg
+        )
+        full_map_recovery = match_mode.startswith("full_map")
+        # In a recovery situation the robot is (or looks) lost, so mirror a manual
+        # global_localize: trust the best full-map match once its score clears the
+        # recovery floor, ignoring the stricter ray_mae gate that good_match uses.
+        # This is the case that previously left the robot stuck for minutes -- the
+        # full-map match was correct (and manual apply fixed it) but ray_mae was
+        # above periodic_relocalize_max_ray_mae_m so good_match was False.
+        recovery_apply = (
+            full_map_recovery
+            and score >= cfg.periodic_relocalize_recovery_min_score
+        )
+        should_apply = apply_override is True or (
+            apply_override is None
+            and (
+                recovery_apply
+                or (good_match and drifted)
+            )
+        )
+
+        result: dict = {
+            "status": "ok",
+            "match_mode": match_mode,
+            "score": score,
+            "ray_mae_m": ray_mae,
+            "shift_m": None if math.isinf(shift_m) else round(shift_m, 3),
+            "shift_deg": None if math.isinf(shift_deg) else round(shift_deg, 2),
+            "good_match": good_match,
+            "drifted": drifted,
+            "recovery_apply": recovery_apply,
+            "navigation_active": nav_active,
+            "nav_recoveries": nav_recoveries,
+            "corrected": False,
+        }
+
+        if not should_apply and apply_override is not True and not good_match:
+            result["status"] = "low_quality"
+            LOGGER.warning(
+                "periodic relocalize: no trusted match after %s "
+                "(score=%.2f ray_mae=%s recovery_floor=%.2f nav_recoveries=%d); "
+                "not correcting",
+                match_mode,
+                score,
+                ray_mae,
+                cfg.periodic_relocalize_recovery_min_score,
+                nav_recoveries,
+            )
+            return self._publish_relocalize_check(result)
+
+        if should_apply and isinstance(matched_pose, Mapping):
+            await self.do_command(
+                {
+                    "command": "relocalize",
+                    "pose": {
+                        "x": float(matched_pose.get("x", 0.0)),
+                        "y": float(matched_pose.get("y", 0.0)),
+                        "theta": float(matched_pose.get("theta", 0.0)),
+                    },
+                    "position_variance_m2": 0.25,
+                    "yaw_variance_rad2": 0.06853891945200942,
+                }
+            )
+            result["status"] = "corrected"
+            result["corrected"] = True
+            LOGGER.info(
+                "periodic relocalize: corrected via %s (shift=%.2f m, %.1f deg, "
+                "score=%.2f, ray_mae=%s, recovery=%s, nav_recoveries=%d)",
+                match_mode,
+                0.0 if math.isinf(shift_m) else shift_m,
+                0.0 if math.isinf(shift_deg) else shift_deg,
+                score,
+                ray_mae,
+                recovery_apply and not good_match,
+                nav_recoveries,
+            )
+        else:
+            LOGGER.debug(
+                "periodic relocalize: pose ok (%s shift=%.2f m score=%.2f)",
+                match_mode,
+                0.0 if math.isinf(shift_m) else shift_m,
+                score,
+            )
+
+        return self._publish_relocalize_check(result)
 
     def _schedule_startup_global_localize(self, loop: asyncio.AbstractEventLoop) -> None:
         cfg = self._cfg
@@ -148,6 +404,9 @@ class RosSlam(SLAM):
             self._run_startup_global_localize(
                 options,
                 delay_s=delay_s,
+                readiness_timeout_s=max(
+                    0.0, float(cfg.global_localize_on_start_readiness_timeout_s)
+                ),
                 run_refine_pass=bool(cfg.global_localize_on_start_refine),
                 refine_delay_s=max(0.0, float(cfg.global_localize_on_start_refine_delay_s)),
                 refine_max_passes=max(
@@ -197,13 +456,48 @@ class RosSlam(SLAM):
         ray_mae = float(ray_mae_raw)
         return score >= target_score and ray_mae <= target_ray_mae_m
 
+    async def _wait_for_startup_localize_ready(
+        self, *, timeout_s: float = 90.0, poll_interval_s: float = 2.0
+    ) -> bool:
+        """Hold the startup auto-localize until scan matching can actually work.
+
+        A fixed post-reconfigure delay fires while MiR rosbridge sessions are
+        still connecting and slam_toolbox is still loading the posegraph; the
+        retry attempts then burn out and the robot stays mislocalized until a
+        manual global_localize. Ready = slam process up, a merged scan with
+        returns readable, and an occupancy map loadable.
+        """
+        mgr = self._manager
+        if mgr is None:
+            return True
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                if mgr.slam_running():
+                    await self._read_merged_scan()  # raises when no returns yet
+                    self._load_active_occupancy_map("auto")
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - not ready yet; keep polling
+                pass
+            await asyncio.sleep(poll_interval_s)
+        if timeout_s > 0.0:
+            LOGGER.warning(
+                "startup global_localize readiness wait timed out after %.0fs; "
+                "attempting anyway",
+                timeout_s,
+            )
+        return False
+
     async def _run_startup_global_localize(
         self,
         options: Mapping[str, ValueTypes],
         *,
         delay_s: float = 4.0,
-        max_attempts: int = 3,
-        retry_delay_s: float = 2.0,
+        max_attempts: int = 5,
+        retry_delay_s: float = 5.0,
+        readiness_timeout_s: float = 90.0,
         run_refine_pass: bool = False,
         refine_delay_s: float = 8.0,
         refine_max_passes: int = 3,
@@ -214,6 +508,12 @@ class RosSlam(SLAM):
         post_apply_refine_delay_s: float = 3.0,
         post_apply_refine_options: Optional[Mapping[str, ValueTypes]] = None,
     ) -> None:
+        if self._is_navigation_active():
+            LOGGER.info("startup global_localize skipped: navigation already active")
+            return
+        await self._wait_for_startup_localize_ready(timeout_s=readiness_timeout_s)
+        # Extra settle time after readiness so slam_toolbox has processed a few
+        # scans against the loaded posegraph before we sample one for matching.
         if delay_s > 0.0:
             await asyncio.sleep(delay_s)
         if self._is_navigation_active():
@@ -386,7 +686,7 @@ class RosSlam(SLAM):
         async def stop_base():
             # MiR base.stop() also calls REST stop_immediately (PAUSE), which
             # drops Manualcontrol and kills the rosbridge /cmd_vel session — breaking
-            # go_to_position and the next navigate_to_location. Nav2 only needs zeros.
+            # go_to_location and the next navigate_to_location. Nav2 only needs zeros.
             await self._base.set_velocity(
                 linear=Vector3(x=0.0, y=0.0, z=0.0),
                 angular=Vector3(x=0.0, y=0.0, z=0.0),
@@ -577,6 +877,19 @@ class RosSlam(SLAM):
 
         if cmd == "global_localize":
             return await self._global_localize(command)
+
+        if cmd == "check_localization":
+            # Run one drift-watchdog cycle on demand. ``apply`` forces or
+            # suppresses the correction; omit it to use the drift thresholds.
+            apply_override = command.get("apply")
+            return await self._periodic_relocalize_cycle(
+                apply_override=(
+                    None if apply_override is None else bool(apply_override)
+                )
+            )
+
+        if cmd == "get_localization_check":
+            return dict(self._last_relocalize_check)
 
         # -- map management --
         if cmd == "list_maps":
@@ -872,6 +1185,7 @@ class RosSlam(SLAM):
 
     async def close(self) -> None:
         self._cancel_startup_global_localize_task()
+        self._cancel_periodic_relocalize_task()
         unregister_slam(self.name)
         if self._manager is not None:
             self._manager.shutdown()

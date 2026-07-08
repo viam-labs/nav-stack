@@ -9,6 +9,13 @@ def test_slam_config_single_lidar_string():
     assert cfg.required_dependencies() == ["b", "front"]
 
 
+def test_slam_config_scan_max_age_default_and_override():
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
+    assert cfg.scan_max_age_s == 2.0
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front", "scan_max_age_s": 0.75})
+    assert cfg.scan_max_age_s == 0.75
+
+
 def test_slam_config_multi_lidar_with_mounts():
     cfg = SlamConfig.from_dict(
         {
@@ -49,6 +56,7 @@ def test_slam_config_global_localize_on_start_options():
     )
     assert cfg.global_localize_on_start is True
     assert cfg.global_localize_on_start_delay_s == pytest.approx(4.5)
+    assert cfg.global_localize_on_start_readiness_timeout_s == pytest.approx(90.0)
     assert cfg.global_localize_on_start_options["full_map"] is True
     assert cfg.global_localize_on_start_options["map_source"] == "live"
     assert cfg.global_localize_on_start_refine is True
@@ -60,6 +68,43 @@ def test_slam_config_global_localize_on_start_options():
     assert cfg.global_localize_on_start_post_apply_refine_delay_s == pytest.approx(8.0)
     assert cfg.global_localize_on_start_post_apply_refine_options["map_source"] == "live"
     assert cfg.global_localize_on_start_refine_options["full_map"] is False
+
+
+def test_slam_config_periodic_relocalize_defaults():
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front", "mode": "localizing"})
+    assert cfg.periodic_relocalize is True
+    assert cfg.periodic_relocalize_interval_s == pytest.approx(20.0)
+    assert cfg.periodic_relocalize_nav_interval_s == pytest.approx(15.0)
+    assert cfg.periodic_relocalize_min_score == pytest.approx(0.5)
+    assert cfg.periodic_relocalize_max_ray_mae_m == pytest.approx(1.0)
+    assert cfg.periodic_relocalize_recovery_min_score == pytest.approx(0.45)
+    assert cfg.periodic_relocalize_min_shift_m == pytest.approx(0.2)
+    assert cfg.periodic_relocalize_min_shift_deg == pytest.approx(10.0)
+    assert cfg.periodic_relocalize_nav_recoveries_threshold == 2
+    assert cfg.periodic_relocalize_full_map_on_low_quality is True
+    assert cfg.periodic_relocalize_during_navigation is True
+    assert cfg.periodic_relocalize_options["search_radius_m"] == pytest.approx(3.0)
+    assert cfg.periodic_relocalize_options["auto_full_map_fallback"] is True
+
+
+def test_slam_config_periodic_relocalize_overrides():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "mode": "localizing",
+            "periodic_relocalize": True,
+            "periodic_relocalize_interval_s": 30.0,
+            "periodic_relocalize_min_score": 0.6,
+            "periodic_relocalize_during_navigation": True,
+            "periodic_relocalize_options": {"search_radius_m": 2.0},
+        }
+    )
+    assert cfg.periodic_relocalize is True
+    assert cfg.periodic_relocalize_interval_s == pytest.approx(30.0)
+    assert cfg.periodic_relocalize_min_score == pytest.approx(0.6)
+    assert cfg.periodic_relocalize_during_navigation is True
+    assert cfg.periodic_relocalize_options["search_radius_m"] == pytest.approx(2.0)
 
 
 def test_slam_config_global_localize_on_start_defaults_enabled():
@@ -175,6 +220,47 @@ def test_apply_nav2_tuning_only_updates_planner_tolerance():
         == 1.0e-10
     )
     assert params["general_goal_checker"]["xy_goal_tolerance"] == 0.4
+
+
+def test_apply_velocity_limits_wires_mppi_and_smoother():
+    from src.models.navigation import _apply_velocity_limits
+
+    params = {
+        "controller_server": {
+            "ros__parameters": {
+                "FollowPath": {"vx_max": 0.4, "vx_min": -0.4, "wz_max": 1.0}
+            }
+        },
+        "velocity_smoother": {
+            "ros__parameters": {
+                "max_velocity": [0.5, 0.0, 2.0],
+                "max_accel": [2.5, 0.0, 3.2],
+            }
+        },
+    }
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "kinematics": "differential",
+            "max_vel_x": 0.35,
+            "max_vel_theta": 0.8,
+            "acc_lim_x": 0.5,
+            "acc_lim_theta": 1.0,
+        }
+    )
+    _apply_velocity_limits(params, cfg)
+
+    fp = params["controller_server"]["ros__parameters"]["FollowPath"]
+    assert fp["motion_model"] == "DiffDrive"
+    assert fp["vx_max"] == 0.35
+    assert fp["vx_min"] == -0.15
+    assert fp["wz_max"] == 0.8
+    assert fp["ax_max"] == 0.5
+    vs = params["velocity_smoother"]["ros__parameters"]
+    assert vs["max_velocity"] == [0.35, 0.0, 0.8]
+    assert vs["max_accel"] == [0.5, 0.0, 1.0]
+    assert vs["max_decel"][0] == -0.75
 
 
 def test_nav2_config_from_attributes():

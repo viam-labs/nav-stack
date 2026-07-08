@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.config import MODE_LOCALIZING, MODE_MAPPING
+from src.config import MODE_LOCALIZING, MODE_MAPPING, SlamConfig
 
 # Stub ROS 2 Python deps so model tests run without a ROS install.
 for _mod in (
@@ -384,6 +384,36 @@ def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
     assert third_cmd["map_source"] == "live"
 
 
+def test_startup_localize_readiness_waits_for_scan_and_map():
+    slam = RosSlam("slam")
+    slam._manager = MagicMock()
+    slam._manager.slam_running.return_value = True
+    slam._read_merged_scan = AsyncMock(
+        side_effect=[RuntimeError("no lidar returns"), MagicMock()]
+    )
+    slam._load_active_occupancy_map = MagicMock(return_value=(MagicMock(), "live"))
+
+    ready = asyncio.run(
+        slam._wait_for_startup_localize_ready(timeout_s=10.0, poll_interval_s=0.0)
+    )
+
+    assert ready is True
+    assert slam._read_merged_scan.await_count == 2
+    slam._load_active_occupancy_map.assert_called_once()
+
+
+def test_startup_localize_readiness_times_out():
+    slam = RosSlam("slam")
+    slam._manager = MagicMock()
+    slam._manager.slam_running.return_value = False
+
+    ready = asyncio.run(
+        slam._wait_for_startup_localize_ready(timeout_s=0.05, poll_interval_s=0.0)
+    )
+
+    assert ready is False
+
+
 def test_run_startup_global_localize_skips_when_navigation_active():
     slam = RosSlam("slam")
     slam._manager = MagicMock()
@@ -454,3 +484,296 @@ def test_stop_base_zeros_velocity_without_full_stop():
     assert kwargs["linear"].x == 0.0
     assert kwargs["linear"].y == 0.0
     assert kwargs["angular"].z == 0.0
+
+
+# -- periodic relocalize (drift watchdog) -----------------------------------
+def _relocalize_slam(**cfg_overrides):
+    d = {
+        "base": "b",
+        "lidar": "f",
+        "mode": "localizing",
+        "periodic_relocalize": True,
+    }
+    d.update(cfg_overrides)
+    slam = RosSlam("slam")
+    slam._cfg = SlamConfig.from_dict(d)
+    slam._manager = MagicMock()
+    slam._manager.get_pose_in_map.return_value = conv.Pose2D(0.0, 0.0, 0.0)
+    slam._manager.nav_status.return_value = {
+        "active": False,
+        "number_of_recoveries": 0,
+    }
+    slam._startup_global_localize_task = None
+    slam._is_navigation_active = MagicMock(return_value=False)
+    return slam
+
+
+def test_schedule_periodic_relocalize_skips_when_disabled():
+    slam = _relocalize_slam(periodic_relocalize=False)
+    loop = MagicMock()
+    slam._schedule_periodic_relocalize(loop)
+    loop.create_task.assert_not_called()
+
+
+def test_schedule_periodic_relocalize_skips_when_mapping():
+    slam = RosSlam("slam")
+    slam._cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "mode": "mapping", "periodic_relocalize": True}
+    )
+    loop = MagicMock()
+    slam._schedule_periodic_relocalize(loop)
+    loop.create_task.assert_not_called()
+
+
+def test_schedule_periodic_relocalize_starts_when_enabled():
+    slam = _relocalize_slam()
+    slam._run_periodic_relocalize = MagicMock(return_value=None)  # avoid coroutine
+    loop = MagicMock()
+    slam._schedule_periodic_relocalize(loop)
+    loop.create_task.assert_called_once()
+
+
+def test_schedule_periodic_relocalize_starts_by_default_in_localizing():
+    slam = RosSlam("slam")
+    slam._cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "mode": "localizing"})
+    slam._run_periodic_relocalize = MagicMock(return_value=None)
+    loop = MagicMock()
+    slam._schedule_periodic_relocalize(loop)
+    loop.create_task.assert_called_once()
+
+
+def test_periodic_relocalize_cycle_corrects_on_drift():
+    slam = _relocalize_slam(
+        periodic_relocalize_min_score=0.5,
+        periodic_relocalize_min_shift_m=0.2,
+    )
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.8,
+            "ray_mae_m": 0.3,
+            "pose": {"x": 1.0, "y": 0.0, "theta": 0.0},
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "corrected"
+    assert result["corrected"] is True
+    assert result["shift_m"] == pytest.approx(1.0)
+    relocalize_cmd = slam.do_command.await_args.args[0]
+    assert relocalize_cmd["command"] == "relocalize"
+    assert relocalize_cmd["pose"]["x"] == pytest.approx(1.0)
+
+
+def test_periodic_relocalize_cycle_no_correction_when_close():
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.9,
+            "ray_mae_m": 0.2,
+            "pose": {"x": 0.05, "y": 0.0, "theta": 0.0},
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "ok"
+    assert result["corrected"] is False
+    slam.do_command.assert_not_awaited()
+
+
+def test_periodic_relocalize_cycle_low_quality_no_correction():
+    slam = _relocalize_slam(periodic_relocalize_min_score=0.5)
+    slam._global_localize = AsyncMock(
+        side_effect=[
+            {
+                "status": "matched",
+                "score": 0.2,
+                "ray_mae_m": 1.5,
+                "pose": {"x": 3.0, "y": 0.0, "theta": 0.0},
+            },
+            {
+                "status": "matched",
+                "score": 0.25,
+                "ray_mae_m": 1.2,
+                "pose": {"x": 3.0, "y": 0.0, "theta": 0.0},
+            },
+        ]
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "low_quality"
+    assert slam._global_localize.await_count == 2
+    slam.do_command.assert_not_awaited()
+
+
+def test_periodic_relocalize_cycle_escalates_full_map_on_low_quality():
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._global_localize = AsyncMock(
+        side_effect=[
+            {
+                "status": "matched",
+                "score": 0.2,
+                "ray_mae_m": 1.5,
+                "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
+            },
+            {
+                "status": "matched",
+                "score": 0.85,
+                "ray_mae_m": 0.25,
+                "pose": {"x": 2.0, "y": 0.0, "theta": 0.0},
+            },
+        ]
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "corrected"
+    assert result["match_mode"] == "full_map_after_low_quality"
+    assert slam._global_localize.await_count == 2
+    full_cmd = slam._global_localize.await_args_list[1].args[0]
+    assert full_cmd["full_map"] is True
+    slam.do_command.assert_awaited_once()
+
+
+def test_periodic_relocalize_cycle_full_map_when_nav_recoveries_high():
+    slam = _relocalize_slam(periodic_relocalize_nav_recoveries_threshold=2)
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._manager.nav_status.return_value = {
+        "active": True,
+        "number_of_recoveries": 11,
+    }
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.9,
+            "ray_mae_m": 0.2,
+            "pose": {"x": 1.5, "y": 0.0, "theta": 0.0},
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "corrected"
+    assert result["match_mode"] == "full_map"
+    first_cmd = slam._global_localize.await_args_list[0].args[0]
+    assert first_cmd["full_map"] is True
+
+
+def test_periodic_relocalize_cycle_recovery_applies_high_ray_mae():
+    # Nav is failing so the watchdog forces a full-map match. The best match is
+    # correct (manual global_localize applies it fine) but ray_mae is above even
+    # the generous good_match gate. The score-only recovery path must still apply
+    # it instead of logging low_quality forever.
+    slam = _relocalize_slam(
+        periodic_relocalize_min_score=0.5,
+        periodic_relocalize_max_ray_mae_m=1.0,
+        periodic_relocalize_recovery_min_score=0.45,
+        periodic_relocalize_nav_recoveries_threshold=2,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._manager.nav_status.return_value = {
+        "active": True,
+        "number_of_recoveries": 23,
+    }
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.61,
+            "ray_mae_m": 1.30,
+            "pose": {"x": 1.9, "y": 0.0, "theta": 1.38},
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "corrected"
+    assert result["corrected"] is True
+    assert result["good_match"] is False
+    assert result["recovery_apply"] is True
+    assert result["match_mode"] == "full_map"
+    slam.do_command.assert_awaited_once()
+
+
+def test_periodic_relocalize_cycle_recovery_floor_blocks_garbage():
+    # A full-map recovery match whose score is below the recovery floor is genuine
+    # garbage and must not be applied.
+    slam = _relocalize_slam(
+        periodic_relocalize_recovery_min_score=0.45,
+        periodic_relocalize_nav_recoveries_threshold=2,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._manager.nav_status.return_value = {
+        "active": True,
+        "number_of_recoveries": 23,
+    }
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.3,
+            "ray_mae_m": 1.4,
+            "pose": {"x": 5.0, "y": 0.0, "theta": 0.0},
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "low_quality"
+    assert result["recovery_apply"] is False
+    slam.do_command.assert_not_awaited()
+
+
+def test_periodic_relocalize_cycle_skips_during_navigation():
+    slam = _relocalize_slam(periodic_relocalize_during_navigation=False)
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock()
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "navigation_active"
+    slam._global_localize.assert_not_awaited()
+
+
+def test_periodic_relocalize_cycle_skips_while_startup_running():
+    slam = _relocalize_slam()
+    pending = MagicMock()
+    pending.done.return_value = False
+    slam._startup_global_localize_task = pending
+    slam._global_localize = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "startup_localize_running"
+    slam._global_localize.assert_not_awaited()
+
+
+def test_check_localization_apply_override_forces_correction():
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=5.0)  # would not drift
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.3,  # low quality, but override forces apply
+            "ray_mae_m": 1.2,
+            "pose": {"x": 0.1, "y": 0.0, "theta": 0.0},
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = asyncio.run(slam._periodic_relocalize_cycle(apply_override=True))
+
+    assert result["corrected"] is True
+    relocalize_cmd = slam.do_command.await_args.args[0]
+    assert relocalize_cmd["command"] == "relocalize"

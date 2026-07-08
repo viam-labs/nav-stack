@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -105,11 +106,19 @@ class BridgeNode(Node):
 
         # Odom pose: prefer the movement sensor's absolute /odom pose when available.
         self._odom = conv.Pose2D(0.0, 0.0, 0.0)
+        # Recent (stamp_ns, pose) samples so scans stamped in the past (lidar
+        # read latency) can be paired with the pose the robot actually had then.
+        self._odom_history: deque = deque(maxlen=150)
         self._last_twist = (0.0, 0.0, 0.0)
         self._last_odom_time = time.monotonic()
         self._last_odom_pub_wall = time.monotonic()
         self._odom_integrate_warned = False
         self._empty_scan_warned = False
+        self._stale_scan_warned = False
+        # Latest merged base_link-frame scan, cached for reactive obstacle
+        # avoidance in simple (non-Nav2) go_to_* motion.
+        self._latest_scan: Optional[conv.LaserScan2D] = None
+        self._latest_scan_wall = 0.0
 
         # Publishers -------------------------------------------------------
         self._scan_pubs: List = []
@@ -323,8 +332,15 @@ class BridgeNode(Node):
 
     # -- scans ---------------------------------------------------------------
     def _on_scan_timer(self) -> None:
+        # Capture the stamp BEFORE reading: rosbridge lidar reads take up to
+        # seconds, and the returned scan reflects the world at capture time.
+        # Stamping stale geometry with a post-read now() shifts obstacles away
+        # from a moving robot and raytrace-clears their true cells (the robot
+        # then drives into obstacles the lidar plainly sees).
+        read_start = self.get_clock().now()
         merged_points = []
         per_lidar_scans = []
+        scan_age_s: Optional[float] = None
         lidar_timeout = max(float(self._slam_cfg.sensor_read_timeout_s), 1.0)
         for i, lidar in enumerate(self._slam_cfg.lidars):
             try:
@@ -341,6 +357,12 @@ class BridgeNode(Node):
             if isinstance(lidar_data, conv.LidarPoints):
                 sensor_scan = lidar_data.sensor_scan
                 base_pts_arr = np.asarray(lidar_data.base_link, dtype=float)
+                if lidar_data.age_s is not None:
+                    scan_age_s = (
+                        lidar_data.age_s
+                        if scan_age_s is None
+                        else max(scan_age_s, lidar_data.age_s)
+                    )
             else:
                 base_pts_arr = np.asarray(lidar_data, dtype=float)
 
@@ -379,12 +401,31 @@ class BridgeNode(Node):
             return
         self._empty_scan_warned = False
 
-        # Fresh stamp + synchronized odom TF. Lidar reads block the module asyncio
-        # loop (MiR rosbridge), so _last_odom_stamp can lag seconds behind the TF
-        # cache while scans still carry that stale time — Nav2 then drops them.
-        stamp = self.get_clock().now().to_msg()
-        vx, vy, vtheta = self._last_twist
-        self._publish_odom_snapshot(stamp, vx, vy, vtheta)
+        # Safety net: mir-base's SLAM path already refuses to serve stale scans,
+        # but if a genuinely old scan slips through, don't hand SLAM/Nav2 a
+        # misregistered scan — skip this cycle instead.
+        if scan_age_s is not None:
+            max_age = float(getattr(self._slam_cfg, "scan_max_age_s", 2.0))
+            if max_age > 0.0 and scan_age_s > max_age:
+                if not self._stale_scan_warned:
+                    self.get_logger().warn(
+                        f"lidar scan cache age {scan_age_s:.2f}s exceeds "
+                        f"scan_max_age_s={max_age:.2f}s; skipping /scan publish "
+                        "(check mir-base scan_cache_max_age_s / rosbridge health)"
+                    )
+                    self._stale_scan_warned = True
+                return
+            self._stale_scan_warned = False
+
+        # Stamp at capture time (read_start - age_s) so obstacles/scan-match
+        # register where the robot actually was when the scan was captured, not
+        # where it is after the (cached) read returns.
+        stamp = self._bounded_scan_stamp(read_start, age_s=scan_age_s or 0.0)
+        # Also publish odom->base_link at exactly this stamp: freshly started
+        # slam/Nav2 nodes have empty TF buffers and drop past-stamped scans
+        # ("earlier than all the data in the transform cache") — a sample at
+        # the scan time makes the lookup succeed by construction.
+        self._publish_scan_time_tf(stamp)
         for i, scan in per_lidar_scans:
             self._scan_pubs[i].publish(self._to_ros_scan(scan, f"laser_{i}", stamp))
 
@@ -404,9 +445,55 @@ class BridgeNode(Node):
                 self._empty_scan_warned = True
             return
         self._empty_scan_warned = False
+        self._latest_scan = merged
+        self._latest_scan_wall = time.monotonic()
         self._merged_scan_pub.publish(
             self._to_ros_scan(merged, self._frames.base_link, stamp)
         )
+
+    def _odom_pose_at(self, stamp) -> conv.Pose2D:
+        """Nearest recorded odom pose to ``stamp`` (falls back to current)."""
+        try:
+            target_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        except (TypeError, AttributeError):
+            return self._odom
+        best_pose = self._odom
+        best_delta = None
+        for sample_ns, pose in self._odom_history:
+            delta = abs(sample_ns - target_ns)
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best_pose = pose
+        return best_pose
+
+    def _publish_scan_time_tf(self, stamp) -> None:
+        pose = self._odom_pose_at(stamp)
+        t = TransformStamped()
+        t.header.stamp = stamp
+        t.header.frame_id = self._frames.odom
+        t.child_frame_id = self._frames.base_link
+        t.transform.translation.x = pose.x
+        t.transform.translation.y = pose.y
+        t.transform.rotation = _quat_msg(pose.theta)
+        self._tf_broadcaster.sendTransform(t)
+
+    def _bounded_scan_stamp(self, read_start, age_s: float = 0.0):
+        """Capture-time stamp (read_start - age_s), clamped to stay in TF buffers.
+
+        ``age_s`` is the cache age mir-base reports for the scan; subtracting it
+        places the stamp at when the scan was actually captured. TF history is
+        ~10s in Nav2 costmaps; a scan stamped older than that would be dropped
+        entirely, which is worse than a bounded position error, so we clamp.
+        """
+        max_lag_ns = 8_000_000_000
+        try:
+            capture_ns = read_start.nanoseconds - int(max(0.0, age_s) * 1e9)
+            now_ns = self.get_clock().now().nanoseconds
+            if now_ns - capture_ns > max_lag_ns:
+                return rclpy.time.Time(nanoseconds=now_ns - max_lag_ns).to_msg()
+            return rclpy.time.Time(nanoseconds=capture_ns).to_msg()
+        except Exception:  # noqa: BLE001 - clamping is best-effort
+            return read_start.to_msg()
 
     def _to_ros_scan(self, scan: conv.LaserScan2D, frame_id: str, stamp) -> LaserScan:
         msg = LaserScan()
@@ -482,6 +569,12 @@ class BridgeNode(Node):
         self._last_odom_stamp = stamp
         self._last_odom_pub_wall = time.monotonic()
         self._last_twist = (vx, vy, vtheta)
+        try:
+            self._odom_history.append(
+                (int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec), pose)
+            )
+        except (TypeError, AttributeError):  # non-Time stamps in tests
+            pass
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = self._frames.odom
@@ -1047,6 +1140,19 @@ class BridgeNode(Node):
             return self._last_pose_in_map
         self._last_pose_in_map = pose
         return pose
+
+    def get_base_scan(self, max_age_s: float = 1.0) -> Optional[conv.LaserScan2D]:
+        """Latest merged base_link-frame scan, or None if too stale/absent.
+
+        Forward (+x) is at angle 0. Used by simple go_to_* obstacle avoidance;
+        a stale scan is treated as "no data" so we never dodge phantom returns.
+        """
+        scan = self._latest_scan
+        if scan is None:
+            return None
+        if time.monotonic() - self._latest_scan_wall > max_age_s:
+            return None
+        return scan
 
 
 class _ZeroDuration:

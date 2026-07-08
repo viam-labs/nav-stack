@@ -61,7 +61,7 @@ def _odom_bridge_stub(*, sample: conv.OdomReading):
     return bridge
 
 
-def test_scan_timer_syncs_odom_and_scan_stamp(monkeypatch):
+def test_scan_timer_stamps_scans_at_read_start(monkeypatch):
     import numpy as np
 
     stamp = MagicMock(name="stamp")
@@ -98,13 +98,139 @@ def test_scan_timer_syncs_odom_and_scan_stamp(monkeypatch):
     bridge._to_ros_scan = lambda s, frame, st: SimpleNamespace(
         header=SimpleNamespace(stamp=st, frame_id=frame)
     )
+    bridge._bounded_scan_stamp = lambda read_start, age_s=0.0: read_start.to_msg()
+    bridge._publish_scan_time_tf = MagicMock()
     monkeypatch.setattr("src.ros.bridge.conv.points_to_scan", lambda *a, **k: scan)
 
     BridgeNode._on_scan_timer(bridge)
 
-    bridge._publish_odom_snapshot.assert_called_once_with(stamp, 0.2, 0.0, 0.1)
+    # Scans must carry the read-start stamp (stale geometry stamped "now" would
+    # shift obstacles ahead of a moving robot and raytrace-clear their cells).
     published = bridge._merged_scan_pub.publish.call_args[0][0]
     assert published.header.stamp is stamp
+    # A TF sample must be published at the scan stamp so fresh slam/Nav2 TF
+    # buffers never drop the (past-stamped) scan.
+    bridge._publish_scan_time_tf.assert_called_once_with(stamp)
+    bridge._publish_odom_snapshot.assert_not_called()
+
+
+def _scan_timer_bridge(lidar_pts, scan, *, scan_max_age_s=2.0):
+    stamp = MagicMock(name="stamp")
+    clock = MagicMock(
+        now=MagicMock(return_value=MagicMock(to_msg=MagicMock(return_value=stamp)))
+    )
+    bridge = SimpleNamespace(
+        _io=SimpleNamespace(read_lidar_points=MagicMock()),
+        _slam_cfg=SimpleNamespace(
+            lidars=[
+                MagicMock(name="l0", z_min=-0.5, z_max=0.5, min_range=0.1, max_range=10.0)
+            ],
+            scan_bins=360,
+            sensor_read_timeout_s=1.0,
+            scan_max_age_s=scan_max_age_s,
+        ),
+        _run=lambda coro, timeout=None: lidar_pts,
+        _empty_scan_warned=False,
+        _stale_scan_warned=False,
+        _last_twist=(0.2, 0.0, 0.1),
+        _frames=SimpleNamespace(base_link="base_link"),
+        get_clock=MagicMock(return_value=clock),
+        _publish_odom_snapshot=MagicMock(),
+        _scan_pubs=[MagicMock()],
+        _merged_scan_pub=MagicMock(),
+        get_logger=MagicMock(return_value=MagicMock()),
+    )
+    bridge._to_ros_scan = lambda s, frame, st: SimpleNamespace(
+        header=SimpleNamespace(stamp=st, frame_id=frame)
+    )
+    bridge._publish_scan_time_tf = MagicMock()
+    return bridge, stamp
+
+
+def test_scan_timer_skips_stale_scan(monkeypatch):
+    import numpy as np
+
+    scan = conv.LaserScan2D(
+        ranges=np.array([1.0, 2.0]),
+        angle_min=-1.0,
+        angle_increment=0.1,
+        range_min=0.1,
+        range_max=10.0,
+    )
+    lidar_pts = conv.LidarPoints(
+        sensor=np.array([[1.0, 0.0, 0.0]]),
+        base_link=np.array([[1.0, 0.0, 0.0]]),
+        sensor_scan=scan,
+        age_s=5.0,
+    )
+    bridge, _ = _scan_timer_bridge(lidar_pts, scan, scan_max_age_s=2.0)
+    bridge._bounded_scan_stamp = MagicMock()
+    monkeypatch.setattr("src.ros.bridge.conv.points_to_scan", lambda *a, **k: scan)
+
+    BridgeNode._on_scan_timer(bridge)
+
+    # A stale scan must not be published to SLAM/Nav2.
+    bridge._merged_scan_pub.publish.assert_not_called()
+    bridge._scan_pubs[0].publish.assert_not_called()
+    bridge._bounded_scan_stamp.assert_not_called()
+    assert bridge._stale_scan_warned is True
+
+
+def test_scan_timer_stamps_at_capture_time_using_age(monkeypatch):
+    import numpy as np
+
+    scan = conv.LaserScan2D(
+        ranges=np.array([1.0, 2.0]),
+        angle_min=-1.0,
+        angle_increment=0.1,
+        range_min=0.1,
+        range_max=10.0,
+    )
+    lidar_pts = conv.LidarPoints(
+        sensor=np.array([[1.0, 0.0, 0.0]]),
+        base_link=np.array([[1.0, 0.0, 0.0]]),
+        sensor_scan=scan,
+        age_s=0.3,
+    )
+    bridge, stamp = _scan_timer_bridge(lidar_pts, scan, scan_max_age_s=2.0)
+    seen = {}
+
+    def _record_stamp(read_start, age_s=0.0):
+        seen["age_s"] = age_s
+        return read_start.to_msg()
+
+    bridge._bounded_scan_stamp = _record_stamp
+    monkeypatch.setattr("src.ros.bridge.conv.points_to_scan", lambda *a, **k: scan)
+
+    BridgeNode._on_scan_timer(bridge)
+
+    # The reported cache age is forwarded so the scan is stamped at capture time.
+    assert seen["age_s"] == 0.3
+    bridge._merged_scan_pub.publish.assert_called_once()
+
+
+def test_odom_pose_at_picks_nearest_history_sample():
+    from collections import deque
+
+    p1 = conv.Pose2D(1.0, 0.0, 0.0)
+    p2 = conv.Pose2D(2.0, 0.0, 0.0)
+    bridge = SimpleNamespace(
+        _odom=conv.Pose2D(9.0, 9.0, 0.0),
+        _odom_history=deque([(1_000_000_000, p1), (2_000_000_000, p2)]),
+    )
+    stamp = SimpleNamespace(sec=1, nanosec=100_000_000)  # 1.1s -> nearest p1
+    assert BridgeNode._odom_pose_at(bridge, stamp) is p1
+    stamp = SimpleNamespace(sec=1, nanosec=900_000_000)  # 1.9s -> nearest p2
+    assert BridgeNode._odom_pose_at(bridge, stamp) is p2
+
+
+def test_odom_pose_at_falls_back_to_current_pose():
+    from collections import deque
+
+    current = conv.Pose2D(5.0, 5.0, 0.0)
+    bridge = SimpleNamespace(_odom=current, _odom_history=deque())
+    stamp = SimpleNamespace(sec=1, nanosec=0)
+    assert BridgeNode._odom_pose_at(bridge, stamp) is current
 
 
 def test_publish_odom_snapshot_updates_twist_and_publishes():

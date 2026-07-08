@@ -210,6 +210,81 @@ def test_mir_laser_scan_payload_skips_zero_and_out_of_range():
     assert conv.scan_has_returns(scan)
 
 
+def test_mir_laser_scan_payload_reports_age_s():
+    payload = {
+        "scans": [
+            {
+                "topic": "/f_raw_scan",
+                "age_s": 0.12,
+                "message": {
+                    "header": {"frame_id": "front_laser_link"},
+                    "angle_min": 0.0,
+                    "angle_increment": math.pi / 2,
+                    "range_min": 0.1,
+                    "range_max": 40.0,
+                    "ranges": [2.0, 3.0],
+                },
+            },
+            {
+                "topic": "/b_raw_scan",
+                "age_s": 0.31,
+                "message": {
+                    "header": {"frame_id": "back_laser_link"},
+                    "angle_min": 0.0,
+                    "angle_increment": math.pi / 2,
+                    "range_min": 0.1,
+                    "range_max": 40.0,
+                    "ranges": [2.0, 3.0],
+                },
+            },
+        ]
+    }
+    pts = conv.points_from_mir_laser_scan_payload(payload)
+    # Oldest scan wins so the merged cloud is stamped conservatively.
+    assert pts.age_s == 0.31
+
+
+def test_mir_laser_scan_payload_age_s_absent_is_none():
+    payload = {
+        "scans": [
+            {
+                "topic": "/f_raw_scan",
+                "message": {
+                    "header": {"frame_id": "front_laser_link"},
+                    "angle_min": 0.0,
+                    "angle_increment": math.pi / 2,
+                    "range_min": 0.1,
+                    "range_max": 40.0,
+                    "ranges": [2.0, 3.0],
+                },
+            }
+        ]
+    }
+    pts = conv.points_from_mir_laser_scan_payload(payload)
+    assert pts.age_s is None
+
+
+def test_mir_laser_scan_payload_top_level_age_s_fallback():
+    payload = {
+        "age_s": 0.2,
+        "scans": [
+            {
+                "topic": "/f_raw_scan",
+                "message": {
+                    "header": {"frame_id": "front_laser_link"},
+                    "angle_min": 0.0,
+                    "angle_increment": math.pi / 2,
+                    "range_min": 0.1,
+                    "range_max": 40.0,
+                    "ranges": [2.0, 3.0],
+                },
+            }
+        ],
+    }
+    pts = conv.points_from_mir_laser_scan_payload(payload)
+    assert pts.age_s == 0.2
+
+
 def test_mir_native_scan_preserves_negative_angle_increment():
     msg = {
         "header": {"frame_id": "front_laser_link"},

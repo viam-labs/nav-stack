@@ -191,6 +191,11 @@ class SlamConfig:
     odom_rate_hz: float = 20.0
     sensor_read_timeout_s: float = 10.0
     scan_bins: int = 720
+    # Safety cutoff for the SLAM/publish scan path: if mir-base reports a scan
+    # cache age (get_laser_scan ``age_s``) above this, the bridge skips publishing
+    # it rather than feeding SLAM/Nav2 a misregistered scan. Accurate age-based
+    # stamping handles normal latency; this only guards genuinely stale data.
+    scan_max_age_s: float = 2.0
     ros_env: Optional[str] = None
     # How ROS /cmd_vel (vx forward, vy lateral) maps to the Viam base SetVelocity axes.
     base_velocity_convention: str = BASE_VELOCITY_ROS
@@ -199,6 +204,9 @@ class SlamConfig:
     # Automatically run global_localize shortly after starting in localizing mode.
     global_localize_on_start: bool = True
     global_localize_on_start_delay_s: float = 4.0
+    # Max time to wait for slam + scans + map to become usable before the
+    # startup auto-localize runs (rosbridge sessions can take tens of seconds).
+    global_localize_on_start_readiness_timeout_s: float = 90.0
     global_localize_on_start_options: Mapping = field(
         default_factory=lambda: {
             "full_map": True,
@@ -221,6 +229,42 @@ class SlamConfig:
             "map_source": "live",
             "local_yaw_window_deg": 120.0,
             "search_radius_m": 6.0,
+        }
+    )
+    # Periodic localization drift watchdog (localizing mode only). Runs a cheap
+    # local scan-match on an interval and re-localizes when pose has drifted.
+    periodic_relocalize: bool = True
+    periodic_relocalize_interval_s: float = 20.0
+    # Shorter interval while Nav2 is active (localization drift shows up as planner
+    # failures / recoveries mid-goal).
+    periodic_relocalize_nav_interval_s: float = 15.0
+    # Below this match score, or above this ray MAE (m), the local match is not
+    # trusted; the watchdog then tries a full-map global_localize (like manual).
+    # ray MAE default is deliberately generous: on real robots a correctly
+    # localized pose still has ~0.5-0.9 m ray MAE (lidar noise, map resolution,
+    # partial coverage), so a tighter gate makes the routine drift-correction path
+    # never fire and drift only gets caught after nav degrades into a recovery.
+    periodic_relocalize_min_score: float = 0.5
+    periodic_relocalize_max_ray_mae_m: float = 1.0
+    # In a recovery situation (full-map match because nav is failing or the local
+    # match was low quality) the watchdog mirrors a manual global_localize: it
+    # applies the best full-map match when its score clears this floor, ignoring
+    # the ray_mae gate. This is what lets a genuinely-lost robot recover even when
+    # the environment's baseline ray_mae is above periodic_relocalize_max_ray_mae_m.
+    periodic_relocalize_recovery_min_score: float = 0.45
+    periodic_relocalize_min_shift_m: float = 0.2
+    periodic_relocalize_min_shift_deg: float = 10.0
+    # When Nav2 reports this many recoveries on the active goal, skip the cheap
+    # local match and run full-map global_localize immediately.
+    periodic_relocalize_nav_recoveries_threshold: int = 2
+    periodic_relocalize_full_map_on_low_quality: bool = True
+    periodic_relocalize_during_navigation: bool = True
+    periodic_relocalize_options: Mapping = field(
+        default_factory=lambda: {
+            "full_map": False,
+            "map_source": "live",
+            "search_radius_m": 3.0,
+            "auto_full_map_fallback": True,
         }
     )
 
@@ -255,6 +299,7 @@ class SlamConfig:
             odom_rate_hz=float(d.get("odom_rate_hz", 20.0)),
             sensor_read_timeout_s=float(d.get("sensor_read_timeout_s", 10.0)),
             scan_bins=int(d.get("scan_bins", 720)),
+            scan_max_age_s=float(d.get("scan_max_age_s", 2.0)),
             ros_env=d.get("ros_env"),
             base_velocity_convention=convention,
             slam_toolbox=SlamToolboxConfig.from_dict(d.get("slam_toolbox", {}) or {}),
@@ -262,6 +307,9 @@ class SlamConfig:
             global_localize_on_start=bool(d.get("global_localize_on_start", True)),
             global_localize_on_start_delay_s=float(
                 d.get("global_localize_on_start_delay_s", 4.0)
+            ),
+            global_localize_on_start_readiness_timeout_s=float(
+                d.get("global_localize_on_start_readiness_timeout_s", 90.0)
             ),
             global_localize_on_start_options=d.get(
                 "global_localize_on_start_options",
@@ -315,6 +363,52 @@ class SlamConfig:
                 "local_yaw_window_deg": 120.0,
                 "search_radius_m": 6.0,
             },
+            periodic_relocalize=bool(d.get("periodic_relocalize", True)),
+            periodic_relocalize_interval_s=float(
+                d.get("periodic_relocalize_interval_s", 20.0)
+            ),
+            periodic_relocalize_nav_interval_s=float(
+                d.get("periodic_relocalize_nav_interval_s", 15.0)
+            ),
+            periodic_relocalize_min_score=float(
+                d.get("periodic_relocalize_min_score", 0.5)
+            ),
+            periodic_relocalize_max_ray_mae_m=float(
+                d.get("periodic_relocalize_max_ray_mae_m", 1.0)
+            ),
+            periodic_relocalize_recovery_min_score=float(
+                d.get("periodic_relocalize_recovery_min_score", 0.45)
+            ),
+            periodic_relocalize_min_shift_m=float(
+                d.get("periodic_relocalize_min_shift_m", 0.2)
+            ),
+            periodic_relocalize_min_shift_deg=float(
+                d.get("periodic_relocalize_min_shift_deg", 10.0)
+            ),
+            periodic_relocalize_nav_recoveries_threshold=int(
+                d.get("periodic_relocalize_nav_recoveries_threshold", 2)
+            ),
+            periodic_relocalize_full_map_on_low_quality=bool(
+                d.get("periodic_relocalize_full_map_on_low_quality", True)
+            ),
+            periodic_relocalize_during_navigation=bool(
+                d.get("periodic_relocalize_during_navigation", True)
+            ),
+            periodic_relocalize_options=d.get(
+                "periodic_relocalize_options",
+                {
+                    "full_map": False,
+                    "map_source": "live",
+                    "search_radius_m": 3.0,
+                    "auto_full_map_fallback": True,
+                },
+            )
+            or {
+                "full_map": False,
+                "map_source": "live",
+                "search_radius_m": 3.0,
+                "auto_full_map_fallback": True,
+            },
         )
 
     def required_dependencies(self) -> List[str]:
@@ -337,6 +431,13 @@ class NavConfig:
     acc_lim_theta: float = 2.0
     inflation_radius: float = 0.55
     cmd_vel_timeout: float = 2.0  # seconds (watchdog)
+    # Reactive obstacle avoidance for simple (non-Nav2) go_to_* motion.
+    simple_avoid_obstacles: bool = True
+    simple_stop_distance: float = 0.4  # meters: stop forward + turn away inside this
+    simple_slow_distance: float = 1.0  # meters: scale speed down inside this
+    # Max scan age (s) still trusted for avoidance. Larger tolerates slower MiR
+    # rosbridge lidar reads; too small makes avoidance fail closed (no drive).
+    simple_scan_max_age: float = 2.0
     nav2: Nav2Config = field(default_factory=Nav2Config)
     nav2_params: Mapping = field(default_factory=dict)
     nav2_params_path: Optional[str] = None
@@ -359,6 +460,10 @@ class NavConfig:
             acc_lim_theta=float(d.get("acc_lim_theta", 2.0)),
             inflation_radius=float(d.get("inflation_radius", 0.55)),
             cmd_vel_timeout=float(d.get("cmd_vel_timeout", 2.0)),
+            simple_avoid_obstacles=bool(d.get("simple_avoid_obstacles", True)),
+            simple_stop_distance=float(d.get("simple_stop_distance", 0.4)),
+            simple_slow_distance=float(d.get("simple_slow_distance", 1.0)),
+            simple_scan_max_age=float(d.get("simple_scan_max_age", 2.0)),
             nav2=Nav2Config.from_dict(d.get("nav2", {}) or {}),
             nav2_params=d.get("nav2_params", {}) or {},
             nav2_params_path=d.get("nav2_params_path"),

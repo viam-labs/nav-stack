@@ -118,6 +118,7 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 | `global_localize_on_start_post_apply_refine_options` | SLAM | Optional args for post-apply refine (default `{ \"map_source\": \"live\" }`) |
 | `global_localize_on_start_refine_options` | SLAM | Optional args for refine passes; defaults to local refinement (`full_map: false`, `map_source: live`, `local_yaw_window_deg: 120`, `search_radius_m: 6`) |
 | `base_velocity_convention` | SLAM | `ros` (default) or `mir` — maps Nav2 `/cmd_vel` to Viam base `SetVelocity` axes |
+| `scan_max_age_s` | SLAM | Safety cutoff for the `/scan` publish path: if the lidar reports a cache age (`get_laser_scan` `age_s`) above this, skip publishing that cycle rather than feed SLAM/Nav2 a stale, misregistered scan (default `2.0`) |
 | `slam_toolbox` | SLAM | Common slam_toolbox params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced: any other slam_toolbox ROS param (merged last) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level Nav2 footprint / velocity limits |
@@ -168,9 +169,18 @@ Example with slam_toolbox tuning:
 Startup auto-localize evaluates candidate poses first (`apply: false`) and only
 publishes the best pose at the end, so early weak passes do not lock in a bad seed.
 
+**Scan freshness / capture-time stamping.** When the lidar (e.g. `viam-labs:mir-base`)
+reports a per-scan cache age (`age_s`) in its `get_laser_scan` output, the bridge
+stamps the published scan at its capture time (`read_start - age_s`) instead of read
+time. This keeps obstacles and scan-match registered where the robot actually was
+when the scan was captured — important on a moving/rotating robot where a cached
+scan stamped "now" would smear geometry and drive localization off. Scans older than
+`scan_max_age_s` are dropped for the SLAM path. Producers that don't report `age_s`
+fall back to read-time stamping (unchanged behavior).
+
 `mode` changes take effect on reconfigure (or via `start_mapping` / `start_localizing` DoCommands).
 
-For **MiR250** bases (`viam-labs:mir-base`), set `"base_velocity_convention": "mir"` so forward Nav2 commands map to Viam `linear.y` (MiR expects forward on Y, not X). Odometry from `viam-labs:mir-base:movement` stays in ROS convention and does not need swapping. Nav-stack stops Nav2 motion with `set_velocity(0)` (not `Base.stop()`), so MiR Manualcontrol and `go_to_position` keep working after a navigation cancel or goal completion.
+For **MiR250** bases (`viam-labs:mir-base`), set `"base_velocity_convention": "mir"` so forward Nav2 commands map to Viam `linear.y` (MiR expects forward on Y, not X). Odometry from `viam-labs:mir-base:movement` stays in ROS convention and does not need swapping. Nav-stack stops Nav2 motion with `set_velocity(0)` (not `Base.stop()`), so MiR Manualcontrol and `go_to_location` keep working after a navigation cancel or goal completion.
 
 The MiR250 is **differential drive** — use `"kinematics": "differential"` (the default). Configuring `omni` (or an `Omni` MPPI motion model) makes Nav2 command lateral velocities the robot cannot execute, which stalls progress near goals and triggers endless spin recoveries. Also avoid `"vx_min": 0`: with reverse disabled, a diff-drive robot must rotate fully around to correct small overshoots.
 

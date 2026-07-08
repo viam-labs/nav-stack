@@ -8,16 +8,25 @@ Nav2 against the same rclpy context and read the active map's locations/zones.
 from __future__ import annotations
 
 from threading import Lock
-from typing import Dict, Optional
+from typing import Dict, Optional, Optional
 
 
 class SlamRuntime:
     """Shared handle published by a SLAM model instance."""
 
-    def __init__(self, manager, map_store, slam_cfg):
+    def __init__(
+        self,
+        manager,
+        map_store,
+        slam_cfg,
+        localization_check: Optional[dict] = None,
+    ):
         self.manager = manager
         self.map_store = map_store
         self.slam_cfg = slam_cfg
+        self.localization_check = (
+            localization_check if localization_check is not None else {"status": "idle"}
+        )
 
 
 _REGISTRY: Dict[str, SlamRuntime] = {}

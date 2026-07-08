@@ -312,6 +312,11 @@ class LidarPoints:
     sensor: np.ndarray  # (N, 3) in the scanner frame
     base_link: np.ndarray  # (N, 3) in base_link
     sensor_scan: Optional["LaserScan2D"] = None  # native MiR scan for /scan_0
+    # Cache age (seconds) of the scan when mir-base returned it, from the
+    # get_laser_scan payload's ``age_s``. Lets the bridge stamp the scan at its
+    # capture time (read_start - age_s) instead of read time; None when the
+    # producer doesn't report it (older mir-base or the direct PCD path).
+    age_s: Optional[float] = None
 
 
 @dataclass
@@ -557,6 +562,7 @@ def points_from_mir_laser_scan_payload(payload: Mapping) -> LidarPoints:
     sensor_chunks: List[np.ndarray] = []
     base_chunks: List[np.ndarray] = []
     sensor_scan: Optional[LaserScan2D] = None
+    ages: List[float] = []
     for entry in payload.get("scans") or []:
         if not isinstance(entry, Mapping):
             continue
@@ -564,6 +570,9 @@ def points_from_mir_laser_scan_payload(payload: Mapping) -> LidarPoints:
         if not isinstance(msg, Mapping):
             msg = entry
         topic = str(entry.get("topic") or "")
+        entry_age = _coerce_optional_float(entry.get("age_s"))
+        if entry_age is not None:
+            ages.append(entry_age)
         if sensor_scan is None:
             candidate = mir_laser_scan_message_to_scan2d(msg)
             if scan_has_returns(candidate):
@@ -575,7 +584,28 @@ def points_from_mir_laser_scan_payload(payload: Mapping) -> LidarPoints:
             base_chunks.append(chunk.base_link)
     sensor = np.vstack(sensor_chunks) if sensor_chunks else np.empty((0, 3))
     base_link = np.vstack(base_chunks) if base_chunks else np.empty((0, 3))
-    return LidarPoints(sensor=sensor, base_link=base_link, sensor_scan=sensor_scan)
+    # Fall back to a top-level age_s if the producer reports it once for the set.
+    if not ages:
+        top_age = _coerce_optional_float(payload.get("age_s"))
+        if top_age is not None:
+            ages.append(top_age)
+    # Merged points mix all lidars, so stamp conservatively at the oldest scan.
+    age_s = max(ages) if ages else None
+    return LidarPoints(
+        sensor=sensor, base_link=base_link, sensor_scan=sensor_scan, age_s=age_s
+    )
+
+
+def _coerce_optional_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
 
 
 def parse_pcd(raw: bytes) -> np.ndarray:

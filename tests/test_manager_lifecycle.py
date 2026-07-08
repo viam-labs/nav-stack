@@ -1,3 +1,4 @@
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -126,6 +127,9 @@ def test_apply_slam_tf_params_sets_transform_timeout():
 
 def test_suppress_jazzy_nav2_extras_pkill_patterns():
     mgr = _manager()
+    # Window 0 makes the background reaper a no-op, so only the initial
+    # synchronous sweep runs and the call count stays deterministic.
+    mgr._SUPPRESS_WINDOW_S = 0.0
     with patch.object(mgr, "_ros_env", return_value={"PATH": "/usr/bin"}), patch(
         "src.ros.manager.time.sleep"
     ), patch("src.ros.manager.subprocess.run") as run:
@@ -134,6 +138,51 @@ def test_suppress_jazzy_nav2_extras_pkill_patterns():
     patterns = [call.args[0][2] for call in run.call_args_list]
     assert "nav2_collision_monitor/collision_monitor" in patterns
     assert "__node:=lifecycle_manager_navigation" in patterns
+
+
+def test_suppress_jazzy_nav2_extras_reaps_over_window():
+    mgr = _manager()
+    mgr._SUPPRESS_WINDOW_S = 5.0
+    reaped = threading.Event()
+    call_count = {"n": 0}
+
+    def _fake_run(*args, **kwargs):
+        call_count["n"] += 1
+        # After the initial 2 calls plus at least one windowed sweep, signal.
+        if call_count["n"] >= 4:
+            reaped.set()
+            mgr._SUPPRESS_WINDOW_S = 0.0  # let the reaper thread exit promptly
+        return MagicMock(returncode=0)
+
+    with patch.object(mgr, "_ros_env", return_value={"PATH": "/usr/bin"}), patch(
+        "src.ros.manager.time.sleep"
+    ), patch("src.ros.manager.subprocess.run", side_effect=_fake_run):
+        mgr._suppress_jazzy_nav2_extras()
+        assert reaped.wait(timeout=5.0)
+
+
+def test_start_nav2_rotates_previous_launch_log(tmp_path):
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "maps_dir": str(tmp_path)})
+    mgr = RosManager(cfg, logger=MagicMock())
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    params_path = tmp_path / "nav2_params.yaml"
+    params_path.write_text("{}", encoding="utf-8")
+    log_path = tmp_path / ".runtime" / "nav2_launch.log"
+    log_path.write_text("old errors", encoding="utf-8")
+
+    proc = MagicMock()
+    proc.poll.return_value = None
+    with patch.object(mgr, "stop_nav2"), patch.object(
+        mgr, "_popen", return_value=proc
+    ), patch.object(mgr, "_wait_for_nav_action", return_value=True), patch.object(
+        mgr, "_suppress_jazzy_nav2_extras"
+    ), patch.object(mgr, "_apply_slam_tf_params"), patch.object(
+        mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout="", stderr="")
+    ):
+        mgr.start_nav2(nav_cfg, params_path)
+
+    assert not log_path.exists()
+    assert (tmp_path / ".runtime" / "nav2_launch.log.prev").read_text() == "old errors"
 
 
 def test_wait_for_map_tf_before_nav2_returns_once_tf_available():

@@ -69,7 +69,9 @@ controller_server:
       az_max: 3.5
       vx_std: 0.2
       vy_std: 0.2
-      wz_std: 0.25
+      # Lower rotational sampling noise: with a Pi-sized batch (1000) high
+      # wz_std makes the chosen trajectory wander in heading (curvy driving).
+      wz_std: 0.15
       vx_max: 0.4
       vx_min: -0.4
       vy_max: 0.0
@@ -123,7 +125,9 @@ controller_server:
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 6.0
+        # Strong enough to track the (now smoothed) global path mid-route;
+        # hands off to GoalCritic within 2.5 m so near-goal behavior is safe.
+        cost_weight: 10.0
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
         # Match GoalCritic threshold so path tracking hands off cleanly to
@@ -156,9 +160,13 @@ planner_server:
     costmap_update_timeout: 1.0
     planner_plugins: ["GridBased"]
     GridBased:
+      # NavFn A*: plans in tens of ms. The default BT replans at 1 Hz, and
+      # heavier planners (Smac) can eat their full multi-second budget every
+      # cycle on a Pi, starving the controller. Driven-path smoothness comes
+      # from MPPI tuning (wz_std, PathAlignCritic), not the global planner.
       plugin: "nav2_navfn_planner::NavfnPlanner"
       tolerance: 0.5
-      use_astar: false
+      use_astar: true
       allow_unknown: true
 behavior_server:
   ros__parameters:

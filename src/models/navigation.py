@@ -5,13 +5,15 @@ service's shared ROS context and exposes, via ``DoCommand``:
 
 * locations CRUD (named map-frame poses)
 * zones CRUD (keepout + speed_limit virtual regions -> Nav2 costmap filters)
-* navigation (to a named location or an arbitrary map point), cancel, and status
+* navigation (Nav2 to a named location or map point; simple closed-loop
+  ``go_to_location`` / ``go_to_point`` without Nav2), cancel, and status
 
 Physical obstacle avoidance is automatic via Nav2's costmaps (live ``/scan`` data).
 """
 from __future__ import annotations
 
 import asyncio
+import math
 from pathlib import Path
 from typing import ClassVar, Mapping, Optional, Sequence, cast
 
@@ -20,16 +22,23 @@ from typing_extensions import Self
 from viam.components.base import Base
 from viam.logging import getLogger
 from viam.proto.app.robot import ServiceConfig
-from viam.proto.common import ResourceName
+from viam.proto.common import ResourceName, Vector3
 from viam.resource.base import ResourceBase
 from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
 from viam.services.generic import Generic
 from viam.utils import ValueTypes, struct_to_dict
 
-from ..config import OMNI, Nav2Config, NavConfig
+from ..config import OMNI, Nav2Config, NavConfig, ros_cmd_vel_to_viam_linear_mm_s
 from ..nav import zones as zones_mod
 from ..nav.locations import LocationStore
+from ..nav.simple_motion import (
+    ObstacleConfig,
+    SimpleMotionCanceled,
+    SimpleMotionError,
+    config_from_nav,
+    drive_to_pose,
+)
 from ..nav.maps import MapHandle
 from ..nav.zones import ZoneStore
 from ..runtime import get_slam
@@ -46,6 +55,9 @@ class RosNavigation(Generic):
         super().__init__(name)
         self._cfg: Optional[NavConfig] = None
         self._base: Optional[Base] = None
+        self._simple_nav_task: Optional[asyncio.Task] = None
+        self._simple_nav_cancel: Optional[asyncio.Event] = None
+        self._simple_nav_status: dict = {"state": "idle", "motion": "simple"}
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -123,11 +135,13 @@ class RosNavigation(Generic):
             **cfg.nav2.to_override_dict(),
         }
         _apply_nav2_tuning(params, overrides)
+        _apply_velocity_limits(params, cfg)
         if cfg.nav2_params:
             _deep_merge(
                 params, _normalize_nav2_user_params(dict(cfg.nav2_params), params)
             )
         _apply_local_costmap_size(params, cfg.nav2)
+        _sync_mppi_model_dt(params)
 
         runtime = get_slam(cfg.slam_service)
         _set_obstacle_sources(params, len(runtime.slam_cfg.lidars))
@@ -248,13 +262,28 @@ class RosNavigation(Generic):
             theta = float(command.get("theta", 0.0))
             await asyncio.to_thread(mgr.navigate, x, y, theta)
             return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
+        if cmd == "go_to_location":
+            loc = self._locations().get(str(command["name"]))
+            return await self._start_simple_go(loc.x, loc.y, loc.theta, command)
+        if cmd == "go_to_point":
+            x = float(command["x"])
+            y = float(command["y"])
+            theta = float(command.get("theta", 0.0))
+            return await self._start_simple_go(x, y, theta, command)
         if cmd == "cancel":
+            await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.cancel)
             return {"status": "canceled"}
         if cmd == "get_status":
             def _status():
                 status = mgr.nav_status()
                 status.update(mgr.nav2_diagnostics())
+                simple = dict(self._simple_nav_status)
+                status["simple_nav"] = simple
+                if simple.get("state") == "active":
+                    status["active"] = True
+                    status["motion"] = "simple"
+                status["localization_check"] = dict(runtime.localization_check)
                 return status
 
             return await asyncio.to_thread(_status)
@@ -296,6 +325,161 @@ class RosNavigation(Generic):
         if cur is None:
             raise RuntimeError("current pose unavailable; provide an explicit pose")
         return store.add(str(command["name"]), cur.x, cur.y, cur.theta)
+
+    # -- simple closed-loop navigation (map frame, no Nav2) ------------------
+    async def _start_simple_go(
+        self,
+        x: float,
+        y: float,
+        theta: float,
+        command: Mapping[str, ValueTypes],
+    ) -> Mapping[str, ValueTypes]:
+        wait = command.get("wait", True)
+        velocity = command.get("velocity_mps")
+        velocity_mps = float(velocity) if velocity is not None else None
+        target = {"x": x, "y": y, "theta": theta}
+        if wait:
+            await self._simple_go_to(x, y, theta, velocity_mps=velocity_mps)
+            return {
+                "status": self._simple_nav_status.get("state", "idle"),
+                "motion": "simple",
+                "target": target,
+            }
+        await self._cancel_simple_nav()
+        self._simple_nav_task = asyncio.create_task(
+            self._simple_go_to(x, y, theta, velocity_mps=velocity_mps)
+        )
+        return {"status": "navigating", "motion": "simple", "target": target}
+
+    async def _cancel_simple_nav(self) -> None:
+        if self._simple_nav_cancel is not None:
+            self._simple_nav_cancel.set()
+        task = self._simple_nav_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, SimpleMotionCanceled):
+                pass
+        self._simple_nav_task = None
+        self._simple_nav_cancel = None
+        await self._stop_base()
+        if self._simple_nav_status.get("state") == "active":
+            self._simple_nav_status = {"state": "canceled", "motion": "simple"}
+
+    async def _stop_base(self) -> None:
+        base = self._base
+        if base is None:
+            return
+        await base.set_velocity(
+            linear=Vector3(x=0, y=0, z=0),
+            angular=Vector3(x=0, y=0, z=0),
+        )
+
+    async def _simple_go_to(
+        self,
+        x: float,
+        y: float,
+        theta: float,
+        *,
+        velocity_mps: Optional[float] = None,
+    ) -> None:
+        cfg = self._require_cfg()
+        runtime = self._require_runtime()
+        base = self._base
+        if base is None:
+            raise RuntimeError("navigation base dependency missing")
+
+        await self._cancel_simple_nav()
+        await asyncio.to_thread(runtime.manager.cancel)
+
+        from ..ros import conversions as conv
+
+        goal = conv.Pose2D(x, y, theta)
+        motion_cfg = config_from_nav(
+            max_vel_x=cfg.max_vel_x,
+            max_vel_theta=cfg.max_vel_theta,
+            yaw_tolerance_rad=cfg.nav2.yaw_goal_tolerance,
+        )
+        cancel_event = asyncio.Event()
+        self._simple_nav_cancel = cancel_event
+        self._simple_nav_status = {
+            "state": "active",
+            "motion": "simple",
+            "target": {"x": x, "y": y, "theta": theta},
+        }
+
+        convention = runtime.slam_cfg.base_velocity_convention
+
+        async def _set_velocity(vx: float, vy: float, vtheta: float) -> None:
+            lx, ly = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, convention)
+            await base.set_velocity(
+                linear=Vector3(x=lx, y=ly, z=0),
+                angular=Vector3(x=0, y=0, z=math.degrees(vtheta)),
+            )
+
+        def _on_progress(progress: dict) -> None:
+            prev = self._simple_nav_status.get("obstacle")
+            self._simple_nav_status.update(progress)
+            new_state = progress.get("obstacle")
+            if new_state != prev and new_state in ("avoid", "slow", "no_scan"):
+                clearance = progress.get("forward_clearance_m")
+                if new_state == "no_scan":
+                    LOGGER.warning(
+                        "simple nav: no fresh lidar scan; suppressing forward motion"
+                    )
+                else:
+                    LOGGER.info(
+                        f"simple nav: obstacle {new_state} "
+                        f"(forward clearance {clearance} m)"
+                    )
+
+        obstacle_cfg = ObstacleConfig(
+            enabled=cfg.simple_avoid_obstacles,
+            stop_distance_m=cfg.simple_stop_distance,
+            slow_distance_m=cfg.simple_slow_distance,
+            max_age_s=cfg.simple_scan_max_age,
+        )
+
+        def _get_scan():
+            return runtime.manager.get_base_scan(obstacle_cfg.max_age_s)
+
+        try:
+            await drive_to_pose(
+                goal=goal,
+                get_pose=runtime.manager.get_pose_in_map,
+                set_velocity=_set_velocity,
+                stop=self._stop_base,
+                cfg=motion_cfg,
+                linear_mps=velocity_mps,
+                cancel_event=cancel_event,
+                on_progress=_on_progress,
+                get_scan=_get_scan,
+                obstacle=obstacle_cfg,
+            )
+            self._simple_nav_status = {
+                "state": "succeeded",
+                "motion": "simple",
+                "target": {"x": x, "y": y, "theta": theta},
+            }
+        except SimpleMotionCanceled:
+            self._simple_nav_status = {
+                "state": "canceled",
+                "motion": "simple",
+                "target": {"x": x, "y": y, "theta": theta},
+            }
+            raise
+        except SimpleMotionError as exc:
+            self._simple_nav_status = {
+                "state": "failed",
+                "motion": "simple",
+                "error": str(exc),
+                "target": {"x": x, "y": y, "theta": theta},
+            }
+            raise RuntimeError(str(exc)) from exc
+        finally:
+            self._simple_nav_cancel = None
+            self._simple_nav_task = None
 
 def _find_template_section_paths(template: Mapping, key: str) -> list:
     """Return paths to every nested mapping named ``key`` inside the template.
@@ -412,6 +596,36 @@ def _validate_nav2_params_structure(params: Mapping) -> None:
         _check(value, str(top))
 
 
+def _sync_mppi_model_dt(params: dict) -> None:
+    """Keep MPPI ``model_dt`` >= the controller period (1/controller_frequency).
+
+    MPPI's on_configure() raises "Controller period more then model dt" when
+    1/controller_frequency > model_dt; that fails the controller_server
+    lifecycle transition and aborts the whole Nav2 bringup. Lowering
+    controller_frequency (e.g. 10 -> 5 Hz on a loaded Pi) without also raising
+    model_dt trips this. Snap model_dt up to the controller period so the two
+    can never drift out of sync, regardless of how the frequency was set
+    (top-level nav2 config or raw nav2_params override).
+    """
+    try:
+        cs = params["controller_server"]["ros__parameters"]
+        freq = float(cs["controller_frequency"])
+        fp = cs["FollowPath"]
+    except (KeyError, TypeError, ValueError):
+        return
+    if not isinstance(fp, dict) or freq <= 0:
+        return
+    if "nav2_mppi_controller" not in str(fp.get("plugin", "")):
+        return
+    period = 1.0 / freq
+    try:
+        current = float(fp.get("model_dt", 0.0))
+    except (TypeError, ValueError):
+        current = 0.0
+    if current < period:
+        fp["model_dt"] = period
+
+
 def _apply_local_costmap_size(params: dict, nav2_cfg: Nav2Config) -> None:
     """Set rolling local costmap dimensions (Jazzy requires integer width/height)."""
     try:
@@ -442,6 +656,47 @@ def _set_obstacle_sources(params: Mapping, n_lidars: int) -> None:
             entry = dict(template)
             entry["topic"] = f"/scan_{i}"
             obstacle[name] = entry
+
+
+def _apply_velocity_limits(params: dict, cfg: NavConfig) -> None:
+    """Wire top-level velocity/accel attributes into MPPI + velocity_smoother.
+
+    The flat override pass only matches identical key names (``max_vel_x``),
+    but MPPI uses ``vx_max``/``wz_max`` and the smoother uses arrays — so the
+    user's configured speed limits silently never reached the controller.
+    """
+    omni = cfg.kinematics == OMNI
+    vy = cfg.max_vel_y if omni else 0.0
+    try:
+        fp = params["controller_server"]["ros__parameters"]["FollowPath"]
+    except (KeyError, TypeError):
+        fp = None
+    if isinstance(fp, dict):
+        fp["motion_model"] = "Omni" if omni else "DiffDrive"
+        fp["vx_max"] = cfg.max_vel_x
+        # Keep a modest reverse for goal corrections; diff-drive with no
+        # reverse must rotate fully around to fix small overshoots.
+        fp["vx_min"] = -min(cfg.max_vel_x, 0.15)
+        fp["vy_max"] = vy
+        fp["wz_max"] = cfg.max_vel_theta
+        fp["ax_max"] = cfg.acc_lim_x
+        fp["ax_min"] = -cfg.acc_lim_x
+        fp["az_max"] = cfg.acc_lim_theta
+    try:
+        vs = params["velocity_smoother"]["ros__parameters"]
+    except (KeyError, TypeError):
+        return
+    if isinstance(vs, dict):
+        vs["max_velocity"] = [cfg.max_vel_x, vy, cfg.max_vel_theta]
+        vs["min_velocity"] = [-cfg.max_vel_x, -vy, -cfg.max_vel_theta]
+        vs["max_accel"] = [cfg.acc_lim_x, cfg.acc_lim_x if omni else 0.0, cfg.acc_lim_theta]
+        # Allow braking harder than accelerating (safety), but keep it bounded
+        # so the smoother actually smooths instead of passing jerks through.
+        vs["max_decel"] = [
+            -1.5 * cfg.acc_lim_x,
+            -1.5 * cfg.acc_lim_x if omni else 0.0,
+            -1.5 * cfg.acc_lim_theta,
+        ]
 
 
 def _deep_merge(obj: dict, overrides: Mapping) -> None:
