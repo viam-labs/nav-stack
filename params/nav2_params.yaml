@@ -102,9 +102,13 @@ controller_server:
       GoalAngleCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 2.0
-        # Final heading alignment only when position is nearly settled.
-        threshold_to_consider: 0.7
+        # Strong enough to force a large in-place final rotation once the robot
+        # is parked on the goal XY (must beat GoalCritic=4.0, which is happy to
+        # just sit on the point). A weak value here reaches the spot but never
+        # turns to the goal heading — the robot ends up facing its approach
+        # direction. Engage in the last meter so the turn has horizon to finish.
+        cost_weight: 6.0
+        threshold_to_consider: 1.0
       PreferForwardCritic:
         enabled: true
         cost_power: 1
