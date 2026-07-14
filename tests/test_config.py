@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from src.config import DIFFERENTIAL, OMNI, NavConfig, SlamConfig, ros_cmd_vel_to_viam_linear_mm_s
@@ -16,6 +18,29 @@ def test_slam_config_scan_max_age_default_and_override():
     assert cfg.scan_max_age_s == 0.75
 
 
+def test_slam_config_lidar_scan_source():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": {"name": "livox-pc", "scan_source": "point_cloud"},
+        }
+    )
+    assert cfg.lidars[0].scan_source == "point_cloud"
+    assert cfg.scan_accumulation_s == pytest.approx(0.3)
+    assert cfg.heading_only_odom is False
+    assert cfg.imu_odom_mode == "accel_only"
+    assert cfg.lidar_odom_enabled is True
+    assert cfg.lidar_odom_range_flow_only is True
+    assert cfg.slam_toolbox.minimum_travel_distance == pytest.approx(0.15)
+    assert cfg.slam_toolbox.minimum_travel_heading == pytest.approx(0.12)
+    assert cfg.slam_params.get("minimum_time_interval") == pytest.approx(0.3)
+    assert cfg.slam_params.get("correlation_search_space_dimension") == pytest.approx(0.6)
+    with pytest.raises(ValueError, match="scan_source"):
+        SlamConfig.from_dict(
+            {"base": "b", "lidar": {"name": "x", "scan_source": "invalid"}}
+        )
+
+
 def test_slam_config_multi_lidar_with_mounts():
     cfg = SlamConfig.from_dict(
         {
@@ -32,6 +57,116 @@ def test_slam_config_multi_lidar_with_mounts():
     assert cfg.lidars[0].x == 0.2
     assert cfg.lidars[1].theta == pytest.approx(3.14159)
     assert "odom" in cfg.required_dependencies()
+    assert cfg.movement_sensor_yaw_deg == 0.0
+
+
+def test_lidar_config_mount_pitch_roll():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": {
+                "name": "livox",
+                "scan_source": "point_cloud",
+                "mount": {"x": 0.463, "z": 1.129, "theta": 0.0, "pitch": 0.035},
+            },
+        }
+    )
+    assert cfg.lidars[0].pitch == pytest.approx(0.035)
+    assert cfg.lidars[0].roll == 0.0
+
+
+def test_slam_config_map_when_still_livox_defaults():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": {"name": "livox", "scan_source": "point_cloud"},
+            "map_when_still": True,
+        }
+    )
+    assert cfg.map_when_still is True
+    assert cfg.scan_accumulation_s == pytest.approx(1.0)
+    assert cfg.map_when_still_dwell_s == pytest.approx(1.0)
+    assert cfg.slam_toolbox.minimum_travel_distance == pytest.approx(0.0)
+    # Real slam_toolbox matcher knobs (use_odometry / use_tf_* are not real params).
+    assert cfg.slam_params.get("correlation_search_space_dimension") == pytest.approx(
+        1.0
+    )
+    assert cfg.slam_params.get("coarse_search_angle_offset") == pytest.approx(0.52)
+    assert cfg.slam_params.get("link_match_minimum_response_fine") == pytest.approx(
+        0.25
+    )
+    assert cfg.slam_params.get("loop_match_minimum_chain_size") == 10
+    assert cfg.slam_params.get("loop_search_maximum_distance") == pytest.approx(5.0)
+    assert cfg.slam_params.get("loop_match_minimum_response_fine") == pytest.approx(
+        0.45
+    )
+    assert cfg.slam_params.get("do_loop_closing") is True
+    assert cfg.slam_params.get("angle_variance_penalty") == pytest.approx(1.0)
+    assert cfg.lidar_odom_enabled is False
+    assert cfg.heading_only_odom is False
+    assert cfg.imu_odom_mode == "accel_only"
+    assert cfg.wall_yaw_correction is True
+    assert cfg.wall_yaw_min_length_m == pytest.approx(2.0)
+    assert cfg.wall_yaw_max_step_deg == pytest.approx(2.0)
+    assert cfg.wall_yaw_blend == pytest.approx(0.5)
+    # Mapping-time revisit check defaults on for stop-and-go Livox carts.
+    assert cfg.mapping_revisit_check is True
+    assert cfg.mapping_revisit_interval_s == pytest.approx(20.0)
+    assert cfg.mapping_revisit_search_radius_m == pytest.approx(5.0)
+    assert cfg.mapping_revisit_wide_radius_m == pytest.approx(12.0)
+    assert cfg.mapping_revisit_min_score == pytest.approx(0.6)
+    assert cfg.mapping_revisit_full_map_min_score == pytest.approx(0.75)
+    assert cfg.mapping_revisit_min_shift_m == pytest.approx(1.0)
+    assert cfg.mapping_revisit_max_shift_m == pytest.approx(10.0)
+    assert cfg.mapping_revisit_full_map_fallback is True
+    # Strict stop-and-go: mid-pivot scans off unless explicitly enabled.
+    assert cfg.map_when_still_yaw_step_deg == pytest.approx(0.0)
+    assert cfg.map_when_still_max_drift_m == pytest.approx(0.03)
+    assert cfg.map_when_still_max_drift_deg == pytest.approx(1.5)
+
+
+def test_slam_config_map_when_still_overrides_user_travel_gates():
+    """Continuous Livox travel gates must not survive with map_when_still."""
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": {"name": "livox", "scan_source": "point_cloud"},
+            "map_when_still": True,
+            "slam_toolbox": {
+                "resolution": 0.05,
+                "minimum_travel_distance": 0.15,
+                "minimum_travel_heading": 0.15,
+            },
+        }
+    )
+    assert cfg.slam_toolbox.minimum_travel_distance == pytest.approx(0.0)
+    assert cfg.slam_toolbox.minimum_travel_heading == pytest.approx(0.0)
+
+
+def test_slam_config_map_when_still_default_off_for_mir_style():
+    """MiR-style laser scan lidars must keep continuous mapping defaults."""
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
+    assert cfg.map_when_still is False
+    assert cfg.wall_yaw_correction is False
+    assert cfg.mapping_revisit_check is False
+    assert cfg.scan_accumulation_s == pytest.approx(0.0)
+
+
+def test_slam_config_movement_sensor_yaw_deg():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": {"name": "x", "scan_source": "point_cloud"},
+            "movement_sensor": "imu",
+            "movement_sensor_yaw_deg": -90,
+            "movement_sensor_upside_down": True,
+            "heading_sensor_invert": True,
+        }
+    )
+    assert cfg.movement_sensor_yaw_deg == pytest.approx(-90.0)
+    assert cfg.movement_sensor_upside_down is True
+    assert cfg.heading_sensor_invert is True
+    assert cfg.heading_sensor_yaw_deg == 0.0
 
 
 def test_slam_config_global_localize_on_start_options():

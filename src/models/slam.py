@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from typing import ClassVar, List, Mapping, Optional, Sequence, cast
+from typing import ClassVar, Dict, List, Mapping, Optional, Sequence, cast
 
 import numpy as np
 from typing_extensions import Self
@@ -27,6 +27,8 @@ from viam.services.slam import SLAM, MappingMode, Pose
 from viam.utils import ValueTypes, struct_to_dict
 
 from ..config import (
+    LIDAR_SCAN_GET_LASER_SCAN,
+    LIDAR_SCAN_POINT_CLOUD,
     MODE_LOCALIZING,
     MODE_MAPPING,
     SlamConfig,
@@ -44,6 +46,12 @@ from ..ros.manager import RosManager
 from ..runtime import SlamRuntime, register_slam, unregister_slam
 
 LOGGER = getLogger(__name__)
+
+
+def _get_laser_scan_not_implemented(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "not implemented" in msg or "docommand not implemented" in msg
+
 
 # Default /initialpose uncertainty for relocalize (~2 m, ~45 deg std dev).
 RELOCALIZE_POSITION_VARIANCE_M2 = 4.0
@@ -66,11 +74,16 @@ class RosSlam(SLAM):
         self._base: Optional[Base] = None
         self._cameras: dict = {}
         self._movement_sensor: Optional[MovementSensor] = None
+        self._heading_sensor: Optional[MovementSensor] = None
         self._map_display_hold = False
         self._visible_map_generation = 0
         self._startup_global_localize_task: Optional[asyncio.Task] = None
         self._periodic_relocalize_task: Optional[asyncio.Task] = None
+        self._mapping_revisit_task: Optional[asyncio.Task] = None
         self._last_relocalize_check: dict = {"status": "idle"}
+        self._last_revisit_check: dict = {"status": "idle"}
+        # Lidars that don't implement get_laser_scan (auto mode); skip re-probing.
+        self._skip_get_laser_scan: set[str] = set()
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -94,6 +107,8 @@ class RosSlam(SLAM):
     ) -> None:
         self._cancel_startup_global_localize_task()
         self._cancel_periodic_relocalize_task()
+        self._cancel_mapping_revisit_task()
+        self._skip_get_laser_scan = set()
         attrs = struct_to_dict(config.attributes)
         cfg = SlamConfig.from_dict(attrs)
         self._cfg = cfg
@@ -113,6 +128,14 @@ class RosSlam(SLAM):
             if cfg.movement_sensor
             else None
         )
+        self._heading_sensor = (
+            cast(
+                MovementSensor,
+                dependencies[MovementSensor.get_resource_name(cfg.heading_sensor)],
+            )
+            if cfg.heading_sensor
+            else None
+        )
 
         self._map_store = MapStore(cfg.maps_dir)
         active = cfg.active_map or self._map_store.get_active_map_name() or "default"
@@ -128,6 +151,7 @@ class RosSlam(SLAM):
         self._start_mode(cfg.mode)
         self._schedule_startup_global_localize(loop)
         self._schedule_periodic_relocalize(loop)
+        self._schedule_mapping_revisit(loop)
 
         register_slam(
             self.name,
@@ -146,6 +170,234 @@ class RosSlam(SLAM):
         if task is not None and not task.done():
             task.cancel()
         self._periodic_relocalize_task = None
+
+    def _cancel_mapping_revisit_task(self) -> None:
+        task = self._mapping_revisit_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._mapping_revisit_task = None
+
+    def _schedule_mapping_revisit(self, loop: asyncio.AbstractEventLoop) -> None:
+        cfg = self._cfg
+        if (
+            cfg is None
+            or cfg.mode != MODE_MAPPING
+            or not cfg.mapping_revisit_check
+        ):
+            return
+        self._mapping_revisit_task = loop.create_task(
+            self._run_mapping_revisit(
+                interval_s=max(5.0, float(cfg.mapping_revisit_interval_s)),
+            )
+        )
+
+    async def _run_mapping_revisit(self, *, interval_s: float) -> None:
+        """Mapping-time revisit watchdog (anti duplicate-corridor).
+
+        slam_toolbox only loop-closes when the drifted return pose is inside its
+        loop search radius; after a long excursion on IMU-only odom it often is
+        not, so a revisited corridor gets mapped as a second copy. This task
+        periodically matches the live scan against the live map — near the
+        current pose first, wider only when needed — and on a strong disagreeing
+        match shifts the odom TF so the next scans link back to the original
+        geometry.
+        """
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                await self._mapping_revisit_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - watchdog must survive hiccups
+                LOGGER.warning("mapping revisit cycle failed: %s", exc)
+                self._publish_revisit_check({"status": "error", "error": str(exc)})
+
+    def _publish_revisit_check(self, result: Mapping[str, ValueTypes]) -> dict:
+        self._last_revisit_check.clear()
+        self._last_revisit_check.update(result)
+        return dict(self._last_revisit_check)
+
+    def _revisit_match_quality(
+        self, result, cfg: SlamConfig
+    ) -> tuple[bool, float, Optional[float]]:
+        score = float(result.score)
+        ray_mae = float(result.ray_mae_m) if math.isfinite(result.ray_mae_m) else None
+        good = score >= cfg.mapping_revisit_min_score and (
+            ray_mae is None or ray_mae <= cfg.mapping_revisit_max_ray_mae_m
+        )
+        return good, score, ray_mae
+
+    async def _mapping_revisit_cycle(
+        self, *, apply_override: Optional[bool] = None
+    ) -> Mapping[str, ValueTypes]:
+        """One revisit check: tiered scan-to-live-map match, odom shift on drift.
+
+        Tier 1 searches ``mapping_revisit_search_radius_m`` around the current
+        pose; tier 2 widens to ``mapping_revisit_wide_radius_m``; tier 3 (full
+        map) runs only when enabled and must clear a stricter score gate —
+        self-similar offices produce convincing wrong corridors at map scale.
+        """
+        cfg = self._cfg
+        mgr = self._manager
+        if cfg is None or mgr is None:
+            return self._publish_revisit_check({"status": "unconfigured"})
+        if cfg.mode != MODE_MAPPING:
+            return self._publish_revisit_check(
+                {"status": "skipped", "reason": "not_mapping"}
+            )
+        node = mgr.node
+        if node is None:
+            return self._publish_revisit_check(
+                {"status": "skipped", "reason": "bridge_not_started"}
+            )
+
+        # Only correct while parked: the odom shift must not land mid-hop, and
+        # the fresh lidar read has to match where the robot actually is.
+        try:
+            bridge_status = node.slam_bridge_status()
+        except Exception:  # noqa: BLE001
+            bridge_status = {}
+        vel = bridge_status.get("odom_velocity") or {}
+        moving = (
+            math.hypot(float(vel.get("vx", 0.0)), float(vel.get("vy", 0.0)))
+            >= cfg.map_when_still_linear_speed_m_s
+            or abs(float(vel.get("vtheta", 0.0)))
+            >= cfg.map_when_still_yaw_rate_rad_s
+        )
+        if moving and apply_override is not True:
+            return self._publish_revisit_check(
+                {"status": "skipped", "reason": "moving"}
+            )
+
+        current = mgr.get_pose_in_map()
+        if current is None:
+            return self._publish_revisit_check(
+                {"status": "skipped", "reason": "no_pose_in_map"}
+            )
+
+        try:
+            occ_map, _ = self._load_active_occupancy_map("live")
+        except Exception as exc:  # noqa: BLE001 - live map not ready yet
+            return self._publish_revisit_check(
+                {"status": "skipped", "reason": f"no_live_map: {exc}"}
+            )
+        scan = await self._read_merged_scan()
+
+        loop = asyncio.get_running_loop()
+
+        def _match(radius_m: float, yaw_window_deg: float, full_map: bool):
+            return global_localize_scan(
+                occ_map,
+                scan,
+                hint=None if full_map else current,
+                full_map=full_map,
+                search_radius_m=radius_m,
+                local_yaw_window_deg=yaw_window_deg,
+                coarse_position_step_m=0.6 if full_map else 0.4,
+                coarse_yaw_step_deg=18.0 if full_map else 12.0,
+            )
+
+        tiers_tried = []
+        match_mode = "local"
+        result = await loop.run_in_executor(
+            None,
+            lambda: _match(cfg.mapping_revisit_search_radius_m, 90.0, False),
+        )
+        good, score, ray_mae = self._revisit_match_quality(result, cfg)
+        tiers_tried.append({"tier": "local", "score": round(score, 3)})
+
+        if not good:
+            match_mode = "wide"
+            wide = await loop.run_in_executor(
+                None,
+                lambda: _match(cfg.mapping_revisit_wide_radius_m, 180.0, False),
+            )
+            wide_good, wide_score, wide_ray_mae = self._revisit_match_quality(
+                wide, cfg
+            )
+            tiers_tried.append({"tier": "wide", "score": round(wide_score, 3)})
+            if wide_good or wide_score > score:
+                result, good, score, ray_mae = wide, wide_good, wide_score, wide_ray_mae
+
+        if not good and cfg.mapping_revisit_full_map_fallback:
+            match_mode = "full_map"
+            full = await loop.run_in_executor(
+                None, lambda: _match(0.0, 360.0, True)
+            )
+            _, full_score, full_ray_mae = self._revisit_match_quality(full, cfg)
+            tiers_tried.append({"tier": "full_map", "score": round(full_score, 3)})
+            # Full map needs the stricter gate regardless of ray MAE outcome.
+            if full_score >= cfg.mapping_revisit_full_map_min_score and (
+                full_ray_mae is None
+                or full_ray_mae <= cfg.mapping_revisit_max_ray_mae_m
+            ):
+                result, good, score, ray_mae = full, True, full_score, full_ray_mae
+
+        shift_m = math.hypot(result.pose.x - current.x, result.pose.y - current.y)
+        shift_deg = abs(
+            math.degrees(_normalize_angle(result.pose.theta - current.theta))
+        )
+        drifted = (
+            shift_m >= cfg.mapping_revisit_min_shift_m
+            or shift_deg >= cfg.mapping_revisit_min_shift_deg
+        )
+        sane = shift_m <= cfg.mapping_revisit_max_shift_m
+
+        out: dict = {
+            "status": "ok",
+            "match_mode": match_mode,
+            "tiers": tiers_tried,
+            "score": round(score, 3),
+            "ray_mae_m": None if ray_mae is None else round(ray_mae, 3),
+            "shift_m": round(shift_m, 3),
+            "shift_deg": round(shift_deg, 2),
+            "good_match": good,
+            "drifted": drifted,
+            "pose": {
+                "x": result.pose.x,
+                "y": result.pose.y,
+                "theta": result.pose.theta,
+            },
+            "corrected": False,
+        }
+
+        should_apply = apply_override is True or (
+            apply_override is None and good and drifted and sane
+        )
+        if not sane and apply_override is not True:
+            out["status"] = "rejected_shift"
+            LOGGER.warning(
+                "mapping revisit: match %.1f m away exceeds "
+                "mapping_revisit_max_shift_m=%.1f; not correcting (score=%.2f)",
+                shift_m,
+                cfg.mapping_revisit_max_shift_m,
+                score,
+            )
+            return self._publish_revisit_check(out)
+        if not good and apply_override is not True:
+            out["status"] = "low_quality"
+            return self._publish_revisit_check(out)
+
+        if should_apply:
+            applied = await asyncio.to_thread(
+                mgr.apply_map_pose_correction, result.pose
+            )
+            out["correction"] = applied
+            if applied.get("applied"):
+                out["status"] = "corrected"
+                out["corrected"] = True
+                LOGGER.info(
+                    "mapping revisit: odom shifted to rejoin map via %s "
+                    "(shift=%.2f m, %.1f deg, score=%.2f, ray_mae=%s)",
+                    match_mode,
+                    shift_m,
+                    shift_deg,
+                    score,
+                    ray_mae,
+                )
+            else:
+                out["status"] = "correction_failed"
+        return self._publish_revisit_check(out)
 
     def _schedule_periodic_relocalize(self, loop: asyncio.AbstractEventLoop) -> None:
         cfg = self._cfg
@@ -641,7 +893,50 @@ class RosSlam(SLAM):
             assert self._cfg is not None
             timeout = max(float(self._cfg.sensor_read_timeout_s), 1.0)
             cam = self._cameras[name]
-            # MiR lidar: get_laser_scan is more reliable than the PCD round-trip.
+            lidar_cfg = next(
+                (lidar for lidar in self._cfg.lidars if lidar.name == name), None
+            )
+            scan_source = lidar_cfg.scan_source if lidar_cfg is not None else "auto"
+
+            async def _read_point_cloud() -> conv.LidarPoints:
+                data = await cam.get_point_cloud(timeout=timeout)
+                raw = data[0] if isinstance(data, tuple) else data
+                pts = conv.parse_pcd(raw)
+                if lidar_cfg is not None and not lidar_cfg.points_in_base_link:
+                    base_pts = conv.transform_lidar_mount_to_base_link(
+                        pts,
+                        x=lidar_cfg.x,
+                        y=lidar_cfg.y,
+                        z=lidar_cfg.z,
+                        theta=lidar_cfg.theta,
+                        pitch=lidar_cfg.pitch,
+                        roll=lidar_cfg.roll,
+                    )
+                else:
+                    base_pts = pts
+                return conv.LidarPoints(sensor=pts, base_link=base_pts)
+
+            if scan_source == LIDAR_SCAN_POINT_CLOUD or name in self._skip_get_laser_scan:
+                return await _read_point_cloud()
+
+            if scan_source == LIDAR_SCAN_GET_LASER_SCAN:
+                raw_payload = await cam.do_command({"command": "get_laser_scan"})
+                payload = (
+                    struct_to_dict(raw_payload)
+                    if not isinstance(raw_payload, dict)
+                    else raw_payload
+                )
+                mir_pts = conv.points_from_mir_laser_scan_payload(payload)
+                if mir_pts.base_link.size > 0 or (
+                    mir_pts.sensor_scan is not None
+                    and conv.scan_has_returns(mir_pts.sensor_scan)
+                ):
+                    return mir_pts
+                raise RuntimeError(
+                    f"lidar {name} get_laser_scan returned no valid ranges"
+                )
+
+            # auto: prefer mir-base get_laser_scan, fall back to point cloud.
             try:
                 raw_payload = await cam.do_command({"command": "get_laser_scan"})
                 payload = (
@@ -656,20 +951,48 @@ class RosSlam(SLAM):
                 ):
                     return mir_pts
                 LOGGER.warning(
-                    "lidar %s get_laser_scan returned no valid ranges", name
+                    "lidar %s get_laser_scan returned no valid ranges; using point cloud",
+                    name,
                 )
-            except Exception as exc:
-                LOGGER.warning("lidar %s get_laser_scan failed: %s", name, exc)
-            data = await cam.get_point_cloud(timeout=timeout)
-            raw = data[0] if isinstance(data, tuple) else data
-            pts = conv.parse_pcd(raw)
-            return conv.ndarray_as_base_link_points(pts)
+            except Exception as exc:  # noqa: BLE001 - fall back to point cloud
+                if _get_laser_scan_not_implemented(exc):
+                    if name not in self._skip_get_laser_scan:
+                        self._skip_get_laser_scan.add(name)
+                        LOGGER.info(
+                            "lidar %s has no get_laser_scan; using get_point_cloud",
+                            name,
+                        )
+                else:
+                    LOGGER.warning(
+                        "lidar %s get_laser_scan failed: %s; using point cloud",
+                        name,
+                        exc,
+                    )
+            return await _read_point_cloud()
 
         async def read_odometry() -> conv.OdomReading:
             if self._movement_sensor is None:
                 return conv.OdomReading(0.0, 0.0, 0.0)
             readings = await self._movement_sensor.get_readings()
-            return conv.parse_odom_from_readings(readings)
+            sample = conv.parse_odom_from_readings(readings)
+            if self._cfg is not None and self._cfg.movement_sensor_upside_down:
+                sample = conv.apply_sensor_upside_down(sample)
+            if self._cfg is not None and self._cfg.movement_sensor_yaw_deg:
+                sample = conv.apply_sensor_mount_yaw(
+                    sample, math.radians(self._cfg.movement_sensor_yaw_deg)
+                )
+            if self._heading_sensor is not None:
+                heading_readings = await self._heading_sensor.get_readings()
+                heading = conv.parse_heading_sensor_readings(heading_readings)
+                if heading is not None:
+                    if self._cfg is not None and self._cfg.heading_sensor_invert:
+                        heading = conv.normalize_angle(-heading)
+                    if self._cfg is not None and self._cfg.heading_sensor_yaw_deg:
+                        heading = conv.normalize_angle(
+                            heading - math.radians(self._cfg.heading_sensor_yaw_deg)
+                        )
+                    sample = conv.merge_odom_heading(sample, heading)
+            return sample
 
         async def drive_base(vx: float, vy: float, vtheta: float):
             assert self._cfg is not None
@@ -693,6 +1016,98 @@ class RosSlam(SLAM):
             )
 
         return IOProvider(read_lidar_points, read_odometry, drive_base, stop_base)
+
+    async def _probe_sensors(self) -> dict:
+        """One-shot lidar + odom read for get_status (does not affect /scan)."""
+        assert self._cfg is not None
+        io = self._build_io()
+        lidars: list[dict] = []
+        for lidar in self._cfg.lidars:
+            entry: dict = {
+                "name": lidar.name,
+                "scan_source": lidar.scan_source,
+            }
+            try:
+                data = await io.read_lidar_points(lidar.name)
+                sensor_pts = np.asarray(data.sensor, dtype=float)
+                base_pts = np.asarray(data.base_link, dtype=float)
+                entry["sensor_points"] = int(sensor_pts.shape[0])
+                entry["base_link_points"] = int(base_pts.shape[0])
+                if data.age_s is not None:
+                    entry["age_s"] = float(data.age_s)
+                scan_pts = base_pts if base_pts.size else sensor_pts
+                if scan_pts.size:
+                    # Height-band stats help catch mount/z-filter mistakes
+                    # (e.g. all points discarded because the cloud is still in
+                    # the sensor frame, or the mast tilt pulls the floor in).
+                    if scan_pts.shape[1] >= 3:
+                        z = scan_pts[:, 2]
+                        in_band = int(
+                            np.count_nonzero((z >= lidar.z_min) & (z <= lidar.z_max))
+                        )
+                        entry["z_band_points"] = in_band
+                        entry["z_min_m"] = float(np.min(z))
+                        entry["z_max_m"] = float(np.max(z))
+                    scan = conv.pointcloud_to_scan(
+                        scan_pts,
+                        z_min=lidar.z_min,
+                        z_max=lidar.z_max,
+                        num_bins=self._cfg.scan_bins,
+                        range_min=lidar.min_range,
+                        range_max=lidar.max_range,
+                    )
+                    entry["scan_valid_returns"] = sum(
+                        1
+                        for r in scan.ranges
+                        if math.isfinite(r)
+                        and r >= scan.range_min
+                        and (not math.isfinite(scan.range_max) or r <= scan.range_max)
+                    )
+                    # Nearest return within ±15° of robot forward — standing in
+                    # front of the cart should drop this even when the occupancy
+                    # map stays frozen (slam_toolbox only adds scans after travel).
+                    forward = conv.forward_sector_min_range(
+                        scan, half_width_rad=math.radians(15.0)
+                    )
+                    if forward is not None:
+                        entry["forward_min_range_m"] = round(forward, 3)
+                    bearing = conv.nearest_return_bearing_deg(scan)
+                    if bearing is not None:
+                        entry["nearest_return_bearing_deg"] = round(bearing, 1)
+                        # Suggest the mount.theta that would put this wall on +X.
+                        entry["suggested_mount_theta_deg"] = round(-bearing, 1)
+                else:
+                    entry["scan_valid_returns"] = 0
+            except Exception as exc:  # noqa: BLE001 - diagnostics only
+                entry["error"] = repr(exc)
+            lidars.append(entry)
+
+        odom_probe: dict = {}
+        try:
+            sample = await io.read_odometry()
+            odom_probe = {
+                "vx": sample.vx,
+                "vy": sample.vy,
+                "vtheta": sample.vtheta,
+                "has_pose": sample.pose is not None,
+                "has_heading": sample.heading_rad is not None,
+                "has_acceleration": sample.ax is not None and sample.ay is not None,
+            }
+            if sample.ax is not None and sample.ay is not None:
+                odom_probe["ax"] = sample.ax
+                odom_probe["ay"] = sample.ay
+            if sample.pose is not None:
+                odom_probe["pose"] = {
+                    "x": sample.pose.x,
+                    "y": sample.pose.y,
+                    "theta": sample.pose.theta,
+                }
+            if sample.heading_rad is not None:
+                odom_probe["heading_rad"] = sample.heading_rad
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            odom_probe["error"] = repr(exc)
+
+        return {"lidars": lidars, "odometry": odom_probe}
 
     def _start_mode(self, mode: str) -> None:
         assert self._manager and self._map_store and self._cfg
@@ -746,8 +1161,15 @@ class RosSlam(SLAM):
         pose2d = node.get_pose_in_map() if node else None
         if pose2d is None:
             return Pose(x=0.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
-        x_mm, y_mm, theta_deg = conv.pose2d_to_viam_pose(pose2d)
-        return Pose(x=x_mm, y=y_mm, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=theta_deg)
+        offset = float(
+            getattr(self._cfg, "map_pose_yaw_offset_deg", 0.0) if self._cfg else 0.0
+        )
+        x_mm, y_mm, z_mm, o_x, o_y, o_z, theta_deg = conv.pose2d_to_viam_slam_pose(
+            pose2d, yaw_offset_deg=offset
+        )
+        return Pose(
+            x=x_mm, y=y_mm, z=z_mm, o_x=o_x, o_y=o_y, o_z=o_z, theta=theta_deg
+        )
 
     async def get_point_cloud_map(
         self, return_edited_map: bool = False, *, timeout: Optional[float] = None, **kwargs
@@ -803,6 +1225,48 @@ class RosSlam(SLAM):
 
         if cmd == "get_mode":
             return {"mode": self._cfg.mode if self._cfg else None}
+
+        if cmd == "get_status":
+            probe_sensors = command.get("probe_sensors", True)
+            if probe_sensors is not None:
+                probe_sensors = bool(probe_sensors)
+
+            def _status():
+                return mgr.slam_diagnostics()
+
+            status = await asyncio.to_thread(_status)
+            status["mode"] = self._cfg.mode if self._cfg else None
+            status["active_map"] = store.get_active_map_name()
+            if self._cfg is not None:
+                status["base"] = self._cfg.base
+                status["movement_sensor"] = self._cfg.movement_sensor
+                status["movement_sensor_yaw_deg"] = self._cfg.movement_sensor_yaw_deg
+                status["map_when_still"] = self._cfg.map_when_still
+                status["heading_sensor"] = self._cfg.heading_sensor
+                status["lidars"] = [
+                    {
+                        "name": lidar.name,
+                        "scan_source": lidar.scan_source,
+                        "mount": {
+                            "x": lidar.x,
+                            "y": lidar.y,
+                            "z": lidar.z,
+                            "theta": lidar.theta,
+                            "pitch": lidar.pitch,
+                            "roll": lidar.roll,
+                        },
+                        "z_min": lidar.z_min,
+                        "z_max": lidar.z_max,
+                        "min_range": lidar.min_range,
+                        "max_range": lidar.max_range,
+                    }
+                    for lidar in self._cfg.lidars
+                ]
+            status["localization_check"] = dict(self._last_relocalize_check)
+            status["revisit_check"] = dict(self._last_revisit_check)
+            if probe_sensors and self._cfg is not None:
+                status["sensor_probe"] = await self._probe_sensors()
+            return status
 
         if cmd == "start_mapping":
             name = command.get("map")
@@ -890,6 +1354,19 @@ class RosSlam(SLAM):
 
         if cmd == "get_localization_check":
             return dict(self._last_relocalize_check)
+
+        if cmd == "revisit_check":
+            # Mapping-mode revisit check on demand. ``apply`` forces the odom
+            # correction (or set false for a dry run); omit for gated behavior.
+            apply_override = command.get("apply")
+            return await self._mapping_revisit_cycle(
+                apply_override=(
+                    None if apply_override is None else bool(apply_override)
+                )
+            )
+
+        if cmd == "get_revisit_check":
+            return dict(self._last_revisit_check)
 
         # -- map management --
         if cmd == "list_maps":
@@ -1186,6 +1663,7 @@ class RosSlam(SLAM):
     async def close(self) -> None:
         self._cancel_startup_global_localize_task()
         self._cancel_periodic_relocalize_task()
+        self._cancel_mapping_revisit_task()
         unregister_slam(self.name)
         if self._manager is not None:
             self._manager.shutdown()

@@ -5,6 +5,7 @@ logic easy to unit-test and shareable between the models and the ROS layer.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Mapping, Optional
 
@@ -19,6 +20,20 @@ SLAM_MODES = {MODE_MAPPING, MODE_LOCALIZING}
 BASE_VELOCITY_ROS = "ros"
 BASE_VELOCITY_MIR = "mir"
 BASE_VELOCITY_CONVENTIONS = {BASE_VELOCITY_ROS, BASE_VELOCITY_MIR}
+
+LIDAR_SCAN_AUTO = "auto"
+LIDAR_SCAN_GET_LASER_SCAN = "get_laser_scan"
+LIDAR_SCAN_POINT_CLOUD = "point_cloud"
+LIDAR_SCAN_SOURCES = {
+    LIDAR_SCAN_AUTO,
+    LIDAR_SCAN_GET_LASER_SCAN,
+    LIDAR_SCAN_POINT_CLOUD,
+}
+
+IMU_ODOM_COAST = "coast"
+IMU_ODOM_ACCEL_ONLY = "accel_only"
+IMU_ODOM_NONE = "none"
+IMU_ODOM_MODES = {IMU_ODOM_COAST, IMU_ODOM_ACCEL_ONLY, IMU_ODOM_NONE}
 
 
 def ros_cmd_vel_to_viam_linear_mm_s(
@@ -48,27 +63,50 @@ class LidarConfig:
     y: float = 0.0
     z: float = 0.0
     theta: float = 0.0  # radians, yaw in base_link
+    # Mount tilt (radians). Positive pitch = sensor forward axis tilted down.
+    # Levels the cloud before z filtering; a ~2 deg mast tilt is enough to pull
+    # floor returns into the z band at 15-20 m (phantom borders at max range).
+    pitch: float = 0.0
+    roll: float = 0.0
     min_range: float = 0.05  # meters
     max_range: float = 25.0  # meters
-    # For depth-camera-style lidars: keep only points within this height band.
+    # Height band for 3D lidars / depth cameras when ``get_point_cloud`` returns
+    # points in ``base_link`` (Z = height above the floor). Keeps floor/ceiling
+    # out of the 2D scan fed to slam_toolbox.
     z_min: float = -0.2
     z_max: float = 2.0
+    # How to read this lidar: ``auto`` tries mir-base-style ``get_laser_scan``
+    # then falls back to ``get_point_cloud``; use ``point_cloud`` for Livox /
+    # depth cameras that only expose ``NextPointCloud``.
+    scan_source: str = LIDAR_SCAN_AUTO
+    # Set true when ``get_point_cloud`` already returns ``base_link`` points
+    # (skip the mount transform — avoids double-offset on some Livox setups).
+    points_in_base_link: bool = False
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "LidarConfig":
         if isinstance(d, str):
             return cls(name=d)
         mount = d.get("mount", {}) or {}
+        scan_source = str(d.get("scan_source", LIDAR_SCAN_AUTO))
+        if scan_source not in LIDAR_SCAN_SOURCES:
+            raise ValueError(
+                f"lidar scan_source must be one of {sorted(LIDAR_SCAN_SOURCES)}"
+            )
         return cls(
             name=d["name"],
             x=float(mount.get("x", d.get("x", 0.0))),
             y=float(mount.get("y", d.get("y", 0.0))),
             z=float(mount.get("z", d.get("z", 0.0))),
             theta=float(mount.get("theta", d.get("theta", 0.0))),
+            pitch=float(mount.get("pitch", d.get("pitch", 0.0))),
+            roll=float(mount.get("roll", d.get("roll", 0.0))),
             min_range=float(d.get("min_range", 0.05)),
             max_range=float(d.get("max_range", 25.0)),
             z_min=float(d.get("z_min", -0.2)),
             z_max=float(d.get("z_max", 2.0)),
+            scan_source=scan_source,
+            points_in_base_link=bool(d.get("points_in_base_link", False)),
         )
 
 
@@ -183,6 +221,32 @@ class SlamConfig:
     base: str
     lidars: List[LidarConfig]
     movement_sensor: Optional[str] = None
+    # Optional IMU (or other) heading source. When set alongside wheel odometry
+    # on ``movement_sensor``, yaw comes from here while translation comes from
+    # the movement sensor — useful for skid-steer bases where wheel slip skews
+    # turn odometry but straight-line encoder velocity is still useful.
+    heading_sensor: Optional[str] = None
+    # Yaw (degrees) of the movement sensor's +x axis relative to the robot's
+    # forward axis. An IMU mounted rotated -90 deg about +z (its x pointing at
+    # the robot's right side) needs -90 here so integrated accel and reported
+    # yaw line up with base_link. Applied to velocity/accel vectors and yaw.
+    movement_sensor_yaw_deg: float = 0.0
+    # Set true when the movement sensor is mounted upside down (flipped about
+    # x): yaw, yaw rate, and lateral accel all read with inverted sign. The
+    # telltale is the map rotating opposite to the robot (room stamped in a
+    # circle while spinning in place). Applied before movement_sensor_yaw_deg.
+    movement_sensor_upside_down: bool = False
+    # Same mount-yaw correction for the dedicated heading sensor (subtracted
+    # from its reported yaw). Set this when heading comes from an IMU that is
+    # physically rotated on the chassis.
+    heading_sensor_yaw_deg: float = 0.0
+    # Negate the dedicated heading sensor's yaw (upside-down heading IMU).
+    heading_sensor_invert: bool = False
+    # Added to GetPosition yaw only (App arrow vs map PCD). Does not change ROS
+    # TF / slam_toolbox. Prefer fixing lidar ``mount.theta`` (see status probe
+    # ``nearest_return_bearing_deg``) — a cosmetic ±45 rarely means TF and PCD
+    # disagree; more often the Livox +X is off base_link forward.
+    map_pose_yaw_offset_deg: float = 0.0
     mode: str = MODE_MAPPING
     maps_dir: str = "/root/.viam/nav-stack/maps"
     active_map: Optional[str] = None
@@ -191,6 +255,60 @@ class SlamConfig:
     odom_rate_hz: float = 20.0
     sensor_read_timeout_s: float = 10.0
     scan_bins: int = 720
+    # Merge recent point-cloud frames before /scan projection. Livox Mid-360 and
+    # similar non-repetitive 3D lidars need this for stable slam_toolbox input.
+    scan_accumulation_s: float = 0.0
+    # How IMU dead-reckons forward velocity when wheel encoders are absent.
+    # ``accel_only`` integrates only on clear forward accel (Livox carts);
+    # ``coast`` keeps velocity at steady speed; ``none`` is yaw-only odom.
+    imu_odom_mode: str = IMU_ODOM_COAST
+    # Deprecated alias for ``imu_odom_mode=none``.
+    heading_only_odom: bool = False
+    # Scan-to-scan lidar odometry; Livox uses loose range-flow hints only.
+    lidar_odom_enabled: bool = True
+    lidar_odom_range_flow_only: bool = False
+    # Stop-and-go mapping bias: only publish /scan after the robot has been
+    # still for ``map_when_still_dwell_s``, once per stop. For IMU + Livox carts
+    # this yields dense scans and lets slam_toolbox match between pauses.
+    # Leave false for MiR / wheel-odom robots (continuous mapping).
+    map_when_still: bool = False
+    map_when_still_dwell_s: float = 1.0
+    map_when_still_linear_speed_m_s: float = 0.02
+    map_when_still_yaw_rate_rad_s: float = 0.04
+    # Mid-pivot scans every N degrees. Default 0 = only publish when fully
+    # stopped (strict stop-and-go; safest against ghost walls with IMU odom).
+    map_when_still_yaw_step_deg: float = 0.0
+    # Abort dwell if pose drifts more than this while "still" (m / deg).
+    map_when_still_max_drift_m: float = 0.03
+    map_when_still_max_drift_deg: float = 1.5
+    # Soft-correct odom yaw from a long side wall in the pause scan (anti-banana
+    # for IMU gyro drift along straight walls). Default on with map_when_still
+    # + point-cloud lidars.
+    wall_yaw_correction: bool = False
+    wall_yaw_min_length_m: float = 2.0
+    wall_yaw_max_step_deg: float = 2.0
+    wall_yaw_blend: float = 0.5
+    # Mapping-time revisit check: periodically match the live scan against the
+    # live map near the current pose and, on a strong match that disagrees with
+    # odom, shift the odom TF so slam_toolbox links back to the original area
+    # instead of mapping a duplicate corridor. Tiered search: local radius
+    # first, wider radius on weak match, full map only as a last resort with a
+    # stricter score gate. Default on with map_when_still + point-cloud lidars.
+    mapping_revisit_check: bool = False
+    mapping_revisit_interval_s: float = 20.0
+    mapping_revisit_search_radius_m: float = 5.0
+    mapping_revisit_wide_radius_m: float = 12.0
+    mapping_revisit_min_score: float = 0.6
+    mapping_revisit_max_ray_mae_m: float = 0.8
+    # Correct only when the match is meaningfully away from the current pose
+    # (below = normal jitter) and not absurdly far (above = likely false match).
+    mapping_revisit_min_shift_m: float = 1.0
+    mapping_revisit_min_shift_deg: float = 10.0
+    mapping_revisit_max_shift_m: float = 10.0
+    # Full-map fallback needs a stronger score: self-similar offices produce
+    # convincing wrong corridors at map scale.
+    mapping_revisit_full_map_fallback: bool = True
+    mapping_revisit_full_map_min_score: float = 0.75
     # Safety cutoff for the SLAM/publish scan path: if mir-base reports a scan
     # cache age (get_laser_scan ``age_s``) above this, the bridge skips publishing
     # it rather than feeding SLAM/Nav2 a misregistered scan. Accurate age-based
@@ -283,10 +401,133 @@ class SlamConfig:
                 f"base_velocity_convention must be one of {sorted(BASE_VELOCITY_CONVENTIONS)}"
             )
         frames_d = d.get("frames", {}) or {}
+        all_point_cloud = bool(lidars) and all(
+            lidar.scan_source == LIDAR_SCAN_POINT_CLOUD for lidar in lidars
+        )
+        imu_odom_mode = str(
+            d.get(
+                "imu_odom_mode",
+                IMU_ODOM_ACCEL_ONLY if all_point_cloud else IMU_ODOM_COAST,
+            )
+        )
+        if imu_odom_mode not in IMU_ODOM_MODES:
+            raise ValueError(
+                f"imu_odom_mode must be one of {sorted(IMU_ODOM_MODES)}"
+            )
+        heading_only_odom = bool(d.get("heading_only_odom", False))
+        if heading_only_odom:
+            imu_odom_mode = IMU_ODOM_NONE
+        stb_raw = dict(d.get("slam_toolbox", {}) or {})
+        slam_params_raw = dict(d.get("slam_params", {}) or {})
+        if all_point_cloud:
+            max_lidar_range = max(lidar.max_range for lidar in lidars)
+            # Real travel gates matter for Livox: with minimum_travel_* at 0,
+            # slam_toolbox scan-matches every noisy non-repetitive frame while
+            # parked and imprints walls at slightly different poses each time.
+            stb_raw.setdefault("minimum_travel_distance", 0.15)
+            stb_raw.setdefault("minimum_travel_heading", 0.12)
+            stb_raw.setdefault("max_laser_range", max_lidar_range)
+            slam_params_raw.setdefault("minimum_time_interval", 0.3)
+            # Keep the correlation search modest: a wide window lets the
+            # matcher jump between self-similar noise minima (ghost walls).
+            slam_params_raw.setdefault("correlation_search_space_dimension", 0.6)
+            slam_params_raw.setdefault("link_scan_maximum_distance", 2.5)
+            if heading_only_odom:
+                stb_raw["minimum_travel_distance"] = 0.0
+                stb_raw["minimum_travel_heading"] = 0.0
+        # Default off for MiR (get_laser_scan + wheel odom). Opt-in for Livox /
+        # point-cloud carts that lack reliable translation odometry.
+        map_when_still = bool(d.get("map_when_still", False))
+        if map_when_still and all_point_cloud:
+            # Scans arrive only at stops; the bridge already rate-limits.
+            # slam_toolbox ALWAYS uses odom→base TF as the scan-match prior —
+            # ``use_odometry`` / ``use_tf_scan_transformation`` are NOT real
+            # slam_toolbox params (no-ops). Widen the *real* correlative angular
+            # search: default coarse_search_angle_offset is only ~±20°, so a
+            # 45–180° pivot between pauses imprints rotated ghost walls.
+            user_sp = dict(d.get("slam_params", {}) or {})
+            stb_raw["minimum_travel_distance"] = 0.0
+            stb_raw["minimum_travel_heading"] = 0.0
+            if "minimum_time_interval" not in user_sp:
+                slam_params_raw["minimum_time_interval"] = 0.0
+            if "correlation_search_space_dimension" not in user_sp:
+                # ~1 m hops; 2.0 let sequential links latch onto neighbors.
+                slam_params_raw["correlation_search_space_dimension"] = 1.0
+            if "link_scan_maximum_distance" not in user_sp:
+                slam_params_raw["link_scan_maximum_distance"] = 3.0
+            if "link_match_minimum_response_fine" not in user_sp:
+                # Reject weak false peaks (wide angular search ghosts rooms).
+                slam_params_raw["link_match_minimum_response_fine"] = 0.25
+            # Gyro provides the yaw prior — search ±~30°, not ±180°. Wider than
+            # stock ±20° so inter-hop pivots still match; ±45°+ re-orients rooms.
+            slam_params_raw["coarse_search_angle_offset"] = float(
+                user_sp.get("coarse_search_angle_offset", 0.52)
+            )
+            slam_params_raw["coarse_angle_resolution"] = float(
+                user_sp.get("coarse_angle_resolution", 0.0349)
+            )
+            slam_params_raw["use_response_expansion"] = bool(
+                user_sp.get("use_response_expansion", True)
+            )
+            # Prefer stock-ish loop closure: chain_size=3 + 12 m search accepted
+            # false corridors in self-similar desk spaces (ghost/warp maps).
+            # Search a bit farther than stock 3 m for IMU XY drift, but keep
+            # stock chain length and strong loop response thresholds.
+            if "loop_match_minimum_chain_size" not in user_sp:
+                slam_params_raw["loop_match_minimum_chain_size"] = 10
+            if "loop_search_maximum_distance" not in user_sp:
+                slam_params_raw["loop_search_maximum_distance"] = 5.0
+            if "loop_search_space_dimension" not in user_sp:
+                slam_params_raw["loop_search_space_dimension"] = 8.0
+            if "loop_match_minimum_response_coarse" not in user_sp:
+                slam_params_raw["loop_match_minimum_response_coarse"] = 0.35
+            if "loop_match_minimum_response_fine" not in user_sp:
+                slam_params_raw["loop_match_minimum_response_fine"] = 0.45
+            if "do_loop_closing" not in user_sp:
+                slam_params_raw["do_loop_closing"] = True
+            if "angle_variance_penalty" not in user_sp:
+                # Keep gyro prior meaningful; low values let matches flip rooms.
+                slam_params_raw["angle_variance_penalty"] = 1.0
+        map_when_still_dwell_s = float(d.get("map_when_still_dwell_s", 1.0))
+        map_when_still_yaw_step_deg = float(d.get("map_when_still_yaw_step_deg", 0.0))
+        default_accum = (
+            max(0.6, map_when_still_dwell_s)
+            if map_when_still and all_point_cloud
+            else (0.3 if all_point_cloud and not heading_only_odom else 0.0)
+        )
+        lidar_odom_enabled = bool(
+            d.get(
+                "lidar_odom_enabled",
+                all_point_cloud and not map_when_still,
+            )
+        )
+        lidar_odom_range_flow_only = bool(
+            d.get("lidar_odom_range_flow_only", all_point_cloud)
+        )
+        wall_yaw_correction = bool(
+            d.get(
+                "wall_yaw_correction",
+                map_when_still and all_point_cloud,
+            )
+        )
+        mapping_revisit_check = bool(
+            d.get(
+                "mapping_revisit_check",
+                map_when_still and all_point_cloud,
+            )
+        )
         return cls(
             base=d["base"],
             lidars=lidars,
             movement_sensor=d.get("movement_sensor"),
+            heading_sensor=d.get("heading_sensor"),
+            movement_sensor_yaw_deg=float(d.get("movement_sensor_yaw_deg", 0.0)),
+            movement_sensor_upside_down=bool(
+                d.get("movement_sensor_upside_down", False)
+            ),
+            heading_sensor_yaw_deg=float(d.get("heading_sensor_yaw_deg", 0.0)),
+            heading_sensor_invert=bool(d.get("heading_sensor_invert", False)),
+            map_pose_yaw_offset_deg=float(d.get("map_pose_yaw_offset_deg", 0.0)),
             mode=mode,
             maps_dir=d.get("maps_dir", "/root/.viam/nav-stack/maps"),
             active_map=d.get("active_map"),
@@ -299,11 +540,66 @@ class SlamConfig:
             odom_rate_hz=float(d.get("odom_rate_hz", 20.0)),
             sensor_read_timeout_s=float(d.get("sensor_read_timeout_s", 10.0)),
             scan_bins=int(d.get("scan_bins", 720)),
+            scan_accumulation_s=float(
+                d.get("scan_accumulation_s", default_accum)
+            ),
+            imu_odom_mode=imu_odom_mode,
+            heading_only_odom=heading_only_odom,
+            lidar_odom_enabled=lidar_odom_enabled,
+            lidar_odom_range_flow_only=lidar_odom_range_flow_only,
+            map_when_still=map_when_still,
+            map_when_still_dwell_s=map_when_still_dwell_s,
+            map_when_still_linear_speed_m_s=float(
+                d.get("map_when_still_linear_speed_m_s", 0.02)
+            ),
+            map_when_still_yaw_rate_rad_s=float(
+                d.get("map_when_still_yaw_rate_rad_s", 0.04)
+            ),
+            map_when_still_yaw_step_deg=map_when_still_yaw_step_deg,
+            map_when_still_max_drift_m=float(
+                d.get("map_when_still_max_drift_m", 0.03)
+            ),
+            map_when_still_max_drift_deg=float(
+                d.get("map_when_still_max_drift_deg", 1.5)
+            ),
+            wall_yaw_correction=wall_yaw_correction,
+            wall_yaw_min_length_m=float(d.get("wall_yaw_min_length_m", 2.0)),
+            wall_yaw_max_step_deg=float(d.get("wall_yaw_max_step_deg", 2.0)),
+            wall_yaw_blend=float(d.get("wall_yaw_blend", 0.5)),
+            mapping_revisit_check=mapping_revisit_check,
+            mapping_revisit_interval_s=float(
+                d.get("mapping_revisit_interval_s", 20.0)
+            ),
+            mapping_revisit_search_radius_m=float(
+                d.get("mapping_revisit_search_radius_m", 5.0)
+            ),
+            mapping_revisit_wide_radius_m=float(
+                d.get("mapping_revisit_wide_radius_m", 12.0)
+            ),
+            mapping_revisit_min_score=float(d.get("mapping_revisit_min_score", 0.6)),
+            mapping_revisit_max_ray_mae_m=float(
+                d.get("mapping_revisit_max_ray_mae_m", 0.8)
+            ),
+            mapping_revisit_min_shift_m=float(
+                d.get("mapping_revisit_min_shift_m", 1.0)
+            ),
+            mapping_revisit_min_shift_deg=float(
+                d.get("mapping_revisit_min_shift_deg", 10.0)
+            ),
+            mapping_revisit_max_shift_m=float(
+                d.get("mapping_revisit_max_shift_m", 10.0)
+            ),
+            mapping_revisit_full_map_fallback=bool(
+                d.get("mapping_revisit_full_map_fallback", True)
+            ),
+            mapping_revisit_full_map_min_score=float(
+                d.get("mapping_revisit_full_map_min_score", 0.75)
+            ),
             scan_max_age_s=float(d.get("scan_max_age_s", 2.0)),
             ros_env=d.get("ros_env"),
             base_velocity_convention=convention,
-            slam_toolbox=SlamToolboxConfig.from_dict(d.get("slam_toolbox", {}) or {}),
-            slam_params=d.get("slam_params", {}) or {},
+            slam_toolbox=SlamToolboxConfig.from_dict(stb_raw),
+            slam_params=slam_params_raw,
             global_localize_on_start=bool(d.get("global_localize_on_start", True)),
             global_localize_on_start_delay_s=float(
                 d.get("global_localize_on_start_delay_s", 4.0)
@@ -415,6 +711,8 @@ class SlamConfig:
         deps = [self.base, *[lidar.name for lidar in self.lidars]]
         if self.movement_sensor:
             deps.append(self.movement_sensor)
+        if self.heading_sensor:
+            deps.append(self.heading_sensor)
         return deps
 
 

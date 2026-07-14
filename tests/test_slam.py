@@ -35,6 +35,65 @@ from src.nav.maps import MapStore
 from src.ros import conversions as conv
 
 
+def test_get_status_includes_bridge_and_sensor_probe(tmp_path: Path):
+    slam = RosSlam("slam")
+    store = MapStore(str(tmp_path))
+    store.create_map("floor1")
+    store.set_active_map("floor1")
+    slam._map_store = store
+    slam._cfg = SlamConfig.from_dict(
+        {
+            "base": "cartbase",
+            "movement_sensor": "imu",
+            "lidar": {
+                "name": "livox-pc",
+                "scan_source": "point_cloud",
+                "mount": {"x": 0.5, "y": 0.0, "z": 1.1, "theta": 0.0},
+            },
+            "mode": "mapping",
+            "active_map": "floor1",
+        }
+    )
+    slam._manager = MagicMock()
+    slam._manager.slam_diagnostics.return_value = {
+        "slam_toolbox_running": True,
+        "scan_publishing": True,
+        "scan_valid_returns": 120,
+        "odom_tf_age_s": 0.1,
+    }
+    slam._probe_sensors = AsyncMock(
+        return_value={
+            "lidars": [{"name": "livox-pc", "scan_valid_returns": 120}],
+            "odometry": {"vx": 0.0, "vy": 0.0, "vtheta": 0.0, "has_pose": False},
+        }
+    )
+
+    result = asyncio.run(slam.do_command({"command": "get_status"}))
+
+    assert result["slam_toolbox_running"] is True
+    assert result["active_map"] == "floor1"
+    assert result["movement_sensor"] == "imu"
+    assert result["sensor_probe"]["lidars"][0]["scan_valid_returns"] == 120
+    slam._probe_sensors.assert_awaited_once()
+
+
+def test_get_status_skips_sensor_probe_when_disabled(tmp_path: Path):
+    slam = RosSlam("slam")
+    store = MapStore(str(tmp_path))
+    store.create_map("floor1")
+    slam._map_store = store
+    slam._cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "mode": "mapping", "active_map": "floor1"}
+    )
+    slam._manager = MagicMock()
+    slam._manager.slam_diagnostics.return_value = {"slam_toolbox_running": True}
+    slam._probe_sensors = AsyncMock()
+
+    asyncio.run(slam.do_command({"command": "get_status", "probe_sensors": False}))
+
+    slam._probe_sensors.assert_not_awaited()
+
+
 def test_resolve_pose_by_location_requires_active_map(tmp_path: Path):
     slam = RosSlam("slam")
     slam._map_store = MapStore(str(tmp_path))

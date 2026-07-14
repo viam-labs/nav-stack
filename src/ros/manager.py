@@ -67,6 +67,7 @@ class RosManager:
         self._started = False
         self._scratch = Path(slam_cfg.maps_dir).expanduser() / ".runtime"
         self._scratch.mkdir(parents=True, exist_ok=True)
+        self._last_slam_params: Dict = {}
 
     # -- lifecycle -----------------------------------------------------------
     def start(self, io, loop: asyncio.AbstractEventLoop, nav_cfg: Optional[NavConfig] = None) -> None:
@@ -107,17 +108,44 @@ class RosManager:
                 time.sleep(0.2)
 
     def shutdown(self) -> None:
+        """Tear down the in-process ROS stack.
+
+        Every step is individually guarded: reconfigure calls this before
+        building a fresh manager, and a partially-failed teardown leaves the
+        old bridge's DDS participant alive — the ROS graph then shows two
+        /viam_nav_stack_bridge nodes fighting over the odom TF.
+        """
+        self._started = False
         self.stop_nav2()
         self.stop_slam()
         if self._executor is not None:
-            self._executor.shutdown()
+            try:
+                self._executor.shutdown(timeout_sec=2.0)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"executor shutdown failed: {exc!r}")
         if self._spin_thread is not None and self._spin_thread.is_alive():
-            self._spin_thread.join(timeout=2.0)
+            # Callbacks can block on Viam sensor reads for up to
+            # sensor_read_timeout_s; give the spin thread a real chance to
+            # drain before destroying the node under it.
+            self._spin_thread.join(timeout=8.0)
+            if self._spin_thread.is_alive():
+                self._log("ROS spin thread still alive; forcing context shutdown")
         if self._node is not None:
-            self._node.destroy_node()
+            if self._executor is not None:
+                try:
+                    self._executor.remove_node(self._node)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                self._node.destroy_node()
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"bridge node destroy failed: {exc!r}")
         self._node = None
         self._executor = None
         self._spin_thread = None
+        # Shutting down the rclpy context tears down the DDS participant even
+        # if destroy_node failed above — this is the backstop against zombie
+        # bridge nodes surviving a reconfigure.
         try:
             import rclpy
 
@@ -125,7 +153,6 @@ class RosManager:
                 rclpy.shutdown()
         except Exception:  # noqa: BLE001
             pass
-        self._started = False
 
     @property
     def node(self):
@@ -386,6 +413,72 @@ class RosManager:
         )
 
     # -- slam_toolbox --------------------------------------------------------
+    def stop_slam(self) -> None:
+        if self.slam_running():
+            state = self._lifecycle_get_state(SLAM_LIFECYCLE_NODE)
+            if state == "active":
+                self._lifecycle_set(SLAM_LIFECYCLE_NODE, "deactivate")
+                time.sleep(0.3)
+        self._terminate(self._slam_proc)
+        self._slam_proc = None
+        # slam_toolbox is launched with start_new_session=True, so it survives
+        # if this module process dies without a clean shutdown (crash or hard
+        # kill mid-reconfigure). An orphaned instance keeps publishing a
+        # competing map->odom TF — the pose then flickers between two SLAM
+        # solutions and walls imprint at multiple angles. Reap any leftovers
+        # before considering the stop complete.
+        self._reap_slam_toolbox_processes(force=False)
+        if not self._wait_for_slam_toolbox_processes_gone(timeout=4.0):
+            self._log("slam_toolbox process still alive after SIGTERM — sending SIGKILL")
+            self._reap_slam_toolbox_processes(force=True)
+            self._wait_for_slam_toolbox_processes_gone(timeout=8.0)
+        # DDS can keep zombie /slam_toolbox names on the graph for a while —
+        # do not block forever waiting for the name to disappear.
+        self._wait_for_ros_node_gone(SLAM_LIFECYCLE_NODE, timeout=2.0)
+        time.sleep(0.25)
+
+    def _reap_slam_toolbox_processes(self, *, force: bool = False) -> None:
+        sig = ["-9"] if force else []
+        for pattern in (
+            "slam_toolbox/async_slam_toolbox_node",
+            "slam_toolbox/localization_slam_toolbox_node",
+            "async_slam_toolbox_node",
+            "localization_slam_toolbox_node",
+        ):
+            subprocess.run(
+                ["pkill", *sig, "-f", pattern],
+                env=self._ros_env(),
+                check=False,
+            )
+
+    def _slam_toolbox_binary_count(self) -> int:
+        """Count live slam_toolbox *binaries* (ignore DDS phantoms / ros2 CLI)."""
+        proc = subprocess.run(
+            [
+                "pgrep",
+                "-f",
+                r"/lib/slam_toolbox/(async|localization)_slam_toolbox_node",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode not in (0, 1):
+            return 0
+        return len([ln for ln in (proc.stdout or "").splitlines() if ln.strip()])
+
+    def _wait_for_slam_toolbox_processes_gone(self, timeout: float = 8.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._slam_toolbox_binary_count() == 0:
+                return True
+            time.sleep(0.25)
+        self._log(
+            f"timed out waiting for slam_toolbox processes to exit "
+            f"(still {self._slam_toolbox_binary_count()})"
+        )
+        return False
+
     def start_slam(self, map_stem: Path, mode: str) -> None:
         """Launch slam_toolbox in mapping or localization mode.
 
@@ -393,21 +486,60 @@ class RosManager:
         / ``<stem>.data``); used to continue mapping or to localize on a saved map.
         """
         self.stop_slam()
+        # Extra pass: a previous module instance can leave a session orphan that
+        # stop_slam's pkill raced; never launch while a sibling process exists.
+        self._reap_slam_toolbox_processes(force=True)
+        self._wait_for_slam_toolbox_processes_gone(timeout=8.0)
         last_error: Optional[Exception] = None
         for attempt in range(1, 3):
             try:
+                if self._slam_toolbox_binary_count() > 0:
+                    self._reap_slam_toolbox_processes(force=True)
+                    self._wait_for_slam_toolbox_processes_gone(timeout=4.0)
                 self._launch_slam(map_stem, mode)
                 self._activate_slam_lifecycle()
                 self._apply_slam_tf_params()
+                # Trust processes, not the ROS graph: FastDDS often keeps stale
+                # /slam_toolbox names after pkill (looks like "3 nodes" with ps empty).
+                n = self._slam_toolbox_binary_count()
+                if n > 1:
+                    raise RuntimeError(
+                        f"{n} slam_toolbox binaries still running after start — "
+                        "orphaned instance fighting over map->odom. "
+                        "Kill leftovers: pkill -9 -f async_slam_toolbox_node"
+                    )
+                if n == 0:
+                    raise RuntimeError(
+                        "slam_toolbox activated but no async/localization binary "
+                        "is running (process died immediately)"
+                    )
                 return
             except RuntimeError as exc:
                 last_error = exc
                 self._log(f"slam_toolbox start attempt {attempt} failed: {exc}")
                 self._terminate(self._slam_proc)
                 self._slam_proc = None
-                self._wait_for_ros_node_gone(SLAM_LIFECYCLE_NODE, timeout=8.0)
+                self._reap_slam_toolbox_processes(force=True)
+                self._wait_for_slam_toolbox_processes_gone(timeout=8.0)
                 time.sleep(0.5 * attempt)
         raise RuntimeError(f"failed to start slam_toolbox after 2 attempts: {last_error}")
+
+    def _count_ros_nodes_named(self, node_name: str) -> int:
+        """How many graph entries match ``node_name`` (may include DDS phantoms)."""
+        names: List[str] = []
+        if self._node is not None:
+            try:
+                names = [
+                    ("/" + name) if ns in ("", "/") else (ns.rstrip("/") + "/" + name)
+                    for name, ns in self._node.get_node_names_and_namespaces()
+                ]
+            except Exception:  # noqa: BLE001
+                names = []
+        if not names:
+            proc = self._run_ros(["ros2", "node", "list"])
+            names = [n.strip() for n in (proc.stdout or "").splitlines() if n.strip()]
+        target = node_name if node_name.startswith("/") else f"/{node_name}"
+        return sum(1 for n in names if n == target or n.endswith(target))
 
     def _launch_slam(self, map_stem: Path, mode: str) -> None:
         params = self._slam_params(map_stem, mode)
@@ -446,6 +578,50 @@ class RosManager:
         rp.setdefault("transform_timeout", 0.0)
         rp.setdefault("tf_buffer_duration", 60.0)
         rp.setdefault("transform_publish_period", 0.02)
+        if self._slam_cfg.heading_only_odom:
+            rp.setdefault("use_odometry", False)
+            rp.setdefault("minimum_travel_distance", 0.0)
+            rp.setdefault("minimum_travel_heading", 0.0)
+        elif getattr(self._slam_cfg, "map_when_still", False) and any(
+            lidar.scan_source == "point_cloud" for lidar in self._slam_cfg.lidars
+        ):
+            # Stop-and-go Livox: bridge gates /scan. slam_toolbox always uses
+            # odom→base as the match prior — widen the real correlative search
+            # (default coarse angle window is only ~±20°).
+            rp.setdefault("minimum_time_interval", 0.0)
+            rp.setdefault("correlation_search_space_dimension", 1.0)
+            rp.setdefault("link_scan_maximum_distance", 3.0)
+            rp.setdefault("link_match_minimum_response_fine", 0.25)
+            # ±~30° around gyro prior — NOT ±π (false room-orientation peaks).
+            rp["coarse_search_angle_offset"] = float(
+                self._slam_cfg.slam_params.get("coarse_search_angle_offset", 0.52)
+            )
+            rp["coarse_angle_resolution"] = float(
+                self._slam_cfg.slam_params.get("coarse_angle_resolution", 0.0349)
+            )
+            rp["use_response_expansion"] = bool(
+                self._slam_cfg.slam_params.get("use_response_expansion", True)
+            )
+            # Near-stock loop closure: wide/early search false-closes corridors.
+            rp.setdefault("loop_match_minimum_chain_size", 10)
+            rp.setdefault("loop_search_maximum_distance", 5.0)
+            rp.setdefault("loop_search_space_dimension", 8.0)
+            rp.setdefault("loop_match_minimum_response_coarse", 0.35)
+            rp.setdefault("loop_match_minimum_response_fine", 0.45)
+            rp.setdefault("do_loop_closing", True)
+            rp.setdefault("angle_variance_penalty", 1.0)
+            # Always override: continuous-Livox travel gates drop stop-and-go scans.
+            rp["minimum_travel_distance"] = 0.0
+            rp["minimum_travel_heading"] = 0.0
+        elif any(
+            lidar.scan_source == "point_cloud" for lidar in self._slam_cfg.lidars
+        ):
+            rp.setdefault("minimum_time_interval", 0.3)
+            rp.setdefault("correlation_search_space_dimension", 0.6)
+            rp.setdefault("link_scan_maximum_distance", 2.5)
+            rp.setdefault("minimum_travel_distance", 0.15)
+            rp.setdefault("minimum_travel_heading", 0.12)
+        self._last_slam_params = rp
         if map_stem and Path(str(map_stem) + ".posegraph").exists():
             rp["map_file_name"] = str(map_stem)
             # Keep localization startup robust for saved posegraphs. Allow user
@@ -468,17 +644,6 @@ class RosManager:
              "-f", str(map_stem), "--ros-args", "-p", "save_map_timeout:=20.0"],
             env=os.environ.copy(), check=False, timeout=40,
         )
-
-    def stop_slam(self) -> None:
-        if self.slam_running():
-            state = self._lifecycle_get_state(SLAM_LIFECYCLE_NODE)
-            if state == "active":
-                self._lifecycle_set(SLAM_LIFECYCLE_NODE, "deactivate")
-                time.sleep(0.3)
-        self._terminate(self._slam_proc)
-        self._slam_proc = None
-        self._wait_for_ros_node_gone(SLAM_LIFECYCLE_NODE, timeout=8.0)
-        time.sleep(0.25)
 
     def reset_slam_map(self) -> bool:
         """Clear slam_toolbox's in-memory map (publishes a fresh empty /map)."""
@@ -983,11 +1148,74 @@ class RosManager:
     def get_pose_in_map(self) -> Optional[conv.Pose2D]:
         return self._require_node().get_pose_in_map()
 
+    def apply_map_pose_correction(self, pose: conv.Pose2D) -> Dict:
+        """Mapping-mode revisit fix: shift odom TF so the slam prior hits ``pose``."""
+        return self._require_node().apply_map_pose_correction(pose)
+
     def get_base_scan(self, max_age_s: float = 1.0) -> Optional[conv.LaserScan2D]:
         node = self._node
         if node is None:
             return None
         return node.get_base_scan(max_age_s)
+
+    def slam_diagnostics(self) -> Dict:
+        """Runtime health snapshot for SLAM (bridge + slam_toolbox process)."""
+        lifecycle_proc = self._run_ros(["ros2", "lifecycle", "get", SLAM_LIFECYCLE_NODE])
+        node_proc = self._run_ros(["ros2", "node", "list"])
+        bridge: Dict = {}
+        if self._node is not None:
+            try:
+                bridge = self._node.slam_bridge_status()
+            except Exception:  # noqa: BLE001 - diagnostics must not raise
+                pass
+        lifecycle_text = (lifecycle_proc.stdout or lifecycle_proc.stderr or "").strip()
+        # Prefer the live DDS graph over `ros2 node list`: the CLI answers from
+        # a discovery-daemon cache that can serve long-dead nodes (phantom
+        # duplicates) — our own participant sees the graph as it is right now.
+        node_names: List[str] = []
+        if self._node is not None:
+            try:
+                node_names = [
+                    ("/" + name) if ns in ("", "/") else (ns.rstrip("/") + "/" + name)
+                    for name, ns in self._node.get_node_names_and_namespaces()
+                ]
+            except Exception:  # noqa: BLE001
+                node_names = []
+        if not node_names:
+            node_names = [
+                n.strip() for n in (node_proc.stdout or "").splitlines() if n.strip()
+            ]
+        duplicates = sorted(
+            {n for n in node_names if node_names.count(n) > 1 and "transform_listener" not in n}
+        )
+        binary_count = self._slam_toolbox_binary_count()
+        return {
+            # DDS often lists stale /slam_toolbox names after pkill — trust
+            # slam_toolbox_binary_count (and `ps`) over duplicate_ros_nodes.
+            "duplicate_ros_nodes": duplicates,
+            "slam_toolbox_binary_count": binary_count,
+            "slam_toolbox_running": self.slam_running(),
+            "slam_toolbox_lifecycle": lifecycle_text,
+            "slam_toolbox_active": self._lifecycle_get_state(SLAM_LIFECYCLE_NODE)
+            == "active",
+            "slam_toolbox_params": {
+                k: getattr(self, "_last_slam_params", {}).get(k)
+                for k in (
+                    "use_odometry",
+                    "use_tf_scan_transformation",
+                    "minimum_travel_distance",
+                    "minimum_travel_heading",
+                    "correlation_search_space_dimension",
+                    "coarse_search_angle_offset",
+                    "coarse_angle_resolution",
+                    "link_match_minimum_response_fine",
+                    "minimum_time_interval",
+                )
+                if getattr(self, "_last_slam_params", {}).get(k) is not None
+            },
+            "ros_nodes": (node_proc.stdout or "").strip(),
+            **bridge,
+        }
 
     def set_nav_config(self, nav_cfg: NavConfig) -> None:
         self._require_node().set_nav_config(nav_cfg)
