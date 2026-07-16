@@ -4,12 +4,13 @@ A Viam navigation stack that wraps the ROS2 **Nav2** and **slam_toolbox** packag
 so any Viam base can map an environment, localize within it, and navigate to named
 locations or arbitrary map points while avoiding obstacles.
 
-This module (`viam-labs:nav-stack`) provides two models:
+This module (`viam-labs:nav-stack`) provides three models:
 
 | Model | API | Purpose |
 | --- | --- | --- |
 | `viam-labs:nav-stack:slam` | `rdk:service:slam` | Mapping + localization via slam_toolbox. Standard SLAM API (live map, position) + map management. |
 | `viam-labs:nav-stack:navigation` | `rdk:service:generic` | Nav2 navigation: named locations, go-to-point, keepout/speed zones, obstacle avoidance, all via `DoCommand`. |
+| `viam-labs:nav-stack:navigation-external` | `rdk:service:generic` | Same Nav2 navigation, driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
 
 ## How it works
 
@@ -235,6 +236,36 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
 Set `"kinematics": "omni"` and a non-zero `max_vel_y` for omnidirectional bases.
 
 The files under [`params/`](params/) are **reference defaults** shipped with the module; runtime params are generated from your Viam service attributes.
+
+### Navigation with an external SLAM service
+
+Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:service:slam` (for example a third-party RTAB-Map module), instead of the bundled `slam_toolbox`. Same DoCommand surface as `navigation`; the difference is that this model runs its **own** sensor bridge and bridges the external SLAM's pose + occupancy grid into ROS:
+
+- `slam_service` names an `rdk:service:slam` dependency. The adapter calls its standard `GetPosition()` (→ `map → odom` TF) and a `get_grid` DoCommand returning `{rows, cols, xMin, yMin, cellSize, data}` with int8 cells (`-1`/`0`/`100`) (→ `/map` OccupancyGrid). No point-cloud rasterization.
+- Because the external SLAM does not publish `/scan` or `/odom`, you configure the sensor bridge here too — `lidars` (Viam `camera` components, projected to `/scan`) and `movement_sensor`. It reuses the same bridge + odometry fusion as the SLAM model.
+- The movement sensor is read via the **typed** `MovementSensor` API (`GetProperties()` then `AngularVelocity` / `LinearAcceleration` / `Orientation` / `LinearVelocity`), not `GetReadings()`, so any movement sensor works. An IMU-only sensor (e.g. a Livox Mid-360's IMU) auto-selects yaw-from-gyro + translation-from-lidar-odometry; its dead-reckoned `Position` is ignored unless you set `trust_movement_sensor_pose: true`.
+
+```json
+{
+  "name": "nav",
+  "api": "rdk:service:generic",
+  "model": "viam-labs:nav-stack:navigation-external",
+  "attributes": {
+    "slam_service": "rtabmap",
+    "base": "my-base",
+    "kinematics": "differential",
+    "lidars": [{ "name": "mid360", "scan_source": "point_cloud" }],
+    "movement_sensor": "mid360-imu",
+    "imu_odom_mode": "accel_only",
+    "lidar_odom_enabled": true,
+    "robot_radius": 0.22,
+    "max_vel_x": 0.4,
+    "inflation_radius": 0.45
+  }
+}
+```
+
+Optional attributes: `trust_movement_sensor_pose` (default `false`), `snap_heading` (default `false`), plus the same bridge/odometry tuning fields as the SLAM service and the same `nav2` block as `navigation`. The built-in `navigation` model is unchanged; use it when you map with `nav-stack:slam`.
 
 ## Workflows
 

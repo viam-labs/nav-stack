@@ -2,7 +2,14 @@ import math
 
 import pytest
 
-from src.config import DIFFERENTIAL, OMNI, NavConfig, SlamConfig, ros_cmd_vel_to_viam_linear_mm_s
+from src.config import (
+    DIFFERENTIAL,
+    OMNI,
+    ExternalNavConfig,
+    NavConfig,
+    SlamConfig,
+    ros_cmd_vel_to_viam_linear_mm_s,
+)
 
 
 def test_slam_config_single_lidar_string():
@@ -616,3 +623,72 @@ def test_normalize_nav2_user_params_relocation_merges_with_node_override():
     rp = normalized["controller_server"]["ros__parameters"]
     assert rp["controller_frequency"] == 10.0
     assert rp["FollowPath"] == {"vx_max": 0.7}
+
+
+def test_external_nav_config_builds_bridge_and_nav():
+    d = {
+        "slam_service": "rtabmap",
+        "base": "base",
+        "lidars": [{"name": "mid360"}],
+        "movement_sensor": "mid360-imu",
+        "kinematics": "differential",
+        "max_vel_x": 0.5,
+    }
+    cfg = ExternalNavConfig.from_dict(d)
+    # bridge SlamConfig carries the sensor deps
+    assert [l.name for l in cfg.bridge.lidars] == ["mid360"]
+    assert cfg.bridge.movement_sensor == "mid360-imu"
+    # nav NavConfig carries Nav2 behavior + the SLAM dep name
+    assert cfg.nav.slam_service == "rtabmap"
+    assert cfg.nav.base == "base"
+    assert cfg.nav.max_vel_x == 0.5
+    # reader flags default off (Position tar pit ignored)
+    assert cfg.trust_movement_sensor_pose is False
+    assert cfg.snap_heading is False
+
+
+def test_external_nav_config_required_deps_union_dedup():
+    d = {
+        "slam_service": "rtabmap",
+        "base": "base",
+        "lidars": [{"name": "a"}, {"name": "b"}],
+        "movement_sensor": "imu",
+    }
+    deps = ExternalNavConfig.from_dict(d).required_dependencies()
+    # slam_service + base + lidars + movement_sensor, no duplicates
+    assert deps[0] == "rtabmap"
+    assert set(deps) == {"rtabmap", "base", "a", "b", "imu"}
+    assert len(deps) == len(set(deps))
+
+
+def test_external_nav_config_reader_flags_parse():
+    d = {
+        "slam_service": "s",
+        "base": "base",
+        "lidars": [{"name": "l"}],
+        "trust_movement_sensor_pose": True,
+        "snap_heading": True,
+    }
+    cfg = ExternalNavConfig.from_dict(d)
+    assert cfg.trust_movement_sensor_pose is True
+    assert cfg.snap_heading is True
+
+
+def test_slam_config_external_nav_tunables_default_and_override():
+    # These back navigation-external; must actually parse (were dead getattrs).
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "l"})
+    assert cfg.external_pose_rate_hz == 10.0
+    assert cfg.external_grid_rate_hz == 1.5
+    assert cfg.external_transform_timeout_s == 0.2
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "l",
+            "external_pose_rate_hz": 5.0,
+            "external_grid_rate_hz": 0.5,
+            "external_transform_timeout_s": 0.3,
+        }
+    )
+    assert cfg.external_pose_rate_hz == 5.0
+    assert cfg.external_grid_rate_hz == 0.5
+    assert cfg.external_transform_timeout_s == 0.3

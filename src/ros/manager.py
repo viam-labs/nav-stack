@@ -49,9 +49,12 @@ def _yaml_dump(data: Dict) -> str:
 
 
 class RosManager:
-    def __init__(self, slam_cfg: SlamConfig, logger=None):
+    def __init__(self, slam_cfg: SlamConfig, logger=None, external_slam=None):
         self._slam_cfg = slam_cfg
         self._logger = logger
+        # When set (external-SLAM navigation), the bridge publishes /map +
+        # map->odom from this Viam SLAM service instead of running slam_toolbox.
+        self._external_slam = external_slam
         self._node = None  # BridgeNode
         self._executor = None
         self._spin_thread: Optional[threading.Thread] = None
@@ -81,7 +84,9 @@ class RosManager:
         if not rclpy.ok():
             rclpy.init()
         self._loop = loop
-        self._node = BridgeNode(self._slam_cfg, io, loop, nav_cfg=nav_cfg)
+        self._node = BridgeNode(
+            self._slam_cfg, io, loop, nav_cfg=nav_cfg, external_slam=self._external_slam
+        )
         # The bridge has 4 callback sources that block on Viam IO (scan, odom,
         # drive, watchdog/misc — each capped at 1 in-flight by its mutually
         # exclusive callback group). With only 4 threads they can all be blocked

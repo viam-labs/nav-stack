@@ -259,6 +259,12 @@ class SlamConfig:
     scan_rate_hz: float = 10.0
     odom_rate_hz: float = 20.0
     sensor_read_timeout_s: float = 10.0
+    # External-SLAM navigation (navigation-external) tunables: how fast the
+    # ExternalSlamPublisher polls the Viam SLAM service for pose/grid and how far
+    # in the future map->odom is stamped. Ignored by the built-in slam_toolbox path.
+    external_pose_rate_hz: float = 10.0
+    external_grid_rate_hz: float = 1.5
+    external_transform_timeout_s: float = 0.2
     scan_bins: int = 720
     # Merge recent point-cloud frames before /scan projection. Livox Mid-360 and
     # similar non-repetitive 3D lidars need this for stable slam_toolbox input.
@@ -569,6 +575,11 @@ class SlamConfig:
             scan_rate_hz=float(d.get("scan_rate_hz", 10.0)),
             odom_rate_hz=float(d.get("odom_rate_hz", 20.0)),
             sensor_read_timeout_s=float(d.get("sensor_read_timeout_s", 10.0)),
+            external_pose_rate_hz=float(d.get("external_pose_rate_hz", 10.0)),
+            external_grid_rate_hz=float(d.get("external_grid_rate_hz", 1.5)),
+            external_transform_timeout_s=float(
+                d.get("external_transform_timeout_s", 0.2)
+            ),
             scan_bins=int(d.get("scan_bins", 720)),
             scan_accumulation_s=float(
                 d.get("scan_accumulation_s", default_accum)
@@ -829,3 +840,39 @@ class NavConfig:
 
     def required_dependencies(self) -> List[str]:
         return [self.slam_service, self.base]
+
+
+@dataclass
+class ExternalNavConfig:
+    """Config for ``viam-labs:nav-stack:navigation-external``.
+
+    Drives Nav2 from an arbitrary Viam ``rdk:service:slam`` (not the built-in
+    slam_toolbox). One flat attributes block yields both a sensor-bridge
+    ``SlamConfig`` (base, lidars, movement sensor, odom tuning) and a ``NavConfig``
+    (Nav2 + navigation behavior); ``slam_service`` names the SLAM dependency.
+    """
+
+    slam_service: str
+    bridge: SlamConfig
+    nav: NavConfig
+    # Trust the movement sensor's Position as an absolute odom pose. Off by
+    # default: dead-reckoned IMU Position drifts (see odom_source.py).
+    trust_movement_sensor_pose: bool = False
+    # Snap yaw from the movement sensor's Orientation instead of integrating gyro.
+    snap_heading: bool = False
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "ExternalNavConfig":
+        return cls(
+            slam_service=d["slam_service"],
+            bridge=SlamConfig.from_dict(d),
+            nav=NavConfig.from_dict(d),
+            trust_movement_sensor_pose=bool(d.get("trust_movement_sensor_pose", False)),
+            snap_heading=bool(d.get("snap_heading", False)),
+        )
+
+    def required_dependencies(self) -> List[str]:
+        # Union of Nav2 deps (slam_service, base) and bridge deps (base, lidars,
+        # movement/heading sensors), de-duplicated preserving order.
+        deps = [*self.nav.required_dependencies(), *self.bridge.required_dependencies()]
+        return list(dict.fromkeys(deps))
