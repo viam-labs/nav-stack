@@ -529,7 +529,7 @@ def test_get_point_cloud_map_shows_current_generation():
 
 def test_stop_base_zeros_velocity_without_full_stop():
     slam = RosSlam("slam")
-    slam._cfg = MagicMock(base_velocity_convention="mir")
+    slam._cfg = MagicMock(base_velocity_convention="viam")
     slam._base = AsyncMock()
     slam._movement_sensor = None
     slam._lidars = {}

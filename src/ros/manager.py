@@ -1152,6 +1152,12 @@ class RosManager:
         """Mapping-mode revisit fix: shift odom TF so the slam prior hits ``pose``."""
         return self._require_node().apply_map_pose_correction(pose)
 
+    def set_still_keyframe_hook(self, hook) -> None:
+        """Forward still-publish keyframe callback to the bridge (or clear)."""
+        node = self._node
+        if node is not None:
+            node.set_still_keyframe_hook(hook)
+
     def get_base_scan(self, max_age_s: float = 1.0) -> Optional[conv.LaserScan2D]:
         node = self._node
         if node is None:

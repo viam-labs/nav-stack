@@ -591,3 +591,95 @@ def global_localize_scan(
         ray_score=best_ray_score,
         ray_mae_m=best_ray_mae,
     )
+
+
+@dataclass(frozen=True)
+class YawFlipChoice:
+    """Result of comparing ``pose`` against the same XY with yaw + π."""
+
+    pose: conv.Pose2D
+    flipped: bool
+    score: float
+    ray_mae_m: float
+    alt_pose: conv.Pose2D
+    alt_score: float
+    alt_ray_mae_m: float
+
+
+def choose_yaw_or_flip(
+    occ_map: OccupancyMap,
+    scan: conv.LaserScan2D,
+    pose: conv.Pose2D,
+    *,
+    reference_theta: Optional[float] = None,
+    score_margin: float = 0.05,
+    ray_mae_slack_m: float = 0.2,
+    hit_radius_cells: int = 2,
+    max_scan_points: int = 240,
+    ray_beams: int = 64,
+    ray_step_m: float = 0.08,
+    ray_weight: float = 0.35,
+) -> YawFlipChoice:
+    """Break corridor 180° ambiguity by scoring ``pose`` vs the same XY at yaw+π.
+
+    Corridors often score similarly both ways; when the two are within
+    ``score_margin`` / ``ray_mae_slack_m``, prefer the yaw closer to
+    ``reference_theta`` (usually the current IMU/map heading). Otherwise take
+    the measurably better score.
+    """
+    scan_xy = scan_endpoints_base_link(scan)
+    if max_scan_points > 0 and scan_xy.shape[0] > max_scan_points:
+        idx = np.linspace(0, scan_xy.shape[0] - 1, max_scan_points, dtype=np.int32)
+        scan_xy = scan_xy[idx]
+    occupied_lookup = _inflate_occupied(
+        occ_map.grid >= 65, max(0, int(hit_radius_cells))
+    )
+    ray_angles, ray_ranges = _sample_scan_beams(scan, max(0, int(ray_beams)))
+    range_max = float(scan.range_max) if math.isfinite(scan.range_max) else 25.0
+
+    def _eval(candidate: conv.Pose2D) -> Tuple[float, float, float]:
+        ep = _score_pose(occ_map, scan_xy, candidate, occupied_lookup=occupied_lookup)
+        ray_q, ray_mae = _ray_alignment(
+            occ_map,
+            candidate,
+            ray_angles,
+            ray_ranges,
+            range_max_m=range_max,
+            step_m=ray_step_m,
+        )
+        combined = float(ep.score) + ray_weight * ((2.0 * ray_q) - 1.0)
+        return combined, float(ep.score), float(ray_mae)
+
+    flip = conv.Pose2D(pose.x, pose.y, _normalize_angle(pose.theta + math.pi))
+    c0, s0, m0 = _eval(pose)
+    c1, s1, m1 = _eval(flip)
+
+    near_tie = abs(c0 - c1) <= score_margin and abs(m0 - m1) <= ray_mae_slack_m
+    prefer_flip = c1 > c0
+    if near_tie and reference_theta is not None:
+        d0 = abs(_normalize_angle(pose.theta - reference_theta))
+        d1 = abs(_normalize_angle(flip.theta - reference_theta))
+        prefer_flip = d1 < d0
+    elif abs(c0 - c1) <= score_margin:
+        # Score tie but MAE differs — trust the tighter ray fit.
+        prefer_flip = m1 < m0
+
+    if prefer_flip:
+        return YawFlipChoice(
+            pose=flip,
+            flipped=True,
+            score=s1,
+            ray_mae_m=m1,
+            alt_pose=pose,
+            alt_score=s0,
+            alt_ray_mae_m=m0,
+        )
+    return YawFlipChoice(
+        pose=pose,
+        flipped=False,
+        score=s0,
+        ray_mae_m=m0,
+        alt_pose=flip,
+        alt_score=s1,
+        alt_ray_mae_m=m1,
+    )

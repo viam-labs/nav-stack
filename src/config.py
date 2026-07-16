@@ -17,9 +17,13 @@ MODE_MAPPING = "mapping"
 MODE_LOCALIZING = "localizing"
 SLAM_MODES = {MODE_MAPPING, MODE_LOCALIZING}
 
+BASE_VELOCITY_VIAM = "viam"
 BASE_VELOCITY_ROS = "ros"
+# Legacy alias for ``viam`` (Y-forward); accepted in config, normalized to ``viam``.
 BASE_VELOCITY_MIR = "mir"
-BASE_VELOCITY_CONVENTIONS = {BASE_VELOCITY_ROS, BASE_VELOCITY_MIR}
+BASE_VELOCITY_CONVENTIONS = {BASE_VELOCITY_VIAM, BASE_VELOCITY_ROS, BASE_VELOCITY_MIR}
+# Conventions that put ROS forward (vx) on Viam ``linear.y``.
+BASE_VELOCITY_Y_FORWARD = {BASE_VELOCITY_VIAM, BASE_VELOCITY_MIR}
 
 LIDAR_SCAN_AUTO = "auto"
 LIDAR_SCAN_GET_LASER_SCAN = "get_laser_scan"
@@ -39,17 +43,18 @@ IMU_ODOM_MODES = {IMU_ODOM_COAST, IMU_ODOM_ACCEL_ONLY, IMU_ODOM_NONE}
 def ros_cmd_vel_to_viam_linear_mm_s(
     vx_mps: float,
     vy_mps: float,
-    convention: str = BASE_VELOCITY_ROS,
+    convention: str = BASE_VELOCITY_VIAM,
 ) -> tuple[float, float]:
     """Convert ROS body-frame linear speeds (m/s) to Viam base ``SetVelocity`` mm/s.
 
-    Default ``ros`` convention: Viam ``linear.x`` = ROS forward (``vx``),
-    Viam ``linear.y`` = ROS lateral (``vy``).
+    Default ``viam`` convention (also ``mir``): Viam ``linear.y`` = ROS forward
+    (``vx``), Viam ``linear.x`` = ROS lateral (``vy``). Matches ``rdk:builtin:wheeled``
+    and MiR bases, which only drive on Y.
 
-    ``mir`` convention (MiR250 via ``viam-labs:mir-base``): Viam ``linear.y`` is
-    forward and ``linear.x`` is lateral — see mir_rosbridge_velocity.viam_velocity_to_ros.
+    ``ros`` convention: Viam ``linear.x`` = ROS forward, ``linear.y`` = lateral —
+    for bases that actually consume X as forward.
     """
-    if convention == BASE_VELOCITY_MIR:
+    if convention in BASE_VELOCITY_Y_FORWARD:
         vx_mps, vy_mps = vy_mps, vx_mps
     return vx_mps * 1000.0, vy_mps * 1000.0
 
@@ -309,6 +314,28 @@ class SlamConfig:
     # convincing wrong corridors at map scale.
     mapping_revisit_full_map_fallback: bool = True
     mapping_revisit_full_map_min_score: float = 0.75
+    # Multi-height-slice verification: accumulate sparse per-band grids from
+    # pause scans (3D lidar only) and veto a revisit correction whose pose
+    # disagrees with any band that has reference data there. The occupancy map
+    # only holds the primary z-band silhouette — desk clutter is self-similar
+    # in that band, but head-height structure rarely is.
+    mapping_revisit_slice_verify: bool = True
+    # Extra bands beyond the primary scan band, [z_min, z_max] in base_link
+    # meters. Defaults: knee band below typical desk clutter, head band above.
+    mapping_revisit_slice_bands: List = field(
+        default_factory=lambda: [[0.15, 0.45], [1.6, 2.4]]
+    )
+    mapping_revisit_slice_min_hit_rate: float = 0.4
+    mapping_revisit_slice_resolution_m: float = 0.15
+    # Pause keyframes: store 2D endpoints + height slices on every accepted
+    # map_when_still /scan publish, then match against them when occupancy
+    # revisit scores are weak (different stop pose/angle than first visit).
+    mapping_revisit_keyframes: bool = True
+    mapping_revisit_keyframe_min_spacing_m: float = 0.5
+    mapping_revisit_keyframe_min_spacing_deg: float = 20.0
+    mapping_revisit_keyframe_max: int = 250
+    mapping_revisit_keyframe_match_tol_m: float = 0.3
+    mapping_revisit_keyframe_min_score: float = 0.55
     # Safety cutoff for the SLAM/publish scan path: if mir-base reports a scan
     # cache age (get_laser_scan ``age_s``) above this, the bridge skips publishing
     # it rather than feeding SLAM/Nav2 a misregistered scan. Accurate age-based
@@ -316,7 +343,7 @@ class SlamConfig:
     scan_max_age_s: float = 2.0
     ros_env: Optional[str] = None
     # How ROS /cmd_vel (vx forward, vy lateral) maps to the Viam base SetVelocity axes.
-    base_velocity_convention: str = BASE_VELOCITY_ROS
+    base_velocity_convention: str = BASE_VELOCITY_VIAM
     slam_toolbox: SlamToolboxConfig = field(default_factory=SlamToolboxConfig)
     slam_params: Mapping = field(default_factory=dict)
     # Automatically run global_localize shortly after starting in localizing mode.
@@ -395,11 +422,14 @@ class SlamConfig:
         mode = d.get("mode", MODE_MAPPING)
         if mode not in SLAM_MODES:
             raise ValueError(f"mode must be one of {sorted(SLAM_MODES)}")
-        convention = d.get("base_velocity_convention", BASE_VELOCITY_ROS)
+        convention = d.get("base_velocity_convention", BASE_VELOCITY_VIAM)
         if convention not in BASE_VELOCITY_CONVENTIONS:
             raise ValueError(
                 f"base_velocity_convention must be one of {sorted(BASE_VELOCITY_CONVENTIONS)}"
             )
+        # Normalize legacy ``mir`` to the canonical Y-forward name.
+        if convention == BASE_VELOCITY_MIR:
+            convention = BASE_VELOCITY_VIAM
         frames_d = d.get("frames", {}) or {}
         all_point_cloud = bool(lidars) and all(
             lidar.scan_source == LIDAR_SCAN_POINT_CLOUD for lidar in lidars
@@ -594,6 +624,35 @@ class SlamConfig:
             ),
             mapping_revisit_full_map_min_score=float(
                 d.get("mapping_revisit_full_map_min_score", 0.75)
+            ),
+            mapping_revisit_slice_verify=bool(
+                d.get("mapping_revisit_slice_verify", True)
+            ),
+            mapping_revisit_slice_bands=[
+                [float(pair[0]), float(pair[1])]
+                for pair in d.get(
+                    "mapping_revisit_slice_bands", [[0.15, 0.45], [1.6, 2.4]]
+                )
+            ],
+            mapping_revisit_slice_min_hit_rate=float(
+                d.get("mapping_revisit_slice_min_hit_rate", 0.4)
+            ),
+            mapping_revisit_slice_resolution_m=float(
+                d.get("mapping_revisit_slice_resolution_m", 0.15)
+            ),
+            mapping_revisit_keyframes=bool(d.get("mapping_revisit_keyframes", True)),
+            mapping_revisit_keyframe_min_spacing_m=float(
+                d.get("mapping_revisit_keyframe_min_spacing_m", 0.5)
+            ),
+            mapping_revisit_keyframe_min_spacing_deg=float(
+                d.get("mapping_revisit_keyframe_min_spacing_deg", 20.0)
+            ),
+            mapping_revisit_keyframe_max=int(d.get("mapping_revisit_keyframe_max", 250)),
+            mapping_revisit_keyframe_match_tol_m=float(
+                d.get("mapping_revisit_keyframe_match_tol_m", 0.3)
+            ),
+            mapping_revisit_keyframe_min_score=float(
+                d.get("mapping_revisit_keyframe_min_score", 0.55)
             ),
             scan_max_age_s=float(d.get("scan_max_age_s", 2.0)),
             ros_env=d.get("ros_env"),
