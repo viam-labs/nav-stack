@@ -1,9 +1,10 @@
 """Module entrypoint.
 
-Registers the two nav-stack resource models with the Viam module server:
+Registers the nav-stack resource models with the Viam module server:
 
-* ``viam-labs:nav-stack:slam``        - SLAM service (mapping + localization)
-* ``viam-labs:nav-stack:navigation``  - generic service (Nav2 navigation + zones)
+* ``viam-labs:nav-stack:slam``                 - SLAM service (mapping + localization)
+* ``viam-labs:nav-stack:navigation``           - Nav2 navigation + zones (built-in SLAM)
+* ``viam-labs:nav-stack:navigation-external``  - Nav2 navigation against any rdk:service:slam
 """
 import asyncio
 
@@ -12,12 +13,16 @@ from viam.module.module import Module
 # Importing the model modules triggers their registration with the Viam registry.
 from .models.slam import RosSlam
 from .models.navigation import RosNavigation
+from .models.navigation_external import RosNavigationExternal
 
 
 async def main() -> None:
     module = Module.from_args()
     module.add_model_from_registry(RosSlam.API, RosSlam.MODEL)
     module.add_model_from_registry(RosNavigation.API, RosNavigation.MODEL)
+    module.add_model_from_registry(
+        RosNavigationExternal.API, RosNavigationExternal.MODEL
+    )
     await module.start()
 
 

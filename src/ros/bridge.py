@@ -98,6 +98,7 @@ class BridgeNode(Node):
         loop: asyncio.AbstractEventLoop,
         nav_cfg: Optional[NavConfig] = None,
         node_name: str = "viam_nav_stack_bridge",
+        external_slam=None,
     ):
         super().__init__(node_name)
         self._slam_cfg = slam_cfg
@@ -353,6 +354,25 @@ class BridgeNode(Node):
         self._executor_queue: List = []
         self._last_feedback: Dict = {}
         self._last_result_status: Optional[str] = None
+
+        # External SLAM bridging: when navigation is driven by an arbitrary Viam
+        # SLAM service (not the built-in slam_toolbox), this publishes /map +
+        # map->odom from that service against the bridge's live odom. ``None``
+        # for the built-in path, so nothing changes there.
+        self._external = None
+        if external_slam is not None:
+            from .external_slam import ExternalSlamPublisher
+
+            self._external = ExternalSlamPublisher(
+                self,
+                external_slam,
+                self._frames,
+                self.get_odom_pose,
+                pose_rate_hz=slam_cfg.external_pose_rate_hz,
+                grid_rate_hz=slam_cfg.external_grid_rate_hz,
+                transform_timeout_s=slam_cfg.external_transform_timeout_s,
+                logger=self.get_logger(),
+            )
 
     # -- helpers -------------------------------------------------------------
     def _guarded(self, fn):
@@ -2018,6 +2038,14 @@ class BridgeNode(Node):
             return self._last_pose_in_map
         self._last_pose_in_map = pose
         return pose
+
+    def get_odom_pose(self) -> conv.Pose2D:
+        """Current ``odom -> base_link`` pose (the pose the odom TF broadcasts).
+
+        Read cross-thread by the external SLAM publisher to anchor ``map->odom``;
+        ``Pose2D`` is reassigned atomically so a lock is unnecessary.
+        """
+        return self._odom
 
     def get_base_scan(self, max_age_s: float = 1.0) -> Optional[conv.LaserScan2D]:
         """Latest merged base_link-frame scan, or None if too stale/absent.

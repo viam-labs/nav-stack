@@ -53,6 +53,24 @@ def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def euler_from_orientation_vector(
+    o_x: float, o_y: float, o_z: float, theta_deg: float
+) -> Tuple[float, float, float]:
+    """(roll, pitch, yaw) in radians from a Viam orientation vector.
+
+    Shared by the external-SLAM pose reader and the typed movement-sensor reader
+    so the orientation-vector -> Euler projection lives in one place.
+    """
+    from viam.proto.common import Orientation
+    from viam.spatialmath import OrientationVector
+
+    ov = OrientationVector.from_proto(
+        Orientation(o_x=o_x, o_y=o_y, o_z=o_z, theta=theta_deg)
+    )
+    e = ov.to_quaternion().to_euler_angles()
+    return e.roll, e.pitch, e.yaw
+
+
 @dataclass(frozen=True)
 class Pose2D:
     """A 2D pose in the map frame, in meters and radians."""
@@ -310,8 +328,21 @@ def parse_odom_body_horizontal_accel_from_readings(
     if rpy is None:
         return None
     roll, pitch, yaw = rpy
-    ax, ay, az = xyz
-    gx, gy, gz = _gravity_specific_force_body(roll, pitch, yaw)
+    return gravity_compensated_body_accel(xyz, roll, pitch, yaw)
+
+
+def gravity_compensated_body_accel(
+    accel_xyz: Tuple[float, float, float], roll: float, pitch: float, yaw: float
+) -> Tuple[float, float]:
+    """Body-frame horizontal (x, y) linear accel with gravity removed.
+
+    ``accel_xyz`` is the raw specific force in m/s^2 (sensor/body frame, gravity
+    still present); ``roll``/``pitch``/``yaw`` are the sensor orientation in
+    radians. Shared by the ``get_readings`` parser and the typed MovementSensor
+    reader so both remove gravity identically.
+    """
+    ax, ay, _az = accel_xyz
+    gx, gy, _gz = _gravity_specific_force_body(roll, pitch, yaw)
     return ax - gx, ay - gy
 
 

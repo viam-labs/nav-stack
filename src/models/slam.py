@@ -19,7 +19,7 @@ from viam.components.camera import Camera
 from viam.components.movement_sensor import MovementSensor
 from viam.logging import getLogger
 from viam.proto.app.robot import ServiceConfig
-from viam.proto.common import ResourceName, Vector3
+from viam.proto.common import ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
@@ -27,12 +27,9 @@ from viam.services.slam import SLAM, MappingMode, Pose
 from viam.utils import ValueTypes, struct_to_dict
 
 from ..config import (
-    LIDAR_SCAN_GET_LASER_SCAN,
-    LIDAR_SCAN_POINT_CLOUD,
     MODE_LOCALIZING,
     MODE_MAPPING,
     SlamConfig,
-    ros_cmd_vel_to_viam_linear_mm_s,
 )
 from ..nav.global_localize import (
     global_localize_scan,
@@ -43,14 +40,10 @@ from ..nav.maps import MapStore, validate_map_name
 from ..ros import conversions as conv
 from ..ros.bridge import IOProvider
 from ..ros.manager import RosManager
+from ..ros.sensor_io import build_io_provider
 from ..runtime import SlamRuntime, register_slam, unregister_slam
 
 LOGGER = getLogger(__name__)
-
-
-def _get_laser_scan_not_implemented(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return "not implemented" in msg or "docommand not implemented" in msg
 
 
 # Default /initialpose uncertainty for relocalize (~2 m, ~45 deg std dev).
@@ -889,133 +882,20 @@ class RosSlam(SLAM):
 
     # -- ROS IO --------------------------------------------------------------
     def _build_io(self) -> IOProvider:
-        async def read_lidar_points(name: str) -> conv.LidarPoints:
-            assert self._cfg is not None
-            timeout = max(float(self._cfg.sensor_read_timeout_s), 1.0)
-            cam = self._cameras[name]
-            lidar_cfg = next(
-                (lidar for lidar in self._cfg.lidars if lidar.name == name), None
-            )
-            scan_source = lidar_cfg.scan_source if lidar_cfg is not None else "auto"
-
-            async def _read_point_cloud() -> conv.LidarPoints:
-                data = await cam.get_point_cloud(timeout=timeout)
-                raw = data[0] if isinstance(data, tuple) else data
-                pts = conv.parse_pcd(raw)
-                if lidar_cfg is not None and not lidar_cfg.points_in_base_link:
-                    base_pts = conv.transform_lidar_mount_to_base_link(
-                        pts,
-                        x=lidar_cfg.x,
-                        y=lidar_cfg.y,
-                        z=lidar_cfg.z,
-                        theta=lidar_cfg.theta,
-                        pitch=lidar_cfg.pitch,
-                        roll=lidar_cfg.roll,
-                    )
-                else:
-                    base_pts = pts
-                return conv.LidarPoints(sensor=pts, base_link=base_pts)
-
-            if scan_source == LIDAR_SCAN_POINT_CLOUD or name in self._skip_get_laser_scan:
-                return await _read_point_cloud()
-
-            if scan_source == LIDAR_SCAN_GET_LASER_SCAN:
-                raw_payload = await cam.do_command({"command": "get_laser_scan"})
-                payload = (
-                    struct_to_dict(raw_payload)
-                    if not isinstance(raw_payload, dict)
-                    else raw_payload
-                )
-                mir_pts = conv.points_from_mir_laser_scan_payload(payload)
-                if mir_pts.base_link.size > 0 or (
-                    mir_pts.sensor_scan is not None
-                    and conv.scan_has_returns(mir_pts.sensor_scan)
-                ):
-                    return mir_pts
-                raise RuntimeError(
-                    f"lidar {name} get_laser_scan returned no valid ranges"
-                )
-
-            # auto: prefer mir-base get_laser_scan, fall back to point cloud.
-            try:
-                raw_payload = await cam.do_command({"command": "get_laser_scan"})
-                payload = (
-                    struct_to_dict(raw_payload)
-                    if not isinstance(raw_payload, dict)
-                    else raw_payload
-                )
-                mir_pts = conv.points_from_mir_laser_scan_payload(payload)
-                if mir_pts.base_link.size > 0 or (
-                    mir_pts.sensor_scan is not None
-                    and conv.scan_has_returns(mir_pts.sensor_scan)
-                ):
-                    return mir_pts
-                LOGGER.warning(
-                    "lidar %s get_laser_scan returned no valid ranges; using point cloud",
-                    name,
-                )
-            except Exception as exc:  # noqa: BLE001 - fall back to point cloud
-                if _get_laser_scan_not_implemented(exc):
-                    if name not in self._skip_get_laser_scan:
-                        self._skip_get_laser_scan.add(name)
-                        LOGGER.info(
-                            "lidar %s has no get_laser_scan; using get_point_cloud",
-                            name,
-                        )
-                else:
-                    LOGGER.warning(
-                        "lidar %s get_laser_scan failed: %s; using point cloud",
-                        name,
-                        exc,
-                    )
-            return await _read_point_cloud()
-
-        async def read_odometry() -> conv.OdomReading:
-            if self._movement_sensor is None:
-                return conv.OdomReading(0.0, 0.0, 0.0)
-            readings = await self._movement_sensor.get_readings()
-            sample = conv.parse_odom_from_readings(readings)
-            if self._cfg is not None and self._cfg.movement_sensor_upside_down:
-                sample = conv.apply_sensor_upside_down(sample)
-            if self._cfg is not None and self._cfg.movement_sensor_yaw_deg:
-                sample = conv.apply_sensor_mount_yaw(
-                    sample, math.radians(self._cfg.movement_sensor_yaw_deg)
-                )
-            if self._heading_sensor is not None:
-                heading_readings = await self._heading_sensor.get_readings()
-                heading = conv.parse_heading_sensor_readings(heading_readings)
-                if heading is not None:
-                    if self._cfg is not None and self._cfg.heading_sensor_invert:
-                        heading = conv.normalize_angle(-heading)
-                    if self._cfg is not None and self._cfg.heading_sensor_yaw_deg:
-                        heading = conv.normalize_angle(
-                            heading - math.radians(self._cfg.heading_sensor_yaw_deg)
-                        )
-                    sample = conv.merge_odom_heading(sample, heading)
-            return sample
-
-        async def drive_base(vx: float, vy: float, vtheta: float):
-            assert self._cfg is not None
-            lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(
-                vx,
-                vy,
-                self._cfg.base_velocity_convention,
-            )
-            await self._base.set_velocity(
-                linear=Vector3(x=lx_mm, y=ly_mm, z=0.0),
-                angular=Vector3(x=0.0, y=0.0, z=math.degrees(vtheta)),
-            )
-
-        async def stop_base():
-            # MiR base.stop() also calls REST stop_immediately (PAUSE), which
-            # drops Manualcontrol and kills the rosbridge /cmd_vel session — breaking
-            # go_to_location and the next navigate_to_location. Nav2 only needs zeros.
-            await self._base.set_velocity(
-                linear=Vector3(x=0.0, y=0.0, z=0.0),
-                angular=Vector3(x=0.0, y=0.0, z=0.0),
-            )
-
-        return IOProvider(read_lidar_points, read_odometry, drive_base, stop_base)
+        assert self._cfg is not None
+        # Built-in path: read odometry from the movement sensor's get_readings()
+        # (odom_reader=None). The external-SLAM model reuses this same builder
+        # with a typed MovementSensor reader injected.
+        return build_io_provider(
+            base=self._base,
+            cameras=self._cameras,
+            cfg=self._cfg,
+            movement_sensor=self._movement_sensor,
+            heading_sensor=self._heading_sensor,
+            skip_get_laser_scan=self._skip_get_laser_scan,
+            odom_reader=None,
+            logger=LOGGER,
+        )
 
     async def _probe_sensors(self) -> dict:
         """One-shot lidar + odom read for get_status (does not affect /scan)."""
