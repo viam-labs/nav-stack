@@ -468,6 +468,30 @@ def test_base_velocity_convention_mir_alias_normalizes_to_viam():
     assert ly == pytest.approx(500.0)
 
 
+def test_min_cmd_vel_defaults_and_legacy_alias():
+    cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    assert cfg.min_cmd_vel_x == pytest.approx(0.15)
+    assert cfg.min_cmd_vel_theta == pytest.approx(0.3)
+
+    cfg = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "min_cmd_vel_x": 0.25, "min_cmd_vel_theta": 0.5}
+    )
+    assert cfg.min_cmd_vel_x == pytest.approx(0.25)
+    assert cfg.min_cmd_vel_theta == pytest.approx(0.5)
+
+    # Legacy names still accepted.
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "simple_min_vel_x": 0.3,
+            "simple_min_vel_theta": 0.6,
+        }
+    )
+    assert cfg.min_cmd_vel_x == pytest.approx(0.3)
+    assert cfg.min_cmd_vel_theta == pytest.approx(0.6)
+
+
 def test_base_velocity_convention_invalid():
     with pytest.raises(ValueError):
         SlamConfig.from_dict(

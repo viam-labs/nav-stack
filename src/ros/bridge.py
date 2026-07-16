@@ -58,6 +58,7 @@ from ..config import (
     LIDAR_SCAN_POINT_CLOUD,
     NavConfig,
     SlamConfig,
+    ros_cmd_vel_to_viam_linear_mm_s,
 )
 from . import conversions as conv
 
@@ -134,6 +135,19 @@ class BridgeNode(Node):
         self._last_cmd_time = 0.0
         self._last_odom_stamp = None
         self._cmd_timeout = nav_cfg.cmd_vel_timeout if nav_cfg else 0.5
+        self._last_cmd_vel_wall = 0.0
+        self._last_cmd_vel: Dict = {
+            "source": None,
+            "nav_active": False,
+            "ros_vx_mps": 0.0,
+            "ros_vy_mps": 0.0,
+            "ros_vtheta_rad_s": 0.0,
+            "viam_linear_x_mm_s": 0.0,
+            "viam_linear_y_mm_s": 0.0,
+            "viam_angular_z_deg_s": 0.0,
+            "convention": getattr(slam_cfg, "base_velocity_convention", None),
+            "age_s": None,
+        }
 
         # Odom pose: prefer the movement sensor's absolute /odom pose when available.
         self._odom = conv.Pose2D(0.0, 0.0, 0.0)
@@ -1428,11 +1442,68 @@ class BridgeNode(Node):
         # Snap near-zero commands so the MiR does not creep past the goal.
         if abs(vx) < 0.03 and abs(vy) < 0.03 and abs(vtheta) < 0.05:
             vx, vy, vtheta = 0.0, 0.0, 0.0
+        else:
+            # Stiction floor: MPPI/smoother often emit 0.05-0.1 m/s which
+            # skid-steer carts ignore (motors hum, nothing moves). Bump nonzero
+            # commands up to the configured minimums.
+            vx, vy, vtheta = self._apply_cmd_vel_floor(vx, vy, vtheta)
         try:
             self._run(self._io.drive_base(vx, vy, vtheta))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f"drive_base failed: {exc!r}")
 
+    def record_cmd_vel(
+        self,
+        vx: float,
+        vy: float,
+        vtheta: float,
+        *,
+        source: str = "nav2",
+    ) -> None:
+        """Remember the last ROS body-frame cmd and its Viam SetVelocity mapping."""
+        convention = getattr(self._slam_cfg, "base_velocity_convention", "viam")
+        lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, convention)
+        self._last_cmd_vel_wall = time.monotonic()
+        self._last_cmd_vel = {
+            "source": source,
+            "nav_active": bool(self._nav_active),
+            "ros_vx_mps": round(float(vx), 4),
+            "ros_vy_mps": round(float(vy), 4),
+            "ros_vtheta_rad_s": round(float(vtheta), 4),
+            "viam_linear_x_mm_s": round(float(lx_mm), 1),
+            "viam_linear_y_mm_s": round(float(ly_mm), 1),
+            "viam_angular_z_deg_s": round(math.degrees(float(vtheta)), 2),
+            "convention": convention,
+            "age_s": 0.0,
+        }
+
+    def last_cmd_vel(self) -> Dict:
+        out = dict(self._last_cmd_vel)
+        if self._last_cmd_vel_wall > 0.0:
+            out["age_s"] = round(time.monotonic() - self._last_cmd_vel_wall, 2)
+        return out
+
+    def _apply_cmd_vel_floor(
+        self, vx: float, vy: float, vtheta: float
+    ) -> tuple[float, float, float]:
+        cfg = self._nav_cfg
+        if cfg is None:
+            return vx, vy, vtheta
+        min_x = float(getattr(cfg, "min_cmd_vel_x", 0.0) or 0.0)
+        min_th = float(getattr(cfg, "min_cmd_vel_theta", 0.0) or 0.0)
+        max_x = float(getattr(cfg, "max_vel_x", 0.0) or 0.0)
+        max_th = float(getattr(cfg, "max_vel_theta", 0.0) or 0.0)
+        if vx != 0.0 and min_x > 0.0:
+            floored = max(abs(vx), min_x)
+            if max_x > 0.0:
+                floored = min(floored, max_x)
+            vx = math.copysign(floored, vx)
+        if vtheta != 0.0 and min_th > 0.0:
+            floored = max(abs(vtheta), min_th)
+            if max_th > 0.0:
+                floored = min(floored, max_th)
+            vtheta = math.copysign(floored, vtheta)
+        return vx, vy, vtheta
     def _on_watchdog(self) -> None:
         self._flush_executor_queue()
         self._flush_pending_nav_goal()
@@ -1441,6 +1512,7 @@ class BridgeNode(Node):
             return
         if time.time() - self._last_cmd_time > self._cmd_timeout:
             try:
+                self.record_cmd_vel(0.0, 0.0, 0.0, source="watchdog_stop")
                 self._run(self._io.stop_base())
             except Exception:  # noqa: BLE001
                 pass
@@ -1839,6 +1911,7 @@ class BridgeNode(Node):
         return {
             "state": self._last_result_status or "idle",
             "active": self._nav_active,
+            "last_cmd_vel": self.last_cmd_vel(),
             **self._last_feedback,
         }
 

@@ -140,6 +140,7 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 | `slam_toolbox` | SLAM | Common slam_toolbox params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced: any other slam_toolbox ROS param (merged last) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level Nav2 footprint / velocity limits |
+| `min_cmd_vel_x`, `min_cmd_vel_theta` | Nav | Stiction floors (default `0.15` m/s, `0.3` rad/s) applied to both `go_to_*` and Nav2 `/cmd_vel_smoothed` before `SetVelocity`. Raise if the cart hums/thunks but barely moves. Legacy aliases: `simple_min_vel_x` / `simple_min_vel_theta` |
 | `nav2` | Nav | Common Nav2 params (goal tolerance, costmap size, etc.) |
 | `nav2_params` | Nav | Advanced: nested Nav2 param overrides (merged last) |
 
@@ -251,6 +252,10 @@ The files under [`params/`](params/) are **reference defaults** shipped with the
 ```python
 await slam.do_command({"command": "start_localizing", "map": "ground-floor"})
 await slam.do_command({"command": "set_initial_pose", "pose": {"x": 0, "y": 0, "theta": 0}})
+# XY roughly right but heading unknown/wrong? slam_toolbox only self-corrects
+# ~±30° of yaw — add refine to run a full-yaw seeded scan match and apply it:
+await slam.do_command({"command": "set_initial_pose",
+                       "pose": {"x": 0, "y": 0, "theta": 0}, "refine": True})
 ```
 
 If the nav-stack map is aligned with the MiR onboard map, seed from the MiR pose instead
@@ -313,6 +318,7 @@ await nav.do_command({"command": "add_location", "name": "dock",
 await nav.do_command({"command": "navigate_to_location", "name": "kitchen"})
 await nav.do_command({"command": "navigate_to_point", "x": 3.5, "y": -1.0})
 await nav.do_command({"command": "get_status"})
+# get_status includes last_cmd_vel (ROS cmd + mapped Viam SetVelocity mm/s)
 await nav.do_command({"command": "cancel"})
 
 # Force Nav2 to stop and relaunch with freshly generated params (param

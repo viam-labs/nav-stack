@@ -1303,6 +1303,9 @@ class RosSlam(SLAM):
 
         async def drive_base(vx: float, vy: float, vtheta: float):
             assert self._cfg is not None
+            node = self._manager.node if self._manager else None
+            if node is not None:
+                node.record_cmd_vel(vx, vy, vtheta, source="nav2")
             lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(
                 vx,
                 vy,
@@ -1317,6 +1320,9 @@ class RosSlam(SLAM):
             # MiR base.stop() also calls REST stop_immediately (PAUSE), which
             # drops Manualcontrol and kills the rosbridge /cmd_vel session — breaking
             # go_to_location and the next navigate_to_location. Nav2 only needs zeros.
+            node = self._manager.node if self._manager else None
+            if node is not None:
+                node.record_cmd_vel(0.0, 0.0, 0.0, source="stop")
             await self._base.set_velocity(
                 linear=Vector3(x=0.0, y=0.0, z=0.0),
                 angular=Vector3(x=0.0, y=0.0, z=0.0),
@@ -1623,6 +1629,23 @@ class RosSlam(SLAM):
         if cmd == "set_initial_pose":
             pose = self._resolve_pose(command)
             await asyncio.to_thread(mgr.set_initial_pose, pose)
+            # ``refine: true`` runs a seeded scan match around the given XY with
+            # a full yaw sweep — slam_toolbox itself only searches ~±30° of
+            # heading, so a seed with roughly-right XY but wrong theta can never
+            # self-correct without this.
+            if command.get("refine"):
+                refine_cmd: dict = {
+                    "command": "global_localize",
+                    "pose": {"x": pose.x, "y": pose.y, "theta": pose.theta},
+                    "search_radius_m": float(command.get("search_radius_m", 3.0)),
+                    "local_yaw_window_deg": float(
+                        command.get("local_yaw_window_deg", 360.0)
+                    ),
+                    "full_map": False,
+                    "auto_full_map_fallback": False,
+                }
+                result = await self._global_localize(refine_cmd)
+                return {"status": "ok", "refine": result}
             return {"status": "ok"}
 
         if cmd in ("relocalize", "refine_localization"):

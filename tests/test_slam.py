@@ -264,6 +264,59 @@ def test_relocalize_uses_current_map_pose(tmp_path: Path):
     assert pose_arg.theta == 0.5
 
 
+def test_set_initial_pose_refine_runs_seeded_yaw_search(tmp_path: Path):
+    slam = RosSlam("slam")
+    slam._map_store = MapStore(str(tmp_path))
+    slam._cfg = MagicMock(mode=MODE_LOCALIZING)
+    mgr = MagicMock()
+    slam._manager = mgr
+
+    refine_result = {"status": "localized", "score": 0.8}
+
+    async def _fake_global_localize(command):
+        _fake_global_localize.command = dict(command)
+        return refine_result
+
+    slam._global_localize = _fake_global_localize
+
+    result = asyncio.run(
+        slam.do_command(
+            {
+                "command": "set_initial_pose",
+                "pose": {"x": 1.0, "y": 2.0, "theta": 0.5},
+                "refine": True,
+            }
+        )
+    )
+
+    mgr.set_initial_pose.assert_called_once()
+    assert result["status"] == "ok"
+    assert result["refine"] == refine_result
+    sent = _fake_global_localize.command
+    assert sent["pose"] == {"x": 1.0, "y": 2.0, "theta": 0.5}
+    assert sent["local_yaw_window_deg"] == 360.0
+    assert sent["full_map"] is False
+    assert sent["auto_full_map_fallback"] is False
+
+
+def test_set_initial_pose_without_refine_skips_search(tmp_path: Path):
+    slam = RosSlam("slam")
+    slam._map_store = MapStore(str(tmp_path))
+    slam._cfg = MagicMock(mode=MODE_LOCALIZING)
+    mgr = MagicMock()
+    slam._manager = mgr
+    slam._global_localize = AsyncMock()
+
+    result = asyncio.run(
+        slam.do_command(
+            {"command": "set_initial_pose", "pose": {"x": 1.0, "y": 2.0, "theta": 0.5}}
+        )
+    )
+
+    assert result == {"status": "ok"}
+    slam._global_localize.assert_not_called()
+
+
 def test_relocalize_use_mir_pose_from_movement_sensor(tmp_path: Path):
     slam = RosSlam("slam")
     slam._map_store = MapStore(str(tmp_path))

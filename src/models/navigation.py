@@ -371,6 +371,12 @@ class RosNavigation(Generic):
         base = self._base
         if base is None:
             return
+        try:
+            node = self._require_runtime().manager.node
+        except Exception:  # noqa: BLE001 - stop must still zero the base
+            node = None
+        if node is not None:
+            node.record_cmd_vel(0.0, 0.0, 0.0, source="simple_stop")
         await base.set_velocity(
             linear=Vector3(x=0, y=0, z=0),
             angular=Vector3(x=0, y=0, z=0),
@@ -400,6 +406,8 @@ class RosNavigation(Generic):
             max_vel_x=cfg.max_vel_x,
             max_vel_theta=cfg.max_vel_theta,
             yaw_tolerance_rad=cfg.nav2.yaw_goal_tolerance,
+            min_linear_mps=cfg.min_cmd_vel_x,
+            min_angular_rad_s=cfg.min_cmd_vel_theta,
         )
         cancel_event = asyncio.Event()
         self._simple_nav_cancel = cancel_event
@@ -412,6 +420,9 @@ class RosNavigation(Generic):
         convention = runtime.slam_cfg.base_velocity_convention
 
         async def _set_velocity(vx: float, vy: float, vtheta: float) -> None:
+            node = runtime.manager.node
+            if node is not None:
+                node.record_cmd_vel(vx, vy, vtheta, source="simple")
             lx, ly = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, convention)
             await base.set_velocity(
                 linear=Vector3(x=lx, y=ly, z=0),
