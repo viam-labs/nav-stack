@@ -9,6 +9,7 @@ from src.ros.nav_view import (
     NavViewOptions,
     _build_frame,
     _colorize,
+    _compute_window,
     legend,
     legend_text,
     placeholder_png,
@@ -143,6 +144,67 @@ def test_legend_text_uses_color_names_not_hex():
     assert txt.count("\n") >= len(legend())
     assert "#" not in txt  # rough colour names, no hex codes
     assert "green" in txt and "magenta" in txt
+
+
+def test_window_full_is_default_and_none():
+    assert _compute_window(_full_snapshot(), NavViewOptions(), _costmap()) is None
+
+
+def test_window_follow_centers_on_pose():
+    snap = {"costmap": _costmap(), "pose": (1.5, 2.3, 0.0)}
+    opts = NavViewOptions(window_mode="follow", window_size_m=0.5)
+    win = _compute_window(snap, opts, snap["costmap"])
+    assert win == pytest.approx((1.25, 2.05, 1.75, 2.55))
+
+
+def test_window_follow_falls_back_to_goal_then_grid_center():
+    cm = _costmap(h=20, w=30, res=0.05, ox=1.0, oy=2.0)
+    opts = NavViewOptions(window_mode="follow", window_size_m=1.0)
+    # no pose -> use goal
+    win = _compute_window({"costmap": cm, "goal": (2.0, 3.0, 0.0)}, opts, cm)
+    assert win == pytest.approx((1.5, 2.5, 2.5, 3.5))
+    # no pose or goal -> grid centre (ox + w*res/2, oy + h*res/2) = (1.75, 2.5)
+    win = _compute_window({"costmap": cm}, opts, cm)
+    assert win == pytest.approx((1.25, 2.0, 2.25, 3.0))
+
+
+def test_window_region_bbox_normalized():
+    cm = _costmap()
+    opts = NavViewOptions(
+        window_mode="region",
+        window_min_x=1.6, window_min_y=2.4, window_max_x=1.2, window_max_y=2.1,
+    )
+    # min/max get sorted regardless of input order.
+    assert _compute_window({"costmap": cm}, opts, cm) == pytest.approx((1.2, 2.1, 1.6, 2.4))
+
+
+def test_window_region_missing_bounds_falls_back_to_full():
+    cm = _costmap()
+    opts = NavViewOptions(window_mode="region", window_min_x=1.2, window_min_y=2.1)
+    assert _compute_window({"costmap": cm}, opts, cm) is None
+
+
+def test_windowed_render_dims_and_alignment():
+    cm = _costmap(h=20, w=30, res=0.05, ox=1.0, oy=2.0)
+    # 0.4m x 0.3m region -> 8 x 6 cells.
+    win = (1.2, 2.1, 1.6, 2.4)
+    img, frame = _build_frame(cm, 300, win)
+    # long edge (8 cells) scaled to 300.
+    assert img.size == (300, 225)
+    assert frame.out_w == 300 and frame.out_h == 225
+    # window centre maps near the image centre.
+    cx, cy = frame.to_px(1.4, 2.25)
+    assert cx == pytest.approx(frame.out_w / 2, abs=frame.scale)
+    assert cy == pytest.approx(frame.out_h / 2, abs=frame.scale)
+
+
+def test_window_outside_grid_is_padded_not_crashing():
+    cm = _costmap()
+    # region entirely off the grid.
+    _img, _frame = _build_frame(cm, 200, (100.0, 100.0, 101.0, 101.0))
+    # follow mode render end-to-end with a pose near an edge.
+    snap = {"costmap": cm, "pose": (1.0, 2.0, 0.0)}
+    _decode(render_nav_view(snap, NavViewOptions(window_mode="follow", window_size_m=2.0)))
 
 
 def test_footprint_fallback_circle_uses_pose():

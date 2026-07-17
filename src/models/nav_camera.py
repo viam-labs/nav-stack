@@ -82,6 +82,12 @@ class NavCamera(Camera):
             show_goal=cfg.show_goal,
             show_history=cfg.show_history,
             robot_radius_m=cfg.robot_radius_m,
+            window_mode=cfg.window_mode,
+            window_size_m=cfg.window_size_m,
+            window_min_x=cfg.window_min_x,
+            window_min_y=cfg.window_min_y,
+            window_max_x=cfg.window_max_x,
+            window_max_y=cfg.window_max_y,
         )
         # The bridge is resolved lazily per frame: Nav2 bringup is asynchronous,
         # so the bridge/costmap may not exist yet when this camera configures.

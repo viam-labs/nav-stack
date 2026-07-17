@@ -17,12 +17,12 @@
     {
       "api": "rdk:service:generic",
       "model": "viam-labs:nav-stack:navigation-external",
-      "short_description": "Nav2 navigation driven by any rdk:service:slam (not just the built-in slam_toolbox); runs its own sensor bridge."
+      "short_description": "Nav2 navigation driven by any rdk:service:slam; runs its own sensor bridge (not just slam_toolbox)."
     },
     {
       "api": "rdk:component:camera",
       "model": "viam-labs:nav-stack:nav-camera",
-      "short_description": "Renders the navigation service's Nav2 costmap with the active plan(s), robot pose, footprint and goal as a camera image."
+      "short_description": "Renders the nav service's Nav2 costmap, active plans, robot pose and goal as a camera image."
     }
   ],
   "entrypoint": "run.sh",
