@@ -261,11 +261,14 @@ def test_set_nav_active_false_clears_pending_cmd_vel():
 
 
 def test_record_cmd_vel_maps_viam_axes():
+    from collections import deque
+
     bridge = SimpleNamespace(
         _nav_active=True,
         _slam_cfg=SimpleNamespace(base_velocity_convention="viam"),
         _last_cmd_vel_wall=0.0,
         _last_cmd_vel={},
+        _cmd_vel_history=deque(maxlen=20),
     )
     BridgeNode.record_cmd_vel(bridge, 0.5, 0.0, 0.2, source="nav2")
     cmd = bridge._last_cmd_vel
@@ -275,6 +278,28 @@ def test_record_cmd_vel_maps_viam_axes():
     assert cmd["viam_linear_y_mm_s"] == 500.0
     assert cmd["viam_angular_z_deg_s"] == pytest.approx(math.degrees(0.2), rel=1e-3)
     assert cmd["convention"] == "viam"
+
+
+def test_cmd_vel_history_keeps_drive_cmds_after_stop():
+    from collections import deque
+
+    bridge = SimpleNamespace(
+        _nav_active=True,
+        _slam_cfg=SimpleNamespace(base_velocity_convention="viam"),
+        _last_cmd_vel_wall=0.0,
+        _last_cmd_vel={},
+        _cmd_vel_history=deque(maxlen=20),
+    )
+    BridgeNode.record_cmd_vel(bridge, 0.5, 0.0, -1.5, source="nav2")
+    BridgeNode.record_cmd_vel(bridge, 0.5, 0.0, -1.5, source="nav2")
+    BridgeNode.record_cmd_vel(bridge, 0.4, 0.0, -1.2, source="nav2")
+    BridgeNode.record_cmd_vel(bridge, 0.0, 0.0, 0.0, source="stop")
+
+    hist = BridgeNode.cmd_vel_history(bridge)
+    assert len(hist) == 3
+    assert hist[0]["ros_vx_mps"] == 0.5
+    assert hist[2]["source"] == "stop"
+    assert BridgeNode.last_cmd_vel(bridge)["source"] == "stop"
 
 
 def test_nav_status_includes_last_cmd_vel():
@@ -289,10 +314,12 @@ def test_nav_status_includes_last_cmd_vel():
                 "age_s": 0.1,
             }
         ),
+        cmd_vel_history=MagicMock(return_value=[{"source": "nav2", "ros_vx_mps": 0.5}]),
     )
     status = BridgeNode.nav_status(bridge)
     assert status["active"] is True
     assert status["last_cmd_vel"]["viam_linear_y_mm_s"] == 300.0
+    assert status["cmd_vel_history"][0]["ros_vx_mps"] == 0.5
 
 
 def test_on_drive_timer_noop_when_nav_inactive():

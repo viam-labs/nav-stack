@@ -582,10 +582,21 @@ def test_get_point_cloud_map_shows_current_generation():
 
 def test_stop_base_zeros_velocity_without_full_stop():
     slam = RosSlam("slam")
-    slam._cfg = MagicMock(base_velocity_convention="viam")
+    slam._cfg = MagicMock(
+        base_velocity_convention="viam",
+        sensor_read_timeout_s=1.0,
+        lidars=[],
+        movement_sensor_upside_down=False,
+        movement_sensor_yaw_deg=0.0,
+        heading_sensor_invert=False,
+        heading_sensor_yaw_deg=0.0,
+    )
     slam._base = AsyncMock()
     slam._movement_sensor = None
-    slam._lidars = {}
+    slam._heading_sensor = None
+    slam._cameras = {}
+    slam._skip_get_laser_scan = set()
+    slam._manager = MagicMock(node=None)
 
     io = slam._build_io()
     asyncio.run(io.stop_base())
@@ -596,6 +607,36 @@ def test_stop_base_zeros_velocity_without_full_stop():
     assert kwargs["linear"].x == 0.0
     assert kwargs["linear"].y == 0.0
     assert kwargs["angular"].z == 0.0
+
+
+def test_nav2_drive_base_sends_angular_z_to_viam_base():
+    slam = RosSlam("slam")
+    slam._cfg = MagicMock(
+        base_velocity_convention="viam",
+        sensor_read_timeout_s=1.0,
+        lidars=[],
+        movement_sensor_upside_down=False,
+        movement_sensor_yaw_deg=0.0,
+        heading_sensor_invert=False,
+        heading_sensor_yaw_deg=0.0,
+    )
+    slam._base = AsyncMock()
+    slam._movement_sensor = None
+    slam._heading_sensor = None
+    slam._cameras = {}
+    slam._skip_get_laser_scan = set()
+    node = MagicMock()
+    slam._manager = MagicMock(node=node)
+
+    io = slam._build_io()
+    asyncio.run(io.drive_base(0.5, 0.0, -1.0))
+
+    node.record_cmd_vel.assert_called_once_with(0.5, 0.0, -1.0, source="nav2")
+    slam._base.set_velocity.assert_awaited_once()
+    kwargs = slam._base.set_velocity.await_args.kwargs
+    assert kwargs["linear"].x == 0.0
+    assert kwargs["linear"].y == 500.0
+    assert kwargs["angular"].z == pytest.approx(-57.2958, rel=1e-5)
 
 
 # -- periodic relocalize (drift watchdog) -----------------------------------

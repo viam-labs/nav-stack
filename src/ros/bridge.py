@@ -123,6 +123,7 @@ class BridgeNode(Node):
         loop: asyncio.AbstractEventLoop,
         nav_cfg: Optional[NavConfig] = None,
         node_name: str = "viam_nav_stack_bridge",
+        external_slam=None,
     ):
         super().__init__(node_name)
         self._slam_cfg = slam_cfg
@@ -148,6 +149,10 @@ class BridgeNode(Node):
             "convention": getattr(slam_cfg, "base_velocity_convention", None),
             "age_s": None,
         }
+        # Ring buffer of recent SetVelocity commands. Consecutive identical
+        # (source + ROS body cmd) samples only refresh the latest entry so a
+        # cancel/stop zero does not wipe the useful drive history.
+        self._cmd_vel_history: deque = deque(maxlen=20)
 
         # Odom pose: prefer the movement sensor's absolute /odom pose when available.
         self._odom = conv.Pose2D(0.0, 0.0, 0.0)
@@ -410,6 +415,25 @@ class BridgeNode(Node):
         self._executor_queue: List = []
         self._last_feedback: Dict = {}
         self._last_result_status: Optional[str] = None
+
+        # External SLAM bridging: when navigation is driven by an arbitrary Viam
+        # SLAM service (not the built-in slam_toolbox), this publishes /map +
+        # map->odom from that service against the bridge's live odom. ``None``
+        # for the built-in path, so nothing changes there.
+        self._external = None
+        if external_slam is not None:
+            from .external_slam import ExternalSlamPublisher
+
+            self._external = ExternalSlamPublisher(
+                self,
+                external_slam,
+                self._frames,
+                self.get_odom_pose,
+                pose_rate_hz=slam_cfg.external_pose_rate_hz,
+                grid_rate_hz=slam_cfg.external_grid_rate_hz,
+                transform_timeout_s=slam_cfg.external_transform_timeout_s,
+                logger=self.get_logger(),
+            )
 
     # -- helpers -------------------------------------------------------------
     def _guarded(self, fn):
@@ -1463,8 +1487,9 @@ class BridgeNode(Node):
         """Remember the last ROS body-frame cmd and its Viam SetVelocity mapping."""
         convention = getattr(self._slam_cfg, "base_velocity_convention", "viam")
         lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, convention)
-        self._last_cmd_vel_wall = time.monotonic()
-        self._last_cmd_vel = {
+        now = time.monotonic()
+        self._last_cmd_vel_wall = now
+        entry = {
             "source": source,
             "nav_active": bool(self._nav_active),
             "ros_vx_mps": round(float(vx), 4),
@@ -1476,11 +1501,39 @@ class BridgeNode(Node):
             "convention": convention,
             "age_s": 0.0,
         }
+        self._last_cmd_vel = entry
+        hist = getattr(self, "_cmd_vel_history", None)
+        if hist is None:
+            return
+        if hist and BridgeNode._cmd_vel_same(hist[-1], entry):
+            hist[-1] = {**entry, "_wall": now}
+        else:
+            hist.append({**entry, "_wall": now})
+
+    @staticmethod
+    def _cmd_vel_same(a: Dict, b: Dict) -> bool:
+        return (
+            a.get("source") == b.get("source")
+            and a.get("ros_vx_mps") == b.get("ros_vx_mps")
+            and a.get("ros_vy_mps") == b.get("ros_vy_mps")
+            and a.get("ros_vtheta_rad_s") == b.get("ros_vtheta_rad_s")
+        )
 
     def last_cmd_vel(self) -> Dict:
         out = dict(self._last_cmd_vel)
         if self._last_cmd_vel_wall > 0.0:
             out["age_s"] = round(time.monotonic() - self._last_cmd_vel_wall, 2)
+        return out
+
+    def cmd_vel_history(self) -> list:
+        """Oldest→newest snapshots (up to 20). Survives cancel/stop zeros."""
+        now = time.monotonic()
+        out = []
+        for item in getattr(self, "_cmd_vel_history", ()):
+            entry = {k: v for k, v in item.items() if k != "_wall"}
+            wall = item.get("_wall", 0.0)
+            entry["age_s"] = round(now - wall, 2) if wall else None
+            out.append(entry)
         return out
 
     def _apply_cmd_vel_floor(
@@ -1912,6 +1965,7 @@ class BridgeNode(Node):
             "state": self._last_result_status or "idle",
             "active": self._nav_active,
             "last_cmd_vel": self.last_cmd_vel(),
+            "cmd_vel_history": self.cmd_vel_history(),
             **self._last_feedback,
         }
 
@@ -2172,6 +2226,14 @@ class BridgeNode(Node):
             return self._last_pose_in_map
         self._last_pose_in_map = pose
         return pose
+
+    def get_odom_pose(self) -> conv.Pose2D:
+        """Current ``odom -> base_link`` pose (the pose the odom TF broadcasts).
+
+        Read cross-thread by the external SLAM publisher to anchor ``map->odom``;
+        ``Pose2D`` is reassigned atomically so a lock is unnecessary.
+        """
+        return self._odom
 
     def get_base_scan(self, max_age_s: float = 1.0) -> Optional[conv.LaserScan2D]:
         """Latest merged base_link-frame scan, or None if too stale/absent.
