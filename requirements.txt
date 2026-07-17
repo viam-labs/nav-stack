@@ -7,3 +7,5 @@
 viam-sdk>=0.30.0
 numpy>=1.24
 PyYAML>=6.0
+# Pillow renders the nav-camera occupancy/plan overlay to PNG.
+Pillow>=10.0

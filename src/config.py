@@ -890,3 +890,45 @@ class ExternalNavConfig:
         # movement/heading sensors), de-duplicated preserving order.
         deps = [*self.nav.required_dependencies(), *self.bridge.required_dependencies()]
         return list(dict.fromkeys(deps))
+
+
+@dataclass
+class NavCameraConfig:
+    """Config for ``viam-labs:nav-stack:nav-camera``.
+
+    A visualization camera that renders the running navigation service's Nav2
+    global costmap with the active plan(s), robot pose, footprint and goal
+    overlaid. ``navigation`` names the ``navigation`` / ``navigation-external``
+    service whose in-process bridge supplies the data.
+    """
+
+    navigation: str
+    max_dim: int = 700
+    plan_history_len: int = 8
+    robot_radius_m: float = 0.22
+    show_global_plan: bool = True
+    show_local_plan: bool = True
+    show_pose: bool = True
+    show_footprint: bool = True
+    show_goal: bool = True
+    show_history: bool = True
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "NavCameraConfig":
+        return cls(
+            navigation=d["navigation"],
+            max_dim=int(d.get("max_dim", 700)),
+            plan_history_len=int(d.get("plan_history_len", 8)),
+            robot_radius_m=float(d.get("robot_radius_m", 0.22)),
+            show_global_plan=bool(d.get("show_global_plan", True)),
+            show_local_plan=bool(d.get("show_local_plan", True)),
+            show_pose=bool(d.get("show_pose", True)),
+            show_footprint=bool(d.get("show_footprint", True)),
+            show_goal=bool(d.get("show_goal", True)),
+            show_history=bool(d.get("show_history", True)),
+        )
+
+    def required_dependencies(self) -> List[str]:
+        # Depend on the navigation service so Viam constructs it (and registers
+        # its bridge) before this camera.
+        return [self.navigation]
