@@ -736,6 +736,9 @@ class RosManager:
         # built-in lifecycle manager anyway (no use_collision_monitor arg).
         # collision_monitor crashes on our disabled config; the built-in manager
         # then waits forever. Our override lifecycle manager owns activation.
+        # Block until the stock manager is actually gone — starting the override
+        # while it is still configuring nodes is the classic Pi hang
+        # (nodes present, lifecycle get timeouts, nav_action_ready false).
         self._suppress_jazzy_nav2_extras()
         self._apply_slam_tf_params()
         # Costmap filter info servers for keepout + speed zones. The mask
@@ -779,6 +782,10 @@ class RosManager:
                  "--params-file", str(lm_params)]
             )
         )
+        # Let bringup finish spawning controller/bt before the override manager
+        # starts configure→activate; otherwise on a loaded Pi the override races
+        # missing nodes and stalls with lifecycle timeouts.
+        self._wait_for_required_nav_nodes(timeout=45.0)
         nav_lm_params = self._scratch / "nav_lifecycle.yaml"
         nav_lm_params.write_text(
             _yaml_dump(
@@ -844,6 +851,33 @@ class RosManager:
         )
 
     _SUPPRESS_WINDOW_S = 25.0
+    _SUPPRESS_STOCK_LM_WAIT_S = 20.0
+    _STOCK_LIFECYCLE_MANAGER_PATTERN = "__node:=lifecycle_manager_navigation"
+
+    def _pgrep_f(self, pattern: str) -> bool:
+        """True if any process command line matches ``pattern`` (pkill-style)."""
+        proc = subprocess.run(
+            ["pgrep", "-f", pattern],
+            env=self._ros_env(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode == 0 and bool((proc.stdout or "").strip())
+
+    def _wait_for_required_nav_nodes(self, timeout: float = 45.0) -> bool:
+        """Block until core Nav2 nodes appear in the graph (not yet activated)."""
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while time.monotonic() < deadline:
+            if self._required_nav_nodes_present():
+                return True
+            time.sleep(1.0)
+        missing = self._missing_required_nav_nodes()
+        self._log(
+            f"Nav2 core nodes not all present before lifecycle override "
+            f"(missing: {missing}); starting override anyway"
+        )
+        return False
 
     def _suppress_jazzy_nav2_extras(self) -> None:
         """Remove Nav2 bringup nodes that conflict with our lifecycle override.
@@ -860,10 +894,13 @@ class RosManager:
         The patterns match by node name / package path, so our own
         ``navigation_lifecycle_manager_override`` and ``filter_lifecycle_manager``
         are never touched.
+
+        Returns only after the stock lifecycle manager is gone (or the wait
+        times out), so the override manager does not race it.
         """
         patterns = (
             "nav2_collision_monitor/collision_monitor",
-            "__node:=lifecycle_manager_navigation",
+            self._STOCK_LIFECYCLE_MANAGER_PATTERN,
         )
 
         def _reap_once() -> None:
@@ -877,6 +914,20 @@ class RosManager:
         # Initial synchronous sweep preserves prior startup timing/ordering.
         time.sleep(3.0)
         _reap_once()
+
+        # Stock LM often SIGABRTs when killed ("context cannot be slept with
+        # because it's invalid") — that is expected. Wait until it is gone.
+        stock_deadline = time.monotonic() + self._SUPPRESS_STOCK_LM_WAIT_S
+        while time.monotonic() < stock_deadline:
+            if not self._pgrep_f(self._STOCK_LIFECYCLE_MANAGER_PATTERN):
+                break
+            _reap_once()
+            time.sleep(0.5)
+        else:
+            self._log(
+                "stock lifecycle_manager_navigation still running after "
+                f"{self._SUPPRESS_STOCK_LM_WAIT_S:.0f}s suppress wait"
+            )
 
         def _reap_window() -> None:
             deadline = time.monotonic() + self._SUPPRESS_WINDOW_S
@@ -955,7 +1006,19 @@ class RosManager:
             "Failed to parse",
             "InvalidParameter",
         )
-        interesting = [ln for ln in lines if any(m in ln for m in markers)]
+        # Jazzy bringup always spawns these; we pkill them. Their death lines
+        # dominate get_status and hide real configure/activate failures.
+        suppress_noise = (
+            "lifecycle_manager_navigation",
+            "nav2_collision_monitor/collision_monitor",
+            "context cannot be slept with because it's invalid",
+        )
+        interesting = [
+            ln
+            for ln in lines
+            if any(m in ln for m in markers)
+            and not any(n in ln for n in suppress_noise)
+        ]
         return "\n".join(interesting[-max_lines:])
 
     def nav2_diagnostics(self) -> Dict:

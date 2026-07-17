@@ -11,6 +11,7 @@ This module (`viam-labs:nav-stack`) provides three models:
 | `viam-labs:nav-stack:slam` | `rdk:service:slam` | Mapping + localization via slam_toolbox. Standard SLAM API (live map, position) + map management. |
 | `viam-labs:nav-stack:navigation` | `rdk:service:navigation` | Nav2 navigation via the standard Navigation API (modes, waypoints, paths, obstacles) + rich `DoCommand` (locations, zones, go-to-point, plan-to-label). Built-in slam_toolbox runtime. |
 | `viam-labs:nav-stack:navigation-external` | `rdk:service:navigation` | Same as `navigation`, but driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
+| `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders the navigation service's Nav2 costmap + active plan(s), robot pose, footprint and goal as a live camera image. Works with either navigation model / any SLAM backend. |
 
 ## How it works
 
@@ -230,11 +231,22 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
     "nav2": {
       "xy_goal_tolerance": 0.25,
       "local_costmap_width": 4.0,
-      "cost_scaling_factor": 3.0
+      "cost_scaling_factor": 3.0,
+      "replan_frequency": 2.0,
+      "progress_movement_time_allowance": 10.0,
+      "navigate_recovery_retries": 4,
+      "recovery_wait_duration": 2.0
     }
   }
 }
 ```
+
+`nav2.replan_frequency` (default **2 Hz**, up from Nav2's stock 1 Hz) rewrites the
+navigate-to-pose behavior tree so global plans refresh more often.
+`progress_movement_time_allowance` (default **10 s**, down from 30) and
+`navigate_recovery_retries` / `recovery_wait_duration` exit reverse/spin recovery
+loops sooner. After changing these, run `restart_nav2` (or reconfigure) so the
+generated BT + params reload.
 
 Set `"kinematics": "omni"` and a non-zero `max_vel_y` for omnidirectional bases. The files under [`params/`](params/) are **reference defaults**; runtime params are generated from your service attributes. See [Navigation API + DoCommand](#navigation-api--docommand) for the full method/command surface (shared with `navigation-external`).
 
@@ -303,6 +315,49 @@ The **SLAM service** hosts annotations (GeoJSON-shaped, per-map, local map-frame
 | `delete_annotation` | `{id}` | `{deleted: bool}` |
 
 Kinds: `no_go` (Polygon → keepout), `slow_down` (Polygon + `max_speed_m_s` → speed cap), `label` (Point → named goal for `plan_to_label`). The navigation service reads annotations from its SLAM source (built-in: nav-stack:slam's store; external: the SLAM dep's `get_annotations`) and applies `no_go`/`slow_down` to the Nav2 costmap masks **lazily on each plan** (so the latest annotations always apply). `slow_down` `max_speed_m_s` is converted to a percentage of `max_vel_x`.
+
+### Visualizing what nav is planning (nav-camera)
+
+`viam-labs:nav-stack:nav-camera` is a read-only `rdk:component:camera` that renders, as an image you can watch in the Viam app's camera stream, what the navigation service is doing — no rviz required. It draws Nav2's **global costmap** (so you see the inflated cost surface the planner actually reasons over) with these overlays:
+
+- **global plan** (`/plan`) in green — the route to the current goal;
+- **plan history** — superseded plans for the current goal, greyed out and faded oldest→faintest, so you can watch how the route changed as the robot replanned (reset on each new goal);
+- **local plan** (`/local_plan`) in orange — the controller's short-horizon path;
+- **robot pose + footprint** (red arrow + blue polygon) from the `map → base_link` TF;
+- **goal marker** (magenta) with a heading tick.
+
+Occupancy colouring: unknown = dark grey, free = light, obstacle inflation = grey→orange gradient, lethal/inscribed = near-black. World "up" renders as image up (rviz-like).
+
+It reads directly from the running navigation service's in-process bridge (found by the `navigation` attribute), so there is no extra ROS process and no round-trip. Because it consumes only Nav2's standard costmap/plan topics, it works with **any** SLAM backend and with either `navigation` or `navigation-external`.
+
+```json
+{
+  "name": "nav-view",
+  "api": "rdk:component:camera",
+  "model": "viam-labs:nav-stack:nav-camera",
+  "attributes": {
+    "navigation": "nav"
+  }
+}
+```
+
+- `navigation` (**required**) — the name of the `navigation` / `navigation-external` service to visualize. It is also declared as a dependency so it starts first.
+- Optional: `max_dim` (longest output edge in px, default `700`), `plan_history_len` (faded trail length, default `8`), `robot_radius_m` (footprint fallback + pose-arrow size, default `0.22`), and per-overlay toggles `show_global_plan` / `show_local_plan` / `show_pose` / `show_footprint` / `show_goal` / `show_history` (all default `true`).
+
+**Windowing** — by default the camera renders the whole map. `window_mode` crops/zooms it:
+- `"full"` (default) — the entire occupancy grid.
+- `"follow"` — a `window_size_m`-metre **square that tracks the robot** (falls back to the goal, then the grid centre, if there's no pose yet). Best for large maps where the whole grid is too zoomed-out to see the plan. `window_size_m` defaults to `6.0`.
+- `"region"` — a fixed map-frame bounding box from `window_min_x` / `window_min_y` / `window_max_x` / `window_max_y` (metres). Best for watching one fixed spot (e.g. a doorway). If any bound is missing it falls back to `"full"`.
+
+```json
+{ "navigation": "nav", "window_mode": "follow", "window_size_m": 5.0 }
+```
+
+Until Nav2 has published a costmap (bringup is asynchronous), the camera returns a placeholder frame.
+
+`DoCommand`:
+- `{"command": "legend"}` — the colour key as a printable string in `legend`, so you can read the map without guessing colours.
+- `{"command": "stats"}` (or any other command) — a text summary: whether the bridge/costmap is present, plan point counts, current goal/pose. Handy for verifying without a video stream.
 
 ## Workflows
 
@@ -387,6 +442,12 @@ await nav.do_command({"command": "navigate_to_point", "x": 3.5, "y": -1.0})
 await nav.do_command({"command": "get_status"})
 # get_status includes last_cmd_vel plus cmd_vel_history (last ~20 distinct
 # ROS/Viam SetVelocity samples, oldest→newest — survives cancel/stop zeros)
+# Plain-English snapshot of what nav is commanding right now (returns immediately):
+# await nav.do_command({"command": "describe_motion"})
+# → {"summary": "Nav2 navigating (goal 'kitchen' is about 2.5 m ahead and to the
+#    right): driving forward at moderate speed while turning hard right for
+#    about 3.0 s — closing distance toward the goal, steering toward the goal",
+#    "goal_relative": "...", "toward_goal": "...", ...}
 # Probe the Nav2 SetVelocity path without navigating:
 # await nav.do_command({"command": "test_drive", "vx": 0.5, "angular_z_deg_s": 57.3, "duration_s": 2})
 await nav.do_command({"command": "cancel"})

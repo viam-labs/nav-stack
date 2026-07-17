@@ -29,6 +29,7 @@ from viam.utils import struct_to_dict
 
 from ..config import ExternalNavConfig
 from ..ros.manager import RosManager
+from ..runtime import register_bridge, unregister_bridge
 from .external_runtime import build_external_runtime
 from .nav_api import NavApiMixin
 from .nav_core import NavCoreMixin
@@ -94,6 +95,12 @@ class RosNavigationExternal(NavApiMixin, NavCoreMixin, Navigation):
             )
         )
 
+        # Publish the live bridge node so a nav-camera can find it and render
+        # this nav's costmap/plans.
+        node = self._manager.node
+        if node is not None:
+            register_bridge(self.name, node)
+
         self._manager.set_nav_config(ext.nav)
         params_path = self._write_nav2_params(ext.nav)
         # Nav2 bringup can take minutes on a Pi; start in the background so
@@ -107,6 +114,7 @@ class RosNavigationExternal(NavApiMixin, NavCoreMixin, Navigation):
         )
 
     async def close(self) -> None:
+        unregister_bridge(self.name)
         if self._manager is not None:
             self._manager.shutdown()
             self._manager = None
