@@ -31,7 +31,12 @@ class SimpleMotionConfig:
     default_linear_mps: float = 0.35
     max_linear_mps: float = 0.35
     max_angular_rad_s: float = 0.8
-    stall_timeout_s: float = 4.0
+    # Floor for nonzero commands. Proportional near-goal / turn slowdowns can
+    # drop below skid-steer stiction (motors "thunk" but the cart does not move),
+    # which then trips the stall detector. Zero means no floor.
+    min_linear_mps: float = 0.15
+    min_angular_rad_s: float = 0.3
+    stall_timeout_s: float = 8.0
     stall_progress_m: float = 0.025
     stall_progress_rad: float = math.radians(2.0)
     timeout_s: float = 120.0
@@ -138,12 +143,32 @@ def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
 
 
+def _apply_min_speed(value: float, minimum: float, maximum: float) -> float:
+    """Keep nonzero commands at least ``minimum`` (and at most ``maximum``)."""
+    if value == 0.0 or minimum <= 0.0:
+        return _clamp(value, maximum) if maximum > 0.0 else value
+    floored = max(abs(value), minimum)
+    return math.copysign(min(floored, maximum) if maximum > 0.0 else floored, value)
+
+
 @dataclass(frozen=True)
 class DriveCommand:
     vx: float
     vy: float
     vtheta: float
     done: bool
+
+
+def apply_velocity_floor(cmd: DriveCommand, cfg: SimpleMotionConfig) -> DriveCommand:
+    """Bump nonzero vx / vtheta up to the configured minimums (stiction floor)."""
+    if cmd.done:
+        return cmd
+    return DriveCommand(
+        _apply_min_speed(cmd.vx, cfg.min_linear_mps, cfg.max_linear_mps),
+        cmd.vy,
+        _apply_min_speed(cmd.vtheta, cfg.min_angular_rad_s, cfg.max_angular_rad_s),
+        False,
+    )
 
 
 def compute_drive_command(
@@ -169,7 +194,9 @@ def compute_drive_command(
 
     if at_xy:
         angular_cmd = _clamp(final_heading_error, max_angular)
-        return DriveCommand(0.0, 0.0, angular_cmd, False)
+        return apply_velocity_floor(
+            DriveCommand(0.0, 0.0, angular_cmd, False), cfg
+        )
 
     linear_cmd = _clamp(dist * 0.5, max_linear)
     if dist < cfg.xy_tolerance_m * 3:
@@ -177,7 +204,9 @@ def compute_drive_command(
     angular_cmd = _clamp(bearing_error * 1.5, max_angular)
     if abs(bearing_error) > math.radians(45.0):
         linear_cmd = min(linear_cmd, max_linear * 0.4)
-    return DriveCommand(linear_cmd, 0.0, angular_cmd, False)
+    return apply_velocity_floor(
+        DriveCommand(linear_cmd, 0.0, angular_cmd, False), cfg
+    )
 
 
 def config_from_nav(
@@ -187,11 +216,15 @@ def config_from_nav(
     xy_tolerance_m: float = 0.075,
     yaw_tolerance_rad: float = math.radians(5.0),
     timeout_s: float = 120.0,
+    min_linear_mps: float = 0.15,
+    min_angular_rad_s: float = 0.3,
 ) -> SimpleMotionConfig:
     return SimpleMotionConfig(
         default_linear_mps=max_vel_x,
         max_linear_mps=max_vel_x,
         max_angular_rad_s=max_vel_theta,
+        min_linear_mps=min_linear_mps,
+        min_angular_rad_s=min_angular_rad_s,
         xy_tolerance_m=xy_tolerance_m,
         yaw_tolerance_rad=yaw_tolerance_rad,
         timeout_s=timeout_s,
@@ -280,6 +313,11 @@ async def drive_to_pose(
                 else:
                     no_scan_since = None
 
+            # Re-apply stiction floor after obstacle scaling (which can crush
+            # speed below what a skid-steer base can physically execute).
+            if not cmd.done and (cmd.vx != 0.0 or cmd.vtheta != 0.0):
+                cmd = apply_velocity_floor(cmd, cfg)
+
             if on_progress is not None:
                 on_progress(
                     {
@@ -292,6 +330,9 @@ async def drive_to_pose(
                             if math.isinf(forward_clearance)
                             else forward_clearance
                         ),
+                        "cmd_vx_mps": cmd.vx,
+                        "cmd_vy_mps": cmd.vy,
+                        "cmd_vtheta_rad_s": cmd.vtheta,
                     }
                 )
 

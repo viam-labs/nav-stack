@@ -128,15 +128,20 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 | `mapping_revisit_interval_s` / `_search_radius_m` / `_wide_radius_m` | SLAM | Check interval (default `20` s) and tiered search radii: local first (default `5` m), wider on weak match (default `12` m) |
 | `mapping_revisit_min_score` / `_max_ray_mae_m` / `_full_map_min_score` | SLAM | Match quality gates (defaults `0.6` / `0.8` m); full-map fallback needs the stricter `0.75` score since self-similar offices produce convincing wrong corridors |
 | `mapping_revisit_min_shift_m` / `_min_shift_deg` / `_max_shift_m` | SLAM | Correct only when the match moved at least `1.0` m / `10°` from the current pose and no more than `10` m (larger = likely false match) |
+| `mapping_revisit_slice_verify` | SLAM | Multi-height-slice veto for revisit corrections (3D lidar only). The 2D map holds one z-band silhouette and desk clutter is self-similar in it; this records sparse per-band grids (knee + head height by default) from trusted pause scans and rejects a proposed correction whose pose disagrees with any band that has reference data there. Default `true` |
+| `mapping_revisit_slice_bands` / `_slice_min_hit_rate` / `_slice_resolution_m` | SLAM | Extra height bands as `[z_min, z_max]` pairs in meters (default `[[0.15, 0.45], [1.6, 2.4]]`), per-band hit-rate gate (default `0.4`), and grid cell size (default `0.15` m) |
+| `mapping_revisit_keyframes` | SLAM | Store a pause keyframe (2D endpoints + height slices + map pose) on every accepted `map_when_still` `/scan` publish, and match against those views when occupancy revisit scores are weak — helps when you stop at different places/angles than the first visit. Default `true` |
+| `mapping_revisit_keyframe_min_spacing_m` / `_deg` / `_max` / `_match_tol_m` / `_min_score` | SLAM | Keyframe dedupe spacing (default `0.5` m / `20°`), max stored frames (`250`), NN match tolerance (`0.3` m), and accept threshold (`0.55` hit-rate) |
 | `movement_sensor_yaw_deg` | SLAM | Yaw (degrees) of the movement sensor's +x axis relative to robot forward. Wit silk-screen Y forward with reverse +Y accel usually needs `90`; geometric Y-forward with correct-signed +Y needs `-90`. Pick the sign that makes forward drive produce positive robot-X velocity (default `0`) |
 | `map_pose_yaw_offset_deg` | SLAM | Added to `GetPosition` yaw only (App arrow vs map). Prefer lidar `mount.theta` — park facing a wall and check status `nearest_return_bearing_deg` / `suggested_mount_theta_deg`. Cosmetics (±45) do not fix ghost walls (default `0`) |
 | `heading_sensor_yaw_deg` | SLAM | Same mount-yaw correction for the dedicated `heading_sensor` (default `0`) |
 | lidar `mount.pitch`, `mount.roll` | SLAM | Mount tilt in radians (positive pitch = forward axis tilted down). Levels the cloud before z filtering — even a ~2° mast tilt pulls floor returns into the z band at 15–20 m and imprints phantom borders at max range (default `0`) |
-| `base_velocity_convention` | SLAM | `ros` (default) or `mir` — maps Nav2 `/cmd_vel` to Viam base `SetVelocity` axes |
+| `base_velocity_convention` | SLAM | `viam` (default, Y-forward) or `ros` (X-forward); legacy `mir` accepted as alias for `viam` — maps Nav2 `/cmd_vel` to Viam base `SetVelocity` axes |
 | `scan_max_age_s` | SLAM | Safety cutoff for the `/scan` publish path: if the lidar reports a cache age (`get_laser_scan` `age_s`) above this, skip publishing that cycle rather than feed SLAM/Nav2 a stale, misregistered scan (default `2.0`) |
 | `slam_toolbox` | SLAM | Common slam_toolbox params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced: any other slam_toolbox ROS param (merged last) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level Nav2 footprint / velocity limits |
+| `min_cmd_vel_x`, `min_cmd_vel_theta` | Nav | Stiction floors (default `0.15` m/s, `0.3` rad/s) applied to both `go_to_*` and Nav2 `/cmd_vel_smoothed` before `SetVelocity`. Raise if the cart hums/thunks but barely moves. Legacy aliases: `simple_min_vel_x` / `simple_min_vel_theta` |
 | `nav2` | Nav | Common Nav2 params (goal tolerance, costmap size, etc.) |
 | `nav2_params` | Nav | Advanced: nested Nav2 param overrides (merged last) |
 
@@ -199,7 +204,7 @@ For a **bare IMU** movement sensor (Wit, etc. with accel + gyro, no wheel pose),
 
 **Wall-line yaw correction (anti-banana).** Long straight walls drawn as curves usually mean gyro heading walked off while driving parallel to the wall. With `map_when_still` + point-cloud lidars, `wall_yaw_correction` defaults **on**: each accepted pause scan looks for a long side wall (≥ `wall_yaw_min_length_m`) and soft-corrects `/odom` yaw by at most `wall_yaw_max_step_deg` (blended by `wall_yaw_blend`) so the wall lines up with robot +X. Status field `wall_yaw` reports the last observation. Disable with `"wall_yaw_correction": false` if a cluttered side repeatedly misleads the fit.
 
-For **MiR250** bases (`viam-labs:mir-base`), set `"base_velocity_convention": "mir"` so forward Nav2 commands map to Viam `linear.y` (MiR expects forward on Y, not X). Odometry from `viam-labs:mir-base:movement` stays in ROS convention and does not need swapping. Nav-stack stops Nav2 motion with `set_velocity(0)` (not `Base.stop()`), so MiR Manualcontrol and `go_to_location` keep working after a navigation cancel or goal completion.
+For **Viam wheeled bases** (`rdk:builtin:wheeled`) and **MiR250** (`viam-labs:mir-base`), keep the default `"base_velocity_convention": "viam"` so forward Nav2 commands map to Viam `linear.y` (Viam wheeled / MiR expect forward on Y, not X). Use `"ros"` only for bases that drive on `linear.x`. Legacy `"mir"` is accepted and normalized to `"viam"`. Odometry from `viam-labs:mir-base:movement` stays in ROS convention and does not need swapping. Nav-stack stops Nav2 motion with `set_velocity(0)` (not `Base.stop()`), so MiR Manualcontrol and `go_to_location` keep working after a navigation cancel or goal completion.
 
 The MiR250 is **differential drive** — use `"kinematics": "differential"` (the default). Configuring `omni` (or an `Omni` MPPI motion model) makes Nav2 command lateral velocities the robot cannot execute, which stalls progress near goals and triggers endless spin recoveries. Also avoid `"vx_min": 0`: with reverse disabled, a diff-drive robot must rotate fully around to correct small overshoots.
 
@@ -314,6 +319,10 @@ Kinds: `no_go` (Polygon → keepout), `slow_down` (Polygon + `max_speed_m_s` →
 ```python
 await slam.do_command({"command": "start_localizing", "map": "ground-floor"})
 await slam.do_command({"command": "set_initial_pose", "pose": {"x": 0, "y": 0, "theta": 0}})
+# XY roughly right but heading unknown/wrong? slam_toolbox only self-corrects
+# ~±30° of yaw — add refine to run a full-yaw seeded scan match and apply it:
+await slam.do_command({"command": "set_initial_pose",
+                       "pose": {"x": 0, "y": 0, "theta": 0}, "refine": True})
 ```
 
 If the nav-stack map is aligned with the MiR onboard map, seed from the MiR pose instead
@@ -376,6 +385,10 @@ await nav.do_command({"command": "add_location", "name": "dock",
 await nav.do_command({"command": "navigate_to_location", "name": "kitchen"})
 await nav.do_command({"command": "navigate_to_point", "x": 3.5, "y": -1.0})
 await nav.do_command({"command": "get_status"})
+# get_status includes last_cmd_vel plus cmd_vel_history (last ~20 distinct
+# ROS/Viam SetVelocity samples, oldest→newest — survives cancel/stop zeros)
+# Probe the Nav2 SetVelocity path without navigating:
+# await nav.do_command({"command": "test_drive", "vx": 0.5, "angular_z_deg_s": 57.3, "duration_s": 2})
 await nav.do_command({"command": "cancel"})
 
 # Force Nav2 to stop and relaunch with freshly generated params (param
@@ -413,13 +426,17 @@ Zones CRUD: `add_zone`, `get_zone`, `list_zones`, `update_zone`, `delete_zone`,
 `list_maps`, `get_active_map`, `set_active_map`, `rename_map`, `delete_map`,
 `start_mapping`, `start_localizing`, `save_map`, `get_mode`, `get_status`
 (live bridge + slam_toolbox health; optional `probe_sensors: false` to skip a
-one-shot lidar/odom read), `set_initial_pose`,
+one-shot lidar/odom read; includes measured `scan_hz` / `lidar_read_hz` over
+the last ~2 s plus configured `scan_rate_hz` — with `map_when_still`, expect low
+`scan_hz` while driving), `set_initial_pose`,
 `global_localize` (lidar scan match against saved map; optional `full_map`,
 `search_radius_m`, `apply`, `local_yaw_window_deg`, `max_scan_points`,
 `auto_full_map_fallback`),
 `relocalize` (alias `refine_localization`; optional `pose`, `location`),
 `revisit_check` / `get_revisit_check` (mapping-mode revisit watchdog cycle on
-demand; optional `apply` to force or dry-run the odom correction).
+demand; optional `apply` to force or dry-run the odom correction; optional
+`yaw_flip` to take the opposite corridor heading; `flip_yaw_only` to reverse
+the current map heading in place when XY is already right).
 
 ## Development
 

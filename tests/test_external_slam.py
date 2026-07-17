@@ -5,6 +5,7 @@ import struct
 import pytest
 
 pytest.importorskip("viam")
+pytest.importorskip("viam.spatialmath")
 
 from viam.proto.common import Pose
 

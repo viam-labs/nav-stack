@@ -26,7 +26,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from typing import Dict, List, Optional
+from typing import Callable, Deque, Dict, List, Optional
 
 import numpy as np
 
@@ -58,8 +58,33 @@ from ..config import (
     LIDAR_SCAN_POINT_CLOUD,
     NavConfig,
     SlamConfig,
+    ros_cmd_vel_to_viam_linear_mm_s,
 )
 from . import conversions as conv
+
+
+def measured_hz(
+    timestamps: Deque[float],
+    *,
+    now: Optional[float] = None,
+    window_s: float = 2.0,
+) -> Optional[float]:
+    """Estimate event rate from recent wall-clock timestamps.
+
+    Uses samples inside ``window_s`` of ``now``. Needs at least two samples.
+    """
+    if len(timestamps) < 2:
+        return None
+    now = time.monotonic() if now is None else float(now)
+    cutoff = now - max(float(window_s), 1e-3)
+    recent = [t for t in timestamps if t >= cutoff]
+    if len(recent) < 2:
+        return None
+    span = recent[-1] - recent[0]
+    if span <= 1e-6:
+        return None
+    return (len(recent) - 1) / span
+
 
 _LATCHED_QOS = QoSProfile(
     depth=1,
@@ -114,6 +139,23 @@ class BridgeNode(Node):
         self._last_cmd_time = 0.0
         self._last_odom_stamp = None
         self._cmd_timeout = nav_cfg.cmd_vel_timeout if nav_cfg else 0.5
+        self._last_cmd_vel_wall = 0.0
+        self._last_cmd_vel: Dict = {
+            "source": None,
+            "nav_active": False,
+            "ros_vx_mps": 0.0,
+            "ros_vy_mps": 0.0,
+            "ros_vtheta_rad_s": 0.0,
+            "viam_linear_x_mm_s": 0.0,
+            "viam_linear_y_mm_s": 0.0,
+            "viam_angular_z_deg_s": 0.0,
+            "convention": getattr(slam_cfg, "base_velocity_convention", None),
+            "age_s": None,
+        }
+        # Ring buffer of recent SetVelocity commands. Consecutive identical
+        # (source + ROS body cmd) samples only refresh the latest entry so a
+        # cancel/stop zero does not wipe the useful drive history.
+        self._cmd_vel_history: deque = deque(maxlen=20)
 
         # Odom pose: prefer the movement sensor's absolute /odom pose when available.
         self._odom = conv.Pose2D(0.0, 0.0, 0.0)
@@ -236,6 +278,25 @@ class BridgeNode(Node):
         # avoidance in simple (non-Nav2) go_to_* motion.
         self._latest_scan: Optional[conv.LaserScan2D] = None
         self._latest_scan_wall = 0.0
+        # Sliding windows for measured rates in get_status / slam_bridge_status.
+        # ~3 s at the default 10 Hz target, plus headroom for bursts.
+        self._lidar_read_times: Deque[float] = deque(maxlen=64)
+        self._scan_pub_times: Deque[float] = deque(maxlen=64)
+        # Optional hook (set by Slam service) called after each accepted
+        # map_when_still /scan publish with (scan, band_points, map_pose).
+        self._still_keyframe_hook: Optional[Callable] = None
+        try:
+            from ..nav.slice_match import SliceBand
+
+            self._slice_bands = SliceBand.parse_bands(
+                getattr(
+                    slam_cfg,
+                    "mapping_revisit_slice_bands",
+                    [[0.15, 0.45], [1.6, 2.4]],
+                )
+            )
+        except Exception:  # noqa: BLE001 - keyframes degrade without bands
+            self._slice_bands = []
 
         # Publishers -------------------------------------------------------
         self._scan_pubs: List = []
@@ -907,6 +968,10 @@ class BridgeNode(Node):
         self._last_still_scan_wall = now
         self._map_when_still_status = "publishing"
 
+    def set_still_keyframe_hook(self, hook: Optional[Callable]) -> None:
+        """Register callback ``(scan, band_points, map_pose)`` after still publish."""
+        self._still_keyframe_hook = hook
+
     def _should_publish_map_when_still(self) -> bool:
         """Compatibility wrapper: readiness only (commit is separate)."""
         return self._still_gate_ready()
@@ -926,6 +991,7 @@ class BridgeNode(Node):
         # then drives into obstacles the lidar plainly sees).
         read_start = self.get_clock().now()
         per_lidar_scans = []
+        cloud_chunks: List[np.ndarray] = []
         scan_age_s: Optional[float] = None
         lidar_timeout = max(float(self._slam_cfg.sensor_read_timeout_s), 1.0)
         for i, lidar in enumerate(self._slam_cfg.lidars):
@@ -943,6 +1009,8 @@ class BridgeNode(Node):
             if isinstance(lidar_data, conv.LidarPoints):
                 sensor_scan = lidar_data.sensor_scan
                 base_pts_arr = np.asarray(lidar_data.base_link, dtype=float)
+                if base_pts_arr.size:
+                    cloud_chunks.append(base_pts_arr)
                 if lidar_data.age_s is not None:
                     scan_age_s = (
                         lidar_data.age_s
@@ -1016,6 +1084,7 @@ class BridgeNode(Node):
                 self._empty_scan_warned = True
             return
         self._empty_scan_warned = False
+        self._lidar_read_times.append(time.monotonic())
 
         # Safety net: mir-base's SLAM path already refuses to serve stale scans,
         # but if a genuinely old scan slips through, don't hand SLAM/Nav2 a
@@ -1089,11 +1158,35 @@ class BridgeNode(Node):
             self._scan_pubs[i].publish(self._to_ros_scan(scan, f"laser_{i}", stamp))
 
         self._latest_scan = merged
-        self._latest_scan_wall = time.monotonic()
+        now = time.monotonic()
+        self._latest_scan_wall = now
+        self._scan_pub_times.append(now)
         self._apply_lidar_odometry(merged)
         self._merged_scan_pub.publish(
             self._to_ros_scan(merged, merged_frame, stamp)
         )
+        if self._map_when_still and self._still_keyframe_hook is not None:
+            self._emit_still_keyframe(merged, cloud_chunks)
+
+    def _emit_still_keyframe(
+        self, scan: conv.LaserScan2D, cloud_chunks: List[np.ndarray]
+    ) -> None:
+        """Notify Slam of an accepted still publish for pause-keyframe storage."""
+        pose = self._lookup_pose_in_map()
+        if pose is None:
+            pose = self._last_pose_in_map
+        if pose is None:
+            return
+        band_points: List[np.ndarray] = []
+        if self._slice_bands and cloud_chunks:
+            from ..nav import slice_match
+
+            cloud = np.vstack(cloud_chunks) if len(cloud_chunks) > 1 else cloud_chunks[0]
+            band_points = slice_match.slice_points_by_bands(cloud, self._slice_bands)
+        try:
+            self._still_keyframe_hook(scan, band_points, pose)
+        except Exception as exc:  # noqa: BLE001 - keyframe path must not kill /scan
+            self.get_logger().warn(f"still keyframe hook failed: {exc!r}")
 
     def _apply_wall_yaw_correction(self, scan: conv.LaserScan2D) -> None:
         """Debias ``_odom.theta`` from a dominant side wall in ``scan``."""
@@ -1378,11 +1471,97 @@ class BridgeNode(Node):
         # Snap near-zero commands so the MiR does not creep past the goal.
         if abs(vx) < 0.03 and abs(vy) < 0.03 and abs(vtheta) < 0.05:
             vx, vy, vtheta = 0.0, 0.0, 0.0
+        else:
+            # Stiction floor: MPPI/smoother often emit 0.05-0.1 m/s which
+            # skid-steer carts ignore (motors hum, nothing moves). Bump nonzero
+            # commands up to the configured minimums.
+            vx, vy, vtheta = self._apply_cmd_vel_floor(vx, vy, vtheta)
         try:
             self._run(self._io.drive_base(vx, vy, vtheta))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f"drive_base failed: {exc!r}")
 
+    def record_cmd_vel(
+        self,
+        vx: float,
+        vy: float,
+        vtheta: float,
+        *,
+        source: str = "nav2",
+    ) -> None:
+        """Remember the last ROS body-frame cmd and its Viam SetVelocity mapping."""
+        convention = getattr(self._slam_cfg, "base_velocity_convention", "viam")
+        lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, convention)
+        now = time.monotonic()
+        self._last_cmd_vel_wall = now
+        entry = {
+            "source": source,
+            "nav_active": bool(self._nav_active),
+            "ros_vx_mps": round(float(vx), 4),
+            "ros_vy_mps": round(float(vy), 4),
+            "ros_vtheta_rad_s": round(float(vtheta), 4),
+            "viam_linear_x_mm_s": round(float(lx_mm), 1),
+            "viam_linear_y_mm_s": round(float(ly_mm), 1),
+            "viam_angular_z_deg_s": round(math.degrees(float(vtheta)), 2),
+            "convention": convention,
+            "age_s": 0.0,
+        }
+        self._last_cmd_vel = entry
+        hist = getattr(self, "_cmd_vel_history", None)
+        if hist is None:
+            return
+        if hist and BridgeNode._cmd_vel_same(hist[-1], entry):
+            hist[-1] = {**entry, "_wall": now}
+        else:
+            hist.append({**entry, "_wall": now})
+
+    @staticmethod
+    def _cmd_vel_same(a: Dict, b: Dict) -> bool:
+        return (
+            a.get("source") == b.get("source")
+            and a.get("ros_vx_mps") == b.get("ros_vx_mps")
+            and a.get("ros_vy_mps") == b.get("ros_vy_mps")
+            and a.get("ros_vtheta_rad_s") == b.get("ros_vtheta_rad_s")
+        )
+
+    def last_cmd_vel(self) -> Dict:
+        out = dict(self._last_cmd_vel)
+        if self._last_cmd_vel_wall > 0.0:
+            out["age_s"] = round(time.monotonic() - self._last_cmd_vel_wall, 2)
+        return out
+
+    def cmd_vel_history(self) -> list:
+        """Oldest→newest snapshots (up to 20). Survives cancel/stop zeros."""
+        now = time.monotonic()
+        out = []
+        for item in getattr(self, "_cmd_vel_history", ()):
+            entry = {k: v for k, v in item.items() if k != "_wall"}
+            wall = item.get("_wall", 0.0)
+            entry["age_s"] = round(now - wall, 2) if wall else None
+            out.append(entry)
+        return out
+
+    def _apply_cmd_vel_floor(
+        self, vx: float, vy: float, vtheta: float
+    ) -> tuple[float, float, float]:
+        cfg = self._nav_cfg
+        if cfg is None:
+            return vx, vy, vtheta
+        min_x = float(getattr(cfg, "min_cmd_vel_x", 0.0) or 0.0)
+        min_th = float(getattr(cfg, "min_cmd_vel_theta", 0.0) or 0.0)
+        max_x = float(getattr(cfg, "max_vel_x", 0.0) or 0.0)
+        max_th = float(getattr(cfg, "max_vel_theta", 0.0) or 0.0)
+        if vx != 0.0 and min_x > 0.0:
+            floored = max(abs(vx), min_x)
+            if max_x > 0.0:
+                floored = min(floored, max_x)
+            vx = math.copysign(floored, vx)
+        if vtheta != 0.0 and min_th > 0.0:
+            floored = max(abs(vtheta), min_th)
+            if max_th > 0.0:
+                floored = min(floored, max_th)
+            vtheta = math.copysign(floored, vtheta)
+        return vx, vy, vtheta
     def _on_watchdog(self) -> None:
         self._flush_executor_queue()
         self._flush_pending_nav_goal()
@@ -1391,6 +1570,7 @@ class BridgeNode(Node):
             return
         if time.time() - self._last_cmd_time > self._cmd_timeout:
             try:
+                self.record_cmd_vel(0.0, 0.0, 0.0, source="watchdog_stop")
                 self._run(self._io.stop_base())
             except Exception:  # noqa: BLE001
                 pass
@@ -1803,6 +1983,8 @@ class BridgeNode(Node):
         return {
             "state": self._last_result_status or "idle",
             "active": self._nav_active,
+            "last_cmd_vel": self.last_cmd_vel(),
+            "cmd_vel_history": self.cmd_vel_history(),
             **self._last_feedback,
         }
 
@@ -1964,8 +2146,14 @@ class BridgeNode(Node):
         pose = tf_pose if tf_pose is not None else cached_pose
         vx, vy, vtheta = self._last_twist
 
+        now = time.monotonic()
+        scan_hz = measured_hz(self._scan_pub_times, now=now)
+        lidar_read_hz = measured_hz(self._lidar_read_times, now=now)
         return {
             "scan_age_s": scan_age_s,
+            "scan_hz": None if scan_hz is None else round(scan_hz, 2),
+            "lidar_read_hz": None if lidar_read_hz is None else round(lidar_read_hz, 2),
+            "scan_rate_hz": float(self._slam_cfg.scan_rate_hz),
             "scan_valid_returns": scan_valid_returns,
             "scan_publishing": scan_age_s is not None and scan_age_s < scan_fresh_limit,
             "odom_tf_age_s": self.odom_tf_age_s(),

@@ -45,13 +45,16 @@ def build_io_provider(
     skip_get_laser_scan: Optional[set] = None,
     odom_reader=None,
     logger,
+    record_cmd_vel=None,
 ) -> IOProvider:
     """Build an ``IOProvider`` from resolved Viam components + a SlamConfig.
 
     ``skip_get_laser_scan`` is a mutable set used to remember lidars that don't
     implement ``get_laser_scan`` (so we stop probing them). ``odom_reader``, when
     given, is any object with an ``async read() -> OdomReading`` — the typed
-    MovementSensor reader for the external path.
+    MovementSensor reader for the external path. ``record_cmd_vel``, when given,
+    is called as ``record_cmd_vel(vx, vy, vtheta, source=...)`` before each
+    base drive/stop so ``get_status`` can show the last SetVelocity mapping.
     """
     if skip_get_laser_scan is None:
         skip_get_laser_scan = set()
@@ -156,6 +159,8 @@ def build_io_provider(
         return sample
 
     async def drive_base(vx: float, vy: float, vtheta: float):
+        if record_cmd_vel is not None:
+            record_cmd_vel(vx, vy, vtheta, source="nav2")
         lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(
             vx, vy, cfg.base_velocity_convention
         )
@@ -168,6 +173,8 @@ def build_io_provider(
         # MiR base.stop() also calls REST stop_immediately (PAUSE), which drops
         # Manualcontrol and kills the rosbridge /cmd_vel session. Nav2 only needs
         # zeros.
+        if record_cmd_vel is not None:
+            record_cmd_vel(0.0, 0.0, 0.0, source="stop")
         await base.set_velocity(
             linear=Vector3(x=0.0, y=0.0, z=0.0),
             angular=Vector3(x=0.0, y=0.0, z=0.0),

@@ -126,6 +126,14 @@ def test_slam_config_map_when_still_livox_defaults():
     assert cfg.mapping_revisit_min_shift_m == pytest.approx(1.0)
     assert cfg.mapping_revisit_max_shift_m == pytest.approx(10.0)
     assert cfg.mapping_revisit_full_map_fallback is True
+    # Multi-height-slice verification defaults (3D lidar).
+    assert cfg.mapping_revisit_slice_verify is True
+    assert cfg.mapping_revisit_slice_bands == [[0.15, 0.45], [1.6, 2.4]]
+    assert cfg.mapping_revisit_slice_min_hit_rate == pytest.approx(0.4)
+    assert cfg.mapping_revisit_slice_resolution_m == pytest.approx(0.15)
+    assert cfg.mapping_revisit_keyframes is True
+    assert cfg.mapping_revisit_keyframe_min_score == pytest.approx(0.55)
+    assert cfg.mapping_revisit_keyframe_max == 250
     # Strict stop-and-go: mid-pivot scans off unless explicitly enabled.
     assert cfg.map_when_still_yaw_step_deg == pytest.approx(0.0)
     assert cfg.map_when_still_max_drift_m == pytest.approx(0.03)
@@ -439,21 +447,56 @@ def test_local_costmap_width_height_are_integers():
     assert isinstance(lc["height"], int)
 
 
-def test_base_velocity_convention_ros_default():
+def test_base_velocity_convention_viam_default():
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "f"})
+    assert cfg.base_velocity_convention == "viam"
+    lx, ly = ros_cmd_vel_to_viam_linear_mm_s(0.5, -0.1, cfg.base_velocity_convention)
+    assert lx == pytest.approx(-100.0)
+    assert ly == pytest.approx(500.0)
+
+
+def test_base_velocity_convention_ros_uses_x_forward():
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "base_velocity_convention": "ros"}
+    )
     assert cfg.base_velocity_convention == "ros"
     lx, ly = ros_cmd_vel_to_viam_linear_mm_s(0.5, -0.1, cfg.base_velocity_convention)
     assert lx == pytest.approx(500.0)
     assert ly == pytest.approx(-100.0)
 
 
-def test_base_velocity_convention_mir_swaps_axes():
+def test_base_velocity_convention_mir_alias_normalizes_to_viam():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "f", "base_velocity_convention": "mir"}
     )
+    assert cfg.base_velocity_convention == "viam"
     lx, ly = ros_cmd_vel_to_viam_linear_mm_s(0.5, -0.1, cfg.base_velocity_convention)
     assert lx == pytest.approx(-100.0)
     assert ly == pytest.approx(500.0)
+
+
+def test_min_cmd_vel_defaults_and_legacy_alias():
+    cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    assert cfg.min_cmd_vel_x == pytest.approx(0.15)
+    assert cfg.min_cmd_vel_theta == pytest.approx(0.3)
+
+    cfg = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "min_cmd_vel_x": 0.25, "min_cmd_vel_theta": 0.5}
+    )
+    assert cfg.min_cmd_vel_x == pytest.approx(0.25)
+    assert cfg.min_cmd_vel_theta == pytest.approx(0.5)
+
+    # Legacy names still accepted.
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "simple_min_vel_x": 0.3,
+            "simple_min_vel_theta": 0.6,
+        }
+    )
+    assert cfg.min_cmd_vel_x == pytest.approx(0.3)
+    assert cfg.min_cmd_vel_theta == pytest.approx(0.6)
 
 
 def test_base_velocity_convention_invalid():

@@ -150,6 +150,8 @@ def test_scan_timer_stamps_scans_at_read_start(monkeypatch):
         _wall_yaw_correction=False,
         _wall_yaw_status={},
         _apply_lidar_odometry=MagicMock(),
+        _lidar_read_times=deque(maxlen=64),
+        _scan_pub_times=deque(maxlen=64),
     )
     bridge._to_ros_scan = lambda s, frame, st: SimpleNamespace(
         header=SimpleNamespace(stamp=st, frame_id=frame)
@@ -203,6 +205,8 @@ def _scan_timer_bridge(lidar_pts, scan, *, scan_max_age_s=2.0):
         _wall_yaw_correction=False,
         _wall_yaw_status={},
         _apply_lidar_odometry=MagicMock(),
+        _lidar_read_times=deque(maxlen=64),
+        _scan_pub_times=deque(maxlen=64),
     )
     bridge._to_ros_scan = lambda s, frame, st: SimpleNamespace(
         header=SimpleNamespace(stamp=st, frame_id=frame)
@@ -1228,3 +1232,15 @@ def test_apply_wall_yaw_correction_updates_odom():
     assert bridge._odom.theta == pytest.approx(-math.radians(2.0), abs=math.radians(0.5))
     assert bridge._odom.x == pytest.approx(1.0)
     assert bridge._gate_odom.theta == pytest.approx(bridge._odom.theta)
+
+
+def test_measured_hz_from_recent_timestamps():
+    from src.ros.bridge import measured_hz
+
+    times = deque([100.0, 100.1, 100.2, 100.3, 100.4], maxlen=64)
+    hz = measured_hz(times, now=100.4, window_s=2.0)
+    assert hz == pytest.approx(10.0)
+    assert measured_hz(deque([100.0]), now=100.1) is None
+    # Samples outside the window are ignored.
+    old = deque([90.0, 90.1, 100.0, 100.1], maxlen=64)
+    assert measured_hz(old, now=100.1, window_s=2.0) == pytest.approx(10.0)

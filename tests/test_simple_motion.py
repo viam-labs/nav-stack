@@ -70,6 +70,35 @@ def test_compute_drive_command_final_heading_only():
     assert cmd.vtheta > 0.0
 
 
+def test_compute_drive_command_applies_stiction_floor():
+    cfg = SimpleMotionConfig(
+        xy_tolerance_m=0.05,
+        max_linear_mps=0.75,
+        max_angular_rad_s=1.2,
+        min_linear_mps=0.2,
+        min_angular_rad_s=0.4,
+    )
+    # Tiny remaining distance would otherwise yield dist*0.5 << min.
+    current = conv.Pose2D(0.0, 0.0, 0.0)
+    goal = conv.Pose2D(0.12, 0.0, 0.0)
+    cmd = compute_drive_command(current, goal, cfg=cfg, linear_mps=0.75)
+    assert not cmd.done
+    assert cmd.vx == pytest.approx(0.2)
+
+
+def test_compute_drive_command_min_floor_zero_disables():
+    cfg = SimpleMotionConfig(
+        xy_tolerance_m=0.05,
+        max_linear_mps=0.75,
+        min_linear_mps=0.0,
+        min_angular_rad_s=0.0,
+    )
+    current = conv.Pose2D(0.0, 0.0, 0.0)
+    goal = conv.Pose2D(0.12, 0.0, 0.0)
+    cmd = compute_drive_command(current, goal, cfg=cfg, linear_mps=0.75)
+    assert cmd.vx == pytest.approx(0.06)  # dist * 0.5, no floor
+
+
 def test_drive_to_pose_reaches_goal():
     cfg = SimpleMotionConfig(
         poll_interval_s=0.01,

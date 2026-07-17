@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import math
+import threading
 import time
+from dataclasses import replace
 from typing import ClassVar, Dict, List, Mapping, Optional, Sequence, cast
 
 import numpy as np
@@ -27,16 +29,20 @@ from viam.services.slam import SLAM, MappingMode, Pose
 from viam.utils import ValueTypes, struct_to_dict
 
 from ..config import (
+    LIDAR_SCAN_GET_LASER_SCAN,
     MODE_LOCALIZING,
     MODE_MAPPING,
     SlamConfig,
 )
 from ..nav.global_localize import (
+    GlobalLocalizeResult,
+    choose_yaw_or_flip,
     global_localize_scan,
     load_occupancy_from_bridge_map,
     load_occupancy_from_map_dir,
 )
 from ..nav.annotations import AnnotationStore
+from ..nav import pause_keyframes, slice_match
 from ..nav.maps import MapStore, validate_map_name
 from ..ros import conversions as conv
 from ..ros.bridge import IOProvider
@@ -76,6 +82,9 @@ class RosSlam(SLAM):
         self._mapping_revisit_task: Optional[asyncio.Task] = None
         self._last_relocalize_check: dict = {"status": "idle"}
         self._last_revisit_check: dict = {"status": "idle"}
+        self._slice_library: Optional[slice_match.SliceLibrary] = None
+        self._pause_keyframes: Optional[pause_keyframes.PauseKeyframeStore] = None
+        self._keyframe_lock = threading.Lock()
         # Lidars that don't implement get_laser_scan (auto mode); skip re-probing.
         self._skip_get_laser_scan: set[str] = set()
 
@@ -142,7 +151,12 @@ class RosSlam(SLAM):
         self._manager = RosManager(cfg, logger=LOGGER)
         loop = asyncio.get_event_loop()
         self._manager.start(self._build_io(), loop)
+        # _build_io before start has no bridge node yet; rewire so drive/stop
+        # can record cmd_vel into get_status.
+        if self._manager.node is not None:
+            self._manager.node._io = self._build_io()
         self._start_mode(cfg.mode)
+        self._wire_still_keyframe_hook()
         self._schedule_startup_global_localize(loop)
         self._schedule_periodic_relocalize(loop)
         self._schedule_mapping_revisit(loop)
@@ -211,6 +225,121 @@ class RosSlam(SLAM):
         self._last_revisit_check.update(result)
         return dict(self._last_revisit_check)
 
+    async def _flip_current_map_yaw(self) -> Mapping[str, ValueTypes]:
+        """Reverse map-frame heading in place (corridor 180° recovery)."""
+        mgr = self._manager
+        if mgr is None:
+            return self._publish_revisit_check({"status": "unconfigured"})
+        current = mgr.get_pose_in_map()
+        if current is None:
+            return self._publish_revisit_check(
+                {"status": "skipped", "reason": "no_pose_in_map"}
+            )
+        flipped = conv.Pose2D(
+            current.x, current.y, _normalize_angle(current.theta + math.pi)
+        )
+        applied = await asyncio.to_thread(mgr.apply_map_pose_correction, flipped)
+        out: dict = {
+            "status": "corrected" if applied.get("applied") else "correction_failed",
+            "flip_yaw_only": True,
+            "yaw_flipped": True,
+            "pose": {"x": flipped.x, "y": flipped.y, "theta": flipped.theta},
+            "correction": applied,
+            "corrected": bool(applied.get("applied")),
+        }
+        if out["corrected"]:
+            LOGGER.info(
+                "mapping revisit: flipped map yaw in place (%.1f -> %.1f deg)",
+                math.degrees(current.theta),
+                math.degrees(flipped.theta),
+            )
+        return self._publish_revisit_check(out)
+
+    def _reset_slice_library(self) -> None:
+        self._slice_library = None
+        with self._keyframe_lock:
+            if self._pause_keyframes is not None:
+                self._pause_keyframes.clear()
+            self._pause_keyframes = None
+
+    def _wire_still_keyframe_hook(self) -> None:
+        mgr = self._manager
+        cfg = self._cfg
+        if mgr is None or cfg is None or not cfg.mapping_revisit_keyframes:
+            if mgr is not None:
+                mgr.set_still_keyframe_hook(None)
+            return
+        mgr.set_still_keyframe_hook(self._on_still_keyframe)
+
+    def _ensure_keyframe_store(
+        self, cfg: SlamConfig
+    ) -> pause_keyframes.PauseKeyframeStore:
+        with self._keyframe_lock:
+            if self._pause_keyframes is None:
+                self._pause_keyframes = pause_keyframes.PauseKeyframeStore(
+                    min_spacing_m=cfg.mapping_revisit_keyframe_min_spacing_m,
+                    min_spacing_deg=cfg.mapping_revisit_keyframe_min_spacing_deg,
+                    max_keyframes=cfg.mapping_revisit_keyframe_max,
+                    match_tol_m=cfg.mapping_revisit_keyframe_match_tol_m,
+                )
+            return self._pause_keyframes
+
+    def _on_still_keyframe(
+        self,
+        scan: conv.LaserScan2D,
+        band_points: List[np.ndarray],
+        pose: conv.Pose2D,
+    ) -> None:
+        """Bridge callback: record pause 2D+slice keyframe (ROS thread)."""
+        cfg = self._cfg
+        if cfg is None or not cfg.mapping_revisit_keyframes:
+            return
+        store = self._ensure_keyframe_store(cfg)
+        with self._keyframe_lock:
+            added = store.add(pose, scan, band_points)
+        if not added:
+            return
+        library = self._get_slice_library(cfg)
+        if library is not None and any(np.asarray(p).size for p in band_points):
+            with self._keyframe_lock:
+                library.record(band_points, pose)
+        LOGGER.info(
+            "pause keyframe recorded at (%.2f, %.2f, %.1f deg); store=%d",
+            pose.x,
+            pose.y,
+            math.degrees(pose.theta),
+            len(store),
+        )
+
+    def _get_slice_library(
+        self, cfg: SlamConfig
+    ) -> Optional[slice_match.SliceLibrary]:
+        """Lazily build the per-session multi-height slice library."""
+        if not cfg.mapping_revisit_slice_verify:
+            return None
+        # Height slices need 3D points; ``auto`` lidars may still deliver them,
+        # and if they turn out 2D-only the verify simply reports no data.
+        if all(
+            lidar.scan_source == LIDAR_SCAN_GET_LASER_SCAN for lidar in cfg.lidars
+        ):
+            return None
+        if self._slice_library is None:
+            try:
+                bands = slice_match.SliceBand.parse_bands(
+                    cfg.mapping_revisit_slice_bands
+                )
+            except (ValueError, TypeError, IndexError) as exc:
+                LOGGER.warning("invalid mapping_revisit_slice_bands: %s", exc)
+                return None
+            if not bands:
+                return None
+            self._slice_library = slice_match.SliceLibrary(
+                bands,
+                resolution_m=cfg.mapping_revisit_slice_resolution_m,
+                min_hit_rate=cfg.mapping_revisit_slice_min_hit_rate,
+            )
+        return self._slice_library
+
     def _revisit_match_quality(
         self, result, cfg: SlamConfig
     ) -> tuple[bool, float, Optional[float]]:
@@ -222,7 +351,10 @@ class RosSlam(SLAM):
         return good, score, ray_mae
 
     async def _mapping_revisit_cycle(
-        self, *, apply_override: Optional[bool] = None
+        self,
+        *,
+        apply_override: Optional[bool] = None,
+        yaw_flip: bool = False,
     ) -> Mapping[str, ValueTypes]:
         """One revisit check: tiered scan-to-live-map match, odom shift on drift.
 
@@ -230,6 +362,10 @@ class RosSlam(SLAM):
         pose; tier 2 widens to ``mapping_revisit_wide_radius_m``; tier 3 (full
         map) runs only when enabled and must clear a stricter score gate —
         self-similar offices produce convincing wrong corridors at map scale.
+
+        After the best 2D match, ``choose_yaw_or_flip`` breaks corridor 180°
+        ambiguity. Pass ``yaw_flip=True`` to take the opposite heading of that
+        auto choice (for when XY is right but facing is wrong).
         """
         cfg = self._cfg
         mgr = self._manager
@@ -275,7 +411,10 @@ class RosSlam(SLAM):
             return self._publish_revisit_check(
                 {"status": "skipped", "reason": f"no_live_map: {exc}"}
             )
-        scan = await self._read_merged_scan()
+        library = self._get_slice_library(cfg)
+        scan, band_points = await self._read_merged_scan_and_bands(
+            library.bands if library is not None else None
+        )
 
         loop = asyncio.get_running_loop()
 
@@ -327,6 +466,133 @@ class RosSlam(SLAM):
             ):
                 result, good, score, ray_mae = full, True, full_score, full_ray_mae
 
+        kf_info = None
+        # Pause keyframes: when occupancy match is weak, try stored stop views
+        # (2D + height slices) — covers returning at a different pause angle.
+        if (
+            not good
+            and cfg.mapping_revisit_keyframes
+            and self._pause_keyframes is not None
+            and len(self._pause_keyframes) > 0
+        ):
+            store = self._pause_keyframes
+
+            def _kf_match(radius: Optional[float]):
+                with self._keyframe_lock:
+                    return store.match(
+                        scan,
+                        band_points,
+                        hint=current,
+                        search_radius_m=radius,
+                    )
+
+            kf = await asyncio.to_thread(
+                _kf_match, cfg.mapping_revisit_wide_radius_m
+            )
+            scope = "near"
+            if kf is None or kf.score < cfg.mapping_revisit_keyframe_min_score:
+                kf_all = await asyncio.to_thread(_kf_match, None)
+                scope = "all"
+                if kf_all is not None and (
+                    kf is None or kf_all.score > kf.score
+                ):
+                    kf = kf_all
+            if kf is not None:
+                tiers_tried.append(
+                    {
+                        "tier": f"keyframe_{scope}",
+                        "score": round(kf.score, 3),
+                        "keyframes": kf.keyframes_considered,
+                    }
+                )
+                kf_info = {
+                    "score": round(kf.score, 3),
+                    "primary_hit_rate": round(kf.primary_hit_rate, 3),
+                    "slice_hit_rate": (
+                        None
+                        if kf.slice_hit_rate is None
+                        else round(kf.slice_hit_rate, 3)
+                    ),
+                    "keyframe_index": kf.keyframe_index,
+                    "scope": scope,
+                }
+                if kf.score >= cfg.mapping_revisit_keyframe_min_score:
+                    # Ray-align against the live map at the keyframe pose so
+                    # the usual MAE gate still applies.
+                    yaw_probe = await asyncio.to_thread(
+                        choose_yaw_or_flip,
+                        occ_map,
+                        scan,
+                        kf.pose,
+                        reference_theta=current.theta,
+                    )
+                    result = GlobalLocalizeResult(
+                        pose=yaw_probe.pose,
+                        score=kf.score,
+                        candidates_evaluated=kf.keyframes_considered,
+                        scan_points_used=0,
+                        in_map_points=0,
+                        hit_rate=kf.primary_hit_rate,
+                        ray_score=0.0,
+                        ray_mae_m=yaw_probe.ray_mae_m,
+                    )
+                    match_mode = "keyframe"
+                    good = (
+                        kf.score >= cfg.mapping_revisit_keyframe_min_score
+                        and (
+                            not math.isfinite(yaw_probe.ray_mae_m)
+                            or yaw_probe.ray_mae_m
+                            <= cfg.mapping_revisit_max_ray_mae_m
+                        )
+                    )
+                    score = float(kf.score)
+                    ray_mae = (
+                        float(yaw_probe.ray_mae_m)
+                        if math.isfinite(yaw_probe.ray_mae_m)
+                        else None
+                    )
+
+        # Corridor 180° ambiguity: same XY often scores similarly both ways.
+        # Re-score pose vs pose+π and prefer IMU-nearer heading on a near-tie.
+        yaw_choice = await asyncio.to_thread(
+            choose_yaw_or_flip,
+            occ_map,
+            scan,
+            result.pose,
+            reference_theta=current.theta,
+        )
+        if yaw_flip:
+            chosen_pose = yaw_choice.alt_pose
+            chosen_score = yaw_choice.alt_score
+            chosen_mae = yaw_choice.alt_ray_mae_m
+            did_flip = not yaw_choice.flipped
+        else:
+            chosen_pose = yaw_choice.pose
+            chosen_score = yaw_choice.score
+            chosen_mae = yaw_choice.ray_mae_m
+            did_flip = yaw_choice.flipped
+        if match_mode == "keyframe":
+            # Keep keyframe hit-rate as the score (occupancy score scale differs).
+            result = replace(
+                result,
+                pose=chosen_pose,
+                ray_mae_m=chosen_mae,
+            )
+            ray_mae = (
+                float(chosen_mae) if math.isfinite(chosen_mae) else None
+            )
+            good = score >= cfg.mapping_revisit_keyframe_min_score and (
+                ray_mae is None or ray_mae <= cfg.mapping_revisit_max_ray_mae_m
+            )
+        else:
+            result = replace(
+                result,
+                pose=chosen_pose,
+                score=chosen_score,
+                ray_mae_m=chosen_mae,
+            )
+            good, score, ray_mae = self._revisit_match_quality(result, cfg)
+
         shift_m = math.hypot(result.pose.x - current.x, result.pose.y - current.y)
         shift_deg = abs(
             math.degrees(_normalize_angle(result.pose.theta - current.theta))
@@ -352,8 +618,18 @@ class RosSlam(SLAM):
                 "y": result.pose.y,
                 "theta": result.pose.theta,
             },
+            "yaw_flipped": did_flip,
+            "yaw_alt": {
+                "theta": yaw_choice.alt_pose.theta,
+                "score": round(yaw_choice.alt_score, 3),
+                "ray_mae_m": round(yaw_choice.alt_ray_mae_m, 3),
+            },
             "corrected": False,
         }
+        if kf_info is not None:
+            out["keyframe_match"] = kf_info
+        if self._pause_keyframes is not None:
+            out["keyframes"] = self._pause_keyframes.status()
 
         should_apply = apply_override is True or (
             apply_override is None and good and drifted and sane
@@ -371,6 +647,28 @@ class RosSlam(SLAM):
         if not good and apply_override is not True:
             out["status"] = "low_quality"
             return self._publish_revisit_check(out)
+
+        # Multi-height-slice verification: the occupancy map only encodes the
+        # primary z-band, which is self-similar across desk clutter. Before
+        # shifting odom, require the proposed pose to also agree with any
+        # height bands we have reference geometry for (recorded from earlier
+        # trusted pause scans). An explicit apply_override skips the veto.
+        if should_apply and drifted and library is not None:
+            verdict = await asyncio.to_thread(
+                library.verify, band_points, result.pose
+            )
+            out["slice_verify"] = verdict
+            if verdict.get("pass") is False and apply_override is not True:
+                out["status"] = "slice_verify_failed"
+                LOGGER.warning(
+                    "mapping revisit: 2D match at (%.2f, %.2f) rejected — "
+                    "%d/%d height slices disagree with stored geometry",
+                    result.pose.x,
+                    result.pose.y,
+                    verdict.get("bands_failed", 0),
+                    verdict.get("bands_checked", 0),
+                )
+                return self._publish_revisit_check(out)
 
         if should_apply:
             applied = await asyncio.to_thread(
@@ -391,6 +689,20 @@ class RosSlam(SLAM):
                 )
             else:
                 out["status"] = "correction_failed"
+
+        # Grow the slice library from confirmed in-place / corrected poses as a
+        # backup to the still-publish keyframe path (no-ops when already dense).
+        if library is not None and good:
+            record_pose: Optional[conv.Pose2D] = None
+            if out["status"] == "corrected":
+                record_pose = result.pose
+            elif out["status"] == "ok" and not drifted:
+                record_pose = current
+            if record_pose is not None and any(
+                np.asarray(pts).size for pts in band_points
+            ):
+                await asyncio.to_thread(library.record, band_points, record_pose)
+                out["slice_scans_recorded"] = library.scans_recorded
         return self._publish_revisit_check(out)
 
     def _schedule_periodic_relocalize(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -887,6 +1199,7 @@ class RosSlam(SLAM):
         # Built-in path: read odometry from the movement sensor's get_readings()
         # (odom_reader=None). The external-SLAM model reuses this same builder
         # with a typed MovementSensor reader injected.
+        node = self._manager.node if self._manager else None
         return build_io_provider(
             base=self._base,
             cameras=self._cameras,
@@ -896,6 +1209,7 @@ class RosSlam(SLAM):
             skip_get_laser_scan=self._skip_get_laser_scan,
             odom_reader=None,
             logger=LOGGER,
+            record_cmd_vel=(node.record_cmd_vel if node is not None else None),
         )
 
     async def _probe_sensors(self) -> dict:
@@ -996,6 +1310,9 @@ class RosSlam(SLAM):
         stem = handle.serialization_stem if handle else None
         self._manager.start_slam(stem, mode)
         self._cfg.mode = mode
+        # Slice reference geometry is pose-graph-relative; a (re)started SLAM
+        # session invalidates it.
+        self._reset_slice_library()
 
     def _reset_live_slam(self, mode: str) -> None:
         """Reset slam_toolbox in place when possible; full restart as fallback."""
@@ -1152,6 +1469,8 @@ class RosSlam(SLAM):
                 ]
             status["localization_check"] = dict(self._last_relocalize_check)
             status["revisit_check"] = dict(self._last_revisit_check)
+            if self._pause_keyframes is not None:
+                status["pause_keyframes"] = self._pause_keyframes.status()
             if probe_sensors and self._cfg is not None:
                 status["sensor_probe"] = await self._probe_sensors()
             return status
@@ -1199,6 +1518,23 @@ class RosSlam(SLAM):
         if cmd == "set_initial_pose":
             pose = self._resolve_pose(command)
             await asyncio.to_thread(mgr.set_initial_pose, pose)
+            # ``refine: true`` runs a seeded scan match around the given XY with
+            # a full yaw sweep — slam_toolbox itself only searches ~±30° of
+            # heading, so a seed with roughly-right XY but wrong theta can never
+            # self-correct without this.
+            if command.get("refine"):
+                refine_cmd: dict = {
+                    "command": "global_localize",
+                    "pose": {"x": pose.x, "y": pose.y, "theta": pose.theta},
+                    "search_radius_m": float(command.get("search_radius_m", 3.0)),
+                    "local_yaw_window_deg": float(
+                        command.get("local_yaw_window_deg", 360.0)
+                    ),
+                    "full_map": False,
+                    "auto_full_map_fallback": False,
+                }
+                result = await self._global_localize(refine_cmd)
+                return {"status": "ok", "refine": result}
             return {"status": "ok"}
 
         if cmd in ("relocalize", "refine_localization"):
@@ -1246,11 +1582,18 @@ class RosSlam(SLAM):
         if cmd == "revisit_check":
             # Mapping-mode revisit check on demand. ``apply`` forces the odom
             # correction (or set false for a dry run); omit for gated behavior.
+            # ``yaw_flip`` takes the opposite heading of the auto corridor
+            # disambiguation (same XY). ``flip_yaw_only`` reverses the current
+            # map heading in place without re-matching — recovery when XY is
+            # already right but facing is 180° wrong.
+            if bool(command.get("flip_yaw_only")):
+                return await self._flip_current_map_yaw()
             apply_override = command.get("apply")
             return await self._mapping_revisit_cycle(
                 apply_override=(
                     None if apply_override is None else bool(apply_override)
-                )
+                ),
+                yaw_flip=bool(command.get("yaw_flip")),
             )
 
         if cmd == "get_revisit_check":
@@ -1345,9 +1688,23 @@ class RosSlam(SLAM):
         )
 
     async def _read_merged_scan(self) -> conv.LaserScan2D:
+        scan, _ = await self._read_merged_scan_and_bands(None)
+        return scan
+
+    async def _read_merged_scan_and_bands(
+        self, bands: Optional[List[slice_match.SliceBand]]
+    ) -> tuple[conv.LaserScan2D, List[np.ndarray]]:
+        """Merged 2D scan plus per-band base_link XY points from one lidar read.
+
+        Bands come only from ``get_point_cloud``-style lidars (z is height in
+        base_link); pure 2D scans contribute to the merged scan but not bands.
+        """
         assert self._cfg is not None
         io = self._build_io()
         scans: List[conv.LaserScan2D] = []
+        band_points: List[np.ndarray] = (
+            [np.empty((0, 2)) for _ in bands] if bands else []
+        )
         for lidar in self._cfg.lidars:
             points = await io.read_lidar_points(lidar.name)
             mount = conv.Pose2D(lidar.x, lidar.y, lidar.theta)
@@ -1357,11 +1714,23 @@ class RosSlam(SLAM):
                 scan = conv.pointcloud_to_scan(
                     points.base_link,
                     # points.base_link are already in base_link coordinates.
+                    # Use the lidar's configured height band — the default band
+                    # would let (tilted-mast) floor returns pollute the match.
+                    z_min=lidar.z_min,
+                    z_max=lidar.z_max,
                     sensor_pose=conv.Pose2D(0.0, 0.0, 0.0),
                     num_bins=self._cfg.scan_bins,
                 )
                 if conv.scan_has_returns(scan):
                     scans.append(scan)
+                    if bands:
+                        sliced = slice_match.slice_points_by_bands(
+                            np.asarray(points.base_link, dtype=float), bands
+                        )
+                        band_points = [
+                            np.vstack([acc, cur]) if cur.size else acc
+                            for acc, cur in zip(band_points, sliced)
+                        ]
                     continue
             if points.sensor_scan is not None and conv.scan_has_returns(points.sensor_scan):
                 scan = points.sensor_scan
@@ -1377,11 +1746,12 @@ class RosSlam(SLAM):
                 scans.append(scan)
         if not scans:
             raise RuntimeError("no lidar returns available for global_localize")
-        return conv.merge_scans(
+        merged = conv.merge_scans(
             scans,
             num_bins=self._cfg.scan_bins,
             range_max=self._cfg.slam_toolbox.max_laser_range,
         )
+        return merged, band_points
 
     def _load_active_occupancy_map(self, source: str = "auto"):
         assert self._map_store is not None and self._manager is not None

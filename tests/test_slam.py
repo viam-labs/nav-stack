@@ -264,6 +264,59 @@ def test_relocalize_uses_current_map_pose(tmp_path: Path):
     assert pose_arg.theta == 0.5
 
 
+def test_set_initial_pose_refine_runs_seeded_yaw_search(tmp_path: Path):
+    slam = RosSlam("slam")
+    slam._map_store = MapStore(str(tmp_path))
+    slam._cfg = MagicMock(mode=MODE_LOCALIZING)
+    mgr = MagicMock()
+    slam._manager = mgr
+
+    refine_result = {"status": "localized", "score": 0.8}
+
+    async def _fake_global_localize(command):
+        _fake_global_localize.command = dict(command)
+        return refine_result
+
+    slam._global_localize = _fake_global_localize
+
+    result = asyncio.run(
+        slam.do_command(
+            {
+                "command": "set_initial_pose",
+                "pose": {"x": 1.0, "y": 2.0, "theta": 0.5},
+                "refine": True,
+            }
+        )
+    )
+
+    mgr.set_initial_pose.assert_called_once()
+    assert result["status"] == "ok"
+    assert result["refine"] == refine_result
+    sent = _fake_global_localize.command
+    assert sent["pose"] == {"x": 1.0, "y": 2.0, "theta": 0.5}
+    assert sent["local_yaw_window_deg"] == 360.0
+    assert sent["full_map"] is False
+    assert sent["auto_full_map_fallback"] is False
+
+
+def test_set_initial_pose_without_refine_skips_search(tmp_path: Path):
+    slam = RosSlam("slam")
+    slam._map_store = MapStore(str(tmp_path))
+    slam._cfg = MagicMock(mode=MODE_LOCALIZING)
+    mgr = MagicMock()
+    slam._manager = mgr
+    slam._global_localize = AsyncMock()
+
+    result = asyncio.run(
+        slam.do_command(
+            {"command": "set_initial_pose", "pose": {"x": 1.0, "y": 2.0, "theta": 0.5}}
+        )
+    )
+
+    assert result == {"status": "ok"}
+    slam._global_localize.assert_not_called()
+
+
 def test_relocalize_use_mir_pose_from_movement_sensor(tmp_path: Path):
     slam = RosSlam("slam")
     slam._map_store = MapStore(str(tmp_path))
@@ -529,10 +582,21 @@ def test_get_point_cloud_map_shows_current_generation():
 
 def test_stop_base_zeros_velocity_without_full_stop():
     slam = RosSlam("slam")
-    slam._cfg = MagicMock(base_velocity_convention="mir")
+    slam._cfg = MagicMock(
+        base_velocity_convention="viam",
+        sensor_read_timeout_s=1.0,
+        lidars=[],
+        movement_sensor_upside_down=False,
+        movement_sensor_yaw_deg=0.0,
+        heading_sensor_invert=False,
+        heading_sensor_yaw_deg=0.0,
+    )
     slam._base = AsyncMock()
     slam._movement_sensor = None
-    slam._lidars = {}
+    slam._heading_sensor = None
+    slam._cameras = {}
+    slam._skip_get_laser_scan = set()
+    slam._manager = MagicMock(node=None)
 
     io = slam._build_io()
     asyncio.run(io.stop_base())
@@ -543,6 +607,36 @@ def test_stop_base_zeros_velocity_without_full_stop():
     assert kwargs["linear"].x == 0.0
     assert kwargs["linear"].y == 0.0
     assert kwargs["angular"].z == 0.0
+
+
+def test_nav2_drive_base_sends_angular_z_to_viam_base():
+    slam = RosSlam("slam")
+    slam._cfg = MagicMock(
+        base_velocity_convention="viam",
+        sensor_read_timeout_s=1.0,
+        lidars=[],
+        movement_sensor_upside_down=False,
+        movement_sensor_yaw_deg=0.0,
+        heading_sensor_invert=False,
+        heading_sensor_yaw_deg=0.0,
+    )
+    slam._base = AsyncMock()
+    slam._movement_sensor = None
+    slam._heading_sensor = None
+    slam._cameras = {}
+    slam._skip_get_laser_scan = set()
+    node = MagicMock()
+    slam._manager = MagicMock(node=node)
+
+    io = slam._build_io()
+    asyncio.run(io.drive_base(0.5, 0.0, -1.0))
+
+    node.record_cmd_vel.assert_called_once_with(0.5, 0.0, -1.0, source="nav2")
+    slam._base.set_velocity.assert_awaited_once()
+    kwargs = slam._base.set_velocity.await_args.kwargs
+    assert kwargs["linear"].x == 0.0
+    assert kwargs["linear"].y == 500.0
+    assert kwargs["angular"].z == pytest.approx(-57.2958, rel=1e-5)
 
 
 # -- periodic relocalize (drift watchdog) -----------------------------------

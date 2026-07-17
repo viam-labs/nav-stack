@@ -1,3 +1,4 @@
+import math
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -204,11 +205,15 @@ def test_on_drive_timer_sends_latest_and_clears():
     bridge = SimpleNamespace(
         _nav_active=True,
         _motors_enabled=True,
+        _nav_cfg=None,
         _cmd_vel_lock=lock,
         _pending_cmd_vel=(0.3, 0.0, 0.4),
         _io=io,
         _run=MagicMock(),
         get_logger=MagicMock(return_value=MagicMock()),
+    )
+    bridge._apply_cmd_vel_floor = lambda vx, vy, vt: BridgeNode._apply_cmd_vel_floor(
+        bridge, vx, vy, vt
     )
 
     BridgeNode._on_drive_timer(bridge)
@@ -221,7 +226,6 @@ def test_on_drive_timer_sends_latest_and_clears():
     bridge._run.reset_mock()
     BridgeNode._on_drive_timer(bridge)
     bridge._run.assert_not_called()
-
 
 def test_on_drive_timer_snaps_near_zero_to_stop():
     lock = __import__("threading").Lock()
@@ -258,6 +262,68 @@ def test_set_nav_active_false_clears_pending_cmd_vel():
     bridge._run.assert_called_once_with("coro")
 
 
+def test_record_cmd_vel_maps_viam_axes():
+    from collections import deque
+
+    bridge = SimpleNamespace(
+        _nav_active=True,
+        _slam_cfg=SimpleNamespace(base_velocity_convention="viam"),
+        _last_cmd_vel_wall=0.0,
+        _last_cmd_vel={},
+        _cmd_vel_history=deque(maxlen=20),
+    )
+    BridgeNode.record_cmd_vel(bridge, 0.5, 0.0, 0.2, source="nav2")
+    cmd = bridge._last_cmd_vel
+    assert cmd["source"] == "nav2"
+    assert cmd["ros_vx_mps"] == 0.5
+    assert cmd["viam_linear_x_mm_s"] == 0.0
+    assert cmd["viam_linear_y_mm_s"] == 500.0
+    assert cmd["viam_angular_z_deg_s"] == pytest.approx(math.degrees(0.2), rel=1e-3)
+    assert cmd["convention"] == "viam"
+
+
+def test_cmd_vel_history_keeps_drive_cmds_after_stop():
+    from collections import deque
+
+    bridge = SimpleNamespace(
+        _nav_active=True,
+        _slam_cfg=SimpleNamespace(base_velocity_convention="viam"),
+        _last_cmd_vel_wall=0.0,
+        _last_cmd_vel={},
+        _cmd_vel_history=deque(maxlen=20),
+    )
+    BridgeNode.record_cmd_vel(bridge, 0.5, 0.0, -1.5, source="nav2")
+    BridgeNode.record_cmd_vel(bridge, 0.5, 0.0, -1.5, source="nav2")
+    BridgeNode.record_cmd_vel(bridge, 0.4, 0.0, -1.2, source="nav2")
+    BridgeNode.record_cmd_vel(bridge, 0.0, 0.0, 0.0, source="stop")
+
+    hist = BridgeNode.cmd_vel_history(bridge)
+    assert len(hist) == 3
+    assert hist[0]["ros_vx_mps"] == 0.5
+    assert hist[2]["source"] == "stop"
+    assert BridgeNode.last_cmd_vel(bridge)["source"] == "stop"
+
+
+def test_nav_status_includes_last_cmd_vel():
+    bridge = SimpleNamespace(
+        _last_result_status="active",
+        _nav_active=True,
+        _last_feedback={"distance_remaining": 1.2},
+        last_cmd_vel=MagicMock(
+            return_value={
+                "source": "nav2",
+                "viam_linear_y_mm_s": 300.0,
+                "age_s": 0.1,
+            }
+        ),
+        cmd_vel_history=MagicMock(return_value=[{"source": "nav2", "ros_vx_mps": 0.5}]),
+    )
+    status = BridgeNode.nav_status(bridge)
+    assert status["active"] is True
+    assert status["last_cmd_vel"]["viam_linear_y_mm_s"] == 300.0
+    assert status["cmd_vel_history"][0]["ros_vx_mps"] == 0.5
+
+
 def test_on_drive_timer_noop_when_nav_inactive():
     lock = __import__("threading").Lock()
     io = SimpleNamespace(drive_base=MagicMock())
@@ -273,6 +339,35 @@ def test_on_drive_timer_noop_when_nav_inactive():
     BridgeNode._on_drive_timer(bridge)
 
     bridge._run.assert_not_called()
+
+
+def test_on_drive_timer_applies_stiction_floor():
+    lock = __import__("threading").Lock()
+    io = SimpleNamespace(drive_base=MagicMock(return_value="coro"))
+    nav_cfg = SimpleNamespace(
+        min_cmd_vel_x=0.2,
+        min_cmd_vel_theta=0.4,
+        max_vel_x=0.75,
+        max_vel_theta=1.2,
+    )
+    bridge = SimpleNamespace(
+        _nav_active=True,
+        _motors_enabled=True,
+        _nav_cfg=nav_cfg,
+        _cmd_vel_lock=lock,
+        _pending_cmd_vel=(0.05, 0.0, 0.1),
+        _io=io,
+        _run=MagicMock(),
+        get_logger=MagicMock(return_value=MagicMock()),
+    )
+    bridge._apply_cmd_vel_floor = lambda vx, vy, vth: BridgeNode._apply_cmd_vel_floor(
+        bridge, vx, vy, vth
+    )
+
+    BridgeNode._on_drive_timer(bridge)
+
+    bridge._run.assert_called_once_with("coro")
+    io.drive_base.assert_called_once_with(0.2, 0.0, 0.4)
 
 
 def test_guarded_callback_swallows_exception_and_logs():

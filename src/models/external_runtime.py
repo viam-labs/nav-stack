@@ -96,6 +96,21 @@ def build_external_runtime(
     manager = RosManager(bridge_cfg, logger=logger, external_slam=slam)
     manager.start(io, loop, nav_cfg=ext.nav)
 
+    node = manager.node
+    if node is not None:
+        # Wire cmd_vel history recording now the bridge node exists.
+        node._io = build_io_provider(
+            base=base,
+            cameras=cameras,
+            cfg=bridge_cfg,
+            movement_sensor=movement_sensor,
+            heading_sensor=heading_sensor,
+            skip_get_laser_scan=set(),
+            odom_reader=odom_reader,
+            logger=logger,
+            record_cmd_vel=node.record_cmd_vel,
+        )
+
     # Locations/zones live in a nav-stack-managed map store (the external SLAM
     # owns the occupancy grid, delivered live via get_grid).
     map_store = MapStore(bridge_cfg.maps_dir)
@@ -103,7 +118,6 @@ def build_external_runtime(
     map_store.get_or_create_map(active)
     map_store.set_active_map(active)
 
-    node = manager.node
     loc_check = (
         node._external.localization_check
         if node is not None and node._external is not None

@@ -305,6 +305,8 @@ class NavCoreMixin:
             await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.cancel)
             return {"status": "canceled"}
+        if cmd == "test_drive":
+            return await self._test_drive(command)
         if cmd == "get_status":
             def _status():
                 status = mgr.nav_status()
@@ -383,10 +385,12 @@ class NavCoreMixin:
         return {"status": "navigating", "motion": "simple", "target": target}
 
     async def _cancel_simple_nav(self) -> None:
+        was_active = self._simple_nav_status.get("state") == "active"
+        task = self._simple_nav_task
+        had_running_task = task is not None and not task.done()
         if self._simple_nav_cancel is not None:
             self._simple_nav_cancel.set()
-        task = self._simple_nav_task
-        if task is not None and not task.done():
+        if had_running_task:
             task.cancel()
             try:
                 await task
@@ -394,18 +398,66 @@ class NavCoreMixin:
                 pass
         self._simple_nav_task = None
         self._simple_nav_cancel = None
-        await self._stop_base()
-        if self._simple_nav_status.get("state") == "active":
+        # Only zero the base when simple nav was actually running. Always
+        # stopping here races Nav2 SetVelocity and can wipe angular mid-turn.
+        if was_active or had_running_task:
+            await self._stop_base()
+        if was_active:
             self._simple_nav_status = {"state": "canceled", "motion": "simple"}
 
     async def _stop_base(self) -> None:
         base = self._base
         if base is None:
             return
+        try:
+            node = self._require_runtime().manager.node
+        except Exception:  # noqa: BLE001 - stop must still zero the base
+            node = None
+        if node is not None:
+            node.record_cmd_vel(0.0, 0.0, 0.0, source="simple_stop")
         await base.set_velocity(
             linear=Vector3(x=0, y=0, z=0),
             angular=Vector3(x=0, y=0, z=0),
         )
+
+    async def _test_drive(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        """Send one ROS-body cmd through the same IO path Nav2 uses, then stop."""
+        runtime = self._require_runtime()
+        io = runtime.manager.node._io if runtime.manager.node else None
+        if io is None:
+            raise RuntimeError("bridge IO unavailable")
+
+        vx = float(command.get("vx", command.get("ros_vx_mps", 0.0)))
+        vy = float(command.get("vy", command.get("ros_vy_mps", 0.0)))
+        vtheta = float(command.get("vtheta", command.get("ros_vtheta_rad_s", 0.0)))
+        if (
+            "angular_z_deg_s" in command
+            and "vtheta" not in command
+            and "ros_vtheta_rad_s" not in command
+        ):
+            vtheta = math.radians(float(command["angular_z_deg_s"]))
+        duration_s = max(0.1, min(float(command.get("duration_s", 1.5)), 5.0))
+
+        lx, ly = ros_cmd_vel_to_viam_linear_mm_s(
+            vx, vy, runtime.slam_cfg.base_velocity_convention
+        )
+        await io.drive_base(vx, vy, vtheta)
+        await asyncio.sleep(duration_s)
+        await io.stop_base()
+        return {
+            "status": "ok",
+            "sent": {
+                "ros_vx_mps": vx,
+                "ros_vy_mps": vy,
+                "ros_vtheta_rad_s": vtheta,
+                "viam_linear_x_mm_s": lx,
+                "viam_linear_y_mm_s": ly,
+                "viam_angular_z_deg_s": math.degrees(vtheta),
+            },
+            "duration_s": duration_s,
+        }
 
     async def _simple_go_to(
         self,
@@ -431,6 +483,8 @@ class NavCoreMixin:
             max_vel_x=cfg.max_vel_x,
             max_vel_theta=cfg.max_vel_theta,
             yaw_tolerance_rad=cfg.nav2.yaw_goal_tolerance,
+            min_linear_mps=cfg.min_cmd_vel_x,
+            min_angular_rad_s=cfg.min_cmd_vel_theta,
         )
         cancel_event = asyncio.Event()
         self._simple_nav_cancel = cancel_event
@@ -443,6 +497,9 @@ class NavCoreMixin:
         convention = runtime.slam_cfg.base_velocity_convention
 
         async def _set_velocity(vx: float, vy: float, vtheta: float) -> None:
+            node = runtime.manager.node
+            if node is not None:
+                node.record_cmd_vel(vx, vy, vtheta, source="simple")
             lx, ly = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, convention)
             await base.set_velocity(
                 linear=Vector3(x=lx, y=ly, z=0),

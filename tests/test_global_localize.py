@@ -167,3 +167,35 @@ def test_global_localize_rejects_sparse_scan():
     )
     with pytest.raises(ValueError, match="too few"):
         global_localize_scan(occ_map, empty, hint=conv.Pose2D(0, 0, 0))
+
+
+def _corridor_map() -> OccupancyMap:
+    """Long N-S corridor — classic 180° scan ambiguity."""
+    grid = np.full((40, 20), -1, dtype=np.int16)
+    grid[2:38, 4] = 100
+    grid[2:38, 15] = 100
+    grid[2:38, 5:15] = 0
+    return OccupancyMap(grid=grid, resolution=0.5, origin_x=0.0, origin_y=0.0)
+
+
+def test_choose_yaw_or_flip_prefers_reference_on_near_tie():
+    from src.nav.global_localize import choose_yaw_or_flip
+
+    occ = _corridor_map()
+    true = conv.Pose2D(5.0, 10.0, math.pi / 2)  # facing +Y along corridor
+    scan = _raycast_scan(occ, true)
+    # Pretend the matcher returned the opposite heading at the right XY.
+    wrong = conv.Pose2D(true.x, true.y, true.theta + math.pi)
+    choice = choose_yaw_or_flip(
+        occ, scan, wrong, reference_theta=true.theta + 0.1
+    )
+    assert choice.flipped is True
+    assert abs(_wrap(choice.pose.theta - true.theta)) < math.radians(5)
+
+
+def _wrap(a: float) -> float:
+    while a > math.pi:
+        a -= 2 * math.pi
+    while a < -math.pi:
+        a += 2 * math.pi
+    return a
