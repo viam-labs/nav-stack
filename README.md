@@ -11,6 +11,7 @@ This module (`viam-labs:nav-stack`) provides three models:
 | `viam-labs:nav-stack:slam` | `rdk:service:slam` | Mapping + localization via slam_toolbox. Standard SLAM API (live map, position) + map management. |
 | `viam-labs:nav-stack:navigation` | `rdk:service:generic` | Nav2 navigation: named locations, go-to-point, keepout/speed zones, obstacle avoidance, all via `DoCommand`. |
 | `viam-labs:nav-stack:navigation-external` | `rdk:service:generic` | Same Nav2 navigation, driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
+| `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders the navigation service's Nav2 costmap + active plan(s), robot pose, footprint and goal as a live camera image. Works with either navigation model / any SLAM backend. |
 
 ## How it works
 
@@ -267,6 +268,40 @@ Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:se
 ```
 
 Optional attributes: `trust_movement_sensor_pose` (default `false`), `snap_heading` (default `false`), plus the same bridge/odometry tuning fields as the SLAM service and the same `nav2` block as `navigation`. The built-in `navigation` model is unchanged; use it when you map with `nav-stack:slam`.
+
+### Visualizing what nav is planning (nav-camera)
+
+`viam-labs:nav-stack:nav-camera` is a read-only `rdk:component:camera` that renders, as an image you can watch in the Viam app's camera stream, what the navigation service is doing — no rviz required. It draws Nav2's **global costmap** (so you see the inflated cost surface the planner actually reasons over) with these overlays:
+
+- **global plan** (`/plan`) in green — the route to the current goal;
+- **plan history** — superseded plans for the current goal, greyed out and faded oldest→faintest, so you can watch how the route changed as the robot replanned (reset on each new goal);
+- **local plan** (`/local_plan`) in orange — the controller's short-horizon path;
+- **robot pose + footprint** (red arrow + blue polygon) from the `map → base_link` TF;
+- **goal marker** (magenta) with a heading tick.
+
+Occupancy colouring: unknown = dark grey, free = light, obstacle inflation = grey→orange gradient, lethal/inscribed = near-black. World "up" renders as image up (rviz-like).
+
+It reads directly from the running navigation service's in-process bridge (found by the `navigation` attribute), so there is no extra ROS process and no round-trip. Because it consumes only Nav2's standard costmap/plan topics, it works with **any** SLAM backend and with either `navigation` or `navigation-external`.
+
+```json
+{
+  "name": "nav-view",
+  "api": "rdk:component:camera",
+  "model": "viam-labs:nav-stack:nav-camera",
+  "attributes": {
+    "navigation": "nav"
+  }
+}
+```
+
+- `navigation` (**required**) — the name of the `navigation` / `navigation-external` service to visualize. It is also declared as a dependency so it starts first.
+- Optional: `max_dim` (longest output edge in px, default `700`), `plan_history_len` (faded trail length, default `8`), `robot_radius_m` (footprint fallback + pose-arrow size, default `0.22`), and per-overlay toggles `show_global_plan` / `show_local_plan` / `show_pose` / `show_footprint` / `show_goal` / `show_history` (all default `true`).
+
+Until Nav2 has published a costmap (bringup is asynchronous), the camera returns a placeholder frame.
+
+`DoCommand`:
+- `{"command": "legend"}` — the colour key as a printable string in `legend`, so you can read the map without guessing colours.
+- `{"command": "stats"}` (or any other command) — a text summary: whether the bridge/costmap is present, plan point counts, current goal/pose. Handy for verifying without a video stream.
 
 ## Workflows
 

@@ -43,7 +43,7 @@ from ..nav.maps import MapStore
 from ..ros.manager import RosManager
 from ..ros.odom_source import TypedMovementSensorOdom, TypedOdomConfig
 from ..ros.sensor_io import build_io_provider
-from ..runtime import SlamRuntime
+from ..runtime import SlamRuntime, register_bridge, unregister_bridge
 from .nav_core import NavServiceBase
 
 LOGGER = getLogger(__name__)
@@ -175,6 +175,11 @@ class RosNavigationExternal(NavServiceBase):
         )
         self._runtime = SlamRuntime(self._manager, map_store, bridge_cfg, loc_check)
 
+        # Publish the live bridge node so a nav-camera can find it and render
+        # this nav's costmap/plans.
+        if node is not None:
+            register_bridge(self.name, node)
+
         self._manager.set_nav_config(ext.nav)
         params_path = self._write_nav2_params(ext.nav)
         # Nav2 bringup can take minutes on a Pi; start in the background so
@@ -188,6 +193,7 @@ class RosNavigationExternal(NavServiceBase):
         )
 
     async def close(self) -> None:
+        unregister_bridge(self.name)
         if self._manager is not None:
             self._manager.shutdown()
             self._manager = None

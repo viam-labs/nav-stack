@@ -32,7 +32,7 @@ from viam.services.generic import Generic
 from viam.utils import struct_to_dict
 
 from ..config import NavConfig
-from ..runtime import get_slam
+from ..runtime import get_slam, register_bridge, unregister_bridge
 
 # Re-exported for backwards-compatible imports (tests + any external callers
 # still do ``from src.models.navigation import _sync_mppi_model_dt`` etc.).
@@ -91,6 +91,10 @@ class RosNavigation(NavServiceBase):
                 "and started before the navigation service"
             )
         runtime.manager.set_nav_config(cfg)
+        # Publish the shared bridge node so a nav-camera can find it and render
+        # this nav's costmap/plans.
+        if runtime.manager.node is not None:
+            register_bridge(self.name, runtime.manager.node)
         params_path = self._write_nav2_params(cfg)
         # Nav2 bringup (with retries) can take minutes on a Pi; run it in the
         # background so reconfigure returns within viam-server's deadline.
@@ -100,6 +104,11 @@ class RosNavigation(NavServiceBase):
             f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}); "
             "Nav2 starting in background"
         )
+
+    async def close(self) -> None:
+        # The bridge node itself is owned by the SLAM service; only drop our
+        # nav-camera registration pointer.
+        unregister_bridge(self.name)
 
 
 Registry.register_resource_creator(

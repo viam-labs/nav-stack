@@ -46,3 +46,26 @@ def unregister_slam(name: str) -> None:
 def get_slam(name: str) -> Optional[SlamRuntime]:
     with _LOCK:
         return _REGISTRY.get(name)
+
+
+# Live bridge nodes, keyed by the *navigation* service name that owns/drives
+# them. Published so the ``nav-camera`` component can find the running
+# ``BridgeNode`` in-process and read Nav2 costmap/plan/pose data for rendering,
+# without a Viam RPC round-trip. Value is a ``ros.bridge.BridgeNode`` (typed as
+# ``object`` here to keep this module import-light and ROS-free).
+_BRIDGES: Dict[str, object] = {}
+
+
+def register_bridge(nav_name: str, node: object) -> None:
+    with _LOCK:
+        _BRIDGES[nav_name] = node
+
+
+def unregister_bridge(nav_name: str) -> None:
+    with _LOCK:
+        _BRIDGES.pop(nav_name, None)
+
+
+def get_bridge(nav_name: str) -> Optional[object]:
+    with _LOCK:
+        return _BRIDGES.get(nav_name)

@@ -35,8 +35,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.action import ActionClient
 
-from geometry_msgs.msg import Quaternion, Twist, TransformStamped, PoseStamped, PoseWithCovarianceStamped
-from nav_msgs.msg import OccupancyGrid, Odometry
+from geometry_msgs.msg import Quaternion, Twist, TransformStamped, PoseStamped, PoseWithCovarianceStamped, PolygonStamped
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Header
 from tf2_ros import (
@@ -434,6 +434,20 @@ class BridgeNode(Node):
                 transform_timeout_s=slam_cfg.external_transform_timeout_s,
                 logger=self.get_logger(),
             )
+
+        # Visualization state for the ``nav-camera`` component. Subscriptions to
+        # Nav2's costmap/plan topics are created lazily by ``enable_viz`` so they
+        # add zero overhead unless a camera is actually rendering. Everything
+        # here is read cross-thread (executor writes, camera thread reads) under
+        # ``_viz_lock``; ``_viz_goal`` is also written from the goal path.
+        self._viz_lock = threading.Lock()
+        self._viz_enabled = False
+        self._viz_global_costmap: Optional[Dict] = None
+        self._viz_global_plan: tuple = ()  # current /plan, tuple of (x, y)
+        self._viz_local_plan: tuple = ()  # current /local_plan
+        self._viz_plan_history: Deque[tuple] = deque(maxlen=8)  # older /plan versions
+        self._viz_footprint: tuple = ()  # robot footprint polygon, (x, y) pairs
+        self._viz_goal: Optional[tuple] = None  # (x, y, theta) of the active goal
 
     # -- helpers -------------------------------------------------------------
     def _guarded(self, fn):
@@ -1899,6 +1913,13 @@ class BridgeNode(Node):
         pose.pose.orientation = _quat_msg(theta)
         goal.pose = pose
 
+        # Record the goal and reset the plan trail so the nav-camera shows the
+        # history of *this* navigation, not stale plans from the previous goal.
+        with self._viz_lock:
+            self._viz_goal = (float(x), float(y), float(theta))
+            self._viz_plan_history.clear()
+            self._viz_global_plan = ()
+
         self._last_result_status = "active"
         self.set_nav_active(True)
         send_future = self._nav_action.send_goal_async(
@@ -2247,6 +2268,117 @@ class BridgeNode(Node):
         if time.monotonic() - self._latest_scan_wall > max_age_s:
             return None
         return scan
+
+    # -- visualization (nav-camera) ------------------------------------------
+    def enable_viz(self, history_len: int = 8) -> None:
+        """Lazily subscribe to Nav2 costmap/plan topics for the nav-camera.
+
+        Idempotent: safe to call on every render. Topics are Nav2 defaults and
+        SLAM-algorithm agnostic (they exist whether the map comes from
+        slam_toolbox or an external SLAM service), so the camera works with any
+        SLAM backend. Absolute topic names keep them valid under any namespace.
+        """
+        with self._viz_lock:
+            if self._viz_enabled:
+                if history_len != self._viz_plan_history.maxlen:
+                    self._viz_plan_history = deque(
+                        self._viz_plan_history, maxlen=max(1, int(history_len))
+                    )
+                return
+            self._viz_enabled = True
+            self._viz_plan_history = deque(maxlen=max(1, int(history_len)))
+
+        sub_kwargs = (
+            {"callback_group": self._cb_misc} if self._cb_misc is not None else {}
+        )
+        # Costmap is latched (transient_local); plans/footprint are streamed.
+        self.create_subscription(
+            OccupancyGrid,
+            "/global_costmap/costmap",
+            self._guarded(self._on_viz_global_costmap),
+            _LATCHED_QOS,
+            **sub_kwargs,
+        )
+        self.create_subscription(
+            Path, "/plan", self._guarded(self._on_viz_global_plan), 10, **sub_kwargs
+        )
+        self.create_subscription(
+            Path, "/local_plan", self._guarded(self._on_viz_local_plan), 10, **sub_kwargs
+        )
+        # Use the *global* costmap footprint: it is published in the map frame
+        # (local_costmap's is in odom), matching the map-frame costmap/plans/pose
+        # this camera renders. Nav2 republishes it at the robot's live pose, so
+        # it tracks the robot as it moves.
+        self.create_subscription(
+            PolygonStamped,
+            "/global_costmap/published_footprint",
+            self._guarded(self._on_viz_footprint),
+            10,
+            **sub_kwargs,
+        )
+
+    def _on_viz_global_costmap(self, msg: OccupancyGrid) -> None:
+        grid = np.array(msg.data, dtype=np.int16).reshape(
+            msg.info.height, msg.info.width
+        )
+        cm = {
+            "grid": grid,
+            "resolution": msg.info.resolution,
+            "origin_x": msg.info.origin.position.x,
+            "origin_y": msg.info.origin.position.y,
+        }
+        with self._viz_lock:
+            self._viz_global_costmap = cm
+
+    @staticmethod
+    def _path_points(msg: Path) -> tuple:
+        return tuple(
+            (p.pose.position.x, p.pose.position.y) for p in msg.poses
+        )
+
+    def _on_viz_global_plan(self, msg: Path) -> None:
+        pts = self._path_points(msg)
+        with self._viz_lock:
+            prev = self._viz_global_plan
+            # Push the superseded plan onto the (bounded) trail so the camera can
+            # fade out where nav used to route. Skip no-op republishes.
+            if prev and prev != pts and (
+                not self._viz_plan_history or self._viz_plan_history[-1] != prev
+            ):
+                self._viz_plan_history.append(prev)
+            self._viz_global_plan = pts
+
+    def _on_viz_local_plan(self, msg: Path) -> None:
+        pts = self._path_points(msg)
+        with self._viz_lock:
+            self._viz_local_plan = pts
+
+    def _on_viz_footprint(self, msg: PolygonStamped) -> None:
+        pts = tuple((pt.x, pt.y) for pt in msg.polygon.points)
+        with self._viz_lock:
+            self._viz_footprint = pts
+
+    def viz_snapshot(self) -> Dict:
+        """Thread-safe snapshot of everything the nav-camera renders.
+
+        Values are plain Python / numpy (no ROS types) so the renderer stays
+        ROS-free and unit-testable.
+        """
+        pose = self.get_pose_in_map()
+        with self._viz_lock:
+            snap = {
+                "costmap": self._viz_global_costmap,
+                "map": self._latest_map,
+                "global_plan": self._viz_global_plan,
+                "plan_history": list(self._viz_plan_history),
+                "local_plan": self._viz_local_plan,
+                "footprint": self._viz_footprint,
+                "goal": self._viz_goal,
+            }
+        snap["pose"] = (
+            (pose.x, pose.y, pose.theta) if pose is not None else None
+        )
+        return snap
 
 
 class _ZeroDuration:
