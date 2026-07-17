@@ -53,16 +53,30 @@ class NavViewOptions:
     show_goal: bool = True
     show_history: bool = True
     robot_radius_m: float = 0.22  # fallback footprint / pose-arrow size
+    # Windowing: "full" renders the whole grid; "follow" renders a
+    # ``window_size_m`` square that tracks the robot (falls back to goal, then
+    # grid centre); "region" renders a fixed map-frame bbox.
+    window_mode: str = "full"
+    window_size_m: float = 6.0
+    window_min_x: Optional[float] = None
+    window_min_y: Optional[float] = None
+    window_max_x: Optional[float] = None
+    window_max_y: Optional[float] = None
 
 
 @dataclass
 class _Frame:
-    """Grid geometry + the pixel scale, shared by every world->pixel mapping."""
+    """View geometry + pixel scale, shared by every world->pixel mapping.
+
+    ``origin_x/origin_y`` are the world coords of the view's bottom-left corner
+    and ``height`` is the view's height in cells (both equal the grid's for a
+    full render, or the crop's for a windowed one).
+    """
 
     origin_x: float
     origin_y: float
     resolution: float
-    height: int  # grid rows
+    height: int  # view rows (cells)
     scale: float  # output pixels per grid cell
     out_w: int
     out_h: int
@@ -112,22 +126,87 @@ def _pick_background(snapshot: Dict) -> Optional[Dict]:
     return None
 
 
-def _build_frame(grid_info: Dict, max_dim: int) -> Tuple[Image.Image, _Frame]:
+def _compute_window(
+    snapshot: Dict, opts: NavViewOptions, grid_info: Dict
+) -> Optional[Tuple[float, float, float, float]]:
+    """Resolve the render window (wx0, wy0, wx1, wy1) in map frame, or None for
+    a full-grid render. Misconfigured windows fall back to None (full)."""
+    mode = (opts.window_mode or "full").lower()
+    if mode == "region":
+        b = (opts.window_min_x, opts.window_min_y, opts.window_max_x, opts.window_max_y)
+        if any(v is None for v in b):
+            return None
+        x0, y0, x1, y1 = (float(v) for v in b)
+        return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+    if mode == "follow":
+        pose = snapshot.get("pose")
+        goal = snapshot.get("goal")
+        if pose is not None:
+            cx, cy = pose[0], pose[1]
+        elif goal is not None:
+            cx, cy = goal[0], goal[1]
+        else:  # nothing to follow yet: centre on the grid
+            grid = np.asarray(grid_info["grid"])
+            gh, gw = grid.shape
+            res = float(grid_info["resolution"])
+            cx = float(grid_info["origin_x"]) + gw * res / 2.0
+            cy = float(grid_info["origin_y"]) + gh * res / 2.0
+        half = max(0.1, float(opts.window_size_m) / 2.0)
+        return (cx - half, cy - half, cx + half, cy + half)
+    return None
+
+
+def _build_frame(
+    grid_info: Dict,
+    max_dim: int,
+    window: Optional[Tuple[float, float, float, float]] = None,
+) -> Tuple[Image.Image, _Frame]:
     grid = np.asarray(grid_info["grid"])
     h, w = grid.shape
-    scale = max(1, int(max_dim)) / float(max(w, h))
-    out_w = max(1, int(round(w * scale)))
-    out_h = max(1, int(round(h * scale)))
+    res = float(grid_info["resolution"])
+    ox = float(grid_info["origin_x"])
+    oy = float(grid_info["origin_y"])
 
     # Grid row 0 is world-bottom; flip so image row 0 is world-top (rviz-like).
-    rgb = np.flipud(_colorize(grid))
-    img = Image.fromarray(rgb, mode="RGB").resize((out_w, out_h), Image.NEAREST)
+    full = Image.fromarray(np.flipud(_colorize(grid)), mode="RGB")  # size (w, h)
 
+    # Crop box in the flipped (top-origin) image. Full render is the whole grid.
+    if window is None:
+        left, top, right, bot = 0, 0, w, h
+    else:
+        wx0, wy0, wx1, wy1 = window
+        # Epsilon absorbs float noise (e.g. 0.6/0.05 == 12.0000000002) so an
+        # exact cell boundary doesn't spill into a phantom extra cell.
+        eps = 1e-6
+        left = int(math.floor((wx0 - ox) / res + eps))
+        right = int(math.ceil((wx1 - ox) / res - eps))
+        top = int(math.floor(h - (wy1 - oy) / res + eps))
+        bot = int(math.ceil(h - (wy0 - oy) / res - eps))
+        if right <= left:
+            right = left + 1
+        if bot <= top:
+            bot = top + 1
+
+    bw, bh = right - left, bot - top
+    # Pad with unknown-grey where the window falls outside the grid.
+    canvas = Image.new("RGB", (bw, bh), _C_UNKNOWN)
+    sl, sr = max(0, left), min(w, right)
+    st, sb = max(0, top), min(h, bot)
+    if sr > sl and sb > st:
+        canvas.paste(full.crop((sl, st, sr, sb)), (sl - left, st - top))
+
+    scale = max(1, int(max_dim)) / float(max(bw, bh))
+    out_w = max(1, int(round(bw * scale)))
+    out_h = max(1, int(round(bh * scale)))
+    img = canvas.resize((out_w, out_h), Image.NEAREST)
+
+    # View origin taken from the rounded crop box so overlays align exactly with
+    # the background: bottom-left world corner + view height in cells.
     frame = _Frame(
-        origin_x=float(grid_info["origin_x"]),
-        origin_y=float(grid_info["origin_y"]),
-        resolution=float(grid_info["resolution"]),
-        height=h,
+        origin_x=ox + left * res,
+        origin_y=oy + (h - bot) * res,
+        resolution=res,
+        height=bh,
         scale=scale,
         out_w=out_w,
         out_h=out_h,
@@ -243,7 +322,8 @@ def render_nav_view(
     if bg is None:
         return _placeholder("nav-camera: waiting for costmap / map...")
 
-    img, frame = _build_frame(bg, opts.max_dim)
+    window = _compute_window(snapshot, opts, bg)
+    img, frame = _build_frame(bg, opts.max_dim, window)
     img = img.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)

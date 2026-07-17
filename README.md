@@ -297,6 +297,15 @@ It reads directly from the running navigation service's in-process bridge (found
 - `navigation` (**required**) — the name of the `navigation` / `navigation-external` service to visualize. It is also declared as a dependency so it starts first.
 - Optional: `max_dim` (longest output edge in px, default `700`), `plan_history_len` (faded trail length, default `8`), `robot_radius_m` (footprint fallback + pose-arrow size, default `0.22`), and per-overlay toggles `show_global_plan` / `show_local_plan` / `show_pose` / `show_footprint` / `show_goal` / `show_history` (all default `true`).
 
+**Windowing** — by default the camera renders the whole map. `window_mode` crops/zooms it:
+- `"full"` (default) — the entire occupancy grid.
+- `"follow"` — a `window_size_m`-metre **square that tracks the robot** (falls back to the goal, then the grid centre, if there's no pose yet). Best for large maps where the whole grid is too zoomed-out to see the plan. `window_size_m` defaults to `6.0`.
+- `"region"` — a fixed map-frame bounding box from `window_min_x` / `window_min_y` / `window_max_x` / `window_max_y` (metres). Best for watching one fixed spot (e.g. a doorway). If any bound is missing it falls back to `"full"`.
+
+```json
+{ "navigation": "nav", "window_mode": "follow", "window_size_m": 5.0 }
+```
+
 Until Nav2 has published a costmap (bringup is asynchronous), the camera returns a placeholder frame.
 
 `DoCommand`:

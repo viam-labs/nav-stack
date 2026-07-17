@@ -912,9 +912,21 @@ class NavCameraConfig:
     show_footprint: bool = True
     show_goal: bool = True
     show_history: bool = True
+    # Windowing: "full" (whole map), "follow" (window_size_m square tracking the
+    # robot), or "region" (fixed map-frame bbox from window_{min,max}_{x,y}).
+    window_mode: str = "full"
+    window_size_m: float = 6.0
+    window_min_x: Optional[float] = None
+    window_min_y: Optional[float] = None
+    window_max_x: Optional[float] = None
+    window_max_y: Optional[float] = None
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "NavCameraConfig":
+        def _optf(key: str) -> Optional[float]:
+            v = d.get(key)
+            return None if v is None else float(v)
+
         return cls(
             navigation=d["navigation"],
             max_dim=int(d.get("max_dim", 700)),
@@ -926,6 +938,12 @@ class NavCameraConfig:
             show_footprint=bool(d.get("show_footprint", True)),
             show_goal=bool(d.get("show_goal", True)),
             show_history=bool(d.get("show_history", True)),
+            window_mode=str(d.get("window_mode", "full")).lower(),
+            window_size_m=float(d.get("window_size_m", 6.0)),
+            window_min_x=_optf("window_min_x"),
+            window_min_y=_optf("window_min_y"),
+            window_max_x=_optf("window_max_x"),
+            window_max_y=_optf("window_max_y"),
         )
 
     def required_dependencies(self) -> List[str]:
