@@ -36,6 +36,7 @@ from ..nav.global_localize import (
     load_occupancy_from_bridge_map,
     load_occupancy_from_map_dir,
 )
+from ..nav.annotations import AnnotationStore
 from ..nav.maps import MapStore, validate_map_name
 from ..ros import conversions as conv
 from ..ros.bridge import IOProvider
@@ -1094,6 +1095,13 @@ class RosSlam(SLAM):
         )
 
     # -- DoCommand -----------------------------------------------------------
+    def _annotations(self) -> AnnotationStore:
+        """GeoJSON annotation store for the active map (no_go / slow_down / label)."""
+        handle = self._map_store.active_handle() if self._map_store else None
+        if handle is None:
+            raise RuntimeError("no active map; create/select one first")
+        return AnnotationStore(handle.annotations_path)
+
     async def do_command(
         self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None, **kwargs
     ) -> Mapping[str, ValueTypes]:
@@ -1256,6 +1264,18 @@ class RosSlam(SLAM):
         if cmd == "set_active_map":
             store.set_active_map(str(command["map"]))
             return {"map": store.get_active_map_name()}
+
+        # -- annotations (GeoJSON no_go / slow_down / label) — rtabmap-compatible
+        if cmd == "get_annotations":
+            return {"annotations": self._annotations().feature_collection()}
+        if cmd == "set_annotations":
+            return {"ids": self._annotations().set_all(dict(command["annotations"]))}
+        if cmd == "add_annotation":
+            return {"id": self._annotations().add(dict(command["annotation"]))}
+        if cmd == "update_annotation":
+            return {"updated": self._annotations().update(dict(command["annotation"]))}
+        if cmd == "delete_annotation":
+            return {"deleted": self._annotations().delete(str(command["id"]))}
         if cmd == "rename_map":
             handle = store.rename_map(str(command["map"]), str(command["new_name"]))
             return {"map": handle.name}

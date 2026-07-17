@@ -22,7 +22,6 @@ from typing import Mapping, Optional
 from viam.components.base import Base
 from viam.logging import getLogger
 from viam.proto.common import Vector3
-from viam.services.generic import Generic
 from viam.utils import ValueTypes
 
 from ..config import OMNI, Nav2Config, NavConfig, ros_cmd_vel_to_viam_linear_mm_s
@@ -43,10 +42,17 @@ LOGGER = getLogger(__name__)
 _PARAMS_TEMPLATE = Path(__file__).resolve().parent.parent.parent / "params" / "nav2_params.yaml"
 
 
-class NavServiceBase(Generic):
-    """Runtime-agnostic Nav2 orchestration shared by the navigation models.
+class NavCoreMixin:
+    """API-agnostic Nav2 orchestration shared by the navigation models.
 
-    Subclasses must implement :meth:`_resolve_runtime` (return the active
+    Mixed in alongside a concrete Viam service base — ``Generic`` for the
+    ``navigation`` / ``navigation-external`` DoCommand models, ``Navigation`` for
+    the ``navigation-service`` model — via cooperative ``super().__init__``. It
+    holds no service-API surface itself, only the shared logic (Nav2 params,
+    locations/zones, go/navigate, cancel, status, simple motion) operating on a
+    resolved ``SlamRuntime`` + ``NavConfig``.
+
+    Concrete classes must implement :meth:`_resolve_runtime` (return the active
     ``SlamRuntime`` or ``None``) and :meth:`reconfigure`.
     """
 
@@ -135,7 +141,7 @@ class NavServiceBase(Generic):
     def _zones(self) -> ZoneStore:
         return ZoneStore(self._active_handle().zones_path)
 
-    def _refresh_zone_masks(self) -> None:
+    def _publish_masks(self, zone_list) -> None:
         runtime = self._require_runtime()
         node = runtime.manager.node
         grid = node.get_map() if node else None
@@ -145,10 +151,56 @@ class NavServiceBase(Generic):
         h, w = grid["grid"].shape
         res = grid["resolution"]
         ox, oy = grid["origin_x"], grid["origin_y"]
-        zone_list = self._zones().list()
         keepout = zones_mod.rasterize_zones(zone_list, zones_mod.KEEPOUT, w, h, res, ox, oy)
         speed = zones_mod.rasterize_zones(zone_list, zones_mod.SPEED_LIMIT, w, h, res, ox, oy)
         runtime.manager.publish_zone_masks(keepout, speed, res, ox, oy)
+
+    def _refresh_zone_masks(self) -> None:
+        """Publish masks from the local zone store (used on reconfigure)."""
+        self._publish_masks(self._zones().list())
+
+    # -- annotations (no_go / slow_down from the SLAM source) ----------------
+    async def _get_annotations(self) -> dict:
+        """Latest annotation FeatureCollection. Overridden per model (built-in
+        reads nav-stack:slam's store; external reads the SLAM dep). Default: none."""
+        return {}
+
+    async def _annotation_zones(self):
+        """Annotation no_go/slow_down features -> transient Zone objects for
+        rasterization (slow_down max_speed_m_s -> speed_pct via max_vel_x)."""
+        fc = await self._get_annotations()
+        if not fc:
+            return []
+        from ..nav import annotations as ann
+        from ..nav.zones import Zone
+
+        max_vel = max(float(self._require_cfg().max_vel_x), 1e-6)
+        zones = [
+            Zone(name=f"__ann_nogo_{i}", type=zones_mod.KEEPOUT, geometry=geom)
+            for i, geom in enumerate(ann.no_go_polygons(fc))
+        ]
+        for i, (geom, mps) in enumerate(ann.slow_down_regions(fc)):
+            pct = max(1.0, min(100.0, mps / max_vel * 100.0))
+            zones.append(
+                Zone(
+                    name=f"__ann_slow_{i}",
+                    type=zones_mod.SPEED_LIMIT,
+                    geometry=geom,
+                    speed_pct=pct,
+                )
+            )
+        return zones
+
+    async def _apply_annotations(self) -> None:
+        """Rasterize local zones + current annotations into the costmap masks."""
+        self._publish_masks(self._zones().list() + await self._annotation_zones())
+
+    async def _navigate(self, x: float, y: float, theta: float) -> None:
+        """Every Nav2 goal routes through here: refresh masks from the latest
+        annotations (so the plan respects them), then send the goal."""
+        await self._apply_annotations()
+        await asyncio.sleep(0.3)  # let the costmap filter integrate the fresh masks
+        await asyncio.to_thread(self._require_runtime().manager.navigate, x, y, theta)
 
     # -- DoCommand -----------------------------------------------------------
     async def do_command(
@@ -223,14 +275,24 @@ class NavServiceBase(Generic):
         # stalls TF/scans (Nav2 extrapolation errors) and deadlocks stop_base.
         if cmd == "navigate_to_location":
             loc = self._locations().get(str(command["name"]))
-            await asyncio.to_thread(mgr.navigate, loc.x, loc.y, loc.theta)
+            await self._navigate(loc.x, loc.y, loc.theta)
             return {"status": "navigating", "target": loc.to_dict()}
         if cmd == "navigate_to_point":
             x = float(command["x"])
             y = float(command["y"])
             theta = float(command.get("theta", 0.0))
-            await asyncio.to_thread(mgr.navigate, x, y, theta)
+            await self._navigate(x, y, theta)
             return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
+        if cmd == "plan_to_label":
+            label = str(command["label"])
+            from ..nav import annotations as ann
+
+            pts = ann.labels(await self._get_annotations())
+            if label not in pts:
+                raise ValueError(f"no 'label' annotation named {label!r}")
+            x, y = pts[label]
+            await self._navigate(x, y, float(command.get("theta", 0.0)))
+            return {"status": "navigating", "label": label, "target": {"x": x, "y": y}}
         if cmd == "go_to_location":
             loc = self._locations().get(str(command["name"]))
             return await self._start_simple_go(loc.x, loc.y, loc.theta, command)

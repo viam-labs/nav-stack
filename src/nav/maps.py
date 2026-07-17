@@ -86,6 +86,10 @@ class MapHandle:
         return self.root / "zones.json"
 
     @property
+    def annotations_path(self) -> Path:
+        return self.root / "annotations.json"
+
+    @property
     def occupancy_yaml_path(self) -> Path:
         return self.root / "map.yaml"
 

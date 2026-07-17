@@ -9,8 +9,8 @@ This module (`viam-labs:nav-stack`) provides three models:
 | Model | API | Purpose |
 | --- | --- | --- |
 | `viam-labs:nav-stack:slam` | `rdk:service:slam` | Mapping + localization via slam_toolbox. Standard SLAM API (live map, position) + map management. |
-| `viam-labs:nav-stack:navigation` | `rdk:service:generic` | Nav2 navigation: named locations, go-to-point, keepout/speed zones, obstacle avoidance, all via `DoCommand`. |
-| `viam-labs:nav-stack:navigation-external` | `rdk:service:generic` | Same Nav2 navigation, driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
+| `viam-labs:nav-stack:navigation` | `rdk:service:navigation` | Nav2 navigation via the standard Navigation API (modes, waypoints, paths, obstacles) + rich `DoCommand` (locations, zones, go-to-point, plan-to-label). Built-in slam_toolbox runtime. |
+| `viam-labs:nav-stack:navigation-external` | `rdk:service:navigation` | Same as `navigation`, but driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
 
 ## How it works
 
@@ -207,10 +207,12 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
 
 ### Navigation service
 
+`viam-labs:nav-stack:navigation` implements the standard `rdk:service:navigation` API (so any Navigation-API client — e.g. a webapp — can drive it) plus a rich `DoCommand` surface. It runs Nav2 against the built-in SLAM model's shared runtime (`slam_service` names a `viam-labs:nav-stack:slam` service).
+
 ```json
 {
   "name": "nav",
-  "api": "rdk:service:generic",
+  "api": "rdk:service:navigation",
   "model": "viam-labs:nav-stack:navigation",
   "attributes": {
     "slam_service": "slam",
@@ -229,13 +231,11 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
 }
 ```
 
-Set `"kinematics": "omni"` and a non-zero `max_vel_y` for omnidirectional bases.
-
-The files under [`params/`](params/) are **reference defaults** shipped with the module; runtime params are generated from your Viam service attributes.
+Set `"kinematics": "omni"` and a non-zero `max_vel_y` for omnidirectional bases. The files under [`params/`](params/) are **reference defaults**; runtime params are generated from your service attributes. See [Navigation API + DoCommand](#navigation-api--docommand) for the full method/command surface (shared with `navigation-external`).
 
 ### Navigation with an external SLAM service
 
-Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:service:slam` (for example a third-party RTAB-Map module), instead of the bundled `slam_toolbox`. Same DoCommand surface as `navigation`; the difference is that this model runs its **own** sensor bridge and bridges the external SLAM's pose + occupancy grid into ROS:
+Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:service:slam` (for example a third-party RTAB-Map module), instead of the bundled `slam_toolbox`. Same `rdk:service:navigation` API + DoCommand surface as `navigation`; the difference is that this model runs its **own** sensor bridge and bridges the external SLAM's pose + occupancy grid into ROS:
 
 - `slam_service` names an `rdk:service:slam` dependency. The adapter calls its standard `GetPosition()` (→ `map → odom` TF) and a `get_grid` DoCommand returning `{rows, cols, xMin, yMin, cellSize, data}` with int8 cells (`-1`/`0`/`100`) (→ `/map` OccupancyGrid). No point-cloud rasterization.
 - Because the external SLAM does not publish `/scan` or `/odom`, you configure the sensor bridge here too — `lidars` (Viam `camera` components, projected to `/scan`) and `movement_sensor`. It reuses the same bridge + odometry fusion as the SLAM model.
@@ -244,7 +244,7 @@ Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:se
 ```json
 {
   "name": "nav",
-  "api": "rdk:service:generic",
+  "api": "rdk:service:navigation",
   "model": "viam-labs:nav-stack:navigation-external",
   "attributes": {
     "slam_service": "rtabmap",
@@ -262,6 +262,42 @@ Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:se
 ```
 
 Optional attributes: `trust_movement_sensor_pose` (default `false`), `snap_heading` (default `false`), plus the same bridge/odometry tuning fields as the SLAM service and the same `nav2` block as `navigation`. The built-in `navigation` model is unchanged; use it when you map with `nav-stack:slam`.
+
+### Navigation API + DoCommand
+
+Both `navigation` and `navigation-external` implement the same `rdk:service:navigation` API + `DoCommand` surface.
+
+**Coordinate overload:** the map is not georeferenced — `GeoPoint.latitude` carries map-frame **x** metres and `GeoPoint.longitude` carries **y** metres. `GetLocation`, waypoints, and `GetObstacles` all use this (matches the convention of compatible Navigation modules, so a webapp built against one drives this backend unchanged).
+
+**Standard API:**
+- `GetLocation` → robot pose as a `GeoPoint` (lat=x, lng=y).
+- `GetMode` / `SetMode` — `MANUAL` (cancel + stop) or `WAYPOINT` (drive the queue in order). `EXPLORE` is unsupported.
+- `AddWaypoint` / `GetWaypoints` / `RemoveWaypoint` — the waypoint queue.
+- `GetPaths` — remaining waypoints as the path (true Nav2 `/plan` is a follow-up).
+- `GetObstacles` — `no_go`/`slow_down` annotations + local keepout zones as `GeoGeometry` (AABB).
+- `GetProperties` → `MAP_TYPE_NONE`.
+
+**DoCommand** (extras beyond the standard API):
+- Locations/zones CRUD, `go_to_point`/`go_to_location` (simple closed-loop), `navigate_to_point`/`navigate_to_location` (Nav2), `cancel`, `get_status`, `start_nav2`/`restart_nav2`.
+- `plan_to_label` `{label}` — navigate to a `label` annotation.
+- `replan` — refresh annotation masks + return the current polyline.
+- `clear_waypoints` — empty the queue.
+- `get_motors_enabled` / `set_motors_enabled {enabled}` — plan-preview gate: when disabled, Nav2 still plans + publishes `cmd_vel` but the base is **not** driven (robot stays put).
+- `get_planner_config` / `set_planner_config {inflation_radius, allow_unknown}` — set regenerates params + restarts Nav2.
+
+### Annotations (no-go / slow-down / labels)
+
+The **SLAM service** hosts annotations (GeoJSON-shaped, per-map, local map-frame metres) via `DoCommand`, mirroring the RTAB-Map module's schema:
+
+| Command | Args | Result |
+|---|---|---|
+| `get_annotations` | `{}` | `{annotations: FeatureCollection}` |
+| `set_annotations` | `{annotations: FeatureCollection}` | `{ids: [...]}` (bulk replace) |
+| `add_annotation` | `{annotation: Feature}` | `{id: "<uuid>"}` |
+| `update_annotation` | `{annotation: Feature}` | `{updated: bool}` |
+| `delete_annotation` | `{id}` | `{deleted: bool}` |
+
+Kinds: `no_go` (Polygon → keepout), `slow_down` (Polygon + `max_speed_m_s` → speed cap), `label` (Point → named goal for `plan_to_label`). The navigation service reads annotations from its SLAM source (built-in: nav-stack:slam's store; external: the SLAM dep's `get_annotations`) and applies `no_go`/`slow_down` to the Nav2 costmap masks **lazily on each plan** (so the latest annotations always apply). `slow_down` `max_speed_m_s` is converted to a percentage of `max_vel_x`.
 
 ## Workflows
 

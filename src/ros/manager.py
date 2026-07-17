@@ -1113,6 +1113,13 @@ class RosManager:
         if self._node is not None:
             self._node.cancel_nav()
 
+    def motors_enabled(self) -> bool:
+        return self._node.motors_enabled() if self._node is not None else True
+
+    def set_motors_enabled(self, enabled: bool) -> None:
+        if self._node is not None:
+            self._node.set_motors_enabled(enabled)
+
     def nav_status(self) -> Dict:
         if self._node is None:
             return {"state": "idle", "active": False}

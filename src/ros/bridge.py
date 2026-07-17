@@ -108,6 +108,9 @@ class BridgeNode(Node):
 
         self._frames = slam_cfg.frames
         self._nav_active = False
+        # Plan-preview gate: when False, Nav2 still plans + publishes cmd_vel but
+        # the bridge withholds set_velocity so the base stays put.
+        self._motors_enabled = True
         self._last_cmd_time = 0.0
         self._last_odom_stamp = None
         self._cmd_timeout = nav_cfg.cmd_vel_timeout if nav_cfg else 0.5
@@ -1369,6 +1372,8 @@ class BridgeNode(Node):
             self._pending_cmd_vel = None
         if pending is None or not self._nav_active:
             return
+        if not self._motors_enabled:
+            return  # plan-preview: cmd_vel consumed but not forwarded to the base
         vx, vy, vtheta = pending
         # Snap near-zero commands so the MiR does not creep past the goal.
         if abs(vx) < 0.03 and abs(vy) < 0.03 and abs(vtheta) < 0.05:
@@ -1413,6 +1418,20 @@ class BridgeNode(Node):
     def set_nav_config(self, nav_cfg: NavConfig) -> None:
         self._nav_cfg = nav_cfg
         self._cmd_timeout = nav_cfg.cmd_vel_timeout
+
+    def motors_enabled(self) -> bool:
+        return self._motors_enabled
+
+    def set_motors_enabled(self, enabled: bool) -> None:
+        self._motors_enabled = bool(enabled)
+        if not self._motors_enabled:
+            # Halt now if mid-motion; set_velocity is latched otherwise.
+            with self._cmd_vel_lock:
+                self._pending_cmd_vel = None
+            try:
+                self._run(self._io.stop_base())
+            except Exception:  # noqa: BLE001
+                pass
 
     def set_nav_active(self, active: bool) -> None:
         self._nav_active = active
