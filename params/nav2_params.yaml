@@ -45,10 +45,12 @@ controller_server:
     use_realtime_priority: false
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      # MiR rosbridge latency can make motion look stalled for several seconds
-      # even when the controller is commanding; give slow platforms more time.
+      # MiR rosbridge latency can make motion look stalled for a few seconds
+      # even when the controller is commanding. 10 s (not stock 30) still
+      # tolerates that without sitting in reverse/spin recoveries forever.
+      # Overridable via nav2.progress_movement_time_allowance.
       required_movement_radius: 0.25
-      movement_time_allowance: 30.0
+      movement_time_allowance: 10.0
     general_goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"

@@ -229,11 +229,22 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
     "nav2": {
       "xy_goal_tolerance": 0.25,
       "local_costmap_width": 4.0,
-      "cost_scaling_factor": 3.0
+      "cost_scaling_factor": 3.0,
+      "replan_frequency": 2.0,
+      "progress_movement_time_allowance": 10.0,
+      "navigate_recovery_retries": 4,
+      "recovery_wait_duration": 2.0
     }
   }
 }
 ```
+
+`nav2.replan_frequency` (default **2 Hz**, up from Nav2's stock 1 Hz) rewrites the
+navigate-to-pose behavior tree so global plans refresh more often.
+`progress_movement_time_allowance` (default **10 s**, down from 30) and
+`navigate_recovery_retries` / `recovery_wait_duration` exit reverse/spin recovery
+loops sooner. After changing these, run `restart_nav2` (or reconfigure) so the
+generated BT + params reload.
 
 Set `"kinematics": "omni"` and a non-zero `max_vel_y` for omnidirectional bases.
 
@@ -386,6 +397,12 @@ await nav.do_command({"command": "navigate_to_point", "x": 3.5, "y": -1.0})
 await nav.do_command({"command": "get_status"})
 # get_status includes last_cmd_vel plus cmd_vel_history (last ~20 distinct
 # ROS/Viam SetVelocity samples, oldest→newest — survives cancel/stop zeros)
+# Plain-English snapshot of what nav is commanding right now (returns immediately):
+# await nav.do_command({"command": "describe_motion"})
+# → {"summary": "Nav2 navigating (goal 'kitchen' is about 2.5 m ahead and to the
+#    right): driving forward at moderate speed while turning hard right for
+#    about 3.0 s — closing distance toward the goal, steering toward the goal",
+#    "goal_relative": "...", "toward_goal": "...", ...}
 # Probe the Nav2 SetVelocity path without navigating:
 # await nav.do_command({"command": "test_drive", "vx": 0.5, "angular_z_deg_s": 57.3, "duration_s": 2})
 await nav.do_command({"command": "cancel"})

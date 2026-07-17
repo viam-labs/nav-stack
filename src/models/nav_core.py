@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
+import re
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -29,6 +31,7 @@ from ..config import OMNI, Nav2Config, NavConfig, ros_cmd_vel_to_viam_linear_mm_
 from ..nav import zones as zones_mod
 from ..nav.locations import LocationStore
 from ..nav.maps import MapHandle
+from ..nav.motion_summary import summarize_nav_motion
 from ..nav.simple_motion import (
     ObstacleConfig,
     SimpleMotionCanceled,
@@ -41,6 +44,11 @@ from ..nav.zones import ZoneStore
 LOGGER = getLogger(__name__)
 
 _PARAMS_TEMPLATE = Path(__file__).resolve().parent.parent.parent / "params" / "nav2_params.yaml"
+_BT_FALLBACK = (
+    Path(__file__).resolve().parent.parent.parent
+    / "params"
+    / "navigate_to_pose_w_replanning_and_recovery.xml"
+)
 
 
 class NavServiceBase(Generic):
@@ -57,6 +65,8 @@ class NavServiceBase(Generic):
         self._simple_nav_task: Optional[asyncio.Task] = None
         self._simple_nav_cancel: Optional[asyncio.Event] = None
         self._simple_nav_status: dict = {"state": "idle", "motion": "simple"}
+        # Optional label (e.g. location name) merged into status["goal"].
+        self._active_goal_name: Optional[str] = None
 
     # -- runtime resolution (subclass-specific) ------------------------------
     def _resolve_runtime(self):
@@ -114,9 +124,21 @@ class NavServiceBase(Generic):
 
         runtime = self._resolve_runtime()
         _set_obstacle_sources(params, len(runtime.slam_cfg.lidars))
+        runtime_dir = Path(runtime.slam_cfg.maps_dir).expanduser() / ".runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        bt_path = _write_nav2_bt_xml(runtime_dir, cfg.nav2)
+        try:
+            bt_params = params.setdefault("bt_navigator", {}).setdefault(
+                "ros__parameters", {}
+            )
+            # Honor an explicit user BT path from nav2_params; otherwise point
+            # at the tuned tree generated from replan_frequency / recovery knobs.
+            if not bt_params.get("default_nav_to_pose_bt_xml"):
+                bt_params["default_nav_to_pose_bt_xml"] = str(bt_path)
+        except (AttributeError, TypeError):
+            pass
         _validate_nav2_params_structure(params)
-        out = Path(runtime.slam_cfg.maps_dir).expanduser() / ".runtime" / "nav2_params.yaml"
-        out.parent.mkdir(parents=True, exist_ok=True)
+        out = runtime_dir / "nav2_params.yaml"
         with open(out, "w") as fh:
             yaml.safe_dump(params, fh, sort_keys=False)
         return out
@@ -223,29 +245,34 @@ class NavServiceBase(Generic):
         # stalls TF/scans (Nav2 extrapolation errors) and deadlocks stop_base.
         if cmd == "navigate_to_location":
             loc = self._locations().get(str(command["name"]))
+            self._active_goal_name = loc.name
             await asyncio.to_thread(mgr.navigate, loc.x, loc.y, loc.theta)
             return {"status": "navigating", "target": loc.to_dict()}
         if cmd == "navigate_to_point":
             x = float(command["x"])
             y = float(command["y"])
             theta = float(command.get("theta", 0.0))
+            self._active_goal_name = None
             await asyncio.to_thread(mgr.navigate, x, y, theta)
             return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
         if cmd == "go_to_location":
             loc = self._locations().get(str(command["name"]))
+            self._active_goal_name = loc.name
             return await self._start_simple_go(loc.x, loc.y, loc.theta, command)
         if cmd == "go_to_point":
             x = float(command["x"])
             y = float(command["y"])
             theta = float(command.get("theta", 0.0))
+            self._active_goal_name = None
             return await self._start_simple_go(x, y, theta, command)
         if cmd == "cancel":
+            self._active_goal_name = None
             await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.cancel)
             return {"status": "canceled"}
         if cmd == "test_drive":
             return await self._test_drive(command)
-        if cmd == "get_status":
+        if cmd in ("get_status", "describe_motion", "what_am_i_doing"):
             def _status():
                 status = mgr.nav_status()
                 status.update(mgr.nav2_diagnostics())
@@ -254,10 +281,27 @@ class NavServiceBase(Generic):
                 if simple.get("state") == "active":
                     status["active"] = True
                     status["motion"] = "simple"
+                    # Prefer simple-nav target when active (Nav2 goal may be stale).
+                    target = simple.get("target")
+                    if isinstance(target, dict):
+                        status["goal"] = dict(target)
+                goal = status.get("goal")
+                if isinstance(goal, dict) and self._active_goal_name:
+                    goal = dict(goal)
+                    goal["name"] = self._active_goal_name
+                    status["goal"] = goal
                 status["localization_check"] = dict(runtime.localization_check)
                 return status
 
-            return await asyncio.to_thread(_status)
+            status = await asyncio.to_thread(_status)
+            if cmd == "get_status":
+                return status
+            cfg = self._require_cfg()
+            return summarize_nav_motion(
+                status,
+                max_vel_x=float(cfg.max_vel_x),
+                max_vel_theta=float(cfg.max_vel_theta),
+            )
         if cmd == "start_nav2":
             cfg = self._require_cfg()
             runtime.manager.set_nav_config(cfg)
@@ -664,6 +708,66 @@ def _apply_local_costmap_size(params: dict, nav2_cfg: Nav2Config) -> None:
         return
     lc["width"] = int(nav2_cfg.local_costmap_width)
     lc["height"] = int(nav2_cfg.local_costmap_height)
+
+
+def _resolve_bt_template() -> Path:
+    """Prefer the distro-installed Nav2 BT; fall back to the shipped Jazzy copy."""
+    distro = os.environ.get("ROS_DISTRO", "").strip()
+    if distro:
+        candidate = Path(
+            f"/opt/ros/{distro}/share/nav2_bt_navigator/behavior_trees"
+            "/navigate_to_pose_w_replanning_and_recovery.xml"
+        )
+        if candidate.is_file():
+            return candidate
+    return _BT_FALLBACK
+
+
+def _tune_nav2_bt_xml(
+    text: str,
+    *,
+    replan_hz: float,
+    navigate_recovery_retries: int,
+    recovery_wait_duration: float,
+) -> str:
+    """Rewrite replan rate / recovery patience fields in a Nav2 BT XML string."""
+    hz = max(0.1, float(replan_hz))
+    retries = max(0, int(navigate_recovery_retries))
+    wait_s = max(0.0, float(recovery_wait_duration))
+    text = re.sub(
+        r'(RateController\s+hz=")[^"]+(")',
+        rf"\g<1>{hz:.1f}\g<2>",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r'(RecoveryNode\s+number_of_retries=")[^"]+("\s+name="NavigateRecovery")',
+        rf"\g<1>{retries}\g<2>",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r'(Wait\s+wait_duration=")[^"]+(")',
+        rf"\g<1>{wait_s:.1f}\g<2>",
+        text,
+        count=1,
+    )
+    return text
+
+
+def _write_nav2_bt_xml(runtime_dir: Path, nav2_cfg: Nav2Config) -> Path:
+    """Write a navigate-to-pose BT tuned from ``nav2`` config into ``runtime_dir``."""
+    template = _resolve_bt_template()
+    text = template.read_text(encoding="utf-8")
+    text = _tune_nav2_bt_xml(
+        text,
+        replan_hz=nav2_cfg.replan_frequency,
+        navigate_recovery_retries=nav2_cfg.navigate_recovery_retries,
+        recovery_wait_duration=nav2_cfg.recovery_wait_duration,
+    )
+    out = runtime_dir / "navigate_to_pose_w_replanning_and_recovery.xml"
+    out.write_text(text, encoding="utf-8")
+    return out
 
 
 def _set_obstacle_sources(params: Mapping, n_lidars: int) -> None:

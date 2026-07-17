@@ -130,9 +130,12 @@ def test_suppress_jazzy_nav2_extras_pkill_patterns():
     # Window 0 makes the background reaper a no-op, so only the initial
     # synchronous sweep runs and the call count stays deterministic.
     mgr._SUPPRESS_WINDOW_S = 0.0
+    mgr._SUPPRESS_STOCK_LM_WAIT_S = 0.0
     with patch.object(mgr, "_ros_env", return_value={"PATH": "/usr/bin"}), patch(
         "src.ros.manager.time.sleep"
-    ), patch("src.ros.manager.subprocess.run") as run:
+    ), patch.object(mgr, "_pgrep_f", return_value=False), patch(
+        "src.ros.manager.subprocess.run"
+    ) as run:
         mgr._suppress_jazzy_nav2_extras()
     assert run.call_count == 2
     patterns = [call.args[0][2] for call in run.call_args_list]
@@ -143,6 +146,7 @@ def test_suppress_jazzy_nav2_extras_pkill_patterns():
 def test_suppress_jazzy_nav2_extras_reaps_over_window():
     mgr = _manager()
     mgr._SUPPRESS_WINDOW_S = 5.0
+    mgr._SUPPRESS_STOCK_LM_WAIT_S = 0.0
     reaped = threading.Event()
     call_count = {"n": 0}
 
@@ -156,9 +160,32 @@ def test_suppress_jazzy_nav2_extras_reaps_over_window():
 
     with patch.object(mgr, "_ros_env", return_value={"PATH": "/usr/bin"}), patch(
         "src.ros.manager.time.sleep"
-    ), patch("src.ros.manager.subprocess.run", side_effect=_fake_run):
+    ), patch.object(mgr, "_pgrep_f", return_value=False), patch(
+        "src.ros.manager.subprocess.run", side_effect=_fake_run
+    ):
         mgr._suppress_jazzy_nav2_extras()
         assert reaped.wait(timeout=5.0)
+
+
+def test_suppress_waits_while_stock_lifecycle_manager_alive():
+    mgr = _manager()
+    mgr._SUPPRESS_WINDOW_S = 0.0
+    mgr._SUPPRESS_STOCK_LM_WAIT_S = 5.0
+    alive_checks = {"n": 0}
+
+    def _pgrep(pattern: str) -> bool:
+        alive_checks["n"] += 1
+        # First few checks see the stock LM; then it disappears.
+        return alive_checks["n"] < 3
+
+    with patch.object(mgr, "_ros_env", return_value={"PATH": "/usr/bin"}), patch(
+        "src.ros.manager.time.sleep"
+    ), patch.object(mgr, "_pgrep_f", side_effect=_pgrep), patch(
+        "src.ros.manager.subprocess.run"
+    ) as run:
+        mgr._suppress_jazzy_nav2_extras()
+    assert alive_checks["n"] >= 3
+    assert run.call_count >= 2
 
 
 def test_start_nav2_rotates_previous_launch_log(tmp_path):
@@ -176,7 +203,9 @@ def test_start_nav2_rotates_previous_launch_log(tmp_path):
         mgr, "_popen", return_value=proc
     ), patch.object(mgr, "_wait_for_nav_action", return_value=True), patch.object(
         mgr, "_suppress_jazzy_nav2_extras"
-    ), patch.object(mgr, "_apply_slam_tf_params"), patch.object(
+    ), patch.object(mgr, "_wait_for_required_nav_nodes", return_value=True), patch.object(
+        mgr, "_apply_slam_tf_params"
+    ), patch.object(
         mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout="", stderr="")
     ):
         mgr.start_nav2(nav_cfg, params_path)
@@ -216,11 +245,15 @@ def test_start_nav2_disables_collision_monitor_launch_arg(tmp_path):
     ) as popen, patch.object(mgr, "_wait_for_nav_action", return_value=False), patch.object(
         mgr, "_suppress_jazzy_nav2_extras"
     ) as suppress, patch.object(
+        mgr, "_wait_for_required_nav_nodes", return_value=True
+    ) as wait_nodes, patch.object(
         mgr, "_apply_slam_tf_params"
     ) as apply_tf, patch.object(
         mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout="", stderr="")
     ):
         mgr.start_nav2(nav_cfg, params_path)
+
+    wait_nodes.assert_called_once()
 
     suppress.assert_called_once()
     apply_tf.assert_called_once()

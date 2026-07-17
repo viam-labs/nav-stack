@@ -415,6 +415,7 @@ class BridgeNode(Node):
         self._executor_queue: List = []
         self._last_feedback: Dict = {}
         self._last_result_status: Optional[str] = None
+        self._active_nav_goal: Optional[Dict[str, float]] = None
 
         # External SLAM bridging: when navigation is driven by an arbitrary Viam
         # SLAM service (not the built-in slam_toolbox), this publishes /map +
@@ -1864,6 +1865,7 @@ class BridgeNode(Node):
             stderr=subprocess.STDOUT,
             text=True,
         )
+        self._active_nav_goal = {"x": float(x), "y": float(y), "theta": float(theta)}
         self._last_result_status = "active"
         self.set_nav_active(True)
         threading.Thread(
@@ -1920,6 +1922,7 @@ class BridgeNode(Node):
             self._viz_plan_history.clear()
             self._viz_global_plan = ()
 
+        self._active_nav_goal = {"x": float(x), "y": float(y), "theta": float(theta)}
         self._last_result_status = "active"
         self.set_nav_active(True)
         send_future = self._nav_action.send_goal_async(
@@ -1982,11 +1985,14 @@ class BridgeNode(Node):
         self._last_result_status = "canceled"
 
     def nav_status(self) -> Dict:
+        pose = self.get_pose_in_map()
         return {
             "state": self._last_result_status or "idle",
             "active": self._nav_active,
             "last_cmd_vel": self.last_cmd_vel(),
             "cmd_vel_history": self.cmd_vel_history(),
+            "goal": dict(self._active_nav_goal) if self._active_nav_goal else None,
+            "pose": self._pose_dict(pose) if pose is not None else None,
             **self._last_feedback,
         }
 

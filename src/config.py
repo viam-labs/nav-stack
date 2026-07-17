@@ -182,12 +182,24 @@ class Nav2Config:
     # template, so a stale default here silently clobbers template retuning.
     # 10 Hz (not Nav2's stock 20) keeps MPPI within a Pi 5's budget.
     controller_frequency: float = 10.0  # Hz
+    # Global replan rate (BT RateController). Stock Nav2 is 1 Hz; 2 Hz reacts
+    # faster to blocked/stale paths without thrashing a Pi + slam_toolbox.
+    replan_frequency: float = 2.0  # Hz
+    # Progress checker: how long with almost no movement before FollowPath
+    # fails into recovery. Stock template was 30 s (very patient); 10 s exits
+    # reverse/spin loops sooner on stuck carts.
+    progress_movement_time_allowance: float = 10.0  # seconds
+    # Outer NavigateRecovery retries (spin/backup/wait/clear cycle). Stock is 6.
+    navigate_recovery_retries: int = 4
+    # Wait behavior duration inside the recovery RoundRobin (stock 5 s).
+    recovery_wait_duration: float = 2.0  # seconds
 
     def to_override_dict(self) -> dict:
         """Flat leaf keys applied to the generated Nav2 params template.
 
         Costmap width/height are applied separately as integers (Jazzy rejects
-        doubles for those parameters).
+        doubles for those parameters). Replan / recovery-retry knobs are applied
+        by rewriting the navigate-to-pose behavior tree XML, not here.
         """
         return {
             "xy_goal_tolerance": self.xy_goal_tolerance,
@@ -196,6 +208,7 @@ class Nav2Config:
             "cost_scaling_factor": self.cost_scaling_factor,
             "resolution": self.costmap_resolution,
             "controller_frequency": self.controller_frequency,
+            "movement_time_allowance": self.progress_movement_time_allowance,
         }
 
     @classmethod
@@ -211,6 +224,12 @@ class Nav2Config:
             local_costmap_height=float(d.get("local_costmap_height", 4.0)),
             costmap_resolution=float(d.get("costmap_resolution", 0.05)),
             controller_frequency=float(d.get("controller_frequency", 10.0)),
+            replan_frequency=float(d.get("replan_frequency", 2.0)),
+            progress_movement_time_allowance=float(
+                d.get("progress_movement_time_allowance", 10.0)
+            ),
+            navigate_recovery_retries=int(d.get("navigate_recovery_retries", 4)),
+            recovery_wait_duration=float(d.get("recovery_wait_duration", 2.0)),
         )
 
 

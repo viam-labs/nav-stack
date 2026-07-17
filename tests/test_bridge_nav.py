@@ -307,6 +307,7 @@ def test_nav_status_includes_last_cmd_vel():
         _last_result_status="active",
         _nav_active=True,
         _last_feedback={"distance_remaining": 1.2},
+        _active_nav_goal={"x": 3.0, "y": -1.0, "theta": 0.5},
         last_cmd_vel=MagicMock(
             return_value={
                 "source": "nav2",
@@ -315,11 +316,15 @@ def test_nav_status_includes_last_cmd_vel():
             }
         ),
         cmd_vel_history=MagicMock(return_value=[{"source": "nav2", "ros_vx_mps": 0.5}]),
+        get_pose_in_map=MagicMock(return_value=SimpleNamespace(x=1.0, y=0.0, theta=0.0)),
+        _pose_dict=BridgeNode._pose_dict,
     )
     status = BridgeNode.nav_status(bridge)
     assert status["active"] is True
     assert status["last_cmd_vel"]["viam_linear_y_mm_s"] == 300.0
     assert status["cmd_vel_history"][0]["ros_vx_mps"] == 0.5
+    assert status["goal"] == {"x": 3.0, "y": -1.0, "theta": 0.5}
+    assert status["pose"] == {"x": 1.0, "y": 0.0, "theta": 0.0}
 
 
 def test_on_drive_timer_noop_when_nav_inactive():
