@@ -131,6 +131,7 @@ class NavApiMixin:
         self._waypoints: List[Waypoint] = []
         self._wp_counter = 0
         self._wp_task: Optional[asyncio.Task] = None
+        self._active_wp_id: Optional[str] = None  # waypoint currently being driven to
 
     async def close(self) -> None:
         self._stop_waypoint_driver()
@@ -163,7 +164,11 @@ class NavApiMixin:
             return {"enabled": self._require_runtime().manager.motors_enabled()}
         if cmd == "set_motors_enabled":
             enabled = bool(command["enabled"])
-            self._require_runtime().manager.set_motors_enabled(enabled)
+            # Offload: manager.set_motors_enabled -> _run(stop_base()) blocks on
+            # the module loop, so calling it inline here would self-deadlock.
+            await asyncio.to_thread(
+                self._require_runtime().manager.set_motors_enabled, enabled
+            )
             return {"enabled": enabled}
         if cmd == "get_planner_config":
             cfg = self._require_cfg()
@@ -213,8 +218,11 @@ class NavApiMixin:
         self._mode = mode
         if mode == Mode.MODE_WAYPOINT:
             self._start_waypoint_driver()
-        else:  # MANUAL: stop driving through waypoints and halt Nav2.
-            self._stop_waypoint_driver()
+        else:  # MANUAL: stop ALL autonomous motion (waypoint driver, simple nav, Nav2).
+            # Await the driver so any in-flight navigate finishes before we cancel
+            # Nav2 (else its goal could land after the cancel and resume motion).
+            await self._stop_waypoint_driver_async()
+            await self._cancel_simple_nav()
             await asyncio.to_thread(self._require_runtime().manager.cancel)
 
     async def get_waypoints(
@@ -233,6 +241,10 @@ class NavApiMixin:
         self, id: str, *, timeout: Optional[float] = None, **kwargs
     ) -> None:
         self._waypoints = [w for w in self._waypoints if w.id != id]
+        # If we removed the waypoint currently being driven to, cancel its Nav2
+        # goal so the driver stops heading there and advances to the next.
+        if id == self._active_wp_id:
+            await asyncio.to_thread(self._require_runtime().manager.cancel)
 
     async def get_paths(
         self, *, timeout: Optional[float] = None, **kwargs
@@ -254,8 +266,13 @@ class NavApiMixin:
             gg = zone_to_geo_geometry(SimpleNamespace(name=f"ann_{i}", geometry=geom))
             if gg is not None:
                 obstacles.append(gg)
-        # Local keepout zones (DoCommand-authored).
-        for z in self._zones().list(zones_mod.KEEPOUT):
+        # Local keepout zones (DoCommand-authored). Degrade to annotations-only
+        # when there is no active map (GetObstacles must not hard-fail).
+        try:
+            local_keepout = self._zones().list(zones_mod.KEEPOUT)
+        except Exception:  # noqa: BLE001 - no active map / no zone store yet
+            local_keepout = []
+        for z in local_keepout:
             gg = zone_to_geo_geometry(z)
             if gg is not None:
                 obstacles.append(gg)
@@ -270,36 +287,66 @@ class NavApiMixin:
             self._wp_task = asyncio.get_event_loop().create_task(self._drive_waypoints())
 
     def _stop_waypoint_driver(self) -> None:
+        """Cancel the driver without awaiting (sync callers, e.g. reconfigure)."""
         if self._wp_task is not None and not self._wp_task.done():
             self._wp_task.cancel()
         self._wp_task = None
 
+    async def _stop_waypoint_driver_async(self) -> None:
+        """Cancel the driver and await its unwind (so an in-flight navigate
+        finishes before the caller cancels Nav2)."""
+        task = self._wp_task
+        self._wp_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001 - cancellation / driver errors
+                pass
+
     async def _drive_waypoints(self) -> None:
-        """Navigate through the waypoint queue in order while in WAYPOINT mode."""
+        """Navigate the waypoint queue in order while in WAYPOINT mode."""
         try:
             while self._mode == Mode.MODE_WAYPOINT:
                 wp = self._waypoints[0] if self._waypoints else None
                 if wp is None:
                     await asyncio.sleep(0.5)
                     continue
-                x, y = geopoint_to_xy(wp.location)
-                await self._navigate(x, y, 0.0)  # refreshes annotation masks, then goals
-                reached = await self._await_arrival()
+                self._active_wp_id = wp.id
+                try:
+                    x, y = geopoint_to_xy(wp.location)
+                    await self._navigate(x, y, 0.0)  # refresh masks, then send goal
+                    reached = await self._await_arrival()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - transient (e.g. Nav2 starting up)
+                    LOGGER.warning("waypoint %s nav error: %s; retrying", wp.id, exc)
+                    await asyncio.sleep(1.0)
+                    continue
+                finally:
+                    self._active_wp_id = None
+
                 if self._mode != Mode.MODE_WAYPOINT:
+                    # Mode changed mid-drive -> cancel the goal we may have sent.
+                    await asyncio.to_thread(self._require_runtime().manager.cancel)
                     break
                 if reached:
                     self._waypoints = [w for w in self._waypoints if w.id != wp.id]
+                elif not any(w.id == wp.id for w in self._waypoints):
+                    continue  # removed mid-drive (remove_waypoint) -> advance to next
                 else:
-                    LOGGER.warning(
-                        "navigation: waypoint %s did not complete; leaving waypoint mode",
-                        wp.id,
-                    )
+                    LOGGER.warning("waypoint %s did not complete; stopping", wp.id)
+                    await asyncio.to_thread(self._require_runtime().manager.cancel)
                     self._mode = Mode.MODE_MANUAL
                     break
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - driver must not crash silently
-            LOGGER.error("waypoint driver failed: %s", exc)
+            LOGGER.error("waypoint driver crashed: %s", exc)
+        finally:
+            # Never leave get_mode reporting WAYPOINT after the driver has stopped.
+            if self._mode == Mode.MODE_WAYPOINT:
+                self._mode = Mode.MODE_MANUAL
 
     async def _await_arrival(self, *, timeout_s: float = 600.0) -> bool:
         """Poll Nav2 status until the active goal finishes; True if it succeeded."""

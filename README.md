@@ -13,6 +13,8 @@ This module (`viam-labs:nav-stack`) provides three models:
 | `viam-labs:nav-stack:navigation-external` | `rdk:service:navigation` | Same as `navigation`, but driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
 | `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders the navigation service's Nav2 costmap + active plan(s), robot pose, footprint and goal as a live camera image. Works with either navigation model / any SLAM backend. |
 
+> **⚠️ Breaking change:** `navigation` and `navigation-external` now use the **`rdk:service:navigation`** API (previously `rdk:service:generic`). Existing configs must change each nav service's `"api"` from `"rdk:service:generic"` to `"rdk:service:navigation"` — the model name is unchanged. The full command surface remains available via `DoCommand`.
+
 ## How it works
 
 The module bundles/orchestrates ROS2 and bridges it to your Viam components:

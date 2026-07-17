@@ -29,6 +29,40 @@ from ..ros.sensor_io import build_io_provider
 from ..runtime import SlamRuntime
 
 
+def resolve_external_deps(
+    ext: ExternalNavConfig, dependencies: Mapping[ResourceName, ResourceBase]
+) -> dict:
+    """Resolve the Viam deps an external nav needs (base, SLAM, lidars, movement/
+    heading sensors). Raises ``KeyError`` if any is missing — call this BEFORE
+    tearing down a running stack so a bad reconfigure doesn't kill the working one.
+    """
+    bridge_cfg = ext.bridge
+    return {
+        "base": cast(Base, dependencies[Base.get_resource_name(ext.nav.base)]),
+        "slam": cast(SLAM, dependencies[SLAM.get_resource_name(ext.slam_service)]),
+        "cameras": {
+            lidar.name: cast(Camera, dependencies[Camera.get_resource_name(lidar.name)])
+            for lidar in bridge_cfg.lidars
+        },
+        "movement_sensor": (
+            cast(
+                MovementSensor,
+                dependencies[MovementSensor.get_resource_name(bridge_cfg.movement_sensor)],
+            )
+            if bridge_cfg.movement_sensor
+            else None
+        ),
+        "heading_sensor": (
+            cast(
+                MovementSensor,
+                dependencies[MovementSensor.get_resource_name(bridge_cfg.heading_sensor)],
+            )
+            if bridge_cfg.heading_sensor
+            else None
+        ),
+    }
+
+
 def build_external_runtime(
     ext: ExternalNavConfig,
     dependencies: Mapping[ResourceName, ResourceBase],
@@ -45,28 +79,12 @@ def build_external_runtime(
     shutting down any prior manager before calling this.
     """
     bridge_cfg = ext.bridge
-    base = cast(Base, dependencies[Base.get_resource_name(ext.nav.base)])
-    slam = cast(SLAM, dependencies[SLAM.get_resource_name(ext.slam_service)])
-    cameras = {
-        lidar.name: cast(Camera, dependencies[Camera.get_resource_name(lidar.name)])
-        for lidar in bridge_cfg.lidars
-    }
-    movement_sensor = (
-        cast(
-            MovementSensor,
-            dependencies[MovementSensor.get_resource_name(bridge_cfg.movement_sensor)],
-        )
-        if bridge_cfg.movement_sensor
-        else None
-    )
-    heading_sensor = (
-        cast(
-            MovementSensor,
-            dependencies[MovementSensor.get_resource_name(bridge_cfg.heading_sensor)],
-        )
-        if bridge_cfg.heading_sensor
-        else None
-    )
+    deps = resolve_external_deps(ext, dependencies)
+    base = deps["base"]
+    slam = deps["slam"]
+    cameras = deps["cameras"]
+    movement_sensor = deps["movement_sensor"]
+    heading_sensor = deps["heading_sensor"]
 
     odom_reader = (
         TypedMovementSensorOdom(

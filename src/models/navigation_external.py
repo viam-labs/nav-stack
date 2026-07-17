@@ -30,7 +30,7 @@ from viam.utils import struct_to_dict
 from ..config import ExternalNavConfig
 from ..ros.manager import RosManager
 from ..runtime import register_bridge, unregister_bridge
-from .external_runtime import build_external_runtime
+from .external_runtime import build_external_runtime, resolve_external_deps
 from .nav_api import NavApiMixin
 from .nav_core import NavCoreMixin
 
@@ -47,6 +47,7 @@ class RosNavigationExternal(NavApiMixin, NavCoreMixin, Navigation):
         self._manager: Optional[RosManager] = None
         self._runtime = None
         self._external_slam = None  # the Viam SLAM dep, for annotation reads
+        self._last_annotations: dict = {}  # last-good annotations (survives blips)
 
     @classmethod
     def new(
@@ -68,14 +69,24 @@ class RosNavigationExternal(NavApiMixin, NavCoreMixin, Navigation):
 
     async def _get_annotations(self) -> dict:
         """Read annotations from the external SLAM service (e.g. rtabmap's
-        get_annotations). Empty if it has no annotation support."""
+        get_annotations), caching the last-good set.
+
+        On a transient failure/timeout we return the **last-good** annotations,
+        not ``{}`` — otherwise a single blip would republish the costmap masks
+        without the no_go keepouts and let Nav2 drive through a no-go zone."""
         if self._external_slam is None:
             return {}
         try:
-            resp = await self._external_slam.do_command({"command": "get_annotations"})
-        except Exception:  # noqa: BLE001 - SLAM may not implement get_annotations
-            return {}
-        return resp.get("annotations", {}) if isinstance(resp, dict) else {}
+            resp = await asyncio.wait_for(
+                self._external_slam.do_command({"command": "get_annotations"}),
+                timeout=2.0,
+            )
+        except Exception:  # noqa: BLE001 - transient RPC / timeout / no support
+            return self._last_annotations
+        fc = resp.get("annotations", {}) if isinstance(resp, dict) else {}
+        if fc:
+            self._last_annotations = fc
+        return fc
 
     def reconfigure(
         self, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -83,6 +94,10 @@ class RosNavigationExternal(NavApiMixin, NavCoreMixin, Navigation):
         ext = ExternalNavConfig.from_dict(struct_to_dict(config.attributes))
         self._cfg = ext.nav  # NavCoreMixin drives Nav2 from the NavConfig
         self._reset_nav_state()
+
+        # Resolve deps BEFORE tearing down the running stack: a missing dep then
+        # raises here, leaving the previously-working ROS stack intact.
+        resolve_external_deps(ext, dependencies)
 
         # Rebuild the ROS stack from scratch on every reconfigure.
         if self._manager is not None:

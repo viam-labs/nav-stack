@@ -50,15 +50,19 @@ class AnnotationStore:
 
     def _load(self) -> None:
         self._features = {}
-        if self.path.exists():
-            try:
-                raw = json.loads(self.path.read_text())
-            except json.JSONDecodeError:
-                raw = {}
-            for feat in raw.get("features") or []:
-                fid = feat.get("id")
-                if fid:
-                    self._features[str(fid)] = feat
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text())
+        except json.JSONDecodeError:
+            raw = {}
+        # Degrade to "no annotations" on structurally-wrong JSON (hand-edit, wrong
+        # schema, partial migration) rather than crashing every navigate for the map.
+        if not isinstance(raw, dict):
+            return
+        for feat in raw.get("features") or []:
+            if isinstance(feat, dict) and feat.get("id"):
+                self._features[str(feat["id"])] = feat
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -148,8 +152,15 @@ def slow_down_regions(fc: Dict) -> List[Tuple[Dict, float]]:
     out = []
     for f in _features_of_kind(fc, SLOW_DOWN):
         ring = _outer_ring_xy(f.get("geometry", {}))
-        if ring and len(ring) >= 3:
+        if not (ring and len(ring) >= 3):
+            continue
+        try:
             speed = float((f.get("properties") or {}).get("max_speed_m_s", 0.0))
+        except (TypeError, ValueError):
+            continue
+        # A slow_down with no positive cap is meaningless (would map to a ~1%
+        # near-keepout); skip it rather than crawl the robot.
+        if speed > 0:
             out.append(({"type": "polygon", "points": ring}, speed))
     return out
 
@@ -163,6 +174,10 @@ def labels(fc: Dict) -> Dict[str, Tuple[float, float]]:
             continue
         coords = geom.get("coordinates")
         lbl = (f.get("properties") or {}).get("label")
-        if lbl and coords:
+        if not (lbl and coords):
+            continue
+        try:
             out[str(lbl)] = (float(coords[0]), float(coords[1]))
+        except (TypeError, IndexError, ValueError):
+            continue  # malformed Point coordinates -> skip this label
     return out

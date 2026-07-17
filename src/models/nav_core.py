@@ -163,6 +163,14 @@ class NavCoreMixin:
     def _zones(self) -> ZoneStore:
         return ZoneStore(self._active_handle().zones_path)
 
+    def _local_zones(self) -> list:
+        """Local zones, or [] when there is no active map yet — so mask refresh
+        during reconfigure/plan doesn't raise before a map is selected."""
+        try:
+            return self._zones().list()
+        except Exception:  # noqa: BLE001 - no active map
+            return []
+
     def _publish_masks(self, zone_list) -> None:
         runtime = self._require_runtime()
         node = runtime.manager.node
@@ -179,7 +187,7 @@ class NavCoreMixin:
 
     def _refresh_zone_masks(self) -> None:
         """Publish masks from the local zone store (used on reconfigure)."""
-        self._publish_masks(self._zones().list())
+        self._publish_masks(self._local_zones())
 
     # -- annotations (no_go / slow_down from the SLAM source) ----------------
     async def _get_annotations(self) -> dict:
@@ -215,7 +223,7 @@ class NavCoreMixin:
 
     async def _apply_annotations(self) -> None:
         """Rasterize local zones + current annotations into the costmap masks."""
-        self._publish_masks(self._zones().list() + await self._annotation_zones())
+        self._publish_masks(self._local_zones() + await self._annotation_zones())
 
     async def _navigate(self, x: float, y: float, theta: float) -> None:
         """Every Nav2 goal routes through here: refresh masks from the latest

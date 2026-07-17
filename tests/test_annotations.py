@@ -91,3 +91,39 @@ def test_unknown_kind_ignored_by_derivations():
     assert no_go_polygons(fc) == []
     assert slow_down_regions(fc) == []
     assert labels(fc) == {}
+
+
+def test_load_degrades_on_non_featurecollection_json(tmp_path):
+    p = tmp_path / "a.json"
+    p.write_text("[1, 2, 3]")  # valid JSON, wrong shape (was: AttributeError)
+    assert AnnotationStore(p).feature_collection()["features"] == []
+    p.write_text("null")
+    assert AnnotationStore(p).feature_collection()["features"] == []
+    p.write_text('{"type":"FeatureCollection","features":["notadict",{"id":"x","type":"Feature","geometry":{"type":"Point","coordinates":[0,0]},"properties":{}}]}')
+    fc = AnnotationStore(p).feature_collection()
+    assert [f["id"] for f in fc["features"]] == ["x"]  # non-dict feature skipped
+
+
+def test_slow_down_skips_missing_or_zero_speed():
+    sq = [[0, 0], [1, 0], [1, 1], [0, 0]]
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            _poly("slow_down", sq),  # no max_speed_m_s
+            _poly("slow_down", sq, max_speed_m_s=0),
+            _poly("slow_down", sq, max_speed_m_s=0.3),
+        ],
+    }
+    regions = slow_down_regions(fc)
+    assert len(regions) == 1 and regions[0][1] == pytest.approx(0.3)
+
+
+def test_labels_skips_malformed_point():
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature", "geometry": {"type": "Point", "coordinates": [1.0]}, "properties": {"kind": "label", "label": "bad"}},
+            _point("good", (2.0, 3.0)),
+        ],
+    }
+    assert labels(fc) == {"good": (2.0, 3.0)}  # malformed skipped, no crash

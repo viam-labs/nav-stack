@@ -278,3 +278,46 @@ def test_reset_nav_state_clears_queue():
         assert await svc.get_waypoints() == []
 
     asyncio.run(body())
+
+
+def test_remove_active_waypoint_cancels_goal(tmp_path):
+    svc, mgr = _svc_with_map(tmp_path)
+
+    async def body():
+        await svc.add_waypoint(map_geopoint(1, 2))
+        svc._active_wp_id = "0"  # pretend the driver is navigating to it
+        await svc.remove_waypoint("0")
+        mgr.cancel.assert_called_once()
+
+    asyncio.run(body())
+
+
+def test_remove_inactive_waypoint_does_not_cancel(tmp_path):
+    svc, mgr = _svc_with_map(tmp_path)
+
+    async def body():
+        await svc.add_waypoint(map_geopoint(1, 2))
+        svc._active_wp_id = "0"
+        await svc.remove_waypoint("1")  # not the active one
+        mgr.cancel.assert_not_called()
+
+    asyncio.run(body())
+
+
+def test_get_obstacles_degrades_without_active_map(tmp_path):
+    square = [[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]
+    fc = {"type": "FeatureCollection", "features": [_nogo(square)]}
+    svc, _ = _svc_with_map(tmp_path, fc)
+    # No active map -> _zones() would raise; get_obstacles must degrade to annotations.
+    svc._runtime.map_store = SimpleNamespace(active_handle=lambda: None)
+    obs = asyncio.run(svc.get_obstacles())
+    assert len(obs) == 1  # the no_go annotation only; no RuntimeError
+
+
+def test_set_motors_enabled_offloaded(tmp_path):
+    # set_motors_enabled must run off the loop (else self-deadlock); here we just
+    # confirm the manager call is made with the right value.
+    svc, mgr = _svc_with_map(tmp_path)
+    res = asyncio.run(svc.do_command({"command": "set_motors_enabled", "enabled": False}))
+    assert res == {"enabled": False}
+    mgr.set_motors_enabled.assert_called_once_with(False)
