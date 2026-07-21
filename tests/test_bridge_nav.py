@@ -211,9 +211,6 @@ def test_on_drive_timer_sends_latest_and_clears():
         _run=MagicMock(),
         get_logger=MagicMock(return_value=MagicMock()),
     )
-    bridge._apply_cmd_vel_floor = lambda vx, vy, vt: BridgeNode._apply_cmd_vel_floor(
-        bridge, vx, vy, vt
-    )
 
     BridgeNode._on_drive_timer(bridge)
 
@@ -344,7 +341,7 @@ def test_on_drive_timer_noop_when_nav_inactive():
     bridge._run.assert_not_called()
 
 
-def test_on_drive_timer_applies_stiction_floor():
+def test_on_drive_timer_does_not_apply_simple_stiction_floor_to_nav2():
     lock = __import__("threading").Lock()
     io = SimpleNamespace(drive_base=MagicMock(return_value="coro"))
     nav_cfg = SimpleNamespace(
@@ -362,14 +359,13 @@ def test_on_drive_timer_applies_stiction_floor():
         _run=MagicMock(),
         get_logger=MagicMock(return_value=MagicMock()),
     )
-    bridge._apply_cmd_vel_floor = lambda vx, vy, vth: BridgeNode._apply_cmd_vel_floor(
-        bridge, vx, vy, vth
-    )
 
     BridgeNode._on_drive_timer(bridge)
 
     bridge._run.assert_called_once_with("coro")
-    io.drive_base.assert_called_once_with(0.2, 0.0, 0.4)
+    # These floors remain available to simple go_to_* but must not distort
+    # Nav2's independently optimized linear/angular command or curvature.
+    io.drive_base.assert_called_once_with(0.05, 0.0, 0.1)
 
 
 def test_guarded_callback_swallows_exception_and_logs():

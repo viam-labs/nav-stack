@@ -216,6 +216,35 @@ def _scan_timer_bridge(lidar_pts, scan, *, scan_max_age_s=2.0):
     return bridge, stamp
 
 
+def test_scan_timer_merges_mir_base_link_points_not_native_sensor_ranges():
+    # Native ranges say the return is straight ahead in the scanner frame, while
+    # mir-base's transformed points place it to the robot's left in base_link.
+    # The merged /scan is stamped base_link and therefore must use the latter.
+    native_ranges = np.full(360, np.inf)
+    native_ranges[180] = 1.0
+    native_scan = conv.LaserScan2D(
+        ranges=native_ranges,
+        angle_min=-math.pi,
+        angle_increment=2.0 * math.pi / 360,
+        range_min=0.1,
+        range_max=10.0,
+    )
+    lidar_pts = conv.LidarPoints(
+        sensor=np.array([[1.0, 0.0, 0.0]]),
+        base_link=np.array([[0.0, 2.0, 0.0]]),
+        sensor_scan=native_scan,
+    )
+    bridge, _ = _scan_timer_bridge(lidar_pts, native_scan)
+    bridge._bounded_scan_stamp = lambda read_start, age_s=0.0: read_start.to_msg()
+
+    BridgeNode._on_scan_timer(bridge)
+
+    merged = bridge._apply_lidar_odometry.call_args.args[0]
+    assert conv.nearest_return_bearing_deg(merged) == pytest.approx(90.0, abs=1.0)
+    published = bridge._merged_scan_pub.publish.call_args.args[0]
+    assert published.header.frame_id == "base_link"
+
+
 def test_scan_timer_skips_stale_scan(monkeypatch):
     import numpy as np
 

@@ -142,7 +142,7 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 | `slam_toolbox` | SLAM | Common slam_toolbox params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced: any other slam_toolbox ROS param (merged last) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level Nav2 footprint / velocity limits |
-| `min_cmd_vel_x`, `min_cmd_vel_theta` | Nav | Optional stiction floors (default **off** / `0`) applied to both `go_to_*` and Nav2 `/cmd_vel_smoothed` before `SetVelocity`. Leave at `0` for MiR; set e.g. `0.15` / `0.3` only for sticky skid-steer carts (a nonzero angular floor turns tiny MPPI yaw trims into hard arcs). Legacy aliases: `simple_min_vel_x` / `simple_min_vel_theta` |
+| `min_cmd_vel_x`, `min_cmd_vel_theta` | Nav | Optional stiction floors (default **off** / `0`) for simple `go_to_*` motion. Nav2 commands are not floored because independently changing linear/angular components distorts MPPI paths. Legacy aliases: `simple_min_vel_x` / `simple_min_vel_theta` |
 | `nav2` | Nav | Common Nav2 params (goal tolerance, costmap size, etc.) |
 | `nav2_params` | Nav | Advanced: nested Nav2 param overrides (merged last) |
 

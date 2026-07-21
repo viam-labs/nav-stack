@@ -1004,6 +1004,7 @@ class BridgeNode(Node):
         # then drives into obstacles the lidar plainly sees).
         read_start = self.get_clock().now()
         per_lidar_scans = []
+        base_link_scans = []
         cloud_chunks: List[np.ndarray] = []
         scan_age_s: Optional[float] = None
         lidar_timeout = max(float(self._slam_cfg.sensor_read_timeout_s), 1.0)
@@ -1018,6 +1019,7 @@ class BridgeNode(Node):
                 continue
 
             sensor_scan = None
+            base_link_scan = None
             base_pts_arr = np.empty((0, 3))
             if isinstance(lidar_data, conv.LidarPoints):
                 sensor_scan = lidar_data.sensor_scan
@@ -1033,7 +1035,22 @@ class BridgeNode(Node):
             else:
                 base_pts_arr = np.asarray(lidar_data, dtype=float)
 
-            if sensor_scan is None or not conv.scan_has_returns(sensor_scan):
+            has_native_scan = sensor_scan is not None and conv.scan_has_returns(
+                sensor_scan
+            )
+            if has_native_scan and base_pts_arr.size:
+                # MiR get_laser_scan returns both native scanner-frame ranges and
+                # points already transformed into base_link. The merged /scan is
+                # published as base_link, so merge the transformed points rather
+                # than relabeling the native ranges as base_link.
+                base_link_scan = conv.points_to_scan(
+                    base_pts_arr,
+                    num_bins=self._slam_cfg.scan_bins,
+                    range_min=lidar.min_range,
+                    range_max=lidar.max_range,
+                )
+
+            if not has_native_scan:
                 # Prefer base_link points when present (typical for get_point_cloud
                 # lidars); z_min/z_max then act as a height band above the floor.
                 if base_pts_arr.size:
@@ -1082,10 +1099,13 @@ class BridgeNode(Node):
                         range_min=lidar.min_range,
                         range_max=lidar.max_range,
                     )
+                    base_link_scan = sensor_scan
                 if not conv.scan_has_returns(sensor_scan):
                     continue
 
             per_lidar_scans.append((i, sensor_scan))
+            if base_link_scan is not None and conv.scan_has_returns(base_link_scan):
+                base_link_scans.append(base_link_scan)
 
         if not per_lidar_scans:
             if not self._empty_scan_warned:
@@ -1138,8 +1158,13 @@ class BridgeNode(Node):
             merged = per_lidar_scans[0][1]
             merged_frame = f"laser_{per_lidar_scans[0][0]}"
         else:
+            scans_to_merge = (
+                base_link_scans
+                if len(base_link_scans) == len(per_lidar_scans)
+                else [scan for _, scan in per_lidar_scans]
+            )
             merged = conv.merge_scans(
-                [scan for _, scan in per_lidar_scans],
+                scans_to_merge,
                 num_bins=self._slam_cfg.scan_bins,
                 range_min=ref.min_range,
                 range_max=ref.max_range,
@@ -1479,7 +1504,7 @@ class BridgeNode(Node):
         if pending is None or not self._nav_active:
             return
         vx, vy, vtheta = pending
-        # Keep Nav2's pre-floor command for diagnostics (last_cmd_vel).
+        # Keep the original Nav2 command for diagnostics.
         self._last_cmd_vel_nav2 = {
             "ros_vx_mps": round(float(vx), 4),
             "ros_vy_mps": round(float(vy), 4),
@@ -1488,10 +1513,6 @@ class BridgeNode(Node):
         # Snap near-zero commands so the MiR does not creep past the goal.
         if abs(vx) < 0.03 and abs(vy) < 0.03 and abs(vtheta) < 0.05:
             vx, vy, vtheta = 0.0, 0.0, 0.0
-        else:
-            # Optional stiction floor (off by default). Nonzero min_cmd_vel_theta
-            # turns tiny MPPI yaw trims into hard arcs on bases like MiR.
-            vx, vy, vtheta = self._apply_cmd_vel_floor(vx, vy, vtheta)
         try:
             self._run(self._io.drive_base(vx, vy, vtheta))
         except Exception as exc:  # noqa: BLE001
@@ -1544,8 +1565,7 @@ class BridgeNode(Node):
         out = dict(self._last_cmd_vel)
         if self._last_cmd_vel_wall > 0.0:
             out["age_s"] = round(time.monotonic() - self._last_cmd_vel_wall, 2)
-        # Pre-floor Nav2 sample (when available) so a stiction floor cannot be
-        # mistaken for Nav2 asking for a hard turn.
+        # Original Nav2 sample (when available), before the near-zero stop snap.
         nav2 = getattr(self, "_last_cmd_vel_nav2", None) or {}
         if nav2:
             out["nav2_ros_vx_mps"] = nav2.get("ros_vx_mps")
@@ -1564,27 +1584,6 @@ class BridgeNode(Node):
             out.append(entry)
         return out
 
-    def _apply_cmd_vel_floor(
-        self, vx: float, vy: float, vtheta: float
-    ) -> tuple[float, float, float]:
-        cfg = self._nav_cfg
-        if cfg is None:
-            return vx, vy, vtheta
-        min_x = float(getattr(cfg, "min_cmd_vel_x", 0.0) or 0.0)
-        min_th = float(getattr(cfg, "min_cmd_vel_theta", 0.0) or 0.0)
-        max_x = float(getattr(cfg, "max_vel_x", 0.0) or 0.0)
-        max_th = float(getattr(cfg, "max_vel_theta", 0.0) or 0.0)
-        if vx != 0.0 and min_x > 0.0:
-            floored = max(abs(vx), min_x)
-            if max_x > 0.0:
-                floored = min(floored, max_x)
-            vx = math.copysign(floored, vx)
-        if vtheta != 0.0 and min_th > 0.0:
-            floored = max(abs(vtheta), min_th)
-            if max_th > 0.0:
-                floored = min(floored, max_th)
-            vtheta = math.copysign(floored, vtheta)
-        return vx, vy, vtheta
     def _on_watchdog(self) -> None:
         self._flush_executor_queue()
         self._flush_pending_nav_goal()

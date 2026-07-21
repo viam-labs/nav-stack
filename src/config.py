@@ -825,12 +825,10 @@ class NavConfig:
     # Max scan age (s) still trusted for avoidance. Larger tolerates slower MiR
     # rosbridge lidar reads; too small makes avoidance fail closed (no drive).
     simple_scan_max_age: float = 2.0
-    # Optional stiction floors (m/s and rad/s) applied to every nonzero velocity
-    # command sent to the base — both Nav2 cmd_vel and simple go_to_*. Default
-    # off (0): MiR and most bases track small MPPI yaw trims; a nonzero
-    # ``min_cmd_vel_theta`` (e.g. 0.3 for sticky skid-steer carts) turns those
-    # trims into hard arcs / loops. Not the Nav2 ``min_vel_x`` param (reverse
-    # speed limit).
+    # Optional stiction floors (m/s and rad/s) for simple go_to_* motion only.
+    # Nav2 cmd_vel is never floored: independently bumping its linear and angular
+    # components distorts MPPI curvature and turns gentle corrections into loops.
+    # Not the Nav2 ``min_vel_x`` param (reverse speed limit).
     min_cmd_vel_x: float = 0.0
     min_cmd_vel_theta: float = 0.0
     nav2: Nav2Config = field(default_factory=Nav2Config)
