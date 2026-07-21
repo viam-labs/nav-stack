@@ -1507,6 +1507,20 @@ class RosSlam(SLAM):
             await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
             return {"status": "saved", "map": handle.name}
 
+        if cmd in ("optimize", "optimize_graph"):
+            # Force SPA: slam_toolbox has no bare CorrectPoses service, so we
+            # serialize + deserialize the live graph (loader calls Compute()).
+            if self._cfg is not None and self._cfg.mode != MODE_MAPPING:
+                raise ValueError(
+                    "optimize requires SLAM mode mapping; call start_mapping first"
+                )
+            handle = store.active_handle()
+            if not handle:
+                raise ValueError("no active map")
+            return await asyncio.to_thread(
+                mgr.optimize_pose_graph, handle.serialization_stem
+            )
+
         if cmd == "set_initial_pose":
             pose = self._resolve_pose(command)
             await asyncio.to_thread(mgr.set_initial_pose, pose)

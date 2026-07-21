@@ -13,6 +13,51 @@ def _manager() -> RosManager:
     return RosManager(cfg, logger=MagicMock())
 
 
+def test_optimize_pose_graph_serializes_then_deserializes_at_pose(tmp_path):
+    mgr = _manager()
+    mgr._slam_proc = MagicMock()
+    mgr._slam_proc.poll.return_value = None
+    stem = tmp_path / "map"
+    calls = []
+
+    def _run(args, timeout=5.0):
+        calls.append(args)
+        return MagicMock(returncode=0, stdout="ok", stderr="")
+
+    with patch.object(mgr, "slam_running", return_value=True), patch.object(
+        mgr, "get_pose_in_map", return_value=conv.Pose2D(1.5, -2.0, 0.25)
+    ), patch.object(mgr, "_toggle_slam_pause", side_effect=[True, True]) as pause, patch.object(
+        mgr, "_run_ros", side_effect=_run
+    ):
+        result = mgr.optimize_pose_graph(stem)
+
+    assert result["ok"] is True
+    assert result["status"] == "optimized"
+    assert result["match_type"] == 2
+    assert result["seed_pose"]["x"] == pytest.approx(1.5)
+    assert pause.call_count == 2  # pause then unpause
+    joined = [" ".join(c) for c in calls]
+    assert any("serialize_map" in j for j in joined)
+    assert any("deserialize_map" in j for j in joined)
+    des = next(c for c in calls if any("deserialize_map" in a for a in c))
+    payload = des[-1]
+    assert "match_type: 2" in payload
+    assert "1.500000" in payload
+
+
+def test_optimize_pose_graph_falls_back_to_first_node_without_pose(tmp_path):
+    mgr = _manager()
+    with patch.object(mgr, "slam_running", return_value=True), patch.object(
+        mgr, "get_pose_in_map", return_value=None
+    ), patch.object(mgr, "_toggle_slam_pause", return_value=False), patch.object(
+        mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout="", stderr="")
+    ) as run:
+        result = mgr.optimize_pose_graph(tmp_path / "map")
+    assert result["match_type"] == 1
+    des = run.call_args_list[-1].args[0]
+    assert "match_type: 1" in des[-1]
+
+
 def test_lifecycle_get_state_parses_primary_state():
     mgr = _manager()
     with patch.object(mgr, "_run_ros") as run:
@@ -43,8 +88,33 @@ def test_activate_slam_lifecycle_configure_and_activate():
     ), patch.object(mgr, "_lifecycle_set", side_effect=[True, True]) as set_mock:
         mgr._activate_slam_lifecycle()
 
-    set_mock.assert_any_call(SLAM_LIFECYCLE_NODE, "configure")
-    set_mock.assert_any_call(SLAM_LIFECYCLE_NODE, "activate")
+    assert set_mock.call_args_list[0].args[:2] == (SLAM_LIFECYCLE_NODE, "configure")
+    assert set_mock.call_args_list[1].args[:2] == (SLAM_LIFECYCLE_NODE, "activate")
+
+
+def test_activate_slam_lifecycle_polls_active_after_activate_cli_timeout():
+    """Map load can outlive ros2 lifecycle set; keep polling for active."""
+    mgr = _manager()
+    mgr._slam_proc = MagicMock()
+    mgr._slam_proc.poll.return_value = None
+    activated = {"n": 0}
+
+    def _set(node, transition, *, timeout=5.0):
+        activated["n"] += 1
+        return False  # CLI timed out, but transition may still finish
+
+    def _state(_node):
+        return "active" if activated["n"] else "inactive"
+
+    with patch.object(mgr, "_wait_for_ros_node", return_value=True), patch.object(
+        mgr, "_lifecycle_get_state", side_effect=_state
+    ), patch.object(mgr, "_lifecycle_set", side_effect=_set) as set_mock, patch(
+        "src.ros.manager.time.sleep"
+    ):
+        mgr._activate_slam_lifecycle(timeout=30.0)
+
+    assert set_mock.call_count == 1
+    assert set_mock.call_args.kwargs.get("timeout", 0) >= 20.0
 
 
 def test_activate_slam_lifecycle_skips_non_lifecycle_node():

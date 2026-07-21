@@ -825,13 +825,14 @@ class NavConfig:
     # Max scan age (s) still trusted for avoidance. Larger tolerates slower MiR
     # rosbridge lidar reads; too small makes avoidance fail closed (no drive).
     simple_scan_max_age: float = 2.0
-    # Stiction floors (m/s and rad/s) applied to every nonzero velocity command
-    # sent to the base — both Nav2 cmd_vel and simple go_to_*. Skid-steer carts
-    # often need ~0.15 m/s before the base actually moves; without a floor,
-    # near-goal proportional slowdown stalls with motors humming. (Not the Nav2
-    # ``min_vel_x`` param, which is the reverse-speed limit.)
-    min_cmd_vel_x: float = 0.15
-    min_cmd_vel_theta: float = 0.3
+    # Optional stiction floors (m/s and rad/s) applied to every nonzero velocity
+    # command sent to the base — both Nav2 cmd_vel and simple go_to_*. Default
+    # off (0): MiR and most bases track small MPPI yaw trims; a nonzero
+    # ``min_cmd_vel_theta`` (e.g. 0.3 for sticky skid-steer carts) turns those
+    # trims into hard arcs / loops. Not the Nav2 ``min_vel_x`` param (reverse
+    # speed limit).
+    min_cmd_vel_x: float = 0.0
+    min_cmd_vel_theta: float = 0.0
     nav2: Nav2Config = field(default_factory=Nav2Config)
     nav2_params: Mapping = field(default_factory=dict)
     nav2_params_path: Optional[str] = None
@@ -860,10 +861,10 @@ class NavConfig:
             simple_scan_max_age=float(d.get("simple_scan_max_age", 2.0)),
             # Legacy aliases: simple_min_vel_x / simple_min_vel_theta.
             min_cmd_vel_x=float(
-                d.get("min_cmd_vel_x", d.get("simple_min_vel_x", 0.15))
+                d.get("min_cmd_vel_x", d.get("simple_min_vel_x", 0.0))
             ),
             min_cmd_vel_theta=float(
-                d.get("min_cmd_vel_theta", d.get("simple_min_vel_theta", 0.3))
+                d.get("min_cmd_vel_theta", d.get("simple_min_vel_theta", 0.0))
             ),
             nav2=Nav2Config.from_dict(d.get("nav2", {}) or {}),
             nav2_params=d.get("nav2_params", {}) or {},

@@ -137,6 +137,7 @@ class BridgeNode(Node):
         self._last_odom_stamp = None
         self._cmd_timeout = nav_cfg.cmd_vel_timeout if nav_cfg else 0.5
         self._last_cmd_vel_wall = 0.0
+        self._last_cmd_vel_nav2: Dict = {}
         self._last_cmd_vel: Dict = {
             "source": None,
             "nav_active": False,
@@ -1478,13 +1479,18 @@ class BridgeNode(Node):
         if pending is None or not self._nav_active:
             return
         vx, vy, vtheta = pending
+        # Keep Nav2's pre-floor command for diagnostics (last_cmd_vel).
+        self._last_cmd_vel_nav2 = {
+            "ros_vx_mps": round(float(vx), 4),
+            "ros_vy_mps": round(float(vy), 4),
+            "ros_vtheta_rad_s": round(float(vtheta), 4),
+        }
         # Snap near-zero commands so the MiR does not creep past the goal.
         if abs(vx) < 0.03 and abs(vy) < 0.03 and abs(vtheta) < 0.05:
             vx, vy, vtheta = 0.0, 0.0, 0.0
         else:
-            # Stiction floor: MPPI/smoother often emit 0.05-0.1 m/s which
-            # skid-steer carts ignore (motors hum, nothing moves). Bump nonzero
-            # commands up to the configured minimums.
+            # Optional stiction floor (off by default). Nonzero min_cmd_vel_theta
+            # turns tiny MPPI yaw trims into hard arcs on bases like MiR.
             vx, vy, vtheta = self._apply_cmd_vel_floor(vx, vy, vtheta)
         try:
             self._run(self._io.drive_base(vx, vy, vtheta))
@@ -1538,6 +1544,13 @@ class BridgeNode(Node):
         out = dict(self._last_cmd_vel)
         if self._last_cmd_vel_wall > 0.0:
             out["age_s"] = round(time.monotonic() - self._last_cmd_vel_wall, 2)
+        # Pre-floor Nav2 sample (when available) so a stiction floor cannot be
+        # mistaken for Nav2 asking for a hard turn.
+        nav2 = getattr(self, "_last_cmd_vel_nav2", None) or {}
+        if nav2:
+            out["nav2_ros_vx_mps"] = nav2.get("ros_vx_mps")
+            out["nav2_ros_vy_mps"] = nav2.get("ros_vy_mps")
+            out["nav2_ros_vtheta_rad_s"] = nav2.get("ros_vtheta_rad_s")
         return out
 
     def cmd_vel_history(self) -> list:

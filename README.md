@@ -142,7 +142,7 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 | `slam_toolbox` | SLAM | Common slam_toolbox params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced: any other slam_toolbox ROS param (merged last) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level Nav2 footprint / velocity limits |
-| `min_cmd_vel_x`, `min_cmd_vel_theta` | Nav | Stiction floors (default `0.15` m/s, `0.3` rad/s) applied to both `go_to_*` and Nav2 `/cmd_vel_smoothed` before `SetVelocity`. Raise if the cart hums/thunks but barely moves. Legacy aliases: `simple_min_vel_x` / `simple_min_vel_theta` |
+| `min_cmd_vel_x`, `min_cmd_vel_theta` | Nav | Optional stiction floors (default **off** / `0`) applied to both `go_to_*` and Nav2 `/cmd_vel_smoothed` before `SetVelocity`. Leave at `0` for MiR; set e.g. `0.15` / `0.3` only for sticky skid-steer carts (a nonzero angular floor turns tiny MPPI yaw trims into hard arcs). Legacy aliases: `simple_min_vel_x` / `simple_min_vel_theta` |
 | `nav2` | Nav | Common Nav2 params (goal tolerance, costmap size, etc.) |
 | `nav2_params` | Nav | Advanced: nested Nav2 param overrides (merged last) |
 
@@ -331,7 +331,10 @@ Until Nav2 has published a costmap (bringup is asynchronous), the camera returns
 2. Drive the base around manually (Viam remote control / SDK). The module only
    takes over the base while navigating, so manual driving and mapping don't
    conflict.
-3. Save when done: `do_command({"command": "save_map"})`.
+3. Optionally force a pose-graph optimization mid-map (serialize → reload so
+   slam_toolbox re-runs SPA — useful after closing a loop that looks bent):
+   `do_command({"command": "optimize"})`.
+4. Save when done: `do_command({"command": "save_map"})`.
 
 ### 2. Localize on a saved map
 
@@ -449,7 +452,9 @@ Zones CRUD: `add_zone`, `get_zone`, `list_zones`, `update_zone`, `delete_zone`,
 ### Map management (SLAM service)
 
 `list_maps`, `get_active_map`, `set_active_map`, `rename_map`, `delete_map`,
-`start_mapping`, `start_localizing`, `save_map`, `get_mode`, `get_status`
+`start_mapping`, `start_localizing`, `save_map`,
+`optimize` (alias `optimize_graph`; mapping mode — force pose-graph SPA via
+serialize/deserialize reload), `get_mode`, `get_status`
 (live bridge + slam_toolbox health; optional `probe_sensors: false` to skip a
 one-shot lidar/odom read; includes measured `scan_hz` / `lidar_read_hz` over
 the last ~2 s plus configured `scan_rate_hz` — with `map_when_still`, expect low

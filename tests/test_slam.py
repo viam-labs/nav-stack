@@ -243,6 +243,38 @@ def test_clear_map_requires_active_map(tmp_path: Path):
         asyncio.run(slam.do_command({"command": "clear_map"}))
 
 
+def test_optimize_do_command_requires_mapping_mode(tmp_path: Path):
+    slam = RosSlam("slam")
+    slam._cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "mode": MODE_LOCALIZING, "maps_dir": str(tmp_path)}
+    )
+    slam._map_store = MapStore(str(tmp_path))
+    slam._manager = MagicMock()
+    with pytest.raises(ValueError, match="mapping"):
+        asyncio.run(slam.do_command({"command": "optimize"}))
+
+
+def test_optimize_do_command_calls_manager(tmp_path: Path):
+    slam = RosSlam("slam")
+    slam._cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "mode": MODE_MAPPING, "maps_dir": str(tmp_path)}
+    )
+    store = MapStore(str(tmp_path))
+    store.create_map("floor")
+    store.set_active_map("floor")
+    slam._map_store = store
+    slam._manager = MagicMock()
+    slam._manager.optimize_pose_graph.return_value = {
+        "status": "optimized",
+        "ok": True,
+        "match_type": 2,
+    }
+    result = asyncio.run(slam.do_command({"command": "optimize"}))
+    assert result["status"] == "optimized"
+    handle = store.active_handle()
+    slam._manager.optimize_pose_graph.assert_called_once_with(handle.serialization_stem)
+
+
 def test_relocalize_uses_current_map_pose(tmp_path: Path):
     slam = RosSlam("slam")
     slam._map_store = MapStore(str(tmp_path))

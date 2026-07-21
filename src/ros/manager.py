@@ -363,26 +363,39 @@ class RosManager:
                 return state
         return None
 
-    def _lifecycle_set(self, node_name: str, transition: str) -> bool:
-        proc = self._run_ros(["ros2", "lifecycle", "set", node_name, transition])
+    def _lifecycle_set(
+        self, node_name: str, transition: str, *, timeout: float = 5.0
+    ) -> bool:
+        proc = self._run_ros(
+            ["ros2", "lifecycle", "set", node_name, transition], timeout=timeout
+        )
         if proc.returncode == 0:
             return True
-        detail = (proc.stderr or proc.stdout or "").strip()
+        detail = (proc.stderr or proc.stdout or "").strip() or f"rc={proc.returncode}"
+        self._last_lifecycle_error = f"{transition}: {detail}"
         self._log(f"slam lifecycle {transition} failed: {detail}")
         return False
 
-    def _activate_slam_lifecycle(self, timeout: float = 15.0) -> None:
+    def _activate_slam_lifecycle(self, timeout: float = 90.0) -> None:
         """Configure + activate slam_toolbox when it is a lifecycle node (Jazzy+).
 
         Older distros expose a plain node that starts active; in that case the
         lifecycle CLI fails and we leave the node as-is.
+
+        Localization activate loads the serialized pose-graph; on a Pi that often
+        exceeds the old 5s ``ros2 lifecycle set`` timeout, so we give activate a
+        long CLI budget and keep polling for ``active`` even if the CLI times out
+        while the transition is still running.
         """
         node = SLAM_LIFECYCLE_NODE
-        if not self._wait_for_ros_node(node, timeout=timeout):
+        self._last_lifecycle_error = ""
+        # Registration wait is separate from the configure/activate budget.
+        if not self._wait_for_ros_node(node, timeout=min(timeout, 30.0)):
             raise RuntimeError(f"{node} did not register with ROS")
 
         deadline = time.monotonic() + timeout
         last_detail = ""
+        activate_attempts = 0
         while time.monotonic() < deadline:
             if self._slam_proc is not None and self._slam_proc.poll() is not None:
                 raise RuntimeError(f"{node} process exited during lifecycle activation")
@@ -396,17 +409,24 @@ class RosManager:
                 time.sleep(0.25)
                 continue
             if state == "unconfigured":
-                if not self._lifecycle_set(node, "configure"):
-                    last_detail = "configure failed"
+                if not self._lifecycle_set(node, "configure", timeout=30.0):
+                    last_detail = self._last_lifecycle_error or "configure failed"
                     time.sleep(0.5)
                     continue
                 time.sleep(0.5)
                 continue
             if state == "inactive":
-                if self._lifecycle_set(node, "activate"):
-                    time.sleep(0.25)
-                    continue
-                last_detail = "activate failed"
+                # Only issue activate a few times; repeated calls while a slow
+                # posegraph load is in flight can wedge the lifecycle FSM.
+                if activate_attempts < 3:
+                    remaining = max(deadline - time.monotonic(), 5.0)
+                    ok = self._lifecycle_set(
+                        node, "activate", timeout=min(60.0, remaining)
+                    )
+                    activate_attempts += 1
+                    if not ok:
+                        last_detail = self._last_lifecycle_error or "activate failed"
+                # Poll: map load may still finish after a CLI timeout.
                 time.sleep(0.5)
                 continue
             if state == "active":
@@ -414,7 +434,8 @@ class RosManager:
                 return
             time.sleep(0.25)
         raise RuntimeError(
-            f"slam_toolbox did not reach active state within {timeout}s ({last_detail})"
+            f"slam_toolbox did not reach active state within {timeout}s "
+            f"({last_detail or 'unknown'}); check posegraph load / slam_toolbox logs"
         )
 
     # -- slam_toolbox --------------------------------------------------------
@@ -490,6 +511,16 @@ class RosManager:
         ``map_stem`` is the path stem of the serialized pose-graph (``<stem>.posegraph``
         / ``<stem>.data``); used to continue mapping or to localize on a saved map.
         """
+        stem = Path(map_stem)
+        posegraph = Path(str(stem) + ".posegraph")
+        data_file = Path(str(stem) + ".data")
+        if mode != MODE_MAPPING:
+            missing = [str(p) for p in (posegraph, data_file) if not p.exists()]
+            if missing:
+                raise RuntimeError(
+                    "cannot localize: missing slam_toolbox serialize file(s): "
+                    + ", ".join(missing)
+                )
         self.stop_slam()
         # Extra pass: a previous module instance can leave a session orphan that
         # stop_slam's pkill raced; never launch while a sibling process exists.
@@ -501,8 +532,10 @@ class RosManager:
                 if self._slam_toolbox_binary_count() > 0:
                     self._reap_slam_toolbox_processes(force=True)
                     self._wait_for_slam_toolbox_processes_gone(timeout=4.0)
-                self._launch_slam(map_stem, mode)
-                self._activate_slam_lifecycle()
+                self._launch_slam(stem, mode)
+                # Localization activate loads the pose-graph; give a Pi enough time.
+                activate_timeout = 90.0 if mode != MODE_MAPPING else 45.0
+                self._activate_slam_lifecycle(timeout=activate_timeout)
                 self._apply_slam_tf_params()
                 # Trust processes, not the ROS graph: FastDDS often keeps stale
                 # /slam_toolbox names after pkill (looks like "3 nodes" with ps empty).
@@ -641,14 +674,111 @@ class RosManager:
         subprocess.run(
             ["ros2", "service", "call", "/slam_toolbox/serialize_map",
              "slam_toolbox/srv/SerializePoseGraph", payload],
-            env=os.environ.copy(), check=False, timeout=30,
+            env=self._ros_env(), check=False, timeout=30,
         )
         # Also export an occupancy grid (pgm/yaml) for inspection/export.
         subprocess.run(
             ["ros2", "run", "nav2_map_server", "map_saver_cli",
              "-f", str(map_stem), "--ros-args", "-p", "save_map_timeout:=20.0"],
-            env=os.environ.copy(), check=False, timeout=40,
+            env=self._ros_env(), check=False, timeout=40,
         )
+
+    def optimize_pose_graph(self, map_stem: Path) -> Dict:
+        """Force a slam_toolbox pose-graph optimization while mapping.
+
+        Stock slam_toolbox has no bare ``CorrectPoses`` service — SPA only runs
+        on loop closure or when a serialized graph is loaded
+        (``loadSerializedPoseGraph`` ends with ``solver_->Compute()``). So we
+        serialize the live graph and immediately deserialize it back with the
+        current map pose as the continue-mapping seed.
+        """
+        if not self.slam_running():
+            raise RuntimeError("slam_toolbox is not running")
+        stem = str(map_stem)
+        pose = None
+        try:
+            pose = self.get_pose_in_map()
+        except Exception:  # noqa: BLE001 - fall back to first-node seed
+            pose = None
+
+        # Pause scan processing for the swap (service is a toggle).
+        paused = self._toggle_slam_pause()
+        try:
+            ser = self._run_ros(
+                [
+                    "ros2",
+                    "service",
+                    "call",
+                    "/slam_toolbox/serialize_map",
+                    "slam_toolbox/srv/SerializePoseGraph",
+                    "{filename: '%s'}" % stem,
+                ],
+                timeout=60.0,
+            )
+            if pose is not None:
+                # DeserializePoseGraph.START_AT_GIVEN_POSE = 2
+                match_type = 2
+                match_name = "START_AT_GIVEN_POSE"
+                des_payload = (
+                    "{filename: '%s', match_type: 2, "
+                    "initial_pose: {x: %.6f, y: %.6f, theta: %.6f}}"
+                    % (stem, float(pose.x), float(pose.y), float(pose.theta))
+                )
+            else:
+                # DeserializePoseGraph.START_AT_FIRST_NODE = 1
+                match_type = 1
+                match_name = "START_AT_FIRST_NODE"
+                des_payload = (
+                    "{filename: '%s', match_type: 1, "
+                    "initial_pose: {x: 0.0, y: 0.0, theta: 0.0}}" % stem
+                )
+            des = self._run_ros(
+                [
+                    "ros2",
+                    "service",
+                    "call",
+                    "/slam_toolbox/deserialize_map",
+                    "slam_toolbox/srv/DeserializePoseGraph",
+                    des_payload,
+                ],
+                timeout=120.0,
+            )
+        finally:
+            if paused:
+                self._toggle_slam_pause()
+
+        ok = (ser.returncode == 0) and (des.returncode == 0)
+        return {
+            "status": "optimized" if ok else "optimize_failed",
+            "ok": ok,
+            "match_type": match_type,
+            "match_type_name": match_name,
+            "map_stem": stem,
+            "seed_pose": (
+                {"x": pose.x, "y": pose.y, "theta": pose.theta}
+                if pose is not None
+                else None
+            ),
+            "serialize_rc": ser.returncode,
+            "deserialize_rc": des.returncode,
+            "serialize_out": ((ser.stdout or "") + (ser.stderr or ""))[-500:],
+            "deserialize_out": ((des.stdout or "") + (des.stderr or ""))[-500:],
+        }
+
+    def _toggle_slam_pause(self) -> bool:
+        """Toggle ``/slam_toolbox/pause_new_measurements``. Returns True if call ok."""
+        proc = self._run_ros(
+            [
+                "ros2",
+                "service",
+                "call",
+                "/slam_toolbox/pause_new_measurements",
+                "slam_toolbox/srv/Pause",
+                "{}",
+            ],
+            timeout=10.0,
+        )
+        return proc.returncode == 0
 
     def reset_slam_map(self) -> bool:
         """Clear slam_toolbox's in-memory map (publishes a fresh empty /map)."""

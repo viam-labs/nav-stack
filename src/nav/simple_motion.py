@@ -34,8 +34,8 @@ class SimpleMotionConfig:
     # Floor for nonzero commands. Proportional near-goal / turn slowdowns can
     # drop below skid-steer stiction (motors "thunk" but the cart does not move),
     # which then trips the stall detector. Zero means no floor.
-    min_linear_mps: float = 0.15
-    min_angular_rad_s: float = 0.3
+    min_linear_mps: float = 0.0
+    min_angular_rad_s: float = 0.0
     stall_timeout_s: float = 8.0
     stall_progress_m: float = 0.025
     stall_progress_rad: float = math.radians(2.0)
@@ -216,8 +216,8 @@ def config_from_nav(
     xy_tolerance_m: float = 0.075,
     yaw_tolerance_rad: float = math.radians(5.0),
     timeout_s: float = 120.0,
-    min_linear_mps: float = 0.15,
-    min_angular_rad_s: float = 0.3,
+    min_linear_mps: float = 0.0,
+    min_angular_rad_s: float = 0.0,
 ) -> SimpleMotionConfig:
     return SimpleMotionConfig(
         default_linear_mps=max_vel_x,

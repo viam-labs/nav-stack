@@ -477,8 +477,9 @@ def test_base_velocity_convention_mir_alias_normalizes_to_viam():
 
 def test_min_cmd_vel_defaults_and_legacy_alias():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
-    assert cfg.min_cmd_vel_x == pytest.approx(0.15)
-    assert cfg.min_cmd_vel_theta == pytest.approx(0.3)
+    # Default off — nonzero floors were a MiR regression (cart-only stiction).
+    assert cfg.min_cmd_vel_x == pytest.approx(0.0)
+    assert cfg.min_cmd_vel_theta == pytest.approx(0.0)
 
     cfg = NavConfig.from_dict(
         {"slam_service": "slam", "base": "b", "min_cmd_vel_x": 0.25, "min_cmd_vel_theta": 0.5}
