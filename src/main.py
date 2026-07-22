@@ -3,8 +3,8 @@
 Registers the nav-stack resource models with the Viam module server:
 
 * ``viam-labs:nav-stack:slam``                 - SLAM service (mapping + localization)
-* ``viam-labs:nav-stack:navigation``           - Nav2 navigation + zones (built-in SLAM)
-* ``viam-labs:nav-stack:navigation-external``  - Nav2 navigation against any rdk:service:slam
+* ``viam-labs:nav-stack:navigation``           - rdk:service:navigation (built-in SLAM runtime)
+* ``viam-labs:nav-stack:navigation-external``  - rdk:service:navigation against any rdk:service:slam
 * ``viam-labs:nav-stack:nav-camera``           - camera rendering the costmap + active plans
 """
 import asyncio

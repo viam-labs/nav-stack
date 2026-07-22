@@ -1,23 +1,17 @@
-"""Navigation service model: ``viam-labs:nav-stack:navigation``.
+"""Navigation model: ``viam-labs:nav-stack:navigation``.
 
-A Viam generic service that wraps ROS2 Nav2. It launches Nav2 against the SLAM
-service's shared ROS context and exposes, via ``DoCommand``:
-
-* locations CRUD (named map-frame poses)
-* zones CRUD (keepout + speed_limit virtual regions -> Nav2 costmap filters)
-* navigation (Nav2 to a named location or map point; simple closed-loop
-  ``go_to_location`` / ``go_to_point`` without Nav2), cancel, and status
-
-Physical obstacle avoidance is automatic via Nav2's costmaps (live ``/scan`` data).
-
-This model borrows the built-in SLAM model's shared in-process ROS runtime
-(looked up in the process-global registry by ``slam_service`` name). All of the
-DoCommand + Nav2 orchestration lives in :class:`~.nav_core.NavServiceBase`; this
-model only supplies the registry-backed runtime resolution.
+Wraps ROS2 Nav2 against the **built-in** SLAM model's shared in-process ROS
+runtime (looked up in the process-global registry by ``slam_service`` name) and
+exposes Viam's standard ``rdk:service:navigation`` API — so a Navigation-API
+client (e.g. a webapp) can drive it. The API surface is shared with
+``navigation-external`` via :class:`~.nav_api.NavApiMixin`; the Nav2 orchestration
++ rich ``DoCommand`` surface (locations, zones, go/navigate, status) live in
+:class:`~.nav_core.NavCoreMixin`. This model only supplies registry-backed runtime
+resolution.
 """
 from __future__ import annotations
 
-from typing import ClassVar, Mapping, Optional, Sequence, cast
+from typing import ClassVar, Mapping, Sequence, cast
 
 from typing_extensions import Self
 
@@ -28,16 +22,17 @@ from viam.proto.common import ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
-from viam.services.generic import Generic
+from viam.services.navigation import Navigation
 from viam.utils import struct_to_dict
 
 from ..config import NavConfig
 from ..runtime import get_slam, register_bridge, unregister_bridge
+from .nav_api import NavApiMixin
 
 # Re-exported for backwards-compatible imports (tests + any external callers
 # still do ``from src.models.navigation import _sync_mppi_model_dt`` etc.).
 from .nav_core import (  # noqa: F401
-    NavServiceBase,
+    NavCoreMixin,
     _apply_local_costmap_size,
     _apply_nav2_tuning,
     _apply_overrides,
@@ -55,7 +50,7 @@ from .nav_core import (  # noqa: F401
 LOGGER = getLogger(__name__)
 
 
-class RosNavigation(NavServiceBase):
+class RosNavigation(NavApiMixin, NavCoreMixin, Navigation):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "nav-stack"), "navigation")
 
     # -- registration --------------------------------------------------------
@@ -79,12 +74,23 @@ class RosNavigation(NavServiceBase):
         cfg = self._require_cfg()
         return get_slam(cfg.slam_service)
 
+    async def _get_annotations(self) -> dict:
+        """Read annotations from the built-in SLAM model's per-map store."""
+        runtime = self._resolve_runtime()
+        handle = runtime.map_store.active_handle() if runtime is not None else None
+        if handle is None:
+            return {}
+        from ..nav.annotations import AnnotationStore
+
+        return AnnotationStore(handle.annotations_path).feature_collection()
+
     def reconfigure(
         self, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
         cfg = NavConfig.from_dict(struct_to_dict(config.attributes))
         self._cfg = cfg
         self._base = cast(Base, dependencies[Base.get_resource_name(cfg.base)])
+        self._reset_nav_state()
 
         runtime = get_slam(cfg.slam_service)
         if runtime is None:
@@ -111,10 +117,11 @@ class RosNavigation(NavServiceBase):
         # The bridge node itself is owned by the SLAM service; only drop our
         # nav-camera registration pointer.
         unregister_bridge(self.name)
+        await super().close()  # -> NavApiMixin.close (stops waypoint driver) -> Navigation
 
 
 Registry.register_resource_creator(
-    Generic.API,
+    Navigation.API,
     RosNavigation.MODEL,
     ResourceCreatorRegistration(RosNavigation.new, RosNavigation.validate_config),
 )

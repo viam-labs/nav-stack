@@ -204,6 +204,7 @@ def test_on_drive_timer_sends_latest_and_clears():
     io = SimpleNamespace(drive_base=MagicMock(return_value="coro"))
     bridge = SimpleNamespace(
         _nav_active=True,
+        _motors_enabled=True,
         _nav_cfg=None,
         _cmd_vel_lock=lock,
         _pending_cmd_vel=(0.3, 0.0, 0.4),
@@ -228,6 +229,7 @@ def test_on_drive_timer_snaps_near_zero_to_stop():
     io = SimpleNamespace(drive_base=MagicMock(return_value="coro"))
     bridge = SimpleNamespace(
         _nav_active=True,
+        _motors_enabled=True,
         _cmd_vel_lock=lock,
         _pending_cmd_vel=(0.01, 0.0, 0.02),
         _io=io,
@@ -352,6 +354,7 @@ def test_on_drive_timer_does_not_apply_simple_stiction_floor_to_nav2():
     )
     bridge = SimpleNamespace(
         _nav_active=True,
+        _motors_enabled=True,
         _nav_cfg=nav_cfg,
         _cmd_vel_lock=lock,
         _pending_cmd_vel=(0.05, 0.0, 0.1),

@@ -1,55 +1,43 @@
 """External-SLAM navigation model: ``viam-labs:nav-stack:navigation-external``.
 
-Like ``viam-labs:nav-stack:navigation`` (same generic DoCommand surface, shared
-:class:`~.nav_core.NavServiceBase`), but instead of borrowing the built-in SLAM
+Like ``viam-labs:nav-stack:navigation`` (same standard ``rdk:service:navigation``
+API via :class:`~.nav_api.NavApiMixin`, same Nav2 orchestration via
+:class:`~.nav_core.NavCoreMixin`), but instead of borrowing the built-in SLAM
 model's in-process runtime it drives Nav2 from an **arbitrary Viam
 ``rdk:service:slam``** dependency.
 
-It stands up its own ROS runtime:
-
-* a :class:`~..ros.manager.RosManager` that runs the sensor bridge (lidars ->
-  ``/scan``, movement sensor -> ``/odom`` + ``odom->base_link`` TF) but **not**
-  slam_toolbox, and
-* an :class:`~..ros.external_slam.ExternalSlamPublisher` (started by the bridge
-  when given ``external_slam``) that republishes the Viam SLAM service's pose and
-  occupancy grid as ``map->odom`` + ``/map``.
-
-Odometry is read through the portable typed MovementSensor API
-(:class:`~..ros.odom_source.TypedMovementSensorOdom`), so it works with any
-movement sensor, not just those matching a specific ``get_readings`` schema.
+The external ROS runtime (own sensor bridge + ``ExternalSlamPublisher`` +
+typed-odom reader + ``SlamRuntime``) is assembled by
+:func:`~.external_runtime.build_external_runtime`, shared with the built-in
+``navigation`` model's runtime resolution only at the ``NavCoreMixin`` seam.
 """
 from __future__ import annotations
 
 import asyncio
-from typing import ClassVar, Mapping, Optional, Sequence, cast
+from typing import ClassVar, Mapping, Optional, Sequence
 
 from typing_extensions import Self
 
-from viam.components.base import Base
-from viam.components.camera import Camera
-from viam.components.movement_sensor import MovementSensor
 from viam.logging import getLogger
 from viam.proto.app.robot import ServiceConfig
 from viam.proto.common import ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
-from viam.services.generic import Generic
-from viam.services.slam import SLAM
+from viam.services.navigation import Navigation
 from viam.utils import struct_to_dict
 
 from ..config import ExternalNavConfig
-from ..nav.maps import MapStore
 from ..ros.manager import RosManager
-from ..ros.odom_source import TypedMovementSensorOdom, TypedOdomConfig
-from ..ros.sensor_io import build_io_provider
-from ..runtime import SlamRuntime, register_bridge, unregister_bridge
-from .nav_core import NavServiceBase
+from ..runtime import register_bridge, unregister_bridge
+from .external_runtime import build_external_runtime, resolve_external_deps
+from .nav_api import NavApiMixin
+from .nav_core import NavCoreMixin
 
 LOGGER = getLogger(__name__)
 
 
-class RosNavigationExternal(NavServiceBase):
+class RosNavigationExternal(NavApiMixin, NavCoreMixin, Navigation):
     MODEL: ClassVar[Model] = Model(
         ModelFamily("viam-labs", "nav-stack"), "navigation-external"
     )
@@ -58,8 +46,9 @@ class RosNavigationExternal(NavServiceBase):
         super().__init__(name)
         self._manager: Optional[RosManager] = None
         self._runtime = None
+        self._external_slam = None  # the Viam SLAM dep, for annotation reads
+        self._last_annotations: dict = {}  # last-good annotations (survives blips)
 
-    # -- registration --------------------------------------------------------
     @classmethod
     def new(
         cls, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -75,108 +64,55 @@ class RosNavigationExternal(NavServiceBase):
         cfg = ExternalNavConfig.from_dict(struct_to_dict(config.attributes))
         return cfg.required_dependencies(), []
 
-    # -- runtime resolution --------------------------------------------------
     def _resolve_runtime(self):
         return self._runtime
+
+    async def _get_annotations(self) -> dict:
+        """Read annotations from the external SLAM service (e.g. rtabmap's
+        get_annotations), caching the last-good set.
+
+        On a transient failure/timeout we return the **last-good** annotations,
+        not ``{}`` — otherwise a single blip would republish the costmap masks
+        without the no_go keepouts and let Nav2 drive through a no-go zone."""
+        if self._external_slam is None:
+            return {}
+        try:
+            resp = await asyncio.wait_for(
+                self._external_slam.do_command({"command": "get_annotations"}),
+                timeout=2.0,
+            )
+        except Exception:  # noqa: BLE001 - transient RPC / timeout / no support
+            return self._last_annotations
+        fc = resp.get("annotations", {}) if isinstance(resp, dict) else {}
+        if fc:
+            self._last_annotations = fc
+        return fc
 
     def reconfigure(
         self, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
         ext = ExternalNavConfig.from_dict(struct_to_dict(config.attributes))
-        bridge_cfg = ext.bridge
-        self._cfg = ext.nav  # NavServiceBase drives Nav2 from the NavConfig
+        self._cfg = ext.nav  # NavCoreMixin drives Nav2 from the NavConfig
+        self._reset_nav_state()
 
-        # Resolve Viam dependencies.
-        self._base = cast(Base, dependencies[Base.get_resource_name(ext.nav.base)])
-        slam = cast(SLAM, dependencies[SLAM.get_resource_name(ext.slam_service)])
-        cameras = {
-            lidar.name: cast(
-                Camera, dependencies[Camera.get_resource_name(lidar.name)]
-            )
-            for lidar in bridge_cfg.lidars
-        }
-        movement_sensor = (
-            cast(
-                MovementSensor,
-                dependencies[MovementSensor.get_resource_name(bridge_cfg.movement_sensor)],
-            )
-            if bridge_cfg.movement_sensor
-            else None
-        )
-        heading_sensor = (
-            cast(
-                MovementSensor,
-                dependencies[MovementSensor.get_resource_name(bridge_cfg.heading_sensor)],
-            )
-            if bridge_cfg.heading_sensor
-            else None
-        )
+        # Resolve deps BEFORE tearing down the running stack: a missing dep then
+        # raises here, leaving the previously-working ROS stack intact.
+        resolve_external_deps(ext, dependencies)
 
         # Rebuild the ROS stack from scratch on every reconfigure.
         if self._manager is not None:
             self._manager.shutdown()
             self._manager = None
 
-        odom_reader = (
-            TypedMovementSensorOdom(
-                movement_sensor,
-                TypedOdomConfig(
-                    trust_pose=ext.trust_movement_sensor_pose,
-                    snap_heading=ext.snap_heading,
-                ),
-                logger=LOGGER,
+        self._base, self._manager, self._runtime, self._external_slam = (
+            build_external_runtime(
+                ext, dependencies, loop=asyncio.get_event_loop(), logger=LOGGER
             )
-            if movement_sensor is not None
-            else None
         )
-        io = build_io_provider(
-            base=self._base,
-            cameras=cameras,
-            cfg=bridge_cfg,
-            movement_sensor=movement_sensor,
-            heading_sensor=heading_sensor,
-            skip_get_laser_scan=set(),
-            odom_reader=odom_reader,
-            logger=LOGGER,
-        )
-
-        # external_slam -> the bridge starts the ExternalSlamPublisher (publishes
-        # /map + map->odom from the SLAM service); slam_toolbox is never launched.
-        self._manager = RosManager(bridge_cfg, logger=LOGGER, external_slam=slam)
-        loop = asyncio.get_event_loop()
-        self._manager.start(io, loop, nav_cfg=ext.nav)
-        node = self._manager.node
-        if node is not None:
-            # Wire cmd_vel recording now that the bridge node exists.
-            node._io = build_io_provider(
-                base=self._base,
-                cameras=cameras,
-                cfg=bridge_cfg,
-                movement_sensor=movement_sensor,
-                heading_sensor=heading_sensor,
-                skip_get_laser_scan=set(),
-                odom_reader=odom_reader,
-                logger=LOGGER,
-                record_cmd_vel=node.record_cmd_vel,
-            )
-
-        # Locations/zones live in a nav-stack-managed map store (the external
-        # SLAM owns the occupancy grid, delivered live via get_grid).
-        map_store = MapStore(bridge_cfg.maps_dir)
-        active = bridge_cfg.active_map or map_store.get_active_map_name() or "default"
-        map_store.get_or_create_map(active)
-        map_store.set_active_map(active)
-
-        node = self._manager.node
-        loc_check = (
-            node._external.localization_check
-            if node is not None and node._external is not None
-            else {"status": "unknown"}
-        )
-        self._runtime = SlamRuntime(self._manager, map_store, bridge_cfg, loc_check)
 
         # Publish the live bridge node so a nav-camera can find it and render
         # this nav's costmap/plans.
+        node = self._manager.node
         if node is not None:
             register_bridge(self.name, node)
 
@@ -198,10 +134,11 @@ class RosNavigationExternal(NavServiceBase):
             self._manager.shutdown()
             self._manager = None
         self._runtime = None
+        await super().close()  # -> NavApiMixin.close (stops waypoint driver) -> Navigation
 
 
 Registry.register_resource_creator(
-    Generic.API,
+    Navigation.API,
     RosNavigationExternal.MODEL,
     ResourceCreatorRegistration(
         RosNavigationExternal.new, RosNavigationExternal.validate_config
