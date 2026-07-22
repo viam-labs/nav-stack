@@ -219,3 +219,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 module.tar.gz
+scripts/watch_describe_motion.py
