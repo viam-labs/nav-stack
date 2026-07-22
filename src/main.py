@@ -3,13 +3,18 @@
 Registers the nav-stack resource models with the Viam module server:
 
 * ``viam-labs:nav-stack:slam``                 - SLAM service (mapping + localization)
-* ``viam-labs:nav-stack:navigation``           - Nav2 navigation + zones (built-in SLAM)
-* ``viam-labs:nav-stack:navigation-external``  - Nav2 navigation against any rdk:service:slam
+* ``viam-labs:nav-stack:navigation``           - Motion (MoveOnMap) + Nav2/zones DoCommand
+* ``viam-labs:nav-stack:navigation-external``  - Motion against any rdk:service:slam
 * ``viam-labs:nav-stack:nav-camera``           - camera rendering the costmap + active plans
 """
 import asyncio
 
 from viam.module.module import Module
+
+# Isolate DDS before any model imports spin up rclpy / child ROS processes.
+from .ros.dds_env import apply_dds_isolation
+
+apply_dds_isolation()
 
 # Importing the model modules triggers their registration with the Viam registry.
 from .models.slam import RosSlam

@@ -9,8 +9,8 @@ This module (`viam-labs:nav-stack`) provides three models:
 | Model | API | Purpose |
 | --- | --- | --- |
 | `viam-labs:nav-stack:slam` | `rdk:service:slam` | Mapping + localization via slam_toolbox. Standard SLAM API (live map, position) + map management. |
-| `viam-labs:nav-stack:navigation` | `rdk:service:generic` | Nav2 navigation: named locations, go-to-point, keepout/speed zones, obstacle avoidance, all via `DoCommand`. |
-| `viam-labs:nav-stack:navigation-external` | `rdk:service:generic` | Same Nav2 navigation, driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
+| `viam-labs:nav-stack:navigation` | `rdk:service:motion` | Nav2 via Motion `MoveOnMap`, plus named locations, zones, and simple `go_to_*` via `DoCommand`. |
+| `viam-labs:nav-stack:navigation-external` | `rdk:service:motion` | Same Motion + DoCommand surface, driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
 | `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders the navigation service's Nav2 costmap + active plan(s), robot pose, footprint and goal as a live camera image. Works with either navigation model / any SLAM backend. |
 
 ## How it works
@@ -76,6 +76,15 @@ sudo apt-get install ros-$ROS_DISTRO-ros-base \
 
 If `viam-server` runs as root and DDS shared-memory fails, point
 `FASTRTPS_DEFAULT_PROFILES_FILE` at a UDP-only FastDDS profile in the module env.
+
+**DDS isolation (cross-machine `/map` crosstalk):** by default nav-stack sets
+`ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`, `ROS_LOCALHOST_ONLY=1`, and (when
+unset) a stable non-zero `ROS_DOMAIN_ID` derived from `/etc/machine-id` and
+persisted in `.ros_domain_id`. That keeps each robot’s ROS graph private even on
+a shared LAN. Override any of these in the module `env` block if you intentionally
+need multi-host DDS. `get_status` reports `ros_domain_id`,
+`ros_automatic_discovery_range`, `ros_localhost_only`, and `map_publisher_count`
+(values > 1 mean foreign `/map` writers are still visible).
 
 ## Configuration
 
@@ -213,10 +222,13 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
 
 ### Navigation service
 
+**Breaking change:** both navigation models are now `rdk:service:motion` (previously
+`rdk:service:generic`). Update robot configs accordingly; attributes are unchanged.
+
 ```json
 {
   "name": "nav",
-  "api": "rdk:service:generic",
+  "api": "rdk:service:motion",
   "model": "viam-labs:nav-stack:navigation",
   "attributes": {
     "slam_service": "slam",
@@ -239,6 +251,31 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
 }
 ```
 
+#### MoveOnMap (Motion API)
+
+Map-frame goals use the standard Motion API. Pose units are **millimeters** and
+orientation **degrees** (planar OrientationVector: `o_z=1`, yaw in `theta`):
+
+```python
+from viam.proto.common import Pose
+from viam.services.motion import MotionClient
+
+nav = MotionClient.from_robot(robot, "nav")
+execution_id = await nav.move_on_map(
+    component_name="my-base",
+    destination=Pose(x=3500, y=-1000, z=0, o_x=0, o_y=0, o_z=1, theta=0),
+    slam_service_name="slam",
+)
+# Non-blocking: poll progress
+plan = await nav.get_plan("my-base", execution_id=execution_id)
+await nav.stop_plan("my-base")  # cancel
+```
+
+`MoveOnMap` returns an `execution_id`. Use `GetPlan` / `ListPlanStatuses` for
+status (`IN_PROGRESS` / `SUCCEEDED` / `STOPPED` / `FAILED`). `Move` and
+`MoveOnGlobe` are not implemented. Locations, zones, and simple `go_to_*` remain
+available via `DoCommand` (including the meters/radians `navigate_to_point`
+alias used by existing scripts).
 `nav2.replan_frequency` (default **2 Hz**, up from Nav2's stock 1 Hz) rewrites the
 navigate-to-pose behavior tree so global plans refresh more often.
 `progress_movement_time_allowance` (default **10 s**, down from 30) and
@@ -252,7 +289,7 @@ The files under [`params/`](params/) are **reference defaults** shipped with the
 
 ### Navigation with an external SLAM service
 
-Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:service:slam` (for example a third-party RTAB-Map module), instead of the bundled `slam_toolbox`. Same DoCommand surface as `navigation`; the difference is that this model runs its **own** sensor bridge and bridges the external SLAM's pose + occupancy grid into ROS:
+Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:service:slam` (for example a third-party RTAB-Map module), instead of the bundled `slam_toolbox`. Same Motion + DoCommand surface as `navigation`; the difference is that this model runs its **own** sensor bridge and bridges the external SLAM's pose + occupancy grid into ROS:
 
 - `slam_service` names an `rdk:service:slam` dependency. The adapter calls its standard `GetPosition()` (→ `map → odom` TF) and a `get_grid` DoCommand returning `{rows, cols, xMin, yMin, cellSize, data}` with int8 cells (`-1`/`0`/`100`) (→ `/map` OccupancyGrid). No point-cloud rasterization.
 - Because the external SLAM does not publish `/scan` or `/odom`, you configure the sensor bridge here too — `lidars` (Viam `camera` components, projected to `/scan`) and `movement_sensor`. It reuses the same bridge + odometry fusion as the SLAM model.
@@ -261,7 +298,7 @@ Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:se
 ```json
 {
   "name": "nav",
-  "api": "rdk:service:generic",
+  "api": "rdk:service:motion",
   "model": "viam-labs:nav-stack:navigation-external",
   "attributes": {
     "slam_service": "rtabmap",
@@ -396,6 +433,9 @@ await slam.do_command({"command": "relocalize"})
 ```
 
 ### 3. Create and use locations
+
+`nav` is a Motion service — prefer `move_on_map` for map goals (mm / degrees).
+DoCommand `navigate_to_point` / locations still use **meters / radians**:
 
 ```python
 # Save the robot's current spot as "kitchen"

@@ -45,9 +45,11 @@ if [ -n "${OVERLAYS:-}" ]; then
 fi
 
 # Keep DDS settings consistent for the in-process bridge and Nav2 child processes.
-# viam-server often runs as root; LOCALHOST discovery avoids root/non-root SHM splits.
+# viam-server often runs as root; LOCALHOST discovery avoids root/non-root SHM splits
+# and (with a unique ROS_DOMAIN_ID) blocks cross-machine /map crosstalk on the LAN.
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export ROS_AUTOMATIC_DISCOVERY_RANGE="${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}"
+export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-1}"
 # ROS logs default to stderr; route to stdout so WARN lines do not appear as
 # modmanager StdErr "error" stream entries.
 export RCUTILS_LOGGING_USE_STDOUT="${RCUTILS_LOGGING_USE_STDOUT:-1}"
@@ -60,5 +62,9 @@ fi
 
 # shellcheck disable=SC1091
 source .venv/bin/activate
+
+# Apply / persist a stable non-zero ROS_DOMAIN_ID when unset (also sets the
+# discovery defaults above if somehow cleared). Explicit env always wins.
+python -c "from src.ros.dds_env import apply_dds_isolation; apply_dds_isolation()"
 
 exec python -m src.main "$@"

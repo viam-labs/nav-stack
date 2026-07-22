@@ -1781,9 +1781,13 @@ class BridgeNode(Node):
         return False
 
     def _ros_env(self) -> dict:
+        from .dds_env import apply_dds_isolation
+
+        apply_dds_isolation()
         env = os.environ.copy()
         env.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
         env.setdefault("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")
+        env.setdefault("ROS_LOCALHOST_ONLY", "1")
         distro = env.get("ROS_DISTRO", "jazzy")
         ros_bin = f"/opt/ros/{distro}/bin"
         path = env.get("PATH", "")
@@ -2104,6 +2108,20 @@ class BridgeNode(Node):
 
     def get_map(self) -> Optional[Dict]:
         return self._latest_map
+
+    def map_publisher_count(self) -> int:
+        """Number of DDS writers currently advertising ``/map``.
+
+        Values > 1 explain App map flickering (foreign / latched maps fighting).
+        """
+        try:
+            infos = self.get_publishers_info_by_topic("/map")
+        except Exception:  # noqa: BLE001
+            try:
+                infos = self.get_publishers_info_by_topic("map")
+            except Exception:  # noqa: BLE001
+                return -1
+        return len(infos or [])
 
     def clear_map(self) -> None:
         """Drop cached occupancy grid so clients stop showing a deleted map."""

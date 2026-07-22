@@ -1,9 +1,9 @@
 """External-SLAM navigation model: ``viam-labs:nav-stack:navigation-external``.
 
-Like ``viam-labs:nav-stack:navigation`` (same generic DoCommand surface, shared
-:class:`~.nav_core.NavServiceBase`), but instead of borrowing the built-in SLAM
-model's in-process runtime it drives Nav2 from an **arbitrary Viam
-``rdk:service:slam``** dependency.
+Like ``viam-labs:nav-stack:navigation`` (same ``rdk:service:motion`` + DoCommand
+surface, shared :class:`~.nav_core.NavServiceBase`), but instead of borrowing
+the built-in SLAM model's in-process runtime it drives Nav2 from an **arbitrary
+Viam ``rdk:service:slam``** dependency.
 
 It stands up its own ROS runtime:
 
@@ -34,7 +34,7 @@ from viam.proto.common import ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
-from viam.services.generic import Generic
+from viam.services.motion import Motion
 from viam.services.slam import SLAM
 from viam.utils import struct_to_dict
 
@@ -201,7 +201,7 @@ class RosNavigationExternal(NavServiceBase):
 
 
 Registry.register_resource_creator(
-    Generic.API,
+    Motion.API,
     RosNavigationExternal.MODEL,
     ResourceCreatorRegistration(
         RosNavigationExternal.new, RosNavigationExternal.validate_config

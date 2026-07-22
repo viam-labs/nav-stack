@@ -1,19 +1,20 @@
 """Navigation service model: ``viam-labs:nav-stack:navigation``.
 
-A Viam generic service that wraps ROS2 Nav2. It launches Nav2 against the SLAM
-service's shared ROS context and exposes, via ``DoCommand``:
+A Viam ``rdk:service:motion`` that wraps ROS2 Nav2. It launches Nav2 against the
+SLAM service's shared ROS context and exposes:
 
-* locations CRUD (named map-frame poses)
-* zones CRUD (keepout + speed_limit virtual regions -> Nav2 costmap filters)
-* navigation (Nav2 to a named location or map point; simple closed-loop
-  ``go_to_location`` / ``go_to_point`` without Nav2), cancel, and status
+* Motion ``MoveOnMap`` / ``StopPlan`` / ``GetPlan`` / ``ListPlanStatuses`` /
+  ``GetPose`` (map-frame Nav2 navigation)
+* DoCommand: locations CRUD, zones CRUD, ``navigate_*`` / ``go_to_*``, cancel,
+  status, and Nav2 ops (``restart_nav2``, …)
 
 Physical obstacle avoidance is automatic via Nav2's costmaps (live ``/scan`` data).
 
 This model borrows the built-in SLAM model's shared in-process ROS runtime
 (looked up in the process-global registry by ``slam_service`` name). All of the
-DoCommand + Nav2 orchestration lives in :class:`~.nav_core.NavServiceBase`; this
-model only supplies the registry-backed runtime resolution.
+Motion + DoCommand + Nav2 orchestration lives in
+:class:`~.nav_core.NavServiceBase`; this model only supplies the registry-backed
+runtime resolution.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ from viam.proto.common import ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
-from viam.services.generic import Generic
+from viam.services.motion import Motion
 from viam.utils import struct_to_dict
 
 from ..config import NavConfig
@@ -44,6 +45,7 @@ from .nav_core import (  # noqa: F401
     _apply_velocity_limits,
     _deep_merge,
     _find_template_section_paths,
+    _nav_status_to_plan_state,
     _normalize_nav2_user_params,
     _set_obstacle_sources,
     _sync_mppi_model_dt,
@@ -114,7 +116,7 @@ class RosNavigation(NavServiceBase):
 
 
 Registry.register_resource_creator(
-    Generic.API,
+    Motion.API,
     RosNavigation.MODEL,
     ResourceCreatorRegistration(RosNavigation.new, RosNavigation.validate_config),
 )

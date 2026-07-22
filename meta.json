@@ -10,14 +10,14 @@
       "short_description": "SLAM service wrapping slam_toolbox for mapping and localization on a Viam base."
     },
     {
-      "api": "rdk:service:generic",
+      "api": "rdk:service:motion",
       "model": "viam-labs:nav-stack:navigation",
-      "short_description": "Nav2 navigation: named locations, go-to-point, zones, obstacle avoidance via DoCommand."
+      "short_description": "Motion MoveOnMap via Nav2, plus locations/zones/go-to DoCommand on a Viam base."
     },
     {
-      "api": "rdk:service:generic",
+      "api": "rdk:service:motion",
       "model": "viam-labs:nav-stack:navigation-external",
-      "short_description": "Nav2 navigation driven by any rdk:service:slam; runs its own sensor bridge (not just slam_toolbox)."
+      "short_description": "Motion MoveOnMap driven by any rdk:service:slam; runs its own sensor bridge."
     },
     {
       "api": "rdk:component:camera",

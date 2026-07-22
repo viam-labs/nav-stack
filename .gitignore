@@ -151,6 +151,7 @@ activemq-data/
 .env
 .envrc
 .ros_env
+.ros_domain_id
 .venv
 env/
 venv/

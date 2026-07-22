@@ -29,6 +29,7 @@ import numpy as np
 
 from ..config import MODE_MAPPING, NavConfig, SlamConfig
 from . import conversions as conv
+from .dds_env import apply_dds_isolation, dds_status
 
 SLAM_LIFECYCLE_NODE = "/slam_toolbox"
 _REQUIRED_NAV_NODES = ("controller_server", "bt_navigator")
@@ -71,6 +72,9 @@ class RosManager:
         self._scratch = Path(slam_cfg.maps_dir).expanduser() / ".runtime"
         self._scratch.mkdir(parents=True, exist_ok=True)
         self._last_slam_params: Dict = {}
+        # Ensure DDS isolation before any child processes inherit the env.
+        # Prefer the module-root persist file; scratch is a fallback location.
+        apply_dds_isolation(self._scratch / "ros_domain_id")
 
     # -- lifecycle -----------------------------------------------------------
     def start(self, io, loop: asyncio.AbstractEventLoop, nav_cfg: Optional[NavConfig] = None) -> None:
@@ -81,6 +85,8 @@ class RosManager:
 
         from .bridge import BridgeNode
 
+        # rclpy.init reads discovery/domain from the environment once.
+        apply_dds_isolation(self._scratch / "ros_domain_id")
         if not rclpy.ok():
             rclpy.init()
         self._loop = loop
@@ -168,9 +174,11 @@ class RosManager:
             self._logger.info(msg)
 
     def _ros_env(self) -> dict:
+        apply_dds_isolation(self._scratch / "ros_domain_id")
         env = os.environ.copy()
         env.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
         env.setdefault("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")
+        env.setdefault("ROS_LOCALHOST_ONLY", "1")
         env.setdefault("RCUTILS_LOGGING_USE_STDOUT", "1")
         distro = env.get("ROS_DISTRO", "jazzy")
         ros_bin = f"/opt/ros/{distro}/bin"
@@ -791,7 +799,7 @@ class RosManager:
                 "slam_toolbox/srv/Reset",
                 "{pause_new_measurements: false}",
             ],
-            env=os.environ.copy(),
+            env=self._ros_env(),
             check=False,
             timeout=10,
         )
@@ -1393,6 +1401,12 @@ class RosManager:
             {n for n in node_names if node_names.count(n) > 1 and "transform_listener" not in n}
         )
         binary_count = self._slam_toolbox_binary_count()
+        map_publishers = None
+        if self._node is not None:
+            try:
+                map_publishers = self._node.map_publisher_count()
+            except Exception:  # noqa: BLE001
+                map_publishers = None
         return {
             # DDS often lists stale /slam_toolbox names after pkill — trust
             # slam_toolbox_binary_count (and `ps`) over duplicate_ros_nodes.
@@ -1418,6 +1432,8 @@ class RosManager:
                 if getattr(self, "_last_slam_params", {}).get(k) is not None
             },
             "ros_nodes": (node_proc.stdout or "").strip(),
+            "map_publisher_count": map_publishers,
+            **dds_status(),
             **bridge,
         }
 

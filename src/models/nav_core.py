@@ -3,14 +3,11 @@
 Both navigation models — the built-in ``viam-labs:nav-stack:navigation`` (which
 borrows the SLAM model's in-process ROS runtime) and the external-SLAM
 ``viam-labs:nav-stack:navigation-external`` (which builds its own runtime around
-an arbitrary ``rdk:service:slam`` dependency) — share the entire DoCommand
-surface, Nav2 params generation, and simple closed-loop motion. That logic lives
-here in ``NavServiceBase``; the concrete models differ only in how they obtain a
+an arbitrary ``rdk:service:slam`` dependency) — share the Motion API
+(``MoveOnMap`` / plan queries), the full DoCommand surface, Nav2 params
+generation, and simple closed-loop motion. That logic lives here in
+``NavServiceBase``; the concrete models differ only in how they obtain a
 ``SlamRuntime`` (``_resolve_runtime``) and how they stand it up (``reconfigure``).
-
-Keeping this API-agnostic (it operates on a ``SlamRuntime`` + ``NavConfig``, not
-on a specific Viam service face) is what lets a future ``rdk:service:navigation``
-model reuse it unchanged.
 """
 from __future__ import annotations
 
@@ -18,13 +15,39 @@ import asyncio
 import math
 import os
 import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import List, Mapping, Optional, Sequence
 
+from google.protobuf.timestamp_pb2 import Timestamp
+from grpclib.const import Status
+from grpclib.exceptions import GRPCError
 from viam.components.base import Base
 from viam.logging import getLogger
-from viam.proto.common import Vector3
-from viam.services.generic import Generic
+from viam.proto.common import (
+    GeoGeometry,
+    GeoPoint,
+    Geometry,
+    Pose,
+    PoseInFrame,
+    Transform,
+    Vector3,
+    WorldState,
+)
+from viam.proto.service.motion import (
+    ComponentState,
+    Constraints,
+    MotionConfiguration,
+    Plan,
+    PlanState,
+    PlanStatus,
+    PlanStatusWithID,
+    PlanStep,
+    PlanWithStatus,
+)
+from viam.services.motion import Motion
 from viam.utils import ValueTypes
 
 from ..config import OMNI, Nav2Config, NavConfig, ros_cmd_vel_to_viam_linear_mm_s
@@ -40,6 +63,7 @@ from ..nav.simple_motion import (
     drive_to_pose,
 )
 from ..nav.zones import ZoneStore
+from ..ros import conversions as conv
 
 LOGGER = getLogger(__name__)
 
@@ -50,8 +74,52 @@ _BT_FALLBACK = (
     / "navigate_to_pose_w_replanning_and_recovery.xml"
 )
 
+_TERMINAL_PLAN_STATES = frozenset(
+    {
+        PlanState.PLAN_STATE_SUCCEEDED,
+        PlanState.PLAN_STATE_FAILED,
+        PlanState.PLAN_STATE_STOPPED,
+    }
+)
 
-class NavServiceBase(Generic):
+
+def _nav_status_to_plan_state(status: Mapping) -> PlanState:
+    """Map bridge ``nav_status()`` into a Motion ``PlanState``."""
+    if status.get("active"):
+        return PlanState.PLAN_STATE_IN_PROGRESS
+    state = str(status.get("state") or "").lower()
+    if state == "succeeded":
+        return PlanState.PLAN_STATE_SUCCEEDED
+    if state in ("canceled", "cancelled"):
+        return PlanState.PLAN_STATE_STOPPED
+    if state in ("failed", "aborted", "rejected"):
+        return PlanState.PLAN_STATE_FAILED
+    return PlanState.PLAN_STATE_UNSPECIFIED
+
+
+def _utcnow_timestamp() -> Timestamp:
+    ts = Timestamp()
+    ts.FromDatetime(datetime.now(timezone.utc))
+    return ts
+
+
+def _pose2d_to_viam_pose_msg(pose: conv.Pose2D) -> Pose:
+    x_mm, y_mm, z_mm, o_x, o_y, o_z, theta_deg = conv.pose2d_to_viam_slam_pose(pose)
+    return Pose(x=x_mm, y=y_mm, z=z_mm, o_x=o_x, o_y=o_y, o_z=o_z, theta=theta_deg)
+
+
+@dataclass
+class _PlanExecution:
+    execution_id: str
+    plan_id: str
+    component_name: str
+    destination: Pose
+    state: PlanState = PlanState.PLAN_STATE_IN_PROGRESS
+    reason: Optional[str] = None
+    status_history: List[PlanStatus] = field(default_factory=list)
+
+
+class NavServiceBase(Motion):
     """Runtime-agnostic Nav2 orchestration shared by the navigation models.
 
     Subclasses must implement :meth:`_resolve_runtime` (return the active
@@ -67,7 +135,9 @@ class NavServiceBase(Generic):
         self._simple_nav_status: dict = {"state": "idle", "motion": "simple"}
         # Optional label (e.g. location name) merged into status["goal"].
         self._active_goal_name: Optional[str] = None
-
+        self._plan_execution: Optional[_PlanExecution] = None
+        self._plan_status_history: List[PlanStatusWithID] = []
+        self._logged_motion_ignored: bool = False
     # -- runtime resolution (subclass-specific) ------------------------------
     def _resolve_runtime(self):
         """Return the active ``SlamRuntime`` or ``None``.
@@ -89,6 +159,288 @@ class NavServiceBase(Generic):
         if runtime is None:
             raise RuntimeError("SLAM runtime unavailable")
         return runtime
+
+    # -- Motion API ----------------------------------------------------------
+    async def move(
+        self,
+        component_name: str,
+        destination: PoseInFrame,
+        world_state: Optional[WorldState] = None,
+        constraints: Optional[Constraints] = None,
+        *,
+        extra: Optional[Mapping[str, ValueTypes]] = None,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        raise GRPCError(Status.UNIMPLEMENTED, "Move is not supported; use MoveOnMap")
+
+    async def move_on_globe(
+        self,
+        component_name: str,
+        destination: GeoPoint,
+        movement_sensor_name: str,
+        obstacles: Optional[Sequence[GeoGeometry]] = None,
+        heading: Optional[float] = None,
+        configuration: Optional[MotionConfiguration] = None,
+        *,
+        bounding_regions: Optional[Sequence[GeoGeometry]] = None,
+        extra: Optional[Mapping[str, ValueTypes]] = None,
+        timeout: Optional[float] = None,
+    ) -> str:
+        raise GRPCError(
+            Status.UNIMPLEMENTED,
+            "MoveOnGlobe is not supported; use MoveOnMap for map-frame navigation",
+        )
+
+    async def move_on_map(
+        self,
+        component_name: str,
+        destination: Pose,
+        slam_service_name: str,
+        configuration: Optional[MotionConfiguration] = None,
+        obstacles: Optional[Sequence[Geometry]] = None,
+        *,
+        extra: Optional[Mapping[str, ValueTypes]] = None,
+        timeout: Optional[float] = None,
+    ) -> str:
+        cfg = self._require_cfg()
+        if component_name and component_name != cfg.base:
+            LOGGER.warning(
+                f"MoveOnMap component_name={component_name!r} does not match "
+                f"configured base={cfg.base!r}; navigating configured base anyway"
+            )
+        if slam_service_name and slam_service_name != cfg.slam_service:
+            LOGGER.warning(
+                f"MoveOnMap slam_service_name={slam_service_name!r} does not match "
+                f"configured slam_service={cfg.slam_service!r}; continuing anyway"
+            )
+        if (obstacles or configuration) and not self._logged_motion_ignored:
+            LOGGER.info(
+                "MoveOnMap obstacles/configuration are ignored in v1 "
+                "(Nav2 costmaps still use live lidar)"
+            )
+            self._logged_motion_ignored = True
+
+        pose2d = conv.viam_pose_to_pose2d(destination.x, destination.y, destination.theta)
+        runtime = self._require_runtime()
+        mgr = runtime.manager
+
+        # A new MoveOnMap supersedes any in-flight plan.
+        if (
+            self._plan_execution is not None
+            and self._plan_execution.state not in _TERMINAL_PLAN_STATES
+        ):
+            self._record_plan_state(
+                self._plan_execution, PlanState.PLAN_STATE_STOPPED, reason="superseded"
+            )
+
+        execution_id = str(uuid.uuid4())
+        plan_id = str(uuid.uuid4())
+        base_name = component_name or cfg.base
+        execution = _PlanExecution(
+            execution_id=execution_id,
+            plan_id=plan_id,
+            component_name=base_name,
+            destination=Pose(
+                x=destination.x,
+                y=destination.y,
+                z=destination.z,
+                o_x=destination.o_x,
+                o_y=destination.o_y,
+                o_z=destination.o_z,
+                theta=destination.theta,
+            ),
+            state=PlanState.PLAN_STATE_IN_PROGRESS,
+        )
+        execution.status_history.append(
+            PlanStatus(
+                state=PlanState.PLAN_STATE_IN_PROGRESS,
+                timestamp=_utcnow_timestamp(),
+            )
+        )
+        self._plan_execution = execution
+        self._active_goal_name = None
+        self._upsert_plan_status_history(execution)
+
+        await self._cancel_simple_nav()
+        await asyncio.to_thread(mgr.navigate, pose2d.x, pose2d.y, pose2d.theta)
+        self._sync_plan_state_from_nav()
+        return execution_id
+
+    async def stop_plan(
+        self,
+        component_name: str,
+        *,
+        extra: Optional[Mapping[str, ValueTypes]] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
+        runtime = self._require_runtime()
+        self._active_goal_name = None
+        await self._cancel_simple_nav()
+        await asyncio.to_thread(runtime.manager.cancel)
+        if self._plan_execution is not None:
+            self._record_plan_state(
+                self._plan_execution, PlanState.PLAN_STATE_STOPPED, reason="stop_plan"
+            )
+
+    async def get_plan(
+        self,
+        component_name: str,
+        last_plan_only: bool = False,
+        execution_id: Optional[str] = None,
+        *,
+        extra: Optional[Mapping[str, ValueTypes]] = None,
+        timeout: Optional[float] = None,
+    ) -> Motion.Plan:
+        self._sync_plan_state_from_nav()
+        execution = self._plan_execution
+        if execution is None:
+            raise GRPCError(Status.NOT_FOUND, "no motion plan has been started")
+        if execution_id and execution.execution_id != execution_id:
+            raise GRPCError(
+                Status.NOT_FOUND,
+                f"no plan found for execution_id={execution_id!r}",
+            )
+        # last_plan_only: we only keep the current plan (no replan history yet).
+        _ = last_plan_only
+        _ = component_name
+        return self._plan_to_response(execution)
+
+    async def list_plan_statuses(
+        self,
+        only_active_plans: bool = False,
+        *,
+        extra: Optional[Mapping[str, ValueTypes]] = None,
+        timeout: Optional[float] = None,
+    ) -> Sequence[PlanStatusWithID]:
+        self._sync_plan_state_from_nav()
+        statuses = list(self._plan_status_history)
+        if only_active_plans:
+            statuses = [
+                s
+                for s in statuses
+                if s.status.state == PlanState.PLAN_STATE_IN_PROGRESS
+            ]
+        return statuses
+
+    async def get_pose(
+        self,
+        component_name: str,
+        destination_frame: str,
+        supplemental_transforms: Optional[Sequence[Transform]] = None,
+        *,
+        extra: Optional[Mapping[str, ValueTypes]] = None,
+        timeout: Optional[float] = None,
+    ) -> PoseInFrame:
+        _ = supplemental_transforms
+        cfg = self._require_cfg()
+        if component_name and component_name != cfg.base:
+            LOGGER.warning(
+                f"get_pose component_name={component_name!r} does not match "
+                f"configured base={cfg.base!r}"
+            )
+        frame = destination_frame or "map"
+        if frame not in ("map", ""):
+            raise GRPCError(
+                Status.INVALID_ARGUMENT,
+                f"only destination_frame='map' is supported (got {destination_frame!r})",
+            )
+        pose2d = await asyncio.to_thread(self._require_runtime().manager.get_pose_in_map)
+        if pose2d is None:
+            raise GRPCError(Status.FAILED_PRECONDITION, "current map pose unavailable")
+        return PoseInFrame(reference_frame="map", pose=_pose2d_to_viam_pose_msg(pose2d))
+
+    def _record_plan_state(
+        self,
+        execution: _PlanExecution,
+        state: PlanState,
+        *,
+        reason: Optional[str] = None,
+    ) -> None:
+        if execution.state == state and (reason is None or execution.reason == reason):
+            self._upsert_plan_status_history(execution)
+            return
+        execution.state = state
+        execution.reason = reason
+        status = PlanStatus(state=state, timestamp=_utcnow_timestamp())
+        if reason:
+            status.reason = reason
+        execution.status_history.append(status)
+        self._upsert_plan_status_history(execution)
+
+    def _upsert_plan_status_history(self, execution: _PlanExecution) -> None:
+        entry = PlanStatusWithID(
+            plan_id=execution.plan_id,
+            execution_id=execution.execution_id,
+            component_name=execution.component_name,
+            status=PlanStatus(
+                state=execution.state,
+                timestamp=_utcnow_timestamp(),
+                reason=execution.reason or "",
+            ),
+        )
+        updated: List[PlanStatusWithID] = []
+        found = False
+        for existing in self._plan_status_history:
+            if existing.execution_id == execution.execution_id:
+                updated.append(entry)
+                found = True
+            else:
+                updated.append(existing)
+        if not found:
+            updated.append(entry)
+        # Keep a bounded history of recent executions.
+        self._plan_status_history = updated[-20:]
+
+    def _sync_plan_state_from_nav(self) -> None:
+        execution = self._plan_execution
+        if execution is None:
+            return
+        if execution.state == PlanState.PLAN_STATE_STOPPED:
+            # Explicit stop_plan / superseded — do not overwrite from Nav2.
+            self._upsert_plan_status_history(execution)
+            return
+        try:
+            status = self._require_runtime().manager.nav_status()
+        except Exception:  # noqa: BLE001 - plan queries should still return last known
+            return
+        mapped = _nav_status_to_plan_state(status)
+        if mapped == PlanState.PLAN_STATE_UNSPECIFIED:
+            if execution.state not in _TERMINAL_PLAN_STATES:
+                mapped = PlanState.PLAN_STATE_IN_PROGRESS
+            else:
+                self._upsert_plan_status_history(execution)
+                return
+        reason = None
+        if mapped == PlanState.PLAN_STATE_FAILED:
+            reason = str(status.get("state") or "failed")
+        self._record_plan_state(execution, mapped, reason=reason)
+
+    def _plan_to_response(self, execution: _PlanExecution) -> Motion.Plan:
+        component_key = str(Base.get_resource_name(execution.component_name))
+        plan = Plan(
+            id=execution.plan_id,
+            execution_id=execution.execution_id,
+            component_name=execution.component_name,
+            steps=[
+                PlanStep(
+                    step={
+                        component_key: ComponentState(pose=execution.destination),
+                    }
+                )
+            ],
+        )
+        current = PlanStatus(
+            state=execution.state,
+            timestamp=_utcnow_timestamp(),
+            reason=execution.reason or "",
+        )
+        return Motion.Plan(
+            current_plan_with_status=PlanWithStatus(
+                plan=plan,
+                status=current,
+                status_history=list(execution.status_history),
+            )
+        )
 
     # -- nav2 params ---------------------------------------------------------
     def _write_nav2_params(self, cfg: NavConfig) -> Path:
@@ -269,6 +621,12 @@ class NavServiceBase(Generic):
             self._active_goal_name = None
             await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.cancel)
+            if self._plan_execution is not None:
+                self._record_plan_state(
+                    self._plan_execution,
+                    PlanState.PLAN_STATE_STOPPED,
+                    reason="cancel",
+                )
             return {"status": "canceled"}
         if cmd == "test_drive":
             return await self._test_drive(command)
