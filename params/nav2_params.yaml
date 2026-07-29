@@ -104,9 +104,7 @@ controller_server:
       GoalAngleCritic:
         enabled: true
         cost_power: 1
-        # Final in-place yaw only. A large threshold (e.g. 1.0 m) with a high
-        # weight makes MPPI spin instead of drive on short navigates — exactly
-        # the "vx=0, tiny ω" failure on skid-steer bases.
+        # DiffDrive runtime profile disables this (in-place yaw on short goals).
         cost_weight: 3.0
         threshold_to_consider: 0.35
       PreferForwardCritic:
@@ -146,6 +144,8 @@ controller_server:
         offset_from_furthest: 5
         threshold_to_consider: 0.5
       PathAngleCritic:
+        # DiffDrive runtime profile disables this: it drives vx=0 micro-yaw on
+        # skid-steer bases. Left enabled here for omni / manual overrides.
         enabled: true
         cost_power: 1
         cost_weight: 1.5
@@ -153,8 +153,8 @@ controller_server:
         threshold_to_consider: 0.5
         max_angle_to_furthest: 1.0
       VelocityDeadbandCritic:
-        # Leave enabled. Disabling at runtime (DiffDrive profile) was linked to
-        # unreliable controller_server bringup on some Jazzy installs.
+        # DiffDrive profile softens cost_weight (35 → 8) at runtime so
+        # "yaw just above deadband" does not beat forward arcs.
         enabled: true
         cost_power: 1
         cost_weight: 35.0
