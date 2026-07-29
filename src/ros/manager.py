@@ -33,6 +33,10 @@ from .dds_env import apply_dds_isolation, dds_status
 
 SLAM_LIFECYCLE_NODE = "/slam_toolbox"
 _REQUIRED_NAV_NODES = ("controller_server", "bt_navigator")
+# Bundled launch that omits collision_monitor / docking / route (see launch/).
+_NAV2_LAUNCH = (
+    Path(__file__).resolve().parent.parent.parent / "launch" / "navigation_launch.py"
+)
 
 
 def _yaml_dump(data: Dict) -> str:
@@ -860,40 +864,37 @@ class RosManager:
         self.stop_nav2()
         self._rotate_nav2_log()
         self._wait_for_map_tf_before_nav2()
-        # Core Nav2 (planner, controller, costmaps, BT, behaviors). slam_toolbox
-        # supplies /map and map->odom, so no map_server/AMCL here.
+        # Use our bundled launch (no collision_monitor / docking / route). Stock
+        # nav2_bringup always starts those; killing them races activation and
+        # leaves nodes present with lifecycle timeouts / zero action servers.
+        if not _NAV2_LAUNCH.is_file():
+            raise FileNotFoundError(f"Nav2 launch file missing: {_NAV2_LAUNCH}")
         self._nav2_procs.append(
             self._popen(
-                ["ros2", "launch", "nav2_bringup", "navigation_launch.py",
-                 f"params_file:={params_path}", "use_sim_time:=false",
-                 "autostart:=false", "use_collision_monitor:=False",
-                 "use_composition:=False"]
+                [
+                    "ros2",
+                    "launch",
+                    str(_NAV2_LAUNCH),
+                    f"params_file:={params_path}",
+                    "use_sim_time:=false",
+                    "autostart:=true",
+                ]
             )
         )
-        # Jazzy navigation_launch.py always starts collision_monitor and a
-        # built-in lifecycle manager anyway (no use_collision_monitor arg).
-        # collision_monitor crashes on our disabled config; the built-in manager
-        # then waits forever. Our override lifecycle manager owns activation.
-        # Block until the stock manager is actually gone — starting the override
-        # while it is still configuring nodes is the classic Pi hang
-        # (nodes present, lifecycle get timeouts, nav_action_ready false).
-        self._suppress_jazzy_nav2_extras()
         self._apply_slam_tf_params()
-        # Activate core Nav2 first. Keepout/speed filter servers are optional and
-        # historically blocked bringup when they failed to register (filter LM
-        # spam-waiting on get_state while controller/bt sat unconfigured).
+        # Keepout/speed filter servers are optional and must not block core
+        # activation (historically the filter LM waited forever on get_state).
         if not self._wait_for_required_nav_nodes(timeout=60.0):
             self._log(
                 "core Nav2 nodes still missing after launch wait; "
                 f"missing={self._missing_required_nav_nodes()}"
             )
-        self._start_nav_lifecycle_override()
-        if self._wait_for_nav_action(timeout=45.0):
+        if self._wait_for_nav_action(timeout=90.0):
             if self._node is not None:
                 self._node.reset_nav_action_client()
         else:
             self._log(
-                "lifecycle override did not activate Nav2; trying manual configure/activate"
+                "lifecycle manager did not activate Nav2; trying manual configure/activate"
             )
             if self._activate_core_nav_nodes_manually() and self._wait_for_nav_action(
                 timeout=30.0
@@ -903,68 +904,6 @@ class RosManager:
             else:
                 self._log("Nav2 started but /navigate_to_pose is not ready yet")
         self._start_costmap_filter_stack(params_path)
-
-    def _start_nav_lifecycle_override(self) -> None:
-        """Start the lifecycle manager that configure→activates core Nav2 nodes."""
-        # Only manage nodes that are actually present. Never invent missing
-        # names (e.g. controller_server) — that makes the LM wait forever.
-        candidates = [
-            "controller_server",
-            "smoother_server",
-            "planner_server",
-            "behavior_server",
-            "bt_navigator",
-            "waypoint_follower",
-            "velocity_smoother",
-        ]
-        present = set()
-        node_list = self._run_ros(["ros2", "node", "list"])
-        if node_list.returncode == 0:
-            present = {
-                line.strip().lstrip("/")
-                for line in (node_list.stdout or "").splitlines()
-                if line.strip()
-            }
-        managed = [name for name in candidates if name in present]
-        if "controller_server" not in managed or "bt_navigator" not in managed:
-            self._log(
-                f"refusing lifecycle override without controller+bt "
-                f"(present={sorted(present)}); will rely on manual activate"
-            )
-            return
-        self._log(f"starting navigation lifecycle override for: {managed}")
-        nav_lm_params = self._scratch / "nav_lifecycle.yaml"
-        nav_lm_params.write_text(
-            _yaml_dump(
-                {
-                    "navigation_lifecycle_manager_override": {
-                        "ros__parameters": {
-                            "autostart": True,
-                            # Bond heartbeats miss on a loaded Pi and the manager
-                            # then deactivates every Nav2 node mid-run ("CRITICAL
-                            # FAILURE: SERVER ... IS DOWN"); disable them.
-                            "bond_timeout": 0.0,
-                            "node_names": managed,
-                        }
-                    }
-                }
-            )
-        )
-        self._nav2_procs.append(
-            self._popen(
-                [
-                    "ros2",
-                    "run",
-                    "nav2_lifecycle_manager",
-                    "lifecycle_manager",
-                    "--ros-args",
-                    "-r",
-                    "__node:=navigation_lifecycle_manager_override",
-                    "--params-file",
-                    str(nav_lm_params),
-                ]
-            )
-        )
 
     def _activate_core_nav_nodes_manually(self) -> bool:
         """Best-effort configure+activate when the lifecycle manager stalls."""
@@ -1100,21 +1039,6 @@ class RosManager:
             timeout=5.0,
         )
 
-    _SUPPRESS_WINDOW_S = 25.0
-    _SUPPRESS_STOCK_LM_WAIT_S = 20.0
-    _STOCK_LIFECYCLE_MANAGER_PATTERN = "__node:=lifecycle_manager_navigation"
-
-    def _pgrep_f(self, pattern: str) -> bool:
-        """True if any process command line matches ``pattern`` (pkill-style)."""
-        proc = subprocess.run(
-            ["pgrep", "-f", pattern],
-            env=self._ros_env(),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        return proc.returncode == 0 and bool((proc.stdout or "").strip())
-
     def _wait_for_required_nav_nodes(self, timeout: float = 45.0) -> bool:
         """Block until core Nav2 nodes appear in the graph (not yet activated)."""
         deadline = time.monotonic() + max(timeout, 0.0)
@@ -1124,70 +1048,10 @@ class RosManager:
             time.sleep(1.0)
         missing = self._missing_required_nav_nodes()
         self._log(
-            f"Nav2 core nodes not all present before lifecycle override "
+            f"Nav2 core nodes not all present after launch wait "
             f"(missing: {missing})"
         )
         return False
-
-    def _suppress_jazzy_nav2_extras(self) -> None:
-        """Remove Nav2 bringup nodes that conflict with our lifecycle override.
-
-        navigation_launch.py always spawns collision_monitor and a built-in
-        ``lifecycle_manager_navigation``. collision_monitor crashes on our
-        disabled config; the built-in manager (autostart) then fights our
-        override for control of the same nodes, so no node ever activates.
-
-        A single delayed pkill races: on a loaded Pi (e.g. during reconfigure)
-        bringup is slow, the built-in manager appears *after* the kill, dodges
-        it, and survives — the exact "all nodes present, none active" hang seen
-        on restart. Reap repeatedly for a window so late arrivals are caught.
-        The patterns match by node name / package path, so our own
-        ``navigation_lifecycle_manager_override`` and ``filter_lifecycle_manager``
-        are never touched.
-
-        Returns only after the stock lifecycle manager is gone (or the wait
-        times out), so the override manager does not race it.
-        """
-        patterns = (
-            "nav2_collision_monitor/collision_monitor",
-            self._STOCK_LIFECYCLE_MANAGER_PATTERN,
-        )
-
-        def _reap_once() -> None:
-            for pattern in patterns:
-                subprocess.run(
-                    ["pkill", "-f", pattern],
-                    env=self._ros_env(),
-                    check=False,
-                )
-
-        # Initial synchronous sweep preserves prior startup timing/ordering.
-        time.sleep(3.0)
-        _reap_once()
-
-        # Stock LM often SIGABRTs when killed ("context cannot be slept with
-        # because it's invalid") — that is expected. Wait until it is gone.
-        stock_deadline = time.monotonic() + self._SUPPRESS_STOCK_LM_WAIT_S
-        while time.monotonic() < stock_deadline:
-            if not self._pgrep_f(self._STOCK_LIFECYCLE_MANAGER_PATTERN):
-                break
-            _reap_once()
-            time.sleep(0.5)
-        else:
-            self._log(
-                "stock lifecycle_manager_navigation still running after "
-                f"{self._SUPPRESS_STOCK_LM_WAIT_S:.0f}s suppress wait"
-            )
-
-        def _reap_window() -> None:
-            deadline = time.monotonic() + self._SUPPRESS_WINDOW_S
-            while time.monotonic() < deadline:
-                time.sleep(1.0)
-                _reap_once()
-
-        threading.Thread(
-            target=_reap_window, name="nav2-suppress", daemon=True
-        ).start()
 
     def stop_nav2(self) -> None:
         self._nav_action_ok_until = 0.0
@@ -1208,6 +1072,7 @@ class RosManager:
         # use the slash form because that is how the executables appear in
         # process command lines (e.g. /opt/ros/jazzy/lib/nav2_controller/controller_server).
         for pattern in (
+            "launch/navigation_launch.py",
             "nav2_bringup/navigation_launch.py",
             "nav2_lifecycle_manager/lifecycle_manager",
             "nav2_map_server/costmap_filter_info_server",

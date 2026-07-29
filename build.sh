@@ -10,6 +10,7 @@ tar -czf module.tar.gz \
     setup.sh \
     run.sh \
     src \
-    params
+    params \
+    launch
 
 echo "Wrote module.tar.gz"

@@ -221,9 +221,9 @@ waypoint_follower:
 
 lifecycle_manager_navigation:
   ros__parameters:
-    # navigation_launch.py starts this manager; our override
-    # (navigation_lifecycle_manager_override) owns activation instead.
-    autostart: false
+    # Bundled launch/navigation_launch.py starts this manager with the same
+    # node list (no collision_monitor / docking / route).
+    autostart: true
     bond_timeout: 0.0
     node_names:
       - controller_server
@@ -233,8 +233,6 @@ lifecycle_manager_navigation:
       - bt_navigator
       - waypoint_follower
       - velocity_smoother
-      - route_server
-      - docking_server
 
 route_server:
   ros__parameters:
@@ -272,10 +270,8 @@ velocity_smoother:
 
 collision_monitor:
   ros__parameters:
-    # Not used (the manager kills this node after launch; the bridge drives
-    # from cmd_vel_smoothed directly). Params must still be valid: Jazzy
-    # cannot type empty lists ("polygons: []" -> InvalidParameterValueException
-    # crash-loop that takes the built-in lifecycle manager down with it).
+    # Not launched by nav-stack (see launch/navigation_launch.py). Kept so a
+    # user who re-enables stock bringup still has valid typed params.
     enabled: false
     base_frame_id: "base_link"
     odom_frame_id: "odom"
