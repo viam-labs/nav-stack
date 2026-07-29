@@ -924,6 +924,42 @@ class RosManager:
         # starts configure→activate; otherwise on a loaded Pi the override races
         # missing nodes and stalls with lifecycle timeouts.
         self._wait_for_required_nav_nodes(timeout=45.0)
+        # Only manage nodes that navigation_launch reliably starts. Including
+        # docking_server / route_server (optional / often absent) makes the
+        # lifecycle manager wait forever — nodes stay unconfigured, plan/nav
+        # hang with lifecycle timeouts and zero action servers.
+        managed = [
+            "controller_server",
+            "smoother_server",
+            "planner_server",
+            "behavior_server",
+            "bt_navigator",
+            "waypoint_follower",
+            "velocity_smoother",
+        ]
+        present = set()
+        node_list = self._run_ros(["ros2", "node", "list"])
+        if node_list.returncode == 0:
+            present = {
+                line.strip().lstrip("/")
+                for line in (node_list.stdout or "").splitlines()
+                if line.strip()
+            }
+        managed = [name for name in managed if name in present]
+        if "controller_server" not in managed or "bt_navigator" not in managed:
+            self._log(
+                f"core Nav2 nodes missing before lifecycle override "
+                f"(present managed={managed}); starting override with defaults"
+            )
+            managed = [
+                "controller_server",
+                "smoother_server",
+                "planner_server",
+                "behavior_server",
+                "bt_navigator",
+                "waypoint_follower",
+                "velocity_smoother",
+            ]
         nav_lm_params = self._scratch / "nav_lifecycle.yaml"
         nav_lm_params.write_text(
             _yaml_dump(
@@ -935,17 +971,7 @@ class RosManager:
                             # then deactivates every Nav2 node mid-run ("CRITICAL
                             # FAILURE: SERVER ... IS DOWN"); disable them.
                             "bond_timeout": 0.0,
-                            "node_names": [
-                                "controller_server",
-                                "smoother_server",
-                                "planner_server",
-                                "behavior_server",
-                                "bt_navigator",
-                                "waypoint_follower",
-                                "velocity_smoother",
-                                "route_server",
-                                "docking_server",
-                            ],
+                            "node_names": managed,
                         }
                     }
                 }
@@ -1329,13 +1355,14 @@ class RosManager:
                 "(check progress with the get_status command)"
             )
         self._apply_slam_tf_params()
-        if (
-            self._nav_cfg is not None
-            and self._nav_params_path is not None
-            and not self.nav_action_ready()
-        ):
-            self._log("Nav2 not healthy during plan; ensuring Nav2 before compute_path")
-            self.ensure_nav2(self._nav_cfg, self._nav_params_path)
+        if not self.nav_action_ready():
+            # Do not block plan on a multi-minute ensure_nav2 retry loop — the UI
+            # looks hung. Ask the caller to restart_nav2 / wait for readiness.
+            raise RuntimeError(
+                "Nav2 is not ready (no active /navigate_to_pose). "
+                "Check get_status: nav_action_ready should be true and "
+                "bt_navigator_lifecycle should be active. Try restart_nav2."
+            )
         try:
             return node.compute_path_to_pose(
                 x,
