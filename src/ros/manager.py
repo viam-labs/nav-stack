@@ -882,7 +882,11 @@ class RosManager:
         # Activate core Nav2 first. Keepout/speed filter servers are optional and
         # historically blocked bringup when they failed to register (filter LM
         # spam-waiting on get_state while controller/bt sat unconfigured).
-        self._wait_for_required_nav_nodes(timeout=45.0)
+        if not self._wait_for_required_nav_nodes(timeout=60.0):
+            self._log(
+                "core Nav2 nodes still missing after launch wait; "
+                f"missing={self._missing_required_nav_nodes()}"
+            )
         self._start_nav_lifecycle_override()
         if self._wait_for_nav_action(timeout=45.0):
             if self._node is not None:
@@ -902,11 +906,9 @@ class RosManager:
 
     def _start_nav_lifecycle_override(self) -> None:
         """Start the lifecycle manager that configure→activates core Nav2 nodes."""
-        # Only manage nodes that navigation_launch reliably starts. Including
-        # docking_server / route_server (optional / often absent) makes the
-        # lifecycle manager wait forever — nodes stay unconfigured, plan/nav
-        # hang with lifecycle timeouts and zero action servers.
-        managed = [
+        # Only manage nodes that are actually present. Never invent missing
+        # names (e.g. controller_server) — that makes the LM wait forever.
+        candidates = [
             "controller_server",
             "smoother_server",
             "planner_server",
@@ -923,21 +925,13 @@ class RosManager:
                 for line in (node_list.stdout or "").splitlines()
                 if line.strip()
             }
-        managed = [name for name in managed if name in present]
+        managed = [name for name in candidates if name in present]
         if "controller_server" not in managed or "bt_navigator" not in managed:
             self._log(
-                f"core Nav2 nodes missing before lifecycle override "
-                f"(present managed={managed}); starting override with defaults"
+                f"refusing lifecycle override without controller+bt "
+                f"(present={sorted(present)}); will rely on manual activate"
             )
-            managed = [
-                "controller_server",
-                "smoother_server",
-                "planner_server",
-                "behavior_server",
-                "bt_navigator",
-                "waypoint_follower",
-                "velocity_smoother",
-            ]
+            return
         self._log(f"starting navigation lifecycle override for: {managed}")
         nav_lm_params = self._scratch / "nav_lifecycle.yaml"
         nav_lm_params.write_text(
@@ -1131,7 +1125,7 @@ class RosManager:
         missing = self._missing_required_nav_nodes()
         self._log(
             f"Nav2 core nodes not all present before lifecycle override "
-            f"(missing: {missing}); starting override anyway"
+            f"(missing: {missing})"
         )
         return False
 

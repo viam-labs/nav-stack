@@ -269,6 +269,7 @@ def test_start_nav2_rotates_previous_launch_log(tmp_path):
 
     proc = MagicMock()
     proc.poll.return_value = None
+    nodes = "/controller_server\n/bt_navigator\n"
     with patch.object(mgr, "stop_nav2"), patch.object(
         mgr, "_popen", return_value=proc
     ), patch.object(mgr, "_wait_for_nav_action", return_value=True), patch.object(
@@ -276,7 +277,7 @@ def test_start_nav2_rotates_previous_launch_log(tmp_path):
     ), patch.object(mgr, "_wait_for_required_nav_nodes", return_value=True), patch.object(
         mgr, "_apply_slam_tf_params"
     ), patch.object(mgr, "_start_costmap_filter_stack"), patch.object(
-        mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout="", stderr="")
+        mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout=nodes, stderr="")
     ):
         mgr.start_nav2(nav_cfg, params_path)
 
@@ -310,6 +311,7 @@ def test_start_nav2_disables_collision_monitor_launch_arg(tmp_path):
 
     proc = MagicMock()
     proc.poll.return_value = None
+    nodes = "/controller_server\n/bt_navigator\n/planner_server\n"
     with patch.object(mgr, "stop_nav2"), patch.object(
         mgr, "_popen", return_value=proc
     ) as popen, patch.object(mgr, "_wait_for_nav_action", return_value=False), patch.object(
@@ -321,7 +323,7 @@ def test_start_nav2_disables_collision_monitor_launch_arg(tmp_path):
     ) as apply_tf, patch.object(
         mgr, "_activate_core_nav_nodes_manually", return_value=False
     ), patch.object(mgr, "_start_costmap_filter_stack"), patch.object(
-        mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout="", stderr="")
+        mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout=nodes, stderr="")
     ):
         mgr.start_nav2(nav_cfg, params_path)
 
@@ -384,6 +386,38 @@ def test_lifecycle_manager_params_disable_bond_timeout(tmp_path):
     assert "docking_server" not in nav_params["navigation_lifecycle_manager_override"][
         "ros__parameters"
     ]["node_names"]
+
+
+def test_lifecycle_override_refused_without_controller_server(tmp_path):
+    """Missing controller + invented node names = LM waits forever (bringup hang)."""
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "maps_dir": str(tmp_path)})
+    mgr = RosManager(cfg, logger=MagicMock())
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    params_path = tmp_path / "nav2_params.yaml"
+    params_path.write_text("{}", encoding="utf-8")
+
+    proc = MagicMock()
+    proc.poll.return_value = None
+    # Same shape as a bad bringup: bt up, controller never registered.
+    nodes = "/bt_navigator\n/planner_server\n/velocity_smoother\n"
+    with patch.object(mgr, "stop_nav2"), patch.object(
+        mgr, "_popen", return_value=proc
+    ) as popen, patch.object(mgr, "_wait_for_nav_action", return_value=False), patch.object(
+        mgr, "_suppress_jazzy_nav2_extras"
+    ), patch.object(mgr, "_wait_for_required_nav_nodes", return_value=False), patch.object(
+        mgr, "_apply_slam_tf_params"
+    ), patch.object(mgr, "_activate_core_nav_nodes_manually", return_value=False), patch.object(
+        mgr, "_start_costmap_filter_stack"
+    ), patch.object(
+        mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout=nodes, stderr="")
+    ):
+        mgr.start_nav2(nav_cfg, params_path)
+
+    assert not (tmp_path / ".runtime" / "nav_lifecycle.yaml").exists()
+    assert not any(
+        "__node:=navigation_lifecycle_manager_override" in call.args[0]
+        for call in popen.call_args_list
+    )
 
 
 def test_nav_action_ready_invalidates_cache_when_nodes_missing():
