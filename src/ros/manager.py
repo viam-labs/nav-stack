@@ -879,51 +879,29 @@ class RosManager:
         # (nodes present, lifecycle get timeouts, nav_action_ready false).
         self._suppress_jazzy_nav2_extras()
         self._apply_slam_tf_params()
-        # Costmap filter info servers for keepout + speed zones. The mask
-        # OccupancyGrids themselves are published by the bridge; these servers
-        # publish the matching CostmapFilterInfo. They are lifecycle nodes, managed
-        # by a dedicated lifecycle_manager with autostart.
-        for which, node_name in (
-            ("keepout", "costmap_filter_info_server_keepout"),
-            ("speed", "costmap_filter_info_server_speed"),
-        ):
-            self._nav2_procs.append(
-                self._popen(
-                    ["ros2", "run", "nav2_map_server", "costmap_filter_info_server",
-                     "--ros-args", "-r", f"__node:={node_name}",
-                     "--params-file", str(params_path)]
-                )
-            )
-        lm_params = self._scratch / "filter_lifecycle.yaml"
-        lm_params.write_text(
-            _yaml_dump(
-                {
-                    "filter_lifecycle_manager": {
-                        "ros__parameters": {
-                            "autostart": True,
-                            # Bond heartbeats miss on a loaded Pi and the manager
-                            # then deactivates every node; disable them.
-                            "bond_timeout": 0.0,
-                            "node_names": [
-                                "costmap_filter_info_server_keepout",
-                                "costmap_filter_info_server_speed",
-                            ],
-                        }
-                    }
-                }
-            )
-        )
-        self._nav2_procs.append(
-            self._popen(
-                ["ros2", "run", "nav2_lifecycle_manager", "lifecycle_manager",
-                 "--ros-args", "-r", "__node:=filter_lifecycle_manager",
-                 "--params-file", str(lm_params)]
-            )
-        )
-        # Let bringup finish spawning controller/bt before the override manager
-        # starts configure→activate; otherwise on a loaded Pi the override races
-        # missing nodes and stalls with lifecycle timeouts.
+        # Activate core Nav2 first. Keepout/speed filter servers are optional and
+        # historically blocked bringup when they failed to register (filter LM
+        # spam-waiting on get_state while controller/bt sat unconfigured).
         self._wait_for_required_nav_nodes(timeout=45.0)
+        self._start_nav_lifecycle_override()
+        if self._wait_for_nav_action(timeout=45.0):
+            if self._node is not None:
+                self._node.reset_nav_action_client()
+        else:
+            self._log(
+                "lifecycle override did not activate Nav2; trying manual configure/activate"
+            )
+            if self._activate_core_nav_nodes_manually() and self._wait_for_nav_action(
+                timeout=30.0
+            ):
+                if self._node is not None:
+                    self._node.reset_nav_action_client()
+            else:
+                self._log("Nav2 started but /navigate_to_pose is not ready yet")
+        self._start_costmap_filter_stack(params_path)
+
+    def _start_nav_lifecycle_override(self) -> None:
+        """Start the lifecycle manager that configure→activates core Nav2 nodes."""
         # Only manage nodes that navigation_launch reliably starts. Including
         # docking_server / route_server (optional / often absent) makes the
         # lifecycle manager wait forever — nodes stay unconfigured, plan/nav
@@ -960,6 +938,7 @@ class RosManager:
                 "waypoint_follower",
                 "velocity_smoother",
             ]
+        self._log(f"starting navigation lifecycle override for: {managed}")
         nav_lm_params = self._scratch / "nav_lifecycle.yaml"
         nav_lm_params.write_text(
             _yaml_dump(
@@ -992,11 +971,124 @@ class RosManager:
                 ]
             )
         )
-        if self._wait_for_nav_action():
-            if self._node is not None:
-                self._node.reset_nav_action_client()
-        else:
-            self._log("Nav2 started but /navigate_to_pose is not ready yet")
+
+    def _activate_core_nav_nodes_manually(self) -> bool:
+        """Best-effort configure+activate when the lifecycle manager stalls."""
+        core = (
+            "controller_server",
+            "planner_server",
+            "smoother_server",
+            "behavior_server",
+            "bt_navigator",
+            "velocity_smoother",
+            "waypoint_follower",
+        )
+        node_list = self._run_ros(["ros2", "node", "list"])
+        present = set()
+        if node_list.returncode == 0:
+            present = {
+                line.strip().lstrip("/")
+                for line in (node_list.stdout or "").splitlines()
+                if line.strip()
+            }
+        ok_any = False
+        for bare in core:
+            if bare not in present:
+                continue
+            name = "/" + bare
+            state = self._lifecycle_get_state(name)
+            if state == "active":
+                ok_any = True
+                continue
+            if state in (None, "unconfigured", "finalized"):
+                if not self._lifecycle_set(name, "configure", timeout=30.0):
+                    self._log(f"manual configure failed for {name}")
+                    continue
+            state = self._lifecycle_get_state(name)
+            if state == "inactive":
+                if not self._lifecycle_set(name, "activate", timeout=60.0):
+                    self._log(f"manual activate failed for {name}")
+                    continue
+            if self._lifecycle_get_state(name) == "active":
+                ok_any = True
+        return ok_any
+
+    def _start_costmap_filter_stack(self, params_path: Path) -> None:
+        """Start keepout/speed filter info servers if they come up quickly.
+
+        These are optional (zones). Never block Nav2 activation on them.
+        """
+        for which, node_name in (
+            ("keepout", "costmap_filter_info_server_keepout"),
+            ("speed", "costmap_filter_info_server_speed"),
+        ):
+            self._nav2_procs.append(
+                self._popen(
+                    [
+                        "ros2",
+                        "run",
+                        "nav2_map_server",
+                        "costmap_filter_info_server",
+                        "--ros-args",
+                        "-r",
+                        f"__node:={node_name}",
+                        "--params-file",
+                        str(params_path),
+                    ]
+                )
+            )
+        # Only start the filter LM if both servers register; otherwise it spam-
+        # waits on get_state forever and adds DDS/CPU noise during bringup.
+        deadline = time.monotonic() + 15.0
+        have_both = False
+        while time.monotonic() < deadline:
+            proc = self._run_ros(["ros2", "node", "list"])
+            nodes = proc.stdout or ""
+            if (
+                "costmap_filter_info_server_keepout" in nodes
+                and "costmap_filter_info_server_speed" in nodes
+            ):
+                have_both = True
+                break
+            time.sleep(0.5)
+        if not have_both:
+            self._log(
+                "costmap filter info servers did not register; skipping filter "
+                "lifecycle manager (keepout/speed zones inactive until next restart)"
+            )
+            return
+        lm_params = self._scratch / "filter_lifecycle.yaml"
+        lm_params.write_text(
+            _yaml_dump(
+                {
+                    "filter_lifecycle_manager": {
+                        "ros__parameters": {
+                            "autostart": True,
+                            "bond_timeout": 0.0,
+                            "node_names": [
+                                "costmap_filter_info_server_keepout",
+                                "costmap_filter_info_server_speed",
+                            ],
+                        }
+                    }
+                }
+            )
+        )
+        self._nav2_procs.append(
+            self._popen(
+                [
+                    "ros2",
+                    "run",
+                    "nav2_lifecycle_manager",
+                    "lifecycle_manager",
+                    "--ros-args",
+                    "-r",
+                    "__node:=filter_lifecycle_manager",
+                    "--params-file",
+                    str(lm_params),
+                ]
+            )
+        )
 
     def _apply_slam_tf_params(self) -> None:
         """Push slam_toolbox TF timing params onto a running node (no restart needed)."""
