@@ -98,24 +98,24 @@ controller_server:
         enabled: true
         cost_power: 1
         cost_weight: 4.0
-        # Start goal-approach (and deceleration) earlier so the robot does not
-        # carry path-following speed into the final meters.
-        threshold_to_consider: 2.5
+        # Active only inside this radius. Keep small so short goals (1–2 m)
+        # still use PathFollow for most of the trip — see Path* thresholds.
+        threshold_to_consider: 1.0
       GoalAngleCritic:
         enabled: true
         cost_power: 1
-        # Strong enough to force a large in-place final rotation once the robot
-        # is parked on the goal XY (must beat GoalCritic=4.0, which is happy to
-        # just sit on the point). A weak value here reaches the spot but never
-        # turns to the goal heading — the robot ends up facing its approach
-        # direction. Engage in the last meter so the turn has horizon to finish.
-        cost_weight: 6.0
-        threshold_to_consider: 1.0
+        # Final in-place yaw only. A large threshold (e.g. 1.0 m) with a high
+        # weight makes MPPI spin instead of drive on short navigates — exactly
+        # the "vx=0, tiny ω" failure on skid-steer bases.
+        cost_weight: 3.0
+        threshold_to_consider: 0.35
       PreferForwardCritic:
         enabled: true
         cost_power: 1
         cost_weight: 3.0
-        threshold_to_consider: 2.5
+        # Path-style critics: DISABLED when closer than threshold. Must stay
+        # below typical navigate distances or short goals never path-follow.
+        threshold_to_consider: 0.5
       CostCritic:
         enabled: true
         cost_power: 1
@@ -131,14 +131,12 @@ controller_server:
       PathAlignCritic:
         enabled: true
         cost_power: 1
-        # Strong enough to track the (now smoothed) global path mid-route;
-        # hands off to GoalCritic within 2.5 m so near-goal behavior is safe.
         cost_weight: 10.0
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
-        # Match GoalCritic threshold so path tracking hands off cleanly to
-        # goal approach (avoids hunt-and-peck near the target).
-        threshold_to_consider: 2.5
+        # Hand off to GoalCritic only in the last half-meter (NOT 2.5 m — that
+        # disabled PathFollow for every short indoor navigate).
+        threshold_to_consider: 0.5
         offset_from_furthest: 15
         use_path_orientations: false
       PathFollowCritic:
@@ -146,13 +144,13 @@ controller_server:
         cost_power: 1
         cost_weight: 4.0
         offset_from_furthest: 5
-        threshold_to_consider: 2.5
+        threshold_to_consider: 0.5
       PathAngleCritic:
         enabled: true
         cost_power: 1
         cost_weight: 1.5
         offset_from_furthest: 4
-        threshold_to_consider: 2.5
+        threshold_to_consider: 0.5
         max_angle_to_furthest: 1.0
       VelocityDeadbandCritic:
         enabled: true

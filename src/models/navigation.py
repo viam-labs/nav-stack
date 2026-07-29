@@ -49,6 +49,7 @@ from .nav_core import (  # noqa: F401
     _normalize_nav2_user_params,
     _set_obstacle_sources,
     _sync_mppi_model_dt,
+    _sync_smoother_reverse_to_mppi,
     _tune_nav2_bt_xml,
     _validate_nav2_params_structure,
     _write_nav2_bt_xml,
