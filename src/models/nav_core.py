@@ -1310,13 +1310,12 @@ def _sync_smoother_reverse_to_mppi(params: dict) -> None:
 
 
 def _apply_diffdrive_mppi_profile(params: dict, cfg: NavConfig) -> None:
-    """Stop DiffDrive MPPI from choosing in-place yaw on short navigates.
+    """Keep DiffDrive MPPI path-following active on short (~1 m) goals.
 
-    PathAngle + GoalAngle + VelocityDeadband strongly prefer pure spin when
-    heading is slightly off. That is fine on a base that can pivot; on
-    skid-steer / low-traction carts it produces ``vx=0`` + ``|ω|≈0.1`` forever
-    while ``test_drive`` (which sends real forward) works. Applied after user
-    ``nav2_params`` so stale overrides cannot reintroduce the failure mode.
+    Only clamps path-critic handoff thresholds (and gently boosts PathFollow).
+    Do **not** disable critics or rewrite smoother feedback here — those
+    mutations have caused ``controller_server`` to fail to start on some
+    Jazzy installs, which is worse than the yaw-only symptom they targeted.
     """
     if cfg.kinematics == OMNI:
         return
@@ -1326,11 +1325,7 @@ def _apply_diffdrive_mppi_profile(params: dict, cfg: NavConfig) -> None:
         return
     if not isinstance(fp, dict):
         return
-    for name in ("PathAngleCritic", "GoalAngleCritic", "VelocityDeadbandCritic"):
-        section = fp.get(name)
-        if isinstance(section, dict):
-            section["enabled"] = False
-    for name in ("PathFollowCritic", "PathAlignCritic", "PreferForwardCritic"):
+    for name in ("PathFollowCritic", "PathAlignCritic", "PreferForwardCritic", "PathAngleCritic"):
         section = fp.get(name)
         if not isinstance(section, dict):
             continue
@@ -1339,7 +1334,7 @@ def _apply_diffdrive_mppi_profile(params: dict, cfg: NavConfig) -> None:
         except (TypeError, ValueError):
             thr = 0.5
         # Path-style critics disable inside this radius; keep it tight so ~1 m
-        # goals still path-follow.
+        # goals still path-follow (the old 2.5 m handoff disabled them entirely).
         if thr > 0.6:
             section["threshold_to_consider"] = 0.5
     follow = fp.get("PathFollowCritic")
@@ -1349,15 +1344,21 @@ def _apply_diffdrive_mppi_profile(params: dict, cfg: NavConfig) -> None:
         except (TypeError, ValueError):
             weight = 4.0
         follow["cost_weight"] = max(weight, 6.0)
-    try:
-        vs = params["velocity_smoother"]["ros__parameters"]
-    except (KeyError, TypeError):
-        return
-    if isinstance(vs, dict):
-        # CLOSED_LOOP + skid-steer odom often fights MPPI; open-loop ramps are
-        # predictable and match what test_drive proves works.
-        vs["feedback"] = "OPEN_LOOP"
-        vs["deadband_velocity"] = [0.0, 0.0, 0.0]
+    goal_angle = fp.get("GoalAngleCritic")
+    if isinstance(goal_angle, dict):
+        # Final heading only — engaging at 1 m forces in-place yaw on short trips.
+        try:
+            thr = float(goal_angle.get("threshold_to_consider", 0.35))
+        except (TypeError, ValueError):
+            thr = 1.0
+        if thr > 0.4:
+            goal_angle["threshold_to_consider"] = 0.35
+        try:
+            weight = float(goal_angle.get("cost_weight", 3.0))
+        except (TypeError, ValueError):
+            weight = 3.0
+        if weight > 3.0:
+            goal_angle["cost_weight"] = 3.0
 
 
 def _mppi_profile_snapshot(params: dict) -> dict:
