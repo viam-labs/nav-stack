@@ -16,7 +16,7 @@ import math
 import os
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Mapping, Optional, Sequence
@@ -503,7 +503,12 @@ class NavServiceBase(Motion):
         _set_obstacle_sources(params, len(runtime.slam_cfg.lidars))
         runtime_dir = Path(runtime.slam_cfg.maps_dir).expanduser() / ".runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
-        bt_path = _write_nav2_bt_xml(runtime_dir, cfg.nav2)
+        # Spin/BackUp recoveries are useless on carpet skid-steer (they are the
+        # vx=0 |ω|≈0.1 samples in cmd history). Force retries off for DiffDrive.
+        nav2_for_bt = cfg.nav2
+        if cfg.kinematics != OMNI and cfg.nav2.navigate_recovery_retries != 0:
+            nav2_for_bt = replace(cfg.nav2, navigate_recovery_retries=0)
+        bt_path = _write_nav2_bt_xml(runtime_dir, nav2_for_bt)
         try:
             bt_params = params.setdefault("bt_navigator", {}).setdefault(
                 "ros__parameters", {}
@@ -1316,9 +1321,10 @@ def _apply_diffdrive_controller(params: dict, cfg: NavConfig) -> None:
     """Use Regulated Pure Pursuit for DiffDrive instead of MPPI.
 
     MPPI on this skid-steer repeatedly converges to ``vx=0`` with
-    ``|ω|≈0.05–0.1`` regardless of critic tuning. RPP tracks a lookahead
-    point with forward motion; ``use_rotate_to_heading: false`` prevents the
-    in-place spin that carpet bases cannot execute usefully.
+    ``|ω|≈0.05–0.1``. RPP tracks a lookahead with forward motion;
+    ``use_rotate_to_heading: false`` avoids stop-and-spin. Also: open-loop
+    smoother (CLOSED_LOOP fights carpet stiction), no RPP collision freeze,
+    and a looser progress checker so weak first motion is not an instant abort.
     """
     if cfg.kinematics == OMNI:
         return
@@ -1329,6 +1335,7 @@ def _apply_diffdrive_controller(params: dict, cfg: NavConfig) -> None:
     if not isinstance(cs, dict):
         return
     reverse_mps = -min(float(cfg.max_vel_x), 0.15)
+    min_speed = max(0.12, 0.5 * float(cfg.max_vel_x))
     # Keep both Jazzy (desired_linear_vel) and newer (max_linear_vel) names.
     cs["FollowPath"] = {
         "plugin": (
@@ -1349,21 +1356,41 @@ def _apply_diffdrive_controller(params: dict, cfg: NavConfig) -> None:
         "lookahead_time": 1.5,
         "rotate_to_heading_angular_vel": min(float(cfg.max_vel_theta), 1.0),
         "use_velocity_scaled_lookahead_dist": True,
-        "min_approach_linear_velocity": 0.08,
+        "min_approach_linear_velocity": max(0.08, min_speed * 0.5),
         "approach_velocity_scaling_dist": 0.6,
-        "use_collision_detection": True,
-        "max_allowed_time_to_collision_up_to_carrot": 1.0,
+        # Global planner already avoids obstacles. Local RPP collision checks
+        # often freeze the cart in inflation (cmd zero → progress fail → Spin).
+        "use_collision_detection": False,
         "use_regulated_linear_velocity_scaling": True,
-        "use_cost_regulated_linear_velocity_scaling": True,
-        "cost_scaling_dist": 0.4,
-        "cost_scaling_gain": 1.0,
+        "use_cost_regulated_linear_velocity_scaling": False,
         "regulated_linear_scaling_min_radius": 0.9,
-        "regulated_linear_scaling_min_speed": 0.12,
+        "regulated_linear_scaling_min_speed": min_speed,
         # Critical for skid-steer / carpet: never stop-and-spin.
         "use_rotate_to_heading": False,
         "allow_reversing": False,
         "transform_tolerance": 10.0,
     }
+    progress = cs.get("progress_checker")
+    if isinstance(progress, dict):
+        try:
+            radius = float(progress.get("required_movement_radius", 0.25))
+        except (TypeError, ValueError):
+            radius = 0.25
+        progress["required_movement_radius"] = min(radius, 0.15)
+        try:
+            allow = float(progress.get("movement_time_allowance", 10.0))
+        except (TypeError, ValueError):
+            allow = 10.0
+        progress["movement_time_allowance"] = max(allow, 30.0)
+    try:
+        vs = params["velocity_smoother"]["ros__parameters"]
+    except (KeyError, TypeError):
+        vs = None
+    if isinstance(vs, dict):
+        # CLOSED_LOOP + carpet stiction: smoother never sees motion and
+        # collapses useful cmds. Open-loop ramps match test_drive.
+        vs["feedback"] = "OPEN_LOOP"
+        vs["deadband_velocity"] = [0.0, 0.0, 0.0]
     _sync_smoother_reverse_to_mppi(params)
 
 
@@ -1388,6 +1415,10 @@ def _mppi_profile_snapshot(params: dict) -> dict:
                 "allow_reversing": fp.get("allow_reversing"),
                 "lookahead_dist": fp.get("lookahead_dist"),
                 "min_approach_linear_velocity": fp.get("min_approach_linear_velocity"),
+                "use_collision_detection": fp.get("use_collision_detection"),
+                "regulated_linear_scaling_min_speed": fp.get(
+                    "regulated_linear_scaling_min_speed"
+                ),
             }
         )
     else:
