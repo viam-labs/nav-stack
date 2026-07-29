@@ -489,6 +489,9 @@ class NavServiceBase(Motion):
             _deep_merge(
                 params, _normalize_nav2_user_params(dict(cfg.nav2_params), params)
             )
+            # User may override FollowPath.vx_min after our wiring; keep the
+            # smoother's reverse cap aligned so it cannot exceed MPPI again.
+            _sync_smoother_reverse_to_mppi(params)
         _apply_local_costmap_size(params, cfg.nav2)
         _sync_mppi_model_dt(params)
 
@@ -1279,6 +1282,25 @@ def _apply_velocity_limits(params: dict, cfg: NavConfig) -> None:
             -1.5 * cfg.acc_lim_x if omni else 0.0,
             -1.5 * cfg.acc_lim_theta,
         ]
+
+
+def _sync_smoother_reverse_to_mppi(params: dict) -> None:
+    """Keep velocity_smoother min_velocity[0] from exceeding FollowPath.vx_min."""
+    try:
+        fp = params["controller_server"]["ros__parameters"]["FollowPath"]
+        vs = params["velocity_smoother"]["ros__parameters"]
+    except (KeyError, TypeError):
+        return
+    if not isinstance(fp, dict) or not isinstance(vs, dict):
+        return
+    if "vx_min" not in fp:
+        return
+    vx_min = float(fp["vx_min"])
+    min_vel = vs.get("min_velocity")
+    if isinstance(min_vel, list) and min_vel:
+        vs["min_velocity"] = [vx_min, *min_vel[1:]]
+    elif isinstance(min_vel, tuple) and min_vel:
+        vs["min_velocity"] = [vx_min, *list(min_vel[1:])]
 
 
 def _deep_merge(obj: dict, overrides: Mapping) -> None:

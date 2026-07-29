@@ -440,6 +440,21 @@ def test_apply_velocity_limits_reverse_scales_with_low_max_vel():
     assert params["velocity_smoother"]["ros__parameters"]["min_velocity"][0] == -0.08
 
 
+def test_sync_smoother_reverse_follows_user_vx_min_override():
+    from src.models.navigation import _sync_smoother_reverse_to_mppi
+
+    params = {
+        "controller_server": {
+            "ros__parameters": {"FollowPath": {"vx_min": 0.0}}
+        },
+        "velocity_smoother": {
+            "ros__parameters": {"min_velocity": [-0.15, 0.0, -1.0]}
+        },
+    }
+    _sync_smoother_reverse_to_mppi(params)
+    assert params["velocity_smoother"]["ros__parameters"]["min_velocity"][0] == 0.0
+
+
 def test_nav2_config_from_attributes():
     cfg = NavConfig.from_dict(
         {
