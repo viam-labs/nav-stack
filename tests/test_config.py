@@ -465,7 +465,11 @@ def test_diffdrive_uses_regulated_pure_pursuit():
                     "plugin": "nav2_mppi_controller::MPPIController",
                     "vx_max": 0.4,
                     "PathAngleCritic": {"enabled": True},
-                }
+                },
+                "progress_checker": {
+                    "required_movement_radius": 0.25,
+                    "movement_time_allowance": 10.0,
+                },
             }
         },
         "velocity_smoother": {
@@ -492,12 +496,18 @@ def test_diffdrive_uses_regulated_pure_pursuit():
     assert "regulated_pure_pursuit" in fp["plugin"]
     assert fp["use_rotate_to_heading"] is False
     assert fp["allow_reversing"] is False
+    assert fp["use_collision_detection"] is False
     assert fp["desired_linear_vel"] == 0.25
     assert fp["max_angular_vel"] == 1.5
     assert fp["min_linear_vel"] == -0.15
+    assert fp["regulated_linear_scaling_min_speed"] == 0.125
+    pc = params["controller_server"]["ros__parameters"]["progress_checker"]
+    assert pc["required_movement_radius"] == 0.15
+    assert pc["movement_time_allowance"] == 30.0
     vs = params["velocity_smoother"]["ros__parameters"]
     assert vs["min_velocity"][0] == -0.15
-    assert vs["feedback"] == "CLOSED_LOOP"
+    assert vs["feedback"] == "OPEN_LOOP"
+    assert vs["deadband_velocity"] == [0.0, 0.0, 0.0]
 
 
 def test_diffdrive_controller_noop_for_omni():
