@@ -58,6 +58,8 @@ controller_server:
       yaw_goal_tolerance: 0.25
       path_length_tolerance: 1.0
     FollowPath:
+      # DiffDrive runtime swaps this for Regulated Pure Pursuit (MPPI keeps
+      # choosing vx=0 micro-yaw on skid-steer). Omni keeps MPPI.
       plugin: "nav2_mppi_controller::MPPIController"
       # Sized for Pi 5 (4 cores shared with slam_toolbox): ~7x less compute
       # than stock 2000x56@20Hz while keeping a ~3.2s horizon.

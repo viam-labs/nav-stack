@@ -493,9 +493,9 @@ class NavServiceBase(Motion):
             # User may override FollowPath.vx_min after our wiring; keep the
             # smoother's reverse cap aligned so it cannot exceed MPPI again.
             _sync_smoother_reverse_to_mppi(params)
-        # After user merges: DiffDrive must not keep critic settings that force
-        # in-place yaw on short goals (skid-steer / carpet death spiral).
-        _apply_diffdrive_mppi_profile(params, cfg)
+        # After user merges: DiffDrive skid-steer cannot use stock MPPI — it
+        # converges to vx=0 micro-yaw. Swap to Regulated Pure Pursuit instead.
+        _apply_diffdrive_controller(params, cfg)
         _apply_local_costmap_size(params, cfg.nav2)
         _sync_mppi_model_dt(params)
 
@@ -1291,7 +1291,7 @@ def _apply_velocity_limits(params: dict, cfg: NavConfig) -> None:
 
 
 def _sync_smoother_reverse_to_mppi(params: dict) -> None:
-    """Keep velocity_smoother min_velocity[0] from exceeding FollowPath.vx_min."""
+    """Keep velocity_smoother min_velocity[0] aligned with controller reverse."""
     try:
         fp = params["controller_server"]["ros__parameters"]["FollowPath"]
         vs = params["velocity_smoother"]["ros__parameters"]
@@ -1299,9 +1299,12 @@ def _sync_smoother_reverse_to_mppi(params: dict) -> None:
         return
     if not isinstance(fp, dict) or not isinstance(vs, dict):
         return
-    if "vx_min" not in fp:
+    if "vx_min" in fp:
+        vx_min = float(fp["vx_min"])
+    elif "min_linear_vel" in fp:
+        vx_min = float(fp["min_linear_vel"])
+    else:
         return
-    vx_min = float(fp["vx_min"])
     min_vel = vs.get("min_velocity")
     if isinstance(min_vel, list) and min_vel:
         vs["min_velocity"] = [vx_min, *min_vel[1:]]
@@ -1309,114 +1312,112 @@ def _sync_smoother_reverse_to_mppi(params: dict) -> None:
         vs["min_velocity"] = [vx_min, *list(min_vel[1:])]
 
 
-def _apply_diffdrive_mppi_profile(params: dict, cfg: NavConfig) -> None:
-    """Bias DiffDrive MPPI toward forward arcs instead of spin-or-stop.
+def _apply_diffdrive_controller(params: dict, cfg: NavConfig) -> None:
+    """Use Regulated Pure Pursuit for DiffDrive instead of MPPI.
 
-    PathAngle/GoalAngle produce ``vx=0`` micro-yaw on skid-steer; disabling
-    them alone can leave CostCritic + PreferForward choosing pure zero when
-    the robot sits in inflation. Soften deadband, keep PreferForward modest,
-    and widen rotational sampling so arcs are actually proposed.
+    MPPI on this skid-steer repeatedly converges to ``vx=0`` with
+    ``|ω|≈0.05–0.1`` regardless of critic tuning. RPP tracks a lookahead
+    point with forward motion; ``use_rotate_to_heading: false`` prevents the
+    in-place spin that carpet bases cannot execute usefully.
     """
     if cfg.kinematics == OMNI:
         return
     try:
-        fp = params["controller_server"]["ros__parameters"]["FollowPath"]
+        cs = params["controller_server"]["ros__parameters"]
     except (KeyError, TypeError):
         return
-    if not isinstance(fp, dict):
+    if not isinstance(cs, dict):
         return
-    for name in ("PathAngleCritic", "GoalAngleCritic"):
-        section = fp.get(name)
-        if isinstance(section, dict):
-            section["enabled"] = False
-    deadband = fp.get("VelocityDeadbandCritic")
-    if isinstance(deadband, dict):
-        # Weight 35 makes "just above yaw deadband" (or stop) dominate arcs.
-        deadband["enabled"] = False
-    for name in ("PathFollowCritic", "PathAlignCritic", "PreferForwardCritic"):
-        section = fp.get(name)
-        if not isinstance(section, dict):
-            continue
-        try:
-            thr = float(section.get("threshold_to_consider", 0.5))
-        except (TypeError, ValueError):
-            thr = 0.5
-        if thr > 0.6:
-            section["threshold_to_consider"] = 0.5
-    follow = fp.get("PathFollowCritic")
-    if isinstance(follow, dict):
-        try:
-            weight = float(follow.get("cost_weight", 4.0))
-        except (TypeError, ValueError):
-            weight = 4.0
-        follow["cost_weight"] = max(weight, 8.0)
-    align = fp.get("PathAlignCritic")
-    if isinstance(align, dict):
-        # Stock weight 10 fights PathFollow into pure yaw when heading is off.
-        try:
-            weight = float(align.get("cost_weight", 10.0))
-        except (TypeError, ValueError):
-            weight = 10.0
-        if weight > 4.0:
-            align["cost_weight"] = 4.0
-    prefer = fp.get("PreferForwardCritic")
-    if isinstance(prefer, dict):
-        # Do not raise PreferForward — high weight + CostCritic → command zero
-        # when every forward sample is slightly inflated.
-        try:
-            weight = float(prefer.get("cost_weight", 3.0))
-        except (TypeError, ValueError):
-            weight = 3.0
-        if weight > 3.0:
-            prefer["cost_weight"] = 3.0
-    # Wider yaw sampling so forward+turn arcs appear in the Pi-sized batch.
-    try:
-        wz_std = float(fp.get("wz_std", 0.15))
-    except (TypeError, ValueError):
-        wz_std = 0.15
-    if wz_std < 0.35:
-        fp["wz_std"] = 0.35
-    try:
-        vx_std = float(fp.get("vx_std", 0.2))
-    except (TypeError, ValueError):
-        vx_std = 0.2
-    if vx_std < 0.25:
-        fp["vx_std"] = 0.25
+    reverse_mps = -min(float(cfg.max_vel_x), 0.15)
+    # Keep both Jazzy (desired_linear_vel) and newer (max_linear_vel) names.
+    cs["FollowPath"] = {
+        "plugin": (
+            "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+        ),
+        "desired_linear_vel": cfg.max_vel_x,
+        "max_linear_vel": cfg.max_vel_x,
+        "min_linear_vel": reverse_mps,
+        "max_angular_vel": cfg.max_vel_theta,
+        "min_angular_vel": -cfg.max_vel_theta,
+        "max_linear_accel": cfg.acc_lim_x,
+        "max_linear_decel": -1.5 * cfg.acc_lim_x,
+        "max_angular_accel": cfg.acc_lim_theta,
+        "max_angular_decel": -1.5 * cfg.acc_lim_theta,
+        "lookahead_dist": 0.6,
+        "min_lookahead_dist": 0.3,
+        "max_lookahead_dist": 0.9,
+        "lookahead_time": 1.5,
+        "rotate_to_heading_angular_vel": min(float(cfg.max_vel_theta), 1.0),
+        "use_velocity_scaled_lookahead_dist": True,
+        "min_approach_linear_velocity": 0.08,
+        "approach_velocity_scaling_dist": 0.6,
+        "use_collision_detection": True,
+        "max_allowed_time_to_collision_up_to_carrot": 1.0,
+        "use_regulated_linear_velocity_scaling": True,
+        "use_cost_regulated_linear_velocity_scaling": True,
+        "cost_scaling_dist": 0.4,
+        "cost_scaling_gain": 1.0,
+        "regulated_linear_scaling_min_radius": 0.9,
+        "regulated_linear_scaling_min_speed": 0.12,
+        # Critical for skid-steer / carpet: never stop-and-spin.
+        "use_rotate_to_heading": False,
+        "allow_reversing": False,
+        "transform_tolerance": 10.0,
+    }
+    _sync_smoother_reverse_to_mppi(params)
 
 
 def _mppi_profile_snapshot(params: dict) -> dict:
-    """Compact FollowPath critic settings for get_status diagnostics."""
+    """Compact FollowPath settings for get_status diagnostics."""
     try:
         fp = params["controller_server"]["ros__parameters"]["FollowPath"]
     except (KeyError, TypeError):
         return {}
     if not isinstance(fp, dict):
         return {}
-    critics = {}
-    for name in (
-        "PathFollowCritic",
-        "PathAlignCritic",
-        "PathAngleCritic",
-        "PreferForwardCritic",
-        "GoalCritic",
-        "GoalAngleCritic",
-        "VelocityDeadbandCritic",
-    ):
-        section = fp.get(name)
-        if not isinstance(section, dict):
-            continue
-        critics[name] = {
-            "enabled": bool(section.get("enabled", True)),
-            "threshold_to_consider": section.get("threshold_to_consider"),
-            "cost_weight": section.get("cost_weight"),
-        }
-    out = {
-        "vx_max": fp.get("vx_max"),
-        "vx_min": fp.get("vx_min"),
-        "wz_max": fp.get("wz_max"),
-        "motion_model": fp.get("motion_model"),
-        "critics": critics,
-    }
+    plugin = str(fp.get("plugin", ""))
+    out: dict = {"plugin": plugin}
+    if "regulated_pure_pursuit" in plugin:
+        out.update(
+            {
+                "desired_linear_vel": fp.get(
+                    "desired_linear_vel", fp.get("max_linear_vel")
+                ),
+                "max_angular_vel": fp.get("max_angular_vel"),
+                "use_rotate_to_heading": fp.get("use_rotate_to_heading"),
+                "allow_reversing": fp.get("allow_reversing"),
+                "lookahead_dist": fp.get("lookahead_dist"),
+                "min_approach_linear_velocity": fp.get("min_approach_linear_velocity"),
+            }
+        )
+    else:
+        critics = {}
+        for name in (
+            "PathFollowCritic",
+            "PathAlignCritic",
+            "PathAngleCritic",
+            "PreferForwardCritic",
+            "GoalCritic",
+            "GoalAngleCritic",
+            "VelocityDeadbandCritic",
+        ):
+            section = fp.get(name)
+            if not isinstance(section, dict):
+                continue
+            critics[name] = {
+                "enabled": bool(section.get("enabled", True)),
+                "threshold_to_consider": section.get("threshold_to_consider"),
+                "cost_weight": section.get("cost_weight"),
+            }
+        out.update(
+            {
+                "vx_max": fp.get("vx_max"),
+                "vx_min": fp.get("vx_min"),
+                "wz_max": fp.get("wz_max"),
+                "motion_model": fp.get("motion_model"),
+                "critics": critics,
+            }
+        )
     try:
         vs = params["velocity_smoother"]["ros__parameters"]
         if isinstance(vs, dict):
