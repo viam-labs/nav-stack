@@ -275,7 +275,7 @@ def test_start_nav2_rotates_previous_launch_log(tmp_path):
         mgr, "_suppress_jazzy_nav2_extras"
     ), patch.object(mgr, "_wait_for_required_nav_nodes", return_value=True), patch.object(
         mgr, "_apply_slam_tf_params"
-    ), patch.object(
+    ), patch.object(mgr, "_start_costmap_filter_stack"), patch.object(
         mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout="", stderr="")
     ):
         mgr.start_nav2(nav_cfg, params_path)
@@ -319,6 +319,8 @@ def test_start_nav2_disables_collision_monitor_launch_arg(tmp_path):
     ) as wait_nodes, patch.object(
         mgr, "_apply_slam_tf_params"
     ) as apply_tf, patch.object(
+        mgr, "_activate_core_nav_nodes_manually", return_value=False
+    ), patch.object(mgr, "_start_costmap_filter_stack"), patch.object(
         mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout="", stderr="")
     ):
         mgr.start_nav2(nav_cfg, params_path)
@@ -338,14 +340,50 @@ def test_start_nav2_disables_collision_monitor_launch_arg(tmp_path):
     )
 
 
-def test_nav_action_ready_requires_core_nodes():
-    mgr = _manager()
-    mgr._nav2_procs = [MagicMock()]
-    mgr._nav2_procs[0].poll.return_value = None
-    with patch.object(mgr, "_nav_action_server_visible", return_value=True), patch.object(
-        mgr, "_required_nav_nodes_present", return_value=False
-    ):
-        assert mgr.nav_action_ready() is False
+def test_lifecycle_manager_params_disable_bond_timeout(tmp_path):
+    yaml = pytest.importorskip("yaml")
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "maps_dir": str(tmp_path)})
+    mgr = RosManager(cfg, logger=MagicMock())
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    params_path = tmp_path / "nav2_params.yaml"
+    params_path.write_text("{}", encoding="utf-8")
+
+    proc = MagicMock()
+    proc.poll.return_value = None
+    nodes = (
+        "/controller_server\n/bt_navigator\n"
+        "/costmap_filter_info_server_keepout\n"
+        "/costmap_filter_info_server_speed\n"
+    )
+    with patch.object(mgr, "stop_nav2"), patch.object(
+        mgr, "_popen", return_value=proc
+    ), patch.object(mgr, "_wait_for_nav_action", return_value=True), patch.object(
+        mgr, "_suppress_jazzy_nav2_extras"
+    ), patch.object(mgr, "_wait_for_required_nav_nodes", return_value=True), patch.object(
+        mgr, "_apply_slam_tf_params"
+    ), patch.object(
+        mgr,
+        "_run_ros",
+        return_value=MagicMock(returncode=0, stdout=nodes, stderr=""),
+    ), patch("time.sleep"):
+        mgr.start_nav2(nav_cfg, params_path)
+
+    scratch = tmp_path / ".runtime"
+    filter_params = yaml.safe_load((scratch / "filter_lifecycle.yaml").read_text())
+    nav_params = yaml.safe_load((scratch / "nav_lifecycle.yaml").read_text())
+    assert (
+        filter_params["filter_lifecycle_manager"]["ros__parameters"]["bond_timeout"]
+        == 0.0
+    )
+    assert (
+        nav_params["navigation_lifecycle_manager_override"]["ros__parameters"][
+            "bond_timeout"
+        ]
+        == 0.0
+    )
+    assert "docking_server" not in nav_params["navigation_lifecycle_manager_override"][
+        "ros__parameters"
+    ]["node_names"]
 
 
 def test_nav_action_ready_invalidates_cache_when_nodes_missing():
@@ -409,36 +447,6 @@ def test_ensure_nav2_retries_three_times_then_raises():
             mgr.ensure_nav2(nav_cfg, params_path)
     assert start.call_count == 3
     assert stop.call_count == 3
-
-
-def test_lifecycle_manager_params_disable_bond_timeout(tmp_path):
-    yaml = pytest.importorskip("yaml")
-    cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "maps_dir": str(tmp_path)})
-    mgr = RosManager(cfg, logger=MagicMock())
-    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
-    params_path = tmp_path / "nav2_params.yaml"
-    params_path.write_text("{}", encoding="utf-8")
-
-    proc = MagicMock()
-    proc.poll.return_value = None
-    with patch.object(mgr, "stop_nav2"), patch.object(
-        mgr, "_popen", return_value=proc
-    ), patch.object(mgr, "_wait_for_nav_action", return_value=True):
-        mgr.start_nav2(nav_cfg, params_path)
-
-    scratch = tmp_path / ".runtime"
-    filter_params = yaml.safe_load((scratch / "filter_lifecycle.yaml").read_text())
-    nav_params = yaml.safe_load((scratch / "nav_lifecycle.yaml").read_text())
-    assert (
-        filter_params["filter_lifecycle_manager"]["ros__parameters"]["bond_timeout"]
-        == 0.0
-    )
-    assert (
-        nav_params["navigation_lifecycle_manager_override"]["ros__parameters"][
-            "bond_timeout"
-        ]
-        == 0.0
-    )
 
 
 def test_nav_action_ready_requires_active_lifecycle_nodes():
