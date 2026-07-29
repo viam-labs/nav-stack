@@ -455,7 +455,7 @@ def test_sync_smoother_reverse_follows_user_vx_min_override():
     assert params["velocity_smoother"]["ros__parameters"]["min_velocity"][0] == 0.0
 
 
-def test_diffdrive_mppi_profile_clamps_short_goal_thresholds():
+def test_diffdrive_mppi_profile_stops_spin_critics():
     from src.models.navigation import _apply_diffdrive_mppi_profile
 
     params = {
@@ -468,7 +468,7 @@ def test_diffdrive_mppi_profile_clamps_short_goal_thresholds():
                         "threshold_to_consider": 1.0,
                         "cost_weight": 6.0,
                     },
-                    "VelocityDeadbandCritic": {"enabled": True},
+                    "VelocityDeadbandCritic": {"enabled": True, "cost_weight": 35.0},
                     "PathFollowCritic": {
                         "enabled": True,
                         "threshold_to_consider": 2.5,
@@ -478,6 +478,7 @@ def test_diffdrive_mppi_profile_clamps_short_goal_thresholds():
                     "PreferForwardCritic": {
                         "enabled": True,
                         "threshold_to_consider": 2.5,
+                        "cost_weight": 3.0,
                     },
                 }
             }
@@ -498,14 +499,14 @@ def test_diffdrive_mppi_profile_clamps_short_goal_thresholds():
     )
     _apply_diffdrive_mppi_profile(params, cfg)
     fp = params["controller_server"]["ros__parameters"]["FollowPath"]
-    # Reliability: leave critics enabled; only clamp handoff thresholds.
-    assert fp["PathAngleCritic"]["enabled"] is True
-    assert fp["GoalAngleCritic"]["enabled"] is True
+    assert fp["PathAngleCritic"]["enabled"] is False
+    assert fp["GoalAngleCritic"]["enabled"] is False
     assert fp["VelocityDeadbandCritic"]["enabled"] is True
+    assert fp["VelocityDeadbandCritic"]["cost_weight"] == 8.0
     assert fp["PathFollowCritic"]["threshold_to_consider"] == 0.5
     assert fp["PathFollowCritic"]["cost_weight"] == 6.0
-    assert fp["GoalAngleCritic"]["threshold_to_consider"] == 0.35
-    assert fp["GoalAngleCritic"]["cost_weight"] == 3.0
+    assert fp["PreferForwardCritic"]["cost_weight"] == 5.0
+    # Smoother mode must stay untouched (bringup / odom feedback).
     vs = params["velocity_smoother"]["ros__parameters"]
     assert vs["feedback"] == "CLOSED_LOOP"
     assert vs["deadband_velocity"] == [0.03, 0.0, 0.05]
