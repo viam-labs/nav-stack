@@ -455,43 +455,23 @@ def test_sync_smoother_reverse_follows_user_vx_min_override():
     assert params["velocity_smoother"]["ros__parameters"]["min_velocity"][0] == 0.0
 
 
-def test_diffdrive_mppi_profile_stops_spin_critics():
-    from src.models.navigation import _apply_diffdrive_mppi_profile
+def test_diffdrive_uses_regulated_pure_pursuit():
+    from src.models.navigation import _apply_diffdrive_controller
 
     params = {
         "controller_server": {
             "ros__parameters": {
                 "FollowPath": {
-                    "vx_std": 0.2,
-                    "wz_std": 0.15,
-                    "PathAngleCritic": {"enabled": True, "threshold_to_consider": 2.5},
-                    "GoalAngleCritic": {
-                        "enabled": True,
-                        "threshold_to_consider": 1.0,
-                        "cost_weight": 6.0,
-                    },
-                    "VelocityDeadbandCritic": {"enabled": True, "cost_weight": 35.0},
-                    "PathFollowCritic": {
-                        "enabled": True,
-                        "threshold_to_consider": 2.5,
-                        "cost_weight": 4.0,
-                    },
-                    "PathAlignCritic": {
-                        "enabled": True,
-                        "threshold_to_consider": 2.5,
-                        "cost_weight": 10.0,
-                    },
-                    "PreferForwardCritic": {
-                        "enabled": True,
-                        "threshold_to_consider": 2.5,
-                        "cost_weight": 5.0,
-                    },
+                    "plugin": "nav2_mppi_controller::MPPIController",
+                    "vx_max": 0.4,
+                    "PathAngleCritic": {"enabled": True},
                 }
             }
         },
         "velocity_smoother": {
             "ros__parameters": {
                 "feedback": "CLOSED_LOOP",
+                "min_velocity": [-0.4, 0.0, -1.0],
                 "deadband_velocity": [0.03, 0.0, 0.05],
             }
         },
@@ -501,22 +481,43 @@ def test_diffdrive_mppi_profile_stops_spin_critics():
             "slam_service": "slam",
             "base": "b",
             "kinematics": "differential",
+            "max_vel_x": 0.25,
+            "max_vel_theta": 1.5,
+            "acc_lim_x": 0.4,
+            "acc_lim_theta": 2.0,
         }
     )
-    _apply_diffdrive_mppi_profile(params, cfg)
+    _apply_diffdrive_controller(params, cfg)
     fp = params["controller_server"]["ros__parameters"]["FollowPath"]
-    assert fp["PathAngleCritic"]["enabled"] is False
-    assert fp["GoalAngleCritic"]["enabled"] is False
-    assert fp["VelocityDeadbandCritic"]["enabled"] is False
-    assert fp["PathFollowCritic"]["threshold_to_consider"] == 0.5
-    assert fp["PathFollowCritic"]["cost_weight"] == 8.0
-    assert fp["PathAlignCritic"]["cost_weight"] == 4.0
-    assert fp["PreferForwardCritic"]["cost_weight"] == 3.0
-    assert fp["wz_std"] == 0.35
-    assert fp["vx_std"] == 0.25
+    assert "regulated_pure_pursuit" in fp["plugin"]
+    assert fp["use_rotate_to_heading"] is False
+    assert fp["allow_reversing"] is False
+    assert fp["desired_linear_vel"] == 0.25
+    assert fp["max_angular_vel"] == 1.5
+    assert fp["min_linear_vel"] == -0.15
     vs = params["velocity_smoother"]["ros__parameters"]
+    assert vs["min_velocity"][0] == -0.15
     assert vs["feedback"] == "CLOSED_LOOP"
-    assert vs["deadband_velocity"] == [0.03, 0.0, 0.05]
+
+
+def test_diffdrive_controller_noop_for_omni():
+    from src.models.navigation import _apply_diffdrive_controller
+
+    params = {
+        "controller_server": {
+            "ros__parameters": {
+                "FollowPath": {"plugin": "nav2_mppi_controller::MPPIController"}
+            }
+        }
+    }
+    cfg = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "kinematics": "omni"}
+    )
+    _apply_diffdrive_controller(params, cfg)
+    assert (
+        params["controller_server"]["ros__parameters"]["FollowPath"]["plugin"]
+        == "nav2_mppi_controller::MPPIController"
+    )
 
 
 def test_nav2_config_from_attributes():
