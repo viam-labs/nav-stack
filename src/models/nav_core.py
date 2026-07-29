@@ -139,6 +139,7 @@ class NavServiceBase(Motion):
         self._plan_status_history: List[PlanStatusWithID] = []
         self._logged_motion_ignored: bool = False
         self._last_preview_plan: Optional[dict] = None
+        self._last_mppi_profile: dict = {}
     # -- runtime resolution (subclass-specific) ------------------------------
     def _resolve_runtime(self):
         """Return the active ``SlamRuntime`` or ``None``.
@@ -492,6 +493,9 @@ class NavServiceBase(Motion):
             # User may override FollowPath.vx_min after our wiring; keep the
             # smoother's reverse cap aligned so it cannot exceed MPPI again.
             _sync_smoother_reverse_to_mppi(params)
+        # After user merges: DiffDrive must not keep critic settings that force
+        # in-place yaw on short goals (skid-steer / carpet death spiral).
+        _apply_diffdrive_mppi_profile(params, cfg)
         _apply_local_costmap_size(params, cfg.nav2)
         _sync_mppi_model_dt(params)
 
@@ -514,6 +518,7 @@ class NavServiceBase(Motion):
         out = runtime_dir / "nav2_params.yaml"
         with open(out, "w") as fh:
             yaml.safe_dump(params, fh, sort_keys=False)
+        self._last_mppi_profile = _mppi_profile_snapshot(params)
         return out
 
     # -- store helpers -------------------------------------------------------
@@ -709,6 +714,7 @@ class NavServiceBase(Motion):
                     goal["name"] = self._active_goal_name
                     status["goal"] = goal
                 status["localization_check"] = dict(runtime.localization_check)
+                status["mppi_profile"] = dict(self._last_mppi_profile)
                 return status
 
             status = await asyncio.to_thread(_status)
@@ -1301,6 +1307,101 @@ def _sync_smoother_reverse_to_mppi(params: dict) -> None:
         vs["min_velocity"] = [vx_min, *min_vel[1:]]
     elif isinstance(min_vel, tuple) and min_vel:
         vs["min_velocity"] = [vx_min, *list(min_vel[1:])]
+
+
+def _apply_diffdrive_mppi_profile(params: dict, cfg: NavConfig) -> None:
+    """Stop DiffDrive MPPI from choosing in-place yaw on short navigates.
+
+    PathAngle + GoalAngle + VelocityDeadband strongly prefer pure spin when
+    heading is slightly off. That is fine on a base that can pivot; on
+    skid-steer / low-traction carts it produces ``vx=0`` + ``|ω|≈0.1`` forever
+    while ``test_drive`` (which sends real forward) works. Applied after user
+    ``nav2_params`` so stale overrides cannot reintroduce the failure mode.
+    """
+    if cfg.kinematics == OMNI:
+        return
+    try:
+        fp = params["controller_server"]["ros__parameters"]["FollowPath"]
+    except (KeyError, TypeError):
+        return
+    if not isinstance(fp, dict):
+        return
+    for name in ("PathAngleCritic", "GoalAngleCritic", "VelocityDeadbandCritic"):
+        section = fp.get(name)
+        if isinstance(section, dict):
+            section["enabled"] = False
+    for name in ("PathFollowCritic", "PathAlignCritic", "PreferForwardCritic"):
+        section = fp.get(name)
+        if not isinstance(section, dict):
+            continue
+        try:
+            thr = float(section.get("threshold_to_consider", 0.5))
+        except (TypeError, ValueError):
+            thr = 0.5
+        # Path-style critics disable inside this radius; keep it tight so ~1 m
+        # goals still path-follow.
+        if thr > 0.6:
+            section["threshold_to_consider"] = 0.5
+    follow = fp.get("PathFollowCritic")
+    if isinstance(follow, dict):
+        try:
+            weight = float(follow.get("cost_weight", 4.0))
+        except (TypeError, ValueError):
+            weight = 4.0
+        follow["cost_weight"] = max(weight, 6.0)
+    try:
+        vs = params["velocity_smoother"]["ros__parameters"]
+    except (KeyError, TypeError):
+        return
+    if isinstance(vs, dict):
+        # CLOSED_LOOP + skid-steer odom often fights MPPI; open-loop ramps are
+        # predictable and match what test_drive proves works.
+        vs["feedback"] = "OPEN_LOOP"
+        vs["deadband_velocity"] = [0.0, 0.0, 0.0]
+
+
+def _mppi_profile_snapshot(params: dict) -> dict:
+    """Compact FollowPath critic settings for get_status diagnostics."""
+    try:
+        fp = params["controller_server"]["ros__parameters"]["FollowPath"]
+    except (KeyError, TypeError):
+        return {}
+    if not isinstance(fp, dict):
+        return {}
+    critics = {}
+    for name in (
+        "PathFollowCritic",
+        "PathAlignCritic",
+        "PathAngleCritic",
+        "PreferForwardCritic",
+        "GoalCritic",
+        "GoalAngleCritic",
+        "VelocityDeadbandCritic",
+    ):
+        section = fp.get(name)
+        if not isinstance(section, dict):
+            continue
+        critics[name] = {
+            "enabled": bool(section.get("enabled", True)),
+            "threshold_to_consider": section.get("threshold_to_consider"),
+            "cost_weight": section.get("cost_weight"),
+        }
+    out = {
+        "vx_max": fp.get("vx_max"),
+        "vx_min": fp.get("vx_min"),
+        "wz_max": fp.get("wz_max"),
+        "motion_model": fp.get("motion_model"),
+        "critics": critics,
+    }
+    try:
+        vs = params["velocity_smoother"]["ros__parameters"]
+        if isinstance(vs, dict):
+            out["smoother_feedback"] = vs.get("feedback")
+            out["smoother_deadband"] = vs.get("deadband_velocity")
+            out["smoother_min_velocity"] = vs.get("min_velocity")
+    except (KeyError, TypeError):
+        pass
+    return out
 
 
 def _deep_merge(obj: dict, overrides: Mapping) -> None:

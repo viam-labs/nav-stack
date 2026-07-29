@@ -455,6 +455,55 @@ def test_sync_smoother_reverse_follows_user_vx_min_override():
     assert params["velocity_smoother"]["ros__parameters"]["min_velocity"][0] == 0.0
 
 
+def test_diffdrive_mppi_profile_disables_spin_critics():
+    from src.models.navigation import _apply_diffdrive_mppi_profile
+
+    params = {
+        "controller_server": {
+            "ros__parameters": {
+                "FollowPath": {
+                    "PathAngleCritic": {"enabled": True, "threshold_to_consider": 2.5},
+                    "GoalAngleCritic": {"enabled": True, "threshold_to_consider": 1.0},
+                    "VelocityDeadbandCritic": {"enabled": True},
+                    "PathFollowCritic": {
+                        "enabled": True,
+                        "threshold_to_consider": 2.5,
+                        "cost_weight": 4.0,
+                    },
+                    "PathAlignCritic": {"enabled": True, "threshold_to_consider": 2.5},
+                    "PreferForwardCritic": {
+                        "enabled": True,
+                        "threshold_to_consider": 2.5,
+                    },
+                }
+            }
+        },
+        "velocity_smoother": {
+            "ros__parameters": {
+                "feedback": "CLOSED_LOOP",
+                "deadband_velocity": [0.03, 0.0, 0.05],
+            }
+        },
+    }
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "kinematics": "differential",
+        }
+    )
+    _apply_diffdrive_mppi_profile(params, cfg)
+    fp = params["controller_server"]["ros__parameters"]["FollowPath"]
+    assert fp["PathAngleCritic"]["enabled"] is False
+    assert fp["GoalAngleCritic"]["enabled"] is False
+    assert fp["VelocityDeadbandCritic"]["enabled"] is False
+    assert fp["PathFollowCritic"]["threshold_to_consider"] == 0.5
+    assert fp["PathFollowCritic"]["cost_weight"] == 6.0
+    vs = params["velocity_smoother"]["ros__parameters"]
+    assert vs["feedback"] == "OPEN_LOOP"
+    assert vs["deadband_velocity"] == [0.0, 0.0, 0.0]
+
+
 def test_nav2_config_from_attributes():
     cfg = NavConfig.from_dict(
         {

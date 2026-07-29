@@ -39,12 +39,14 @@ from ..runtime import get_slam, register_bridge, unregister_bridge
 # still do ``from src.models.navigation import _sync_mppi_model_dt`` etc.).
 from .nav_core import (  # noqa: F401
     NavServiceBase,
+    _apply_diffdrive_mppi_profile,
     _apply_local_costmap_size,
     _apply_nav2_tuning,
     _apply_overrides,
     _apply_velocity_limits,
     _deep_merge,
     _find_template_section_paths,
+    _mppi_profile_snapshot,
     _nav_status_to_plan_state,
     _normalize_nav2_user_params,
     _set_obstacle_sources,
