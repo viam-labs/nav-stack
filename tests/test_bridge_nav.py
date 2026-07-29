@@ -209,12 +209,14 @@ def test_on_drive_timer_sends_latest_and_clears():
         _pending_cmd_vel=(0.3, 0.0, 0.4),
         _io=io,
         _run=MagicMock(),
+        record_cmd_vel=MagicMock(),
         get_logger=MagicMock(return_value=MagicMock()),
     )
 
     BridgeNode._on_drive_timer(bridge)
 
-    io.drive_base.assert_called_once_with(0.3, 0.0, 0.4)
+    bridge.record_cmd_vel.assert_called_once_with(0.3, 0.0, 0.4, source="nav2")
+    io.drive_base.assert_called_once_with(0.3, 0.0, 0.4, record_source=None)
     bridge._run.assert_called_once_with("coro")
     assert bridge._pending_cmd_vel is None
 
@@ -232,12 +234,15 @@ def test_on_drive_timer_snaps_near_zero_to_stop():
         _pending_cmd_vel=(0.01, 0.0, 0.02),
         _io=io,
         _run=MagicMock(),
+        record_cmd_vel=MagicMock(),
         get_logger=MagicMock(return_value=MagicMock()),
     )
 
     BridgeNode._on_drive_timer(bridge)
 
-    io.drive_base.assert_called_once_with(0.0, 0.0, 0.0)
+    # History keeps the pre-snap Nav2 command; base gets zeros.
+    bridge.record_cmd_vel.assert_called_once_with(0.01, 0.0, 0.02, source="nav2")
+    io.drive_base.assert_called_once_with(0.0, 0.0, 0.0, record_source=None)
 
 
 def test_set_nav_active_false_clears_pending_cmd_vel():
@@ -333,6 +338,7 @@ def test_on_drive_timer_noop_when_nav_inactive():
         _pending_cmd_vel=(0.3, 0.0, 0.4),
         _io=io,
         _run=MagicMock(),
+        record_cmd_vel=MagicMock(),
         get_logger=MagicMock(return_value=MagicMock()),
     )
 
@@ -357,15 +363,17 @@ def test_on_drive_timer_does_not_apply_simple_stiction_floor_to_nav2():
         _pending_cmd_vel=(0.05, 0.0, 0.1),
         _io=io,
         _run=MagicMock(),
+        record_cmd_vel=MagicMock(),
         get_logger=MagicMock(return_value=MagicMock()),
     )
 
     BridgeNode._on_drive_timer(bridge)
 
     bridge._run.assert_called_once_with("coro")
+    bridge.record_cmd_vel.assert_called_once_with(0.05, 0.0, 0.1, source="nav2")
     # These floors remain available to simple go_to_* but must not distort
     # Nav2's independently optimized linear/angular command or curvature.
-    io.drive_base.assert_called_once_with(0.05, 0.0, 0.1)
+    io.drive_base.assert_called_once_with(0.05, 0.0, 0.1, record_source=None)
 
 
 def test_guarded_callback_swallows_exception_and_logs():

@@ -1513,17 +1513,20 @@ class BridgeNode(Node):
         if pending is None or not self._nav_active:
             return
         vx, vy, vtheta = pending
-        # Keep the original Nav2 command for diagnostics.
+        # Keep the original Nav2 command for diagnostics (before the snap).
         self._last_cmd_vel_nav2 = {
             "ros_vx_mps": round(float(vx), 4),
             "ros_vy_mps": round(float(vy), 4),
             "ros_vtheta_rad_s": round(float(vtheta), 4),
         }
+        # History must show what Nav2 asked for — not the post-snap zeros we
+        # send to the base (those hide the micro-yaw / creep failure modes).
+        self.record_cmd_vel(vx, vy, vtheta, source="nav2")
         # Snap near-zero commands so the MiR does not creep past the goal.
         if abs(vx) < 0.03 and abs(vy) < 0.03 and abs(vtheta) < 0.05:
             vx, vy, vtheta = 0.0, 0.0, 0.0
         try:
-            self._run(self._io.drive_base(vx, vy, vtheta))
+            self._run(self._io.drive_base(vx, vy, vtheta, record_source=None))
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f"drive_base failed: {exc!r}")
 
