@@ -665,6 +665,58 @@ def chunk_bytes(data: bytes, chunk_size: int = 1 << 20) -> List[bytes]:
     return [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
 
 
+def path_msg_to_points(path_msg, *, max_points: int = 400) -> List[Dict[str, float]]:
+    """Convert a ``nav_msgs/Path``-like object into ``[{x,y,theta}, ...]``.
+
+    Downsamples evenly when longer than ``max_points``, keeping endpoints.
+    Coordinates are meters / radians in the path's frame (normally ``map``).
+    """
+    if path_msg is None:
+        return []
+    poses = list(getattr(path_msg, "poses", None) or [])
+    if not poses:
+        return []
+
+    def _one(ps) -> Dict[str, float]:
+        pose = ps.pose
+        q = pose.orientation
+        theta = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        return {
+            "x": float(pose.position.x),
+            "y": float(pose.position.y),
+            "theta": float(theta),
+        }
+
+    if max_points <= 0 or len(poses) <= max_points:
+        return [_one(p) for p in poses]
+    if max_points == 1:
+        return [_one(poses[-1])]
+    n = len(poses)
+    idxs = [
+        int(round(i * (n - 1) / float(max_points - 1))) for i in range(max_points)
+    ]
+    seen = set()
+    ordered: List[int] = []
+    for idx in idxs:
+        if idx not in seen:
+            seen.add(idx)
+            ordered.append(idx)
+    return [_one(poses[i]) for i in ordered]
+
+
+def path_length_m(points: List[Dict[str, float]]) -> float:
+    """Polyline length of map-frame path points (meters)."""
+    if len(points) < 2:
+        return 0.0
+    total = 0.0
+    for a, b in zip(points, points[1:]):
+        total += math.hypot(float(b["x"]) - float(a["x"]), float(b["y"]) - float(a["y"]))
+    return total
+
+
 # ---------------------------------------------------------------------------
 # LaserScan <-> points, and multi-lidar merge
 # ---------------------------------------------------------------------------

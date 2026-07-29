@@ -447,6 +447,15 @@ await nav.do_command({"command": "add_location", "name": "dock",
 await nav.do_command({"command": "navigate_to_location", "name": "kitchen"})
 await nav.do_command({"command": "navigate_to_point", "x": 3.5, "y": -1.0})
 await nav.do_command({"command": "get_status"})
+# Preview a path without moving (Nav2 ComputePathToPose). Returns map-frame
+# waypoints in meters/radians; also draws on nav-camera if configured:
+# await nav.do_command({"command": "plan_to_point", "x": 3.5, "y": -1.0})
+# await nav.do_command({"command": "plan_to_location", "name": "kitchen"})
+# → {"status": "planned", "feasible": true, "path": [{"x":..., "y":..., "theta":...}, ...],
+#    "length_m": ..., "planning_time_s": ...}
+# Then run the previewed goal:
+# await nav.do_command({"command": "execute_plan"})
+# Motion MoveOnMap can also preview: move_on_map(..., extra={"preview": true})
 # get_status includes last_cmd_vel plus cmd_vel_history (last ~20 distinct
 # ROS/Viam SetVelocity samples, oldest→newest — survives cancel/stop zeros)
 # Plain-English snapshot of what nav is commanding right now (returns immediately):
