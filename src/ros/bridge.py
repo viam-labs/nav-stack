@@ -51,6 +51,11 @@ try:
 except Exception:  # pragma: no cover - nav2 may be absent in mapping-only installs
     NavigateToPose = None
 
+try:
+    from nav2_msgs.action import ComputePathToPose
+except Exception:  # pragma: no cover - nav2 may be absent in mapping-only installs
+    ComputePathToPose = None
+
 from ..config import (
     IMU_ODOM_ACCEL_ONLY,
     IMU_ODOM_COAST,
@@ -94,6 +99,8 @@ _LATCHED_QOS = QoSProfile(
 
 _NAV_ACTION_NAME = "/navigate_to_pose"
 _NAV_ACTION_CLIENT_NAME = "navigate_to_pose"
+_COMPUTE_PATH_ACTION_NAME = "/compute_path_to_pose"
+_COMPUTE_PATH_ACTION_CLIENT_NAME = "compute_path_to_pose"
 
 
 def _quat_msg(yaw: float) -> Quaternion:
@@ -408,6 +415,7 @@ class BridgeNode(Node):
 
         # Action client (created lazily once Nav2 is running) ----------------
         self._nav_action: Optional[ActionClient] = None
+        self._compute_path_action: Optional[ActionClient] = None
         self._goal_handle = None
         self._nav_cli_proc: Optional[subprocess.Popen] = None
         self._nav_goal_lock = threading.Lock()
@@ -417,6 +425,7 @@ class BridgeNode(Node):
         self._last_feedback: Dict = {}
         self._last_result_status: Optional[str] = None
         self._active_nav_goal: Optional[Dict[str, float]] = None
+        self._last_preview_plan: Optional[Dict] = None
 
         # External SLAM bridging: when navigation is driven by an arbitrary Viam
         # SLAM service (not the built-in slam_toolbox), this publishes /map +
@@ -1668,12 +1677,178 @@ class BridgeNode(Node):
             except Exception:  # noqa: BLE001 - best-effort teardown
                 pass
             self._nav_action = None
+        if self._compute_path_action is not None:
+            try:
+                self._compute_path_action.destroy()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            self._compute_path_action = None
 
     def _ensure_nav_action_client(self) -> None:
         if NavigateToPose is None:
             return
         if self._nav_action is None:
             self._nav_action = ActionClient(self, NavigateToPose, _NAV_ACTION_CLIENT_NAME)
+
+    def _ensure_compute_path_action_client(self) -> None:
+        if ComputePathToPose is None:
+            return
+        if self._compute_path_action is None:
+            self._compute_path_action = ActionClient(
+                self, ComputePathToPose, _COMPUTE_PATH_ACTION_CLIENT_NAME
+            )
+
+    def compute_path_to_pose(
+        self,
+        x: float,
+        y: float,
+        theta: float = 0.0,
+        *,
+        planner_id: str = "GridBased",
+        start: Optional[conv.Pose2D] = None,
+        timeout_s: float = 20.0,
+        max_points: int = 400,
+    ) -> Dict:
+        """Ask Nav2's planner for a path without starting motion.
+
+        Uses ``/compute_path_to_pose``. Does not touch ``/cmd_vel`` or set
+        ``nav_active``. Updates the nav-camera preview overlay with the path.
+        """
+        if ComputePathToPose is None:
+            raise RuntimeError(
+                f"Nav2 action {_COMPUTE_PATH_ACTION_NAME!r} unavailable "
+                "(nav2_msgs not installed?)"
+            )
+        tf_wait_s = 8.0 if self._last_pose_in_map is None else 3.0
+        if not self._wait_for_map_tf(timeout_s=tf_wait_s):
+            if self._last_pose_in_map is None:
+                raise RuntimeError(
+                    "map->base_link transform not available; localize before planning"
+                )
+            self.get_logger().warn(
+                "map->base_link lookup timed out during plan preview; "
+                "sending compute_path anyway"
+            )
+
+        self._ensure_compute_path_action_client()
+        if self._compute_path_action is None:
+            raise RuntimeError(f"Nav2 action {_COMPUTE_PATH_ACTION_NAME!r} unavailable")
+
+        if not self._wait_for_compute_path_server(timeout_s=10.0):
+            self.reset_nav_action_client()
+            self._ensure_compute_path_action_client()
+            if not self._wait_for_compute_path_server(timeout_s=5.0):
+                raise RuntimeError(
+                    f"Nav2 action {_COMPUTE_PATH_ACTION_NAME!r} not available "
+                    "(is planner_server active?)"
+                )
+
+        goal = ComputePathToPose.Goal()
+        goal.planner_id = str(planner_id or "GridBased")
+        goal.goal = PoseStamped()
+        goal.goal.header.frame_id = self._frames.map
+        goal.goal.header.stamp = self._goal_pose_stamp()
+        goal.goal.pose.position.x = float(x)
+        goal.goal.pose.position.y = float(y)
+        goal.goal.pose.orientation = _quat_msg(float(theta))
+        if start is not None:
+            goal.use_start = True
+            goal.start = PoseStamped()
+            goal.start.header.frame_id = self._frames.map
+            goal.start.header.stamp = self._goal_pose_stamp()
+            goal.start.pose.position.x = float(start.x)
+            goal.start.pose.position.y = float(start.y)
+            goal.start.pose.orientation = _quat_msg(float(start.theta))
+        else:
+            goal.use_start = False
+
+        done = threading.Event()
+        outcome: Dict = {"result": None, "exc": None}
+
+        def _on_result(future) -> None:
+            try:
+                wrapped = future.result()
+                outcome["result"] = getattr(wrapped, "result", wrapped)
+            except Exception as exc:  # noqa: BLE001
+                outcome["exc"] = exc
+            done.set()
+
+        def _on_goal_response(future) -> None:
+            try:
+                goal_handle = future.result()
+            except Exception as exc:  # noqa: BLE001
+                outcome["exc"] = exc
+                done.set()
+                return
+            if goal_handle is None or not goal_handle.accepted:
+                outcome["exc"] = RuntimeError("compute_path_to_pose goal rejected")
+                done.set()
+                return
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(_on_result)
+
+        send_future = self._compute_path_action.send_goal_async(goal)
+        send_future.add_done_callback(_on_goal_response)
+        if not done.wait(timeout=max(float(timeout_s), 1.0)):
+            raise RuntimeError(
+                f"compute_path_to_pose timed out after {timeout_s:.1f}s"
+            )
+        if outcome["exc"] is not None:
+            raise RuntimeError(f"compute_path_to_pose failed: {outcome['exc']!r}")
+
+        result = outcome["result"]
+        if result is None:
+            raise RuntimeError("compute_path_to_pose returned no result")
+
+        error_code = int(getattr(result, "error_code", 0) or 0)
+        error_msg = str(getattr(result, "error_msg", "") or "")
+        path_msg = getattr(result, "path", None)
+        points = conv.path_msg_to_points(path_msg, max_points=max_points)
+        length_m = conv.path_length_m(points)
+        planning_time = getattr(result, "planning_time", None)
+        planning_time_s = 0.0
+        if planning_time is not None:
+            planning_time_s = float(getattr(planning_time, "sec", 0)) + float(
+                getattr(planning_time, "nanosec", 0)
+            ) * 1e-9
+
+        feasible = error_code == 0 and len(points) >= 2
+        preview = {
+            "feasible": feasible,
+            "error_code": error_code,
+            "error_msg": error_msg,
+            "planner_id": goal.planner_id,
+            "planning_time_s": round(planning_time_s, 4),
+            "length_m": round(length_m, 3),
+            "path": points,
+            "goal": {"x": float(x), "y": float(y), "theta": float(theta)},
+            "start": (
+                {"x": float(start.x), "y": float(start.y), "theta": float(start.theta)}
+                if start is not None
+                else None
+            ),
+            "point_count": len(points),
+        }
+        self._last_preview_plan = preview
+        # Show on nav-camera without enabling drive watchdog / cmd_vel.
+        with self._viz_lock:
+            self._viz_goal = (float(x), float(y), float(theta))
+            self._viz_plan_history.clear()
+            self._viz_global_plan = tuple((p["x"], p["y"]) for p in points)
+        return preview
+
+    def last_preview_plan(self) -> Optional[Dict]:
+        return dict(self._last_preview_plan) if self._last_preview_plan else None
+
+    def _wait_for_compute_path_server(self, timeout_s: float = 10.0) -> bool:
+        if self._compute_path_action is None:
+            return False
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self._compute_path_action.server_is_ready():
+                return True
+            time.sleep(0.1)
+        return False
 
     def _wait_for_map_tf(self, timeout_s: float = 8.0) -> bool:
         """Block until map->base_link is available (post-localize / set_initial_pose).

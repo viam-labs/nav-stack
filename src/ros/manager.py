@@ -1310,6 +1310,68 @@ class RosManager:
         self.ensure_nav2(self._nav_cfg, self._nav_params_path)
         node.send_nav_goal(x, y, theta)
 
+    def compute_path(
+        self,
+        x: float,
+        y: float,
+        theta: float = 0.0,
+        *,
+        planner_id: str = "GridBased",
+        start: Optional[conv.Pose2D] = None,
+        timeout_s: float = 20.0,
+        max_points: int = 400,
+    ) -> Dict:
+        """Plan a Nav2 path to ``(x, y, theta)`` without moving the base."""
+        node = self._require_node()
+        if self.nav2_startup_in_progress():
+            raise RuntimeError(
+                "Nav2 is still starting up in the background; retry in a few seconds "
+                "(check progress with the get_status command)"
+            )
+        self._apply_slam_tf_params()
+        if (
+            self._nav_cfg is not None
+            and self._nav_params_path is not None
+            and not self.nav_action_ready()
+        ):
+            self._log("Nav2 not healthy during plan; ensuring Nav2 before compute_path")
+            self.ensure_nav2(self._nav_cfg, self._nav_params_path)
+        try:
+            return node.compute_path_to_pose(
+                x,
+                y,
+                theta,
+                planner_id=planner_id,
+                start=start,
+                timeout_s=timeout_s,
+                max_points=max_points,
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "not available" not in msg and "unavailable" not in msg:
+                raise
+        if self._nav_cfg is None or self._nav_params_path is None:
+            raise RuntimeError(
+                "compute_path_to_pose not available and Nav2 has no saved startup config"
+            )
+        self._log("compute_path unavailable; ensuring Nav2 and retrying")
+        self.ensure_nav2(self._nav_cfg, self._nav_params_path)
+        return node.compute_path_to_pose(
+            x,
+            y,
+            theta,
+            planner_id=planner_id,
+            start=start,
+            timeout_s=timeout_s,
+            max_points=max_points,
+        )
+
+    def last_preview_plan(self) -> Optional[Dict]:
+        node = self._node
+        if node is None:
+            return None
+        return node.last_preview_plan()
+
     def cancel(self) -> None:
         if self._node is not None:
             self._node.cancel_nav()

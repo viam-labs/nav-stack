@@ -138,6 +138,7 @@ class NavServiceBase(Motion):
         self._plan_execution: Optional[_PlanExecution] = None
         self._plan_status_history: List[PlanStatusWithID] = []
         self._logged_motion_ignored: bool = False
+        self._last_preview_plan: Optional[dict] = None
     # -- runtime resolution (subclass-specific) ------------------------------
     def _resolve_runtime(self):
         """Return the active ``SlamRuntime`` or ``None``.
@@ -223,6 +224,23 @@ class NavServiceBase(Motion):
         pose2d = conv.viam_pose_to_pose2d(destination.x, destination.y, destination.theta)
         runtime = self._require_runtime()
         mgr = runtime.manager
+
+        # Preview-only: plan with Nav2's ComputePathToPose, do not drive.
+        extra = extra or {}
+        if bool(extra.get("preview") or extra.get("plan_only")):
+            preview = await asyncio.to_thread(
+                mgr.compute_path, pose2d.x, pose2d.y, pose2d.theta
+            )
+            self._last_preview_plan = preview
+            if not preview.get("feasible"):
+                raise GRPCError(
+                    Status.FAILED_PRECONDITION,
+                    preview.get("error_msg")
+                    or f"no feasible path (error_code={preview.get('error_code')})",
+                )
+            # Return a synthetic execution id so callers can correlate with DoCommand
+            # get_last_plan; motion is not started.
+            return f"preview-{uuid.uuid4()}"
 
         # A new MoveOnMap supersedes any in-flight plan.
         if (
@@ -607,6 +625,45 @@ class NavServiceBase(Motion):
             self._active_goal_name = None
             await asyncio.to_thread(mgr.navigate, x, y, theta)
             return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
+        if cmd in ("plan_to_point", "compute_path_to_point"):
+            return await self._plan_preview(command, mgr)
+        if cmd in ("plan_to_location", "compute_path_to_location"):
+            loc = self._locations().get(str(command["name"]))
+            payload = dict(command)
+            payload["x"] = loc.x
+            payload["y"] = loc.y
+            payload["theta"] = loc.theta
+            preview = await self._plan_preview(payload, mgr)
+            preview["location"] = loc.to_dict()
+            self._last_preview_plan = preview
+            return preview
+        if cmd in ("get_last_plan", "get_preview_plan"):
+            preview = self._last_preview_plan or mgr.last_preview_plan()
+            if not preview:
+                raise ValueError("no preview plan; call plan_to_point first")
+            return {"plan": preview}
+        if cmd == "execute_plan":
+            preview = self._last_preview_plan or mgr.last_preview_plan()
+            if not preview:
+                raise ValueError("no preview plan; call plan_to_point first")
+            if not preview.get("feasible"):
+                raise ValueError(
+                    preview.get("error_msg")
+                    or f"last preview was not feasible (error_code={preview.get('error_code')})"
+                )
+            goal = preview.get("goal") or {}
+            x = float(goal["x"])
+            y = float(goal["y"])
+            theta = float(goal.get("theta", 0.0))
+            name = preview.get("location", {}).get("name") if isinstance(preview.get("location"), dict) else None
+            self._active_goal_name = name
+            await asyncio.to_thread(mgr.navigate, x, y, theta)
+            return {
+                "status": "navigating",
+                "target": {"x": x, "y": y, "theta": theta, **({"name": name} if name else {})},
+                "from_preview": True,
+                "length_m": preview.get("length_m"),
+            }
         if cmd == "go_to_location":
             loc = self._locations().get(str(command["name"]))
             self._active_goal_name = loc.name
@@ -798,6 +855,33 @@ class NavServiceBase(Motion):
             },
             "duration_s": duration_s,
         }
+
+    async def _plan_preview(self, command: Mapping, mgr) -> dict:
+        """Run Nav2 ComputePathToPose and cache the result for execute_plan."""
+        from ..ros import conversions as conv
+
+        x = float(command["x"])
+        y = float(command["y"])
+        theta = float(command.get("theta", 0.0))
+        planner_id = str(command.get("planner_id", "GridBased"))
+        timeout_s = float(command.get("timeout_s", 20.0))
+        max_points = int(command.get("max_points", 400))
+        start = None
+        if "start" in command and isinstance(command["start"], Mapping):
+            s = command["start"]
+            start = conv.Pose2D(float(s["x"]), float(s["y"]), float(s.get("theta", 0.0)))
+        preview = await asyncio.to_thread(
+            mgr.compute_path,
+            x,
+            y,
+            theta,
+            planner_id=planner_id,
+            start=start,
+            timeout_s=timeout_s,
+            max_points=max_points,
+        )
+        self._last_preview_plan = preview
+        return {"status": "planned" if preview.get("feasible") else "infeasible", **preview}
 
     async def _simple_go_to(
         self,
