@@ -462,6 +462,8 @@ def test_diffdrive_mppi_profile_stops_spin_critics():
         "controller_server": {
             "ros__parameters": {
                 "FollowPath": {
+                    "vx_std": 0.2,
+                    "wz_std": 0.15,
                     "PathAngleCritic": {"enabled": True, "threshold_to_consider": 2.5},
                     "GoalAngleCritic": {
                         "enabled": True,
@@ -474,11 +476,15 @@ def test_diffdrive_mppi_profile_stops_spin_critics():
                         "threshold_to_consider": 2.5,
                         "cost_weight": 4.0,
                     },
-                    "PathAlignCritic": {"enabled": True, "threshold_to_consider": 2.5},
+                    "PathAlignCritic": {
+                        "enabled": True,
+                        "threshold_to_consider": 2.5,
+                        "cost_weight": 10.0,
+                    },
                     "PreferForwardCritic": {
                         "enabled": True,
                         "threshold_to_consider": 2.5,
-                        "cost_weight": 3.0,
+                        "cost_weight": 5.0,
                     },
                 }
             }
@@ -501,12 +507,13 @@ def test_diffdrive_mppi_profile_stops_spin_critics():
     fp = params["controller_server"]["ros__parameters"]["FollowPath"]
     assert fp["PathAngleCritic"]["enabled"] is False
     assert fp["GoalAngleCritic"]["enabled"] is False
-    assert fp["VelocityDeadbandCritic"]["enabled"] is True
-    assert fp["VelocityDeadbandCritic"]["cost_weight"] == 8.0
+    assert fp["VelocityDeadbandCritic"]["enabled"] is False
     assert fp["PathFollowCritic"]["threshold_to_consider"] == 0.5
-    assert fp["PathFollowCritic"]["cost_weight"] == 6.0
-    assert fp["PreferForwardCritic"]["cost_weight"] == 5.0
-    # Smoother mode must stay untouched (bringup / odom feedback).
+    assert fp["PathFollowCritic"]["cost_weight"] == 8.0
+    assert fp["PathAlignCritic"]["cost_weight"] == 4.0
+    assert fp["PreferForwardCritic"]["cost_weight"] == 3.0
+    assert fp["wz_std"] == 0.35
+    assert fp["vx_std"] == 0.25
     vs = params["velocity_smoother"]["ros__parameters"]
     assert vs["feedback"] == "CLOSED_LOOP"
     assert vs["deadband_velocity"] == [0.03, 0.0, 0.05]

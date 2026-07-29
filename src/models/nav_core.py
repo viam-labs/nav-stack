@@ -1310,12 +1310,12 @@ def _sync_smoother_reverse_to_mppi(params: dict) -> None:
 
 
 def _apply_diffdrive_mppi_profile(params: dict, cfg: NavConfig) -> None:
-    """Stop DiffDrive MPPI from choosing in-place micro-yaw on short navigates.
+    """Bias DiffDrive MPPI toward forward arcs instead of spin-or-stop.
 
-    On skid-steer / low-traction bases, PathAngle + GoalAngle + a heavy
-    VelocityDeadband critic prefer ``vx=0`` with ``|ω|≈0.05–0.1`` (just above
-    the yaw deadband) while ``test_drive`` forward works. Keep CLOSED_LOOP
-    smoother untouched (bringup-safe); only retune FollowPath critics.
+    PathAngle/GoalAngle produce ``vx=0`` micro-yaw on skid-steer; disabling
+    them alone can leave CostCritic + PreferForward choosing pure zero when
+    the robot sits in inflation. Soften deadband, keep PreferForward modest,
+    and widen rotational sampling so arcs are actually proposed.
     """
     if cfg.kinematics == OMNI:
         return
@@ -1325,11 +1325,14 @@ def _apply_diffdrive_mppi_profile(params: dict, cfg: NavConfig) -> None:
         return
     if not isinstance(fp, dict):
         return
-    # These two explicitly reward heading-only corrections.
     for name in ("PathAngleCritic", "GoalAngleCritic"):
         section = fp.get(name)
         if isinstance(section, dict):
             section["enabled"] = False
+    deadband = fp.get("VelocityDeadbandCritic")
+    if isinstance(deadband, dict):
+        # Weight 35 makes "just above yaw deadband" (or stop) dominate arcs.
+        deadband["enabled"] = False
     for name in ("PathFollowCritic", "PathAlignCritic", "PreferForwardCritic"):
         section = fp.get(name)
         if not isinstance(section, dict):
@@ -1338,8 +1341,6 @@ def _apply_diffdrive_mppi_profile(params: dict, cfg: NavConfig) -> None:
             thr = float(section.get("threshold_to_consider", 0.5))
         except (TypeError, ValueError):
             thr = 0.5
-        # Path-style critics disable inside this radius; keep it tight so ~1 m
-        # goals still path-follow (the old 2.5 m handoff disabled them entirely).
         if thr > 0.6:
             section["threshold_to_consider"] = 0.5
     follow = fp.get("PathFollowCritic")
@@ -1348,23 +1349,39 @@ def _apply_diffdrive_mppi_profile(params: dict, cfg: NavConfig) -> None:
             weight = float(follow.get("cost_weight", 4.0))
         except (TypeError, ValueError):
             weight = 4.0
-        follow["cost_weight"] = max(weight, 6.0)
+        follow["cost_weight"] = max(weight, 8.0)
+    align = fp.get("PathAlignCritic")
+    if isinstance(align, dict):
+        # Stock weight 10 fights PathFollow into pure yaw when heading is off.
+        try:
+            weight = float(align.get("cost_weight", 10.0))
+        except (TypeError, ValueError):
+            weight = 10.0
+        if weight > 4.0:
+            align["cost_weight"] = 4.0
     prefer = fp.get("PreferForwardCritic")
     if isinstance(prefer, dict):
+        # Do not raise PreferForward — high weight + CostCritic → command zero
+        # when every forward sample is slightly inflated.
         try:
             weight = float(prefer.get("cost_weight", 3.0))
         except (TypeError, ValueError):
             weight = 3.0
-        prefer["cost_weight"] = max(weight, 5.0)
-    deadband = fp.get("VelocityDeadbandCritic")
-    if isinstance(deadband, dict):
-        # Weight 35 makes "pure yaw just above deadband" dominate slow arcs.
-        try:
-            weight = float(deadband.get("cost_weight", 35.0))
-        except (TypeError, ValueError):
-            weight = 35.0
-        if weight > 8.0:
-            deadband["cost_weight"] = 8.0
+        if weight > 3.0:
+            prefer["cost_weight"] = 3.0
+    # Wider yaw sampling so forward+turn arcs appear in the Pi-sized batch.
+    try:
+        wz_std = float(fp.get("wz_std", 0.15))
+    except (TypeError, ValueError):
+        wz_std = 0.15
+    if wz_std < 0.35:
+        fp["wz_std"] = 0.35
+    try:
+        vx_std = float(fp.get("vx_std", 0.2))
+    except (TypeError, ValueError):
+        vx_std = 0.2
+    if vx_std < 0.25:
+        fp["vx_std"] = 0.25
 
 
 def _mppi_profile_snapshot(params: dict) -> dict:

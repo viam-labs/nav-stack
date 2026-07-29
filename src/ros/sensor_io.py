@@ -158,9 +158,17 @@ def build_io_provider(
                 sample = conv.merge_odom_heading(sample, heading)
         return sample
 
-    async def drive_base(vx: float, vy: float, vtheta: float):
-        if record_cmd_vel is not None:
-            record_cmd_vel(vx, vy, vtheta, source="nav2")
+    async def drive_base(
+        vx: float,
+        vy: float,
+        vtheta: float,
+        *,
+        record_source: Optional[str] = "nav2",
+    ):
+        # ``record_source=None`` skips history (caller already recorded the
+        # pre-snap Nav2 command — see BridgeNode._on_drive_timer).
+        if record_cmd_vel is not None and record_source is not None:
+            record_cmd_vel(vx, vy, vtheta, source=record_source)
         lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(
             vx, vy, cfg.base_velocity_convention
         )
