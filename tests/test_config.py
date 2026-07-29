@@ -409,8 +409,35 @@ def test_apply_velocity_limits_wires_mppi_and_smoother():
     assert fp["ax_max"] == 0.5
     vs = params["velocity_smoother"]["ros__parameters"]
     assert vs["max_velocity"] == [0.35, 0.0, 0.8]
+    # Smoother reverse must match MPPI — not full -max_vel_x.
+    assert vs["min_velocity"] == [-0.15, -0.0, -0.8]
     assert vs["max_accel"] == [0.5, 0.0, 1.0]
     assert vs["max_decel"][0] == -0.75
+
+
+def test_apply_velocity_limits_reverse_scales_with_low_max_vel():
+    from src.models.navigation import _apply_velocity_limits
+
+    params = {
+        "controller_server": {
+            "ros__parameters": {"FollowPath": {}}
+        },
+        "velocity_smoother": {"ros__parameters": {}},
+    }
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "kinematics": "differential",
+            "max_vel_x": 0.08,
+            "max_vel_theta": 0.4,
+            "acc_lim_x": 0.3,
+            "acc_lim_theta": 0.5,
+        }
+    )
+    _apply_velocity_limits(params, cfg)
+    assert params["controller_server"]["ros__parameters"]["FollowPath"]["vx_min"] == -0.08
+    assert params["velocity_smoother"]["ros__parameters"]["min_velocity"][0] == -0.08
 
 
 def test_nav2_config_from_attributes():

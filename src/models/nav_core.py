@@ -1240,9 +1240,17 @@ def _apply_velocity_limits(params: dict, cfg: NavConfig) -> None:
     The flat override pass only matches identical key names (``max_vel_x``),
     but MPPI uses ``vx_max``/``wz_max`` and the smoother uses arrays — so the
     user's configured speed limits silently never reached the controller.
+
+    Reverse is intentionally capped (``<= 0.15 m/s``) for both MPPI and the
+    velocity smoother. Allowing the smoother full ``-max_vel_x`` while MPPI is
+    limited lets recoveries / stale cmd bursts command hard reverse that the
+    controller never intended — dangerous on skid-steer / low-traction bases.
     """
     omni = cfg.kinematics == OMNI
     vy = cfg.max_vel_y if omni else 0.0
+    # Modest reverse for small overshoots; diff-drive with vx_min=0 must spin
+    # fully around instead. Cap magnitude so reverse never matches full forward.
+    reverse_mps = -min(float(cfg.max_vel_x), 0.15)
     try:
         fp = params["controller_server"]["ros__parameters"]["FollowPath"]
     except (KeyError, TypeError):
@@ -1250,9 +1258,7 @@ def _apply_velocity_limits(params: dict, cfg: NavConfig) -> None:
     if isinstance(fp, dict):
         fp["motion_model"] = "Omni" if omni else "DiffDrive"
         fp["vx_max"] = cfg.max_vel_x
-        # Keep a modest reverse for goal corrections; diff-drive with no
-        # reverse must rotate fully around to fix small overshoots.
-        fp["vx_min"] = -min(cfg.max_vel_x, 0.15)
+        fp["vx_min"] = reverse_mps
         fp["vy_max"] = vy
         fp["wz_max"] = cfg.max_vel_theta
         fp["ax_max"] = cfg.acc_lim_x
@@ -1261,10 +1267,10 @@ def _apply_velocity_limits(params: dict, cfg: NavConfig) -> None:
     try:
         vs = params["velocity_smoother"]["ros__parameters"]
     except (KeyError, TypeError):
-        return
+        vs = None
     if isinstance(vs, dict):
         vs["max_velocity"] = [cfg.max_vel_x, vy, cfg.max_vel_theta]
-        vs["min_velocity"] = [-cfg.max_vel_x, -vy, -cfg.max_vel_theta]
+        vs["min_velocity"] = [reverse_mps, -vy, -cfg.max_vel_theta]
         vs["max_accel"] = [cfg.acc_lim_x, cfg.acc_lim_x if omni else 0.0, cfg.acc_lim_theta]
         # Allow braking harder than accelerating (safety), but keep it bounded
         # so the smoother actually smooths instead of passing jerks through.
