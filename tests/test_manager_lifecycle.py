@@ -195,67 +195,17 @@ def test_apply_slam_tf_params_sets_transform_timeout():
     assert run.call_args.args[0][-1] == "0.0"
 
 
-def test_suppress_jazzy_nav2_extras_pkill_patterns():
-    mgr = _manager()
-    # Window 0 makes the background reaper a no-op, so only the initial
-    # synchronous sweep runs and the call count stays deterministic.
-    mgr._SUPPRESS_WINDOW_S = 0.0
-    mgr._SUPPRESS_STOCK_LM_WAIT_S = 0.0
-    with patch.object(mgr, "_ros_env", return_value={"PATH": "/usr/bin"}), patch(
-        "src.ros.manager.time.sleep"
-    ), patch.object(mgr, "_pgrep_f", return_value=False), patch(
-        "src.ros.manager.subprocess.run"
-    ) as run:
-        mgr._suppress_jazzy_nav2_extras()
-    assert run.call_count == 2
-    patterns = [call.args[0][2] for call in run.call_args_list]
-    assert "nav2_collision_monitor/collision_monitor" in patterns
-    assert "__node:=lifecycle_manager_navigation" in patterns
+def test_bundled_nav2_launch_file_exists():
+    from src.ros.manager import _NAV2_LAUNCH
 
-
-def test_suppress_jazzy_nav2_extras_reaps_over_window():
-    mgr = _manager()
-    mgr._SUPPRESS_WINDOW_S = 5.0
-    mgr._SUPPRESS_STOCK_LM_WAIT_S = 0.0
-    reaped = threading.Event()
-    call_count = {"n": 0}
-
-    def _fake_run(*args, **kwargs):
-        call_count["n"] += 1
-        # After the initial 2 calls plus at least one windowed sweep, signal.
-        if call_count["n"] >= 4:
-            reaped.set()
-            mgr._SUPPRESS_WINDOW_S = 0.0  # let the reaper thread exit promptly
-        return MagicMock(returncode=0)
-
-    with patch.object(mgr, "_ros_env", return_value={"PATH": "/usr/bin"}), patch(
-        "src.ros.manager.time.sleep"
-    ), patch.object(mgr, "_pgrep_f", return_value=False), patch(
-        "src.ros.manager.subprocess.run", side_effect=_fake_run
-    ):
-        mgr._suppress_jazzy_nav2_extras()
-        assert reaped.wait(timeout=5.0)
-
-
-def test_suppress_waits_while_stock_lifecycle_manager_alive():
-    mgr = _manager()
-    mgr._SUPPRESS_WINDOW_S = 0.0
-    mgr._SUPPRESS_STOCK_LM_WAIT_S = 5.0
-    alive_checks = {"n": 0}
-
-    def _pgrep(pattern: str) -> bool:
-        alive_checks["n"] += 1
-        # First few checks see the stock LM; then it disappears.
-        return alive_checks["n"] < 3
-
-    with patch.object(mgr, "_ros_env", return_value={"PATH": "/usr/bin"}), patch(
-        "src.ros.manager.time.sleep"
-    ), patch.object(mgr, "_pgrep_f", side_effect=_pgrep), patch(
-        "src.ros.manager.subprocess.run"
-    ) as run:
-        mgr._suppress_jazzy_nav2_extras()
-    assert alive_checks["n"] >= 3
-    assert run.call_count >= 2
+    assert _NAV2_LAUNCH.is_file()
+    text = _NAV2_LAUNCH.read_text(encoding="utf-8")
+    assert 'package="nav2_collision_monitor"' not in text
+    assert 'name="docking_server"' not in text
+    assert 'name="route_server"' not in text
+    assert 'name="controller_server"' in text
+    assert 'name="velocity_smoother"' in text
+    assert 'name="lifecycle_manager_navigation"' in text
 
 
 def test_start_nav2_rotates_previous_launch_log(tmp_path):
@@ -269,15 +219,12 @@ def test_start_nav2_rotates_previous_launch_log(tmp_path):
 
     proc = MagicMock()
     proc.poll.return_value = None
-    nodes = "/controller_server\n/bt_navigator\n"
     with patch.object(mgr, "stop_nav2"), patch.object(
         mgr, "_popen", return_value=proc
     ), patch.object(mgr, "_wait_for_nav_action", return_value=True), patch.object(
-        mgr, "_suppress_jazzy_nav2_extras"
-    ), patch.object(mgr, "_wait_for_required_nav_nodes", return_value=True), patch.object(
-        mgr, "_apply_slam_tf_params"
-    ), patch.object(mgr, "_start_costmap_filter_stack"), patch.object(
-        mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout=nodes, stderr="")
+        mgr, "_wait_for_required_nav_nodes", return_value=True
+    ), patch.object(mgr, "_apply_slam_tf_params"), patch.object(
+        mgr, "_start_costmap_filter_stack"
     ):
         mgr.start_nav2(nav_cfg, params_path)
 
@@ -302,7 +249,9 @@ def test_wait_for_map_tf_before_nav2_noop_without_node():
     mgr._wait_for_map_tf_before_nav2(timeout=0.1)
 
 
-def test_start_nav2_disables_collision_monitor_launch_arg(tmp_path):
+def test_start_nav2_uses_bundled_launch_with_autostart(tmp_path):
+    from src.ros.manager import _NAV2_LAUNCH
+
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "maps_dir": str(tmp_path)})
     mgr = RosManager(cfg, logger=MagicMock())
     nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
@@ -311,32 +260,24 @@ def test_start_nav2_disables_collision_monitor_launch_arg(tmp_path):
 
     proc = MagicMock()
     proc.poll.return_value = None
-    nodes = "/controller_server\n/bt_navigator\n/planner_server\n"
     with patch.object(mgr, "stop_nav2"), patch.object(
         mgr, "_popen", return_value=proc
     ) as popen, patch.object(mgr, "_wait_for_nav_action", return_value=False), patch.object(
-        mgr, "_suppress_jazzy_nav2_extras"
-    ) as suppress, patch.object(
         mgr, "_wait_for_required_nav_nodes", return_value=True
-    ) as wait_nodes, patch.object(
-        mgr, "_apply_slam_tf_params"
-    ) as apply_tf, patch.object(
+    ) as wait_nodes, patch.object(mgr, "_apply_slam_tf_params") as apply_tf, patch.object(
         mgr, "_activate_core_nav_nodes_manually", return_value=False
-    ), patch.object(mgr, "_start_costmap_filter_stack"), patch.object(
-        mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout=nodes, stderr="")
-    ):
+    ), patch.object(mgr, "_start_costmap_filter_stack"):
         mgr.start_nav2(nav_cfg, params_path)
 
     wait_nodes.assert_called_once()
-
-    suppress.assert_called_once()
     apply_tf.assert_called_once()
 
     launch_args = popen.call_args_list[0].args[0]
-    assert "autostart:=false" in launch_args
-    assert "use_collision_monitor:=False" in launch_args
-    assert "use_composition:=False" in launch_args
-    assert any(
+    assert launch_args[0:3] == ["ros2", "launch", str(_NAV2_LAUNCH)]
+    assert "autostart:=true" in launch_args
+    assert f"params_file:={params_path}" in launch_args
+    # No stock-bringup kill/override dance.
+    assert not any(
         "__node:=navigation_lifecycle_manager_override" in call.args[0]
         for call in popen.call_args_list
     )
@@ -360,10 +301,8 @@ def test_lifecycle_manager_params_disable_bond_timeout(tmp_path):
     with patch.object(mgr, "stop_nav2"), patch.object(
         mgr, "_popen", return_value=proc
     ), patch.object(mgr, "_wait_for_nav_action", return_value=True), patch.object(
-        mgr, "_suppress_jazzy_nav2_extras"
-    ), patch.object(mgr, "_wait_for_required_nav_nodes", return_value=True), patch.object(
-        mgr, "_apply_slam_tf_params"
-    ), patch.object(
+        mgr, "_wait_for_required_nav_nodes", return_value=True
+    ), patch.object(mgr, "_apply_slam_tf_params"), patch.object(
         mgr,
         "_run_ros",
         return_value=MagicMock(returncode=0, stdout=nodes, stderr=""),
@@ -372,52 +311,12 @@ def test_lifecycle_manager_params_disable_bond_timeout(tmp_path):
 
     scratch = tmp_path / ".runtime"
     filter_params = yaml.safe_load((scratch / "filter_lifecycle.yaml").read_text())
-    nav_params = yaml.safe_load((scratch / "nav_lifecycle.yaml").read_text())
     assert (
         filter_params["filter_lifecycle_manager"]["ros__parameters"]["bond_timeout"]
         == 0.0
     )
-    assert (
-        nav_params["navigation_lifecycle_manager_override"]["ros__parameters"][
-            "bond_timeout"
-        ]
-        == 0.0
-    )
-    assert "docking_server" not in nav_params["navigation_lifecycle_manager_override"][
-        "ros__parameters"
-    ]["node_names"]
-
-
-def test_lifecycle_override_refused_without_controller_server(tmp_path):
-    """Missing controller + invented node names = LM waits forever (bringup hang)."""
-    cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "maps_dir": str(tmp_path)})
-    mgr = RosManager(cfg, logger=MagicMock())
-    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
-    params_path = tmp_path / "nav2_params.yaml"
-    params_path.write_text("{}", encoding="utf-8")
-
-    proc = MagicMock()
-    proc.poll.return_value = None
-    # Same shape as a bad bringup: bt up, controller never registered.
-    nodes = "/bt_navigator\n/planner_server\n/velocity_smoother\n"
-    with patch.object(mgr, "stop_nav2"), patch.object(
-        mgr, "_popen", return_value=proc
-    ) as popen, patch.object(mgr, "_wait_for_nav_action", return_value=False), patch.object(
-        mgr, "_suppress_jazzy_nav2_extras"
-    ), patch.object(mgr, "_wait_for_required_nav_nodes", return_value=False), patch.object(
-        mgr, "_apply_slam_tf_params"
-    ), patch.object(mgr, "_activate_core_nav_nodes_manually", return_value=False), patch.object(
-        mgr, "_start_costmap_filter_stack"
-    ), patch.object(
-        mgr, "_run_ros", return_value=MagicMock(returncode=0, stdout=nodes, stderr="")
-    ):
-        mgr.start_nav2(nav_cfg, params_path)
-
-    assert not (tmp_path / ".runtime" / "nav_lifecycle.yaml").exists()
-    assert not any(
-        "__node:=navigation_lifecycle_manager_override" in call.args[0]
-        for call in popen.call_args_list
-    )
+    # Navigation LM lives in the bundled launch now (no override yaml).
+    assert not (scratch / "nav_lifecycle.yaml").exists()
 
 
 def test_nav_action_ready_invalidates_cache_when_nodes_missing():
