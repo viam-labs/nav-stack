@@ -50,6 +50,50 @@ def test_write_nav2_bt_xml_uses_config_defaults(tmp_path: Path):
     assert 'RateController hz="2.0"' in text
     assert 'number_of_retries="4" name="NavigateRecovery"' in text
     assert 'Wait wait_duration="2.0"' in text
+    # Path smoothing is opt-in (small diffdrive bases only).
+    assert "<SmoothPath" not in text
+
+
+def test_tune_nav2_bt_xml_injects_smooth_path():
+    out = _tune_nav2_bt_xml(
+        _SAMPLE_BT,
+        replan_hz=2.0,
+        navigate_recovery_retries=4,
+        recovery_wait_duration=2.0,
+        smooth_path=True,
+    )
+    # ComputePathToPose gets wrapped so SmoothPath overwrites {path} in place;
+    # ForceSuccess keeps a smoothing failure from failing navigation.
+    assert '<Sequence name="ComputeAndSmoothPath"><ComputePathToPose' in out
+    assert (
+        '<ForceSuccess><SmoothPath unsmoothed_path="{path}" '
+        'smoothed_path="{path}" smoother_id="simple_smoother"' in out
+    )
+    assert out.count("<SmoothPath") == 1
+    # Idempotent: re-tuning an already-injected tree adds nothing.
+    again = _tune_nav2_bt_xml(
+        out,
+        replan_hz=2.0,
+        navigate_recovery_retries=4,
+        recovery_wait_duration=2.0,
+        smooth_path=True,
+    )
+    assert again.count("<SmoothPath") == 1
+
+
+def test_write_nav2_bt_xml_smooth_path_wraps_shipped_tree(tmp_path: Path):
+    path = _write_nav2_bt_xml(tmp_path, Nav2Config(), smooth_path=True)
+    text = path.read_text(encoding="utf-8")
+    assert text.count("<SmoothPath") == 1
+    assert "<ForceSuccess>" in text
+    # The wrap must keep RecoveryNode name="ComputePathToPose" at 2 children:
+    # the compute+smooth sequence, then the clear-costmap recovery sequence.
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(text)
+    recovery = root.find(".//RecoveryNode[@name='ComputePathToPose']")
+    if recovery is not None:
+        assert len(list(recovery)) == 2
 
 
 def test_nav2_config_progress_and_replan_defaults():

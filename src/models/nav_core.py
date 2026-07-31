@@ -486,16 +486,17 @@ class NavServiceBase(Motion):
         }
         _apply_nav2_tuning(params, overrides)
         _apply_velocity_limits(params, cfg)
+        user_params: dict = {}
         if cfg.nav2_params:
-            _deep_merge(
-                params, _normalize_nav2_user_params(dict(cfg.nav2_params), params)
-            )
+            user_params = _normalize_nav2_user_params(dict(cfg.nav2_params), params)
+            _deep_merge(params, user_params)
             # User may override FollowPath.vx_min after our wiring; keep the
             # smoother's reverse cap aligned so it cannot exceed MPPI again.
             _sync_smoother_reverse_to_mppi(params)
-        # After user merges: DiffDrive skid-steer cannot use stock MPPI — it
-        # converges to vx=0 micro-yaw. Swap to Regulated Pure Pursuit instead.
-        _apply_diffdrive_controller(params, cfg)
+        # DiffDrive skid-steer cannot use stock MPPI — it converges to vx=0
+        # micro-yaw. Swap to Regulated Pure Pursuit; user_params re-merge on
+        # top so explicit nav2_params overrides survive the swap.
+        _apply_diffdrive_controller(params, cfg, user_params)
         _apply_local_costmap_size(params, cfg.nav2)
         _sync_mppi_model_dt(params)
 
@@ -508,7 +509,14 @@ class NavServiceBase(Motion):
         nav2_for_bt = cfg.nav2
         if cfg.kinematics != OMNI and cfg.nav2.navigate_recovery_retries != 0:
             nav2_for_bt = replace(cfg.nav2, navigate_recovery_retries=0)
-        bt_path = _write_nav2_bt_xml(runtime_dir, nav2_for_bt)
+        # Small DiffDrive bases follow the path with a short lookahead, so raw
+        # NavFn grid zigzag feeds curvature noise straight into cmd_vel; run
+        # the path through smoother_server. Cart / omni BTs stay unchanged.
+        bt_path = _write_nav2_bt_xml(
+            runtime_dir,
+            nav2_for_bt,
+            smooth_path=cfg.kinematics != OMNI and _is_small_base(cfg),
+        )
         try:
             bt_params = params.setdefault("bt_navigator", {}).setdefault(
                 "ros__parameters", {}
@@ -1179,17 +1187,46 @@ def _resolve_bt_template() -> Path:
     return _BT_FALLBACK
 
 
+def _inject_smooth_path_bt(text: str) -> str:
+    """Wrap the ``ComputePathToPose`` action with a ``SmoothPath`` step.
+
+    ``smoothed_path`` overwrites ``{path}`` in place; ``ForceSuccess`` keeps a
+    smoothing hiccup from failing navigation (the raw path is already on the
+    blackboard). Works on both the distro-installed tree and the shipped
+    fallback since both use a self-closing ``<ComputePathToPose .../>``.
+    """
+    if "<SmoothPath" in text:
+        return text
+    m = re.search(r"<ComputePathToPose\b[^>]*/>", text)
+    if m is None:
+        return text
+    smooth = (
+        '<SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" '
+        'smoother_id="simple_smoother" max_smoothing_duration="1.0" '
+        'check_for_collisions="false"/>'
+    )
+    wrapped = (
+        '<Sequence name="ComputeAndSmoothPath">'
+        f"{m.group(0)}<ForceSuccess>{smooth}</ForceSuccess>"
+        "</Sequence>"
+    )
+    return text[: m.start()] + wrapped + text[m.end():]
+
+
 def _tune_nav2_bt_xml(
     text: str,
     *,
     replan_hz: float,
     navigate_recovery_retries: int,
     recovery_wait_duration: float,
+    smooth_path: bool = False,
 ) -> str:
     """Rewrite replan rate / recovery patience fields in a Nav2 BT XML string."""
     hz = max(0.1, float(replan_hz))
     retries = max(0, int(navigate_recovery_retries))
     wait_s = max(0.0, float(recovery_wait_duration))
+    if smooth_path:
+        text = _inject_smooth_path_bt(text)
     text = re.sub(
         r'(RateController\s+hz=")[^"]+(")',
         rf"\g<1>{hz:.1f}\g<2>",
@@ -1211,7 +1248,9 @@ def _tune_nav2_bt_xml(
     return text
 
 
-def _write_nav2_bt_xml(runtime_dir: Path, nav2_cfg: Nav2Config) -> Path:
+def _write_nav2_bt_xml(
+    runtime_dir: Path, nav2_cfg: Nav2Config, *, smooth_path: bool = False
+) -> Path:
     """Write a navigate-to-pose BT tuned from ``nav2`` config into ``runtime_dir``."""
     template = _resolve_bt_template()
     text = template.read_text(encoding="utf-8")
@@ -1220,6 +1259,7 @@ def _write_nav2_bt_xml(runtime_dir: Path, nav2_cfg: Nav2Config) -> Path:
         replan_hz=nav2_cfg.replan_frequency,
         navigate_recovery_retries=nav2_cfg.navigate_recovery_retries,
         recovery_wait_duration=nav2_cfg.recovery_wait_duration,
+        smooth_path=smooth_path,
     )
     out = runtime_dir / "navigate_to_pose_w_replanning_and_recovery.xml"
     out.write_text(text, encoding="utf-8")
@@ -1317,14 +1357,53 @@ def _sync_smoother_reverse_to_mppi(params: dict) -> None:
         vs["min_velocity"] = [vx_min, *list(min_vel[1:])]
 
 
-def _apply_diffdrive_controller(params: dict, cfg: NavConfig) -> None:
+# Bases at or below this radius get the "nimble" DiffDrive profile (Viam
+# Rover class). Larger carts (MiR class) keep the carpet-tested values.
+_SMALL_BASE_RADIUS_M = 0.15
+
+
+def _is_small_base(cfg: NavConfig) -> bool:
+    try:
+        return float(cfg.robot_radius) <= _SMALL_BASE_RADIUS_M
+    except (TypeError, ValueError):
+        return False
+
+
+def _user_subtree(user_params: Optional[Mapping], *path: str) -> Mapping:
+    """Fetch a nested mapping out of normalized user nav2_params (or {})."""
+    node: object = user_params or {}
+    for key in path:
+        if not isinstance(node, Mapping):
+            return {}
+        node = node.get(key, {})
+    return node if isinstance(node, Mapping) else {}
+
+
+def _apply_diffdrive_controller(
+    params: dict, cfg: NavConfig, user_params: Optional[Mapping] = None
+) -> None:
     """Use Regulated Pure Pursuit for DiffDrive instead of MPPI.
 
     MPPI on this skid-steer repeatedly converges to ``vx=0`` with
-    ``|ω|≈0.05–0.1``. RPP tracks a lookahead with forward motion;
-    ``use_rotate_to_heading: false`` avoids stop-and-spin. Also: open-loop
-    smoother (CLOSED_LOOP fights carpet stiction), no RPP collision freeze,
-    and a looser progress checker so weak first motion is not an instant abort.
+    ``|ω|≈0.05–0.1``. RPP tracks a lookahead with forward motion. Also:
+    open-loop smoother (CLOSED_LOOP fights carpet stiction), no RPP collision
+    freeze, and a looser progress checker so weak first motion is not an
+    instant abort.
+
+    Two profiles, gated on ``robot_radius``:
+
+    * cart (> 0.15 m, e.g. MiR): the carpet-tested values, unchanged.
+      ``use_rotate_to_heading: false`` because stop-and-spin is useless there.
+    * small (<= 0.15 m, e.g. Viam Rover): the cart geometry made these bases
+      spin in place — ``regulated_linear_scaling_min_speed`` at half top speed
+      inflated ω (RPP computes ω = v·curvature after flooring v), and the
+      velocity-scaled lookahead collapsed to 0.3 m, where curvature = 2y/L²
+      explodes. Longer minimum lookahead, a real speed floor, rotate-to-heading
+      for large heading errors, and yaw accel the smoother can actually track.
+
+    ``user_params`` (normalized ``nav2_params``) re-merges on top so explicit
+    FollowPath / progress_checker / velocity_smoother overrides win. A user
+    who sets ``FollowPath.plugin`` opts out of this profile entirely.
     """
     if cfg.kinematics == OMNI:
         return
@@ -1334,8 +1413,25 @@ def _apply_diffdrive_controller(params: dict, cfg: NavConfig) -> None:
         return
     if not isinstance(cs, dict):
         return
+    user_cs = _user_subtree(user_params, "controller_server", "ros__parameters")
+    user_fp = user_cs.get("FollowPath")
+    if isinstance(user_fp, Mapping) and user_fp.get("plugin"):
+        # Explicit controller choice: leave the merged template alone.
+        return
+    small = _is_small_base(cfg)
     reverse_mps = -min(float(cfg.max_vel_x), 0.15)
-    min_speed = max(0.12, 0.5 * float(cfg.max_vel_x))
+    if small:
+        min_speed = min(0.10, 0.5 * float(cfg.max_vel_x))
+        min_radius = 0.35
+        lookahead, min_lookahead, max_lookahead = 0.55, 0.45, 0.9
+        # Smoother slew must keep up with RPP's ω demand or pursuit limit-cycles
+        # (lag distance approaching the lookahead distance = oscillation).
+        yaw_accel = max(float(cfg.acc_lim_theta), 4.0 * float(cfg.max_vel_theta))
+    else:
+        min_speed = max(0.12, 0.5 * float(cfg.max_vel_x))
+        min_radius = 0.9
+        lookahead, min_lookahead, max_lookahead = 0.6, 0.3, 0.9
+        yaw_accel = float(cfg.acc_lim_theta)
     # Keep both Jazzy (desired_linear_vel) and newer (max_linear_vel) names.
     cs["FollowPath"] = {
         "plugin": (
@@ -1348,13 +1444,14 @@ def _apply_diffdrive_controller(params: dict, cfg: NavConfig) -> None:
         "min_angular_vel": -cfg.max_vel_theta,
         "max_linear_accel": cfg.acc_lim_x,
         "max_linear_decel": -1.5 * cfg.acc_lim_x,
-        "max_angular_accel": cfg.acc_lim_theta,
-        "max_angular_decel": -1.5 * cfg.acc_lim_theta,
-        "lookahead_dist": 0.6,
-        "min_lookahead_dist": 0.3,
-        "max_lookahead_dist": 0.9,
+        "max_angular_accel": yaw_accel,
+        "max_angular_decel": -1.5 * yaw_accel,
+        "lookahead_dist": lookahead,
+        "min_lookahead_dist": min_lookahead,
+        "max_lookahead_dist": max_lookahead,
         "lookahead_time": 1.5,
         "rotate_to_heading_angular_vel": min(float(cfg.max_vel_theta), 1.0),
+        "rotate_to_heading_min_angle": 0.785,
         "use_velocity_scaled_lookahead_dist": True,
         "min_approach_linear_velocity": max(0.08, min_speed * 0.5),
         "approach_velocity_scaling_dist": 0.6,
@@ -1363,13 +1460,16 @@ def _apply_diffdrive_controller(params: dict, cfg: NavConfig) -> None:
         "use_collision_detection": False,
         "use_regulated_linear_velocity_scaling": True,
         "use_cost_regulated_linear_velocity_scaling": False,
-        "regulated_linear_scaling_min_radius": 0.9,
+        "regulated_linear_scaling_min_radius": min_radius,
         "regulated_linear_scaling_min_speed": min_speed,
-        # Critical for skid-steer / carpet: never stop-and-spin.
-        "use_rotate_to_heading": False,
+        # Carts on carpet must never stop-and-spin; a small rover pivots
+        # cleanly, and arcing through a >45° heading error is what spun it.
+        "use_rotate_to_heading": small,
         "allow_reversing": False,
         "transform_tolerance": 10.0,
     }
+    if isinstance(user_fp, Mapping) and user_fp:
+        _deep_merge(cs["FollowPath"], user_fp)
     progress = cs.get("progress_checker")
     if isinstance(progress, dict):
         try:
@@ -1382,6 +1482,9 @@ def _apply_diffdrive_controller(params: dict, cfg: NavConfig) -> None:
         except (TypeError, ValueError):
             allow = 10.0
         progress["movement_time_allowance"] = max(allow, 30.0)
+        user_progress = user_cs.get("progress_checker")
+        if isinstance(user_progress, Mapping) and user_progress:
+            _deep_merge(progress, user_progress)
     try:
         vs = params["velocity_smoother"]["ros__parameters"]
     except (KeyError, TypeError):
@@ -1391,6 +1494,16 @@ def _apply_diffdrive_controller(params: dict, cfg: NavConfig) -> None:
         # collapses useful cmds. Open-loop ramps match test_drive.
         vs["feedback"] = "OPEN_LOOP"
         vs["deadband_velocity"] = [0.0, 0.0, 0.0]
+        if small:
+            accel = vs.get("max_accel")
+            decel = vs.get("max_decel")
+            if isinstance(accel, list) and len(accel) == 3:
+                vs["max_accel"] = [accel[0], accel[1], yaw_accel]
+            if isinstance(decel, list) and len(decel) == 3:
+                vs["max_decel"] = [decel[0], decel[1], -1.5 * yaw_accel]
+        user_vs = _user_subtree(user_params, "velocity_smoother", "ros__parameters")
+        if user_vs:
+            _deep_merge(vs, user_vs)
     _sync_smoother_reverse_to_mppi(params)
 
 
@@ -1414,8 +1527,12 @@ def _mppi_profile_snapshot(params: dict) -> dict:
                 "use_rotate_to_heading": fp.get("use_rotate_to_heading"),
                 "allow_reversing": fp.get("allow_reversing"),
                 "lookahead_dist": fp.get("lookahead_dist"),
+                "min_lookahead_dist": fp.get("min_lookahead_dist"),
                 "min_approach_linear_velocity": fp.get("min_approach_linear_velocity"),
                 "use_collision_detection": fp.get("use_collision_detection"),
+                "regulated_linear_scaling_min_radius": fp.get(
+                    "regulated_linear_scaling_min_radius"
+                ),
                 "regulated_linear_scaling_min_speed": fp.get(
                     "regulated_linear_scaling_min_speed"
                 ),

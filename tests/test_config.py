@@ -501,6 +501,13 @@ def test_diffdrive_uses_regulated_pure_pursuit():
     assert fp["max_angular_vel"] == 1.5
     assert fp["min_linear_vel"] == -0.15
     assert fp["regulated_linear_scaling_min_speed"] == 0.125
+    # Cart-scale regression guard: default robot_radius (0.22) must keep the
+    # carpet-tested geometry exactly.
+    assert fp["regulated_linear_scaling_min_radius"] == 0.9
+    assert fp["lookahead_dist"] == 0.6
+    assert fp["min_lookahead_dist"] == 0.3
+    assert fp["max_lookahead_dist"] == 0.9
+    assert fp["max_angular_accel"] == 2.0
     pc = params["controller_server"]["ros__parameters"]["progress_checker"]
     assert pc["required_movement_radius"] == 0.15
     assert pc["movement_time_allowance"] == 30.0
@@ -508,6 +515,122 @@ def test_diffdrive_uses_regulated_pure_pursuit():
     assert vs["min_velocity"][0] == -0.15
     assert vs["feedback"] == "OPEN_LOOP"
     assert vs["deadband_velocity"] == [0.0, 0.0, 0.0]
+
+
+def _diffdrive_params_fixture():
+    return {
+        "controller_server": {
+            "ros__parameters": {
+                "FollowPath": {
+                    "plugin": "nav2_mppi_controller::MPPIController",
+                    "vx_max": 0.4,
+                },
+                "progress_checker": {
+                    "required_movement_radius": 0.25,
+                    "movement_time_allowance": 10.0,
+                },
+            }
+        },
+        "velocity_smoother": {
+            "ros__parameters": {
+                "feedback": "CLOSED_LOOP",
+                "min_velocity": [-0.4, 0.0, -1.0],
+                "max_accel": [1.0, 0.0, 2.0],
+                "max_decel": [-1.5, 0.0, -3.0],
+                "deadband_velocity": [0.03, 0.0, 0.05],
+            }
+        },
+    }
+
+
+def test_diffdrive_small_base_profile():
+    from src.models.navigation import _apply_diffdrive_controller
+
+    params = _diffdrive_params_fixture()
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "viam_base",
+            "kinematics": "differential",
+            "robot_radius": 0.1,
+        }
+    )
+    _apply_diffdrive_controller(params, cfg)
+    fp = params["controller_server"]["ros__parameters"]["FollowPath"]
+    # Speed floor must never inflate omega (RPP does omega = v * curvature
+    # after flooring v): 0.10, not half of max_vel_x.
+    assert fp["regulated_linear_scaling_min_speed"] == 0.10
+    assert fp["regulated_linear_scaling_min_radius"] == 0.35
+    # Velocity-scaled lookahead must not collapse to 0.3 m at low speed.
+    assert fp["min_lookahead_dist"] == 0.45
+    assert fp["lookahead_dist"] == 0.55
+    # A small rover pivots cleanly; large heading errors rotate in place
+    # instead of arcing tighter than the robot's own footprint.
+    assert fp["use_rotate_to_heading"] is True
+    assert fp["allow_reversing"] is False
+    # Yaw slew must track RPP demand (4 * max_vel_theta), in RPP and smoother.
+    assert fp["max_angular_accel"] == 4.0
+    vs = params["velocity_smoother"]["ros__parameters"]
+    assert vs["max_accel"] == [1.0, 0.0, 4.0]
+    assert vs["max_decel"] == [-1.5, 0.0, -6.0]
+
+
+def test_diffdrive_user_followpath_overrides_survive():
+    from src.models.navigation import _apply_diffdrive_controller
+
+    params = _diffdrive_params_fixture()
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "kinematics": "differential",
+            "robot_radius": 0.1,
+        }
+    )
+    user_params = {
+        "controller_server": {
+            "ros__parameters": {
+                "FollowPath": {
+                    "min_lookahead_dist": 0.6,
+                    "regulated_linear_scaling_min_speed": 0.05,
+                },
+                "progress_checker": {"required_movement_radius": 0.3},
+            }
+        },
+        "velocity_smoother": {"ros__parameters": {"feedback": "CLOSED_LOOP"}},
+    }
+    _apply_diffdrive_controller(params, cfg, user_params)
+    fp = params["controller_server"]["ros__parameters"]["FollowPath"]
+    assert "regulated_pure_pursuit" in fp["plugin"]
+    assert fp["min_lookahead_dist"] == 0.6
+    assert fp["regulated_linear_scaling_min_speed"] == 0.05
+    pc = params["controller_server"]["ros__parameters"]["progress_checker"]
+    assert pc["required_movement_radius"] == 0.3
+    vs = params["velocity_smoother"]["ros__parameters"]
+    assert vs["feedback"] == "CLOSED_LOOP"
+
+
+def test_diffdrive_user_plugin_choice_skips_swap():
+    from src.models.navigation import _apply_diffdrive_controller
+
+    params = _diffdrive_params_fixture()
+    cfg = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "kinematics": "differential"}
+    )
+    user_params = {
+        "controller_server": {
+            "ros__parameters": {
+                "FollowPath": {"plugin": "nav2_mppi_controller::MPPIController"}
+            }
+        }
+    }
+    _apply_diffdrive_controller(params, cfg, user_params)
+    fp = params["controller_server"]["ros__parameters"]["FollowPath"]
+    assert fp["plugin"] == "nav2_mppi_controller::MPPIController"
+    assert "regulated_linear_scaling_min_speed" not in fp
+    # Explicit plugin choice means we leave the smoother alone too.
+    vs = params["velocity_smoother"]["ros__parameters"]
+    assert vs["feedback"] == "CLOSED_LOOP"
 
 
 def test_diffdrive_controller_noop_for_omni():

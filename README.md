@@ -161,7 +161,7 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level Nav2 footprint / velocity limits |
 | `min_cmd_vel_x`, `min_cmd_vel_theta` | Nav | Optional stiction floors (default **off** / `0`) for simple `go_to_*` motion. Nav2 commands are not floored because independently changing linear/angular components distorts MPPI paths. Legacy aliases: `simple_min_vel_x` / `simple_min_vel_theta` |
 | `nav2` | Nav | Common Nav2 params (goal tolerance, costmap size, etc.) |
-| `nav2_params` | Nav | Advanced: nested Nav2 param overrides (merged last) |
+| `nav2_params` | Nav | Advanced: nested Nav2 param overrides (merged last; on differential bases `FollowPath` / `progress_checker` / `velocity_smoother` overrides re-merge on top of the generated DiffDrive profile) |
 
 Example with slam_toolbox tuning:
 
@@ -225,6 +225,13 @@ For a **bare IMU** movement sensor (Wit, etc. with accel + gyro, no wheel pose),
 For **Viam wheeled bases** (`rdk:builtin:wheeled`) and **MiR250** (`viam-labs:mir-base`), keep the default `"base_velocity_convention": "viam"` so forward Nav2 commands map to Viam `linear.y` (Viam wheeled / MiR expect forward on Y, not X). Use `"ros"` only for bases that drive on `linear.x`. Legacy `"mir"` is accepted and normalized to `"viam"`. Odometry from `viam-labs:mir-base:movement` stays in ROS convention and does not need swapping. Nav-stack stops Nav2 motion with `set_velocity(0)` (not `Base.stop()`), so MiR Manualcontrol and `go_to_location` keep working after a navigation cancel or goal completion.
 
 The MiR250 is **differential drive** — use `"kinematics": "differential"` (the default). Configuring `omni` (or an `Omni` MPPI motion model) makes Nav2 command lateral velocities the robot cannot execute, which stalls progress near goals and triggers endless spin recoveries. Also avoid `"vx_min": 0`: with reverse disabled, a diff-drive robot must rotate fully around to correct small overshoots. Nav-stack caps reverse at `min(max_vel_x, 0.15)` for both MPPI (`vx_min`) and the velocity smoother (`min_velocity[0]`) so recoveries cannot command full-speed reverse through the smoother.
+
+**DiffDrive controller profiles.** Differential bases use Regulated Pure Pursuit (MPPI converges to `vx=0` micro-yaw on skid-steer), with two profiles gated on `robot_radius`:
+
+- **cart** (`robot_radius` > 0.15 m, e.g. MiR): the carpet-tested geometry — `regulated_linear_scaling_min_speed = max(0.12, 0.5·max_vel_x)`, lookahead 0.3–0.9 m, `use_rotate_to_heading: false` (stop-and-spin is useless on carpet).
+- **small** (`robot_radius` ≤ 0.15 m, e.g. Viam Rover): the cart geometry made small bases spin in place — the speed floor inflated yaw (RPP computes `ω = v·curvature` *after* flooring `v`) and the velocity-scaled lookahead collapsed to 0.3 m where curvature explodes. This profile uses a 0.10 m/s floor, `regulated_linear_scaling_min_radius: 0.35`, lookahead 0.45–0.9 m, `use_rotate_to_heading: true` (heading errors ≥ 45° pivot in place instead of arcing tighter than the footprint), yaw accel of at least `4·max_vel_theta` so the smoother can track RPP, and a `SmoothPath` step in the behavior tree (wrapped in `ForceSuccess` — smoothing failures fall back to the raw NavFn path) so grid zigzag does not feed curvature noise into the short lookahead.
+
+Any individual value can be overridden via `nav2_params` (e.g. `{"controller_server": {"FollowPath": {"min_lookahead_dist": 0.6}}}`) — user overrides re-merge on top of the generated profile. Setting `FollowPath.plugin` explicitly opts out of the profile swap entirely (the template + your overrides are used as-is, including smoother settings).
 
 For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a single `get_readings()` per odom tick. It uses **`odom_position_x_m` / `odom_position_y_m` / `odom_yaw_deg`** when present (true `/odom` frame from mir-base ≥ the odom-fields update). Map-frame `position_x_m`/`position_y_m` and fused `yaw_deg` are **not** used for `/odom` — slam_toolbox needs a smooth odom frame. Until mir-base exposes the odom fields, orientation falls back to velocity integration; upgrade mir-base or patch it to publish `odom_*` keys from the parsed `/odom` message. Raise `mir_rosbridge_timeout_s` (≥5) and `odom_rate_hz` (≥15) if updates lag.
 
