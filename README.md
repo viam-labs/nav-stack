@@ -74,8 +74,11 @@ sudo apt-get install ros-$ROS_DISTRO-ros-base \
   components returning point clouds; a true 2D lidar is ideal, depth cameras work
   via projection), and a **movement sensor** providing velocity for odometry.
 
-If `viam-server` runs as root and DDS shared-memory fails, point
-`FASTRTPS_DEFAULT_PROFILES_FILE` at a UDP-only FastDDS profile in the module env.
+If `viam-server` runs as root, FastDDS shared-memory can hang Nav2 participant
+create after SIGKILL leftovers in `/dev/shm`. nav-stack defaults
+`FASTDDS_BUILTIN_TRANSPORTS=UDPv4` (overridable). You can still point
+`FASTRTPS_DEFAULT_PROFILES_FILE` at a custom UDP-only FastDDS profile in the
+module env; when that is set, the builtin-transports default is left alone.
 
 **DDS isolation (cross-machine `/map` crosstalk):** by default nav-stack sets
 `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`, `ROS_LOCALHOST_ONLY=1`, and (when

@@ -54,10 +54,12 @@ export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-1}"
 # modmanager StdErr "error" stream entries.
 export RCUTILS_LOGGING_USE_STDOUT="${RCUTILS_LOGGING_USE_STDOUT:-1}"
 
-# Work around shared-memory transport issues when viam-server runs as root by
-# defaulting to a UDP-only FastDDS profile if the user supplied one.
-if [ -n "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" ]; then
-    export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+# Default to UDP-only FastDDS transport. Shared-memory + root + SIGKILL'd Nav2
+# leftovers frequently leave /dev/shm segments whose robust mutexes hang the
+# next participant create (Nav2 procs alive at 0% CPU, never on the graph).
+# Explicit FASTRTPS_DEFAULT_PROFILES_FILE / FASTDDS_BUILTIN_TRANSPORTS still win.
+if [ -z "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" ]; then
+    export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"
 fi
 
 # shellcheck disable=SC1091

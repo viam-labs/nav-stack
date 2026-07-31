@@ -1966,6 +1966,8 @@ class BridgeNode(Node):
         env.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
         env.setdefault("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")
         env.setdefault("ROS_LOCALHOST_ONLY", "1")
+        if not env.get("FASTRTPS_DEFAULT_PROFILES_FILE"):
+            env.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
         distro = env.get("ROS_DISTRO", "jazzy")
         ros_bin = f"/opt/ros/{distro}/bin"
         path = env.get("PATH", "")

@@ -20,6 +20,8 @@ def _clear_dds_env(monkeypatch):
         "ROS_AUTOMATIC_DISCOVERY_RANGE",
         "ROS_LOCALHOST_ONLY",
         "RMW_IMPLEMENTATION",
+        "FASTDDS_BUILTIN_TRANSPORTS",
+        "FASTRTPS_DEFAULT_PROFILES_FILE",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -41,6 +43,8 @@ def test_apply_dds_isolation_sets_defaults_and_persists(tmp_path, monkeypatch):
     assert status["ros_automatic_discovery_range"] == "LOCALHOST"
     assert status["ros_localhost_only"] == "1"
     assert status["rmw_implementation"] == "rmw_fastrtps_cpp"
+    assert status["fastdds_builtin_transports"] == "UDPv4"
+    assert status["fastrtps_default_profiles_file"] == ""
     domain = int(status["ros_domain_id"])
     assert 1 <= domain <= 101
     assert persist.read_text(encoding="utf-8").strip() == str(domain)
@@ -55,12 +59,24 @@ def test_apply_dds_isolation_respects_explicit_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ROS_DOMAIN_ID", "0")
     monkeypatch.setenv("ROS_AUTOMATIC_DISCOVERY_RANGE", "SUBNET")
     monkeypatch.setenv("ROS_LOCALHOST_ONLY", "0")
+    monkeypatch.setenv("FASTDDS_BUILTIN_TRANSPORTS", "SHM")
     persist = tmp_path / "ros_domain_id"
     status = apply_dds_isolation(persist)
     assert status["ros_domain_id"] == "0"
     assert status["ros_automatic_discovery_range"] == "SUBNET"
     assert status["ros_localhost_only"] == "0"
+    assert status["fastdds_builtin_transports"] == "SHM"
     assert not persist.exists()
+
+
+def test_apply_dds_isolation_skips_builtin_when_profiles_file_set(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FASTRTPS_DEFAULT_PROFILES_FILE", "/tmp/fastdds.xml")
+    status = apply_dds_isolation(tmp_path / "ros_domain_id")
+    assert status["fastrtps_default_profiles_file"] == "/tmp/fastdds.xml"
+    assert status["fastdds_builtin_transports"] == ""
+    assert "FASTDDS_BUILTIN_TRANSPORTS" not in os.environ
 
 
 def test_dds_status_reads_environ(monkeypatch):
@@ -68,9 +84,12 @@ def test_dds_status_reads_environ(monkeypatch):
     monkeypatch.setenv("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")
     monkeypatch.setenv("ROS_LOCALHOST_ONLY", "1")
     monkeypatch.setenv("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
+    monkeypatch.setenv("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
     assert dds_status() == {
         "ros_domain_id": "42",
         "ros_automatic_discovery_range": "LOCALHOST",
         "ros_localhost_only": "1",
         "rmw_implementation": "rmw_fastrtps_cpp",
+        "fastdds_builtin_transports": "UDPv4",
+        "fastrtps_default_profiles_file": "",
     }

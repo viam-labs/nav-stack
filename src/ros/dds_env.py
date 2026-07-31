@@ -85,6 +85,10 @@ def apply_dds_isolation(
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
     os.environ.setdefault("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")
     os.environ.setdefault("ROS_LOCALHOST_ONLY", "1")
+    # Prefer UDP over shared memory when no XML profile is supplied. Avoids
+    # hung Nav2 participant create after root SIGKILL leaves stale SHM.
+    if not os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE"):
+        os.environ.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
 
     if "ROS_DOMAIN_ID" not in os.environ or os.environ.get("ROS_DOMAIN_ID", "") == "":
         path = resolve_persist_path(persist_path)
@@ -106,4 +110,10 @@ def dds_status() -> Dict[str, str]:
         ),
         "ros_localhost_only": os.environ.get("ROS_LOCALHOST_ONLY", ""),
         "rmw_implementation": os.environ.get("RMW_IMPLEMENTATION", ""),
+        "fastdds_builtin_transports": os.environ.get(
+            "FASTDDS_BUILTIN_TRANSPORTS", ""
+        ),
+        "fastrtps_default_profiles_file": os.environ.get(
+            "FASTRTPS_DEFAULT_PROFILES_FILE", ""
+        ),
     }
