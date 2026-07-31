@@ -74,11 +74,16 @@ sudo apt-get install ros-$ROS_DISTRO-ros-base \
   components returning point clouds; a true 2D lidar is ideal, depth cameras work
   via projection), and a **movement sensor** providing velocity for odometry.
 
-If `viam-server` runs as root, FastDDS shared-memory can hang Nav2 participant
-create after SIGKILL leftovers in `/dev/shm`. nav-stack defaults
-`FASTDDS_BUILTIN_TRANSPORTS=UDPv4` (overridable). You can still point
-`FASTRTPS_DEFAULT_PROFILES_FILE` at a custom UDP-only FastDDS profile in the
-module env; when that is set, the builtin-transports default is left alone.
+If `viam-server` runs as root, FastDDS shared-memory can hang participant create
+when SIGKILL'd nodes leave segments behind in `/dev/shm` (processes alive at 0%
+CPU, never appearing on the ROS graph). Clearing `/dev/shm/fastrtps_*` and
+`/dev/shm/sem.fastrtps_*` while the stack is stopped resolves that. As a
+persistent workaround set `FASTDDS_BUILTIN_TRANSPORTS=UDPv4` or point
+`FASTRTPS_DEFAULT_PROFILES_FILE` at a UDP-only FastDDS profile in the module env.
+Neither is set by default — `FASTDDS_BUILTIN_TRANSPORTS` replaces the whole
+builtin transport set, which conflicts with the one `ROS_LOCALHOST_ONLY`
+installs and can stop nodes registering with ROS entirely. Both values are
+reported in `get_status` for diagnosis.
 
 **DDS isolation (cross-machine `/map` crosstalk):** by default nav-stack sets
 `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`, `ROS_LOCALHOST_ONLY=1`, and (when

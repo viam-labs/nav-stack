@@ -184,8 +184,6 @@ class RosManager:
         env.setdefault("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")
         env.setdefault("ROS_LOCALHOST_ONLY", "1")
         env.setdefault("RCUTILS_LOGGING_USE_STDOUT", "1")
-        if not env.get("FASTRTPS_DEFAULT_PROFILES_FILE"):
-            env.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
         distro = env.get("ROS_DISTRO", "jazzy")
         ros_bin = f"/opt/ros/{distro}/bin"
         path = env.get("PATH", "")

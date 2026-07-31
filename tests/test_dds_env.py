@@ -43,7 +43,10 @@ def test_apply_dds_isolation_sets_defaults_and_persists(tmp_path, monkeypatch):
     assert status["ros_automatic_discovery_range"] == "LOCALHOST"
     assert status["ros_localhost_only"] == "1"
     assert status["rmw_implementation"] == "rmw_fastrtps_cpp"
-    assert status["fastdds_builtin_transports"] == "UDPv4"
+    # Never defaulted: overriding the builtin transport set breaks the one
+    # ROS_LOCALHOST_ONLY installs (slam_toolbox failed to register with ROS).
+    assert status["fastdds_builtin_transports"] == ""
+    assert "FASTDDS_BUILTIN_TRANSPORTS" not in os.environ
     assert status["fastrtps_default_profiles_file"] == ""
     domain = int(status["ros_domain_id"])
     assert 1 <= domain <= 101
@@ -69,14 +72,12 @@ def test_apply_dds_isolation_respects_explicit_env(tmp_path, monkeypatch):
     assert not persist.exists()
 
 
-def test_apply_dds_isolation_skips_builtin_when_profiles_file_set(
-    tmp_path, monkeypatch
-):
+def test_apply_dds_isolation_reports_opt_in_transport_env(tmp_path, monkeypatch):
     monkeypatch.setenv("FASTRTPS_DEFAULT_PROFILES_FILE", "/tmp/fastdds.xml")
+    monkeypatch.setenv("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
     status = apply_dds_isolation(tmp_path / "ros_domain_id")
     assert status["fastrtps_default_profiles_file"] == "/tmp/fastdds.xml"
-    assert status["fastdds_builtin_transports"] == ""
-    assert "FASTDDS_BUILTIN_TRANSPORTS" not in os.environ
+    assert status["fastdds_builtin_transports"] == "UDPv4"
 
 
 def test_dds_status_reads_environ(monkeypatch):
