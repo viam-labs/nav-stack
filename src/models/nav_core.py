@@ -1040,6 +1040,31 @@ def _find_template_section_paths(template: Mapping, key: str) -> list:
     return paths
 
 
+def _coerce_types_to_template(user_node: dict, template_node: Mapping) -> None:
+    """Cast user override leaf types to match the template's declared types.
+
+    Viam config attributes arrive through protobuf Structs, which turn every
+    JSON number into a double. ROS 2 parameters are strictly typed, so a user
+    writing ``"default_server_timeout": 200`` produces ``200.0`` in the merged
+    YAML and the owning node dies at startup with "expected [integer] got
+    [double]". Wherever the template declares an integer at the same path,
+    whole-number floats are cast back to int (and ints are widened to float
+    where the template declares a double). Bools and non-integral floats are
+    left untouched; params absent from the template cannot be inferred.
+    """
+    for key, value in user_node.items():
+        tmpl = template_node.get(key)
+        if isinstance(value, dict) and isinstance(tmpl, Mapping):
+            _coerce_types_to_template(value, tmpl)
+            continue
+        if isinstance(value, bool) or isinstance(tmpl, bool):
+            continue
+        if isinstance(tmpl, int) and isinstance(value, float) and value.is_integer():
+            user_node[key] = int(value)
+        elif isinstance(tmpl, float) and isinstance(value, int):
+            user_node[key] = float(value)
+
+
 def _normalize_nav2_user_params(user_params: dict, template: Mapping) -> dict:
     """Rewrite user ``nav2_params`` into the strict rcl-compatible structure.
 
@@ -1052,6 +1077,9 @@ def _normalize_nav2_user_params(user_params: dict, template: Mapping) -> dict:
 
     Merging either form unfixed corrupts the generated params file and crashes
     every Nav2 node at startup (rcl: "Cannot have a value before ros__parameters").
+
+    Leaf values are then type-coerced against the template (protobuf delivers
+    all numbers as doubles; ROS 2 params are strictly typed).
     """
     normalized: dict = {}
     relocated: dict = {}
@@ -1097,6 +1125,7 @@ def _normalize_nav2_user_params(user_params: dict, template: Mapping) -> dict:
         normalized[key] = value
     if relocated:
         _deep_merge(normalized, relocated)
+    _coerce_types_to_template(normalized, template)
     return normalized
 
 

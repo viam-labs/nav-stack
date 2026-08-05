@@ -795,6 +795,44 @@ def test_normalize_nav2_user_params_keeps_wrapped_form():
     assert normalized == user
 
 
+def test_normalize_nav2_user_params_coerces_types_to_template():
+    # Viam attributes arrive via protobuf Structs: every number is a double.
+    # bt_navigator declares default_server_timeout as int and dies on 200.0.
+    from src.models.navigation import _normalize_nav2_user_params
+
+    template = {
+        "bt_navigator": {
+            "ros__parameters": {
+                "default_server_timeout": 20,
+                "bt_loop_duration": 10,
+                "action_server_result_timeout": 900.0,
+                "use_sim_time": False,
+            }
+        },
+    }
+    user = {
+        "bt_navigator": {
+            "ros__parameters": {
+                "default_server_timeout": 200.0,  # int in template
+                "action_server_result_timeout": 300,  # float in template
+                "use_sim_time": True,  # bool must survive untouched
+                "unknown_param": 5.0,  # not in template: left as-is
+            }
+        },
+    }
+
+    rp = _normalize_nav2_user_params(user, template)["bt_navigator"][
+        "ros__parameters"
+    ]
+
+    assert rp["default_server_timeout"] == 200
+    assert isinstance(rp["default_server_timeout"], int)
+    assert rp["action_server_result_timeout"] == 300.0
+    assert isinstance(rp["action_server_result_timeout"], float)
+    assert rp["use_sim_time"] is True
+    assert rp["unknown_param"] == 5.0
+
+
 def test_validate_nav2_params_structure_rejects_bad_tree():
     from src.models.navigation import _validate_nav2_params_structure
 
