@@ -291,8 +291,9 @@ status (`IN_PROGRESS` / `SUCCEEDED` / `STOPPED` / `FAILED`). `Move` and
 `MoveOnGlobe` are not implemented. Locations, zones, and simple `go_to_*` remain
 available via `DoCommand` (including the meters/radians `navigate_to_point`
 alias used by existing scripts).
-`nav2.replan_frequency` (default **2 Hz**, up from Nav2's stock 1 Hz) rewrites the
-navigate-to-pose behavior tree so global plans refresh more often.
+`nav2.replan_frequency` (default **1 Hz**, matching Nav2's stock rate) rewrites the
+navigate-to-pose behavior tree; raise it on fast hardware to refresh global
+plans more often.
 `progress_movement_time_allowance` (default **10 s**, down from 30) and
 `navigate_recovery_retries` / `recovery_wait_duration` exit reverse/spin recovery
 loops sooner. After changing these, run `restart_nav2` (or reconfigure) so the

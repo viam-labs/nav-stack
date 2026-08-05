@@ -47,7 +47,7 @@ def test_tune_nav2_bt_xml_rewrites_replan_and_recovery():
 def test_write_nav2_bt_xml_uses_config_defaults(tmp_path: Path):
     path = _write_nav2_bt_xml(tmp_path, Nav2Config())
     text = path.read_text(encoding="utf-8")
-    assert 'RateController hz="2.0"' in text
+    assert 'RateController hz="1.0"' in text
     assert 'number_of_retries="4" name="NavigateRecovery"' in text
     assert 'Wait wait_duration="2.0"' in text
     # Path smoothing is opt-in (small diffdrive bases only).
@@ -98,7 +98,7 @@ def test_write_nav2_bt_xml_smooth_path_wraps_shipped_tree(tmp_path: Path):
 
 def test_nav2_config_progress_and_replan_defaults():
     cfg = Nav2Config.from_dict({})
-    assert cfg.replan_frequency == 2.0
+    assert cfg.replan_frequency == 1.0
     assert cfg.progress_movement_time_allowance == 10.0
     assert cfg.navigate_recovery_retries == 4
     assert cfg.recovery_wait_duration == 2.0

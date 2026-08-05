@@ -1,7 +1,7 @@
 <!--
   Fallback navigate-to-pose BT (Jazzy-shaped). At runtime the module prefers the
   distro-installed copy under /opt/ros/$ROS_DISTRO/... and rewrites:
-    RateController hz              <- nav2.replan_frequency (default 2.0)
+    RateController hz              <- nav2.replan_frequency (default 1.0)
     NavigateRecovery retries       <- nav2.navigate_recovery_retries (default 4)
     Wait wait_duration             <- nav2.recovery_wait_duration (default 2.0)
   The generated file is pointed at by bt_navigator.default_nav_to_pose_bt_xml.
@@ -12,7 +12,7 @@
       <PipelineSequence name="NavigateWithReplanning">
         <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
         <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
-        <RateController hz="2.0">
+        <RateController hz="1.0">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
             <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
             <Sequence>

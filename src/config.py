@@ -182,9 +182,11 @@ class Nav2Config:
     # template, so a stale default here silently clobbers template retuning.
     # 10 Hz (not Nav2's stock 20) keeps MPPI within a Pi 5's budget.
     controller_frequency: float = 10.0  # Hz
-    # Global replan rate (BT RateController). Stock Nav2 is 1 Hz; 2 Hz reacts
-    # faster to blocked/stale paths without thrashing a Pi + slam_toolbox.
-    replan_frequency: float = 2.0  # Hz
+    # Global replan rate (BT RateController). Stock Nav2's 1 Hz: each replan
+    # costs a plan + smooth + path handoff, and 2 Hz measurably starves the
+    # controller loop on a Pi running slam_toolbox alongside. Raise it on
+    # faster hardware if you need quicker reaction to blocked paths.
+    replan_frequency: float = 1.0  # Hz
     # Progress checker: how long with almost no movement before FollowPath
     # fails into recovery. Stock template was 30 s (very patient); 10 s exits
     # reverse/spin loops sooner on stuck carts.
@@ -224,7 +226,7 @@ class Nav2Config:
             local_costmap_height=float(d.get("local_costmap_height", 4.0)),
             costmap_resolution=float(d.get("costmap_resolution", 0.05)),
             controller_frequency=float(d.get("controller_frequency", 10.0)),
-            replan_frequency=float(d.get("replan_frequency", 2.0)),
+            replan_frequency=float(d.get("replan_frequency", 1.0)),
             progress_movement_time_allowance=float(
                 d.get("progress_movement_time_allowance", 10.0)
             ),
