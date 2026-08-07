@@ -6,7 +6,7 @@ SLAM service's shared ROS context and exposes:
 * Motion ``MoveOnMap`` / ``StopPlan`` / ``GetPlan`` / ``ListPlanStatuses`` /
   ``GetPose`` (map-frame Nav2 navigation)
 * DoCommand: locations CRUD, zones CRUD, ``navigate_*`` / ``go_to_*``, cancel,
-  status, and Nav2 ops (``restart_nav2``, …)
+  status, ``get_costmap``, and Nav2 ops (``restart_nav2``, …)
 
 Physical obstacle avoidance is automatic via Nav2's costmaps (live ``/scan`` data).
 

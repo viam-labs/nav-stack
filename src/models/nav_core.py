@@ -756,6 +756,49 @@ class NavServiceBase(Motion):
             await asyncio.to_thread(_restart)
             return {"status": "nav2_restarted", **runtime.manager.nav2_diagnostics()}
 
+        if cmd == "get_costmap":
+            # Live Nav2 global costmap (falls back to /map) as a compact uint8
+            # occupancy grid in map frame — for operator UIs overlaying the SLAM map.
+            from ..runtime import get_bridge
+
+            bridge = get_bridge(self.name)
+            if bridge is None:
+                return {"available": False, "reason": "bridge_unavailable"}
+
+            def _fetch():
+                bridge.enable_viz(8)
+                return bridge.viz_snapshot()
+
+            snap = await asyncio.to_thread(_fetch)
+            cm = snap.get("costmap") or snap.get("map")
+            if not cm or cm.get("grid") is None:
+                return {"available": False, "reason": "no_costmap"}
+
+            import base64
+
+            import numpy as np
+
+            grid = np.asarray(cm["grid"])
+            # Default stride=2 (~10 cm cells) keeps RPC payloads modest for UI poll.
+            stride = max(1, int(command.get("stride", 2)))
+            if stride > 1:
+                grid = grid[::stride, ::stride]
+            height, width = int(grid.shape[0]), int(grid.shape[1])
+            resolution = float(cm["resolution"]) * stride
+            # 255 = unknown (-1); 0 free; 1..100 cost (Nav2 OccupancyGrid convention).
+            u8 = np.where(grid < 0, 255, np.clip(grid, 0, 100)).astype(np.uint8)
+            return {
+                "available": True,
+                "origin_x": float(cm["origin_x"]),
+                "origin_y": float(cm["origin_y"]),
+                "resolution": resolution,
+                "width": width,
+                "height": height,
+                "encoding": "uint8_row_major",
+                "unknown": 255,
+                "data_b64": base64.b64encode(u8.tobytes()).decode("ascii"),
+            }
+
         raise ValueError(f"unknown command: {cmd!r}")
 
     def _add_location(self, command, runtime):
