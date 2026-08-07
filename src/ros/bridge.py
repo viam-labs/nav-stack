@@ -18,6 +18,7 @@ marshalled onto the module's asyncio loop via ``run_coroutine_threadsafe``.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import math
 import os
 import re
@@ -137,6 +138,12 @@ class BridgeNode(Node):
         self._nav_cfg = nav_cfg
         self._io = io
         self._loop = loop
+        # Set by RosManager.shutdown before tearing down ROS / the asyncio loop.
+        # Timers no-op and in-flight ``_run`` futures are cancelled so Viam RPCs
+        # (get_readings, etc.) do not become "Task was destroyed but it is pending".
+        self._closing = False
+        self._inflight_futures: set = set()
+        self._inflight_lock = threading.Lock()
 
         self._frames = slam_cfg.frames
         self._nav_active = False
@@ -461,6 +468,46 @@ class BridgeNode(Node):
         self._viz_goal: Optional[tuple] = None  # (x, y, theta) of the active goal
 
     # -- helpers -------------------------------------------------------------
+    def begin_shutdown(self) -> None:
+        """Stop accepting work and cancel in-flight Viam RPCs from ROS timers.
+
+        Call this at the start of ``RosManager.shutdown`` — before destroying the
+        executor / asyncio loop — so ``read_odometry`` / lidar coroutines are
+        cancelled instead of GC'd mid-await (grpclib KeyError / Task destroyed).
+        """
+        self._closing = True
+        with self._inflight_lock:
+            pending = list(self._inflight_futures)
+            self._inflight_futures.clear()
+        for fut in pending:
+            try:
+                fut.cancel()
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
+
+    def _run(self, coro, timeout: float = 2.0):
+        """Run an async Viam call on the module loop from this ROS thread."""
+        if self._closing:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            raise RuntimeError("bridge is shutting down")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        with self._inflight_lock:
+            self._inflight_futures.add(future)
+
+        def _drop(_fut) -> None:
+            with self._inflight_lock:
+                self._inflight_futures.discard(future)
+
+        future.add_done_callback(_drop)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            future.cancel()
+            raise
+        except concurrent.futures.CancelledError as exc:
+            raise RuntimeError("viam sensor call cancelled during shutdown") from exc
+
     def _guarded(self, fn):
         """Wrap a timer/subscription callback so exceptions cannot kill the executor.
 
@@ -470,6 +517,8 @@ class BridgeNode(Node):
         """
 
         def wrapped(*args):
+            if self._closing:
+                return
             try:
                 fn(*args)
             except Exception as exc:  # noqa: BLE001 - keep the executor alive
@@ -481,11 +530,6 @@ class BridgeNode(Node):
                     pass
 
         return wrapped
-
-    def _run(self, coro, timeout: float = 2.0):
-        """Run an async Viam call on the module loop from this ROS thread."""
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout)
 
     def _submit_on_executor(self, fn, timeout: float = 10.0):
         """Run ``fn`` on the rclpy executor thread (safe for publishers/actions)."""

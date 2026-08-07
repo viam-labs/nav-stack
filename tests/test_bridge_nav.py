@@ -378,7 +378,10 @@ def test_on_drive_timer_does_not_apply_simple_stiction_floor_to_nav2():
 
 def test_guarded_callback_swallows_exception_and_logs():
     logger = MagicMock()
-    bridge = SimpleNamespace(get_logger=MagicMock(return_value=logger))
+    bridge = SimpleNamespace(
+        get_logger=MagicMock(return_value=logger),
+        _closing=False,
+    )
 
     def boom():
         raise RuntimeError("kaput")
@@ -391,10 +394,26 @@ def test_guarded_callback_swallows_exception_and_logs():
 
 
 def test_guarded_callback_passes_arguments():
-    bridge = SimpleNamespace(get_logger=MagicMock(return_value=MagicMock()))
+    bridge = SimpleNamespace(
+        get_logger=MagicMock(return_value=MagicMock()),
+        _closing=False,
+    )
     seen = []
 
     wrapped = BridgeNode._guarded(bridge, seen.append)
     wrapped("msg")
 
     assert seen == ["msg"]
+
+
+def test_guarded_callback_skips_when_closing():
+    bridge = SimpleNamespace(
+        get_logger=MagicMock(return_value=MagicMock()),
+        _closing=True,
+    )
+    called = []
+
+    wrapped = BridgeNode._guarded(bridge, called.append)
+    wrapped("msg")
+
+    assert called == []

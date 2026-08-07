@@ -131,6 +131,14 @@ class RosManager:
         /viam_nav_stack_bridge nodes fighting over the odom TF.
         """
         self._started = False
+        # Cancel in-flight Viam RPCs (odom/lidar/drive) before tearing down ROS
+        # or the asyncio loop — otherwise GC leaves "Task was destroyed but it
+        # is pending" / grpclib KeyError noise and can wedge the next start.
+        if self._node is not None:
+            try:
+                self._node.begin_shutdown()
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"bridge begin_shutdown failed: {exc!r}")
         self.stop_nav2()
         self.stop_slam()
         if self._executor is not None:
@@ -1092,7 +1100,42 @@ class RosManager:
                 env=self._ros_env(),
                 check=False,
             )
+        # Give SIGTERM a moment, then force-kill leftovers (same idea as slam).
         time.sleep(0.5)
+        if self._nav2_orphan_binaries_present():
+            self._log("Nav2 processes still alive after SIGTERM — sending SIGKILL")
+            for pattern in (
+                "launch/navigation_launch.py",
+                "nav2_bringup/navigation_launch.py",
+                "nav2_lifecycle_manager/lifecycle_manager",
+                "nav2_controller/controller_server",
+                "nav2_bt_navigator/bt_navigator",
+                "nav2_planner/planner_server",
+                "nav2_behaviors/behavior_server",
+                "nav2_smoother/smoother_server",
+                "nav2_velocity_smoother/velocity_smoother",
+                "nav2_waypoint_follower/waypoint_follower",
+            ):
+                subprocess.run(
+                    ["pkill", "-9", "-f", pattern],
+                    env=self._ros_env(),
+                    check=False,
+                )
+            time.sleep(0.3)
+
+    def _nav2_orphan_binaries_present(self) -> bool:
+        """True if common Nav2 binaries are still running after stop."""
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-f", "nav2_controller/controller_server|nav2_bt_navigator/bt_navigator|nav2_planner/planner_server"],
+                env=self._ros_env(),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return False
+        return bool((proc.stdout or "").strip())
 
     def nav2_running(self) -> bool:
         return any(p.poll() is None for p in self._nav2_procs)
