@@ -295,9 +295,12 @@ alias used by existing scripts).
 navigate-to-pose behavior tree; raise it on fast hardware to refresh global
 plans more often.
 `progress_movement_time_allowance` (default **10 s**, down from 30) and
-`navigate_recovery_retries` / `recovery_wait_duration` exit reverse/spin recovery
-loops sooner. After changing these, run `restart_nav2` (or reconfigure) so the
-generated BT + params reload.
+`navigate_recovery_retries` (default **4**) / `recovery_wait_duration` control
+how many times the BT clears costmaps / spins / backs up before giving up when
+planning or path following fails (e.g. start boxed in by inflation). Set
+`navigate_recovery_retries` to `0` to disable those recoveries (some carpet
+skid-steer carts prefer that). After changing these, run `restart_nav2` (or
+reconfigure) so the generated BT + params reload.
 
 Set `"kinematics": "omni"` and a non-zero `max_vel_y` for omnidirectional bases.
 

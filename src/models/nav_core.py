@@ -16,7 +16,7 @@ import math
 import os
 import re
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Mapping, Optional, Sequence
@@ -504,17 +504,14 @@ class NavServiceBase(Motion):
         _set_obstacle_sources(params, len(runtime.slam_cfg.lidars))
         runtime_dir = Path(runtime.slam_cfg.maps_dir).expanduser() / ".runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
-        # Spin/BackUp recoveries are useless on carpet skid-steer (they are the
-        # vx=0 |ω|≈0.1 samples in cmd history). Force retries off for DiffDrive.
-        nav2_for_bt = cfg.nav2
-        if cfg.kinematics != OMNI and cfg.nav2.navigate_recovery_retries != 0:
-            nav2_for_bt = replace(cfg.nav2, navigate_recovery_retries=0)
         # Small DiffDrive bases follow the path with a short lookahead, so raw
         # NavFn grid zigzag feeds curvature noise straight into cmd_vel; run
         # the path through smoother_server. Cart / omni BTs stay unchanged.
+        # NavigateRecovery retries come from nav2.navigate_recovery_retries
+        # (default 4) — BackUp/Spin/clear then replan when stuck near obstacles.
         bt_path = _write_nav2_bt_xml(
             runtime_dir,
-            nav2_for_bt,
+            cfg.nav2,
             smooth_path=cfg.kinematics != OMNI and _is_small_base(cfg),
         )
         try:
