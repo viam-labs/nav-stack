@@ -119,6 +119,31 @@ class _PlanExecution:
     status_history: List[PlanStatus] = field(default_factory=list)
 
 
+@dataclass
+class _SuspendedNav:
+    """Goal remembered by ``suspend`` so ``resume`` can re-issue navigate."""
+
+    x: float
+    y: float
+    theta: float
+    name: Optional[str] = None
+    motion: str = "nav2"  # "nav2" | "simple"
+    reason: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        out = {
+            "x": float(self.x),
+            "y": float(self.y),
+            "theta": float(self.theta),
+            "motion": self.motion,
+        }
+        if self.name:
+            out["name"] = self.name
+        if self.reason:
+            out["reason"] = self.reason
+        return out
+
+
 class NavServiceBase(Motion):
     """Runtime-agnostic Nav2 orchestration shared by the navigation models.
 
@@ -140,6 +165,9 @@ class NavServiceBase(Motion):
         self._logged_motion_ignored: bool = False
         self._last_preview_plan: Optional[dict] = None
         self._last_mppi_profile: dict = {}
+        # Set by ``suspend``; cleared by ``resume``, ``cancel``, ``stop_plan``,
+        # or any new navigate / MoveOnMap / simple go.
+        self._suspended: Optional[_SuspendedNav] = None
     # -- runtime resolution (subclass-specific) ------------------------------
     def _resolve_runtime(self):
         """Return the active ``SlamRuntime`` or ``None``.
@@ -252,6 +280,7 @@ class NavServiceBase(Motion):
                 self._plan_execution, PlanState.PLAN_STATE_STOPPED, reason="superseded"
             )
 
+        self._suspended = None
         execution_id = str(uuid.uuid4())
         plan_id = str(uuid.uuid4())
         base_name = component_name or cfg.base
@@ -294,6 +323,7 @@ class NavServiceBase(Motion):
     ) -> None:
         runtime = self._require_runtime()
         self._active_goal_name = None
+        self._suspended = None
         await self._cancel_simple_nav()
         await asyncio.to_thread(runtime.manager.cancel)
         if self._plan_execution is not None:
@@ -633,6 +663,7 @@ class NavServiceBase(Motion):
         # stalls TF/scans (Nav2 extrapolation errors) and deadlocks stop_base.
         if cmd == "navigate_to_location":
             loc = self._locations().get(str(command["name"]))
+            self._suspended = None
             self._active_goal_name = loc.name
             await asyncio.to_thread(mgr.navigate, loc.x, loc.y, loc.theta)
             return {"status": "navigating", "target": loc.to_dict()}
@@ -640,6 +671,7 @@ class NavServiceBase(Motion):
             x = float(command["x"])
             y = float(command["y"])
             theta = float(command.get("theta", 0.0))
+            self._suspended = None
             self._active_goal_name = None
             await asyncio.to_thread(mgr.navigate, x, y, theta)
             return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
@@ -674,6 +706,7 @@ class NavServiceBase(Motion):
             y = float(goal["y"])
             theta = float(goal.get("theta", 0.0))
             name = preview.get("location", {}).get("name") if isinstance(preview.get("location"), dict) else None
+            self._suspended = None
             self._active_goal_name = name
             await asyncio.to_thread(mgr.navigate, x, y, theta)
             return {
@@ -684,16 +717,23 @@ class NavServiceBase(Motion):
             }
         if cmd == "go_to_location":
             loc = self._locations().get(str(command["name"]))
+            self._suspended = None
             self._active_goal_name = loc.name
             return await self._start_simple_go(loc.x, loc.y, loc.theta, command)
         if cmd == "go_to_point":
             x = float(command["x"])
             y = float(command["y"])
             theta = float(command.get("theta", 0.0))
+            self._suspended = None
             self._active_goal_name = None
             return await self._start_simple_go(x, y, theta, command)
+        if cmd in ("suspend", "pause_nav", "suspend_nav"):
+            return await self._suspend_nav(command)
+        if cmd in ("resume", "resume_nav"):
+            return await self._resume_nav(command)
         if cmd == "cancel":
             self._active_goal_name = None
+            self._suspended = None
             await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.cancel)
             if self._plan_execution is not None:
@@ -725,6 +765,11 @@ class NavServiceBase(Motion):
                     status["goal"] = goal
                 status["localization_check"] = dict(runtime.localization_check)
                 status["mppi_profile"] = dict(self._last_mppi_profile)
+                suspended = self._suspended
+                status["suspended"] = suspended is not None
+                status["suspended_goal"] = (
+                    suspended.to_dict() if suspended is not None else None
+                )
                 return status
 
             status = await asyncio.to_thread(_status)
@@ -817,6 +862,154 @@ class NavServiceBase(Motion):
         if cur is None:
             raise RuntimeError("current pose unavailable; provide an explicit pose")
         return store.add(str(command["name"]), cur.x, cur.y, cur.theta)
+
+    # -- suspend / resume (cancel + remembered goal) -------------------------
+    def _snapshot_active_goal(self) -> Optional[_SuspendedNav]:
+        """Capture the in-flight Nav2 or simple-nav target, if any."""
+        name = self._active_goal_name
+        simple = self._simple_nav_status
+        if simple.get("state") == "active":
+            target = simple.get("target")
+            if isinstance(target, Mapping):
+                return _SuspendedNav(
+                    x=float(target["x"]),
+                    y=float(target["y"]),
+                    theta=float(target.get("theta", 0.0)),
+                    name=name,
+                    motion="simple",
+                )
+
+        status: Mapping = {}
+        try:
+            status = self._require_runtime().manager.nav_status()
+        except Exception:  # noqa: BLE001 - fall through to plan execution
+            status = {}
+        nav_active = bool(status.get("active")) or str(
+            status.get("state") or ""
+        ).lower() in ("active",)
+        goal = status.get("goal") if isinstance(status.get("goal"), Mapping) else None
+        if nav_active and goal is not None:
+            return _SuspendedNav(
+                x=float(goal["x"]),
+                y=float(goal["y"]),
+                theta=float(goal.get("theta", 0.0)),
+                name=name,
+                motion="nav2",
+            )
+
+        execution = self._plan_execution
+        if execution is not None and execution.state not in _TERMINAL_PLAN_STATES:
+            pose2d = conv.viam_pose_to_pose2d(
+                execution.destination.x,
+                execution.destination.y,
+                execution.destination.theta,
+            )
+            return _SuspendedNav(
+                x=pose2d.x,
+                y=pose2d.y,
+                theta=pose2d.theta,
+                name=name,
+                motion="nav2",
+            )
+        return None
+
+    async def _suspend_nav(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        """Cancel motion but remember the goal for a later ``resume``."""
+        reason = command.get("reason")
+        reason_s = str(reason) if reason is not None else None
+        snapshot = self._snapshot_active_goal()
+        if snapshot is None and self._suspended is not None:
+            # Already suspended; refresh optional reason and return current.
+            if reason_s:
+                self._suspended.reason = reason_s
+            return {
+                "status": "suspended",
+                "already_suspended": True,
+                "goal": self._suspended.to_dict(),
+            }
+        if snapshot is None:
+            raise ValueError("nothing to suspend (no active Nav2 or simple-nav goal)")
+
+        snapshot.reason = reason_s
+        runtime = self._require_runtime()
+        # Keep the label on the suspended snapshot; clear live goal name.
+        self._active_goal_name = None
+        await self._cancel_simple_nav()
+        await asyncio.to_thread(runtime.manager.cancel)
+        if self._plan_execution is not None:
+            self._record_plan_state(
+                self._plan_execution,
+                PlanState.PLAN_STATE_STOPPED,
+                reason="suspended",
+            )
+        self._suspended = snapshot
+        return {"status": "suspended", "goal": snapshot.to_dict()}
+
+    async def _resume_nav(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        """Re-issue the goal saved by ``suspend`` (replans from current pose)."""
+        _ = command
+        suspended = self._suspended
+        if suspended is None:
+            raise ValueError("nothing to resume (call suspend first)")
+
+        self._suspended = None
+        self._active_goal_name = suspended.name
+        target = {
+            "x": suspended.x,
+            "y": suspended.y,
+            "theta": suspended.theta,
+            **({"name": suspended.name} if suspended.name else {}),
+        }
+
+        if suspended.motion == "simple":
+            result = await self._start_simple_go(
+                suspended.x,
+                suspended.y,
+                suspended.theta,
+                {"wait": False},
+            )
+            out = dict(result)
+            out["resumed"] = True
+            out["target"] = target
+            return out
+
+        cfg = self._require_cfg()
+        runtime = self._require_runtime()
+        dest = _pose2d_to_viam_pose_msg(
+            conv.Pose2D(suspended.x, suspended.y, suspended.theta)
+        )
+        execution_id = str(uuid.uuid4())
+        plan_id = str(uuid.uuid4())
+        execution = _PlanExecution(
+            execution_id=execution_id,
+            plan_id=plan_id,
+            component_name=cfg.base,
+            destination=dest,
+            state=PlanState.PLAN_STATE_IN_PROGRESS,
+        )
+        execution.status_history.append(
+            PlanStatus(
+                state=PlanState.PLAN_STATE_IN_PROGRESS,
+                timestamp=_utcnow_timestamp(),
+            )
+        )
+        self._plan_execution = execution
+        self._upsert_plan_status_history(execution)
+        await self._cancel_simple_nav()
+        await asyncio.to_thread(
+            runtime.manager.navigate, suspended.x, suspended.y, suspended.theta
+        )
+        self._sync_plan_state_from_nav()
+        return {
+            "status": "navigating",
+            "resumed": True,
+            "target": target,
+            "execution_id": execution_id,
+        }
 
     # -- simple closed-loop navigation (map frame, no Nav2) ------------------
     async def _start_simple_go(

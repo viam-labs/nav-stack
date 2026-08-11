@@ -190,3 +190,92 @@ def test_do_command_cancel_marks_motion_plan_stopped():
     plan = asyncio.run(nav.get_plan("my-base", execution_id=execution_id))
     assert plan.current_plan_with_status.status.state == PlanState.PLAN_STATE_STOPPED
     mgr.cancel.assert_called()
+
+
+def test_suspend_resume_move_on_map():
+    nav, mgr = _configured_nav(
+        nav_status={
+            "active": True,
+            "state": "active",
+            "goal": {"x": 1.0, "y": 0.0, "theta": 0.0},
+        }
+    )
+    dest = Pose(x=1000.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
+    execution_id = asyncio.run(nav.move_on_map("my-base", dest, "slam"))
+
+    suspended = asyncio.run(
+        nav.do_command({"command": "suspend", "reason": "safety"})
+    )
+    assert suspended["status"] == "suspended"
+    assert suspended["goal"]["x"] == pytest.approx(1.0)
+    assert suspended["goal"]["y"] == pytest.approx(0.0)
+    assert suspended["goal"]["motion"] == "nav2"
+    assert suspended["goal"]["reason"] == "safety"
+    mgr.cancel.assert_called()
+    plan = asyncio.run(nav.get_plan("my-base", execution_id=execution_id))
+    assert plan.current_plan_with_status.status.state == PlanState.PLAN_STATE_STOPPED
+    assert plan.current_plan_with_status.status.reason == "suspended"
+
+    status = asyncio.run(nav.do_command({"command": "get_status"}))
+    assert status["suspended"] is True
+    assert status["suspended_goal"]["x"] == pytest.approx(1.0)
+
+    mgr.navigate.reset_mock()
+    mgr.nav_status.return_value = {"active": True, "state": "active", "goal": {"x": 1.0, "y": 0.0, "theta": 0.0}}
+    resumed = asyncio.run(nav.do_command({"command": "resume"}))
+    assert resumed["status"] == "navigating"
+    assert resumed["resumed"] is True
+    assert "execution_id" in resumed
+    mgr.navigate.assert_called_once_with(1.0, 0.0, 0.0)
+
+    status = asyncio.run(nav.do_command({"command": "get_status"}))
+    assert status["suspended"] is False
+    assert status["suspended_goal"] is None
+
+
+def test_suspend_when_idle_raises():
+    nav, _mgr = _configured_nav(nav_status={"active": False, "state": "idle"})
+    with pytest.raises(ValueError, match="nothing to suspend"):
+        asyncio.run(nav.do_command({"command": "suspend"}))
+
+
+def test_resume_when_not_suspended_raises():
+    nav, _mgr = _configured_nav()
+    with pytest.raises(ValueError, match="nothing to resume"):
+        asyncio.run(nav.do_command({"command": "resume"}))
+
+
+def test_cancel_clears_suspended_goal():
+    nav, mgr = _configured_nav(
+        nav_status={
+            "active": True,
+            "state": "active",
+            "goal": {"x": 2.0, "y": 3.0, "theta": 0.5},
+        }
+    )
+    asyncio.run(
+        nav.do_command({"command": "navigate_to_point", "x": 2.0, "y": 3.0, "theta": 0.5})
+    )
+    asyncio.run(nav.do_command({"command": "suspend"}))
+    assert nav._suspended is not None
+    asyncio.run(nav.do_command({"command": "cancel"}))
+    assert nav._suspended is None
+    with pytest.raises(ValueError, match="nothing to resume"):
+        asyncio.run(nav.do_command({"command": "resume"}))
+
+
+def test_suspend_already_suspended_is_idempotent():
+    nav, mgr = _configured_nav(
+        nav_status={
+            "active": True,
+            "state": "active",
+            "goal": {"x": 1.5, "y": -0.5, "theta": 0.1},
+        }
+    )
+    asyncio.run(nav.do_command({"command": "navigate_to_point", "x": 1.5, "y": -0.5, "theta": 0.1}))
+    first = asyncio.run(nav.do_command({"command": "suspend", "reason": "a"}))
+    mgr.nav_status.return_value = {"active": False, "state": "canceled"}
+    second = asyncio.run(nav.do_command({"command": "suspend", "reason": "b"}))
+    assert second["already_suspended"] is True
+    assert second["goal"]["reason"] == "b"
+    assert first["goal"]["x"] == pytest.approx(1.5)

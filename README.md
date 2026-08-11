@@ -487,6 +487,15 @@ await nav.do_command({"command": "get_status"})
 # await nav.do_command({"command": "test_drive", "vx": 0.5, "angular_z_deg_s": 57.3, "duration_s": 2})
 await nav.do_command({"command": "cancel"})
 
+# Suspend/resume: cancel the active goal but remember it (for safety stops).
+# resume re-issues navigate/simple-go to the same pose (Nav2 replans from here).
+# await nav.do_command({"command": "suspend", "reason": "safety"})
+# → {"status": "suspended", "goal": {"x": ..., "y": ..., "theta": ..., "motion": "nav2"}}
+# get_status includes suspended + suspended_goal while held
+# await nav.do_command({"command": "resume"})
+# → {"status": "navigating", "resumed": true, "target": {...}, "execution_id": "..."}
+# cancel / stop_plan / a new navigate clears any suspended goal (no resume).
+
 # Force Nav2 to stop and relaunch with freshly generated params (param
 # changes normally apply automatically on reconfigure; this is the manual
 # override). get_status includes "controller_frequency_loaded" to verify.
