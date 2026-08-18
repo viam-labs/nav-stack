@@ -4,7 +4,7 @@ A Viam navigation stack that wraps the ROS2 **Nav2** and **slam_toolbox** packag
 so any Viam base can map an environment, localize within it, and navigate to named
 locations or arbitrary map points while avoiding obstacles.
 
-This module (`viam-labs:nav-stack`) provides three models:
+This module (`viam-labs:nav-stack`) provides:
 
 | Model | API | Purpose |
 | --- | --- | --- |
@@ -12,6 +12,7 @@ This module (`viam-labs:nav-stack`) provides three models:
 | `viam-labs:nav-stack:navigation` | `rdk:service:motion` | Nav2 via Motion `MoveOnMap`, plus named locations, zones, and simple `go_to_*` via `DoCommand`. |
 | `viam-labs:nav-stack:navigation-external` | `rdk:service:motion` | Same Motion + DoCommand surface, driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
 | `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders the navigation service's Nav2 costmap + active plan(s), robot pose, footprint and goal as a live camera image. Works with either navigation model / any SLAM backend. |
+| `viam-labs:nav-stack:shm-pointcloud` | `rdk:component:camera` | Copies a source camera's PCD into POSIX shared memory so SLAM can read lidar without gRPC on the scan timer. |
 
 ## How it works
 
@@ -154,6 +155,9 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 | `map_pose_yaw_offset_deg` | SLAM | Added to `GetPosition` yaw only (App arrow vs map). Prefer lidar `mount.theta` — park facing a wall and check status `nearest_return_bearing_deg` / `suggested_mount_theta_deg`. Cosmetics (±45) do not fix ghost walls (default `0`) |
 | `heading_sensor_yaw_deg` | SLAM | Same mount-yaw correction for the dedicated `heading_sensor` (default `0`) |
 | lidar `mount.pitch`, `mount.roll` | SLAM | Mount tilt in radians (positive pitch = forward axis tilted down). Levels the cloud before z filtering — even a ~2° mast tilt pulls floor returns into the z band at 15–20 m and imprints phantom borders at max range (default `0`) |
+| lidar `shm_name` | SLAM | POSIX shm object (e.g. `/viam-pc-lidar`) in the `viam-shared-memory-test` double-buffer layout. When set, `/scan` tries shm before `get_point_cloud`. See **Shared-memory lidar** below |
+| lidar `shm_required` | SLAM | If `true`, never fall back to gRPC when shm is empty (default `false`) |
+| lidar `shm_region_size` | SLAM | Shm region bytes; must match the writer (default `2097152` = 2×1 MiB slots) |
 | `base_velocity_convention` | SLAM | `viam` (default, Y-forward) or `ros` (X-forward); legacy `mir` accepted as alias for `viam` — maps Nav2 `/cmd_vel` to Viam base `SetVelocity` axes |
 | `scan_max_age_s` | SLAM | Safety cutoff for the `/scan` publish path: if the lidar reports a cache age (`get_laser_scan` `age_s`) above this, skip publishing that cycle rather than feed SLAM/Nav2 a stale, misregistered scan (default `2.0`) |
 | `slam_toolbox` | SLAM | Common slam_toolbox params (resolution, max_laser_range, etc.) |
@@ -335,6 +339,39 @@ Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:se
 ```
 
 Optional attributes: `trust_movement_sensor_pose` (default `false`), `snap_heading` (default `false`), plus the same bridge/odometry tuning fields as the SLAM service and the same `nav2` block as `navigation`. The built-in `navigation` model is unchanged; use it when you map with `nav-stack:slam`.
+
+### Shared-memory lidar (optional, Pi / rover)
+
+gRPC `GetPointCloud` on every `/scan` tick is a real cost on a Pi. If a lidar module publishes PCD into POSIX shm using the same wire format as the `viam-shared-memory-test` prototype (2 MB region, two 1 MB slots, seq/timestamp/nbytes header), nav-stack can read it instead.
+
+**Today rplidar does not write shm.** Use `viam-labs:nav-stack:shm-pointcloud` as a republisher: it still calls `get_point_cloud` on the source camera, but on a **background thread**, so the ROS scan timer only copies the latest frame. That is the experiment to run on a Viam Rover. A native writer inside the lidar module would skip gRPC entirely.
+
+```json
+{
+  "name": "lidar-shm",
+  "api": "rdk:component:camera",
+  "model": "viam-labs:nav-stack:shm-pointcloud",
+  "attributes": {
+    "source": "lidar",
+    "shm_name": "/viam-pc-lidar",
+    "produce_hz": 10
+  }
+}
+```
+
+On the SLAM service lidar:
+
+```json
+"lidar": {
+  "name": "lidar",
+  "shm_name": "/viam-pc-lidar",
+  "shm_required": false
+}
+```
+
+`shm_required: true` once you confirm frames are flowing (otherwise a missing writer silently falls back to gRPC). `get_status` reports `lidar_shm` (hits, misses, `grpc_fallbacks`, last age/bytes). Odometry is not on shm — those RPCs are small.
+
+macOS shm names are short (~31 chars). On Linux they live under `/dev/shm`.
 
 ### Visualizing what nav is planning (nav-camera)
 

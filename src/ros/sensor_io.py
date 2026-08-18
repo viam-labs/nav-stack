@@ -28,6 +28,7 @@ from ..config import (
 )
 from . import conversions as conv
 from .bridge import IOProvider
+from .shm_lidar import ShmPointCloudClient
 
 
 def get_laser_scan_not_implemented(exc: BaseException) -> bool:
@@ -46,6 +47,7 @@ def build_io_provider(
     odom_reader=None,
     logger,
     record_cmd_vel=None,
+    shm_lidar=None,
 ) -> IOProvider:
     """Build an ``IOProvider`` from resolved Viam components + a SlamConfig.
 
@@ -55,6 +57,8 @@ def build_io_provider(
     MovementSensor reader for the external path. ``record_cmd_vel``, when given,
     is called as ``record_cmd_vel(vx, vy, vtheta, source=...)`` before each
     base drive/stop so ``get_status`` can show the last SetVelocity mapping.
+    ``shm_lidar`` is a shared :class:`~.shm_lidar.ShmPointCloudClient` used when
+    a lidar has ``shm_name`` set.
     """
     if skip_get_laser_scan is None:
         skip_get_laser_scan = set()
@@ -65,9 +69,9 @@ def build_io_provider(
         lidar_cfg = next((lidar for lidar in cfg.lidars if lidar.name == name), None)
         scan_source = lidar_cfg.scan_source if lidar_cfg is not None else "auto"
 
-        async def _read_point_cloud() -> conv.LidarPoints:
-            data = await cam.get_point_cloud(timeout=timeout)
-            raw = data[0] if isinstance(data, tuple) else data
+        async def _points_from_pcd(
+            raw: bytes, *, age_s: Optional[float] = None
+        ) -> conv.LidarPoints:
             pts = conv.parse_pcd(raw)
             if lidar_cfg is not None and not lidar_cfg.points_in_base_link:
                 base_pts = conv.transform_lidar_mount_to_base_link(
@@ -81,7 +85,28 @@ def build_io_provider(
                 )
             else:
                 base_pts = pts
-            return conv.LidarPoints(sensor=pts, base_link=base_pts)
+            return conv.LidarPoints(sensor=pts, base_link=base_pts, age_s=age_s)
+
+        async def _read_point_cloud() -> conv.LidarPoints:
+            shm_name = lidar_cfg.shm_name if lidar_cfg is not None else None
+            if shm_name:
+                client = shm_lidar
+                if client is None:
+                    raise RuntimeError(
+                        f"lidar {name} has shm_name={shm_name!r} but no shm client"
+                    )
+                got = client.try_read(shm_name, lidar_cfg.shm_region_size)
+                if got is not None:
+                    raw, age_s = got
+                    return await _points_from_pcd(raw, age_s=age_s)
+                if lidar_cfg.shm_required:
+                    raise RuntimeError(
+                        f"lidar {name} shm {shm_name!r} has no complete frame"
+                    )
+                client.note_fallback(shm_name)
+            data = await cam.get_point_cloud(timeout=timeout)
+            raw = data[0] if isinstance(data, tuple) else data
+            return await _points_from_pcd(raw)
 
         if scan_source == LIDAR_SCAN_POINT_CLOUD or name in skip_get_laser_scan:
             return await _read_point_cloud()

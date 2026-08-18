@@ -23,6 +23,11 @@
       "api": "rdk:component:camera",
       "model": "viam-labs:nav-stack:nav-camera",
       "short_description": "Renders the nav service's Nav2 costmap, active plans, robot pose and goal as a camera image."
+    },
+    {
+      "api": "rdk:component:camera",
+      "model": "viam-labs:nav-stack:shm-pointcloud",
+      "short_description": "Copies a source camera's point cloud into POSIX shared memory for low-latency lidar reads."
     }
   ],
   "entrypoint": "run.sh",

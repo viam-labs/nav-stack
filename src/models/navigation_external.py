@@ -43,6 +43,7 @@ from ..nav.maps import MapStore
 from ..ros.manager import RosManager
 from ..ros.odom_source import TypedMovementSensorOdom, TypedOdomConfig
 from ..ros.sensor_io import build_io_provider
+from ..ros.shm_lidar import ShmPointCloudClient
 from ..runtime import SlamRuntime, register_bridge, unregister_bridge
 from .nav_core import NavServiceBase
 
@@ -58,6 +59,7 @@ class RosNavigationExternal(NavServiceBase):
         super().__init__(name)
         self._manager: Optional[RosManager] = None
         self._runtime = None
+        self._shm_lidar = ShmPointCloudClient(logger=LOGGER)
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -116,6 +118,8 @@ class RosNavigationExternal(NavServiceBase):
         if self._manager is not None:
             self._manager.shutdown()
             self._manager = None
+        self._shm_lidar.close()
+        self._shm_lidar = ShmPointCloudClient(logger=LOGGER)
 
         odom_reader = (
             TypedMovementSensorOdom(
@@ -138,6 +142,7 @@ class RosNavigationExternal(NavServiceBase):
             skip_get_laser_scan=set(),
             odom_reader=odom_reader,
             logger=LOGGER,
+            shm_lidar=self._shm_lidar,
         )
 
         # external_slam -> the bridge starts the ExternalSlamPublisher (publishes
@@ -158,6 +163,7 @@ class RosNavigationExternal(NavServiceBase):
                 odom_reader=odom_reader,
                 logger=LOGGER,
                 record_cmd_vel=node.record_cmd_vel,
+                shm_lidar=self._shm_lidar,
             )
 
         # Locations/zones live in a nav-stack-managed map store (the external
@@ -194,6 +200,7 @@ class RosNavigationExternal(NavServiceBase):
 
     async def close(self) -> None:
         unregister_bridge(self.name)
+        self._shm_lidar.close()
         if self._manager is not None:
             self._manager.shutdown()
             self._manager = None

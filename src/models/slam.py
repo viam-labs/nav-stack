@@ -47,6 +47,7 @@ from ..ros import conversions as conv
 from ..ros.bridge import IOProvider
 from ..ros.manager import RosManager
 from ..ros.sensor_io import build_io_provider
+from ..ros.shm_lidar import ShmPointCloudClient
 from ..runtime import SlamRuntime, register_slam, unregister_slam
 
 LOGGER = getLogger(__name__)
@@ -86,6 +87,7 @@ class RosSlam(SLAM):
         self._keyframe_lock = threading.Lock()
         # Lidars that don't implement get_laser_scan (auto mode); skip re-probing.
         self._skip_get_laser_scan: set[str] = set()
+        self._shm_lidar = ShmPointCloudClient(logger=LOGGER)
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -1209,6 +1211,7 @@ class RosSlam(SLAM):
             odom_reader=None,
             logger=LOGGER,
             record_cmd_vel=(node.record_cmd_vel if node is not None else None),
+            shm_lidar=self._shm_lidar,
         )
 
     async def _probe_sensors(self) -> dict:
@@ -1220,6 +1223,7 @@ class RosSlam(SLAM):
             entry: dict = {
                 "name": lidar.name,
                 "scan_source": lidar.scan_source,
+                "shm_name": lidar.shm_name,
             }
             try:
                 data = await io.read_lidar_points(lidar.name)
@@ -1456,9 +1460,14 @@ class RosSlam(SLAM):
                         "z_max": lidar.z_max,
                         "min_range": lidar.min_range,
                         "max_range": lidar.max_range,
+                        "shm_name": lidar.shm_name,
+                        "shm_required": lidar.shm_required,
                     }
                     for lidar in self._cfg.lidars
                 ]
+                shm_status = self._shm_lidar.status()
+                if shm_status:
+                    status["lidar_shm"] = shm_status
             status["localization_check"] = dict(self._last_relocalize_check)
             status["revisit_check"] = dict(self._last_revisit_check)
             if self._pause_keyframes is not None:
@@ -1929,6 +1938,7 @@ class RosSlam(SLAM):
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
         unregister_slam(self.name)
+        self._shm_lidar.close()
         if self._manager is not None:
             self._manager.shutdown()
             self._manager = None
