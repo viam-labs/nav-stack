@@ -4,9 +4,9 @@ Wraps an existing Viam camera (e.g. ``viam:lidar:rplidar``) and copies each
 ``get_point_cloud`` frame into a POSIX shm ring that SLAM/Nav2 can read without
 blocking the ROS scan timer on gRPC.
 
-Until the lidar module itself writes shm, this is the way to try the transport
-on a rover: the gRPC hop still happens, but on a dedicated thread at
-``produce_hz``, and nav-stack's scan loop only memcpy's the latest frame.
+Until the *source* camera writes shm itself, this is the fallback for Livox /
+depth cams: gRPC still happens, but on a dedicated thread. For Slamtec A1/A3/S1
+prefer ``viam-labs:nav-stack:rplidar``, which talks UART and writes shm directly.
 
 Wire format matches ``viam-shared-memory-test`` (see :mod:`~..ros.pcshm`).
 """

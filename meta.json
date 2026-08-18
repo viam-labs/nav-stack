@@ -28,6 +28,11 @@
       "api": "rdk:component:camera",
       "model": "viam-labs:nav-stack:shm-pointcloud",
       "short_description": "Copies a source camera's point cloud into POSIX shared memory for low-latency lidar reads."
+    },
+    {
+      "api": "rdk:component:camera",
+      "model": "viam-labs:nav-stack:rplidar",
+      "short_description": "Minimal Slamtec RPLIDAR driver that publishes scans to POSIX shared memory."
     }
   ],
   "entrypoint": "run.sh",

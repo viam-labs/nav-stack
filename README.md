@@ -13,6 +13,7 @@ This module (`viam-labs:nav-stack`) provides:
 | `viam-labs:nav-stack:navigation-external` | `rdk:service:motion` | Same Motion + DoCommand surface, driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
 | `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders the navigation service's Nav2 costmap + active plan(s), robot pose, footprint and goal as a live camera image. Works with either navigation model / any SLAM backend. |
 | `viam-labs:nav-stack:shm-pointcloud` | `rdk:component:camera` | Copies a source camera's PCD into POSIX shared memory so SLAM can read lidar without gRPC on the scan timer. |
+| `viam-labs:nav-stack:rplidar` | `rdk:component:camera` | Minimal Slamtec RPLIDAR UART driver (A1/A3/S1-class) that writes each revolution to shm — no `viam:rplidar` module. |
 
 ## How it works
 
@@ -342,36 +343,41 @@ Optional attributes: `trust_movement_sensor_pose` (default `false`), `snap_headi
 
 ### Shared-memory lidar (optional, Pi / rover)
 
-gRPC `GetPointCloud` on every `/scan` tick is a real cost on a Pi. If a lidar module publishes PCD into POSIX shm using the same wire format as the `viam-shared-memory-test` prototype (2 MB region, two 1 MB slots, seq/timestamp/nbytes header), nav-stack can read it instead.
+gRPC `GetPointCloud` on every `/scan` tick is a real cost on a Pi. nav-stack can read PCD from POSIX shm (same wire format as `viam-shared-memory-test`: 2 MB, two 1 MB slots).
 
-**Today rplidar does not write shm.** Use `viam-labs:nav-stack:shm-pointcloud` as a republisher: it still calls `get_point_cloud` on the source camera, but on a **background thread**, so the ROS scan timer only copies the latest frame. That is the experiment to run on a Viam Rover. A native writer inside the lidar module would skip gRPC entirely.
+**Preferred on a Viam Rover:** replace `viam:lidar:rplidar` with this module's own driver so the scan never leaves the nav-stack process:
 
 ```json
 {
-  "name": "lidar-shm",
+  "name": "lidar",
   "api": "rdk:component:camera",
-  "model": "viam-labs:nav-stack:shm-pointcloud",
+  "model": "viam-labs:nav-stack:rplidar",
   "attributes": {
-    "source": "lidar",
-    "shm_name": "/viam-pc-lidar",
-    "produce_hz": 10
+    "serial_path": "/dev/ttyUSB1",
+    "shm_name": "/viam-pc-lidar"
   }
 }
 ```
 
-On the SLAM service lidar:
+Remove the `viam:rplidar` registry module so two processes don't open the same serial port. `shm_name` defaults to `/viam-pc-<component-name>`.
+
+On the SLAM service:
 
 ```json
 "lidar": {
   "name": "lidar",
   "shm_name": "/viam-pc-lidar",
-  "shm_required": false
+  "shm_required": true
 }
 ```
 
-`shm_required: true` once you confirm frames are flowing (otherwise a missing writer silently falls back to gRPC). `get_status` reports `lidar_shm` (hits, misses, `grpc_fallbacks`, last age/bytes). Odometry is not on shm — those RPCs are small.
+`get_status` → `lidar_shm` shows hits/misses. The camera DoCommand returns baud, model, scan counts.
 
-macOS shm names are short (~31 chars). On Linux they live under `/dev/shm`.
+This driver speaks the public Slamtec UART protocol (SCAN / INFO / HEALTH), starts the A1 motor via DTR, and uses the same XY convention as [viam-modules/rplidar](https://github.com/viam-modules/rplidar). It does **not** use that module's lock files (those break `serial/by-id` paths).
+
+**Other lidars** (Livox, depth cams): keep using `viam-labs:nav-stack:shm-pointcloud` to republish an existing camera into shm (gRPC still happens, but off the ROS timer).
+
+macOS shm names are short (~31 chars). On Linux they live under `/dev/shm`. Odometry is not on shm — those RPCs are small.
 
 ### Visualizing what nav is planning (nav-camera)
 
