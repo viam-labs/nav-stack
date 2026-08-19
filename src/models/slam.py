@@ -1431,9 +1431,10 @@ class RosSlam(SLAM):
             probe_sensors = command.get("probe_sensors", True)
             if probe_sensors is not None:
                 probe_sensors = bool(probe_sensors)
+            fast = bool(command.get("fast", False))
 
             def _status():
-                return mgr.slam_diagnostics()
+                return mgr.slam_diagnostics(fast=fast)
 
             status = await asyncio.to_thread(_status)
             status["mode"] = self._cfg.mode if self._cfg else None
@@ -1472,7 +1473,7 @@ class RosSlam(SLAM):
             status["revisit_check"] = dict(self._last_revisit_check)
             if self._pause_keyframes is not None:
                 status["pause_keyframes"] = self._pause_keyframes.status()
-            if probe_sensors and self._cfg is not None:
+            if probe_sensors and not fast and self._cfg is not None:
                 status["sensor_probe"] = await self._probe_sensors()
             return status
 

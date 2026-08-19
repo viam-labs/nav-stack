@@ -71,6 +71,7 @@ class RosManager:
         self._nav_action_ok_until = 0.0
         self._nav2_params_sig = ""
         self._nav2_ensure_lock = threading.Lock()
+        self._diagnostics_lock = threading.Lock()
         self._nav2_ensure_thread: Optional[threading.Thread] = None
         self._started = False
         self._scratch = Path(slam_cfg.maps_dir).expanduser() / ".runtime"
@@ -241,6 +242,14 @@ class RosManager:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+            )
+        except OSError as exc:
+            self._log(f"ros2 command failed ({exc!r}): {' '.join(cmd)}")
+            return subprocess.CompletedProcess(
+                cmd,
+                returncode=-1,
+                stdout="",
+                stderr=str(exc),
             )
         except subprocess.TimeoutExpired as exc:
             self._log(f"ros2 command timed out after {timeout:.0f}s: {' '.join(cmd)}")
@@ -1179,30 +1188,38 @@ class RosManager:
         ]
         return "\n".join(interesting[-max_lines:])
 
-    def nav2_diagnostics(self) -> Dict:
-        action_proc = self._run_ros(["ros2", "action", "list"])
-        action_info_proc = self._run_ros(["ros2", "action", "info", "/navigate_to_pose"])
-        node_proc = self._run_ros(["ros2", "node", "list"])
-        lifecycle_proc = self._run_ros(["ros2", "lifecycle", "get", "/bt_navigator"])
-        controller_proc = self._run_ros(["ros2", "lifecycle", "get", "/controller_server"])
-        # Read back the frequency the running controller actually loaded, so a
-        # stale Nav2 running old params is visible directly in get_status.
-        freq_proc = self._run_ros(
-            ["ros2", "param", "get", "/controller_server", "controller_frequency"]
-        )
-        log_path = self._scratch / "nav2_launch.log"
-        log_tail = ""
-        if log_path.exists():
-            try:
-                log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
-            except OSError:
-                log_tail = ""
+    def nav2_diagnostics(self, *, fast: bool = False) -> Dict:
         odom_tf_age = None
         if self._node is not None:
             try:
                 odom_tf_age = self._node.odom_tf_age_s()
             except Exception:  # noqa: BLE001 - diagnostics must not raise
                 pass
+        if fast:
+            return {
+                "fast": True,
+                "nav2_processes_running": self.nav2_running(),
+                "nav2_startup_in_progress": self.nav2_startup_in_progress(),
+                "odom_tf_age_s": odom_tf_age,
+            }
+        with self._diagnostics_lock:
+            action_proc = self._run_ros(["ros2", "action", "list"])
+            action_info_proc = self._run_ros(["ros2", "action", "info", "/navigate_to_pose"])
+            node_proc = self._run_ros(["ros2", "node", "list"])
+            lifecycle_proc = self._run_ros(["ros2", "lifecycle", "get", "/bt_navigator"])
+            controller_proc = self._run_ros(["ros2", "lifecycle", "get", "/controller_server"])
+            # Read back the frequency the running controller actually loaded, so a
+            # stale Nav2 running old params is visible directly in get_status.
+            freq_proc = self._run_ros(
+                ["ros2", "param", "get", "/controller_server", "controller_frequency"]
+            )
+            log_path = self._scratch / "nav2_launch.log"
+            log_tail = ""
+            if log_path.exists():
+                try:
+                    log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+                except OSError:
+                    log_tail = ""
         return {
             "nav2_processes_running": self.nav2_running(),
             "nav2_startup_in_progress": self.nav2_startup_in_progress(),
@@ -1453,20 +1470,24 @@ class RosManager:
             return None
         return node.get_base_scan(max_age_s)
 
-    def slam_diagnostics(self) -> Dict:
+    def slam_diagnostics(self, *, fast: bool = False) -> Dict:
         """Runtime health snapshot for SLAM (bridge + slam_toolbox process)."""
-        lifecycle_proc = self._run_ros(["ros2", "lifecycle", "get", SLAM_LIFECYCLE_NODE])
-        node_proc = self._run_ros(["ros2", "node", "list"])
         bridge: Dict = {}
         if self._node is not None:
             try:
                 bridge = self._node.slam_bridge_status()
             except Exception:  # noqa: BLE001 - diagnostics must not raise
                 pass
-        lifecycle_text = (lifecycle_proc.stdout or lifecycle_proc.stderr or "").strip()
-        # Prefer the live DDS graph over `ros2 node list`: the CLI answers from
-        # a discovery-daemon cache that can serve long-dead nodes (phantom
-        # duplicates) — our own participant sees the graph as it is right now.
+        if fast:
+            return {
+                "fast": True,
+                "slam_toolbox_running": self.slam_running(),
+                **dds_status(),
+                **bridge,
+            }
+        with self._diagnostics_lock:
+            lifecycle_proc = self._run_ros(["ros2", "lifecycle", "get", SLAM_LIFECYCLE_NODE])
+            node_proc = self._run_ros(["ros2", "node", "list"])
         node_names: List[str] = []
         if self._node is not None:
             try:
@@ -1490,6 +1511,7 @@ class RosManager:
                 map_publishers = self._node.map_publisher_count()
             except Exception:  # noqa: BLE001
                 map_publishers = None
+        lifecycle_text = (lifecycle_proc.stdout or lifecycle_proc.stderr or "").strip()
         return {
             # DDS often lists stale /slam_toolbox names after pkill — trust
             # slam_toolbox_binary_count (and `ps`) over duplicate_ros_nodes.
@@ -1530,8 +1552,19 @@ class RosManager:
         return self._node
 
     @staticmethod
+    def _close_proc_streams(proc: subprocess.Popen) -> None:
+        for stream in (proc.stdout, proc.stderr, proc.stdin):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    @staticmethod
     def _terminate(proc: Optional[subprocess.Popen]) -> None:
         if proc is None or proc.poll() is not None:
+            if proc is not None:
+                RosManager._close_proc_streams(proc)
             return
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -1545,6 +1578,11 @@ class RosManager:
             except (ProcessLookupError, PermissionError, OSError):
                 proc.kill()
             time.sleep(0.2)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        RosManager._close_proc_streams(proc)
 
     def _clear_localization_buffer(self) -> None:
         """Best-effort clear of stale localization history before reseeding."""

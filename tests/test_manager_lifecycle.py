@@ -442,3 +442,22 @@ def test_navigate_rejects_while_nav2_startup_in_progress():
         with pytest.raises(RuntimeError, match="still starting up"):
             mgr.navigate(1.0, 2.0, 0.5)
     mgr._node.send_nav_goal.assert_not_called()
+
+
+def test_run_ros_oserror_returns_failed_proc():
+    mgr = _manager()
+    with patch("src.ros.manager.subprocess.run", side_effect=OSError(9, "Bad file descriptor")):
+        proc = mgr._run_ros(["ros2", "node", "list"])
+    assert proc.returncode == -1
+    assert "Bad file descriptor" in (proc.stderr or "")
+
+
+def test_nav2_diagnostics_fast_skips_ros_cli():
+    mgr = _manager()
+    mgr._node = MagicMock()
+    mgr._node.odom_tf_age_s.return_value = 0.2
+    with patch.object(mgr, "_run_ros") as run_ros:
+        out = mgr.nav2_diagnostics(fast=True)
+    run_ros.assert_not_called()
+    assert out["fast"] is True
+    assert out["odom_tf_age_s"] == 0.2

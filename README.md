@@ -513,6 +513,8 @@ await nav.do_command({"command": "add_location", "name": "dock",
 await nav.do_command({"command": "navigate_to_location", "name": "kitchen"})
 await nav.do_command({"command": "navigate_to_point", "x": 3.5, "y": -1.0})
 await nav.do_command({"command": "get_status"})
+# If status RPCs time out under load, use fast mode (bridge-only, no ros2 CLI):
+# await nav.do_command({"command": "get_status", "fast": true})
 # Preview a path without moving (Nav2 ComputePathToPose). Returns map-frame
 # waypoints in meters/radians; also draws on nav-camera if configured:
 # await nav.do_command({"command": "plan_to_point", "x": 3.5, "y": -1.0})
@@ -580,7 +582,8 @@ Zones CRUD: `add_zone`, `get_zone`, `list_zones`, `update_zone`, `delete_zone`,
 `optimize` (alias `optimize_graph`; mapping mode — force pose-graph SPA via
 serialize/deserialize reload), `get_mode`, `get_status`
 (live bridge + slam_toolbox health; optional `probe_sensors: false` to skip a
-one-shot lidar/odom read; includes measured `scan_hz` / `lidar_read_hz` over
+one-shot lidar/odom read; optional `fast: true` to skip slow `ros2` CLI probes
+when the module is under load; includes measured `scan_hz` / `lidar_read_hz` over
 the last ~2 s plus configured `scan_rate_hz` — with `map_when_still`, expect low
 `scan_hz` while driving), `set_initial_pose`,
 `global_localize` (lidar scan match against saved map; optional `full_map`,

@@ -50,6 +50,8 @@ class RPLidarShm(Camera):
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._device_lock = threading.Lock()
+        self._stall_abort = threading.Event()
         self._latest = b""
         self._scans = 0
         self._errors = 0
@@ -116,6 +118,7 @@ class RPLidarShm(Camera):
         self._max_publish_gap_s = float(attrs.get("max_publish_gap_s", 5.0))
         self._serial_path = serial_path or None
         self._stop = threading.Event()
+        self._stall_abort.clear()
         self._scans = 0
         self._errors = 0
         self._reconnects = 0
@@ -143,6 +146,10 @@ class RPLidarShm(Camera):
         )
 
     def _open_device(self) -> None:
+        with self._device_lock:
+            self._open_device_unlocked()
+
+    def _open_device_unlocked(self) -> None:
         if self._serial_path:
             dev = RPLidarSerial(
                 self._serial_path,
@@ -169,18 +176,19 @@ class RPLidarShm(Camera):
         self._info = dict(dev.info)
 
     def _close_device(self) -> None:
-        device = self._device
-        if device is None:
-            return
-        try:
-            device.stop()
-        except Exception:
-            pass
-        try:
-            device.close()
-        except Exception:
-            pass
-        self._device = None
+        with self._device_lock:
+            device = self._device
+            if device is None:
+                return
+            try:
+                device.stop()
+            except Exception:
+                pass
+            try:
+                device.close()
+            except Exception:
+                pass
+            self._device = None
 
     def _publish_scan(self, measurements) -> None:
         xyz = scan_to_xyz_m(measurements, min_range_mm=self._min_range_mm)
@@ -208,9 +216,11 @@ class RPLidarShm(Camera):
                 backoff = self._reconnect_backoff_s
                 device = self._device
             discarded = 0
+            self._stall_abort.clear()
             try:
                 for measurements in device.iter_scans(
                     max_stall_s=self._max_publish_gap_s,
+                    abort_check=self._stall_abort.is_set,
                 ):
                     if self._stop.is_set():
                         return
@@ -230,6 +240,7 @@ class RPLidarShm(Camera):
                     return
                 LOGGER.error("rplidar %r scan loop exited: %s", self.name, exc)
                 self._close_device()
+                self._stall_abort.clear()
                 time.sleep(backoff)
                 backoff = min(backoff * 2.0, self._max_reconnect_backoff_s)
 
@@ -259,7 +270,7 @@ class RPLidarShm(Camera):
         return True
 
     def _stall_watchdog(self) -> None:
-        """Force-close UART when publishes stop so the scan loop can reconnect."""
+        """Abort the scan loop when publishes stop so reconnect runs on one thread."""
         while not self._stop.wait(1.0):
             gap = self._max_publish_gap_s
             if gap <= 0:
@@ -270,14 +281,16 @@ class RPLidarShm(Camera):
             age = time.monotonic() - last
             if age <= gap:
                 continue
+            if self._stall_abort.is_set():
+                continue
             LOGGER.warning(
-                "rplidar %r publish stalled %.1fs (> %.1fs); closing serial",
+                "rplidar %r publish stalled %.1fs (> %.1fs); aborting scan loop",
                 self.name,
                 age,
                 gap,
             )
             self._last_error = f"publish stalled {age:.1f}s"
-            self._close_device()
+            self._stall_abort.set()
 
     async def get_images(self, *, extra=None, timeout=None, **kwargs):
         raise NotImplementedError("rplidar does not support get_images; use get_point_cloud")

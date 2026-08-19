@@ -746,9 +746,11 @@ class NavServiceBase(Motion):
         if cmd == "test_drive":
             return await self._test_drive(command)
         if cmd in ("get_status", "describe_motion", "what_am_i_doing"):
+            fast = bool(command.get("fast", False))
+
             def _status():
                 status = mgr.nav_status()
-                status.update(mgr.nav2_diagnostics())
+                status.update(mgr.nav2_diagnostics(fast=fast))
                 simple = dict(self._simple_nav_status)
                 status["simple_nav"] = simple
                 if simple.get("state") == "active":

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Iterator, List, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
 from . import rplidar_protocol as proto
 
@@ -279,11 +279,14 @@ class RPLidarSerial:
         min_points: int = 20,
         max_buffer_nodes: int = 2000,
         max_stall_s: float = 5.0,
+        abort_check: Optional[Callable[[], bool]] = None,
     ) -> Iterator[List[Measurement]]:
         self.start_scan()
         scan: List[Measurement] = []
         last_complete = time.monotonic()
         while True:
+            if abort_check is not None and abort_check():
+                raise proto.RPLidarError("scan aborted")
             if max_stall_s > 0 and time.monotonic() - last_complete > max_stall_s:
                 raise proto.RPLidarError(
                     f"no complete scan in {max_stall_s:.1f}s (motor or UART stalled)"

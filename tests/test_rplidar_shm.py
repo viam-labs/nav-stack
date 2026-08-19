@@ -279,6 +279,82 @@ def test_iter_scans_raises_when_stalled():
     lidar.close()
 
 
+def test_iter_scans_honors_abort_check():
+    fake = ScriptedSerial([_circle_scan(), _circle_scan(), _circle_scan()])
+    lidar = RPLidarSerial(
+        "/dev/null",
+        serial_port=fake,
+        motor_warmup_s=0.0,
+        reset_settle_s=0.0,
+    )
+    lidar.open()
+    aborted = False
+
+    def abort() -> bool:
+        return aborted
+
+    gen = lidar.iter_scans(min_points=20, abort_check=abort)
+    next(gen)
+    aborted = True
+    with pytest.raises(proto.RPLidarError, match="scan aborted"):
+        next(gen)
+    lidar.close()
+
+
+def test_stall_watchdog_signals_abort_without_closing_device():
+    pytest.importorskip("viam")
+    import threading
+
+    from src.models.rplidar_shm import RPLidarShm
+
+    class BlockingDevice:
+        def __init__(self):
+            self.port = "/dev/fake"
+            self.baudrate = 115200
+            self.info = {"model": proto.MODEL_A1}
+            self.close_calls = 0
+            self._released = threading.Event()
+
+        def iter_scans(self, **kwargs):
+            abort_check = kwargs.get("abort_check")
+            while abort_check is None or not abort_check():
+                time.sleep(0.05)
+            raise proto.RPLidarError("scan aborted")
+
+        def stop(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self._released.set()
+
+    cam = RPLidarShm("lidar")
+    cam._stop = threading.Event()
+    cam._warmup_scans = 0
+    cam._max_publish_gap_s = 0.2
+    cam._reconnect_backoff_s = 0.05
+    cam._max_reconnect_backoff_s = 0.1
+    cam._last_publish_wall = time.monotonic() - 1.0
+    fake = BlockingDevice()
+    cam._device = fake
+    cam._info = dict(fake.info)
+
+    watchdog = threading.Thread(target=cam._stall_watchdog, daemon=True)
+    watchdog.start()
+    deadline = time.monotonic() + 2.0
+    try:
+        while time.monotonic() < deadline:
+            if cam._stall_abort.is_set():
+                break
+            time.sleep(0.05)
+        assert cam._stall_abort.is_set()
+        assert fake.close_calls == 0
+    finally:
+        cam._stop.set()
+        cam._stall_abort.set()
+        watchdog.join(timeout=2.0)
+
+
 def test_publish_scan_writes_shm_pcd():
     pytest.importorskip("viam")
     from src.models.rplidar_shm import RPLidarShm

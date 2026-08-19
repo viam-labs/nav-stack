@@ -94,6 +94,27 @@ def test_get_status_skips_sensor_probe_when_disabled(tmp_path: Path):
     slam._probe_sensors.assert_not_awaited()
 
 
+def test_get_status_fast_skips_ros_cli_and_sensor_probe(tmp_path: Path):
+    slam = RosSlam("slam")
+    store = MapStore(str(tmp_path))
+    store.create_map("floor1")
+    slam._map_store = store
+    slam._cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "mode": "mapping", "active_map": "floor1"}
+    )
+    slam._manager = MagicMock()
+    slam._manager.slam_diagnostics.return_value = {
+        "fast": True,
+        "scan_publishing": False,
+    }
+    slam._probe_sensors = AsyncMock()
+
+    asyncio.run(slam.do_command({"command": "get_status", "fast": True}))
+
+    slam._manager.slam_diagnostics.assert_called_once_with(fast=True)
+    slam._probe_sensors.assert_not_awaited()
+
+
 def test_resolve_pose_by_location_requires_active_map(tmp_path: Path):
     slam = RosSlam("slam")
     slam._map_store = MapStore(str(tmp_path))
