@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 from typing import List, Tuple
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -353,6 +354,28 @@ def test_stall_watchdog_signals_abort_without_closing_device():
         cam._stop.set()
         cam._stall_abort.set()
         watchdog.join(timeout=2.0)
+
+
+def test_stall_watchdog_restarts_scan_thread_when_abort_does_not_recover():
+    pytest.importorskip("viam")
+    import threading
+
+    from src.models.rplidar_shm import RPLidarShm
+
+    cam = RPLidarShm("lidar")
+    cam._stop = threading.Event()
+    cam._max_publish_gap_s = 0.2
+    cam._last_publish_wall = time.monotonic() - 1.0
+    cam._scan_loop_progress_wall = time.monotonic() - 1.0
+    cam._thread = threading.Thread(target=lambda: time.sleep(60.0), daemon=True)
+    cam._thread.start()
+    cam._start_scan_thread = MagicMock()  # type: ignore[method-assign]
+
+    cam._restart_scan_thread("test")
+    assert cam._thread_restarts == 1
+    cam._start_scan_thread.assert_called_once()
+    cam._stop.set()
+    cam._thread.join(timeout=1.0)
 
 
 def test_publish_scan_writes_shm_pcd():

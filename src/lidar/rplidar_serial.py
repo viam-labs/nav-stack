@@ -150,21 +150,37 @@ class RPLidarSerial:
         if callable(flush):
             flush()
 
-    def _read_exact(self, n: int, *, context: str = "") -> bytes:
-        buf = self._ser.read(n)
-        if len(buf) != n:
-            hint = ""
-            if len(buf) == 0:
-                hint = (
-                    " (no bytes — wrong serial_path, lidar powered off, "
-                    "or another process owns the port)"
+    def _read_exact(
+        self,
+        n: int,
+        *,
+        context: str = "",
+        abort_check: Optional[Callable[[], bool]] = None,
+    ) -> bytes:
+        buf = bytearray()
+        deadline = time.monotonic() + max(self.timeout_s, 1.0) + (n * 0.05)
+        while len(buf) < n:
+            if abort_check is not None and abort_check():
+                raise proto.RPLidarError("scan aborted")
+            chunk = self._ser.read(n - len(buf))
+            if chunk:
+                buf.extend(chunk)
+                continue
+            if time.monotonic() >= deadline:
+                hint = ""
+                if len(buf) == 0:
+                    hint = (
+                        " (no bytes — wrong serial_path, lidar powered off, "
+                        "or another process owns the port)"
+                    )
+                raise proto.RPLidarError(
+                    f"short read {len(buf)}/{n}{(' during ' + context) if context else ''}{hint}"
                 )
-            raise proto.RPLidarError(
-                f"short read {len(buf)}/{n}{(' during ' + context) if context else ''}{hint}"
-            )
-        return buf
+        return bytes(buf)
 
-    def _read_descriptor(self) -> tuple[int, bool, int]:
+    def _read_descriptor(
+        self, *, abort_check: Optional[Callable[[], bool]] = None
+    ) -> tuple[int, bool, int]:
         """Read one response descriptor, skipping leading startup junk.
 
         Some units emit a few stray bytes right after reset/open (or when the
@@ -173,16 +189,18 @@ class RPLidarSerial:
         window.
         """
         deadline = time.monotonic() + max(self.timeout_s, 1.0)
-        first = self._read_exact(1, context="descriptor sync")
+        first = self._read_exact(1, context="descriptor sync", abort_check=abort_check)
         while time.monotonic() < deadline:
+            if abort_check is not None and abort_check():
+                raise proto.RPLidarError("scan aborted")
             if first and first[0] == proto.SYNC:
-                second = self._read_exact(1, context="descriptor sync")
+                second = self._read_exact(1, context="descriptor sync", abort_check=abort_check)
                 if second and second[0] == proto.SYNC2:
-                    rest = self._read_exact(5, context="descriptor")
+                    rest = self._read_exact(5, context="descriptor", abort_check=abort_check)
                     return proto.parse_descriptor(first + second + rest)
                 first = second
                 continue
-            first = self._read_exact(1, context="descriptor sync")
+            first = self._read_exact(1, context="descriptor sync", abort_check=abort_check)
         raise proto.RPLidarError("bad descriptor sync (timed out)")
 
     def _handshake(self) -> None:
@@ -262,12 +280,14 @@ class RPLidarSerial:
         time.sleep(0.01)
         self._clear()
 
-    def start_scan(self) -> None:
+    def start_scan(self, *, abort_check: Optional[Callable[[], bool]] = None) -> None:
         self.start_motor()
         if self.motor_warmup_s > 0:
             time.sleep(self.motor_warmup_s)
+        if abort_check is not None and abort_check():
+            raise proto.RPLidarError("scan aborted")
         self._write(proto.command(proto.CMD_SCAN))
-        size, single, dtype = self._read_descriptor()
+        size, single, dtype = self._read_descriptor(abort_check=abort_check)
         if size != proto.NODE_LEN or single or dtype != proto.SCAN_TYPE:
             raise proto.RPLidarError(
                 f"unexpected scan descriptor size={size} single={single} type={dtype}"
@@ -281,7 +301,7 @@ class RPLidarSerial:
         max_stall_s: float = 5.0,
         abort_check: Optional[Callable[[], bool]] = None,
     ) -> Iterator[List[Measurement]]:
-        self.start_scan()
+        self.start_scan(abort_check=abort_check)
         scan: List[Measurement] = []
         last_complete = time.monotonic()
         while True:
@@ -297,7 +317,7 @@ class RPLidarSerial:
                 drop -= drop % proto.NODE_LEN
                 if drop:
                     self._ser.read(drop)
-            raw = self._read_exact(proto.NODE_LEN)
+            raw = self._read_exact(proto.NODE_LEN, abort_check=abort_check)
             try:
                 new_scan, quality, angle, dist = proto.decode_node(raw)
             except proto.RPLidarError:

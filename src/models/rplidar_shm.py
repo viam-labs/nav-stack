@@ -52,6 +52,10 @@ class RPLidarShm(Camera):
         self._lock = threading.Lock()
         self._device_lock = threading.Lock()
         self._stall_abort = threading.Event()
+        self._scan_epoch = 0
+        self._scan_loop_progress_wall: Optional[float] = None
+        self._last_thread_restart_wall = 0.0
+        self._thread_restarts = 0
         self._latest = b""
         self._scans = 0
         self._errors = 0
@@ -119,16 +123,17 @@ class RPLidarShm(Camera):
         self._serial_path = serial_path or None
         self._stop = threading.Event()
         self._stall_abort.clear()
+        self._scan_epoch += 1
+        self._scan_loop_progress_wall = None
+        self._last_thread_restart_wall = 0.0
+        self._thread_restarts = 0
         self._scans = 0
         self._errors = 0
         self._reconnects = 0
         self._last_error = None
         self._open_device()
         self._shm = pcshm.open_writer(self._shm_name, region)
-        self._thread = threading.Thread(
-            target=self._scan_loop, name=f"{self.name}-rplidar", daemon=True
-        )
-        self._thread.start()
+        self._start_scan_thread()
         if self._max_publish_gap_s > 0:
             self._stall_thread = threading.Thread(
                 target=self._stall_watchdog,
@@ -144,6 +149,31 @@ class RPLidarShm(Camera):
             self._info.get("model"),
             self._shm_name,
         )
+
+    def _start_scan_thread(self) -> None:
+        self._thread = threading.Thread(
+            target=self._scan_loop, name=f"{self.name}-rplidar", daemon=True
+        )
+        self._thread.start()
+
+    def _restart_scan_thread(self, reason: str) -> None:
+        if self._stop.is_set():
+            return
+        now = time.monotonic()
+        if now - self._last_thread_restart_wall < self._max_publish_gap_s:
+            return
+        self._last_thread_restart_wall = now
+        self._thread_restarts += 1
+        self._last_error = reason
+        LOGGER.error("rplidar %r restarting scan thread (#%d): %s", self.name, self._thread_restarts, reason)
+        self._scan_epoch += 1
+        self._stall_abort.set()
+        self._close_device()
+        old = self._thread
+        if old is not None and old.is_alive() and old is not threading.current_thread():
+            old.join(timeout=self._timeout_s + self._motor_warmup_s + 3.0)
+        self._stall_abort.clear()
+        self._start_scan_thread()
 
     def _open_device(self) -> None:
         with self._device_lock:
@@ -205,44 +235,51 @@ class RPLidarShm(Camera):
         self._last_publish_wall = time.monotonic()
 
     def _scan_loop(self) -> None:
+        epoch = self._scan_epoch
         backoff = self._reconnect_backoff_s
-        while not self._stop.is_set():
-            device = self._device
-            if device is None:
-                if not self._try_reconnect(backoff):
+        try:
+            while not self._stop.is_set() and self._scan_epoch == epoch:
+                self._scan_loop_progress_wall = time.monotonic()
+                device = self._device
+                if device is None:
+                    if not self._try_reconnect(backoff):
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2.0, self._max_reconnect_backoff_s)
+                        continue
+                    backoff = self._reconnect_backoff_s
+                    device = self._device
+                discarded = 0
+                self._stall_abort.clear()
+                try:
+                    for measurements in device.iter_scans(
+                        max_stall_s=self._max_publish_gap_s,
+                        abort_check=self._stall_abort.is_set,
+                    ):
+                        self._scan_loop_progress_wall = time.monotonic()
+                        if self._stop.is_set() or self._scan_epoch != epoch:
+                            return
+                        if discarded < self._warmup_scans:
+                            discarded += 1
+                            continue
+                        try:
+                            self._publish_scan(measurements)
+                        except Exception as exc:  # noqa: BLE001
+                            self._errors += 1
+                            self._last_error = repr(exc)
+                            LOGGER.warning("rplidar %r publish failed: %s", self.name, exc)
+                except Exception as exc:  # noqa: BLE001
+                    self._errors += 1
+                    self._last_error = repr(exc)
+                    if self._stop.is_set() or self._scan_epoch != epoch:
+                        return
+                    LOGGER.error("rplidar %r scan loop exited: %s", self.name, exc)
+                    self._close_device()
+                    self._stall_abort.clear()
                     time.sleep(backoff)
                     backoff = min(backoff * 2.0, self._max_reconnect_backoff_s)
-                    continue
-                backoff = self._reconnect_backoff_s
-                device = self._device
-            discarded = 0
-            self._stall_abort.clear()
-            try:
-                for measurements in device.iter_scans(
-                    max_stall_s=self._max_publish_gap_s,
-                    abort_check=self._stall_abort.is_set,
-                ):
-                    if self._stop.is_set():
-                        return
-                    if discarded < self._warmup_scans:
-                        discarded += 1
-                        continue
-                    try:
-                        self._publish_scan(measurements)
-                    except Exception as exc:  # noqa: BLE001
-                        self._errors += 1
-                        self._last_error = repr(exc)
-                        LOGGER.warning("rplidar %r publish failed: %s", self.name, exc)
-            except Exception as exc:  # noqa: BLE001
-                self._errors += 1
-                self._last_error = repr(exc)
-                if self._stop.is_set():
-                    return
-                LOGGER.error("rplidar %r scan loop exited: %s", self.name, exc)
-                self._close_device()
-                self._stall_abort.clear()
-                time.sleep(backoff)
-                backoff = min(backoff * 2.0, self._max_reconnect_backoff_s)
+        finally:
+            if not self._stop.is_set() and self._scan_epoch == epoch:
+                LOGGER.error("rplidar %r scan loop stopped unexpectedly", self.name)
 
     def _try_reconnect(self, backoff_s: float) -> bool:
         if self._stop.is_set():
@@ -270,7 +307,8 @@ class RPLidarShm(Camera):
         return True
 
     def _stall_watchdog(self) -> None:
-        """Abort the scan loop when publishes stop so reconnect runs on one thread."""
+        """Abort hung scans and restart the scan thread if publishes stay stale."""
+        restart_after = max(self._max_publish_gap_s * 2.0, 10.0)
         while not self._stop.wait(1.0):
             gap = self._max_publish_gap_s
             if gap <= 0:
@@ -280,6 +318,15 @@ class RPLidarShm(Camera):
                 continue
             age = time.monotonic() - last
             if age <= gap:
+                continue
+            progress = self._scan_loop_progress_wall
+            progress_age = (time.monotonic() - progress) if progress is not None else age
+            thread = self._thread
+            thread_alive = thread is not None and thread.is_alive()
+            if age >= restart_after and (
+                not thread_alive or progress_age >= gap
+            ):
+                self._restart_scan_thread(f"publish stalled {age:.1f}s")
                 continue
             if self._stall_abort.is_set():
                 continue
@@ -316,9 +363,16 @@ class RPLidarShm(Camera):
         cmd = command.get("command") if isinstance(command, Mapping) else None
         if cmd == "get_laser_scan":
             raise NotImplementedError("rplidar does not support get_laser_scan")
+        if cmd == "restart":
+            self._restart_scan_thread("do_command restart")
+            return {"status": "restarting", "thread_restarts": self._thread_restarts}
         last_pub_age_s = None
         if self._last_publish_wall is not None:
             last_pub_age_s = round(time.monotonic() - self._last_publish_wall, 3)
+        progress_age_s = None
+        if self._scan_loop_progress_wall is not None:
+            progress_age_s = round(time.monotonic() - self._scan_loop_progress_wall, 3)
+        thread = self._thread
         return {
             "serial_path": self._serial_path,
             "baudrate": self._device.baudrate if self._device else None,
@@ -327,6 +381,10 @@ class RPLidarShm(Camera):
             "scans": self._scans,
             "errors": self._errors,
             "reconnects": self._reconnects,
+            "thread_restarts": self._thread_restarts,
+            "scan_thread_alive": thread is not None and thread.is_alive(),
+            "scan_loop_progress_age_s": progress_age_s,
+            "stall_abort_set": self._stall_abort.is_set(),
             "last_points": self._last_points,
             "last_error": self._last_error,
             "last_publish_age_s": last_pub_age_s,
