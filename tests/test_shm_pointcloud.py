@@ -131,3 +131,30 @@ def test_shm_pointcloud_on_demand_mode_fetches_inline():
         assert cam._writes == 1
     finally:
         cam.close_sync()
+
+
+def test_shm_pointcloud_reconfigure_reuses_stop_event():
+    from src.models.shm_pointcloud import ShmPointCloud
+
+    cam = ShmPointCloud("rep")
+    stop = cam._stop
+    cam._stop.set()
+    cam.close_sync()
+    cam._stop.clear()
+    assert cam._stop is stop
+    assert not cam._stop.is_set()
+
+
+def test_close_sync_keeps_thread_and_shm_when_join_fails():
+    from src.models.shm_pointcloud import ShmPointCloud
+
+    cam = ShmPointCloud("rep")
+    fake_thread = MagicMock()
+    fake_thread.is_alive.return_value = True
+    fake_shm = MagicMock()
+    cam._thread = fake_thread
+    cam._shm = fake_shm
+    cam.close_sync()
+    assert cam._thread is fake_thread
+    assert cam._shm is fake_shm
+    fake_shm.close.assert_not_called()

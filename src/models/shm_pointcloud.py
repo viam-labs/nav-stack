@@ -47,6 +47,7 @@ class ShmPointCloud(Camera):
         self._thread: Optional[threading.Thread] = None
         self._worker_loop: Optional[asyncio.AbstractEventLoop] = None
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self._latest = b""
         self._produce_hz = 10.0
         self._timeout_s = 2.0
@@ -90,8 +91,12 @@ class ShmPointCloud(Camera):
         if source is None:
             raise RuntimeError(f"shm-pointcloud source camera {source_name!r} missing")
         self._source = source  # type: ignore[assignment]
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError(
+                f"shm-pointcloud {self.name!r} producer thread still running after close_sync"
+            )
+        self._stop.clear()
         self._shm = pcshm.open_writer(shm_name, region)
-        self._stop = threading.Event()
         self._writes = 0
         self._errors = 0
         self._last_error = None
@@ -109,7 +114,8 @@ class ShmPointCloud(Camera):
         )
 
     def _join_timeout_s(self) -> float:
-        return self._timeout_s + 2.0
+        period = 1.0 / max(self._produce_hz, 0.1) if self._produce_hz > 0 else 0.0
+        return self._timeout_s + period + 2.0
 
     def _produce_loop(self) -> None:
         loop = asyncio.new_event_loop()
@@ -150,7 +156,10 @@ class ShmPointCloud(Camera):
         raw = data[0] if isinstance(data, tuple) else data
         if not raw:
             raise RuntimeError("empty point cloud")
-        shm.write(raw)
+        with self._write_lock:
+            if self._stop.is_set() or shm is not self._shm:
+                return
+            shm.write(raw)
         with self._lock:
             self._latest = raw
         self._writes += 1
@@ -204,15 +213,16 @@ class ShmPointCloud(Camera):
         self._stop.set()
         self._source = None
         thread = self._thread
-        if thread is not None:
+        if thread is not None and thread.is_alive():
             thread.join(timeout=self._join_timeout_s())
-            if thread.is_alive():
-                LOGGER.error(
-                    "shm-pointcloud %r producer thread did not stop within %.1fs",
-                    self.name,
-                    self._join_timeout_s(),
-                )
-            self._thread = None
+        if thread is not None and thread.is_alive():
+            LOGGER.error(
+                "shm-pointcloud %r producer thread did not stop within %.1fs",
+                self.name,
+                self._join_timeout_s(),
+            )
+            return
+        self._thread = None
         if self._shm is not None:
             self._shm.close()
             self._shm = None
