@@ -361,7 +361,7 @@ gRPC `GetPointCloud` on every `/scan` tick is a real cost on a Pi. nav-stack can
 
 Prefer a stable `/dev/serial/by-id/...` path over `/dev/ttyUSB*` — USB enumeration can swap after reboot. If ports move often, omit `serial_path` and set `"serial_autodetect": true` to probe `/dev/serial/by-id/*` and `/dev/ttyUSB*` until GET_INFO succeeds.
 
-Optional rplidar attributes: `baud_rate` (default tries 256000 then 115200), `timeout_s` (default `2.0`), `serial_autodetect`, `warmup_scans`, `min_range_mm`, `reconnect_backoff_s` (default `1.0`), `max_publish_gap_s` (default `5.0` — abort/restart scan thread when shm stops updating). The scan thread auto-reconnects after UART errors instead of leaving stale data in shm. Camera DoCommand `restart` forces a scan-thread restart without reconfiguring the whole module.
+Optional rplidar attributes: `baud_rate` (default tries 256000 then 115200), `timeout_s` (default `2.0`), `serial_autodetect`, `warmup_scans`, `min_range_mm`, `reconnect_backoff_s` (default `1.0`), `max_publish_gap_s` (default `5.0` — abort/re-kick the scan loop when shm stops updating). The scan thread auto-reconnects after UART errors instead of leaving stale data in shm. Camera DoCommand `restart` forces a UART drop + reconnect without spawning extra threads.
 
 Remove the `viam:rplidar` registry module so two processes don't open the same serial port. `shm_name` defaults to `/viam-pc-<component-name>`.
 

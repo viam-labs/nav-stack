@@ -356,7 +356,7 @@ def test_stall_watchdog_signals_abort_without_closing_device():
         watchdog.join(timeout=2.0)
 
 
-def test_stall_watchdog_restarts_scan_thread_when_abort_does_not_recover():
+def test_kick_scan_loop_closes_device_without_spawning_thread():
     pytest.importorskip("viam")
     import threading
 
@@ -364,18 +364,16 @@ def test_stall_watchdog_restarts_scan_thread_when_abort_does_not_recover():
 
     cam = RPLidarShm("lidar")
     cam._stop = threading.Event()
-    cam._max_publish_gap_s = 0.2
-    cam._last_publish_wall = time.monotonic() - 1.0
-    cam._scan_loop_progress_wall = time.monotonic() - 1.0
-    cam._thread = threading.Thread(target=lambda: time.sleep(60.0), daemon=True)
-    cam._thread.start()
-    cam._start_scan_thread = MagicMock()  # type: ignore[method-assign]
+    fake = MagicMock()
+    fake.baudrate = 115200
+    cam._device = fake
 
-    cam._restart_scan_thread("test")
-    assert cam._thread_restarts == 1
-    cam._start_scan_thread.assert_called_once()
-    cam._stop.set()
-    cam._thread.join(timeout=1.0)
+    cam._kick_scan_loop("test")
+    assert cam._kick_count == 1
+    assert cam._stall_abort.is_set()
+    assert cam._device is None
+    fake.stop.assert_called_once()
+    fake.close.assert_called_once()
 
 
 def test_publish_scan_writes_shm_pcd():
