@@ -353,11 +353,15 @@ gRPC `GetPointCloud` on every `/scan` tick is a real cost on a Pi. nav-stack can
   "api": "rdk:component:camera",
   "model": "viam-labs:nav-stack:rplidar",
   "attributes": {
-    "serial_path": "/dev/ttyUSB1",
+    "serial_path": "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_XXXX",
     "shm_name": "/viam-pc-lidar"
   }
 }
 ```
+
+Prefer a stable `/dev/serial/by-id/...` path over `/dev/ttyUSB*` — USB enumeration can swap after reboot. If ports move often, omit `serial_path` and set `"serial_autodetect": true` to probe `/dev/serial/by-id/*` and `/dev/ttyUSB*` until GET_INFO succeeds.
+
+Optional rplidar attributes: `baud_rate` (default tries 256000 then 115200), `timeout_s` (default `2.0`), `serial_autodetect`, `warmup_scans`, `min_range_mm`.
 
 Remove the `viam:rplidar` registry module so two processes don't open the same serial port. `shm_name` defaults to `/viam-pc-<component-name>`.
 

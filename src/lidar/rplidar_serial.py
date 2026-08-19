@@ -24,7 +24,7 @@ class RPLidarSerial:
         port: str,
         *,
         baudrate: Optional[int] = None,
-        timeout_s: float = 1.0,
+        timeout_s: float = 2.0,
         serial_port=None,
         motor_warmup_s: float = 1.0,
         reset_settle_s: float = 0.5,
@@ -70,7 +70,40 @@ class RPLidarSerial:
                         pass
                 self._ser = None
         raise proto.RPLidarError(
-            f"failed to open RPLIDAR on {self.port!r}: {last!r}"
+            f"failed to open RPLIDAR on {self.port!r} at {bauds}: {last!r}. "
+            "If the lidar and IMU USB ports swapped, try the other /dev/ttyUSB* "
+            "or a /dev/serial/by-id/... path."
+        )
+
+    @classmethod
+    def open_first_working(
+        cls,
+        ports: List[str],
+        *,
+        baudrate: Optional[int] = None,
+        timeout_s: float = 2.0,
+        motor_warmup_s: float = 1.0,
+        reset_settle_s: float = 0.5,
+    ) -> "RPLidarSerial":
+        """Try each port (and baud) until GET_INFO succeeds."""
+        errors: List[str] = []
+        for port in ports:
+            dev = cls(
+                port,
+                baudrate=baudrate,
+                timeout_s=timeout_s,
+                motor_warmup_s=motor_warmup_s,
+                reset_settle_s=reset_settle_s,
+            )
+            try:
+                dev.open()
+                return dev
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{port}: {exc!r}")
+                dev.close()
+        raise proto.RPLidarError(
+            "no RPLIDAR responded on any candidate serial port. "
+            f"Tried: {', '.join(ports)}. Errors: {'; '.join(errors)}"
         )
 
     def close(self) -> None:
@@ -92,10 +125,18 @@ class RPLidarSerial:
     def _write(self, data: bytes) -> None:
         self._ser.write(data)
 
-    def _read_exact(self, n: int) -> bytes:
+    def _read_exact(self, n: int, *, context: str = "") -> bytes:
         buf = self._ser.read(n)
         if len(buf) != n:
-            raise proto.RPLidarError(f"short read {len(buf)}/{n}")
+            hint = ""
+            if len(buf) == 0:
+                hint = (
+                    " (no bytes — wrong serial_path, lidar powered off, "
+                    "or another process owns the port)"
+                )
+            raise proto.RPLidarError(
+                f"short read {len(buf)}/{n}{(' during ' + context) if context else ''}{hint}"
+            )
         return buf
 
     def _read_descriptor(self) -> tuple[int, bool, int]:
@@ -106,26 +147,30 @@ class RPLidarSerial:
         ``0xA5 0x5A`` descriptor sync instead of failing on the first 7-byte
         window.
         """
-        first = self._read_exact(1)
-        limit = max(64, int(self.timeout_s * 256))
-        for _ in range(limit):
+        deadline = time.monotonic() + max(self.timeout_s, 1.0)
+        first = self._read_exact(1, context="descriptor sync")
+        while time.monotonic() < deadline:
             if first and first[0] == proto.SYNC:
-                second = self._read_exact(1)
+                second = self._read_exact(1, context="descriptor sync")
                 if second and second[0] == proto.SYNC2:
-                    rest = self._read_exact(5)
+                    rest = self._read_exact(5, context="descriptor")
                     return proto.parse_descriptor(first + second + rest)
                 first = second
                 continue
-            first = self._read_exact(1)
-        raise proto.RPLidarError("bad descriptor sync")
+            first = self._read_exact(1, context="descriptor sync")
+        raise proto.RPLidarError("bad descriptor sync (timed out)")
 
     def _handshake(self) -> None:
+        # A1-class units often need the motor line driven before UART replies
+        # reliably on some USB-serial adapters.
+        self.start_motor()
         self.stop()
-        time.sleep(0.02)
+        time.sleep(0.05)
         self._write(proto.command(proto.CMD_RESET))
         if self.reset_settle_s > 0:
             time.sleep(self.reset_settle_s)
         self._clear()
+        time.sleep(0.02)
         self.info = self.get_info()
         status, code = self.get_health()
         if status == 2:
@@ -158,6 +203,8 @@ class RPLidarSerial:
         return proto.decode_health(self._read_exact(size))
 
     def start_motor(self) -> None:
+        if self._ser is None:
+            return
         model = int(self.info.get("model") or 0)
         if model == proto.MODEL_S1:
             return

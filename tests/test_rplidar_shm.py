@@ -135,6 +135,51 @@ def test_serial_handshake_resyncs_after_junk_prefix():
     assert len(meas) == 36
 
 
+def test_open_first_working_tries_ports():
+    class SilentSerial:
+        dtr = True
+
+        def write(self, data: bytes) -> int:
+            return len(data)
+
+        def read(self, n: int) -> bytes:
+            return b""
+
+        def close(self) -> None:
+            pass
+
+    mocks = {
+        "/dev/ttyUSB0": SilentSerial(),
+        "/dev/ttyUSB1": ScriptedSerial([_circle_scan(), _circle_scan()]),
+    }
+
+    def factory(port, **kwargs):
+        return mocks[port]
+
+    import src.lidar.rplidar_serial as rs
+
+    old = rs._pyserial
+    rs._pyserial = type(
+        "M",
+        (),
+        {
+            "Serial": staticmethod(factory),
+            "PARITY_NONE": 0,
+            "STOPBITS_ONE": 1,
+        },
+    )
+    try:
+        lidar = RPLidarSerial.open_first_working(
+            ["/dev/ttyUSB0", "/dev/ttyUSB1"],
+            motor_warmup_s=0.0,
+            reset_settle_s=0.0,
+        )
+        assert lidar.port == "/dev/ttyUSB1"
+        lidar.close()
+    finally:
+        rs._pyserial = old
+
+
 def test_publish_scan_writes_shm_pcd():
     pytest.importorskip("viam")
     from src.models.rplidar_shm import RPLidarShm

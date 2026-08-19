@@ -26,6 +26,7 @@ from viam.utils import struct_to_dict
 
 from ..lidar.rplidar_protocol import RPLidarError, scan_to_xyz_m
 from ..lidar.rplidar_serial import RPLidarSerial
+from ..lidar.serial_ports import list_candidate_serial_ports
 from ..ros import conversions as conv
 from ..ros import pcshm
 
@@ -73,8 +74,12 @@ class RPLidarShm(Camera):
         cls, config: ComponentConfig
     ) -> tuple[Sequence[str], Sequence[str]]:
         attrs = struct_to_dict(config.attributes)
-        if not str(attrs.get("serial_path") or "").strip():
-            raise ValueError("rplidar requires attributes.serial_path")
+        serial_path = str(attrs.get("serial_path") or "").strip()
+        autodetect = bool(attrs.get("serial_autodetect", False))
+        if not serial_path and not autodetect:
+            raise ValueError(
+                "rplidar requires attributes.serial_path or serial_autodetect=true"
+            )
         return [], []
 
     def reconfigure(
@@ -84,25 +89,44 @@ class RPLidarShm(Camera):
         self.close_sync()
         attrs = struct_to_dict(config.attributes)
         serial_path = str(attrs.get("serial_path") or "").strip()
+        autodetect = bool(attrs.get("serial_autodetect", False))
         baud = attrs.get("baud_rate") or attrs.get("baudrate")
         baudrate = int(baud) if baud else None
+        timeout_s = float(attrs.get("timeout_s", 2.0))
         self._min_range_mm = float(attrs.get("min_range_mm", 0.0))
         self._warmup_scans = int(attrs.get("warmup_scans", 5))
         region = int(attrs.get("shm_region_size", pcshm.DEFAULT_REGION_SIZE))
         explicit = str(attrs.get("shm_name") or "").strip() or None
         self._shm_name = _shm_name_for(self.name, explicit)
-        self._serial_path = serial_path
+        motor_warmup_s = float(attrs.get("motor_warmup_s", 1.0))
+        reset_settle_s = float(attrs.get("reset_settle_s", 0.5))
+        if serial_path:
+            self._serial_path = serial_path
+            self._device = RPLidarSerial(
+                serial_path,
+                baudrate=baudrate,
+                timeout_s=timeout_s,
+                motor_warmup_s=motor_warmup_s,
+                reset_settle_s=reset_settle_s,
+            )
+            self._device.open()
+        elif autodetect:
+            ports = list_candidate_serial_ports()
+            self._device = RPLidarSerial.open_first_working(
+                ports,
+                baudrate=baudrate,
+                timeout_s=timeout_s,
+                motor_warmup_s=motor_warmup_s,
+                reset_settle_s=reset_settle_s,
+            )
+            self._serial_path = self._device.port
+            LOGGER.info("nav-stack rplidar autodetected serial=%s", self._serial_path)
+        else:
+            raise ValueError("rplidar requires serial_path or serial_autodetect")
         self._stop = threading.Event()
         self._scans = 0
         self._errors = 0
         self._last_error = None
-        self._device = RPLidarSerial(
-            serial_path,
-            baudrate=baudrate,
-            motor_warmup_s=float(attrs.get("motor_warmup_s", 1.0)),
-            reset_settle_s=float(attrs.get("reset_settle_s", 0.5)),
-        )
-        self._device.open()
         self._info = dict(self._device.info)
         self._shm = pcshm.open_writer(self._shm_name, region)
         self._thread = threading.Thread(
@@ -112,7 +136,7 @@ class RPLidarShm(Camera):
         LOGGER.info(
             "nav-stack rplidar %r serial=%s baud=%s model=%s shm=%s",
             self.name,
-            serial_path,
+            self._serial_path,
             self._device.baudrate,
             self._info.get("model"),
             self._shm_name,
