@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -63,7 +64,7 @@ def test_read_lidar_uses_shm_when_configured():
     cam = MagicMock()
     cam.get_point_cloud = AsyncMock(side_effect=AssertionError("gRPC should not run"))
     try:
-        writer.write(_MIN_PCD, timestamp_ns=1)
+        writer.write(_MIN_PCD, timestamp_ns=time.time_ns())
         io = _io(
             lidars=[
                 {
@@ -136,6 +137,48 @@ def test_read_lidar_shm_required_raises_when_empty():
         )
         with pytest.raises(RuntimeError, match="no complete frame"):
             asyncio.run(io.read_lidar_points("front"))
+        cam.get_point_cloud.assert_not_called()
+    finally:
+        client.close()
+        writer.close()
+
+
+def test_read_lidar_rejects_stale_shm_frame():
+    name = "/viam-pc-navio-stale"
+    writer = pcshm.open_writer(name)
+    client = ShmPointCloudClient()
+    cam = MagicMock()
+    cam.get_point_cloud = AsyncMock()
+    stale_ns = 1_000_000_000  # 1s epoch — always older than max_age
+    try:
+        writer.write(_MIN_PCD, timestamp_ns=stale_ns)
+        cfg = SlamConfig.from_dict(
+            {
+                "base": "b",
+                "lidars": [
+                    {
+                        "name": "front",
+                        "scan_source": "point_cloud",
+                        "shm_name": name,
+                        "shm_required": True,
+                    }
+                ],
+                "sensor_read_timeout_s": 1.0,
+                "scan_max_age_s": 2.0,
+            }
+        )
+        io = build_io_provider(
+            base=MagicMock(),
+            cameras={"front": cam},
+            cfg=cfg,
+            logger=MagicMock(),
+            shm_lidar=client,
+        )
+        with pytest.raises(RuntimeError, match="frame too old"):
+            asyncio.run(io.read_lidar_points("front"))
+        stats = client.status()[name]
+        assert stats["stale_hits"] >= 1
+        assert stats["hits"] == 0
         cam.get_point_cloud.assert_not_called()
     finally:
         client.close()

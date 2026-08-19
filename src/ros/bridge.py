@@ -1182,7 +1182,7 @@ class BridgeNode(Node):
                     self.get_logger().warn(
                         f"lidar scan cache age {scan_age_s:.2f}s exceeds "
                         f"scan_max_age_s={max_age:.2f}s; skipping /scan publish "
-                        "(check mir-base scan_cache_max_age_s / rosbridge health)"
+                        "(stale lidar frame — check rplidar last_publish_age_s / reconnects)"
                     )
                     self._stale_scan_warned = True
                 return

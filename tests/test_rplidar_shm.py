@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import List, Tuple
 
 import numpy as np
@@ -179,6 +180,65 @@ def test_open_first_working_tries_ports():
         lidar.close()
     finally:
         rs._pyserial = old
+
+
+def test_scan_loop_reconnects_after_uart_exit():
+    pytest.importorskip("viam")
+    import threading
+
+    from src.models.rplidar_shm import RPLidarShm
+
+    class OneShotDevice:
+        def __init__(self):
+            self.calls = 0
+            self.port = "/dev/fake"
+            self.baudrate = 115200
+            self.info = {"model": proto.MODEL_A1}
+
+        def iter_scans(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                yield _circle_scan()
+                raise proto.RPLidarError("short read 0/1")
+            while True:
+                yield _circle_scan()
+
+        def stop(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    cam = RPLidarShm("lidar")
+    cam._stop = threading.Event()
+    cam._warmup_scans = 0
+    cam._reconnect_backoff_s = 0.01
+    cam._max_reconnect_backoff_s = 0.05
+    cam._shm_name = "/viam-pc-recon"
+    cam._shm = pcshm.open_writer(cam._shm_name)
+    fake = OneShotDevice()
+
+    def fake_open():
+        cam._device = fake
+        cam._info = dict(fake.info)
+
+    cam._open_device = fake_open  # type: ignore[method-assign]
+    fake_open()
+    thread = threading.Thread(target=cam._scan_loop, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2.0
+    try:
+        while time.monotonic() < deadline:
+            if cam._reconnects >= 1 and cam._scans >= 2:
+                break
+            time.sleep(0.05)
+        assert cam._reconnects >= 1
+        assert cam._scans >= 2
+        assert fake.calls >= 2
+    finally:
+        cam._stop.set()
+        thread.join(timeout=2.0)
+        cam.close_sync()
 
 
 def test_publish_scan_writes_shm_pcd():

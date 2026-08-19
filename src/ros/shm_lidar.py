@@ -19,6 +19,7 @@ from . import pcshm
 class ShmReadStats:
     hits: int = 0
     misses: int = 0
+    stale_hits: int = 0
     fallbacks: int = 0
     errors: int = 0
     last_bytes: int = 0
@@ -30,6 +31,7 @@ class ShmReadStats:
         return {
             "hits": self.hits,
             "misses": self.misses,
+            "stale_hits": self.stale_hits,
             "grpc_fallbacks": self.fallbacks,
             "errors": self.errors,
             "last_bytes": self.last_bytes,
@@ -90,7 +92,11 @@ class ShmPointCloudClient:
             slot.stats.fallbacks += 1
 
     def try_read(
-        self, shm_name: str, region_size: int = pcshm.DEFAULT_REGION_SIZE
+        self,
+        shm_name: str,
+        region_size: int = pcshm.DEFAULT_REGION_SIZE,
+        *,
+        max_age_s: Optional[float] = None,
     ) -> Optional[Tuple[bytes, float]]:
         """Return ``(pcd_bytes, age_s)`` or ``None`` if no complete frame yet."""
         key = pcshm.normalize_name(shm_name)
@@ -159,6 +165,14 @@ class ShmPointCloudClient:
         age_s = 0.0
         if ts_ns:
             age_s = max(0.0, (time.time_ns() - int(ts_ns)) / 1e9)
+        if max_age_s is not None and max_age_s > 0.0 and age_s > max_age_s:
+            with self._lock:
+                slot.stats.stale_hits += 1
+                slot.stats.last_age_s = age_s
+                slot.stats.last_error = (
+                    f"frame too old ({age_s:.2f}s > max_age_s={max_age_s:.2f}s)"
+                )
+            return None
         with self._lock:
             slot.stats.hits += 1
             slot.stats.last_bytes = len(payload)

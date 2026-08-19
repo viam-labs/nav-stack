@@ -28,6 +28,7 @@ from ..config import (
 )
 from . import conversions as conv
 from .bridge import IOProvider
+from . import pcshm
 from .shm_lidar import ShmPointCloudClient
 
 
@@ -95,13 +96,20 @@ def build_io_provider(
                     raise RuntimeError(
                         f"lidar {name} has shm_name={shm_name!r} but no shm client"
                     )
-                got = client.try_read(shm_name, lidar_cfg.shm_region_size)
+                max_age = float(cfg.scan_max_age_s) if cfg.scan_max_age_s > 0.0 else None
+                got = client.try_read(
+                    shm_name,
+                    lidar_cfg.shm_region_size,
+                    max_age_s=max_age,
+                )
                 if got is not None:
                     raw, age_s = got
                     return await _points_from_pcd(raw, age_s=age_s)
                 if lidar_cfg.shm_required:
+                    stats = client.status().get(pcshm.normalize_name(shm_name), {})
+                    detail = stats.get("last_error") or "no complete frame"
                     raise RuntimeError(
-                        f"lidar {name} shm {shm_name!r} has no complete frame"
+                        f"lidar {name} shm {shm_name!r} unavailable: {detail}"
                     )
                 client.note_fallback(shm_name)
             data = await cam.get_point_cloud(timeout=timeout)

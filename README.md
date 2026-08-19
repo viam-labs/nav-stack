@@ -361,7 +361,7 @@ gRPC `GetPointCloud` on every `/scan` tick is a real cost on a Pi. nav-stack can
 
 Prefer a stable `/dev/serial/by-id/...` path over `/dev/ttyUSB*` — USB enumeration can swap after reboot. If ports move often, omit `serial_path` and set `"serial_autodetect": true` to probe `/dev/serial/by-id/*` and `/dev/ttyUSB*` until GET_INFO succeeds.
 
-Optional rplidar attributes: `baud_rate` (default tries 256000 then 115200), `timeout_s` (default `2.0`), `serial_autodetect`, `warmup_scans`, `min_range_mm`.
+Optional rplidar attributes: `baud_rate` (default tries 256000 then 115200), `timeout_s` (default `2.0`), `serial_autodetect`, `warmup_scans`, `min_range_mm`, `reconnect_backoff_s` (default `1.0`). The scan thread auto-reconnects after UART errors instead of leaving stale data in shm.
 
 Remove the `viam:rplidar` registry module so two processes don't open the same serial port. `shm_name` defaults to `/viam-pc-<component-name>`.
 
@@ -375,7 +375,7 @@ On the SLAM service:
 }
 ```
 
-`get_status` → `lidar_shm` shows hits/misses. The camera DoCommand returns baud, model, scan counts.
+`get_status` → `lidar_shm` shows hits/misses/stale_hits. Frames older than `scan_max_age_s` (default 2 s) are rejected so a dead writer cannot silently freeze SLAM. The camera DoCommand returns baud, model, scan counts, `reconnects`, and `last_publish_age_s`.
 
 This driver speaks the public Slamtec UART protocol (SCAN / INFO / HEALTH), starts the A1 motor via DTR, and uses the same XY convention as [viam-modules/rplidar](https://github.com/viam-modules/rplidar). It does **not** use that module's lock files (those break `serial/by-id` paths).
 
