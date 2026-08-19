@@ -98,6 +98,27 @@ class RPLidarSerial:
             raise proto.RPLidarError(f"short read {len(buf)}/{n}")
         return buf
 
+    def _read_descriptor(self) -> tuple[int, bool, int]:
+        """Read one response descriptor, skipping leading startup junk.
+
+        Some units emit a few stray bytes right after reset/open (or when the
+        wrong port briefly echoes noise). Be tolerant of bytes before the
+        ``0xA5 0x5A`` descriptor sync instead of failing on the first 7-byte
+        window.
+        """
+        first = self._read_exact(1)
+        limit = max(64, int(self.timeout_s * 256))
+        for _ in range(limit):
+            if first and first[0] == proto.SYNC:
+                second = self._read_exact(1)
+                if second and second[0] == proto.SYNC2:
+                    rest = self._read_exact(5)
+                    return proto.parse_descriptor(first + second + rest)
+                first = second
+                continue
+            first = self._read_exact(1)
+        raise proto.RPLidarError("bad descriptor sync")
+
     def _handshake(self) -> None:
         self.stop()
         time.sleep(0.02)
@@ -122,7 +143,7 @@ class RPLidarSerial:
 
     def get_info(self) -> dict:
         self._write(proto.command(proto.CMD_GET_INFO))
-        size, single, dtype = proto.parse_descriptor(self._read_exact(7))
+        size, single, dtype = self._read_descriptor()
         if size != proto.INFO_LEN or not single or dtype != proto.INFO_TYPE:
             raise proto.RPLidarError(
                 f"unexpected info descriptor size={size} single={single} type={dtype}"
@@ -131,7 +152,7 @@ class RPLidarSerial:
 
     def get_health(self) -> Tuple[int, int]:
         self._write(proto.command(proto.CMD_GET_HEALTH))
-        size, single, dtype = proto.parse_descriptor(self._read_exact(7))
+        size, single, dtype = self._read_descriptor()
         if size != proto.HEALTH_LEN or not single or dtype != proto.HEALTH_TYPE:
             raise proto.RPLidarError("unexpected health descriptor")
         return proto.decode_health(self._read_exact(size))
@@ -160,7 +181,7 @@ class RPLidarSerial:
         if self.motor_warmup_s > 0:
             time.sleep(self.motor_warmup_s)
         self._write(proto.command(proto.CMD_SCAN))
-        size, single, dtype = proto.parse_descriptor(self._read_exact(7))
+        size, single, dtype = self._read_descriptor()
         if size != proto.NODE_LEN or single or dtype != proto.SCAN_TYPE:
             raise proto.RPLidarError(
                 f"unexpected scan descriptor size={size} single={single} type={dtype}"

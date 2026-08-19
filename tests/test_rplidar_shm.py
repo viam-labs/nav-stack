@@ -71,6 +71,26 @@ class ScriptedSerial:
         pass
 
 
+class JunkPrefixSerial(ScriptedSerial):
+    def write(self, data: bytes) -> int:
+        data = bytes(data)
+        self.writes.append(data)
+        if data == proto.command(proto.CMD_GET_INFO):
+            self._buf += b"\x00\xff\x13junk"
+            self._buf += proto.descriptor(proto.INFO_LEN, True, proto.INFO_TYPE)
+            self._buf += proto.encode_info(model=proto.MODEL_A1)
+        elif data == proto.command(proto.CMD_GET_HEALTH):
+            self._buf += b"\x99"
+            self._buf += proto.descriptor(proto.HEALTH_LEN, True, proto.HEALTH_TYPE)
+            self._buf += proto.encode_health(0, 0)
+        elif data == proto.command(proto.CMD_SCAN):
+            self._buf += b"\x01\x02"
+            self._buf += proto.descriptor(proto.NODE_LEN, False, proto.SCAN_TYPE)
+            self._buf += proto.encode_scan_stream(self._scans)
+        self.in_waiting = len(self._buf)
+        return len(data)
+
+
 def _circle_scan(n: int = 36, radius_mm: float = 2000.0) -> List[Tuple[int, float, float]]:
     step = 360.0 / n
     return [(20, i * step, radius_mm) for i in range(n)]
@@ -98,6 +118,21 @@ def test_serial_handshake_and_one_scan():
     assert len(xyz) == 36
     rs = [math.hypot(x, y) for x, y, _ in xyz]
     assert min(rs) == pytest.approx(2.0, abs=0.02)
+
+
+def test_serial_handshake_resyncs_after_junk_prefix():
+    fake = JunkPrefixSerial([_circle_scan(), _circle_scan(), _circle_scan()])
+    lidar = RPLidarSerial(
+        "/dev/null",
+        serial_port=fake,
+        motor_warmup_s=0.0,
+        reset_settle_s=0.0,
+    )
+    lidar.open()
+    assert lidar.info["model"] == proto.MODEL_A1
+    meas = next(lidar.iter_scans(min_points=20))
+    lidar.close()
+    assert len(meas) == 36
 
 
 def test_publish_scan_writes_shm_pcd():
