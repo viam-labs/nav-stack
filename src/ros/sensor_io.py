@@ -34,7 +34,19 @@ from .shm_lidar import ShmPointCloudClient
 
 def get_laser_scan_not_implemented(exc: BaseException) -> bool:
     msg = str(exc).lower()
-    return "not implemented" in msg or "docommand not implemented" in msg
+    return (
+        "not implemented" in msg
+        or "docommand not implemented" in msg
+        or "did not return get_laser_scan" in msg
+    )
+
+
+def is_mir_laser_scan_payload(payload: Mapping) -> bool:
+    """True when ``payload`` looks like mir-base ``get_laser_scan`` output."""
+    scans = payload.get("scans")
+    if scans is None:
+        return "message" in payload or "topic" in payload
+    return isinstance(scans, list)
 
 
 def build_io_provider(
@@ -126,6 +138,10 @@ def build_io_provider(
                 if not isinstance(raw_payload, dict)
                 else raw_payload
             )
+            if not is_mir_laser_scan_payload(payload):
+                raise NotImplementedError(
+                    f"lidar {name} do_command did not return get_laser_scan data"
+                )
             mir_pts = conv.points_from_mir_laser_scan_payload(payload)
             if mir_pts.base_link.size > 0 or (
                 mir_pts.sensor_scan is not None
@@ -142,6 +158,10 @@ def build_io_provider(
                 if not isinstance(raw_payload, dict)
                 else raw_payload
             )
+            if not is_mir_laser_scan_payload(payload):
+                raise NotImplementedError(
+                    f"lidar {name} do_command did not return get_laser_scan data"
+                )
             mir_pts = conv.points_from_mir_laser_scan_payload(payload)
             if mir_pts.base_link.size > 0 or (
                 mir_pts.sensor_scan is not None

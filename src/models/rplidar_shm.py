@@ -267,6 +267,9 @@ class RPLidarShm(Camera):
     async def do_command(
         self, command: Mapping[str, object], *, timeout: Optional[float] = None, **kwargs
     ) -> Mapping[str, object]:
+        cmd = command.get("command") if isinstance(command, Mapping) else None
+        if cmd == "get_laser_scan":
+            raise NotImplementedError("rplidar does not support get_laser_scan")
         last_pub_age_s = None
         if self._last_publish_wall is not None:
             last_pub_age_s = round(time.monotonic() - self._last_publish_wall, 3)

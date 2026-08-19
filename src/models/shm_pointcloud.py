@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from typing import ClassVar, Mapping, Optional, Sequence
 
 from typing_extensions import Self
@@ -44,7 +45,7 @@ class ShmPointCloud(Camera):
         self._shm: Optional[pcshm.Writer] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._worker_loop: Optional[asyncio.AbstractEventLoop] = None
         self._lock = threading.Lock()
         self._latest = b""
         self._produce_hz = 10.0
@@ -94,10 +95,6 @@ class ShmPointCloud(Camera):
         self._writes = 0
         self._errors = 0
         self._last_error = None
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._loop = asyncio.get_event_loop()
         if self._produce_hz > 0:
             self._thread = threading.Thread(
                 target=self._produce_loop, name=f"{self.name}-shm", daemon=True
@@ -111,26 +108,45 @@ class ShmPointCloud(Camera):
             self._produce_hz,
         )
 
-    def _produce_loop(self) -> None:
-        period = 1.0 / max(self._produce_hz, 0.1)
-        while not self._stop.wait(period):
-            try:
-                self._publish_once()
-            except Exception as exc:  # noqa: BLE001 - keep the loop alive
-                self._errors += 1
-                self._last_error = repr(exc)
-                LOGGER.warning("shm-pointcloud %r produce failed: %s", self.name, exc)
+    def _join_timeout_s(self) -> float:
+        return self._timeout_s + 2.0
 
-    def _publish_once(self) -> None:
-        source = self._source
-        loop = self._loop
-        shm = self._shm
-        if source is None or loop is None or shm is None:
+    def _produce_loop(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._worker_loop = loop
+        period = 1.0 / max(self._produce_hz, 0.1)
+        try:
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._publish_once_async())
+            except Exception as exc:  # noqa: BLE001
+                self._record_error(exc)
+            while not self._stop.is_set():
+                if self._stop.wait(period):
+                    break
+                try:
+                    loop.run_until_complete(self._publish_once_async())
+                except Exception as exc:  # noqa: BLE001
+                    self._record_error(exc)
+        finally:
+            self._worker_loop = None
+            loop.close()
+
+    def _record_error(self, exc: BaseException) -> None:
+        self._errors += 1
+        self._last_error = repr(exc)
+        LOGGER.warning("shm-pointcloud %r produce failed: %s", self.name, exc)
+
+    async def _publish_once_async(self) -> None:
+        if self._stop.is_set():
             return
-        fut = asyncio.run_coroutine_threadsafe(
-            source.get_point_cloud(timeout=self._timeout_s), loop
-        )
-        data = fut.result(timeout=self._timeout_s + 0.5)
+        source = self._source
+        shm = self._shm
+        if source is None or shm is None:
+            return
+        data = await source.get_point_cloud(timeout=self._timeout_s)
+        if self._stop.is_set():
+            return
         raw = data[0] if isinstance(data, tuple) else data
         if not raw:
             raise RuntimeError("empty point cloud")
@@ -149,17 +165,23 @@ class ShmPointCloud(Camera):
     async def get_point_cloud(
         self, *, extra=None, timeout: Optional[float] = None, **kwargs
     ) -> tuple[bytes, str]:
-        if self._produce_hz > 0:
+        wait_s = float(timeout) if timeout is not None else self._timeout_s
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
             with self._lock:
                 pcd = self._latest
-            if not pcd:
-                self._publish_once()
-                with self._lock:
-                    pcd = self._latest
-            return pcd, "pointcloud/pcd"
-        self._publish_once()
-        with self._lock:
-            return self._latest, "pointcloud/pcd"
+            if pcd:
+                return pcd, "pointcloud/pcd"
+            if self._produce_hz > 0:
+                await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+            await self._publish_once_async()
+            with self._lock:
+                pcd = self._latest
+            if pcd:
+                return pcd, "pointcloud/pcd"
+            break
+        raise RuntimeError("shm-pointcloud has no frame yet")
 
     async def get_properties(self, *, timeout=None, **kwargs) -> Camera.Properties:
         return Camera.Properties(supports_pcd=True, mime_types=["pointcloud/pcd"])
@@ -180,13 +202,20 @@ class ShmPointCloud(Camera):
 
     def close_sync(self) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        self._source = None
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=self._join_timeout_s())
+            if thread.is_alive():
+                LOGGER.error(
+                    "shm-pointcloud %r producer thread did not stop within %.1fs",
+                    self.name,
+                    self._join_timeout_s(),
+                )
             self._thread = None
         if self._shm is not None:
             self._shm.close()
             self._shm = None
-        self._source = None
 
     async def close(self):
         self.close_sync()
