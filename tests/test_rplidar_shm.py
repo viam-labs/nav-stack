@@ -241,6 +241,44 @@ def test_scan_loop_reconnects_after_uart_exit():
         cam.close_sync()
 
 
+def test_iter_scans_raises_when_stalled():
+    class StuckSerial(ScriptedSerial):
+        def write(self, data: bytes) -> int:
+            data = bytes(data)
+            self.writes.append(data)
+            if data == proto.command(proto.CMD_SCAN):
+                self._buf += proto.descriptor(proto.NODE_LEN, False, proto.SCAN_TYPE)
+                self._streaming = True
+            elif data == proto.command(proto.CMD_GET_INFO):
+                self._buf += proto.descriptor(proto.INFO_LEN, True, proto.INFO_TYPE)
+                self._buf += proto.encode_info(model=proto.MODEL_A1)
+            elif data == proto.command(proto.CMD_GET_HEALTH):
+                self._buf += proto.descriptor(proto.HEALTH_LEN, True, proto.HEALTH_TYPE)
+                self._buf += proto.encode_health(0, 0)
+            self.in_waiting = len(self._buf)
+            return len(data)
+
+        def read(self, n: int) -> bytes:
+            if getattr(self, "_streaming", False):
+                while len(self._buf) < n:
+                    self._buf += proto.encode_node(
+                        new_scan=False, quality=10, angle_deg=0.0, distance_mm=1000.0
+                    )
+            return super().read(n)
+
+    fake = StuckSerial([_circle_scan()])
+    lidar = RPLidarSerial(
+        "/dev/null",
+        serial_port=fake,
+        motor_warmup_s=0.0,
+        reset_settle_s=0.0,
+    )
+    lidar.open()
+    with pytest.raises(proto.RPLidarError, match="no complete scan"):
+        next(lidar.iter_scans(min_points=20, max_stall_s=0.2))
+    lidar.close()
+
+
 def test_publish_scan_writes_shm_pcd():
     pytest.importorskip("viam")
     from src.models.rplidar_shm import RPLidarShm

@@ -278,10 +278,16 @@ class RPLidarSerial:
         *,
         min_points: int = 20,
         max_buffer_nodes: int = 2000,
+        max_stall_s: float = 5.0,
     ) -> Iterator[List[Measurement]]:
         self.start_scan()
         scan: List[Measurement] = []
+        last_complete = time.monotonic()
         while True:
+            if max_stall_s > 0 and time.monotonic() - last_complete > max_stall_s:
+                raise proto.RPLidarError(
+                    f"no complete scan in {max_stall_s:.1f}s (motor or UART stalled)"
+                )
             waiting = getattr(self._ser, "in_waiting", 0) or 0
             if waiting > max_buffer_nodes * proto.NODE_LEN:
                 drop = waiting - (max_buffer_nodes * proto.NODE_LEN)
@@ -295,6 +301,7 @@ class RPLidarSerial:
                 continue
             if new_scan:
                 if len(scan) >= min_points:
+                    last_complete = time.monotonic()
                     yield scan
                 scan = []
             if quality > 0 and dist > 0:
