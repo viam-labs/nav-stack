@@ -7,17 +7,23 @@ from typing import List
 
 
 def list_candidate_serial_ports() -> List[str]:
-    """Return stable by-id paths first, then numbered ttyUSB/ttyACM."""
+    """Return CP2102 by-id paths first, then other by-id, then ttyUSB/ttyACM."""
     seen: set[str] = set()
     out: List[str] = []
-    for pattern in (
-        "/dev/serial/by-id/usb-*",
-        "/dev/ttyUSB*",
-        "/dev/ttyACM*",
-    ):
+
+    def add(path: str) -> None:
+        if path in seen:
+            return
+        seen.add(path)
+        out.append(path)
+
+    by_id = sorted(glob.glob("/dev/serial/by-id/usb-*"))
+    for path in by_id:
+        if "Silicon_Labs" in path or "CP210" in path:
+            add(path)
+    for path in by_id:
+        add(path)
+    for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*"):
         for path in sorted(glob.glob(pattern)):
-            if path in seen:
-                continue
-            seen.add(path)
-            out.append(path)
+            add(path)
     return out

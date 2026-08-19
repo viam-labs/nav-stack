@@ -106,6 +106,7 @@ def test_serial_handshake_and_one_scan():
         reset_settle_s=0.0,
     )
     lidar.open()
+    assert fake.writes[0] == proto.command(proto.CMD_GET_INFO)
     assert lidar.info["model"] == proto.MODEL_A1
     scans = []
     for meas in lidar.iter_scans(min_points=20):

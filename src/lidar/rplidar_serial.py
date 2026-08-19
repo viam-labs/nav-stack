@@ -49,14 +49,7 @@ class RPLidarSerial:
         for baud in bauds:
             ser = None
             try:
-                ser = _pyserial.Serial(
-                    self.port,
-                    baudrate=int(baud),
-                    parity=_pyserial.PARITY_NONE,
-                    stopbits=_pyserial.STOPBITS_ONE,
-                    timeout=self.timeout_s,
-                    dsrdtr=True,
-                )
+                ser = self._connect_serial(int(baud))
                 self._ser = ser
                 self.baudrate = int(baud)
                 self._handshake()
@@ -106,6 +99,35 @@ class RPLidarSerial:
             f"Tried: {', '.join(ports)}. Errors: {'; '.join(errors)}"
         )
 
+    def _connect_serial(self, baud: int):
+        """Open the UART like viam-modules/rplidar: no DTR/DSR flow control."""
+        kwargs = dict(
+            baudrate=baud,
+            parity=_pyserial.PARITY_NONE,
+            stopbits=_pyserial.STOPBITS_ONE,
+            timeout=self.timeout_s,
+            dsrdtr=False,
+            rtscts=False,
+        )
+        try:
+            return _pyserial.Serial(self.port, exclusive=True, **kwargs)
+        except TypeError:
+            return _pyserial.Serial(self.port, **kwargs)
+
+    def _prepare_port(self) -> None:
+        ser = self._ser
+        for name in ("reset_input_buffer", "reset_output_buffer"):
+            fn = getattr(ser, name, None)
+            if callable(fn):
+                fn()
+        self._clear()
+        # A1 motor off (DTR high) until start_scan, matching post-connect idle state.
+        if hasattr(ser, "dtr"):
+            ser.dtr = True
+        if hasattr(ser, "rts"):
+            ser.rts = False
+        time.sleep(0.05)
+
     def close(self) -> None:
         ser = self._ser
         if ser is None:
@@ -124,6 +146,9 @@ class RPLidarSerial:
 
     def _write(self, data: bytes) -> None:
         self._ser.write(data)
+        flush = getattr(self._ser, "flush", None)
+        if callable(flush):
+            flush()
 
     def _read_exact(self, n: int, *, context: str = "") -> bytes:
         buf = self._ser.read(n)
@@ -161,17 +186,31 @@ class RPLidarSerial:
         raise proto.RPLidarError("bad descriptor sync (timed out)")
 
     def _handshake(self) -> None:
-        # A1-class units often need the motor line driven before UART replies
-        # reliably on some USB-serial adapters.
-        self.start_motor()
-        self.stop()
-        time.sleep(0.05)
-        self._write(proto.command(proto.CMD_RESET))
-        if self.reset_settle_s > 0:
-            time.sleep(self.reset_settle_s)
-        self._clear()
-        time.sleep(0.02)
-        self.info = self.get_info()
+        """Match viam-modules/rplidar: GET_INFO first, no motor/reset upfront."""
+        if self._owns_port:
+            self._prepare_port()
+        else:
+            self._clear()
+
+        last: Optional[Exception] = None
+        for attempt in (
+            lambda: None,
+            lambda: (self.stop(), time.sleep(0.05), self._clear()),
+            lambda: (
+                self._write(proto.command(proto.CMD_RESET)),
+                time.sleep(self.reset_settle_s),
+                self._clear(),
+            ),
+        ):
+            try:
+                attempt()
+                self.info = self.get_info()
+                break
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+        else:
+            raise proto.RPLidarError(f"GET_INFO failed after stop/reset retries: {last!r}")
+
         status, code = self.get_health()
         if status == 2:
             raise proto.RPLidarError(f"RPLIDAR health error code={code}")
