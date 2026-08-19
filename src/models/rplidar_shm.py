@@ -77,6 +77,14 @@ class RPLidarShm(Camera):
         self._max_publish_gap_s = 5.0
         self._stall_thread: Optional[threading.Thread] = None
 
+    def _join_timeout_s(self) -> float:
+        """Long enough for scan loop to exit reconnect backoff and UART reads."""
+        return self._max_reconnect_backoff_s + self._timeout_s + self._motor_warmup_s + 5.0
+
+    def _wait_backoff(self, backoff: float) -> bool:
+        """Wait up to ``backoff`` seconds; return True when ``_stop`` is set."""
+        return self._stop.wait(backoff)
+
     @classmethod
     def new(
         cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -120,7 +128,6 @@ class RPLidarShm(Camera):
         self._max_reconnect_backoff_s = float(attrs.get("max_reconnect_backoff_s", 15.0))
         self._max_publish_gap_s = float(attrs.get("max_publish_gap_s", 5.0))
         self._serial_path = serial_path or None
-        self._stop = threading.Event()
         self._stall_abort.clear()
         self._scan_loop_progress_wall = None
         self._kick_count = 0
@@ -129,6 +136,11 @@ class RPLidarShm(Camera):
         self._errors = 0
         self._reconnects = 0
         self._last_error = None
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError(
+                f"rplidar {self.name!r} scan thread still running after close_sync"
+            )
+        self._stop.clear()
         self._open_device()
         self._shm = pcshm.open_writer(self._shm_name, region)
         self._thread = threading.Thread(
@@ -230,7 +242,8 @@ class RPLidarShm(Camera):
                 if device is None:
                     self._stall_abort.clear()
                     if not self._try_reconnect(backoff):
-                        time.sleep(backoff)
+                        if self._wait_backoff(backoff):
+                            return
                         backoff = min(backoff * 2.0, self._max_reconnect_backoff_s)
                         continue
                     backoff = self._reconnect_backoff_s
@@ -262,7 +275,8 @@ class RPLidarShm(Camera):
                     LOGGER.error("rplidar %r scan loop exited: %s", self.name, exc)
                     self._close_device()
                     self._stall_abort.clear()
-                    time.sleep(backoff)
+                    if self._wait_backoff(backoff):
+                        return
                     backoff = min(backoff * 2.0, self._max_reconnect_backoff_s)
         finally:
             self._close_device()
@@ -378,10 +392,26 @@ class RPLidarShm(Camera):
 
     def close_sync(self) -> None:
         self._stop.set()
+        self._stall_abort.set()
         self._close_device()
-        for thread in (self._thread, self._stall_thread):
-            if thread is not None:
-                thread.join(timeout=self._timeout_s + 2.0)
+        join_timeout = self._join_timeout_s()
+        scan_thread = self._thread
+        stall_thread = self._stall_thread
+        for thread in (scan_thread, stall_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=join_timeout)
+        alive = [
+            t.name
+            for t in (scan_thread, stall_thread)
+            if t is not None and t.is_alive()
+        ]
+        if alive:
+            LOGGER.error(
+                "rplidar %r background threads still running after close: %s",
+                self.name,
+                ", ".join(alive),
+            )
+            return
         self._thread = None
         self._stall_thread = None
         if self._shm is not None:

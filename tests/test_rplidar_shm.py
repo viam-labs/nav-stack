@@ -376,6 +376,83 @@ def test_kick_scan_loop_closes_device_without_spawning_thread():
     fake.close.assert_called_once()
 
 
+def test_close_sync_interrupts_long_backoff():
+    pytest.importorskip("viam")
+    import threading
+
+    from src.models.rplidar_shm import RPLidarShm
+
+    class FailDevice:
+        port = "/dev/fake"
+        baudrate = 115200
+        info = {"model": proto.MODEL_A1}
+
+        def iter_scans(self, **kwargs):
+            raise proto.RPLidarError("uart died")
+
+        def stop(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    cam = RPLidarShm("lidar")
+    stop = cam._stop
+    cam._warmup_scans = 0
+    cam._reconnect_backoff_s = 15.0
+    cam._max_reconnect_backoff_s = 15.0
+    cam._timeout_s = 2.0
+    cam._motor_warmup_s = 0.0
+    cam._shm_name = "/viam-pc-close-backoff"
+    cam._shm = pcshm.open_writer(cam._shm_name)
+    fake = FailDevice()
+    cam._device = fake
+    cam._info = dict(fake.info)
+
+    thread = threading.Thread(target=cam._scan_loop, daemon=True)
+    cam._thread = thread
+    thread.start()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and cam._errors < 1:
+        time.sleep(0.05)
+    assert cam._errors >= 1
+
+    t0 = time.monotonic()
+    cam.close_sync()
+    elapsed = time.monotonic() - t0
+
+    assert cam._stop is stop
+    assert elapsed < 2.0
+    assert not thread.is_alive()
+    assert cam._thread is None
+
+
+def test_join_timeout_covers_reconnect_backoff():
+    pytest.importorskip("viam")
+
+    from src.models.rplidar_shm import RPLidarShm
+
+    cam = RPLidarShm("lidar")
+    cam._max_reconnect_backoff_s = 15.0
+    cam._timeout_s = 2.0
+    cam._motor_warmup_s = 1.0
+    assert cam._join_timeout_s() >= cam._max_reconnect_backoff_s + cam._timeout_s
+
+
+def test_reconfigure_reuses_stop_event():
+    pytest.importorskip("viam")
+
+    from src.models.rplidar_shm import RPLidarShm
+
+    cam = RPLidarShm("lidar")
+    stop = cam._stop
+    cam._stop.set()
+    cam.close_sync()
+    cam._stop.clear()
+    assert cam._stop is stop
+    assert not cam._stop.is_set()
+
+
 def test_publish_scan_writes_shm_pcd():
     pytest.importorskip("viam")
     from src.models.rplidar_shm import RPLidarShm

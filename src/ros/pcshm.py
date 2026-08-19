@@ -17,7 +17,9 @@ Names are POSIX shm_open names such as ``/viam-pc-lidar``.
 
 from __future__ import annotations
 
+import os
 import struct
+import sys
 import time
 from multiprocessing import shared_memory
 from typing import Optional, Tuple
@@ -41,6 +43,17 @@ def normalize_name(name: str) -> str:
     if name.startswith("/"):
         return name
     return "/" + name
+
+
+def object_identity(name: str) -> Optional[int]:
+    """Return a Linux ``/dev/shm`` inode when the object exists, else ``None``."""
+    if sys.platform != "linux":
+        return None
+    path = f"/dev/shm/{_python_shm_name(name)}"
+    try:
+        return os.stat(path).st_ino
+    except OSError:
+        return None
 
 
 def _python_shm_name(name: str) -> str:

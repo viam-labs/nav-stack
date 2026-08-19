@@ -143,6 +143,53 @@ def test_read_lidar_shm_required_raises_when_empty():
         writer.close()
 
 
+def test_client_remaps_after_writer_restart():
+    name = "/viam-pc-restart"
+    client = ShmPointCloudClient()
+    w1 = pcshm.open_writer(name)
+    stale_ns = 1_000_000_000
+    try:
+        w1.write(_MIN_PCD, timestamp_ns=stale_ns)
+        assert client.try_read(name, max_age_s=2.0) is None
+        assert client.status()[name]["stale_hits"] >= 1
+        assert client.status()[name]["remaps"] >= 1
+    finally:
+        w1.close()
+
+    w2 = pcshm.open_writer(name)
+    try:
+        w2.write(_MIN_PCD, timestamp_ns=time.time_ns())
+        got = client.try_read(name, max_age_s=2.0)
+        assert got is not None
+        stats = client.status()[name]
+        assert stats["hits"] >= 1
+        assert stats["remaps"] >= 1
+    finally:
+        w2.close()
+        client.close()
+
+
+def test_client_remaps_on_no_frame_after_writer_restart():
+    name = "/viam-pc-restart2"
+    client = ShmPointCloudClient()
+    w1 = pcshm.open_writer(name)
+    try:
+        w1.write(_MIN_PCD, timestamp_ns=time.time_ns())
+        assert client.try_read(name) is not None
+    finally:
+        w1.close()
+
+    w2 = pcshm.open_writer(name)
+    try:
+        w2.write(_MIN_PCD, timestamp_ns=time.time_ns())
+        got = client.try_read(name)
+        assert got is not None
+        assert client.status()[name]["hits"] >= 2
+    finally:
+        w2.close()
+        client.close()
+
+
 def test_read_lidar_rejects_stale_shm_frame():
     name = "/viam-pc-navio-stale"
     writer = pcshm.open_writer(name)
