@@ -360,7 +360,7 @@ class RPLidarShm(Camera):
     ) -> Mapping[str, object]:
         cmd = command.get("command") if isinstance(command, Mapping) else None
         if cmd == "get_laser_scan":
-            raise NotImplementedError("rplidar does not support get_laser_scan")
+            raise NotImplementedError("rplidar get_laser_scan is not implemented")
         if cmd == "restart":
             self._kick_scan_loop("do_command restart")
             return {"status": "restarting", "kick_count": self._kick_count}

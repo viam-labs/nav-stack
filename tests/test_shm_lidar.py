@@ -230,3 +230,44 @@ def test_read_lidar_rejects_stale_shm_frame():
     finally:
         client.close()
         writer.close()
+
+
+def test_read_lidar_stale_shm_does_not_fallback_when_not_required():
+    """shm_required=false must still refuse gRPC fallback for stale frames."""
+    name = "/viam-pc-navio-stale-opt"
+    writer = pcshm.open_writer(name)
+    client = ShmPointCloudClient()
+    cam = MagicMock()
+    cam.get_point_cloud = AsyncMock(return_value=(_MIN_PCD, "pointcloud/pcd"))
+    stale_ns = 1_000_000_000
+    try:
+        writer.write(_MIN_PCD, timestamp_ns=stale_ns)
+        cfg = SlamConfig.from_dict(
+            {
+                "base": "b",
+                "lidars": [
+                    {
+                        "name": "front",
+                        "scan_source": "point_cloud",
+                        "shm_name": name,
+                        "shm_required": False,
+                    }
+                ],
+                "sensor_read_timeout_s": 1.0,
+                "scan_max_age_s": 2.0,
+            }
+        )
+        io = build_io_provider(
+            base=MagicMock(),
+            cameras={"front": cam},
+            cfg=cfg,
+            logger=MagicMock(),
+            shm_lidar=client,
+        )
+        with pytest.raises(RuntimeError, match="frame too old"):
+            asyncio.run(io.read_lidar_points("front"))
+        cam.get_point_cloud.assert_not_called()
+        assert client.status()[name]["grpc_fallbacks"] == 0
+    finally:
+        client.close()
+        writer.close()

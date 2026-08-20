@@ -78,12 +78,63 @@ def test_auto_mode_skips_rplidar_status_docommand():
         writer.close()
 
 
+def test_auto_mode_skips_after_rplidar_not_implemented():
+    """RPLidarShm raises NotImplementedError; auto mode must stop re-probing."""
+    name = "/viam-pc-rplidar-nie"
+    writer = pcshm.open_writer(name)
+    client = ShmPointCloudClient()
+    cam = MagicMock()
+    cam.do_command = AsyncMock(
+        side_effect=NotImplementedError("rplidar does not support get_laser_scan")
+    )
+    cam.get_point_cloud = AsyncMock(return_value=(_MIN_PCD, "pointcloud/pcd"))
+    logger = MagicMock()
+    skip: set[str] = set()
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidars": [{"name": "lidar", "scan_source": "auto", "shm_name": name}],
+            "sensor_read_timeout_s": 1.0,
+        }
+    )
+    io = build_io_provider(
+        base=MagicMock(),
+        cameras={"lidar": cam},
+        cfg=cfg,
+        logger=logger,
+        shm_lidar=client,
+        skip_get_laser_scan=skip,
+    )
+    try:
+        writer.write(_MIN_PCD, timestamp_ns=time.time_ns())
+        assert asyncio.run(io.read_lidar_points("lidar")).sensor.shape[0] == 1
+        assert "lidar" in skip
+        assert asyncio.run(io.read_lidar_points("lidar")).sensor.shape[0] == 1
+        assert cam.do_command.await_count == 1
+        logger.warning.assert_not_called()
+    finally:
+        client.close()
+        writer.close()
+
+
 def test_rplidar_get_laser_scan_raises_not_implemented():
     from src.models.rplidar_shm import RPLidarShm
+    from src.ros.sensor_io import get_laser_scan_not_implemented
 
     cam = RPLidarShm("lidar")
-    with pytest.raises(NotImplementedError, match="get_laser_scan"):
+    with pytest.raises(NotImplementedError) as ei:
         asyncio.run(cam.do_command({"command": "get_laser_scan"}))
+    assert get_laser_scan_not_implemented(ei.value)
+
+
+def test_get_laser_scan_not_implemented_matches_legacy_rplidar_message():
+    from src.ros.sensor_io import get_laser_scan_not_implemented
+
+    # Historical message before "not implemented" was in the text.
+    assert get_laser_scan_not_implemented(
+        NotImplementedError("rplidar does not support get_laser_scan")
+    )
+    assert get_laser_scan_not_implemented(RuntimeError("connection reset")) is False
 
 
 def test_shm_pointcloud_get_point_cloud_waits_for_producer():

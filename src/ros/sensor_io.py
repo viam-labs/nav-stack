@@ -33,12 +33,22 @@ from .shm_lidar import ShmPointCloudClient
 
 
 def get_laser_scan_not_implemented(exc: BaseException) -> bool:
+    # Prefer the exception type: RPLidarShm raises NotImplementedError with a
+    # message that historically said "does not support" (no "not implemented").
+    if isinstance(exc, NotImplementedError):
+        return True
     msg = str(exc).lower()
     return (
         "not implemented" in msg
+        or "does not support get_laser_scan" in msg
         or "docommand not implemented" in msg
         or "did not return get_laser_scan" in msg
     )
+
+
+def _shm_error_is_stale(detail: object) -> bool:
+    """True when shm miss is a rejected old frame (must not gRPC-fallback)."""
+    return "frame too old" in str(detail).lower()
 
 
 def is_mir_laser_scan_payload(payload: Mapping) -> bool:
@@ -117,9 +127,12 @@ def build_io_provider(
                 if got is not None:
                     raw, age_s = got
                     return await _points_from_pcd(raw, age_s=age_s)
-                if lidar_cfg.shm_required:
-                    stats = client.status().get(pcshm.normalize_name(shm_name), {})
-                    detail = stats.get("last_error") or "no complete frame"
+                stats = client.status().get(pcshm.normalize_name(shm_name), {})
+                detail = stats.get("last_error") or "no complete frame"
+                # Stale frames must not fall back to get_point_cloud: that path
+                # returns the same cached PCD with age_s unset, so the bridge
+                # scan_max_age_s gate never fires and a dead writer freezes SLAM.
+                if lidar_cfg.shm_required or _shm_error_is_stale(detail):
                     raise RuntimeError(
                         f"lidar {name} shm {shm_name!r} unavailable: {detail}"
                     )
