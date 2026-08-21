@@ -68,6 +68,8 @@ msg = latest["msg"]
 if msg is None:
     print(f"\nFAIL: no message on {MAP_TOPIC} within 6s.")
     print("  -> adapter not publishing /map (get_grid empty/failed?), or QoS/discovery mismatch.")
+    node.destroy_node()
+    rclpy.shutdown()
     sys.exit(1)
 
 # Robot pose in the map frame (best-effort; a few spins to fill the TF buffer).

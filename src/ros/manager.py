@@ -635,7 +635,6 @@ class RosManager:
         # stamp) and Nav2 TF lookups fail with extrapolation errors.
         rp.setdefault("transform_timeout", 0.0)
         rp.setdefault("tf_buffer_duration", 60.0)
-        rp.setdefault("transform_publish_period", 0.02)
         if self._slam_cfg.heading_only_odom:
             rp.setdefault("use_odometry", False)
             rp.setdefault("minimum_travel_distance", 0.0)
@@ -1544,7 +1543,12 @@ class RosManager:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 proc.kill()
-            time.sleep(0.2)
+            # Reap after SIGKILL so the child cannot linger as a zombie until
+            # the Popen object is garbage-collected.
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
 
     def _clear_localization_buffer(self) -> None:
         """Best-effort clear of stale localization history before reseeding."""

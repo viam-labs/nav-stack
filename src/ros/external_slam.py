@@ -201,7 +201,7 @@ class ExternalSlamPublisher:
             self._map_pub.publish(grid)
             self._last_grid_key = key
 
-    def _occupancy_from_get_grid(self, resp: dict) -> Optional[OccupancyGrid]:
+    def _occupancy_from_get_grid(self, resp: dict) -> Optional["OccupancyGrid"]:  # noqa: F821 - lazy rclpy import
         parsed = parse_get_grid(resp)
         if parsed is None:
             self._log("get_grid: malformed/inconsistent response; skipping")

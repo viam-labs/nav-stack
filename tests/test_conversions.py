@@ -416,6 +416,29 @@ def test_parse_heading_sensor_readings_euler():
     assert math.isclose(heading, 1.2)
 
 
+def test_parse_heading_small_degree_values_convert():
+    """Keys named *_deg are always degrees, even below the 2*pi heuristic."""
+    heading = conv.parse_heading_sensor_readings({"yaw_deg": 5.0})
+    assert math.isclose(heading, math.radians(5.0))
+    heading = conv._parse_heading_rad_from_readings(
+        {"odom_yaw_deg": 3.0}, odom_only=True
+    )
+    assert math.isclose(heading, math.radians(3.0))
+
+
+def test_parse_odom_twist_prefers_angular_velocity_for_yaw_rate():
+    """linear_velocity.z is vertical speed, not turn rate; use angular_velocity."""
+    vx, vy, vtheta = conv.parse_odom_twist_from_readings(
+        {
+            "linear_velocity": {"x": 1.0, "y": 0.0, "z": 0.0},
+            "angular_velocity": {"x": 0.0, "y": 0.0, "z": 30.0},  # deg/s
+        }
+    )
+    assert math.isclose(vx, 1.0)
+    assert math.isclose(vy, 0.0)
+    assert math.isclose(vtheta, math.radians(30.0))
+
+
 def test_parse_odom_from_readings_viam_vector3_objects():
     """Viam often returns Vector3/Euler objects, not plain dicts."""
 
@@ -508,7 +531,6 @@ def test_base_link_cloud_to_lidar_scan():
 def test_merge_accumulated_rotation_only():
     pts = np.array([[2.0, 0.0, 1.0]])
     old = conv.Pose2D(0.0, 0.0, math.pi / 4)
-    current = conv.Pose2D(0.0, 0.0, 0.0)
     merged = conv.merge_accumulated_rotation_only([(pts, old)], 0.0)
     assert merged.shape == (1, 3)
     assert math.isclose(merged[0, 0], math.sqrt(2.0), abs_tol=0.01)

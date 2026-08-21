@@ -66,7 +66,7 @@ class ObstacleConfig:
 
 
 def normalize_angle(rad: float) -> float:
-    return math.atan2(math.sin(rad), math.cos(rad))
+    return conv.normalize_angle(rad)
 
 
 def cone_min_range(scan: conv.LaserScan2D, lo_rad: float, hi_rad: float) -> float:

@@ -8,7 +8,6 @@ import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 
 
 class _FakeNode:
@@ -69,9 +68,7 @@ def _still_bridge(**kwargs):
         _still_since=None,
         _dwell_pose0=None,
         _scan_published_this_stop=False,
-        _last_still_scan_yaw=None,
         _last_still_scan_pose=None,
-        _last_still_scan_wall=None,
         _last_odom_ok_wall=9999.0,
         _odom_fail_streak=0,
         _last_odom_error=None,

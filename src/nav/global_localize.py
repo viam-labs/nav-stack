@@ -38,9 +38,6 @@ class OccupancyMap:
         row = int(math.floor((y_m - self.origin_y) / self.resolution))
         return row, col
 
-    def occupied_mask(self, threshold: int = 65) -> np.ndarray:
-        return self.grid >= threshold
-
     def known_mask(self) -> np.ndarray:
         return self.grid >= 0
 
@@ -121,24 +118,6 @@ def _read_pgm(path: Path) -> np.ndarray:
     if not raw.startswith(b"P5"):
         raise ValueError(f"unsupported PGM format in {path}")
 
-    header_end = 0
-    parts: List[bytes] = []
-    for _ in range(3):
-        while header_end < len(raw):
-            if raw[header_end : header_end + 1] in b" \t\r\n":
-                header_end += 1
-                continue
-            if raw[header_end : header_end + 1] == b"#":
-                while header_end < len(raw) and raw[header_end : header_end + 1] != b"\n":
-                    header_end += 1
-                continue
-            start = header_end
-            while header_end < len(raw) and raw[header_end : header_end + 1] not in b" \t\r\n":
-                header_end += 1
-            parts.append(raw[start:header_end])
-            break
-
-    # Re-scan header more robustly.
     tokens: List[str] = []
     i = 0
     while i < len(raw) and len(tokens) < 4:
@@ -227,14 +206,6 @@ def scan_endpoints_base_link(scan: conv.LaserScan2D) -> np.ndarray:
     if pts.size == 0:
         return np.empty((0, 2))
     return pts
-
-
-def _normalize_angle(theta: float) -> float:
-    while theta > math.pi:
-        theta -= 2.0 * math.pi
-    while theta < -math.pi:
-        theta += 2.0 * math.pi
-    return theta
 
 
 def _score_pose(
@@ -402,7 +373,7 @@ def _iter_pose_grid(
             if (x - center_x) ** 2 + (y - center_y) ** 2 > radius_m**2 + 1e-9:
                 continue
             for it in range(-yaw_steps, yaw_steps + 1):
-                theta = _normalize_angle(center_theta + it * yaw_step_rad)
+                theta = conv.normalize_angle(center_theta + it * yaw_step_rad)
                 yield conv.Pose2D(x, y, theta)
 
 
@@ -650,15 +621,15 @@ def choose_yaw_or_flip(
         combined = float(ep.score) + ray_weight * ((2.0 * ray_q) - 1.0)
         return combined, float(ep.score), float(ray_mae)
 
-    flip = conv.Pose2D(pose.x, pose.y, _normalize_angle(pose.theta + math.pi))
+    flip = conv.Pose2D(pose.x, pose.y, conv.normalize_angle(pose.theta + math.pi))
     c0, s0, m0 = _eval(pose)
     c1, s1, m1 = _eval(flip)
 
     near_tie = abs(c0 - c1) <= score_margin and abs(m0 - m1) <= ray_mae_slack_m
     prefer_flip = c1 > c0
     if near_tie and reference_theta is not None:
-        d0 = abs(_normalize_angle(pose.theta - reference_theta))
-        d1 = abs(_normalize_angle(flip.theta - reference_theta))
+        d0 = abs(conv.normalize_angle(pose.theta - reference_theta))
+        d1 = abs(conv.normalize_angle(flip.theta - reference_theta))
         prefer_flip = d1 < d0
     elif abs(c0 - c1) <= score_margin:
         # Score tie but MAE differs — trust the tighter ray fit.

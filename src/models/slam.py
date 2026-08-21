@@ -57,11 +57,6 @@ RELOCALIZE_POSITION_VARIANCE_M2 = 4.0
 RELOCALIZE_YAW_VARIANCE_RAD2 = (math.pi / 4) ** 2
 
 
-def _normalize_angle(rad: float) -> float:
-    """Wrap an angle to [-pi, pi]."""
-    return math.atan2(math.sin(rad), math.cos(rad))
-
-
 class RosSlam(SLAM):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "nav-stack"), "slam")
 
@@ -184,6 +179,19 @@ class RosSlam(SLAM):
             task.cancel()
         self._mapping_revisit_task = None
 
+    def _reschedule_mode_watchdogs(self) -> None:
+        """Restart mode-gated background tasks after a runtime mode switch.
+
+        ``start_mapping`` / ``start_localizing`` change ``cfg.mode`` outside
+        reconfigure; without this, e.g. periodic relocalize would never start
+        after switching to localizing.
+        """
+        loop = asyncio.get_event_loop()
+        self._cancel_periodic_relocalize_task()
+        self._cancel_mapping_revisit_task()
+        self._schedule_periodic_relocalize(loop)
+        self._schedule_mapping_revisit(loop)
+
     def _schedule_mapping_revisit(self, loop: asyncio.AbstractEventLoop) -> None:
         cfg = self._cfg
         if (
@@ -235,7 +243,7 @@ class RosSlam(SLAM):
                 {"status": "skipped", "reason": "no_pose_in_map"}
             )
         flipped = conv.Pose2D(
-            current.x, current.y, _normalize_angle(current.theta + math.pi)
+            current.x, current.y, conv.normalize_angle(current.theta + math.pi)
         )
         applied = await asyncio.to_thread(mgr.apply_map_pose_correction, flipped)
         out: dict = {
@@ -594,7 +602,7 @@ class RosSlam(SLAM):
 
         shift_m = math.hypot(result.pose.x - current.x, result.pose.y - current.y)
         shift_deg = abs(
-            math.degrees(_normalize_angle(result.pose.theta - current.theta))
+            math.degrees(conv.normalize_angle(result.pose.theta - current.theta))
         )
         drifted = (
             shift_m >= cfg.mapping_revisit_min_shift_m
@@ -769,7 +777,7 @@ class RosSlam(SLAM):
         )
         shift_deg = abs(
             math.degrees(
-                _normalize_angle(
+                conv.normalize_angle(
                     float(matched_pose.get("theta", 0.0)) - current.theta
                 )
             )
@@ -1320,6 +1328,9 @@ class RosSlam(SLAM):
         if mode == MODE_MAPPING and mgr.slam_running() and mgr.reset_slam_map():
             if self._cfg is not None:
                 self._cfg.mode = mode
+            # The in-place reset wiped the pose graph, so pose-graph-relative
+            # slice/keyframe references are stale too.
+            self._reset_slice_library()
             return
         self._start_mode(mode)
 
@@ -1476,6 +1487,7 @@ class RosSlam(SLAM):
             # loop: the bridge marshals odom/lidar/cmd_vel onto it, so blocking
             # here stalls TF and scans.
             await asyncio.to_thread(self._start_mode, MODE_MAPPING)
+            self._reschedule_mode_watchdogs()
             return {"status": "mapping", "map": store.get_active_map_name()}
 
         if cmd == "start_localizing":
@@ -1486,6 +1498,7 @@ class RosSlam(SLAM):
             if not handle or not handle.has_serialized_map():
                 raise ValueError("active map has no saved data; map it first")
             await asyncio.to_thread(self._start_mode, MODE_LOCALIZING)
+            self._reschedule_mode_watchdogs()
             result: dict[str, ValueTypes] = {
                 "status": "localizing",
                 "map": store.get_active_map_name(),

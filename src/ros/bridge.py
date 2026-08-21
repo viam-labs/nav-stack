@@ -59,7 +59,6 @@ except Exception:  # pragma: no cover - nav2 may be absent in mapping-only insta
 
 from ..config import (
     IMU_ODOM_ACCEL_ONLY,
-    IMU_ODOM_COAST,
     IMU_ODOM_NONE,
     LIDAR_SCAN_POINT_CLOUD,
     NavConfig,
@@ -148,7 +147,6 @@ class BridgeNode(Node):
         self._frames = slam_cfg.frames
         self._nav_active = False
         self._last_cmd_time = 0.0
-        self._last_odom_stamp = None
         self._cmd_timeout = nav_cfg.cmd_vel_timeout if nav_cfg else 0.5
         self._last_cmd_vel_wall = 0.0
         self._last_cmd_vel_nav2: Dict = {}
@@ -234,9 +232,7 @@ class BridgeNode(Node):
         self._still_since: Optional[float] = None
         self._dwell_pose0: Optional[tuple] = None
         self._scan_published_this_stop = False
-        self._last_still_scan_yaw: Optional[float] = None
         self._last_still_scan_pose: Optional[tuple] = None
-        self._last_still_scan_wall: Optional[float] = None
         self._map_when_still_status = "disabled"
         self._last_odom_ok_wall = time.monotonic()
         self._odom_fail_streak = 0
@@ -425,10 +421,6 @@ class BridgeNode(Node):
         self._compute_path_action: Optional[ActionClient] = None
         self._goal_handle = None
         self._nav_cli_proc: Optional[subprocess.Popen] = None
-        self._nav_goal_lock = threading.Lock()
-        self._pending_nav_goal: Optional[tuple] = None
-        self._executor_lock = threading.Lock()
-        self._executor_queue: List = []
         self._last_feedback: Dict = {}
         self._last_result_status: Optional[str] = None
         self._active_nav_goal: Optional[Dict[str, float]] = None
@@ -530,34 +522,6 @@ class BridgeNode(Node):
                     pass
 
         return wrapped
-
-    def _submit_on_executor(self, fn, timeout: float = 10.0):
-        """Run ``fn`` on the rclpy executor thread (safe for publishers/actions)."""
-        done = threading.Event()
-        outcome: Dict[str, object] = {}
-
-        def wrapped() -> None:
-            try:
-                outcome["result"] = fn()
-            except Exception as exc:  # noqa: BLE001 - propagate to caller thread
-                outcome["exc"] = exc
-            finally:
-                done.set()
-
-        with self._executor_lock:
-            self._executor_queue.append(wrapped)
-        if not done.wait(timeout=timeout):
-            raise RuntimeError("ROS executor dispatch timed out")
-        if "exc" in outcome:
-            raise outcome["exc"]  # type: ignore[misc]
-        return outcome.get("result")
-
-    def _flush_executor_queue(self) -> None:
-        with self._executor_lock:
-            queue = self._executor_queue[:]
-            self._executor_queue.clear()
-        for fn in queue:
-            fn()
 
     def _bounded_odom_dt(self, dt: float) -> float:
         """Bound odom integration dt to avoid large stale-velocity jumps."""
@@ -1026,21 +990,14 @@ class BridgeNode(Node):
 
     def _still_gate_commit(self) -> None:
         """Record that a still-scan was published for this stop."""
-        now = time.monotonic()
         x, y, yaw = self._gate_pose_tuple()
         self._scan_published_this_stop = True
-        self._last_still_scan_yaw = yaw
         self._last_still_scan_pose = (x, y, yaw)
-        self._last_still_scan_wall = now
         self._map_when_still_status = "publishing"
 
     def set_still_keyframe_hook(self, hook: Optional[Callable]) -> None:
         """Register callback ``(scan, band_points, map_pose)`` after still publish."""
         self._still_keyframe_hook = hook
-
-    def _should_publish_map_when_still(self) -> bool:
-        """Compatibility wrapper: readiness only (commit is separate)."""
-        return self._still_gate_ready()
 
     # -- scans ---------------------------------------------------------------
     def _on_scan_timer(self) -> None:
@@ -1368,7 +1325,11 @@ class BridgeNode(Node):
         msg.header.frame_id = frame_id
         msg.angle_min = float(scan.angle_min)
         msg.angle_increment = float(scan.angle_increment)
-        msg.angle_max = float(scan.angle_min + scan.angle_increment * len(scan.ranges))
+        # ROS convention: angle_max is the angle of the LAST beam, i.e.
+        # angle_min + (N-1) * increment (beam i sits at angle_min + i*increment).
+        msg.angle_max = float(
+            scan.angle_min + scan.angle_increment * max(len(scan.ranges) - 1, 0)
+        )
         msg.range_min = float(scan.range_min)
         msg.range_max = float(scan.range_max if math.isfinite(scan.range_max) else 100.0)
         ranges = np.asarray(scan.ranges, dtype=float)
@@ -1501,7 +1462,6 @@ class BridgeNode(Node):
         # Snapshot the reference once: the scan timer and odom timer run on
         # different executor threads, and Pose2D is reassigned atomically.
         pose = self._odom
-        self._last_odom_stamp = stamp
         self._last_odom_pub_wall = time.monotonic()
         self._last_twist = (vx, vy, vtheta)
         try:
@@ -1641,8 +1601,6 @@ class BridgeNode(Node):
         return out
 
     def _on_watchdog(self) -> None:
-        self._flush_executor_queue()
-        self._flush_pending_nav_goal()
         self._keep_odom_tf_alive()
         if not self._nav_active:
             return
@@ -1650,8 +1608,8 @@ class BridgeNode(Node):
             try:
                 self.record_cmd_vel(0.0, 0.0, 0.0, source="watchdog_stop")
                 self._run(self._io.stop_base())
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f"watchdog stop_base failed: {exc!r}")
 
     def odom_tf_age_s(self) -> float:
         """Seconds since the bridge last published odom + TF (liveness signal)."""
@@ -1687,8 +1645,8 @@ class BridgeNode(Node):
                 self._pending_cmd_vel = None
             try:
                 self._run(self._io.stop_base())
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f"stop_base on nav-inactive failed: {exc!r}")
 
     # -- costmap filter masks ------------------------------------------------
     def publish_mask(
@@ -1968,30 +1926,6 @@ class BridgeNode(Node):
                 pass
             self._goal_handle = None
 
-    def _flush_pending_nav_goal(self) -> None:
-        with self._nav_goal_lock:
-            pending = self._pending_nav_goal
-            if pending is None:
-                return
-            x, y, theta, done, outcome = pending
-            self._pending_nav_goal = None
-        try:
-            self._cancel_inflight_nav()
-            self._ensure_nav_action_client()
-            outcome["ok"] = self._publish_nav_goal(x, y, theta)
-        except Exception as exc:  # noqa: BLE001 - propagate to caller thread
-            outcome["exc"] = exc
-        finally:
-            done.set()
-
-    def _dispatch_rclpy_nav_goal(self, x: float, y: float, theta: float) -> bool:
-        # Force dispatch onto executor and wait briefly so we fail fast instead
-        # of reporting "navigating" for a goal that never left this process.
-        res = self._submit_on_executor(
-            lambda: self._publish_nav_goal(x, y, theta), timeout=3.0
-        )
-        return bool(res)
-
     def _wait_for_rclpy_action_server(self) -> bool:
         if self._nav_action is None:
             return False
@@ -2114,16 +2048,12 @@ class BridgeNode(Node):
         return True
 
     def _watch_cli_nav_proc(self, proc: subprocess.Popen) -> None:
+        # No timeout: ``ros2 action send_goal`` blocks until the NavigateToPose
+        # result, so a long navigation legitimately keeps this process alive.
+        # cancel_nav()/_cancel_inflight_nav() terminate the process, which makes
+        # communicate() return (and reaps it).
         try:
-            output = proc.communicate(timeout=20.0)[0] or ""
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            self.get_logger().warn(
-                "nav CLI goal send timed out waiting for action server/result"
-            )
-            self._last_result_status = "failed"
-            self.set_nav_active(False)
-            return
+            output = proc.communicate()[0] or ""
         except Exception as exc:  # noqa: BLE001 - keep bridge alive on CLI errors
             self.get_logger().warn(f"nav CLI goal failed: {exc}")
             self._last_result_status = "failed"
@@ -2132,7 +2062,8 @@ class BridgeNode(Node):
         lowered = output.lower()
         if proc.returncode == 0 and "succeeded" in lowered:
             self._last_result_status = "succeeded"
-        elif "canceled" in lowered:
+        elif "canceled" in lowered or (proc.returncode or 0) < 0:
+            # Negative returncode means we terminated it (cancel / new goal).
             self._last_result_status = "canceled"
         elif "aborted" in lowered:
             self._last_result_status = "aborted"
@@ -2212,8 +2143,6 @@ class BridgeNode(Node):
         self.set_nav_active(False)
 
     def cancel_nav(self) -> None:
-        with self._nav_goal_lock:
-            self._pending_nav_goal = None
         if self._nav_cli_proc is not None and self._nav_cli_proc.poll() is None:
             self._nav_cli_proc.terminate()
             self._nav_cli_proc = None
@@ -2233,10 +2162,6 @@ class BridgeNode(Node):
             "pose": self._pose_dict(pose) if pose is not None else None,
             **self._last_feedback,
         }
-
-    def set_initial_odom(self, pose: conv.Pose2D) -> None:
-        """Reset wheel odometry (``odom -> base_link``). Not a map-frame pose."""
-        self._odom = pose
 
     def apply_map_pose_correction(self, map_pose: conv.Pose2D) -> Dict:
         """Shift the published odom pose so the slam prior lands on ``map_pose``.
@@ -2324,7 +2249,7 @@ class BridgeNode(Node):
         self._latest_map = None
         self._last_map_wall = 0.0
         self._map_sub = self.create_subscription(
-            OccupancyGrid, "map", self._on_map, _LATCHED_QOS, **sub_kwargs
+            OccupancyGrid, "map", self._guarded(self._on_map), _LATCHED_QOS, **sub_kwargs
         )
         return self._map_generation
 
@@ -2455,8 +2380,8 @@ class BridgeNode(Node):
             "pose_from_cache": tf_pose is None and cached_pose is not None,
         }
 
-    def _lookup_pose_in_map(self) -> Optional[conv.Pose2D]:
-        """Raw map->base_link TF lookup; None when unavailable (no cache fallback)."""
+    def _lookup_tf_pose_2d(self, child_frame: str) -> Optional[conv.Pose2D]:
+        """Raw map->``child_frame`` TF lookup as a 2D pose; None when unavailable."""
         try:
             lookup_kwargs: Dict = {}
             try:
@@ -2467,7 +2392,7 @@ class BridgeNode(Node):
                 pass
             tf = self._tf_buffer.lookup_transform(
                 self._frames.map,
-                self._frames.base_link,
+                child_frame,
                 rclpy.time.Time(),
                 **lookup_kwargs,
             )
@@ -2477,27 +2402,13 @@ class BridgeNode(Node):
         q = tf.transform.rotation
         return conv.Pose2D(t.x, t.y, conv.quaternion_to_yaw(q.x, q.y, q.z, q.w))
 
+    def _lookup_pose_in_map(self) -> Optional[conv.Pose2D]:
+        """Raw map->base_link TF lookup; None when unavailable (no cache fallback)."""
+        return self._lookup_tf_pose_2d(self._frames.base_link)
+
     def _lookup_map_to_odom(self) -> Optional[conv.Pose2D]:
         """map->odom TF from slam_toolbox (translation here drives pose_in_map)."""
-        try:
-            lookup_kwargs: Dict = {}
-            try:
-                from rclpy.duration import Duration
-
-                lookup_kwargs["timeout"] = Duration(seconds=0.2)
-            except ImportError:
-                pass
-            tf = self._tf_buffer.lookup_transform(
-                self._frames.map,
-                self._frames.odom,
-                rclpy.time.Time(),
-                **lookup_kwargs,
-            )
-        except Exception:  # noqa: BLE001
-            return None
-        t = tf.transform.translation
-        q = tf.transform.rotation
-        return conv.Pose2D(t.x, t.y, conv.quaternion_to_yaw(q.x, q.y, q.z, q.w))
+        return self._lookup_tf_pose_2d(self._frames.odom)
 
     def get_pose_in_map(self) -> Optional[conv.Pose2D]:
         pose = self._lookup_pose_in_map()

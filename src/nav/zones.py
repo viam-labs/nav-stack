@@ -22,8 +22,7 @@ from __future__ import annotations
 
 import json
 import math
-import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -33,17 +32,11 @@ KEEPOUT = "keepout"
 SPEED_LIMIT = "speed_limit"
 ZONE_TYPES = {KEEPOUT, SPEED_LIMIT}
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$")
+from .naming import validate_name
 
 
 def validate_zone_name(name: str) -> str:
-    name = (name or "").strip()
-    if not _NAME_RE.match(name):
-        raise ValueError(
-            f"invalid zone name {name!r}: use 1-64 chars of letters, digits, "
-            "space, dash or underscore"
-        )
-    return name
+    return validate_name(name, "zone")
 
 
 def _validate_geometry(geometry: Dict) -> Dict:

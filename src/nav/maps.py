@@ -18,24 +18,17 @@ switches its locations and zones too.
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$")
+from .naming import validate_name
 
 
 def validate_map_name(name: str) -> str:
-    name = (name or "").strip()
-    if not _NAME_RE.match(name):
-        raise ValueError(
-            f"invalid map name {name!r}: use 1-64 chars of letters, digits, "
-            "space, dash or underscore"
-        )
-    return name
+    return validate_name(name, "map")
 
 
 @dataclass
