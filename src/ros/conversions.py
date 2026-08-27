@@ -134,6 +134,17 @@ def _angle_to_rad(value: float) -> float:
     return float(value)
 
 
+def _heading_value_to_rad(key: str, value: float) -> float:
+    """Radians from a heading reading; keys named ``*_deg`` are always degrees.
+
+    Other keys are ambiguous, so fall back to the magnitude heuristic (small
+    values assumed radians). Without this, ``yaw_deg=5`` would stay ~5 rad.
+    """
+    if key.endswith("_deg"):
+        return math.radians(float(value))
+    return _angle_to_rad(float(value))
+
+
 def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
     return quaternion_to_yaw(float(x), float(y), float(z), float(w))
 
@@ -240,7 +251,7 @@ def _parse_heading_rad_from_readings(
     if odom_only:
         for tk in ("odom_yaw_deg", "odom_theta", "odom_yaw"):
             if tk in readings:
-                return _angle_to_rad(float(readings[tk]))
+                return _heading_value_to_rad(tk, float(readings[tk]))
         # mir-base publishes map-fused pose/heading separately from /odom. When
         # its wheel-odometry velocity fields are present, never treat IMU-style
         # orientation as the odom heading.
@@ -252,7 +263,7 @@ def _parse_heading_rad_from_readings(
 
     for tk in ("odom_yaw_deg", "odom_theta", "odom_yaw", "yaw_deg", "theta", "yaw", "heading", "pose_theta"):
         if tk in readings:
-            return _angle_to_rad(float(readings[tk]))
+            return _heading_value_to_rad(tk, float(readings[tk]))
     return _parse_orientation_yaw_rad(readings)
 
 
@@ -382,19 +393,28 @@ def parse_odom_twist_from_readings(readings: Mapping) -> Tuple[float, float, flo
             return float(lin_xyz[1]), -float(lin_xyz[0]), vtheta
         return 0.0, 0.0, vtheta
 
+    # Viam MovementSensor API: GetAngularVelocity is degrees/sec (same as
+    # mir-base's angular_velocity_dps). Do NOT treat this as rad/s.
+    ang_xyz = _xyz_from_reading(readings.get("angular_velocity"))
+
     for prefix in ("linear_velocity", "velocity"):
         block = readings.get(prefix)
         if isinstance(block, Mapping) and all(k in block for k in ("x", "y", "z")):
             # Ambiguous units (m/s vs mm/s). Prefer explicit ``linear_velocity_mps``.
+            if ang_xyz is not None:
+                # Yaw rate must come from angular_velocity when present; the
+                # linear block's z is vertical velocity, not a turn rate.
+                return (
+                    float(block["x"]),
+                    float(block["y"]),
+                    math.radians(float(ang_xyz[2])),
+                )
             return (
                 float(block["x"]),
                 float(block["y"]),
                 math.radians(float(block.get("z", 0.0))),
             )
 
-    # Viam MovementSensor API: GetAngularVelocity is degrees/sec (same as
-    # mir-base's angular_velocity_dps). Do NOT treat this as rad/s.
-    ang_xyz = _xyz_from_reading(readings.get("angular_velocity"))
     if ang_xyz is not None:
         vx = vy = 0.0
         lin_xyz = _xyz_from_reading(readings.get("linear_velocity"))
@@ -457,7 +477,7 @@ def parse_heading_sensor_readings(readings: Mapping) -> Optional[float]:
         return None
     for tk in ("odom_yaw_deg", "odom_theta", "odom_yaw", "yaw_deg", "theta", "yaw", "heading"):
         if tk in readings:
-            return _angle_to_rad(float(readings[tk]))
+            return _heading_value_to_rad(tk, float(readings[tk]))
     return _parse_orientation_yaw_rad(readings)
 
 
@@ -1627,17 +1647,6 @@ def base_link_cloud_to_lidar_scan(
     return points_to_scan(xy, **scan_kwargs)
 
 
-def ndarray_as_base_link_points(points: np.ndarray) -> LidarPoints:
-    """Wrap a base_link-frame point cloud for the bridge (PCD fallback path)."""
-    points = np.asarray(points, dtype=float)
-    if points.size == 0:
-        empty = np.empty((0, 3))
-        return LidarPoints(sensor=empty, base_link=empty)
-    if points.shape[1] == 2:
-        points = np.column_stack([points[:, 0], points[:, 1], np.zeros(len(points))])
-    return LidarPoints(sensor=points, base_link=points)
-
-
 def points_from_mir_laser_scan_payload(payload: Mapping) -> LidarPoints:
     """Parse ``viam-labs:mir-base:lidar`` ``get_laser_scan`` output into points."""
     sensor_chunks: List[np.ndarray] = []
@@ -1766,17 +1775,3 @@ def parse_pcd(raw: bytes) -> np.ndarray:
     return np.stack(
         [structured["x"], structured["y"], structured["z"]], axis=1
     ).astype(float)
-
-
-def pack_pcd_xyz_from_bytes(raw: bytes) -> np.ndarray:
-    """Parse a minimal binary PCD (x/y/z float32) back into an ``(N, 3)`` array.
-
-    Provided mainly for tests / round-tripping ``points_to_pcd``.
-    """
-    text = raw.split(b"DATA binary\n", 1)
-    if len(text) != 2:
-        raise ValueError("not a binary PCD produced by points_to_pcd")
-    body = text[1]
-    count = len(body) // 12
-    out = np.frombuffer(body[: count * 12], dtype=np.float32).reshape(-1, 3)
-    return out

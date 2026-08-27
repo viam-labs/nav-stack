@@ -4,8 +4,9 @@
 Duration wording ("for about 3.1 s") is ignored for change detection so a
 stable maneuver does not spam the console as the timer ticks.
 
-Defaults match the miti-nav2 machine. Prefer env vars over hardcoding keys:
+Required environment:
 
+  export VIAM_MACHINE_ADDRESS='<machine>.viam.cloud'
   export VIAM_API_KEY='...'
   export VIAM_API_KEY_ID='...'
   python scripts/watch_describe_motion.py
@@ -19,24 +20,27 @@ import sys
 from datetime import datetime
 
 from viam.robot.client import RobotClient
-from viam.services.generic import Generic as GenericService
+from viam.services.motion import MotionClient
 
 # Match trailing / mid-phrase duration clauses produced by motion_summary.
 _DURATION_RE = re.compile(
     r"\s+for about \d+(?:\.\d+)? s\b|\s+for \d+(?:\.\d+)? s\b"
 )
 
-ADDRESS = os.environ.get(
-    "VIAM_MACHINE_ADDRESS", "miti-nav2-main.q0s2f7mco8.viam.cloud"
-)
 NAV_NAME = os.environ.get("NAV_SERVICE_NAME", "nav")
 INTERVAL_S = float(os.environ.get("WATCH_INTERVAL_S", "1"))
 
-# Prefer env; fall back to the values from your Viam sample script.
-API_KEY = os.environ.get("VIAM_API_KEY", "s5x9mjenwda4s7dz4smudgzzerknomd3")
-API_KEY_ID = os.environ.get(
-    "VIAM_API_KEY_ID", "2028ab21-233d-4fec-97e4-36988dce7398"
-)
+
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(f"error: {name} environment variable is required")
+    return value
+
+
+ADDRESS = _require_env("VIAM_MACHINE_ADDRESS")
+API_KEY = _require_env("VIAM_API_KEY")
+API_KEY_ID = _require_env("VIAM_API_KEY_ID")
 
 
 def fingerprint(summary: str) -> str:
@@ -54,7 +58,8 @@ async def connect() -> RobotClient:
 
 async def main() -> None:
     async with await connect() as machine:
-        nav = GenericService.from_robot(machine, NAV_NAME)
+        # nav-stack navigation models register as rdk:service:motion.
+        nav = MotionClient.from_robot(machine, NAV_NAME)
         last_fp: str | None = None
         print(
             f"watching {NAV_NAME!r} on {ADDRESS} every {INTERVAL_S:g}s "

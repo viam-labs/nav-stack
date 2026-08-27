@@ -112,7 +112,13 @@ class RosNavigationExternal(NavServiceBase):
             else None
         )
 
-        # Rebuild the ROS stack from scratch on every reconfigure.
+        # Rebuild the ROS stack from scratch on every reconfigure. Signal any
+        # running simple-nav loop first (reconfigure is sync; cannot await it)
+        # and drop the bridge registration so nav-camera cannot render from the
+        # node we are about to shut down.
+        if self._simple_nav_cancel is not None:
+            self._simple_nav_cancel.set()
+        unregister_bridge(self.name)
         if self._manager is not None:
             self._manager.shutdown()
             self._manager = None
@@ -175,10 +181,12 @@ class RosNavigationExternal(NavServiceBase):
         )
         self._runtime = SlamRuntime(self._manager, map_store, bridge_cfg, loc_check)
 
-        # Publish the live bridge node so a nav-camera can find it and render
-        # this nav's costmap/plans.
-        if node is not None:
-            register_bridge(self.name, node)
+        # Publish a provider so a nav-camera always sees this service's current
+        # bridge node (survives manager rebuilds and a temporarily-None node).
+        register_bridge(
+            self.name,
+            lambda: self._manager.node if self._manager is not None else None,
+        )
 
         self._manager.set_nav_config(ext.nav)
         params_path = self._write_nav2_params(ext.nav)
@@ -193,6 +201,8 @@ class RosNavigationExternal(NavServiceBase):
         )
 
     async def close(self) -> None:
+        # Stop any in-flight simple-nav loop before tearing the manager down.
+        await self._cancel_simple_nav()
         unregister_bridge(self.name)
         if self._manager is not None:
             self._manager.shutdown()

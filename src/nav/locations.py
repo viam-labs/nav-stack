@@ -6,22 +6,15 @@ convention) in the map's ``locations.json``.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$")
+from .naming import validate_name
 
 
 def validate_location_name(name: str) -> str:
-    name = (name or "").strip()
-    if not _NAME_RE.match(name):
-        raise ValueError(
-            f"invalid location name {name!r}: use 1-64 chars of letters, digits, "
-            "space, dash or underscore"
-        )
-    return name
+    return validate_name(name, "location")
 
 
 @dataclass

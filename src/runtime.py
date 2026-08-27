@@ -8,7 +8,7 @@ Nav2 against the same rclpy context and read the active map's locations/zones.
 from __future__ import annotations
 
 from threading import Lock
-from typing import Dict, Optional, Optional
+from typing import Dict, Optional
 
 
 class SlamRuntime:
@@ -51,14 +51,16 @@ def get_slam(name: str) -> Optional[SlamRuntime]:
 # Live bridge nodes, keyed by the *navigation* service name that owns/drives
 # them. Published so the ``nav-camera`` component can find the running
 # ``BridgeNode`` in-process and read Nav2 costmap/plan/pose data for rendering,
-# without a Viam RPC round-trip. Value is a ``ros.bridge.BridgeNode`` (typed as
-# ``object`` here to keep this module import-light and ROS-free).
+# without a Viam RPC round-trip. Value is a ``ros.bridge.BridgeNode`` or a
+# zero-arg callable returning the current node (so a SLAM restart that swaps
+# the manager/node cannot leave the registry pointing at a dead node). Typed
+# as ``object`` here to keep this module import-light and ROS-free.
 _BRIDGES: Dict[str, object] = {}
 
 
-def register_bridge(nav_name: str, node: object) -> None:
+def register_bridge(nav_name: str, node_or_provider: object) -> None:
     with _LOCK:
-        _BRIDGES[nav_name] = node
+        _BRIDGES[nav_name] = node_or_provider
 
 
 def unregister_bridge(nav_name: str) -> None:
@@ -68,4 +70,10 @@ def unregister_bridge(nav_name: str) -> None:
 
 def get_bridge(nav_name: str) -> Optional[object]:
     with _LOCK:
-        return _BRIDGES.get(nav_name)
+        entry = _BRIDGES.get(nav_name)
+    if callable(entry):
+        try:
+            return entry()
+        except Exception:  # noqa: BLE001 - a failing provider means no bridge
+            return None
+    return entry

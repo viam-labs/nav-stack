@@ -18,7 +18,7 @@ runtime resolution.
 """
 from __future__ import annotations
 
-from typing import ClassVar, Mapping, Optional, Sequence, cast
+from typing import ClassVar, Mapping, Sequence, cast
 
 from typing_extensions import Self
 
@@ -98,10 +98,21 @@ class RosNavigation(NavServiceBase):
                 "and started before the navigation service"
             )
         runtime.manager.set_nav_config(cfg)
-        # Publish the shared bridge node so a nav-camera can find it and render
-        # this nav's costmap/plans.
-        if runtime.manager.node is not None:
-            register_bridge(self.name, runtime.manager.node)
+        # A previous simple-nav loop (go_to_* with wait: false) must not keep
+        # driving the base across a reconfigure; reconfigure is sync, so signal
+        # the cancel event instead of awaiting the task.
+        if self._simple_nav_cancel is not None:
+            self._simple_nav_cancel.set()
+        # Publish a provider (not the node itself) so a nav-camera always sees
+        # the SLAM service's *current* bridge node, even after a SLAM restart
+        # swaps the manager.
+        slam_service = cfg.slam_service
+        register_bridge(
+            self.name,
+            lambda: (
+                rt.manager.node if (rt := get_slam(slam_service)) is not None else None
+            ),
+        )
         params_path = self._write_nav2_params(cfg)
         # Nav2 bringup (with retries) can take minutes on a Pi; run it in the
         # background so reconfigure returns within viam-server's deadline.
@@ -113,6 +124,9 @@ class RosNavigation(NavServiceBase):
         )
 
     async def close(self) -> None:
+        # Stop any in-flight simple-nav loop so it cannot keep commanding the
+        # base after teardown.
+        await self._cancel_simple_nav()
         # The bridge node itself is owned by the SLAM service; only drop our
         # nav-camera registration pointer.
         unregister_bridge(self.name)

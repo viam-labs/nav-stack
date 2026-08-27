@@ -665,6 +665,7 @@ class NavServiceBase(Motion):
             loc = self._locations().get(str(command["name"]))
             self._suspended = None
             self._active_goal_name = loc.name
+            await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.navigate, loc.x, loc.y, loc.theta)
             return {"status": "navigating", "target": loc.to_dict()}
         if cmd == "navigate_to_point":
@@ -673,6 +674,7 @@ class NavServiceBase(Motion):
             theta = float(command.get("theta", 0.0))
             self._suspended = None
             self._active_goal_name = None
+            await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.navigate, x, y, theta)
             return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
         if cmd in ("plan_to_point", "compute_path_to_point"):
@@ -708,6 +710,7 @@ class NavServiceBase(Motion):
             name = preview.get("location", {}).get("name") if isinstance(preview.get("location"), dict) else None
             self._suspended = None
             self._active_goal_name = name
+            await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.navigate, x, y, theta)
             return {
                 "status": "navigating",
@@ -1023,6 +1026,10 @@ class NavServiceBase(Motion):
         velocity = command.get("velocity_mps")
         velocity_mps = float(velocity) if velocity is not None else None
         target = {"x": x, "y": y, "theta": theta}
+        # Callers own cancellation of any previous simple-nav run: _simple_go_to
+        # must never call _cancel_simple_nav itself, or a background run would
+        # cancel its own task handle and drop it (making it uncancelable later).
+        await self._cancel_simple_nav()
         if wait:
             await self._simple_go_to(x, y, theta, velocity_mps=velocity_mps)
             return {
@@ -1030,7 +1037,6 @@ class NavServiceBase(Motion):
                 "motion": "simple",
                 "target": target,
             }
-        await self._cancel_simple_nav()
         self._simple_nav_task = asyncio.create_task(
             self._simple_go_to(x, y, theta, velocity_mps=velocity_mps)
         )
@@ -1152,7 +1158,8 @@ class NavServiceBase(Motion):
         if base is None:
             raise RuntimeError("navigation base dependency missing")
 
-        await self._cancel_simple_nav()
+        # Stop any in-flight Nav2 goal; the caller has already canceled any
+        # previous simple-nav run (see _start_simple_go).
         await asyncio.to_thread(runtime.manager.cancel)
 
         from ..ros import conversions as conv
@@ -1245,8 +1252,12 @@ class NavServiceBase(Motion):
             }
             raise RuntimeError(str(exc)) from exc
         finally:
-            self._simple_nav_cancel = None
-            self._simple_nav_task = None
+            # Only clear state that still belongs to this run: a newer goal may
+            # already have installed its own cancel event / task handle.
+            if self._simple_nav_cancel is cancel_event:
+                self._simple_nav_cancel = None
+            if self._simple_nav_task is asyncio.current_task():
+                self._simple_nav_task = None
 
 
 # ---------------------------------------------------------------------------

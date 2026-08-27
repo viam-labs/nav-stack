@@ -46,7 +46,6 @@ _STILL_METHODS = (
     "_reset_still_dwell",
     "_still_gate_ready",
     "_still_gate_commit",
-    "_should_publish_map_when_still",
 )
 
 
@@ -335,7 +334,6 @@ def test_publish_odom_snapshot_updates_twist_and_publishes():
     bridge = SimpleNamespace(
         _odom=conv.Pose2D(1.0, 2.0, 0.25),
         _frames=SimpleNamespace(odom="odom", base_link="base_link"),
-        _last_odom_stamp=None,
         _last_twist=(0.0, 0.0, 0.0),
         _odom_pub=MagicMock(),
         _tf_broadcaster=MagicMock(),
@@ -344,7 +342,6 @@ def test_publish_odom_snapshot_updates_twist_and_publishes():
     stamp = MagicMock()
     BridgeNode._publish_odom_snapshot(bridge, stamp, 0.5, 0.0, 0.1)
 
-    assert bridge._last_odom_stamp is stamp
     assert bridge._last_twist == (0.5, 0.0, 0.1)
     bridge._odom_pub.publish.assert_called_once()
     bridge._tf_broadcaster.sendTransform.assert_called_once()
@@ -999,6 +996,7 @@ def test_get_pose_in_map_returns_cached_pose_on_lookup_failure():
         _tf_buffer=SimpleNamespace(lookup_transform=MagicMock(return_value=tf)),
         _last_pose_in_map=None,
     )
+    bridge._lookup_tf_pose_2d = lambda child: BridgeNode._lookup_tf_pose_2d(bridge, child)
     bridge._lookup_pose_in_map = lambda: BridgeNode._lookup_pose_in_map(bridge)
 
     pose = BridgeNode.get_pose_in_map(bridge)
@@ -1056,9 +1054,7 @@ def _still_gate_ns(**kwargs):
         _still_since=None,
         _dwell_pose0=None,
         _scan_published_this_stop=False,
-        _last_still_scan_yaw=None,
         _last_still_scan_pose=None,
-        _last_still_scan_wall=None,
         _last_odom_ok_wall=9999.0,
         _odom_fail_streak=0,
         _last_odom_error=None,
@@ -1080,7 +1076,7 @@ def test_map_when_still_disabled_always_publishes():
             _use_lidar_frame_scans=True,
         )
     )
-    assert bridge._should_publish_map_when_still() is True
+    assert bridge._still_gate_ready() is True
     assert bridge._map_when_still_status == "disabled"
 
 
@@ -1095,7 +1091,7 @@ def test_map_when_still_ignores_non_point_cloud_mir_path():
             _last_twist=(1.0, 0.0, 0.0),
         )
     )
-    assert bridge._should_publish_map_when_still() is True
+    assert bridge._still_gate_ready() is True
     assert bridge._map_when_still_status == "disabled_non_point_cloud"
 
 
@@ -1127,9 +1123,7 @@ def test_map_when_still_blocks_when_odom_dead(monkeypatch):
     """Without odom we cannot prove stillness — never publish."""
     bridge = _still_gate_ns(
         _scan_published_this_stop=True,
-        _last_still_scan_yaw=0.0,
         _last_still_scan_pose=(0.0, 0.0, 0.0),
-        _last_still_scan_wall=51.5,
         _last_odom_ok_wall=50.0,
         _odom_fail_streak=10,
         _last_odom_error="EOF",
@@ -1152,7 +1146,7 @@ def test_map_when_still_yaw_step_during_pivot(monkeypatch):
     t["now"] = 200.6
     assert bridge._still_gate_ready() is True
     bridge._still_gate_commit()
-    assert bridge._last_still_scan_yaw == pytest.approx(0.0)
+    assert bridge._last_still_scan_pose[2] == pytest.approx(0.0)
 
     # In-place spin: no linear motion, yaw rate above still threshold.
     bridge._last_twist = (0.0, 0.0, 0.5)
@@ -1175,7 +1169,6 @@ def test_map_when_still_pose_hop_allows_rescan(monkeypatch):
     """If twist looks still but odom moved, still allow a new stop scan."""
     bridge = _still_gate_ns(
         _scan_published_this_stop=True,
-        _last_still_scan_yaw=0.0,
         _last_still_scan_pose=(0.0, 0.0, 0.0),
         _odom=SimpleNamespace(x=0.5, y=0.0, theta=0.0),
         _gate_odom=SimpleNamespace(x=0.5, y=0.0, theta=0.0),

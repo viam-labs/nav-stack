@@ -20,14 +20,6 @@ from ..ros import conversions as conv
 from .global_localize import scan_endpoints_base_link
 
 
-def _normalize_angle(theta: float) -> float:
-    while theta > math.pi:
-        theta -= 2.0 * math.pi
-    while theta < -math.pi:
-        theta += 2.0 * math.pi
-    return theta
-
-
 def _to_map_xy(pts_xy: np.ndarray, pose: conv.Pose2D) -> np.ndarray:
     pts_xy = np.asarray(pts_xy, dtype=float)
     if pts_xy.size == 0:
@@ -121,7 +113,7 @@ class PauseKeyframeStore:
         for prev in self._frames:
             dist = math.hypot(pose.x - prev.pose.x, pose.y - prev.pose.y)
             dyaw = abs(
-                math.degrees(_normalize_angle(pose.theta - prev.pose.theta))
+                math.degrees(conv.normalize_angle(pose.theta - prev.pose.theta))
             )
             if dist < self.min_spacing_m and dyaw < self.min_spacing_deg:
                 return False
@@ -196,7 +188,7 @@ class PauseKeyframeStore:
                         pose = conv.Pose2D(
                             kf.pose.x + dx,
                             kf.pose.y + dy,
-                            _normalize_angle(kf.pose.theta + iy * yaw_step),
+                            conv.normalize_angle(kf.pose.theta + iy * yaw_step),
                         )
                         q_map = _to_map_xy(query, pose)
                         primary = nn_hit_rate(

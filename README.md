@@ -4,7 +4,7 @@ A Viam navigation stack that wraps the ROS2 **Nav2** and **slam_toolbox** packag
 so any Viam base can map an environment, localize within it, and navigate to named
 locations or arbitrary map points while avoiding obstacles.
 
-This module (`viam-labs:nav-stack`) provides three models:
+This module (`viam-labs:nav-stack`) provides four models:
 
 | Model | API | Purpose |
 | --- | --- | --- |
@@ -233,7 +233,7 @@ The MiR250 is **differential drive** — use `"kinematics": "differential"` (the
 
 Any individual value can be overridden via `nav2_params` (e.g. `{"controller_server": {"FollowPath": {"min_lookahead_dist": 0.6}}}`) — user overrides re-merge on top of the generated profile. Setting `FollowPath.plugin` explicitly opts out of the profile swap entirely (the template + your overrides are used as-is, including smoother settings).
 
-For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a single `get_readings()` per odom tick. It uses **`odom_position_x_m` / `odom_position_y_m` / `odom_yaw_deg`** when present (true `/odom` frame from mir-base ≥ the odom-fields update). Map-frame `position_x_m`/`position_y_m` and fused `yaw_deg` are **not** used for `/odom` — slam_toolbox needs a smooth odom frame. Until mir-base exposes the odom fields, orientation falls back to velocity integration; upgrade mir-base or patch it to publish `odom_*` keys from the parsed `/odom` message. Raise `mir_rosbridge_timeout_s` (≥5) and `odom_rate_hz` (≥15) if updates lag.
+For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a single `get_readings()` per odom tick. It uses **`odom_position_x_m` / `odom_position_y_m` / `odom_yaw_deg`** when present (true `/odom` frame from mir-base ≥ the odom-fields update). Map-frame `position_x_m`/`position_y_m` and fused `yaw_deg` are **not** used for `/odom` — slam_toolbox needs a smooth odom frame. Until mir-base exposes the odom fields, orientation falls back to velocity integration; upgrade mir-base or patch it to publish `odom_*` keys from the parsed `/odom` message. Raise mir-base's `mir_rosbridge_timeout_s` attribute (≥5, on the `viam-labs:mir-base` component, not this module) and `odom_rate_hz` (≥15) if updates lag.
 
 ### Navigation service
 

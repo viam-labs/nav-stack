@@ -400,7 +400,6 @@ def test_nav_action_ready_requires_active_lifecycle_nodes():
 
 
 def test_ensure_nav2_async_runs_in_background_and_deduplicates():
-    import threading
 
     mgr = _manager()
     started = threading.Event()

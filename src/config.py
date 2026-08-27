@@ -5,7 +5,6 @@ logic easy to unit-test and shareable between the models and the ROS layer.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import List, Mapping, Optional
 
@@ -368,7 +367,6 @@ class SlamConfig:
     # it rather than feeding SLAM/Nav2 a misregistered scan. Accurate age-based
     # stamping handles normal latency; this only guards genuinely stale data.
     scan_max_age_s: float = 2.0
-    ros_env: Optional[str] = None
     # How ROS /cmd_vel (vx forward, vy lateral) maps to the Viam base SetVelocity axes.
     base_velocity_convention: str = BASE_VELOCITY_VIAM
     slam_toolbox: SlamToolboxConfig = field(default_factory=SlamToolboxConfig)
@@ -687,7 +685,6 @@ class SlamConfig:
                 d.get("mapping_revisit_keyframe_min_score", 0.55)
             ),
             scan_max_age_s=float(d.get("scan_max_age_s", 2.0)),
-            ros_env=d.get("ros_env"),
             base_velocity_convention=convention,
             slam_toolbox=SlamToolboxConfig.from_dict(stb_raw),
             slam_params=slam_params_raw,
@@ -835,8 +832,6 @@ class NavConfig:
     min_cmd_vel_theta: float = 0.0
     nav2: Nav2Config = field(default_factory=Nav2Config)
     nav2_params: Mapping = field(default_factory=dict)
-    nav2_params_path: Optional[str] = None
-    ros_env: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "NavConfig":
@@ -868,8 +863,6 @@ class NavConfig:
             ),
             nav2=Nav2Config.from_dict(d.get("nav2", {}) or {}),
             nav2_params=d.get("nav2_params", {}) or {},
-            nav2_params_path=d.get("nav2_params_path"),
-            ros_env=d.get("ros_env"),
         )
 
     def required_dependencies(self) -> List[str]:
