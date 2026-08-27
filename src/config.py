@@ -86,6 +86,13 @@ class LidarConfig:
     # Set true when ``get_point_cloud`` already returns ``base_link`` points
     # (skip the mount transform — avoids double-offset on some Livox setups).
     points_in_base_link: bool = False
+    # Optional POSIX shm object (e.g. ``/viam-pc-lidar``) in the
+    # viam-shared-memory-test double-buffer layout. When set, scan paths
+    # (bridge + builtin ViamWorldIO) try shm before ``get_point_cloud``.
+    shm_name: Optional[str] = None
+    shm_region_size: int = 2 * 1024 * 1024
+    # If true, never fall back to gRPC GetPointCloud when shm is empty/missing.
+    shm_required: bool = False
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "LidarConfig":
@@ -97,6 +104,13 @@ class LidarConfig:
             raise ValueError(
                 f"lidar scan_source must be one of {sorted(LIDAR_SCAN_SOURCES)}"
             )
+        shm_name = d.get("shm_name")
+        shm_name_s = str(shm_name).strip() if shm_name else ""
+        region = int(
+            d.get("shm_region_size", d.get("shm_region_size_bytes", 2 * 1024 * 1024))
+        )
+        if region <= 0 or region % 2 != 0:
+            raise ValueError("lidar shm_region_size must be a positive even byte count")
         return cls(
             name=d["name"],
             x=float(mount.get("x", d.get("x", 0.0))),
@@ -111,6 +125,9 @@ class LidarConfig:
             z_max=float(d.get("z_max", 2.0)),
             scan_source=scan_source,
             points_in_base_link=bool(d.get("points_in_base_link", False)),
+            shm_name=shm_name_s or None,
+            shm_region_size=region,
+            shm_required=bool(d.get("shm_required", False)),
         )
 
 

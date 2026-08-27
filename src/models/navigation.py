@@ -133,6 +133,10 @@ class RosNavigation(NavServiceBase):
                 lidars=runtime.slam_cfg.lidars,
                 base_velocity_convention=runtime.slam_cfg.base_velocity_convention,
                 viz=viz,
+                shm_lidar=runtime.shm_lidar,
+                scan_max_age_s=float(
+                    getattr(runtime.slam_cfg, "scan_max_age_s", 2.0) or 2.0
+                ),
                 logger=lambda m: LOGGER.info(m),
             )
             runtime.manager.set_builtin_world(world)

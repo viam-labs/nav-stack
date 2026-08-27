@@ -12,17 +12,27 @@
     {
       "api": "rdk:service:motion",
       "model": "viam-labs:nav-stack:navigation",
-      "short_description": "Motion MoveOnMap via builtin navigator (or Nav2), plus locations/zones/go-to DoCommand on a Viam base."
+      "short_description": "Motion MoveOnMap (builtin or Nav2) with locations, zones, and go-to DoCommand."
     },
     {
       "api": "rdk:service:motion",
       "model": "viam-labs:nav-stack:navigation-external",
-      "short_description": "Motion MoveOnMap from any rdk:service:slam; builtin path is ROS-free (get_grid/GetPosition + base)."
+      "short_description": "MoveOnMap from any rdk:service:slam; builtin path is ROS-free."
     },
     {
       "api": "rdk:component:camera",
       "model": "viam-labs:nav-stack:nav-camera",
-      "short_description": "Renders the nav service's costmap, active plans, robot pose and goal as a camera image."
+      "short_description": "Renders nav costmap, plans, pose, and goal as a live camera image."
+    },
+    {
+      "api": "rdk:component:camera",
+      "model": "viam-labs:nav-stack:shm-pointcloud",
+      "short_description": "Copies a source camera PCD into POSIX shm for low-latency lidar reads."
+    },
+    {
+      "api": "rdk:component:camera",
+      "model": "viam-labs:nav-stack:rplidar",
+      "short_description": "Slamtec RPLIDAR UART driver that publishes scans to POSIX shm."
     }
   ],
   "entrypoint": "run.sh",

@@ -79,6 +79,25 @@ def test_lidar_config_mount_pitch_roll():
     )
     assert cfg.lidars[0].pitch == pytest.approx(0.035)
     assert cfg.lidars[0].roll == 0.0
+    assert cfg.lidars[0].shm_name is None
+    assert cfg.lidars[0].shm_required is False
+
+
+def test_lidar_config_shm_fields():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": {
+                "name": "front",
+                "shm_name": "/viam-pc-lidar",
+                "shm_required": True,
+                "shm_region_size": 4 * 1024 * 1024,
+            },
+        }
+    )
+    assert cfg.lidars[0].shm_name == "/viam-pc-lidar"
+    assert cfg.lidars[0].shm_required is True
+    assert cfg.lidars[0].shm_region_size == 4 * 1024 * 1024
 
 
 def test_slam_config_map_when_still_livox_defaults():

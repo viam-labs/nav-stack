@@ -25,6 +25,7 @@ class SlamRuntime:
         localization_check: Optional[dict] = None,
         *,
         cameras: Optional[dict] = None,
+        shm_lidar: Optional[object] = None,
     ):
         self.manager = manager
         self.map_store = map_store
@@ -34,6 +35,8 @@ class SlamRuntime:
         )
         # Lidar camera resources (name -> Camera), for ViamWorldIO scan reads.
         self.cameras = dict(cameras or {})
+        # Shared POSIX-shm PCD client (bridge + builtin nav).
+        self.shm_lidar = shm_lidar
 
 
 _REGISTRY: Dict[str, SlamRuntime] = {}

@@ -20,13 +20,25 @@ from ..config import (
 )
 from ..ros import conversions as conv
 from ..ros.external_slam import parse_get_grid, slam_pose_to_pose2d
+from ..ros import pcshm
 from .viz_store import NavVizStore
 from .world_io import WorldIO
 
 
 def _get_laser_scan_not_implemented(exc: BaseException) -> bool:
+    if isinstance(exc, NotImplementedError):
+        return True
     msg = str(exc).lower()
-    return "not implemented" in msg or "docommand not implemented" in msg
+    return (
+        "not implemented" in msg
+        or "does not support get_laser_scan" in msg
+        or "docommand not implemented" in msg
+        or "did not return get_laser_scan" in msg
+    )
+
+
+def _shm_error_is_stale(detail: object) -> bool:
+    return "frame too old" in str(detail).lower()
 
 
 def get_grid_response_to_map(resp: Mapping) -> Optional[dict]:
@@ -73,6 +85,8 @@ class ViamWorldIO:
         lidars: Optional[Sequence[LidarConfig]] = None,
         base_velocity_convention: str = "viam",
         viz: Optional[NavVizStore] = None,
+        shm_lidar=None,
+        scan_max_age_s: float = 2.0,
         drive_timeout_s: float = 2.0,
         map_cache_s: float = 1.0,
         scan_bins: int = 360,
@@ -85,6 +99,8 @@ class ViamWorldIO:
         self._lidars = list(lidars or [])
         self._convention = base_velocity_convention
         self._viz = viz
+        self._shm_lidar = shm_lidar
+        self._scan_max_age_s = float(scan_max_age_s)
         self._drive_timeout_s = drive_timeout_s
         self._map_cache_s = map_cache_s
         self._scan_bins = scan_bins
@@ -165,20 +181,11 @@ class ViamWorldIO:
             and now - self._scan_cache_at <= max_age_s
         ):
             return self._scan_cache
-        if not self._lidars or not self._cameras:
+        if not self._lidars:
             return self._scan_cache
         scans = []
         for lidar in self._lidars:
-            cam = self._cameras.get(lidar.name)
-            if cam is None:
-                continue
-            try:
-                scan = self._run(
-                    self._read_lidar_scan(cam, lidar),
-                    timeout=2.5,
-                )
-            except Exception:  # noqa: BLE001
-                continue
+            scan = self._read_lidar_scan_sync(lidar, max_age_s=max_age_s)
             if scan is not None:
                 scans.append(scan)
         if not scans:
@@ -192,36 +199,89 @@ class ViamWorldIO:
         self._scan_cache_at = now
         return merged
 
-    async def _read_lidar_scan(
+    def _pcd_to_scan(
+        self, raw: bytes, lidar: LidarConfig
+    ) -> conv.LaserScan2D:
+        pts = conv.parse_pcd(raw)
+        if not lidar.points_in_base_link:
+            pts = conv.transform_lidar_mount_to_base_link(
+                pts,
+                x=lidar.x,
+                y=lidar.y,
+                z=lidar.z,
+                theta=lidar.theta,
+                pitch=lidar.pitch,
+                roll=lidar.roll,
+            )
+        pts = conv.filter_points_by_z(pts, lidar.z_min, lidar.z_max)
+        return conv.points_to_scan(
+            pts,
+            angle_min=-math.pi,
+            angle_max=math.pi,
+            num_bins=self._scan_bins,
+            range_min=lidar.min_range,
+            range_max=lidar.max_range,
+        )
+
+    def _try_shm_scan(
+        self, lidar: LidarConfig, *, max_age_s: float
+    ) -> Optional[conv.LaserScan2D]:
+        """Sync shm read — no event-loop hop (control-loop hot path)."""
+        if not lidar.shm_name or self._shm_lidar is None:
+            return None
+        age_limit = self._scan_max_age_s if self._scan_max_age_s > 0 else max_age_s
+        got = self._shm_lidar.try_read(
+            lidar.shm_name,
+            lidar.shm_region_size,
+            max_age_s=age_limit if age_limit > 0 else None,
+        )
+        if got is None:
+            stats = self._shm_lidar.status().get(
+                pcshm.normalize_name(lidar.shm_name), {}
+            )
+            detail = stats.get("last_error") or "no complete frame"
+            if lidar.shm_required or _shm_error_is_stale(detail):
+                self._log(
+                    f"lidar {lidar.name} shm {lidar.shm_name!r} unavailable: {detail}"
+                )
+                return None
+            self._shm_lidar.note_fallback(lidar.shm_name)
+            return None
+        raw, _age = got
+        return self._pcd_to_scan(raw, lidar)
+
+    def _read_lidar_scan_sync(
+        self, lidar: LidarConfig, *, max_age_s: float
+    ) -> Optional[conv.LaserScan2D]:
+        # Prefer POSIX shm (memcpy) so the 10 Hz control loop never blocks on
+        # gRPC GetPointCloud — that lag was causing no_scan spin / circles.
+        shm_scan = self._try_shm_scan(lidar, max_age_s=max_age_s)
+        if shm_scan is not None:
+            return shm_scan
+        if lidar.shm_name and lidar.shm_required:
+            return None
+        cam = self._cameras.get(lidar.name)
+        if cam is None:
+            return None
+        try:
+            return self._run(
+                self._read_lidar_scan_grpc(cam, lidar),
+                timeout=1.0,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _read_lidar_scan_grpc(
         self, cam, lidar: LidarConfig
     ) -> Optional[conv.LaserScan2D]:
-        timeout = 2.0
+        timeout = 1.0
         scan_source = lidar.scan_source
         name = lidar.name
 
         async def _from_point_cloud() -> Optional[conv.LaserScan2D]:
             data = await cam.get_point_cloud(timeout=timeout)
             raw = data[0] if isinstance(data, tuple) else data
-            pts = conv.parse_pcd(raw)
-            if not lidar.points_in_base_link:
-                pts = conv.transform_lidar_mount_to_base_link(
-                    pts,
-                    x=lidar.x,
-                    y=lidar.y,
-                    z=lidar.z,
-                    theta=lidar.theta,
-                    pitch=lidar.pitch,
-                    roll=lidar.roll,
-                )
-            pts = conv.filter_points_by_z(pts, lidar.z_min, lidar.z_max)
-            return conv.points_to_scan(
-                pts,
-                angle_min=-math.pi,
-                angle_max=math.pi,
-                num_bins=self._scan_bins,
-                range_min=lidar.min_range,
-                range_max=lidar.max_range,
-            )
+            return self._pcd_to_scan(raw, lidar)
 
         async def _from_get_laser_scan() -> Optional[conv.LaserScan2D]:
             raw_payload = await cam.do_command({"command": "get_laser_scan"})
@@ -258,7 +318,6 @@ class ViamWorldIO:
             except Exception:  # noqa: BLE001
                 return None
 
-        # auto
         try:
             scan = await _from_get_laser_scan()
             if scan is not None:

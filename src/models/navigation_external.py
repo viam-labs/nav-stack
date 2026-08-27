@@ -49,6 +49,7 @@ from ..nav_builtin import (
     ViamWorldIO,
     make_builtin_navigator,
 )
+from ..ros.shm_lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
     register_bridge,
@@ -71,6 +72,7 @@ class RosNavigationExternal(NavServiceBase):
         self._manager = None
         self._runtime = None
         self._viz: Optional[NavVizStore] = None
+        self._shm_lidar = ShmPointCloudClient(logger=LOGGER)
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -103,6 +105,8 @@ class RosNavigationExternal(NavServiceBase):
             except Exception:  # noqa: BLE001
                 pass
             self._manager = None
+        self._shm_lidar.close()
+        self._shm_lidar = ShmPointCloudClient(logger=LOGGER)
         self._viz = None
         self._runtime = None
 
@@ -153,6 +157,8 @@ class RosNavigationExternal(NavServiceBase):
             lidars=ext.bridge.lidars,
             base_velocity_convention=ext.bridge.base_velocity_convention,
             viz=viz,
+            shm_lidar=self._shm_lidar,
+            scan_max_age_s=float(ext.bridge.scan_max_age_s or 2.0),
             logger=lambda m: LOGGER.info(m),
         )
         navigator = make_builtin_navigator(
@@ -166,6 +172,7 @@ class RosNavigationExternal(NavServiceBase):
             ext.bridge,
             {"status": "viam"},
             cameras=cameras,
+            shm_lidar=self._shm_lidar,
         )
         register_nav_viz(self.name, viz)
         self._refresh_zone_masks()
@@ -225,6 +232,7 @@ class RosNavigationExternal(NavServiceBase):
             skip_get_laser_scan=set(),
             odom_reader=odom_reader,
             logger=LOGGER,
+            shm_lidar=self._shm_lidar,
         )
 
         self._manager = RosManager(bridge_cfg, logger=LOGGER, external_slam=slam)
@@ -242,6 +250,7 @@ class RosNavigationExternal(NavServiceBase):
                 odom_reader=odom_reader,
                 logger=LOGGER,
                 record_cmd_vel=node.record_cmd_vel,
+                shm_lidar=self._shm_lidar,
             )
 
         loc_check = (
@@ -250,7 +259,12 @@ class RosNavigationExternal(NavServiceBase):
             else {"status": "unknown"}
         )
         self._runtime = SlamRuntime(
-            self._manager, map_store, bridge_cfg, loc_check, cameras=cameras
+            self._manager,
+            map_store,
+            bridge_cfg,
+            loc_check,
+            cameras=cameras,
+            shm_lidar=self._shm_lidar,
         )
         register_bridge(
             self.name,

@@ -147,3 +147,54 @@ def test_builtin_nav_host_status():
     assert status["nav_backend"] == "builtin"
     diag = host.nav2_diagnostics()
     assert diag["nav2_processes_running"] is False
+
+
+def test_viam_world_io_prefers_shm_scan():
+    """Control-loop scan path should hit shm without calling the camera."""
+    import time as _time
+
+    from src.config import LidarConfig
+    from src.ros import pcshm
+    from src.ros.shm_lidar import ShmPointCloudClient
+
+    min_pcd = (
+        b"# .PCD v0.7\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\n"
+        b"COUNT 1 1 1\nWIDTH 1\nHEIGHT 1\nPOINTS 1\nDATA ascii\n1 0 0\n"
+    )
+    loop = asyncio.new_event_loop()
+    name = "/viam-pc-test-nav"
+    writer = pcshm.open_writer(name)
+    client = ShmPointCloudClient()
+    try:
+        writer.write(min_pcd, timestamp_ns=_time.time_ns())
+        lidar = LidarConfig(
+            name="lidar",
+            shm_name=name,
+            shm_required=True,
+            scan_source="point_cloud",
+            points_in_base_link=True,
+        )
+        cam = MagicMock()
+        cam.get_point_cloud = AsyncMock(
+            side_effect=AssertionError("gRPC should not be used")
+        )
+        world = ViamWorldIO(
+            slam=MagicMock(),
+            base=MagicMock(),
+            loop=loop,
+            cameras={"lidar": cam},
+            lidars=[lidar],
+            shm_lidar=client,
+            scan_max_age_s=2.0,
+        )
+        scan = world.get_scan()
+        assert scan is not None
+        assert conv.scan_has_returns(scan)
+        cam.get_point_cloud.assert_not_called()
+        stats = client.status()[pcshm.normalize_name(name)]
+        assert stats["hits"] >= 1
+    finally:
+        client.close()
+        writer.close()
+        pcshm._try_unlink(name)
+        loop.close()
