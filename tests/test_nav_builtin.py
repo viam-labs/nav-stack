@@ -1,0 +1,249 @@
+"""Unit tests for ROS-free builtin costmap + A* planner."""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pytest
+
+from src.nav_builtin.controller import FollowerConfig, compute_path_command, lookahead_pose
+from src.nav_builtin.costmap import LETHAL, build_costmap, is_traversable
+from src.nav_builtin.navigator import BuiltinNavigator
+from src.nav_builtin.planner import plan_on_costmap, plan_path
+from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
+from src.ros import conversions as conv
+
+
+def _empty_map(size: int = 40, resolution: float = 0.05) -> dict:
+    grid = np.zeros((size, size), dtype=np.int16)
+    return {
+        "grid": grid,
+        "resolution": resolution,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+    }
+
+
+def _wall_map() -> dict:
+    """Free space with a vertical wall that forces a detour."""
+    grid = np.zeros((40, 40), dtype=np.int16)
+    grid[5:35, 20] = 100  # wall down the middle, with gaps at top/bottom
+    grid[0:5, 20] = 0
+    grid[35:40, 20] = 0
+    return {
+        "grid": grid,
+        "resolution": 0.1,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+    }
+
+
+def test_build_costmap_inflates_obstacles():
+    occ = OccupancyGrid(
+        grid=np.array(
+            [
+                [0, 0, 0, 0, 0],
+                [0, 0, 100, 0, 0],
+                [0, 0, 0, 0, 0],
+            ],
+            dtype=np.int16,
+        ),
+        resolution=0.1,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    costs = build_costmap(
+        occ, inflation_radius_m=0.25, robot_radius_m=0.1, cost_scaling_factor=3.0
+    )
+    assert costs[1, 2] == LETHAL
+    # Neighbors should be non-free.
+    assert costs[1, 1] > 0
+    assert costs[1, 3] > 0
+
+
+def test_plan_straight_line_on_empty_map():
+    m = _empty_map()
+    start = Pose2D(0.25, 0.25, 0.0)
+    goal = Pose2D(1.5, 1.5, 0.0)
+    result = plan_path(
+        m, start, goal, inflation_radius_m=0.2, robot_radius_m=0.1
+    )
+    assert result.feasible
+    assert len(result.path.points) >= 2
+    assert result.path.points[0][0] == pytest.approx(start.x)
+    assert result.path.points[-1][0] == pytest.approx(goal.x)
+    preview = result.to_preview_dict(goal=(goal.x, goal.y, goal.theta), start=start)
+    assert preview["feasible"] is True
+    assert preview["point_count"] >= 2
+    assert preview["planner_id"] == "LazyThetaStar"
+
+
+def test_lazy_theta_star_shorter_or_smoother_than_astar():
+    m = _empty_map(size=60, resolution=0.05)
+    start = Pose2D(0.25, 0.25, 0.0)
+    goal = Pose2D(2.75, 2.25, 0.0)
+    astar = plan_path(
+        m, start, goal, inflation_radius_m=0.15, robot_radius_m=0.05, algorithm="astar"
+    )
+    theta = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.15,
+        robot_radius_m=0.05,
+        algorithm="lazy_theta_star",
+    )
+    assert astar.feasible and theta.feasible
+    # Any-angle should use fewer waypoints than grid A* on open space.
+    assert len(theta.path.points) <= len(astar.path.points)
+    # And path length should be no worse than A* (within tiny float slack).
+    def _len(path):
+        pts = path.points
+        return sum(
+            math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+            for i in range(1, len(pts))
+        )
+
+    assert _len(theta.path) <= _len(astar.path) + 1e-6
+
+
+def test_lazy_theta_star_detours_around_wall():
+    m = _wall_map()
+    start = Pose2D(0.5, 2.0, 0.0)
+    goal = Pose2D(3.5, 2.0, 0.0)
+    result = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.15,
+        robot_radius_m=0.05,
+        algorithm="lazy_theta_star",
+    )
+    assert result.feasible
+    ys = [p[1] for p in result.path.points]
+    assert min(ys) < 1.0 or max(ys) > 3.0
+
+
+def test_plan_detours_around_wall():
+    m = _wall_map()
+    start = Pose2D(0.5, 2.0, 0.0)  # left of wall
+    goal = Pose2D(3.5, 2.0, 0.0)  # right of wall
+    result = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.15,
+        robot_radius_m=0.05,
+        algorithm="astar",
+    )
+    assert result.feasible
+    xs = [p[0] for p in result.path.points]
+    # Path must go around (not straight through x=2.0 wall column).
+    # At least one point should be near the gap (y near 0 or 3.5+).
+    ys = [p[1] for p in result.path.points]
+    assert min(ys) < 1.0 or max(ys) > 3.0
+    assert max(xs) > 3.0
+
+
+def test_builtin_planner_config_alias():
+    from src.config import NavConfig
+
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "builtin": {"planner": "LazyThetaStar"},
+        }
+    )
+    assert cfg.builtin.planner == "lazy_theta_star"
+
+
+def test_plan_fails_when_goal_in_lethal():
+    # Fully occupied map: nowhere to snap the goal.
+    grid = np.full((20, 20), 100, dtype=np.int16)
+    m = {
+        "grid": grid,
+        "resolution": 0.1,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+    }
+    start = Pose2D(0.5, 0.5, 0.0)
+    goal = Pose2D(1.5, 1.5, 0.0)
+    result = plan_path(
+        m, start, goal, inflation_radius_m=0.2, robot_radius_m=0.1
+    )
+    assert result.feasible is False
+    assert result.error_code != 0
+
+
+def test_lookahead_advances_along_path():
+    path = Path2D(points=((0.0, 0.0), (1.0, 0.0), (2.0, 0.0)), goal_theta=0.0)
+    pose = Pose2D(0.0, 0.0, 0.0)
+    target, idx, is_final = lookahead_pose(
+        pose, path, lookahead_m=0.5, waypoint_tolerance_m=0.1
+    )
+    assert not is_final
+    assert target.x == pytest.approx(0.5, abs=0.05)
+
+
+def test_compute_path_command_drives_forward():
+    path = Path2D(points=((0.0, 0.0), (2.0, 0.0)), goal_theta=0.0)
+    current = Pose2D(0.0, 0.0, 0.0)
+    cmd, progress = compute_path_command(current, path, cfg=FollowerConfig())
+    assert not cmd.done
+    assert cmd.vx > 0.0
+    assert progress["distance_remaining_m"] > 0.0
+
+
+class _FakeWorld:
+    def __init__(self, pose: Pose2D, map_data: dict):
+        self.pose = pose
+        self.map_data = map_data
+        self.cmds = []
+        self.stopped = False
+
+    def get_map(self):
+        return self.map_data
+
+    def get_pose(self):
+        return self.pose
+
+    def get_scan(self, max_age_s: float = 2.0):
+        return None
+
+    def set_velocity(self, vx, vy, vtheta):
+        self.cmds.append((vx, vy, vtheta))
+        # Nudge pose toward +x for a trivial follow.
+        if vx > 0:
+            self.pose = Pose2D(self.pose.x + 0.05, self.pose.y, self.pose.theta)
+
+    def stop(self):
+        self.stopped = True
+
+    def set_viz_plan(self, path_xy, goal=None):
+        pass
+
+
+def test_builtin_navigator_compute_path_and_status():
+    world = _FakeWorld(Pose2D(0.2, 0.2, 0.0), _empty_map())
+    nav = BuiltinNavigator(
+        world,
+        inflation_radius_m=0.15,
+        robot_radius_m=0.05,
+        avoid_obstacles=False,
+        xy_tolerance_m=0.1,
+        timeout_s=5.0,
+    )
+    preview = nav.compute_path(1.5, 0.2, 0.0)
+    assert preview["feasible"] is True
+    assert nav.last_preview_plan() is not None
+    status = nav.nav_status()
+    assert status["motion"] == "builtin"
+    assert status["active"] is False
+
+
+def test_builtin_navigator_cancel_sets_status():
+    world = _FakeWorld(Pose2D(0.2, 0.2, 0.0), _empty_map())
+    nav = BuiltinNavigator(world, avoid_obstacles=False)
+    nav.cancel()
+    assert nav.nav_status()["state"] == "canceled"

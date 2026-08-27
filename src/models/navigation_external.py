@@ -2,10 +2,11 @@
 
 Like ``viam-labs:nav-stack:navigation`` (same ``rdk:service:motion`` + DoCommand
 surface, shared :class:`~.nav_core.NavServiceBase`), but instead of borrowing
-the built-in SLAM model's in-process runtime it drives Nav2 from an **arbitrary
-Viam ``rdk:service:slam``** dependency.
+the built-in SLAM model's in-process runtime it drives navigation from an
+**arbitrary Viam ``rdk:service:slam``** dependency.
 
-It stands up its own ROS runtime:
+Default ``nav_backend`` is ``builtin``. With ``nav_backend: nav2`` it stands up
+its own ROS runtime:
 
 * a :class:`~..ros.manager.RosManager` that runs the sensor bridge (lidars ->
   ``/scan``, movement sensor -> ``/odom`` + ``odom->base_link`` TF) but **not**
@@ -191,13 +192,20 @@ class RosNavigationExternal(NavServiceBase):
         self._manager.set_nav_config(ext.nav)
         params_path = self._write_nav2_params(ext.nav)
         # Nav2 bringup can take minutes on a Pi; start in the background so
-        # reconfigure returns within viam-server's deadline.
+        # reconfigure returns within viam-server's deadline. Builtin backend
+        # skips Nav2 (ensure_nav2_async no-ops).
         self._manager.ensure_nav2_async(ext.nav, params_path)
         self._refresh_zone_masks()
+        backend = ext.nav.nav_backend
         LOGGER.info(
             f"nav-stack navigation-external '{self.name}' configured "
-            f"({ext.nav.kinematics}); Nav2 starting in background against "
+            f"({ext.nav.kinematics}, nav_backend={backend}) against "
             f"SLAM service {ext.slam_service!r}"
+            + (
+                "; Nav2 starting in background"
+                if ext.nav.uses_nav2()
+                else "; using builtin navigator"
+            )
         )
 
     async def close(self) -> None:

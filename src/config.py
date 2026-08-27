@@ -161,6 +161,76 @@ class SlamToolboxConfig:
         )
 
 
+NAV_BACKEND_BUILTIN = "builtin"
+NAV_BACKEND_NAV2 = "nav2"
+NAV_BACKENDS = frozenset({NAV_BACKEND_BUILTIN, NAV_BACKEND_NAV2})
+
+BUILTIN_PLANNER_ASTAR = "astar"
+BUILTIN_PLANNER_LAZY_THETA = "lazy_theta_star"
+BUILTIN_PLANNERS = frozenset({BUILTIN_PLANNER_ASTAR, BUILTIN_PLANNER_LAZY_THETA})
+
+
+def normalize_builtin_planner(name: Optional[str]) -> str:
+    """Map config aliases onto ``astar`` / ``lazy_theta_star``."""
+    if not name:
+        return BUILTIN_PLANNER_LAZY_THETA
+    key = str(name).strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "astar": BUILTIN_PLANNER_ASTAR,
+        "a_star": BUILTIN_PLANNER_ASTAR,
+        "gridbased": BUILTIN_PLANNER_ASTAR,
+        "builtinastar": BUILTIN_PLANNER_ASTAR,
+        "lazy_theta_star": BUILTIN_PLANNER_LAZY_THETA,
+        "lazy_theta*": BUILTIN_PLANNER_LAZY_THETA,
+        "lazythetastar": BUILTIN_PLANNER_LAZY_THETA,
+        "theta_star": BUILTIN_PLANNER_LAZY_THETA,
+        "thetastar": BUILTIN_PLANNER_LAZY_THETA,
+    }
+    if key in aliases:
+        return aliases[key]
+    if key in BUILTIN_PLANNERS:
+        return key
+    raise ValueError(
+        f"builtin.planner must be one of {sorted(BUILTIN_PLANNERS)} "
+        f"(aliases: LazyThetaStar, AStar); got {name!r}"
+    )
+
+
+@dataclass
+class BuiltinNavConfig:
+    """Tuning for the in-module (ROS-free) navigator.
+
+    Footprint / velocity limits stay top-level on ``NavConfig`` so both backends
+    share them. Goal tolerances default to the same numbers as ``Nav2Config``.
+    """
+
+    # ``lazy_theta_star`` (default) or ``astar``.
+    planner: str = BUILTIN_PLANNER_LAZY_THETA
+    lookahead_m: float = 0.6
+    replan_period_s: float = 1.0
+    timeout_s: float = 300.0
+    cost_scaling_factor: float = 4.0
+    # When None, NavConfig / Nav2Config tolerances are used at wire time.
+    xy_goal_tolerance: Optional[float] = None
+    yaw_goal_tolerance: Optional[float] = None
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":
+        if not d:
+            return cls()
+        xy = d.get("xy_goal_tolerance", None)
+        yaw = d.get("yaw_goal_tolerance", None)
+        return cls(
+            planner=normalize_builtin_planner(d.get("planner", BUILTIN_PLANNER_LAZY_THETA)),
+            lookahead_m=float(d.get("lookahead_m", 0.6)),
+            replan_period_s=float(d.get("replan_period_s", 1.0)),
+            timeout_s=float(d.get("timeout_s", 300.0)),
+            cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),
+            xy_goal_tolerance=float(xy) if xy is not None else None,
+            yaw_goal_tolerance=float(yaw) if yaw is not None else None,
+        )
+
+
 @dataclass
 class Nav2Config:
     """Common Nav2 ROS parameters exposed via Viam config.
@@ -830,6 +900,9 @@ class NavConfig:
     # Not the Nav2 ``min_vel_x`` param (reverse speed limit).
     min_cmd_vel_x: float = 0.0
     min_cmd_vel_theta: float = 0.0
+    # Default: in-module planner/controller. Set to "nav2" to keep ROS Nav2.
+    nav_backend: str = NAV_BACKEND_BUILTIN
+    builtin: BuiltinNavConfig = field(default_factory=BuiltinNavConfig)
     nav2: Nav2Config = field(default_factory=Nav2Config)
     nav2_params: Mapping = field(default_factory=dict)
 
@@ -838,6 +911,11 @@ class NavConfig:
         kinematics = d.get("kinematics", DIFFERENTIAL)
         if kinematics not in KINEMATICS:
             raise ValueError(f"kinematics must be one of {sorted(KINEMATICS)}")
+        backend = str(d.get("nav_backend", NAV_BACKEND_BUILTIN) or NAV_BACKEND_BUILTIN)
+        if backend not in NAV_BACKENDS:
+            raise ValueError(
+                f"nav_backend must be one of {sorted(NAV_BACKENDS)}, got {backend!r}"
+            )
         return cls(
             slam_service=d["slam_service"],
             base=d["base"],
@@ -861,9 +939,17 @@ class NavConfig:
             min_cmd_vel_theta=float(
                 d.get("min_cmd_vel_theta", d.get("simple_min_vel_theta", 0.0))
             ),
+            nav_backend=backend,
+            builtin=BuiltinNavConfig.from_dict(d.get("builtin", {}) or {}),
             nav2=Nav2Config.from_dict(d.get("nav2", {}) or {}),
             nav2_params=d.get("nav2_params", {}) or {},
         )
+
+    def uses_builtin_nav(self) -> bool:
+        return self.nav_backend == NAV_BACKEND_BUILTIN
+
+    def uses_nav2(self) -> bool:
+        return self.nav_backend == NAV_BACKEND_NAV2
 
     def required_dependencies(self) -> List[str]:
         return [self.slam_service, self.base]

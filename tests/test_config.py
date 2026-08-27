@@ -294,6 +294,24 @@ def test_nav_config_defaults_and_deps():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
     assert cfg.kinematics == DIFFERENTIAL
     assert cfg.required_dependencies() == ["slam", "b"]
+    assert cfg.nav_backend == "builtin"
+    assert cfg.uses_builtin_nav() is True
+    assert cfg.uses_nav2() is False
+
+
+def test_nav_config_nav_backend_nav2():
+    cfg = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "nav_backend": "nav2"}
+    )
+    assert cfg.uses_nav2() is True
+    assert cfg.builtin.lookahead_m == 0.6
+
+
+def test_nav_config_bad_nav_backend():
+    with pytest.raises(ValueError, match="nav_backend"):
+        NavConfig.from_dict(
+            {"slam_service": "slam", "base": "b", "nav_backend": "magic"}
+        )
 
 
 def test_nav_config_omni():

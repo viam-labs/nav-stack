@@ -27,7 +27,13 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from ..config import MODE_MAPPING, NavConfig, SlamConfig
+from ..config import (
+    MODE_MAPPING,
+    NAV_BACKEND_BUILTIN,
+    NAV_BACKEND_NAV2,
+    NavConfig,
+    SlamConfig,
+)
 from . import conversions as conv
 from .dds_env import apply_dds_isolation, dds_status
 
@@ -72,6 +78,9 @@ class RosManager:
         self._nav2_params_sig = ""
         self._nav2_ensure_lock = threading.Lock()
         self._nav2_ensure_thread: Optional[threading.Thread] = None
+        # Builtin navigator (default). Built on set_nav_config when
+        # nav_backend == builtin; None means delegate to Nav2 action clients.
+        self._builtin_nav = None
         self._started = False
         self._scratch = Path(slam_cfg.maps_dir).expanduser() / ".runtime"
         self._scratch.mkdir(parents=True, exist_ok=True)
@@ -864,6 +873,11 @@ class RosManager:
                 pass
 
     def start_nav2(self, nav_cfg: NavConfig, params_path: Path) -> None:
+        if nav_cfg.uses_builtin_nav():
+            raise RuntimeError(
+                "nav_backend is 'builtin'; Nav2 is not started. "
+                "Set nav_backend: 'nav2' to use ROS Nav2."
+            )
         self._nav_cfg = nav_cfg
         self._nav_params_path = params_path
         self._nav2_params_sig = self._params_file_sig(params_path)
@@ -1202,12 +1216,15 @@ class RosManager:
             except Exception:  # noqa: BLE001 - diagnostics must not raise
                 pass
         return {
+            "nav_backend": self.nav_backend(),
             "nav2_processes_running": self.nav2_running(),
             "nav2_startup_in_progress": self.nav2_startup_in_progress(),
             # Age of the bridge's last odom/TF publish; more than a few seconds
             # means the bridge executor is stalled or dead.
             "odom_tf_age_s": odom_tf_age,
-            "nav_action_ready": self.nav_action_ready(),
+            "nav_action_ready": (
+                True if self._builtin_nav is not None else self.nav_action_ready()
+            ),
             "actions": (action_proc.stdout or "").strip(),
             "actions_rc": action_proc.returncode,
             "actions_stderr": (action_proc.stderr or "").strip(),
@@ -1231,6 +1248,12 @@ class RosManager:
 
     def ensure_nav2(self, nav_cfg: NavConfig, params_path: Path) -> None:
         """Start or restart Nav2 until ``/navigate_to_pose`` is available."""
+        self._nav_cfg = nav_cfg
+        self._nav_params_path = params_path
+        self._configure_navigator(nav_cfg)
+        if nav_cfg.uses_builtin_nav():
+            self._log("nav_backend=builtin; skipping Nav2 ensure")
+            return
         if self.nav_action_ready():
             # Nav2 params are only read at process start. If the generated
             # params changed (retuning, module update), a healthy Nav2 is still
@@ -1279,6 +1302,10 @@ class RosManager:
         """
         self._nav_cfg = nav_cfg
         self._nav_params_path = params_path
+        self._configure_navigator(nav_cfg)
+        if nav_cfg.uses_builtin_nav():
+            self._log("nav_backend=builtin; skipping background Nav2 startup")
+            return
         with self._nav2_ensure_lock:
             if self.nav2_startup_in_progress():
                 self._log("Nav2 startup already in progress; skipping duplicate request")
@@ -1297,7 +1324,61 @@ class RosManager:
             self._nav2_ensure_thread.start()
 
     # -- navigation delegation ----------------------------------------------
+    def _configure_navigator(self, nav_cfg: NavConfig) -> None:
+        """Install or clear the builtin navigator based on ``nav_backend``."""
+        if not nav_cfg.uses_builtin_nav():
+            if self._builtin_nav is not None:
+                try:
+                    self._builtin_nav.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._builtin_nav = None
+            return
+        from ..nav_builtin import BridgeWorldIO, BuiltinNavigator
+
+        bcfg = nav_cfg.builtin
+        xy_tol = (
+            bcfg.xy_goal_tolerance
+            if bcfg.xy_goal_tolerance is not None
+            else nav_cfg.nav2.xy_goal_tolerance
+        )
+        yaw_tol = (
+            bcfg.yaw_goal_tolerance
+            if bcfg.yaw_goal_tolerance is not None
+            else nav_cfg.nav2.yaw_goal_tolerance
+        )
+        world = BridgeWorldIO(lambda: self._node)
+        self._builtin_nav = BuiltinNavigator(
+            world,
+            inflation_radius_m=nav_cfg.inflation_radius,
+            robot_radius_m=nav_cfg.robot_radius,
+            cost_scaling_factor=bcfg.cost_scaling_factor,
+            algorithm=bcfg.planner,
+            replan_period_s=bcfg.replan_period_s,
+            lookahead_m=bcfg.lookahead_m,
+            xy_tolerance_m=xy_tol,
+            yaw_tolerance_rad=yaw_tol,
+            max_vel_x=nav_cfg.max_vel_x,
+            max_vel_theta=nav_cfg.max_vel_theta,
+            min_cmd_vel_x=nav_cfg.min_cmd_vel_x,
+            min_cmd_vel_theta=nav_cfg.min_cmd_vel_theta,
+            timeout_s=bcfg.timeout_s,
+            avoid_obstacles=nav_cfg.simple_avoid_obstacles,
+            stop_distance_m=nav_cfg.simple_stop_distance,
+            slow_distance_m=nav_cfg.simple_slow_distance,
+            scan_max_age_s=nav_cfg.simple_scan_max_age,
+            logger=self._log,
+        )
+
+    def nav_backend(self) -> str:
+        if self._nav_cfg is not None:
+            return self._nav_cfg.nav_backend
+        return NAV_BACKEND_BUILTIN if self._builtin_nav is not None else NAV_BACKEND_NAV2
+
     def navigate(self, x: float, y: float, theta: float) -> None:
+        if self._builtin_nav is not None:
+            self._builtin_nav.navigate(x, y, theta)
+            return
         node = self._require_node()
         if self.nav2_startup_in_progress():
             raise RuntimeError(
@@ -1338,7 +1419,23 @@ class RosManager:
         timeout_s: float = 20.0,
         max_points: int = 400,
     ) -> Dict:
-        """Plan a Nav2 path to ``(x, y, theta)`` without moving the base."""
+        """Plan a path to ``(x, y, theta)`` without moving the base."""
+        if self._builtin_nav is not None:
+            from ..nav_builtin.planner import DEFAULT_PLANNER_ID, planner_id_for
+
+            return self._builtin_nav.compute_path(
+                x,
+                y,
+                theta,
+                planner_id=(
+                    planner_id_for(planner_id)
+                    if planner_id and planner_id != "GridBased"
+                    else DEFAULT_PLANNER_ID
+                ),
+                start=start,
+                timeout_s=timeout_s,
+                max_points=max_points,
+            )
         node = self._require_node()
         if self.nav2_startup_in_progress():
             raise RuntimeError(
@@ -1386,19 +1483,34 @@ class RosManager:
         )
 
     def last_preview_plan(self) -> Optional[Dict]:
+        if self._builtin_nav is not None:
+            return self._builtin_nav.last_preview_plan()
         node = self._node
         if node is None:
             return None
         return node.last_preview_plan()
 
     def cancel(self) -> None:
+        if self._builtin_nav is not None:
+            self._builtin_nav.cancel()
+            return
         if self._node is not None:
             self._node.cancel_nav()
 
     def nav_status(self) -> Dict:
+        if self._builtin_nav is not None:
+            status = self._builtin_nav.nav_status()
+            status["nav_backend"] = NAV_BACKEND_BUILTIN
+            return status
         if self._node is None:
-            return {"state": "idle", "active": False}
-        return self._node.nav_status()
+            return {
+                "state": "idle",
+                "active": False,
+                "nav_backend": self.nav_backend(),
+            }
+        status = self._node.nav_status()
+        status["nav_backend"] = NAV_BACKEND_NAV2
+        return status
 
     # -- zone masks ----------------------------------------------------------
     def publish_zone_masks(
@@ -1519,7 +1631,10 @@ class RosManager:
         }
 
     def set_nav_config(self, nav_cfg: NavConfig) -> None:
-        self._require_node().set_nav_config(nav_cfg)
+        self._nav_cfg = nav_cfg
+        self._configure_navigator(nav_cfg)
+        if self._node is not None:
+            self._node.set_nav_config(nav_cfg)
 
     # -- helpers -------------------------------------------------------------
     def _require_node(self):

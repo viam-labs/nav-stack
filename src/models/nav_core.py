@@ -786,6 +786,12 @@ class NavServiceBase(Motion):
             )
         if cmd == "start_nav2":
             cfg = self._require_cfg()
+            if cfg.uses_builtin_nav():
+                return {
+                    "status": "skipped",
+                    "reason": "nav_backend is builtin; set nav_backend: nav2 to use Nav2",
+                    "nav_backend": cfg.nav_backend,
+                }
             runtime.manager.set_nav_config(cfg)
             params_path = self._write_nav2_params(cfg)
             await asyncio.to_thread(runtime.manager.ensure_nav2, cfg, params_path)
@@ -794,6 +800,12 @@ class NavServiceBase(Motion):
             # Unconditional stop + start: guarantees regenerated params are
             # loaded even when Nav2 currently looks healthy.
             cfg = self._require_cfg()
+            if cfg.uses_builtin_nav():
+                return {
+                    "status": "skipped",
+                    "reason": "nav_backend is builtin; set nav_backend: nav2 to use Nav2",
+                    "nav_backend": cfg.nav_backend,
+                }
             runtime.manager.set_nav_config(cfg)
             params_path = self._write_nav2_params(cfg)
 

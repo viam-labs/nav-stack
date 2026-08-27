@@ -250,7 +250,7 @@ def test_bundled_nav2_launch_file_exists():
 def test_start_nav2_rotates_previous_launch_log(tmp_path):
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "maps_dir": str(tmp_path)})
     mgr = RosManager(cfg, logger=MagicMock())
-    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b", "nav_backend": "nav2"})
     params_path = tmp_path / "nav2_params.yaml"
     params_path.write_text("{}", encoding="utf-8")
     log_path = tmp_path / ".runtime" / "nav2_launch.log"
@@ -293,7 +293,7 @@ def test_start_nav2_uses_bundled_launch_with_autostart(tmp_path):
 
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "maps_dir": str(tmp_path)})
     mgr = RosManager(cfg, logger=MagicMock())
-    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b", "nav_backend": "nav2"})
     params_path = tmp_path / "nav2_params.yaml"
     params_path.write_text("{}", encoding="utf-8")
 
@@ -326,7 +326,7 @@ def test_lifecycle_manager_params_disable_bond_timeout(tmp_path):
     yaml = pytest.importorskip("yaml")
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "maps_dir": str(tmp_path)})
     mgr = RosManager(cfg, logger=MagicMock())
-    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b", "nav_backend": "nav2"})
     params_path = tmp_path / "nav2_params.yaml"
     params_path.write_text("{}", encoding="utf-8")
 
@@ -363,7 +363,7 @@ def test_ensure_nav2_returns_early_when_params_unchanged(tmp_path):
     params_path = tmp_path / "nav2_params.yaml"
     params_path.write_text("a: 1", encoding="utf-8")
     mgr._nav2_params_sig = mgr._params_file_sig(params_path)
-    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b", "nav_backend": "nav2"})
 
     with patch.object(mgr, "nav_action_ready", return_value=True), patch.object(
         mgr, "stop_nav2"
@@ -379,7 +379,7 @@ def test_ensure_nav2_restarts_when_params_changed(tmp_path):
     params_path = tmp_path / "nav2_params.yaml"
     params_path.write_text("a: 1", encoding="utf-8")
     mgr._nav2_params_sig = "stale-signature-from-old-params"
-    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b", "nav_backend": "nav2"})
 
     with patch.object(mgr, "nav_action_ready", return_value=True), patch.object(
         mgr, "stop_nav2"
@@ -394,7 +394,7 @@ def test_ensure_nav2_restarts_when_params_changed(tmp_path):
 
 def test_ensure_nav2_retries_three_times_then_raises():
     mgr = _manager()
-    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b", "nav_backend": "nav2"})
     params_path = MagicMock()
     with patch.object(mgr, "nav_action_ready", return_value=False), patch.object(
         mgr, "nav2_running", return_value=False
@@ -436,7 +436,9 @@ def test_ensure_nav2_async_runs_in_background_and_deduplicates():
         started.set()
         release.wait(timeout=5.0)
 
-    nav_cfg = MagicMock()
+    nav_cfg = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "nav_backend": "nav2"}
+    )
     params_path = MagicMock()
     with patch.object(mgr, "ensure_nav2", side_effect=_slow_ensure) as ensure:
         mgr.ensure_nav2_async(nav_cfg, params_path)
@@ -455,15 +457,40 @@ def test_ensure_nav2_async_runs_in_background_and_deduplicates():
 
 def test_ensure_nav2_async_swallows_background_failure():
     mgr = _manager()
+    nav_cfg = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "nav_backend": "nav2"}
+    )
     with patch.object(mgr, "ensure_nav2", side_effect=RuntimeError("boom")):
-        mgr.ensure_nav2_async(MagicMock(), MagicMock())
+        mgr.ensure_nav2_async(nav_cfg, MagicMock())
         mgr._nav2_ensure_thread.join(timeout=2.0)
     assert mgr.nav2_startup_in_progress() is False
+
+
+def test_ensure_nav2_async_skips_for_builtin_backend():
+    mgr = _manager()
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    assert nav_cfg.uses_builtin_nav()
+    with patch.object(mgr, "ensure_nav2") as ensure:
+        mgr.ensure_nav2_async(nav_cfg, MagicMock())
+    ensure.assert_not_called()
+    assert mgr._builtin_nav is not None
+    assert mgr.nav2_startup_in_progress() is False
+
+
+def test_navigate_uses_builtin_when_configured():
+    mgr = _manager()
+    nav_cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    mgr.set_nav_config(nav_cfg)
+    assert mgr._builtin_nav is not None
+    with patch.object(mgr._builtin_nav, "navigate") as nav:
+        mgr.navigate(1.0, 2.0, 0.3)
+    nav.assert_called_once_with(1.0, 2.0, 0.3)
 
 
 def test_navigate_rejects_while_nav2_startup_in_progress():
     mgr = _manager()
     mgr._node = MagicMock()
+    mgr._builtin_nav = None  # force Nav2 path
     with patch.object(mgr, "nav2_startup_in_progress", return_value=True):
         with pytest.raises(RuntimeError, match="still starting up"):
             mgr.navigate(1.0, 2.0, 0.5)

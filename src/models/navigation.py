@@ -1,18 +1,19 @@
 """Navigation service model: ``viam-labs:nav-stack:navigation``.
 
-A Viam ``rdk:service:motion`` that wraps ROS2 Nav2. It launches Nav2 against the
-SLAM service's shared ROS context and exposes:
+A Viam ``rdk:service:motion`` for map-frame navigation. By default it uses the
+in-module builtin navigator (``nav_backend: builtin``). Set ``nav_backend: nav2``
+to launch ROS2 Nav2 against the SLAM service's shared ROS context instead.
+
+Exposes:
 
 * Motion ``MoveOnMap`` / ``StopPlan`` / ``GetPlan`` / ``ListPlanStatuses`` /
-  ``GetPose`` (map-frame Nav2 navigation)
+  ``GetPose``
 * DoCommand: locations CRUD, zones CRUD, ``navigate_*`` / ``go_to_*``, cancel,
-  status, ``get_costmap``, and Nav2 ops (``restart_nav2``, …)
-
-Physical obstacle avoidance is automatic via Nav2's costmaps (live ``/scan`` data).
+  status, ``get_costmap``, and Nav2 ops (``restart_nav2``, …) when using Nav2
 
 This model borrows the built-in SLAM model's shared in-process ROS runtime
 (looked up in the process-global registry by ``slam_service`` name). All of the
-Motion + DoCommand + Nav2 orchestration lives in
+Motion + DoCommand orchestration lives in
 :class:`~.nav_core.NavServiceBase`; this model only supplies the registry-backed
 runtime resolution.
 """
@@ -116,11 +117,18 @@ class RosNavigation(NavServiceBase):
         params_path = self._write_nav2_params(cfg)
         # Nav2 bringup (with retries) can take minutes on a Pi; run it in the
         # background so reconfigure returns within viam-server's deadline.
+        # Builtin backend skips Nav2 entirely (ensure_nav2_async no-ops).
         runtime.manager.ensure_nav2_async(cfg, params_path)
         self._refresh_zone_masks()
+        backend = cfg.nav_backend
         LOGGER.info(
-            f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}); "
-            "Nav2 starting in background"
+            f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}, "
+            f"nav_backend={backend})"
+            + (
+                "; Nav2 starting in background"
+                if cfg.uses_nav2()
+                else "; using builtin navigator"
+            )
         )
 
     async def close(self) -> None:
