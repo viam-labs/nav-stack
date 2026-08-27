@@ -206,7 +206,7 @@ class BuiltinNavConfig:
 
     # ``lazy_theta_star`` (default) or ``astar``.
     planner: str = BUILTIN_PLANNER_LAZY_THETA
-    lookahead_m: float = 0.6
+    lookahead_m: float = 1.0
     replan_period_s: float = 1.0
     timeout_s: float = 300.0
     cost_scaling_factor: float = 4.0
@@ -222,7 +222,7 @@ class BuiltinNavConfig:
         yaw = d.get("yaw_goal_tolerance", None)
         return cls(
             planner=normalize_builtin_planner(d.get("planner", BUILTIN_PLANNER_LAZY_THETA)),
-            lookahead_m=float(d.get("lookahead_m", 0.6)),
+            lookahead_m=float(d.get("lookahead_m", 1.0)),
             replan_period_s=float(d.get("replan_period_s", 1.0)),
             timeout_s=float(d.get("timeout_s", 300.0)),
             cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),

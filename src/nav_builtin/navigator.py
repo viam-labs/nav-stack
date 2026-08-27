@@ -22,7 +22,7 @@ class BuiltinNavigator:
         cost_scaling_factor: float = 4.0,
         algorithm: str = "lazy_theta_star",
         replan_period_s: float = 1.0,
-        lookahead_m: float = 0.6,
+        lookahead_m: float = 1.0,
         xy_tolerance_m: float = 0.25,
         yaw_tolerance_rad: float = 0.25,
         max_vel_x: float = 0.4,

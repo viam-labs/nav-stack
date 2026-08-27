@@ -186,6 +186,41 @@ def test_lookahead_advances_along_path():
     assert target.x == pytest.approx(0.5, abs=0.05)
 
 
+def test_lookahead_projects_onto_sparse_segment():
+    """Robot mid-segment should look ahead along the line, not jump to a vertex."""
+    path = Path2D(points=((0.0, 0.0), (5.0, 0.0)), goal_theta=0.0)
+    pose = Pose2D(2.0, 0.1, 0.0)
+    target, idx, is_final = lookahead_pose(
+        pose, path, lookahead_m=1.0, waypoint_tolerance_m=0.1
+    )
+    assert not is_final
+    assert target.x == pytest.approx(3.0, abs=0.15)
+    assert abs(target.y) < 0.2
+
+
+def test_follow_command_translates_while_gently_turning():
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    current = Pose2D(0.0, 0.0, 0.0)
+    target = Pose2D(2.0, 0.5, 0.0)  # ~14 deg bearing — should still drive
+    cmd = compute_follow_command(current, target, cfg=cfg)
+    assert not cmd.done
+    assert cmd.vx > 0.05
+    assert cmd.vtheta != 0.0
+
+
+def test_follow_command_rotates_in_place_when_facing_away():
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    current = Pose2D(0.0, 0.0, 0.0)
+    target = Pose2D(-2.0, 0.0, 0.0)  # 180 deg behind
+    cmd = compute_follow_command(current, target, cfg=cfg)
+    assert cmd.vx == 0.0
+    assert abs(cmd.vtheta) > 0.0
+
+
 def test_compute_path_command_drives_forward():
     path = Path2D(points=((0.0, 0.0), (2.0, 0.0)), goal_theta=0.0)
     current = Pose2D(0.0, 0.0, 0.0)

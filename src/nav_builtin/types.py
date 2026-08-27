@@ -80,6 +80,8 @@ class NavStatus:
     path: Optional[List[dict]] = None
     length_m: float = 0.0
     motion: str = "builtin"
+    # Live follower diagnostics (obstacle / cmd / bearing) while active.
+    progress: Optional[dict] = None
 
     def to_dict(self) -> dict:
         out = {
@@ -93,6 +95,19 @@ class NavStatus:
         }
         if self.path is not None:
             out["path"] = list(self.path)
+        if self.progress is not None:
+            out["progress"] = dict(self.progress)
+            # Convenience mirrors for describe_motion / get_status consumers.
+            for key in (
+                "obstacle",
+                "forward_clearance_m",
+                "cmd_vx_mps",
+                "cmd_vtheta_rad_s",
+                "bearing_error_rad",
+                "distance_remaining_m",
+            ):
+                if key in self.progress and key not in out:
+                    out[key] = self.progress[key]
         return out
 
 

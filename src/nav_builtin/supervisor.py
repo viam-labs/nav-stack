@@ -25,7 +25,7 @@ class NavSupervisor:
         cost_scaling_factor: float = 4.0,
         algorithm: str = "lazy_theta_star",
         replan_period_s: float = 1.0,
-        lookahead_m: float = 0.6,
+        lookahead_m: float = 1.0,
         xy_tolerance_m: float = 0.25,
         yaw_tolerance_rad: float = 0.25,
         max_vel_x: float = 0.4,
@@ -93,6 +93,7 @@ class NavSupervisor:
                 path=list(s.path) if s.path is not None else None,
                 length_m=s.length_m,
                 motion=s.motion,
+                progress=dict(s.progress) if s.progress is not None else None,
             )
 
     def _set_status(self, **kwargs) -> None:
@@ -193,9 +194,14 @@ class NavSupervisor:
                     return
 
                 now = time.monotonic()
-                need_replan = now - last_replan >= self._replan_period
-                if need_replan:
+                need_replan_check = now - last_replan >= self._replan_period
+                if need_replan_check:
+                    last_replan = now
                     map_data = self._world.get_map()
+                    # Only replan when the current path is blocked. Soft periodic
+                    # replan was flipping Lazy Theta* routes every second and
+                    # making differential bases spin in place chasing a new
+                    # bearing.
                     if map_data is not None and path_blocked(
                         map_data,
                         path,
@@ -226,18 +232,6 @@ class NavSupervisor:
                                 error_msg=replanned.error_msg or "replan failed",
                             )
                             return
-                    elif need_replan:
-                        # Periodic soft replan even if not blocked (dynamic world).
-                        replanned = self.plan(goal, start=pose)
-                        if replanned.feasible:
-                            path = replanned.path
-                            preview = replanned.to_preview_dict(
-                                goal=(goal.x, goal.y, goal.theta), start=pose
-                            )
-                            self._set_status(
-                                path=preview["path"], length_m=preview["length_m"]
-                            )
-                    last_replan = now
 
                 scan = None
                 if self._follower.obstacle is not None and self._follower.obstacle.enabled:
@@ -245,6 +239,22 @@ class NavSupervisor:
 
                 cmd, progress = compute_path_command(
                     pose, path, cfg=self._follower, scan=scan
+                )
+                self._set_status(
+                    pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
+                    progress={
+                        k: progress[k]
+                        for k in (
+                            "obstacle",
+                            "forward_clearance_m",
+                            "cmd_vx_mps",
+                            "cmd_vtheta_rad_s",
+                            "bearing_error_rad",
+                            "distance_remaining_m",
+                            "waypoint_index",
+                        )
+                        if k in progress
+                    },
                 )
                 if progress.get("obstacle") == "no_scan":
                     # Fail closed: stop forward; brief wait then continue.
