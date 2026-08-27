@@ -142,6 +142,8 @@ class BuiltinNavigator:
         )
         self._last_preview = preview
         try:
+            if result.costmap_viz is not None:
+                self._world.set_viz_costmap(result.costmap_viz)
             if preview.get("feasible"):
                 self._world.set_viz_plan(
                     tuple((p["x"], p["y"]) for p in preview["path"]),

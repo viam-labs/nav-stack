@@ -11,6 +11,7 @@ import numpy as np
 from .costmap import (
     INSCRIBED,
     build_costmap,
+    costmap_viz_dict,
     is_traversable,
     nearest_free_cell,
     occupancy_from_bridge_map,
@@ -354,7 +355,11 @@ def plan_path(
     cost_scaling_factor: float = 4.0,
     algorithm: str = DEFAULT_PLANNER,
 ) -> PlanResult:
-    """Plan from a bridge-style map dict."""
+    """Plan from a bridge-style map dict.
+
+    On success, ``result.costmap_viz`` holds an OccupancyGrid-style dict the
+    nav-camera can render (inflated costs the planner actually used).
+    """
     try:
         occ = occupancy_from_bridge_map(map_data)
     except (KeyError, TypeError, ValueError) as exc:
@@ -365,7 +370,9 @@ def plan_path(
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
     )
-    return plan_on_costmap(occ, costs, start, goal, algorithm=algorithm)
+    result = plan_on_costmap(occ, costs, start, goal, algorithm=algorithm)
+    result.costmap_viz = costmap_viz_dict(occ, costs)
+    return result
 
 
 def path_blocked(

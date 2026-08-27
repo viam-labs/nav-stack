@@ -118,6 +118,8 @@ class PlanResult:
     error_code: int = 0
     error_msg: str = ""
     planning_time_s: float = 0.0
+    # Optional OccupancyGrid-style dict for nav-camera (inflated costs).
+    costmap_viz: Optional[dict] = None
 
     def to_preview_dict(
         self,

@@ -61,6 +61,28 @@ def test_build_costmap_inflates_obstacles():
     assert costs[1, 3] > 0
 
 
+def test_costmap_viz_dict_shows_inflation_gradient():
+    from src.nav_builtin.costmap import costmap_viz_dict, costs_to_occupancy_viz
+
+    occ = OccupancyGrid(
+        grid=np.zeros((21, 21), dtype=np.int16),
+        resolution=0.05,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    occ.grid[10, 10] = 100
+    costs = build_costmap(
+        occ, inflation_radius_m=0.35, robot_radius_m=0.12, cost_scaling_factor=3.0
+    )
+    viz = costs_to_occupancy_viz(costs)
+    assert viz[10, 10] == 100
+    # Halo around obstacle should be 1..99, not raw free zeros.
+    assert (viz[8:13, 8:13] > 0).sum() > 5
+    d = costmap_viz_dict(occ, costs)
+    assert d["grid"].shape == (21, 21)
+    assert d["resolution"] == 0.05
+
+
 def test_plan_straight_line_on_empty_map():
     m = _empty_map()
     start = Pose2D(0.25, 0.25, 0.0)
@@ -257,6 +279,9 @@ class _FakeWorld:
 
     def set_viz_plan(self, path_xy, goal=None):
         pass
+
+    def set_viz_costmap(self, costmap):
+        self.costmap = costmap
 
 
 def test_builtin_navigator_compute_path_and_status():

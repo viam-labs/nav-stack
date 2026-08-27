@@ -4,6 +4,8 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
+import numpy as np
+
 from ..ros import conversions as conv
 from .world_io import WorldIO
 
@@ -74,6 +76,23 @@ class BridgeWorldIO:
             node._viz_global_plan = tuple(path_xy)  # noqa: SLF001
             if goal is not None:
                 node._viz_goal = (float(goal[0]), float(goal[1]), float(goal[2]))  # noqa: SLF001
+
+    def set_viz_costmap(self, costmap: dict) -> None:
+        """Publish the builtin inflated costmap into the nav-camera snapshot."""
+        node = self._get_node()
+        if node is None or not costmap:
+            return
+        grid = costmap.get("grid")
+        if grid is None:
+            return
+        cm = {
+            "grid": np.asarray(grid),
+            "resolution": float(costmap["resolution"]),
+            "origin_x": float(costmap["origin_x"]),
+            "origin_y": float(costmap["origin_y"]),
+        }
+        with getattr(node, "_viz_lock", self._viz_lock):
+            node._viz_global_costmap = cm  # noqa: SLF001
 
 
 # Explicit Protocol satisfaction for type checkers.

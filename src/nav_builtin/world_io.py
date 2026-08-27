@@ -37,3 +37,7 @@ class WorldIO(Protocol):
     ) -> None:
         """Optional nav-camera overlay; default no-op."""
         return None
+
+    def set_viz_costmap(self, costmap: dict) -> None:
+        """Optional inflated costmap for nav-camera; default no-op."""
+        return None

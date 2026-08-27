@@ -134,6 +134,43 @@ def is_traversable(cost: int, *, allow_unknown: bool = False) -> bool:
     return True
 
 
+def costs_to_occupancy_viz(costs: np.ndarray) -> np.ndarray:
+    """Convert layered uint8 costs to OccupancyGrid-style int16 for nav-camera.
+
+    Nav2 / nav_view colouring expects: -1 unknown, 0 free, 1..98 inflation,
+    99 inscribed, 100 lethal.
+    """
+    c = np.asarray(costs)
+    out = np.zeros(c.shape, dtype=np.int16)
+    out[c == FREE] = 0
+    out[c == UNKNOWN] = -1
+    out[c == LETHAL] = 100
+    out[c == INSCRIBED] = 99
+    mid = (c > FREE) & (c < INSCRIBED)
+    if mid.any():
+        # Map 1..252 → 1..98.
+        scaled = np.clip(
+            np.rint(c[mid].astype(np.float32) * (98.0 / float(INSCRIBED - 1))),
+            1,
+            98,
+        ).astype(np.int16)
+        out[mid] = scaled
+    return out
+
+
+def costmap_viz_dict(
+    occ: OccupancyGrid,
+    costs: np.ndarray,
+) -> dict:
+    """Bridge-style map dict the nav-camera can render as an inflated costmap."""
+    return {
+        "grid": costs_to_occupancy_viz(costs),
+        "resolution": float(occ.resolution),
+        "origin_x": float(occ.origin_x),
+        "origin_y": float(occ.origin_y),
+    }
+
+
 def nearest_free_cell(
     costs: np.ndarray,
     row: int,

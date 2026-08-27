@@ -122,6 +122,22 @@ class NavSupervisor:
             algorithm=self._algorithm,
         )
 
+    def _publish_plan_viz(self, result: PlanResult, goal: Pose2D, start: Optional[Pose2D]) -> None:
+        preview = result.to_preview_dict(
+            goal=(goal.x, goal.y, goal.theta), start=start
+        )
+        try:
+            if result.costmap_viz is not None:
+                self._world.set_viz_costmap(result.costmap_viz)
+            if preview.get("feasible"):
+                self._world.set_viz_plan(
+                    tuple((p["x"], p["y"]) for p in preview["path"]),
+                    (goal.x, goal.y, goal.theta),
+                )
+        except Exception:  # noqa: BLE001 - viz is best-effort
+            pass
+        return preview
+
     def run_goal(self, goal: Pose2D) -> None:
         """Plan and follow until success, failure, or cancel. Blocking."""
         self._cancel.clear()
@@ -146,15 +162,8 @@ class NavSupervisor:
                 return
 
             path = result.path
-            preview = result.to_preview_dict(goal=(goal.x, goal.y, goal.theta), start=None)
+            preview = self._publish_plan_viz(result, goal, start=None)
             self._set_status(path=preview["path"], length_m=preview["length_m"])
-            try:
-                self._world.set_viz_plan(
-                    tuple((p["x"], p["y"]) for p in preview["path"]),
-                    (goal.x, goal.y, goal.theta),
-                )
-            except Exception:  # noqa: BLE001 - viz is best-effort
-                pass
 
             deadline = time.monotonic() + self._timeout_s
             last_replan = time.monotonic()
@@ -211,19 +220,10 @@ class NavSupervisor:
                         replanned = self.plan(goal, start=pose)
                         if replanned.feasible:
                             path = replanned.path
-                            preview = replanned.to_preview_dict(
-                                goal=(goal.x, goal.y, goal.theta), start=pose
-                            )
+                            preview = self._publish_plan_viz(replanned, goal, start=pose)
                             self._set_status(
                                 path=preview["path"], length_m=preview["length_m"]
                             )
-                            try:
-                                self._world.set_viz_plan(
-                                    tuple((p["x"], p["y"]) for p in preview["path"]),
-                                    (goal.x, goal.y, goal.theta),
-                                )
-                            except Exception:  # noqa: BLE001
-                                pass
                         else:
                             self._world.stop()
                             self._set_status(
