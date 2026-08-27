@@ -552,6 +552,11 @@ class BridgeNode(Node):
         decay velocity quickly so back-and-forth drives don't imprint the map.
         """
         if self._imu_odom_mode == IMU_ODOM_NONE and not self._has_wheel_twist:
+            # No IMU-accel translation, but keep lidar-odometry velocity (set by
+            # the scan timer). Zeroing here wiped scan-to-scan vx every odom tick
+            # and froze map XY while heading still updated from gyro.
+            if self._lidar_odom_enabled:
+                return self._imu_vx, self._imu_vy
             self._imu_vx = 0.0
             self._imu_vy = 0.0
             return 0.0, 0.0

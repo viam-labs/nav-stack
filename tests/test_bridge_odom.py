@@ -717,6 +717,32 @@ def test_bridge_heading_only_odom_zeros_translation(monkeypatch):
     assert bridge._odom.y == 0.0
 
 
+def test_bridge_imu_none_keeps_lidar_odom_velocity(monkeypatch):
+    """imu_odom_mode=none must not wipe scan-to-scan vx before pose integrate."""
+    sample = conv.parse_odom_from_readings(
+        {
+            "angular_velocity": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "orientation": {"yaw": 0.0, "pitch": 0.0, "roll": 0.0},
+            "linear_acceleration": {"x": 0.2, "y": 0.0, "z": 9.80665},
+        }
+    )
+    bridge = _odom_bridge_stub(sample=sample)
+    bridge._imu_odom_mode = "none"
+    bridge._heading_only_odom = True
+    bridge._lidar_odom_enabled = True
+    bridge._has_wheel_twist = False
+    bridge._imu_vx = 0.4
+    bridge._odom = conv.Pose2D(0.0, 0.0, 0.0)
+    monkeypatch.setattr("src.ros.bridge.time.monotonic", lambda: 1.0)
+    bridge._last_odom_time = 0.9
+
+    BridgeNode._on_odom_timer(bridge)
+
+    assert bridge._imu_vx == pytest.approx(0.4, abs=0.01)
+    assert bridge._odom.x == pytest.approx(0.04, abs=0.005)
+    assert bridge._odom.y == pytest.approx(0.0, abs=0.005)
+
+
 def test_bridge_lidar_odometry_rejects_sign_conflict(monkeypatch):
     n = 90
     angle_min = -math.pi / 3
