@@ -12,12 +12,12 @@
     {
       "api": "rdk:service:motion",
       "model": "viam-labs:nav-stack:navigation",
-      "short_description": "Motion MoveOnMap (builtin or Nav2) with locations, zones, and go-to DoCommand."
+      "short_description": "Builtin MoveOnMap over Viam APIs (ROS-free); Nav2 optional."
     },
     {
       "api": "rdk:service:motion",
       "model": "viam-labs:nav-stack:navigation-external",
-      "short_description": "MoveOnMap from any rdk:service:slam; builtin path is ROS-free."
+      "short_description": "MoveOnMap from any slam; builtin path is fully ROS-free."
     },
     {
       "api": "rdk:component:camera",

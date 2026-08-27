@@ -1,20 +1,16 @@
 """Navigation service model: ``viam-labs:nav-stack:navigation``.
 
-A Viam ``rdk:service:motion`` for map-frame navigation. By default it uses the
-in-module builtin navigator (``nav_backend: builtin``) with **ViamWorldIO**
-(SLAM ``get_grid`` / ``GetPosition``, lidar cameras, base SetVelocity) — no
-Nav2 and no ROS topics on the nav path. Set ``nav_backend: nav2`` to launch
-ROS2 Nav2 against the SLAM service's shared ROS context instead.
+Default ``nav_backend: builtin`` drives the in-module navigator over Viam APIs
+only (``ViamWorldIO`` + ``BuiltinNavHost``): SLAM ``get_grid`` / ``GetPosition``,
+lidar shm/cameras, ``Base.SetVelocity``. No RosManager, no bridge registration,
+no Nav2.
 
-The built-in SLAM service may still use ROS/slam_toolbox internally; this model
-only borrows that shared runtime for map store / (optional) Nav2.
+Set ``nav_backend: nav2`` to launch ROS2 Nav2 against the SLAM service's shared
+ROS context (legacy).
 
-Exposes:
-
-* Motion ``MoveOnMap`` / ``StopPlan`` / ``GetPlan`` / ``ListPlanStatuses`` /
-  ``GetPose``
-* DoCommand: locations CRUD, zones CRUD, ``navigate_*`` / ``go_to_*``, cancel,
-  status, ``get_costmap``, and Nav2 ops (``restart_nav2``, …) when using Nav2
+Note: the companion ``viam-labs:nav-stack:slam`` model still uses ROS
+(slam_toolbox) for mapping. For a fully ROS-free robot, use
+``navigation-external`` against any non-ROS ``rdk:service:slam``.
 """
 from __future__ import annotations
 
@@ -35,8 +31,14 @@ from viam.services.slam import SLAM
 from viam.utils import struct_to_dict
 
 from ..config import NavConfig
-from ..nav_builtin import NavVizStore, ViamWorldIO
+from ..nav_builtin import (
+    BuiltinNavHost,
+    NavVizStore,
+    ViamWorldIO,
+    make_builtin_navigator,
+)
 from ..runtime import (
+    SlamRuntime,
     get_slam,
     register_bridge,
     register_nav_viz,
@@ -76,6 +78,8 @@ class RosNavigation(NavServiceBase):
         super().__init__(name)
         self._viz: Optional[NavVizStore] = None
         self._slam_resource = None
+        # When builtin: a SlamRuntime whose ``manager`` is BuiltinNavHost (no ROS).
+        self._builtin_runtime: Optional[SlamRuntime] = None
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -95,6 +99,8 @@ class RosNavigation(NavServiceBase):
 
     # -- runtime resolution --------------------------------------------------
     def _resolve_runtime(self):
+        if self._builtin_runtime is not None:
+            return self._builtin_runtime
         cfg = self._require_cfg()
         return get_slam(cfg.slam_service)
 
@@ -108,8 +114,8 @@ class RosNavigation(NavServiceBase):
             SLAM, dependencies[SLAM.get_resource_name(cfg.slam_service)]
         )
 
-        runtime = get_slam(cfg.slam_service)
-        if runtime is None:
+        slam_rt = get_slam(cfg.slam_service)
+        if slam_rt is None:
             raise RuntimeError(
                 f"SLAM service {cfg.slam_service!r} not found; it must be configured "
                 "and started before the navigation service"
@@ -120,8 +126,15 @@ class RosNavigation(NavServiceBase):
         unregister_nav_viz(self.name)
         unregister_bridge(self.name)
         self._viz = None
+        if self._builtin_runtime is not None:
+            try:
+                self._builtin_runtime.manager.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            self._builtin_runtime = None
 
         if cfg.uses_builtin_nav():
+            # Fully ROS-free nav surface: never touch slam_rt.manager (RosManager).
             viz = NavVizStore()
             self._viz = viz
             loop = asyncio.get_event_loop()
@@ -129,38 +142,39 @@ class RosNavigation(NavServiceBase):
                 slam=self._slam_resource,
                 base=self._base,
                 loop=loop,
-                cameras=runtime.cameras,
-                lidars=runtime.slam_cfg.lidars,
-                base_velocity_convention=runtime.slam_cfg.base_velocity_convention,
+                cameras=slam_rt.cameras,
+                lidars=slam_rt.slam_cfg.lidars,
+                base_velocity_convention=slam_rt.slam_cfg.base_velocity_convention,
                 viz=viz,
-                shm_lidar=runtime.shm_lidar,
+                shm_lidar=slam_rt.shm_lidar,
                 scan_max_age_s=float(
-                    getattr(runtime.slam_cfg, "scan_max_age_s", 2.0) or 2.0
+                    getattr(slam_rt.slam_cfg, "scan_max_age_s", 2.0) or 2.0
                 ),
                 logger=lambda m: LOGGER.info(m),
             )
-            runtime.manager.set_builtin_world(world)
-            register_nav_viz(self.name, viz)
-            # Keep bridge registration so legacy callers still find the SLAM
-            # bridge; nav-camera prefers nav viz via get_nav_view.
-            slam_service = cfg.slam_service
-            register_bridge(
-                self.name,
-                lambda: (
-                    rt.manager.node
-                    if (rt := get_slam(slam_service)) is not None
-                    else None
-                ),
+            navigator = make_builtin_navigator(
+                world, cfg, logger=lambda m: LOGGER.info(m)
             )
-            runtime.manager.set_nav_config(cfg)
+            host = BuiltinNavHost(navigator, world, viz, nav_cfg=cfg)
+            self._builtin_runtime = SlamRuntime(
+                host,
+                slam_rt.map_store,
+                slam_rt.slam_cfg,
+                slam_rt.localization_check,
+                cameras=slam_rt.cameras,
+                shm_lidar=slam_rt.shm_lidar,
+            )
+            register_nav_viz(self.name, viz)
             self._refresh_zone_masks()
             LOGGER.info(
                 f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}, "
-                f"nav_backend=builtin, ViamWorldIO)"
+                f"nav_backend=builtin, ROS-free ViamWorldIO)"
             )
             return
 
-        runtime.manager.set_builtin_world(None)
+        # Legacy Nav2 path: share the SLAM RosManager / bridge.
+        if hasattr(slam_rt.manager, "set_builtin_world"):
+            slam_rt.manager.set_builtin_world(None)
         slam_service = cfg.slam_service
         register_bridge(
             self.name,
@@ -168,9 +182,9 @@ class RosNavigation(NavServiceBase):
                 rt.manager.node if (rt := get_slam(slam_service)) is not None else None
             ),
         )
-        runtime.manager.set_nav_config(cfg)
+        slam_rt.manager.set_nav_config(cfg)
         params_path = self._write_nav2_params(cfg)
-        runtime.manager.ensure_nav2_async(cfg, params_path)
+        slam_rt.manager.ensure_nav2_async(cfg, params_path)
         self._refresh_zone_masks()
         LOGGER.info(
             f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}, "
@@ -181,6 +195,12 @@ class RosNavigation(NavServiceBase):
         await self._cancel_simple_nav()
         unregister_bridge(self.name)
         unregister_nav_viz(self.name)
+        if self._builtin_runtime is not None:
+            try:
+                self._builtin_runtime.manager.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            self._builtin_runtime = None
         self._viz = None
 
 
