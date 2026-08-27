@@ -81,6 +81,9 @@ class RosManager:
         # Builtin navigator (default). Built on set_nav_config when
         # nav_backend == builtin; None means delegate to Nav2 action clients.
         self._builtin_nav = None
+        # Optional WorldIO override (ViamWorldIO). When set, builtin nav skips
+        # BridgeWorldIO / ROS topics for map/pose/scan/drive.
+        self._builtin_world = None
         self._started = False
         self._scratch = Path(slam_cfg.maps_dir).expanduser() / ".runtime"
         self._scratch.mkdir(parents=True, exist_ok=True)
@@ -1324,6 +1327,12 @@ class RosManager:
             self._nav2_ensure_thread.start()
 
     # -- navigation delegation ----------------------------------------------
+    def set_builtin_world(self, world) -> None:
+        """Install a WorldIO (typically ``ViamWorldIO``) for builtin nav."""
+        self._builtin_world = world
+        if self._nav_cfg is not None and self._nav_cfg.uses_builtin_nav():
+            self._configure_navigator(self._nav_cfg)
+
     def _configure_navigator(self, nav_cfg: NavConfig) -> None:
         """Install or clear the builtin navigator based on ``nav_backend``."""
         if not nav_cfg.uses_builtin_nav():
@@ -1334,40 +1343,13 @@ class RosManager:
                     pass
             self._builtin_nav = None
             return
-        from ..nav_builtin import BridgeWorldIO, BuiltinNavigator
+        from ..nav_builtin import BridgeWorldIO, make_builtin_navigator
 
-        bcfg = nav_cfg.builtin
-        xy_tol = (
-            bcfg.xy_goal_tolerance
-            if bcfg.xy_goal_tolerance is not None
-            else nav_cfg.nav2.xy_goal_tolerance
-        )
-        yaw_tol = (
-            bcfg.yaw_goal_tolerance
-            if bcfg.yaw_goal_tolerance is not None
-            else nav_cfg.nav2.yaw_goal_tolerance
-        )
-        world = BridgeWorldIO(lambda: self._node)
-        self._builtin_nav = BuiltinNavigator(
-            world,
-            inflation_radius_m=nav_cfg.inflation_radius,
-            robot_radius_m=nav_cfg.robot_radius,
-            cost_scaling_factor=bcfg.cost_scaling_factor,
-            algorithm=bcfg.planner,
-            replan_period_s=bcfg.replan_period_s,
-            lookahead_m=bcfg.lookahead_m,
-            xy_tolerance_m=xy_tol,
-            yaw_tolerance_rad=yaw_tol,
-            max_vel_x=nav_cfg.max_vel_x,
-            max_vel_theta=nav_cfg.max_vel_theta,
-            min_cmd_vel_x=nav_cfg.min_cmd_vel_x,
-            min_cmd_vel_theta=nav_cfg.min_cmd_vel_theta,
-            timeout_s=bcfg.timeout_s,
-            avoid_obstacles=nav_cfg.simple_avoid_obstacles,
-            stop_distance_m=nav_cfg.simple_stop_distance,
-            slow_distance_m=nav_cfg.simple_slow_distance,
-            scan_max_age_s=nav_cfg.simple_scan_max_age,
-            logger=self._log,
+        world = self._builtin_world
+        if world is None:
+            world = BridgeWorldIO(lambda: self._node)
+        self._builtin_nav = make_builtin_navigator(
+            world, nav_cfg, logger=self._log
         )
 
     def nav_backend(self) -> str:
@@ -1545,6 +1527,11 @@ class RosManager:
         )
 
     def get_pose_in_map(self) -> Optional[conv.Pose2D]:
+        if self._builtin_nav is not None and self._builtin_world is not None:
+            try:
+                return self._builtin_world.get_pose()
+            except Exception:  # noqa: BLE001
+                pass
         return self._require_node().get_pose_in_map()
 
     def apply_map_pose_correction(self, pose: conv.Pose2D) -> Dict:
@@ -1558,6 +1545,11 @@ class RosManager:
             node.set_still_keyframe_hook(hook)
 
     def get_base_scan(self, max_age_s: float = 1.0) -> Optional[conv.LaserScan2D]:
+        if self._builtin_nav is not None and self._builtin_world is not None:
+            try:
+                return self._builtin_world.get_scan(max_age_s)
+            except Exception:  # noqa: BLE001
+                pass
         node = self._node
         if node is None:
             return None

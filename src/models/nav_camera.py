@@ -39,7 +39,7 @@ from ..ros.nav_view import (
     placeholder_png,
     render_nav_view,
 )
-from ..runtime import get_bridge
+from ..runtime import get_nav_view
 
 LOGGER = getLogger(__name__)
 
@@ -102,13 +102,18 @@ class NavCamera(Camera):
         cfg = self._cfg
         if cfg is None:
             return placeholder_png("nav-camera: not configured")
-        bridge = get_bridge(cfg.navigation)
-        if bridge is None:
+        view = get_nav_view(cfg.navigation)
+        if view is None:
             return placeholder_png(
                 f"nav-camera: navigation {cfg.navigation!r} not running yet"
             )
-        bridge.enable_viz(cfg.plan_history_len)
-        snapshot = bridge.viz_snapshot()
+        if hasattr(view, "enable_viz"):
+            view.enable_viz(cfg.plan_history_len)
+        snapshot = (
+            view.viz_snapshot()
+            if hasattr(view, "viz_snapshot")
+            else view.snapshot()
+        )
         return render_nav_view(snapshot, self._opts)
 
     async def get_image(
@@ -149,11 +154,16 @@ class NavCamera(Camera):
         cfg = self._cfg
         if cfg is None:
             return {"configured": False}
-        bridge = get_bridge(cfg.navigation)
-        if bridge is None:
-            return {"navigation": cfg.navigation, "bridge": False}
-        bridge.enable_viz(cfg.plan_history_len)
-        snap = bridge.viz_snapshot()
+        view = get_nav_view(cfg.navigation)
+        if view is None:
+            return {"navigation": cfg.navigation, "bridge": False, "viz": False}
+        if hasattr(view, "enable_viz"):
+            view.enable_viz(cfg.plan_history_len)
+        snap = (
+            view.viz_snapshot()
+            if hasattr(view, "viz_snapshot")
+            else view.snapshot()
+        )
 
         def _n(v) -> int:
             return len(v) if v else 0
@@ -161,6 +171,7 @@ class NavCamera(Camera):
         return {
             "navigation": cfg.navigation,
             "bridge": True,
+            "viz": True,
             "has_costmap": snap.get("costmap") is not None,
             "has_map": snap.get("map") is not None,
             "global_plan_points": _n(snap.get("global_plan")),

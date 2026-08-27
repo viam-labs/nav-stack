@@ -1,8 +1,13 @@
 """Navigation service model: ``viam-labs:nav-stack:navigation``.
 
 A Viam ``rdk:service:motion`` for map-frame navigation. By default it uses the
-in-module builtin navigator (``nav_backend: builtin``). Set ``nav_backend: nav2``
-to launch ROS2 Nav2 against the SLAM service's shared ROS context instead.
+in-module builtin navigator (``nav_backend: builtin``) with **ViamWorldIO**
+(SLAM ``get_grid`` / ``GetPosition``, lidar cameras, base SetVelocity) — no
+Nav2 and no ROS topics on the nav path. Set ``nav_backend: nav2`` to launch
+ROS2 Nav2 against the SLAM service's shared ROS context instead.
+
+The built-in SLAM service may still use ROS/slam_toolbox internally; this model
+only borrows that shared runtime for map store / (optional) Nav2.
 
 Exposes:
 
@@ -10,16 +15,11 @@ Exposes:
   ``GetPose``
 * DoCommand: locations CRUD, zones CRUD, ``navigate_*`` / ``go_to_*``, cancel,
   status, ``get_costmap``, and Nav2 ops (``restart_nav2``, …) when using Nav2
-
-This model borrows the built-in SLAM model's shared in-process ROS runtime
-(looked up in the process-global registry by ``slam_service`` name). All of the
-Motion + DoCommand orchestration lives in
-:class:`~.nav_core.NavServiceBase`; this model only supplies the registry-backed
-runtime resolution.
 """
 from __future__ import annotations
 
-from typing import ClassVar, Mapping, Sequence, cast
+import asyncio
+from typing import ClassVar, Mapping, Optional, Sequence, cast
 
 from typing_extensions import Self
 
@@ -31,10 +31,18 @@ from viam.resource.base import ResourceBase
 from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
 from viam.services.motion import Motion
+from viam.services.slam import SLAM
 from viam.utils import struct_to_dict
 
 from ..config import NavConfig
-from ..runtime import get_slam, register_bridge, unregister_bridge
+from ..nav_builtin import NavVizStore, ViamWorldIO
+from ..runtime import (
+    get_slam,
+    register_bridge,
+    register_nav_viz,
+    unregister_bridge,
+    unregister_nav_viz,
+)
 
 # Re-exported for backwards-compatible imports (tests + any external callers
 # still do ``from src.models.navigation import _sync_mppi_model_dt`` etc.).
@@ -64,6 +72,11 @@ LOGGER = getLogger(__name__)
 class RosNavigation(NavServiceBase):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "nav-stack"), "navigation")
 
+    def __init__(self, name: str):
+        super().__init__(name)
+        self._viz: Optional[NavVizStore] = None
+        self._slam_resource = None
+
     # -- registration --------------------------------------------------------
     @classmethod
     def new(
@@ -91,6 +104,9 @@ class RosNavigation(NavServiceBase):
         cfg = NavConfig.from_dict(struct_to_dict(config.attributes))
         self._cfg = cfg
         self._base = cast(Base, dependencies[Base.get_resource_name(cfg.base)])
+        self._slam_resource = cast(
+            SLAM, dependencies[SLAM.get_resource_name(cfg.slam_service)]
+        )
 
         runtime = get_slam(cfg.slam_service)
         if runtime is None:
@@ -98,15 +114,49 @@ class RosNavigation(NavServiceBase):
                 f"SLAM service {cfg.slam_service!r} not found; it must be configured "
                 "and started before the navigation service"
             )
-        runtime.manager.set_nav_config(cfg)
-        # A previous simple-nav loop (go_to_* with wait: false) must not keep
-        # driving the base across a reconfigure; reconfigure is sync, so signal
-        # the cancel event instead of awaiting the task.
         if self._simple_nav_cancel is not None:
             self._simple_nav_cancel.set()
-        # Publish a provider (not the node itself) so a nav-camera always sees
-        # the SLAM service's *current* bridge node, even after a SLAM restart
-        # swaps the manager.
+
+        unregister_nav_viz(self.name)
+        unregister_bridge(self.name)
+        self._viz = None
+
+        if cfg.uses_builtin_nav():
+            viz = NavVizStore()
+            self._viz = viz
+            loop = asyncio.get_event_loop()
+            world = ViamWorldIO(
+                slam=self._slam_resource,
+                base=self._base,
+                loop=loop,
+                cameras=runtime.cameras,
+                lidars=runtime.slam_cfg.lidars,
+                base_velocity_convention=runtime.slam_cfg.base_velocity_convention,
+                viz=viz,
+                logger=lambda m: LOGGER.info(m),
+            )
+            runtime.manager.set_builtin_world(world)
+            register_nav_viz(self.name, viz)
+            # Keep bridge registration so legacy callers still find the SLAM
+            # bridge; nav-camera prefers nav viz via get_nav_view.
+            slam_service = cfg.slam_service
+            register_bridge(
+                self.name,
+                lambda: (
+                    rt.manager.node
+                    if (rt := get_slam(slam_service)) is not None
+                    else None
+                ),
+            )
+            runtime.manager.set_nav_config(cfg)
+            self._refresh_zone_masks()
+            LOGGER.info(
+                f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}, "
+                f"nav_backend=builtin, ViamWorldIO)"
+            )
+            return
+
+        runtime.manager.set_builtin_world(None)
         slam_service = cfg.slam_service
         register_bridge(
             self.name,
@@ -114,30 +164,20 @@ class RosNavigation(NavServiceBase):
                 rt.manager.node if (rt := get_slam(slam_service)) is not None else None
             ),
         )
+        runtime.manager.set_nav_config(cfg)
         params_path = self._write_nav2_params(cfg)
-        # Nav2 bringup (with retries) can take minutes on a Pi; run it in the
-        # background so reconfigure returns within viam-server's deadline.
-        # Builtin backend skips Nav2 entirely (ensure_nav2_async no-ops).
         runtime.manager.ensure_nav2_async(cfg, params_path)
         self._refresh_zone_masks()
-        backend = cfg.nav_backend
         LOGGER.info(
             f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}, "
-            f"nav_backend={backend})"
-            + (
-                "; Nav2 starting in background"
-                if cfg.uses_nav2()
-                else "; using builtin navigator"
-            )
+            f"nav_backend=nav2); Nav2 starting in background"
         )
 
     async def close(self) -> None:
-        # Stop any in-flight simple-nav loop so it cannot keep commanding the
-        # base after teardown.
         await self._cancel_simple_nav()
-        # The bridge node itself is owned by the SLAM service; only drop our
-        # nav-camera registration pointer.
         unregister_bridge(self.name)
+        unregister_nav_viz(self.name)
+        self._viz = None
 
 
 Registry.register_resource_creator(

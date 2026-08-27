@@ -12,17 +12,17 @@
     {
       "api": "rdk:service:motion",
       "model": "viam-labs:nav-stack:navigation",
-      "short_description": "Motion MoveOnMap via Nav2, plus locations/zones/go-to DoCommand on a Viam base."
+      "short_description": "Motion MoveOnMap via builtin navigator (or Nav2), plus locations/zones/go-to DoCommand on a Viam base."
     },
     {
       "api": "rdk:service:motion",
       "model": "viam-labs:nav-stack:navigation-external",
-      "short_description": "Motion MoveOnMap driven by any rdk:service:slam; runs its own sensor bridge."
+      "short_description": "Motion MoveOnMap from any rdk:service:slam; builtin path is ROS-free (get_grid/GetPosition + base)."
     },
     {
       "api": "rdk:component:camera",
       "model": "viam-labs:nav-stack:nav-camera",
-      "short_description": "Renders the nav service's Nav2 costmap, active plans, robot pose and goal as a camera image."
+      "short_description": "Renders the nav service's costmap, active plans, robot pose and goal as a camera image."
     }
   ],
   "entrypoint": "run.sh",

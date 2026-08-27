@@ -157,7 +157,13 @@ class RosSlam(SLAM):
 
         register_slam(
             self.name,
-            SlamRuntime(self._manager, self._map_store, cfg, self._last_relocalize_check),
+            SlamRuntime(
+                self._manager,
+                self._map_store,
+                cfg,
+                self._last_relocalize_check,
+                cameras=self._cameras,
+            ),
         )
         LOGGER.info(f"nav-stack SLAM '{self.name}' configured in {cfg.mode} mode")
 
@@ -1433,6 +1439,21 @@ class RosSlam(SLAM):
 
         if cmd == "get_mode":
             return {"mode": self._cfg.mode if self._cfg else None}
+
+        if cmd == "get_grid":
+            # Occupancy for external consumers (builtin nav ViamWorldIO, etc.).
+            def _grid():
+                node = mgr.node
+                if node is None:
+                    return None
+                return node.get_map()
+
+            map_data = await asyncio.to_thread(_grid)
+            if map_data is None or map_data.get("grid") is None:
+                return {"available": False, "reason": "no_map"}
+            from ..nav_builtin.viam_io import bridge_map_to_get_grid
+
+            return bridge_map_to_get_grid(map_data)
 
         if cmd == "get_status":
             probe_sensors = command.get("probe_sensors", True)

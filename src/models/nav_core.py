@@ -581,7 +581,10 @@ class NavServiceBase(Motion):
 
     def _refresh_zone_masks(self) -> None:
         runtime = self._require_runtime()
-        node = runtime.manager.node
+        node = getattr(runtime.manager, "node", None)
+        if node is None:
+            # Builtin / ROS-free host: no Nav2 costmap filters to publish into.
+            return
         grid = node.get_map() if node else None
         if not grid:
             LOGGER.warning("no map yet; zone masks will publish once a map is available")
@@ -823,21 +826,26 @@ class NavServiceBase(Motion):
         if cmd == "get_costmap":
             # Inflated costmap for operator UIs (nav-stack-ui Costmap toggle).
             # Nav2 backend: prefer /global_costmap/costmap, else /map.
-            # Builtin backend: build the same inflation the planner uses from /map
+            # Builtin backend: build the same inflation the planner uses from map
             # so the UI is not stuck on an un-inflated occupancy grid.
-            from ..runtime import get_bridge
+            from ..runtime import get_nav_view
 
-            bridge = get_bridge(self.name)
-            if bridge is None:
-                return {"available": False, "reason": "bridge_unavailable"}
+            view = get_nav_view(self.name)
+            if view is None:
+                return {"available": False, "reason": "viz_unavailable"}
 
             cfg = self._require_cfg()
 
             def _fetch():
                 import time as _time
 
-                bridge.enable_viz(8)
-                snap = bridge.viz_snapshot()
+                if hasattr(view, "enable_viz"):
+                    view.enable_viz(8)
+                snap = (
+                    view.viz_snapshot()
+                    if hasattr(view, "viz_snapshot")
+                    else view.snapshot()
+                )
                 cm = snap.get("costmap")
                 if cfg.uses_builtin_nav():
                     now = _time.monotonic()
@@ -847,9 +855,19 @@ class NavServiceBase(Motion):
                         and now - self._builtin_costmap_cache_at < 1.0
                     ):
                         return cached
-                    # Always rebuild from the live map so UI polling stays fresh
-                    # even before the first plan_to / navigate.
-                    mp = snap.get("map") or bridge.get_map()
+                    mp = snap.get("map")
+                    if mp is None and hasattr(view, "get_map"):
+                        mp = view.get_map()
+                    if mp is None or mp.get("grid") is None:
+                        # Refresh from ViamWorldIO / BuiltinNavHost when viz is cold.
+                        world = getattr(runtime.manager, "_world", None)
+                        if world is None:
+                            world = getattr(runtime.manager, "_builtin_world", None)
+                        if world is not None and hasattr(world, "get_map"):
+                            try:
+                                mp = world.get_map()
+                            except Exception:  # noqa: BLE001
+                                mp = None
                     if mp is not None and mp.get("grid") is not None:
                         from ..nav_builtin.costmap import (
                             build_costmap,
@@ -871,13 +889,16 @@ class NavServiceBase(Motion):
                         self._builtin_costmap_cache_at = now
                         # Keep nav-camera in sync with what the UI sees.
                         try:
-                            with bridge._viz_lock:  # noqa: SLF001
-                                bridge._viz_global_costmap = {  # noqa: SLF001
-                                    "grid": cm["grid"],
-                                    "resolution": cm["resolution"],
-                                    "origin_x": cm["origin_x"],
-                                    "origin_y": cm["origin_y"],
-                                }
+                            if hasattr(view, "set_costmap"):
+                                view.set_costmap(cm)
+                            elif hasattr(view, "_viz_lock"):
+                                with view._viz_lock:  # noqa: SLF001
+                                    view._viz_global_costmap = {  # noqa: SLF001
+                                        "grid": cm["grid"],
+                                        "resolution": cm["resolution"],
+                                        "origin_x": cm["origin_x"],
+                                        "origin_y": cm["origin_y"],
+                                    }
                         except Exception:  # noqa: BLE001
                             pass
                 if cm is None:
@@ -1148,11 +1169,10 @@ class NavServiceBase(Motion):
     async def _test_drive(
         self, command: Mapping[str, ValueTypes]
     ) -> Mapping[str, ValueTypes]:
-        """Send one ROS-body cmd through the same IO path Nav2 uses, then stop."""
+        """Send one ROS-body cmd through the drive path, then stop."""
         runtime = self._require_runtime()
-        io = runtime.manager.node._io if runtime.manager.node else None
-        if io is None:
-            raise RuntimeError("bridge IO unavailable")
+        node = getattr(runtime.manager, "node", None)
+        io = node._io if node is not None else None
 
         vx = float(command.get("vx", command.get("ros_vx_mps", 0.0)))
         vy = float(command.get("vy", command.get("ros_vy_mps", 0.0)))
@@ -1168,9 +1188,24 @@ class NavServiceBase(Motion):
         lx, ly = ros_cmd_vel_to_viam_linear_mm_s(
             vx, vy, runtime.slam_cfg.base_velocity_convention
         )
-        await io.drive_base(vx, vy, vtheta)
-        await asyncio.sleep(duration_s)
-        await io.stop_base()
+        if io is not None:
+            await io.drive_base(vx, vy, vtheta)
+            await asyncio.sleep(duration_s)
+            await io.stop_base()
+        else:
+            # ROS-free builtin: drive the Viam base directly.
+            base = self._base
+            if base is None:
+                raise RuntimeError("base unavailable")
+            await base.set_velocity(
+                linear=Vector3(x=lx, y=ly, z=0.0),
+                angular=Vector3(x=0.0, y=0.0, z=math.degrees(vtheta)),
+            )
+            await asyncio.sleep(duration_s)
+            await base.set_velocity(
+                linear=Vector3(x=0.0, y=0.0, z=0.0),
+                angular=Vector3(x=0.0, y=0.0, z=0.0),
+            )
         return {
             "status": "ok",
             "sent": {
@@ -1250,7 +1285,7 @@ class NavServiceBase(Motion):
         convention = runtime.slam_cfg.base_velocity_convention
 
         async def _set_velocity(vx: float, vy: float, vtheta: float) -> None:
-            node = runtime.manager.node
+            node = getattr(runtime.manager, "node", None)
             if node is not None:
                 node.record_cmd_vel(vx, vy, vtheta, source="simple")
             lx, ly = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, convention)
