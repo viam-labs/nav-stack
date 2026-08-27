@@ -102,24 +102,19 @@ def build_costmap(
             yy, xx = yy[closer], xx[closer]
             dist[yy, xx] = r
 
-    # Apply inflation costs on free cells.
+    # Apply inflation costs on free cells (vectorized).
     free = costs == FREE
-    for y in range(h):
-        row_free = free[y]
-        if not row_free.any():
-            continue
-        d = dist[y]
-        for x in np.flatnonzero(row_free):
-            dc = int(d[x])
-            if dc > inflate_cells:
-                continue
-            if dc <= inscribed_cells:
-                costs[y, x] = INSCRIBED
-                continue
-            # Exponential decay like Nav2: cost = 253 * exp(-factor * dist_m)
-            dist_m = dc * res
-            c = int(round(INSCRIBED * math.exp(-cost_scaling_factor * dist_m)))
-            costs[y, x] = max(1, min(INSCRIBED - 1, c))
+    within = free & (dist <= inflate_cells)
+    if within.any():
+        inscribed = within & (dist <= inscribed_cells)
+        costs[inscribed] = INSCRIBED
+        soft = within & ~inscribed
+        if soft.any():
+            dist_m = dist[soft].astype(np.float64) * res
+            soft_costs = np.rint(
+                INSCRIBED * np.exp(-cost_scaling_factor * dist_m)
+            ).astype(np.int32)
+            costs[soft] = np.clip(soft_costs, 1, INSCRIBED - 1).astype(np.uint8)
 
     return costs
 

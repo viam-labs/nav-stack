@@ -168,6 +168,10 @@ class NavServiceBase(Motion):
         # Set by ``suspend``; cleared by ``resume``, ``cancel``, ``stop_plan``,
         # or any new navigate / MoveOnMap / simple go.
         self._suspended: Optional[_SuspendedNav] = None
+        # Builtin get_costmap cache (nav-stack-ui polls while Costmap is on).
+        self._builtin_costmap_cache: Optional[dict] = None
+        self._builtin_costmap_cache_at: float = 0.0
+
     # -- runtime resolution (subclass-specific) ------------------------------
     def _resolve_runtime(self):
         """Return the active ``SlamRuntime`` or ``None``.
@@ -817,20 +821,70 @@ class NavServiceBase(Motion):
             return {"status": "nav2_restarted", **runtime.manager.nav2_diagnostics()}
 
         if cmd == "get_costmap":
-            # Live Nav2 global costmap (falls back to /map) as a compact uint8
-            # occupancy grid in map frame — for operator UIs overlaying the SLAM map.
+            # Inflated costmap for operator UIs (nav-stack-ui Costmap toggle).
+            # Nav2 backend: prefer /global_costmap/costmap, else /map.
+            # Builtin backend: build the same inflation the planner uses from /map
+            # so the UI is not stuck on an un-inflated occupancy grid.
             from ..runtime import get_bridge
 
             bridge = get_bridge(self.name)
             if bridge is None:
                 return {"available": False, "reason": "bridge_unavailable"}
 
-            def _fetch():
-                bridge.enable_viz(8)
-                return bridge.viz_snapshot()
+            cfg = self._require_cfg()
 
-            snap = await asyncio.to_thread(_fetch)
-            cm = snap.get("costmap") or snap.get("map")
+            def _fetch():
+                import time as _time
+
+                bridge.enable_viz(8)
+                snap = bridge.viz_snapshot()
+                cm = snap.get("costmap")
+                if cfg.uses_builtin_nav():
+                    now = _time.monotonic()
+                    cached = self._builtin_costmap_cache
+                    if (
+                        cached is not None
+                        and now - self._builtin_costmap_cache_at < 1.0
+                    ):
+                        return cached
+                    # Always rebuild from the live map so UI polling stays fresh
+                    # even before the first plan_to / navigate.
+                    mp = snap.get("map") or bridge.get_map()
+                    if mp is not None and mp.get("grid") is not None:
+                        from ..nav_builtin.costmap import (
+                            build_costmap,
+                            costmap_viz_dict,
+                            occupancy_from_bridge_map,
+                        )
+
+                        occ = occupancy_from_bridge_map(mp)
+                        costs = build_costmap(
+                            occ,
+                            inflation_radius_m=cfg.inflation_radius,
+                            robot_radius_m=cfg.robot_radius,
+                            cost_scaling_factor=float(
+                                cfg.builtin.cost_scaling_factor
+                            ),
+                        )
+                        cm = costmap_viz_dict(occ, costs)
+                        self._builtin_costmap_cache = cm
+                        self._builtin_costmap_cache_at = now
+                        # Keep nav-camera in sync with what the UI sees.
+                        try:
+                            with bridge._viz_lock:  # noqa: SLF001
+                                bridge._viz_global_costmap = {  # noqa: SLF001
+                                    "grid": cm["grid"],
+                                    "resolution": cm["resolution"],
+                                    "origin_x": cm["origin_x"],
+                                    "origin_y": cm["origin_y"],
+                                }
+                        except Exception:  # noqa: BLE001
+                            pass
+                if cm is None:
+                    cm = snap.get("map")
+                return cm
+
+            cm = await asyncio.to_thread(_fetch)
             if not cm or cm.get("grid") is None:
                 return {"available": False, "reason": "no_costmap"}
 
@@ -857,6 +911,7 @@ class NavServiceBase(Motion):
                 "encoding": "uint8_row_major",
                 "unknown": 255,
                 "data_b64": base64.b64encode(u8.tobytes()).decode("ascii"),
+                "nav_backend": cfg.nav_backend,
             }
 
         raise ValueError(f"unknown command: {cmd!r}")
