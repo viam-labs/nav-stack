@@ -297,14 +297,13 @@ class RosManager:
         if not self.nav2_running():
             self._nav_action_ok_until = 0.0
             return False
-        # Recently verified fully healthy: run only the cheapest check (one
-        # `ros2 node list`) instead of the ~7 CLI subprocesses (seconds each on
-        # a Pi). A vanished core node is a real crash and resets the grace
-        # window; action/lifecycle CLI flake alone must not block goals.
+        # Recently verified healthy: trust the grace window. Do not shell out to
+        # ``ros2 node list`` here — each CLI invoke (bash + source + ros2) is
+        # often 1–3s on a Pi and made every plan_to_* feel multi-second even
+        # though NavFn itself is tens of ms. Process liveness is already covered
+        # by nav2_running(); action clients fail fast if Nav2 actually died.
         if now < self._nav_action_ok_until:
-            if self._required_nav_nodes_present():
-                return True
-            self._nav_action_ok_until = 0.0
+            return True
         action_ok = self._nav_action_server_visible()
         nodes_ok = self._required_nav_nodes_present()
         if not (action_ok and nodes_ok):
@@ -313,11 +312,11 @@ class RosManager:
         if self._required_nav_nodes_active():
             self._nav_action_ok_until = now + 60.0
             return True
-        # Lifecycle CLI is slow on Pi; keep accepting goals briefly if we were
-        # recently healthy so a transient lifecycle query does not block nav.
-        if now < self._nav_action_ok_until:
-            return True
         return False
+
+    def _nav_action_ready_cached(self) -> bool:
+        """True when Nav2 procs are up and we recently verified the action graph."""
+        return self.nav2_running() and time.monotonic() < self._nav_action_ok_until
 
     def wait_for_nav_action(self, timeout: float = 90.0) -> bool:
         return self._wait_for_nav_action(timeout=timeout)
@@ -1305,7 +1304,6 @@ class RosManager:
                 "Nav2 is still starting up in the background; retry in a few seconds "
                 "(check progress with the get_status command)"
             )
-        self._apply_slam_tf_params()
         # Cancel any stuck recovery / prior goal so a second navigate_to_location
         # cannot appear to do nothing while BT is still busy.
         try:
@@ -1347,10 +1345,11 @@ class RosManager:
                 "Nav2 is still starting up in the background; retry in a few seconds "
                 "(check progress with the get_status command)"
             )
-        self._apply_slam_tf_params()
-        if not self.nav_action_ready():
-            # Do not block plan on a multi-minute ensure_nav2 retry loop — the UI
-            # looks hung. Ask the caller to restart_nav2 / wait for readiness.
+        # Hot path: do not call ``ros2 param set`` / full CLI readiness here.
+        # Those were dominating wall-clock plan_to_* latency in the UI (~seconds)
+        # while NavFn itself is tens of ms. TF params are applied at slam/Nav2
+        # start; readiness is cached after the first successful check.
+        if not self._nav_action_ready_cached() and not self.nav_action_ready():
             raise RuntimeError(
                 "Nav2 is not ready (no active /navigate_to_pose). "
                 "Check get_status: nav_action_ready should be true and "

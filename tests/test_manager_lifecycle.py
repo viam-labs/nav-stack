@@ -158,9 +158,7 @@ def test_navigate_cancels_prior_goal():
     mgr = _manager()
     mgr._node = MagicMock()
     mgr._node.send_nav_goal.return_value = True
-    with patch.object(mgr, "nav_action_ready", return_value=True), patch.object(
-        mgr, "_apply_slam_tf_params"
-    ):
+    with patch.object(mgr, "nav_action_ready", return_value=True):
         mgr.navigate(1.0, 2.0, 0.5)
     mgr._node.cancel_nav.assert_called_once()
 
@@ -177,12 +175,32 @@ def test_navigate_retries_after_ensuring_nav2_when_action_unavailable():
 
     with patch.object(mgr, "ensure_nav2") as ensure, patch.object(
         mgr, "nav_action_ready", return_value=True
-    ), patch.object(mgr, "_apply_slam_tf_params"):
+    ):
         mgr.navigate(1.0, 2.0, 0.5)
 
     mgr._node.cancel_nav.assert_called_once()
     ensure.assert_called_once_with(mgr._nav_cfg, mgr._nav_params_path)
     assert mgr._node.send_nav_goal.call_count == 2
+
+
+def test_compute_path_skips_cli_when_readiness_cached():
+    mgr = _manager()
+    mgr._node = MagicMock()
+    mgr._node.compute_path_to_pose.return_value = {"feasible": True, "path": []}
+    mgr._nav2_procs = [MagicMock()]
+    mgr._nav2_procs[0].poll.return_value = None
+    mgr._nav_action_ok_until = __import__("time").monotonic() + 60.0
+
+    with patch.object(mgr, "_apply_slam_tf_params") as apply_tf, patch.object(
+        mgr, "nav_action_ready"
+    ) as ready, patch.object(mgr, "_run_ros") as run:
+        out = mgr.compute_path(1.0, 2.0, 0.0)
+
+    assert out["feasible"] is True
+    apply_tf.assert_not_called()
+    ready.assert_not_called()
+    run.assert_not_called()
+    mgr._node.compute_path_to_pose.assert_called_once()
 
 
 def test_apply_slam_tf_params_sets_transform_timeout():
@@ -193,6 +211,27 @@ def test_apply_slam_tf_params_sets_transform_timeout():
         mgr._apply_slam_tf_params()
     run.assert_called_once()
     assert run.call_args.args[0][-1] == "0.0"
+
+
+def test_nav_action_ready_trusts_grace_window_without_cli():
+    mgr = _manager()
+    mgr._nav2_procs = [MagicMock()]
+    mgr._nav2_procs[0].poll.return_value = None
+    mgr._nav_action_ok_until = __import__("time").monotonic() + 60.0
+    with patch.object(mgr, "_required_nav_nodes_present") as present, patch.object(
+        mgr, "_nav_action_server_visible"
+    ) as visible:
+        assert mgr.nav_action_ready() is True
+    present.assert_not_called()
+    visible.assert_not_called()
+
+
+def test_nav_action_ready_clears_cache_when_nav2_not_running():
+    mgr = _manager()
+    mgr._nav2_procs = []
+    mgr._nav_action_ok_until = __import__("time").monotonic() + 60.0
+    assert mgr.nav_action_ready() is False
+    assert mgr._nav_action_ok_until == 0.0
 
 
 def test_bundled_nav2_launch_file_exists():
@@ -317,18 +356,6 @@ def test_lifecycle_manager_params_disable_bond_timeout(tmp_path):
     )
     # Navigation LM lives in the bundled launch now (no override yaml).
     assert not (scratch / "nav_lifecycle.yaml").exists()
-
-
-def test_nav_action_ready_invalidates_cache_when_nodes_missing():
-    mgr = _manager()
-    mgr._nav2_procs = [MagicMock()]
-    mgr._nav2_procs[0].poll.return_value = None
-    mgr._nav_action_ok_until = __import__("time").monotonic() + 60.0
-    with patch.object(mgr, "_required_nav_nodes_present", return_value=False), patch.object(
-        mgr, "_nav_action_server_visible", return_value=True
-    ):
-        assert mgr.nav_action_ready() is False
-    assert mgr._nav_action_ok_until == 0.0
 
 
 def test_ensure_nav2_returns_early_when_params_unchanged(tmp_path):
