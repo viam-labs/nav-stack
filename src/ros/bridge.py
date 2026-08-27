@@ -1749,25 +1749,20 @@ class BridgeNode(Node):
                 f"Nav2 action {_COMPUTE_PATH_ACTION_NAME!r} unavailable "
                 "(nav2_msgs not installed?)"
             )
-        tf_wait_s = 8.0 if self._last_pose_in_map is None else 3.0
-        if not self._wait_for_map_tf(timeout_s=tf_wait_s):
-            if self._last_pose_in_map is None:
-                raise RuntimeError(
-                    "map->base_link transform not available; localize before planning"
-                )
-            self.get_logger().warn(
-                "map->base_link lookup timed out during plan preview; "
-                "sending compute_path anyway"
-            )
+        # Explicit start, or a prior map pose, means we can ask the planner
+        # immediately. Do not burn seconds on a bridge-local TF poll — NavFn
+        # itself is tens of ms, and Nav2 uses its own TF buffer.
+        if start is None:
+            self._ensure_map_pose_ready(require_live=False)
 
         self._ensure_compute_path_action_client()
         if self._compute_path_action is None:
             raise RuntimeError(f"Nav2 action {_COMPUTE_PATH_ACTION_NAME!r} unavailable")
 
-        if not self._wait_for_compute_path_server(timeout_s=10.0):
+        if not self._wait_for_compute_path_server(timeout_s=2.0):
             self.reset_nav_action_client()
             self._ensure_compute_path_action_client()
-            if not self._wait_for_compute_path_server(timeout_s=5.0):
+            if not self._wait_for_compute_path_server(timeout_s=2.0):
                 raise RuntimeError(
                     f"Nav2 action {_COMPUTE_PATH_ACTION_NAME!r} not available "
                     "(is planner_server active?)"
@@ -1870,28 +1865,57 @@ class BridgeNode(Node):
     def last_preview_plan(self) -> Optional[Dict]:
         return dict(self._last_preview_plan) if self._last_preview_plan else None
 
-    def _wait_for_compute_path_server(self, timeout_s: float = 10.0) -> bool:
+    def _wait_for_compute_path_server(self, timeout_s: float = 2.0) -> bool:
         if self._compute_path_action is None:
             return False
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if self._compute_path_action.server_is_ready():
                 return True
-            time.sleep(0.1)
+            time.sleep(0.05)
         return False
 
-    def _wait_for_map_tf(self, timeout_s: float = 8.0) -> bool:
+    def _wait_for_map_tf(self, timeout_s: float = 0.5) -> bool:
         """Block until map->base_link is available (post-localize / set_initial_pose).
 
         Uses a raw TF lookup, not get_pose_in_map(): that helper falls back to a
         cached pose on lookup failure, which would defeat this readiness check.
         """
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
+        deadline = time.monotonic() + max(float(timeout_s), 0.0)
+        while True:
             if self._lookup_pose_in_map() is not None:
                 return True
-            time.sleep(0.1)
-        return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def _ensure_map_pose_ready(
+        self,
+        *,
+        require_live: bool = False,
+        fail_fast_s: float = 0.5,
+        not_ready_msg: str = (
+            "map->base_link transform not available; localize before planning"
+        ),
+    ) -> None:
+        """Fail fast unless a map pose is already known (or briefly appears).
+
+        Previously we blocked 3–8s on every plan/goal even after localization,
+        which dominated wall-clock "planning" time. Nav2 has its own TF buffer;
+        a cached bridge pose is enough to proceed.
+        """
+        if self._lookup_pose_in_map() is not None:
+            return
+        if self._last_pose_in_map is not None and not require_live:
+            return
+        if self._wait_for_map_tf(timeout_s=fail_fast_s):
+            return
+        if self._last_pose_in_map is not None and not require_live:
+            self.get_logger().warn(
+                "map->base_link lookup timed out; using cached pose and continuing"
+            )
+            return
+        raise RuntimeError(not_ready_msg)
 
     def _goal_pose_stamp(self):
         """Use latest-available TF; avoids extrapolation when slam lags scan stamps."""
@@ -1906,31 +1930,23 @@ class BridgeNode(Node):
         """Send a map-frame goal to Nav2."""
         if NavigateToPose is None:
             raise RuntimeError(f"Nav2 action {_NAV_ACTION_NAME!r} unavailable")
-        # Shorter wait once localization has succeeded before: we would proceed
-        # anyway, so do not add 8s of latency to every goal on a stale buffer.
-        tf_wait_s = 8.0 if self._last_pose_in_map is None else 3.0
-        if not self._wait_for_map_tf(timeout_s=tf_wait_s):
-            # Only hard-fail when localization has never succeeded. A stale
-            # bridge-local TF buffer must not block goals: bt_navigator has its
-            # own buffer and is the real authority, and will abort visibly if
-            # the map pose is truly unavailable.
-            if self._last_pose_in_map is None:
-                raise RuntimeError(
-                    "map->base_link transform not available; run set_initial_pose "
-                    "or global_localize and wait for localization before navigating"
-                )
-            self.get_logger().warn(
-                "map->base_link lookup timed out but localization previously "
-                "succeeded; sending goal anyway (Nav2 aborts if pose is unavailable)"
-            )
+        # Fail fast when never localized; once we have a cached map pose do not
+        # add multi-second TF polls (bt_navigator is the real TF authority).
+        self._ensure_map_pose_ready(
+            require_live=False,
+            not_ready_msg=(
+                "map->base_link transform not available; run set_initial_pose "
+                "or global_localize and wait for localization before navigating"
+            ),
+        )
         self._ensure_nav_action_client()
-        if self._wait_for_rclpy_action_server():
+        if self._wait_for_rclpy_action_server(timeout_s=2.0):
             self._cancel_inflight_nav()
             return self._publish_nav_goal(x, y, theta)
         # rclpy action clients can become stale after Nav2 restarts; recreate once.
         self.reset_nav_action_client()
         self._ensure_nav_action_client()
-        if self._wait_for_rclpy_action_server():
+        if self._wait_for_rclpy_action_server(timeout_s=2.0):
             self._cancel_inflight_nav()
             return self._publish_nav_goal(x, y, theta)
         # Last-resort fallback to CLI send if discovery sees the action.
@@ -1951,14 +1967,14 @@ class BridgeNode(Node):
                 pass
             self._goal_handle = None
 
-    def _wait_for_rclpy_action_server(self) -> bool:
+    def _wait_for_rclpy_action_server(self, timeout_s: float = 2.0) -> bool:
         if self._nav_action is None:
             return False
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + max(float(timeout_s), 0.0)
         while time.monotonic() < deadline:
             if self._nav_action.server_is_ready():
                 return True
-            time.sleep(0.2)
+            time.sleep(0.05)
         return False
 
     def _ros_env(self) -> dict:

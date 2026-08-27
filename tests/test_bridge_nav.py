@@ -40,7 +40,9 @@ def _nav_bridge_stub():
         _nav_active=True,
         get_logger=MagicMock(return_value=MagicMock()),
         set_nav_active=MagicMock(),
+        _ensure_map_pose_ready=MagicMock(),
         _wait_for_map_tf=MagicMock(return_value=True),
+        _lookup_pose_in_map=MagicMock(return_value=None),
         _last_pose_in_map=None,
     )
     return bridge
@@ -95,7 +97,9 @@ def test_on_nav_result_maps_success_status():
 
 def test_send_nav_goal_fails_without_map_tf():
     bridge = _nav_bridge_stub()
-    bridge._wait_for_map_tf = MagicMock(return_value=False)
+    bridge._ensure_map_pose_ready = MagicMock(
+        side_effect=RuntimeError("map->base_link transform not available")
+    )
 
     with pytest.raises(RuntimeError, match="map->base_link transform not available"):
         BridgeNode.send_nav_goal(bridge, 1.0, 2.0, 0.5)
@@ -105,7 +109,8 @@ def test_send_nav_goal_proceeds_on_stale_tf_when_previously_localized():
     from src.ros import conversions as conv
 
     bridge = _nav_bridge_stub()
-    bridge._wait_for_map_tf = MagicMock(return_value=False)
+    # Cached pose is enough: readiness helper returns without blocking.
+    bridge._ensure_map_pose_ready = MagicMock()
     bridge._last_pose_in_map = conv.Pose2D(1.0, 2.0, 0.0)
     bridge._ensure_nav_action_client = MagicMock()
     bridge._wait_for_rclpy_action_server = MagicMock(return_value=True)
@@ -116,6 +121,36 @@ def test_send_nav_goal_proceeds_on_stale_tf_when_previously_localized():
 
     assert ok is True
     bridge._publish_nav_goal.assert_called_once_with(1.0, 2.0, 0.5)
+    bridge._ensure_map_pose_ready.assert_called_once()
+
+
+def test_ensure_map_pose_ready_uses_cache_without_waiting():
+    from src.ros import conversions as conv
+
+    bridge = SimpleNamespace(
+        _last_pose_in_map=conv.Pose2D(1.0, 2.0, 0.0),
+        _lookup_pose_in_map=MagicMock(return_value=None),
+        _wait_for_map_tf=MagicMock(return_value=False),
+        get_logger=MagicMock(return_value=MagicMock()),
+    )
+
+    BridgeNode._ensure_map_pose_ready(bridge, require_live=False)
+
+    bridge._wait_for_map_tf.assert_not_called()
+
+
+def test_ensure_map_pose_ready_fails_fast_when_never_localized():
+    bridge = SimpleNamespace(
+        _last_pose_in_map=None,
+        _lookup_pose_in_map=MagicMock(return_value=None),
+        _wait_for_map_tf=MagicMock(return_value=False),
+        get_logger=MagicMock(return_value=MagicMock()),
+    )
+
+    with pytest.raises(RuntimeError, match="localize before planning"):
+        BridgeNode._ensure_map_pose_ready(bridge, fail_fast_s=0.5)
+
+    bridge._wait_for_map_tf.assert_called_once_with(timeout_s=0.5)
 
 
 def test_send_nav_goal_recreates_stale_action_client_then_publishes():
