@@ -86,6 +86,7 @@ def _odom_bridge_stub(*, sample: conv.OdomReading):
         _prev_scan_for_odom=None,
         _prev_scan_odom_theta=0.0,
         _prev_scan_odom_wall=0.0,
+        _last_lidar_odom_accept_wall=0.0,
         _frames=SimpleNamespace(odom="odom", base_link="base_link"),
         get_logger=MagicMock(return_value=MagicMock()),
         get_clock=MagicMock(
@@ -733,6 +734,7 @@ def test_bridge_imu_none_keeps_lidar_odom_velocity(monkeypatch):
     bridge._has_wheel_twist = False
     bridge._imu_vx = 0.4
     bridge._odom = conv.Pose2D(0.0, 0.0, 0.0)
+    bridge._last_lidar_odom_accept_wall = 1.0  # fresh lidar accept
     monkeypatch.setattr("src.ros.bridge.time.monotonic", lambda: 1.0)
     bridge._last_odom_time = 0.9
 
@@ -741,6 +743,57 @@ def test_bridge_imu_none_keeps_lidar_odom_velocity(monkeypatch):
     assert bridge._imu_vx == pytest.approx(0.4, abs=0.01)
     assert bridge._odom.x == pytest.approx(0.04, abs=0.005)
     assert bridge._odom.y == pytest.approx(0.0, abs=0.005)
+
+
+def test_bridge_imu_none_zupts_when_lidar_accept_stale(monkeypatch):
+    sample = conv.parse_odom_from_readings(
+        {
+            "angular_velocity": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "orientation": {"yaw": 0.0, "pitch": 0.0, "roll": 0.0},
+            "linear_acceleration": {"x": 0.0, "y": 0.0, "z": 9.80665},
+        }
+    )
+    bridge = _odom_bridge_stub(sample=sample)
+    bridge._imu_odom_mode = "none"
+    bridge._heading_only_odom = True
+    bridge._lidar_odom_enabled = True
+    bridge._has_wheel_twist = False
+    bridge._imu_vx = 0.4
+    bridge._last_lidar_odom_accept_wall = 0.0  # >0.4s stale at t=1.0
+    monkeypatch.setattr("src.ros.bridge.time.monotonic", lambda: 1.0)
+    bridge._last_odom_time = 0.9
+
+    BridgeNode._on_odom_timer(bridge)
+
+    assert abs(bridge._imu_vx) < 0.4
+    # After one decay tick vx should drop; repeated ticks zero it.
+    for _ in range(20):
+        bridge._last_odom_time = 0.9
+        BridgeNode._on_odom_timer(bridge)
+    assert bridge._imu_vx == 0.0
+
+
+def test_bridge_lidar_odometry_zupts_on_stationary_improvement(monkeypatch):
+    """When zero-shift is best, leftover vx must clear (no coast while parked)."""
+    n = 90
+    angle_min = -math.pi / 3
+    angle_inc = (2 * math.pi / 3) / (n - 1)
+    angles = angle_min + np.arange(n) * angle_inc
+    ranges = 5.0 / np.cos(angles)
+    scan = conv.LaserScan2D(ranges, angle_min, angle_inc, 0.1, 30.0)
+    bridge = _odom_bridge_stub(sample=conv.OdomReading(0.0, 0.0, 0.0, heading_rad=0.0))
+    bridge._has_wheel_twist = False
+    bridge._imu_vx = 0.35
+    bridge._odom = conv.Pose2D(0.0, 0.0, 0.0)
+    clock = {"t": 0.0}
+    monkeypatch.setattr("src.ros.bridge.time.monotonic", lambda: clock["t"])
+
+    BridgeNode._apply_lidar_odometry(bridge, scan)
+    clock["t"] = 0.2
+    BridgeNode._apply_lidar_odometry(bridge, scan)  # identical → improvement reject
+
+    assert bridge._lidar_odom_status.get("reason") == "improvement"
+    assert bridge._imu_vx == 0.0
 
 
 def test_bridge_lidar_odometry_rejects_sign_conflict(monkeypatch):

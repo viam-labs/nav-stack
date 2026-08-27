@@ -190,6 +190,7 @@ class BridgeNode(Node):
         self._prev_scan_for_odom: Optional[conv.LaserScan2D] = None
         self._prev_scan_odom_theta = 0.0
         self._prev_scan_odom_wall = time.monotonic()
+        self._last_lidar_odom_accept_wall = 0.0
         self._scan_accumulation_s = float(slam_cfg.scan_accumulation_s)
         self._imu_odom_mode = (
             IMU_ODOM_NONE
@@ -556,6 +557,14 @@ class BridgeNode(Node):
             # the scan timer). Zeroing here wiped scan-to-scan vx every odom tick
             # and froze map XY while heading still updated from gyro.
             if self._lidar_odom_enabled:
+                # Soft ZUPT if lidar has not confirmed motion recently — leftover
+                # vx after a stop must not coast into the map for seconds.
+                age = time.monotonic() - self._last_lidar_odom_accept_wall
+                if age > 0.4:
+                    self._imu_vx *= 0.85
+                    if abs(self._imu_vx) < 0.04:
+                        self._imu_vx = 0.0
+                    self._imu_vy = 0.0
                 return self._imu_vx, self._imu_vy
             self._imu_vx = 0.0
             self._imu_vy = 0.0
@@ -724,6 +733,7 @@ class BridgeNode(Node):
             self._imu_vy = 0.0
             self._last_flow_wall = now
             self._last_flow_vx = flow_vx
+            self._last_lidar_odom_accept_wall = now
             self._lidar_odom_status = {
                 "accepted": True,
                 "method": "range_flow",
@@ -747,9 +757,10 @@ class BridgeNode(Node):
         self._prev_scan_odom_theta = self._odom.theta
         self._prev_scan_odom_wall = now
         if motion is None:
+            reject = str(debug.get("reject", "no_match"))
             self._lidar_odom_status = {
                 "accepted": False,
-                "reason": debug.get("reject", "no_match"),
+                "reason": reject,
                 "method": debug.get("method", "none"),
                 "best_dx": round(float(debug.get("best_dx", 0.0)), 4),
                 "best_residual_m": round(float(debug.get("best_residual_m", 0.0)), 4),
@@ -757,6 +768,11 @@ class BridgeNode(Node):
                 "zero_residual_m": round(float(debug.get("zero_residual_m", 0.0)), 4),
                 "age_s": round(dt, 3),
             }
+            # "improvement" means zero translation fits as well as any shift —
+            # treat as lidar-confirmed stop so leftover vx cannot coast into the map.
+            if reject == "improvement" and abs(float(debug.get("best_dx", 0.0))) < 0.02:
+                self._imu_vx = 0.0
+                self._imu_vy = 0.0
             return
         dx, _dy, _ = motion
         dist = abs(dx)
@@ -770,6 +786,9 @@ class BridgeNode(Node):
                 "dt_s": round(dt, 3),
                 "age_s": round(dt, 3),
             }
+            if dist < 0.01:
+                self._imu_vx = 0.0
+                self._imu_vy = 0.0
             return
 
         # Reject sign flips unless acceleration confirms the new direction —
@@ -812,6 +831,7 @@ class BridgeNode(Node):
         self._imu_vx = (1.0 - alpha) * self._imu_vx + alpha * meas_vx
         self._imu_vy = 0.0
         self._imu_still_ticks = 0
+        self._last_lidar_odom_accept_wall = now
         self._lidar_odom_status = {
             "accepted": True,
             "dx": round(dx, 4),
