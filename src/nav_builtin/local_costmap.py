@@ -197,6 +197,59 @@ def max_cost_along_segment(
     return worst
 
 
+def footprint_max_cost(
+    view: LocalCostmapView,
+    x_m: float,
+    y_m: float,
+    *,
+    robot_radius_m: float,
+) -> int:
+    """Maximum cost under a circular footprint (``LETHAL`` when out of map)."""
+    res = view.occ.resolution
+    cells = max(1, int(math.ceil(robot_radius_m / res)))
+    row, col = view.world_to_cell(x_m, y_m)
+    h, w = view.costs.shape
+    r2 = cells * cells
+    worst = FREE
+    for dy in range(-cells, cells + 1):
+        for dx in range(-cells, cells + 1):
+            if dx * dx + dy * dy > r2:
+                continue
+            rr, cc = row + dy, col + dx
+            if not (0 <= rr < h and 0 <= cc < w):
+                return LETHAL
+            worst = max(worst, int(view.costs[rr, cc]))
+    return worst
+
+
+def reverse_backup_feasible(
+    view: LocalCostmapView,
+    x_m: float,
+    y_m: float,
+    theta_rad: float,
+    *,
+    robot_radius_m: float,
+    distance_m: float,
+    sample_step_m: float = 0.05,
+) -> bool:
+    """True when straight reverse stays traversable and ends in lower local cost."""
+    start_cost = footprint_max_cost(
+        view, x_m, y_m, robot_radius_m=robot_radius_m
+    )
+    step = max(float(sample_step_m), 1e-3)
+    steps = max(1, int(math.ceil(float(distance_m) / step)))
+    cth = math.cos(theta_rad)
+    sth = math.sin(theta_rad)
+    x, y = x_m, y_m
+    for _ in range(steps):
+        x -= cth * step
+        y -= sth * step
+        if footprint_collides(view, x, y, robot_radius_m=robot_radius_m):
+            return False
+    end_cost = footprint_max_cost(view, x, y, robot_radius_m=robot_radius_m)
+    return end_cost < start_cost
+
+
 def footprint_collides(
     view: LocalCostmapView,
     x_m: float,

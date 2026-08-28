@@ -9,7 +9,12 @@ import pytest
 from src.nav.simple_motion import rear_clearance_m
 from src.nav_builtin.controller import FollowerConfig, compute_path_command
 from src.nav_builtin.costmap import build_costmap, occupancy_from_bridge_map
-from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig, footprint_collides
+from src.nav_builtin.local_costmap import (
+    LocalCostmap,
+    LocalCostmapConfig,
+    footprint_collides,
+    reverse_backup_feasible,
+)
 from src.nav_builtin.local_planner import LocalPlannerConfig, compute_local_command
 from src.nav_builtin.smoother import smooth_path
 from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
@@ -184,6 +189,48 @@ def test_local_costmap_marks_scan_hit():
     view = lc.update(pose, scan)
     # Forward hit at x=2.0 should be marked lethal/inscribed after inflation.
     assert view.cost_at_world(2.0, 1.0) > 0
+
+
+def test_reverse_backup_feasible_requires_cost_improvement():
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=3.0,
+            height_m=3.0,
+            resolution=0.05,
+            inflation_radius_m=0.15,
+            robot_radius_m=0.08,
+            use_global_static=False,
+        )
+    )
+    th = math.pi / 2
+    n = 36
+    ranges_ahead = np.full(n, 3.0)
+    ranges_ahead[n // 2] = 0.25
+    scan_ahead = conv.LaserScan2D(
+        ranges_ahead,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(conv.Pose2D(1.5, 1.5, th), scan_ahead)
+    assert reverse_backup_feasible(
+        view, 1.5, 1.5, th, robot_radius_m=0.08, distance_m=0.35
+    )
+    # Wall behind robot — reverse would deepen overlap; must reject.
+    ranges_rear = np.full(n, 3.0)
+    ranges_rear[0] = 0.25
+    scan_rear = conv.LaserScan2D(
+        ranges_rear,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view_rear = lc.update(conv.Pose2D(1.5, 1.5, th), scan_rear)
+    assert not reverse_backup_feasible(
+        view_rear, 1.5, 1.5, th, robot_radius_m=0.08, distance_m=0.35
+    )
 
 
 def test_local_planner_prefers_reverse_when_blocked_ahead():

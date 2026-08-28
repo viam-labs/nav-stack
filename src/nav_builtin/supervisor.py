@@ -1,6 +1,7 @@
 """Goal lifecycle: plan → follow → replan → succeed / fail / cancel."""
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Optional
@@ -14,7 +15,12 @@ from ..nav.simple_motion import (
 )
 from ..ros import conversions as conv
 from .controller import FollowerConfig, compute_path_command
-from .local_costmap import LocalCostmap, LocalCostmapConfig
+from .local_costmap import (
+    LocalCostmap,
+    LocalCostmapConfig,
+    footprint_max_cost,
+    reverse_backup_feasible,
+)
 from .local_planner import LocalPlannerConfig
 from .planner import path_blocked, plan_path
 from .smoother import smooth_plan_path
@@ -66,6 +72,8 @@ class NavSupervisor:
         backup_dist_m: float = 0.35,
         backup_speed_mps: float = 0.15,
         backup_rear_clear_m: float = 0.45,
+        backup_max_attempts: int = 2,
+        backup_cooldown_s: float = 4.0,
     ):
         self._world = world
         self._inflation = inflation_radius_m
@@ -89,6 +97,8 @@ class NavSupervisor:
         self._backup_dist_m = backup_dist_m
         self._backup_speed_mps = backup_speed_mps
         self._backup_rear_clear_m = backup_rear_clear_m
+        self._backup_max_attempts = max(0, int(backup_max_attempts))
+        self._backup_cooldown_s = backup_cooldown_s
         self._local_costmap = (
             LocalCostmap(
                 LocalCostmapConfig(
@@ -254,6 +264,9 @@ class NavSupervisor:
             spin_stuck_since: Optional[float] = None
             backup_active = False
             backup_start: Optional[Pose2D] = None
+            backup_start_cost = 0
+            backup_attempts = 0
+            backup_cooldown_until = 0.0
             poll = self._follower.motion.poll_interval_s
 
             while time.monotonic() < deadline:
@@ -410,18 +423,34 @@ class NavSupervisor:
 
                 if backup_active and backup_start is not None:
                     backed_m = distance_m(pose, backup_start)
+                    pose_cost = (
+                        footprint_max_cost(
+                            local_view,
+                            pose.x,
+                            pose.y,
+                            robot_radius_m=self._robot_radius,
+                        )
+                        if local_view is not None
+                        else 0
+                    )
                     rear = (
                         rear_clearance_m(scan)
                         if scan is not None
                         else math.inf
                     )
+                    worse = (
+                        local_view is not None
+                        and pose_cost > backup_start_cost + 5
+                    )
                     if (
                         backed_m >= self._backup_dist_m
                         or rear < self._backup_rear_clear_m * 0.85
+                        or worse
                     ):
                         backup_active = False
                         backup_start = None
                         spin_stuck_since = None
+                        backup_cooldown_until = now + self._backup_cooldown_s
                         replanned = self.plan(goal, start=pose)
                         if replanned.feasible:
                             path = replanned.path
@@ -446,29 +475,48 @@ class NavSupervisor:
                 elif (
                     self._backup_enabled
                     and scan is not None
+                    and local_view is not None
                     and progress.get("local_planner")
                     and abs(cmd.vx) < 0.05
                     and abs(cmd.vtheta) > 0.1
+                    and backup_attempts < self._backup_max_attempts
+                    and now >= backup_cooldown_until
                 ):
                     if spin_stuck_since is None:
                         spin_stuck_since = now
-                    elif (
-                        now - spin_stuck_since >= self._backup_stuck_time_s
-                        and rear_clearance_m(scan) >= self._backup_rear_clear_m
-                    ):
-                        backup_active = True
-                        backup_start = pose
-                        spin_stuck_since = None
-                        cmd = DriveCommand(
-                            -self._backup_speed_mps, 0.0, 0.0, False
+                    elif now - spin_stuck_since >= self._backup_stuck_time_s:
+                        rear_ok = rear_clearance_m(scan) >= self._backup_rear_clear_m
+                        costmap_ok = reverse_backup_feasible(
+                            local_view,
+                            pose.x,
+                            pose.y,
+                            pose.theta,
+                            robot_radius_m=self._robot_radius,
+                            distance_m=self._backup_dist_m,
                         )
-                        progress = {
-                            **progress,
-                            "local_planner": False,
-                            "obstacle": "backup",
-                            "cmd_vx_mps": cmd.vx,
-                            "cmd_vtheta_rad_s": cmd.vtheta,
-                        }
+                        if rear_ok and costmap_ok:
+                            backup_active = True
+                            backup_start = pose
+                            backup_start_cost = footprint_max_cost(
+                                local_view,
+                                pose.x,
+                                pose.y,
+                                robot_radius_m=self._robot_radius,
+                            )
+                            backup_attempts += 1
+                            spin_stuck_since = None
+                            cmd = DriveCommand(
+                                -self._backup_speed_mps, 0.0, 0.0, False
+                            )
+                            progress = {
+                                **progress,
+                                "local_planner": False,
+                                "obstacle": "backup",
+                                "cmd_vx_mps": cmd.vx,
+                                "cmd_vtheta_rad_s": cmd.vtheta,
+                            }
+                        else:
+                            spin_stuck_since = None
                 else:
                     spin_stuck_since = None
 

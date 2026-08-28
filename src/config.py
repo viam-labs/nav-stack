@@ -259,6 +259,8 @@ class BuiltinNavConfig:
     backup_dist_m: float = 0.35
     backup_speed_mps: float = 0.15
     backup_rear_clear_m: float = 0.45
+    backup_max_attempts: int = 2
+    backup_cooldown_s: float = 4.0
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":
@@ -293,6 +295,8 @@ class BuiltinNavConfig:
             backup_dist_m=float(d.get("backup_dist_m", 0.35)),
             backup_speed_mps=float(d.get("backup_speed_mps", 0.15)),
             backup_rear_clear_m=float(d.get("backup_rear_clear_m", 0.45)),
+            backup_max_attempts=int(d.get("backup_max_attempts", 2)),
+            backup_cooldown_s=float(d.get("backup_cooldown_s", 4.0)),
         )
 
 
