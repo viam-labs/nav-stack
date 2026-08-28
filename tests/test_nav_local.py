@@ -113,6 +113,37 @@ def test_local_costmap_syncs_stale_scan_pose():
     assert view.cost_at_world(2.0, 0.0) == 0
 
 
+def test_local_costmap_does_not_reinflate_global_static():
+    """Global static in the local window must not get a second inflation pass."""
+    from src.nav_builtin.costmap import INSCRIBED, build_costmap, occupancy_from_bridge_map
+
+    m = _empty_map(size=60, resolution=0.05)
+    occ = occupancy_from_bridge_map(m)
+    occ.grid[30, 30] = 100
+    global_costs = build_costmap(
+        occ, inflation_radius_m=0.25, robot_radius_m=0.22, cost_scaling_factor=4.0
+    )
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=2.0,
+            height_m=2.0,
+            resolution=0.05,
+            inflation_radius_m=0.25,
+            robot_radius_m=0.22,
+            use_global_static=True,
+        )
+    )
+    pose = conv.Pose2D(1.5, 1.5, 0.0)
+    view = lc.update(pose, None, global_occ=occ, global_costs=global_costs)
+    # Just outside the global hard halo should remain free (double inflate would block).
+    wx, wy = occ.cell_to_world(30, 24)
+    assert int(global_costs[30, 24]) < INSCRIBED
+    assert view.cost_at_world(wx, wy) == int(global_costs[30, 24])
+    # Inside the halo, local must match global exactly — not a wider ring.
+    wx2, wy2 = occ.cell_to_world(30, 28)
+    assert view.cost_at_world(wx2, wy2) == int(global_costs[30, 28])
+
+
 def test_local_costmap_marks_scan_hit():
     lc = LocalCostmap(
         LocalCostmapConfig(

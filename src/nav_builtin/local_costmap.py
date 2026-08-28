@@ -17,7 +17,7 @@ class LocalCostmapConfig:
     width_m: float = 4.0
     height_m: float = 4.0
     resolution: float = 0.05
-    inflation_radius_m: float = 0.4
+    inflation_radius_m: float = 0.25
     robot_radius_m: float = 0.22
     cost_scaling_factor: float = 4.0
     # Include static lethal/inscribed cells from the global map in the window.
@@ -79,15 +79,14 @@ class LocalCostmap:
             origin_y=self._origin_y,
         )
 
-    def _copy_global_static(
+    def _project_global_costs(
         self,
         global_occ: OccupancyGrid,
         global_costs: np.ndarray,
-    ) -> None:
-        if not self._cfg.use_global_static:
-            return
+    ) -> np.ndarray:
+        """Copy already-inflated global costs into the local window (no re-inflate)."""
+        costs = np.zeros((self._h, self._w), dtype=np.uint8)
         res = self._occ.resolution
-        # Vectorized: world coords of every local cell center.
         cols = np.arange(self._w, dtype=np.float64)
         rows = np.arange(self._h, dtype=np.float64)
         xs = self._origin_x + (cols + 0.5) * res
@@ -103,8 +102,8 @@ class LocalCostmap:
         inside = (grows >= 0) & (grows < gh) & (gcols >= 0) & (gcols < gw)
         grows_c = np.clip(grows, 0, gh - 1)
         gcols_c = np.clip(gcols, 0, gw - 1)
-        blocked = inside & (global_costs[grows_c, gcols_c] >= INSCRIBED)
-        self._raw[blocked] = 100
+        costs[inside] = global_costs[grows_c, gcols_c][inside]
+        return costs
 
     def _mark_scan(self, pose: conv.Pose2D, scan: conv.LaserScan2D) -> None:
         pts = scan.to_points()
@@ -142,25 +141,33 @@ class LocalCostmap:
     ) -> LocalCostmapView:
         self._recenter(pose)
         self._raw.fill(0)
+        costs = np.zeros((self._h, self._w), dtype=np.uint8)
         if (
             global_occ is not None
             and global_costs is not None
             and self._cfg.use_global_static
         ):
-            self._copy_global_static(global_occ, global_costs)
+            costs = self._project_global_costs(global_occ, global_costs)
         if scan is not None:
             self._mark_scan(pose, scan)
-        occ = OccupancyGrid(
+        scan_occ = OccupancyGrid(
             grid=self._raw,
             resolution=self._occ.resolution,
             origin_x=self._origin_x,
             origin_y=self._origin_y,
         )
-        costs = build_costmap(
-            occ,
+        scan_costs = build_costmap(
+            scan_occ,
             inflation_radius_m=self._cfg.inflation_radius_m,
             robot_radius_m=self._cfg.robot_radius_m,
             cost_scaling_factor=self._cfg.cost_scaling_factor,
+        )
+        costs = np.maximum(costs, scan_costs)
+        occ = OccupancyGrid(
+            grid=self._raw,
+            resolution=self._occ.resolution,
+            origin_x=self._origin_x,
+            origin_y=self._origin_y,
         )
         return LocalCostmapView(
             costs=costs,
