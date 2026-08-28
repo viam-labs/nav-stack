@@ -7,7 +7,7 @@
     {
       "api": "rdk:service:slam",
       "model": "viam-labs:nav-stack:slam",
-      "short_description": "SLAM service wrapping slam_toolbox for mapping and localization on a Viam base."
+      "short_description": "SLAM: builtin occupancy (default) or slam_toolbox; mapping and localization on a Viam base."
     },
     {
       "api": "rdk:service:motion",

@@ -182,6 +182,10 @@ NAV_BACKEND_BUILTIN = "builtin"
 NAV_BACKEND_NAV2 = "nav2"
 NAV_BACKENDS = frozenset({NAV_BACKEND_BUILTIN, NAV_BACKEND_NAV2})
 
+SLAM_BACKEND_BUILTIN = "builtin"
+SLAM_BACKEND_TOOLBOX = "slam_toolbox"
+SLAM_BACKENDS = frozenset({SLAM_BACKEND_BUILTIN, SLAM_BACKEND_TOOLBOX})
+
 BUILTIN_PLANNER_ASTAR = "astar"
 BUILTIN_PLANNER_LAZY_THETA = "lazy_theta_star"
 BUILTIN_PLANNERS = frozenset({BUILTIN_PLANNER_ASTAR, BUILTIN_PLANNER_LAZY_THETA})
@@ -360,6 +364,8 @@ class SlamConfig:
     # disagree; more often the Livox +X is off base_link forward.
     map_pose_yaw_offset_deg: float = 0.0
     mode: str = MODE_MAPPING
+    # Default: in-process occupancy SLAM. Set ``slam_toolbox`` to keep ROS.
+    slam_backend: str = SLAM_BACKEND_BUILTIN
     maps_dir: str = "/root/.viam/nav-stack/maps"
     active_map: Optional[str] = None
     frames: Frames = field(default_factory=Frames)
@@ -534,6 +540,14 @@ class SlamConfig:
         mode = d.get("mode", MODE_MAPPING)
         if mode not in SLAM_MODES:
             raise ValueError(f"mode must be one of {sorted(SLAM_MODES)}")
+        slam_backend = str(
+            d.get("slam_backend", SLAM_BACKEND_BUILTIN) or SLAM_BACKEND_BUILTIN
+        )
+        if slam_backend not in SLAM_BACKENDS:
+            raise ValueError(
+                f"slam_backend must be one of {sorted(SLAM_BACKENDS)}, "
+                f"got {slam_backend!r}"
+            )
         convention = d.get("base_velocity_convention", BASE_VELOCITY_VIAM)
         if convention not in BASE_VELOCITY_CONVENTIONS:
             raise ValueError(
@@ -671,6 +685,7 @@ class SlamConfig:
             heading_sensor_invert=bool(d.get("heading_sensor_invert", False)),
             map_pose_yaw_offset_deg=float(d.get("map_pose_yaw_offset_deg", 0.0)),
             mode=mode,
+            slam_backend=slam_backend,
             maps_dir=d.get("maps_dir", "/root/.viam/nav-stack/maps"),
             active_map=d.get("active_map"),
             frames=Frames(
@@ -889,6 +904,12 @@ class SlamConfig:
         if self.heading_sensor:
             deps.append(self.heading_sensor)
         return deps
+
+    def uses_builtin_slam(self) -> bool:
+        return self.slam_backend == SLAM_BACKEND_BUILTIN
+
+    def uses_slam_toolbox(self) -> bool:
+        return self.slam_backend == SLAM_BACKEND_TOOLBOX
 
 
 @dataclass

@@ -88,6 +88,13 @@ class MapHandle:
     def has_serialized_map(self) -> bool:
         return self.posegraph_path.exists()
 
+    def has_occupancy_map(self) -> bool:
+        """True when ``map.yaml`` + ``map.pgm`` exist (builtin SLAM / export)."""
+        return self.occupancy_yaml_path.exists() and (self.root / "map.pgm").exists()
+
+    def has_any_map(self) -> bool:
+        return self.has_serialized_map() or self.has_occupancy_map()
+
     def clear_serialized_data(self) -> None:
         """Remove slam_toolbox serialization and exported occupancy grid files."""
         for path in (
@@ -140,7 +147,9 @@ class MapStore:
                 {
                     **meta.to_dict(),
                     "active": child.name == active,
-                    "has_map": handle.has_serialized_map(),
+                    "has_map": handle.has_any_map(),
+                    "has_posegraph": handle.has_serialized_map(),
+                    "has_occupancy": handle.has_occupancy_map(),
                 }
             )
         return out

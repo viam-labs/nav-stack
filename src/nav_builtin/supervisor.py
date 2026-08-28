@@ -310,4 +310,5 @@ class NavSupervisor:
                 self._world.stop()
             except Exception:  # noqa: BLE001
                 pass
-            self._set_status(state="failed", active=False, error_msg=str(exc))
+            msg = str(exc).strip() or type(exc).__name__
+            self._set_status(state="failed", active=False, error_msg=msg)

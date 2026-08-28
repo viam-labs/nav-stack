@@ -44,11 +44,10 @@ from ..nav.global_localize import (
 from ..nav import pause_keyframes, slice_match
 from ..nav.maps import MapStore, validate_map_name
 from ..ros import conversions as conv
-from ..ros.bridge import IOProvider
-from ..ros.manager import RosManager
-from ..ros.sensor_io import build_io_provider
 from ..ros.shm_lidar import ShmPointCloudClient
 from ..runtime import SlamRuntime, register_slam, unregister_slam
+from ..slam_builtin import BuiltinSlamEngine, BuiltinSlamHost
+from ..slam_builtin.io_sensors import BuiltinSensors
 
 LOGGER = getLogger(__name__)
 
@@ -64,7 +63,9 @@ class RosSlam(SLAM):
     def __init__(self, name: str):
         super().__init__(name)
         self._cfg: Optional[SlamConfig] = None
-        self._manager: Optional[RosManager] = None
+        # RosManager (slam_toolbox) or BuiltinSlamHost (builtin).
+        self._manager = None
+        self._engine: Optional[BuiltinSlamEngine] = None
         self._map_store: Optional[MapStore] = None
         self._base: Optional[Base] = None
         self._cameras: dict = {}
@@ -141,18 +142,44 @@ class RosSlam(SLAM):
         self._map_store.get_or_create_map(active, resolution=cfg.slam_toolbox.resolution)
         self._map_store.set_active_map(active)
 
-        # (Re)start the ROS stack.
         if self._manager is not None:
             self._manager.shutdown()
-        self._manager = RosManager(cfg, logger=LOGGER)
+            self._manager = None
+        self._engine = None
+
         loop = asyncio.get_event_loop()
-        self._manager.start(self._build_io(), loop)
-        # _build_io before start has no bridge node yet; rewire so drive/stop
-        # can record cmd_vel into get_status.
-        if self._manager.node is not None:
-            self._manager.node._io = self._build_io()
-        self._start_mode(cfg.mode)
-        self._wire_still_keyframe_hook()
+        if cfg.uses_builtin_slam():
+            sensors = BuiltinSensors(
+                cfg=cfg,
+                cameras=self._cameras,
+                movement_sensor=self._movement_sensor,
+                heading_sensor=self._heading_sensor,
+                shm_lidar=self._shm_lidar,
+                loop=loop,
+                logger=LOGGER.info,
+                skip_get_laser_scan=self._skip_get_laser_scan,
+                scan_max_age_s=float(cfg.scan_max_age_s or 2.0),
+            )
+            self._engine = BuiltinSlamEngine(
+                cfg, sensors, self._map_store, logger=LOGGER.info
+            )
+            self._manager = BuiltinSlamHost(self._engine)
+            self._manager.start()
+            self._start_mode(cfg.mode)
+            backend = "builtin"
+        else:
+            from ..ros.manager import RosManager
+
+            self._manager = RosManager(cfg, logger=LOGGER)
+            self._manager.start(self._build_io(), loop)
+            # _build_io before start has no bridge node yet; rewire so drive/stop
+            # can record cmd_vel into get_status.
+            if self._manager.node is not None:
+                self._manager.node._io = self._build_io()
+            self._start_mode(cfg.mode)
+            self._wire_still_keyframe_hook()
+            backend = "slam_toolbox"
+
         self._schedule_startup_global_localize(loop)
         self._schedule_periodic_relocalize(loop)
         self._schedule_mapping_revisit(loop)
@@ -168,7 +195,10 @@ class RosSlam(SLAM):
                 shm_lidar=self._shm_lidar,
             ),
         )
-        LOGGER.info(f"nav-stack SLAM '{self.name}' configured in {cfg.mode} mode")
+        LOGGER.info(
+            f"nav-stack SLAM '{self.name}' configured in {cfg.mode} mode "
+            f"(slam_backend={backend})"
+        )
 
     def _cancel_startup_global_localize_task(self) -> None:
         task = self._startup_global_localize_task
@@ -1210,7 +1240,9 @@ class RosSlam(SLAM):
                     await asyncio.sleep(max(retry_delay_s, 0.0))
 
     # -- ROS IO --------------------------------------------------------------
-    def _build_io(self) -> IOProvider:
+    def _build_io(self):
+        from ..ros.sensor_io import build_io_provider
+
         assert self._cfg is not None
         # Built-in path: read odometry from the movement sensor's get_readings()
         # (odom_reader=None). The external-SLAM model reuses this same builder
@@ -1225,13 +1257,15 @@ class RosSlam(SLAM):
             skip_get_laser_scan=self._skip_get_laser_scan,
             odom_reader=None,
             logger=LOGGER,
-            record_cmd_vel=(node.record_cmd_vel if node is not None else None),
+            record_cmd_vel=getattr(node, "record_cmd_vel", None),
             shm_lidar=self._shm_lidar,
         )
 
     async def _probe_sensors(self) -> dict:
         """One-shot lidar + odom read for get_status (does not affect /scan)."""
         assert self._cfg is not None
+        if self._cfg.uses_builtin_slam() and self._engine is not None:
+            return await self._probe_sensors_builtin()
         io = self._build_io()
         lidars: list[dict] = []
         for lidar in self._cfg.lidars:
@@ -1320,6 +1354,59 @@ class RosSlam(SLAM):
         except Exception as exc:  # noqa: BLE001 - diagnostics only
             odom_probe["error"] = repr(exc)
 
+        return {"lidars": lidars, "odometry": odom_probe}
+
+    async def _probe_sensors_builtin(self) -> dict:
+        """Probe via BuiltinSensors (no ROS bridge / IOProvider)."""
+        assert self._engine is not None and self._cfg is not None
+        sensors = self._engine._sensors  # noqa: SLF001
+        lidars: list[dict] = []
+        for lidar in self._cfg.lidars:
+            entry: dict = {
+                "name": lidar.name,
+                "scan_source": lidar.scan_source,
+                "shm_name": lidar.shm_name,
+            }
+            try:
+                scan = await asyncio.to_thread(
+                    sensors._read_lidar_scan_sync, lidar, max_age_s=2.0  # noqa: SLF001
+                )
+                if scan is None:
+                    entry["scan_valid_returns"] = 0
+                else:
+                    entry["scan_valid_returns"] = sum(
+                        1
+                        for r in scan.ranges
+                        if math.isfinite(r)
+                        and r >= scan.range_min
+                        and (
+                            not math.isfinite(scan.range_max) or r <= scan.range_max
+                        )
+                    )
+                    forward = conv.forward_sector_min_range(
+                        scan, half_width_rad=math.radians(15.0)
+                    )
+                    if forward is not None:
+                        entry["forward_min_range_m"] = round(forward, 3)
+            except Exception as exc:  # noqa: BLE001
+                entry["error"] = repr(exc)
+            lidars.append(entry)
+
+        odom_probe: dict = {}
+        try:
+            sample = await asyncio.to_thread(sensors.get_odom)
+            if sample is None:
+                odom_probe["error"] = "no_odometry"
+            else:
+                odom_probe = {
+                    "vx": sample.vx,
+                    "vy": sample.vy,
+                    "vtheta": sample.vtheta,
+                    "has_pose": sample.pose is not None,
+                    "has_heading": sample.heading_rad is not None,
+                }
+        except Exception as exc:  # noqa: BLE001
+            odom_probe["error"] = repr(exc)
         return {"lidars": lidars, "odometry": odom_probe}
 
     def _start_mode(self, mode: str) -> None:
@@ -1425,10 +1512,11 @@ class RosSlam(SLAM):
             if mapping
             else MappingMode.MAPPING_MODE_LOCALIZE_ONLY
         )
+        builtin = self._cfg is not None and self._cfg.uses_builtin_slam()
         return SLAM.Properties(
             cloud_slam=False,
             mapping_mode=mode,
-            internal_state_file_type=".posegraph",
+            internal_state_file_type="" if builtin else ".posegraph",
             sensor_info=[],
         )
 
@@ -1470,6 +1558,9 @@ class RosSlam(SLAM):
 
             status = await asyncio.to_thread(_status)
             status["mode"] = self._cfg.mode if self._cfg else None
+            status["slam_backend"] = (
+                self._cfg.slam_backend if self._cfg else None
+            )
             status["active_map"] = store.get_active_map_name()
             if self._cfg is not None:
                 status["base"] = self._cfg.base
@@ -1526,7 +1617,12 @@ class RosSlam(SLAM):
             if name:
                 store.set_active_map(str(name))
             handle = store.active_handle()
-            if not handle or not handle.has_serialized_map():
+            need_map = (
+                handle.has_any_map()
+                if self._cfg is not None and self._cfg.uses_builtin_slam()
+                else (handle.has_serialized_map() if handle else False)
+            )
+            if not handle or not need_map:
                 raise ValueError("active map has no saved data; map it first")
             await asyncio.to_thread(self._start_mode, MODE_LOCALIZING)
             self._reschedule_mode_watchdogs()

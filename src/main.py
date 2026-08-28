@@ -2,9 +2,9 @@
 
 Registers the nav-stack resource models with the Viam module server.
 
-ROS-backed models (slam / navigation-nav2 / nav-camera against a bridge) require
-``rclpy``. Camera helpers and ``navigation-external`` with ``nav_backend: builtin``
-are ROS-free and always register.
+ROS-backed models (navigation with ``nav_backend: nav2``, slam with
+``slam_backend: slam_toolbox``) require ``rclpy``. Builtin slam/nav and camera
+helpers always register.
 """
 from __future__ import annotations
 
@@ -29,34 +29,31 @@ from .ros.dds_env import apply_dds_isolation
 
 apply_dds_isolation()
 
-# Always-on (no ROS required).
+# Always-on (no ROS required at import time).
 from .models.shm_pointcloud import ShmPointCloud
 from .models.rplidar_shm import RPLidarShm
-
-# Builtin nav + external SLAM: import without requiring rclpy at import time.
-# navigation_external only imports RosManager lazily on nav_backend=nav2.
 from .models.navigation_external import RosNavigationExternal
 from .models.nav_camera import NavCamera
+from .models.slam import RosSlam
 
-_ROS_MODELS = None
+_NAV2_MODEL = None
 if _rclpy_available():
-    from .models.slam import RosSlam
     from .models.navigation import RosNavigation
 
-    _ROS_MODELS = (RosSlam, RosNavigation)
+    _NAV2_MODEL = RosNavigation
 else:
     LOGGER.warning(
         "rclpy not found — registering ROS-free models only "
-        "(navigation-external, nav-camera, shm-pointcloud, rplidar). "
-        "nav-stack:slam and nav_backend=nav2 require a ROS 2 install."
+        "(slam builtin, navigation-external, nav-camera, shm-pointcloud, rplidar). "
+        "slam_backend=slam_toolbox and nav_backend=nav2 require a ROS 2 install."
     )
 
 
 async def main() -> None:
     module = Module.from_args()
-    if _ROS_MODELS is not None:
-        for model_cls in _ROS_MODELS:
-            module.add_model_from_registry(model_cls.API, model_cls.MODEL)
+    module.add_model_from_registry(RosSlam.API, RosSlam.MODEL)
+    if _NAV2_MODEL is not None:
+        module.add_model_from_registry(_NAV2_MODEL.API, _NAV2_MODEL.MODEL)
     module.add_model_from_registry(
         RosNavigationExternal.API, RosNavigationExternal.MODEL
     )
