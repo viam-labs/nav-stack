@@ -253,6 +253,33 @@ def test_predict_absolute_odom_uses_deltas_and_gates_jumps():
     assert p2.theta == pytest.approx(p1.theta)
 
 
+def test_follow_command_intermediate_target_never_marks_done():
+    from src.nav_builtin.controller import FollowerConfig, compute_follow_command
+    from src.nav_builtin.types import Pose2D
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    current = Pose2D(0.0, 0.0, 0.0)
+    target = Pose2D(0.1, 0.0, 0.0)  # within 0.5 * xy_tol
+    cmd = compute_follow_command(current, target, cfg=cfg, final_yaw=None)
+    assert not cmd.done
+
+
+def test_host_relocalize_applies_drift_correction():
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
+    )
+    engine = BuiltinSlamEngine(
+        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
+    )  # type: ignore[arg-type]
+    host = BuiltinSlamHost(engine)
+    engine.set_pose(conv.Pose2D(1.0, 1.0, 0.0))
+
+    # 0.2 m drift fix from periodic relocalize should apply (not soft-gated).
+    host.relocalize(conv.Pose2D(1.2, 1.0, 0.0))
+    assert engine.get_pose().x == pytest.approx(1.2)
+
+
 def test_host_relocalize_soft_seed():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
@@ -263,7 +290,7 @@ def test_host_relocalize_soft_seed():
     host = BuiltinSlamHost(engine)
     engine.set_pose(conv.Pose2D(1.0, 1.0, 0.0))
 
-    # Nearby relocalize (periodic watchdog agreeing within noise) is a no-op.
+    # Tiny nudge within the continuous matcher's band is still a no-op.
     host.relocalize(conv.Pose2D(1.1, 1.05, math.radians(5.0)))
     assert engine.get_pose().x == pytest.approx(1.0)
     assert engine.get_pose().y == pytest.approx(1.0)

@@ -15,12 +15,18 @@ from ..nav.simple_motion import (
     heading_error_rad,
 )
 from ..ros import conversions as conv
+from .local_costmap import LocalCostmapView
+from .local_planner import LocalPlannerConfig, compute_local_command
+from .path_utils import closest_point_on_path
 from .types import Path2D, Pose2D
 
 
 @dataclass
 class FollowerConfig:
-    lookahead_m: float = 1.0
+    lookahead_m: float = 0.6
+    min_lookahead_m: float = 0.25
+    max_lookahead_m: float = 0.7
+    approach_dist_m: float = 0.35
     waypoint_tolerance_m: float = 0.15
     # Above this bearing error, stop translating and rotate in place. Below it,
     # keep moving while turning (needed for sparse Lazy Theta* paths).
@@ -41,49 +47,14 @@ def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
 
 
-def closest_point_on_path(
-    current: Pose2D,
-    path: Path2D,
-) -> Tuple[float, float, int, float]:
-    """Return (x, y, segment_index, distance_along_path_m) for the closest point.
-
-    ``segment_index`` is the index of the segment start vertex (``i`` of
-    ``points[i] -> points[i+1]``).
-    """
-    pts = path.points
-    if not pts:
-        return current.x, current.y, 0, 0.0
-    if len(pts) == 1:
-        return pts[0][0], pts[0][1], 0, 0.0
-
-    best_d2 = math.inf
-    best_xy = pts[0]
-    best_seg = 0
-    best_along = 0.0
-    along = 0.0
-    for i in range(len(pts) - 1):
-        x0, y0 = pts[i]
-        x1, y1 = pts[i + 1]
-        dx, dy = x1 - x0, y1 - y0
-        seg_len2 = dx * dx + dy * dy
-        if seg_len2 < 1e-12:
-            t = 0.0
-            px, py = x0, y0
-            seg_len = 0.0
-        else:
-            t = ((current.x - x0) * dx + (current.y - y0) * dy) / seg_len2
-            t = max(0.0, min(1.0, t))
-            px = x0 + t * dx
-            py = y0 + t * dy
-            seg_len = math.sqrt(seg_len2)
-        d2 = (current.x - px) ** 2 + (current.y - py) ** 2
-        if d2 < best_d2:
-            best_d2 = d2
-            best_xy = (px, py)
-            best_seg = i
-            best_along = along + t * seg_len
-        along += seg_len
-    return best_xy[0], best_xy[1], best_seg, best_along
+def _effective_lookahead(cfg: FollowerConfig, *, speed_mps: float) -> float:
+    """Velocity-scaled lookahead (mugger-dds RPP: 0.25–0.7 m at ~1 s horizon)."""
+    lo = min(cfg.min_lookahead_m, cfg.max_lookahead_m)
+    hi = max(cfg.min_lookahead_m, cfg.max_lookahead_m)
+    scaled = max(lo, min(hi, abs(speed_mps) * 1.0))
+    if lo <= cfg.lookahead_m <= hi:
+        return max(lo, min(hi, cfg.lookahead_m if speed_mps < 0.05 else scaled))
+    return scaled
 
 
 def lookahead_pose(
@@ -163,8 +134,9 @@ def compute_follow_command(
             motion,
         )
 
-    if dist <= motion.xy_tolerance_m * 0.5:
-        return DriveCommand(0.0, 0.0, 0.0, True)
+    # Intermediate pursuit target reached — not navigation complete.
+    if final_yaw is None and dist <= motion.xy_tolerance_m * 0.5:
+        return DriveCommand(0.0, 0.0, 0.0, False)
 
     max_linear = motion.max_linear_mps
     max_angular = motion.max_angular_rad_s
@@ -181,6 +153,9 @@ def compute_follow_command(
     linear_cmd = _clamp(dist * 0.6, max_linear)
     if dist < motion.xy_tolerance_m * 3:
         linear_cmd = min(linear_cmd, max_linear * 0.4)
+    if cfg.approach_dist_m > 0 and dist < cfg.approach_dist_m:
+        floor = max(0.1, max_linear * 0.25)
+        linear_cmd = min(linear_cmd, floor)
     # Scale linear with bearing so we don't plow sideways.
     bearing_scale = max(0.25, 1.0 - (abs(bearing) / cfg.rotate_in_place_rad) * 0.6)
     linear_cmd *= bearing_scale
@@ -196,38 +171,78 @@ def compute_path_command(
     *,
     cfg: FollowerConfig,
     scan: Optional[conv.LaserScan2D] = None,
+    speed_mps: Optional[float] = None,
+    local_view: Optional[LocalCostmapView] = None,
+    local_planner: Optional[LocalPlannerConfig] = None,
+    robot_radius_m: float = 0.22,
+    min_cmd_vel_x: float = 0.0,
+    min_cmd_vel_theta: float = 0.0,
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``."""
+    est_speed = cfg.motion.max_linear_mps * 0.5 if speed_mps is None else speed_mps
+    lookahead = _effective_lookahead(cfg, speed_mps=est_speed)
     target, idx, is_final = lookahead_pose(
         current,
         path,
-        lookahead_m=cfg.lookahead_m,
+        lookahead_m=lookahead,
         waypoint_tolerance_m=cfg.waypoint_tolerance_m,
     )
     near_goal = distance_m(
         current, Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
     ) <= (cfg.motion.xy_tolerance_m * 2.0)
 
-    if is_final or near_goal:
-        goal = Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta)
-        cmd = compute_follow_command(
-            current, goal, cfg=cfg, final_yaw=path.goal_theta
+    local_active = False
+    if (
+        local_view is not None
+        and local_planner is not None
+        and not near_goal
+    ):
+        local_cmd = compute_local_command(
+            current,
+            path,
+            local_view,
+            cfg=local_planner,
+            max_vel_x=cfg.motion.max_linear_mps,
+            max_vel_theta=cfg.motion.max_angular_rad_s,
+            robot_radius_m=robot_radius_m,
+            min_cmd_vel_x=min_cmd_vel_x,
+            min_cmd_vel_theta=min_cmd_vel_theta,
         )
-    else:
-        cmd = compute_follow_command(current, target, cfg=cfg, final_yaw=None)
+        if local_cmd is not None:
+            cmd = local_cmd
+            cmd = apply_velocity_floor(cmd, cfg.motion)
+            local_active = True
+        else:
+            local_cmd = None
+
+    if not local_active:
+        if is_final or near_goal:
+            goal = Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta)
+            cmd = compute_follow_command(
+                current, goal, cfg=cfg, final_yaw=path.goal_theta
+            )
+        else:
+            cmd = compute_follow_command(current, target, cfg=cfg, final_yaw=None)
 
     obstacle_state = "clear"
     forward_clearance = math.inf
-    if cfg.obstacle is not None and cfg.obstacle.enabled:
+    if (
+        not local_active
+        and cfg.obstacle is not None
+        and cfg.obstacle.enabled
+    ):
         cmd, obstacle_state, forward_clearance = apply_obstacle_avoidance(
             cmd, scan, cfg.obstacle, max_angular_rad_s=cfg.motion.max_angular_rad_s
         )
         if not cmd.done and (cmd.vx != 0.0 or cmd.vtheta != 0.0):
             cmd = apply_velocity_floor(cmd, cfg.motion)
+    elif local_active:
+        obstacle_state = "local_planner"
 
     progress = {
         "waypoint_index": idx,
         "is_final": is_final,
+        "local_planner": local_active,
         "distance_remaining_m": distance_m(
             current, Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
         ),

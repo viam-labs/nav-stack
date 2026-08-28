@@ -19,16 +19,6 @@ def make_builtin_navigator(
     logger=None,
 ) -> BuiltinNavigator:
     bcfg = nav_cfg.builtin
-    xy_tol = (
-        bcfg.xy_goal_tolerance
-        if bcfg.xy_goal_tolerance is not None
-        else nav_cfg.nav2.xy_goal_tolerance
-    )
-    yaw_tol = (
-        bcfg.yaw_goal_tolerance
-        if bcfg.yaw_goal_tolerance is not None
-        else nav_cfg.nav2.yaw_goal_tolerance
-    )
     return BuiltinNavigator(
         world,
         inflation_radius_m=nav_cfg.inflation_radius,
@@ -37,8 +27,11 @@ def make_builtin_navigator(
         algorithm=bcfg.planner,
         replan_period_s=bcfg.replan_period_s,
         lookahead_m=bcfg.lookahead_m,
-        xy_tolerance_m=xy_tol,
-        yaw_tolerance_rad=yaw_tol,
+        min_lookahead_m=bcfg.min_lookahead_m,
+        max_lookahead_m=bcfg.max_lookahead_m,
+        approach_dist_m=bcfg.approach_dist_m,
+        xy_tolerance_m=bcfg.xy_goal_tolerance,
+        yaw_tolerance_rad=bcfg.yaw_goal_tolerance,
         max_vel_x=nav_cfg.max_vel_x,
         max_vel_theta=nav_cfg.max_vel_theta,
         min_cmd_vel_x=nav_cfg.min_cmd_vel_x,
@@ -48,6 +41,16 @@ def make_builtin_navigator(
         stop_distance_m=nav_cfg.simple_stop_distance,
         slow_distance_m=nav_cfg.simple_slow_distance,
         scan_max_age_s=nav_cfg.simple_scan_max_age,
+        smooth_path=bcfg.smooth_path,
+        smooth_sample_spacing_m=bcfg.smooth_sample_spacing_m,
+        local_costmap_enabled=bcfg.local_costmap_enabled,
+        local_costmap_width_m=bcfg.local_costmap_width_m,
+        local_costmap_height_m=bcfg.local_costmap_height_m,
+        local_costmap_resolution=bcfg.local_costmap_resolution,
+        local_inflation_radius_m=bcfg.local_inflation_radius_m,
+        local_planner_enabled=bcfg.local_planner_enabled,
+        local_planner_sim_time_s=bcfg.local_planner_sim_time_s,
+        local_planner_activate_cost=bcfg.local_planner_activate_cost,
         logger=logger,
     )
 

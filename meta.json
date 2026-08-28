@@ -33,6 +33,11 @@
       "api": "rdk:component:camera",
       "model": "viam-labs:nav-stack:rplidar",
       "short_description": "Slamtec RPLIDAR UART driver that publishes scans to POSIX shm."
+    },
+    {
+      "api": "rdk:component:movement_sensor",
+      "model": "viam-labs:nav-stack:wit-imu",
+      "short_description": "WitMotion IMU with USB autodetect and POSIX shm for builtin SLAM."
     }
   ],
   "entrypoint": "run.sh",

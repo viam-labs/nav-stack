@@ -337,14 +337,31 @@ class ViamWorldIO:
             return None
 
     def set_velocity(self, vx: float, vy: float, vtheta: float) -> None:
+        vx, vy, vtheta = _sanitize_base_cmd(vx, vy, vtheta)
         lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, self._convention)
-        self._run(
-            self._base.set_velocity(
-                linear=Vector3(x=lx_mm, y=ly_mm, z=0.0),
-                angular=Vector3(x=0.0, y=0.0, z=math.degrees(vtheta)),
-            ),
-            timeout=self._drive_timeout_s,
-        )
+        try:
+            self._run(
+                self._base.set_velocity(
+                    linear=Vector3(x=lx_mm, y=ly_mm, z=0.0),
+                    angular=Vector3(x=0.0, y=0.0, z=math.degrees(vtheta)),
+                ),
+                timeout=self._drive_timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Wheeled bases reject non-zero but tiny wheel RPM ("nearly 0").
+            # Snap to a clean stop or pure spin and retry once.
+            if not _is_near_zero_rpm_error(exc):
+                raise
+            if abs(vtheta) >= 0.15:
+                self._run(
+                    self._base.set_velocity(
+                        linear=Vector3(x=0.0, y=0.0, z=0.0),
+                        angular=Vector3(x=0.0, y=0.0, z=math.degrees(vtheta)),
+                    ),
+                    timeout=self._drive_timeout_s,
+                )
+            else:
+                self.stop()
 
     def stop(self) -> None:
         try:
@@ -371,6 +388,32 @@ class ViamWorldIO:
         if self._viz is None:
             return
         self._viz.set_costmap(costmap)
+
+
+def _sanitize_base_cmd(
+    vx: float, vy: float, vtheta: float
+) -> tuple[float, float, float]:
+    """Snap sub-deadband speeds to zero so Viam wheeled bases don't reject RPM.
+
+    Diff-drive with tiny ``vx`` + large ``vtheta`` also drives one wheel through
+    ~0 RPM — prefer pure spin in that case.
+    """
+    lin_eps = 0.05  # m/s
+    ang_eps = 0.08  # rad/s
+    if abs(vx) < lin_eps:
+        vx = 0.0
+    if abs(vy) < lin_eps:
+        vy = 0.0
+    if abs(vtheta) < ang_eps:
+        vtheta = 0.0
+    if vx != 0.0 and abs(vx) < 0.12 and abs(vtheta) > 0.25:
+        vx = 0.0
+    return vx, vy, vtheta
+
+
+def _is_near_zero_rpm_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "nearly 0" in msg or "rpm that is nearly" in msg
 
 
 def _check_protocol() -> None:

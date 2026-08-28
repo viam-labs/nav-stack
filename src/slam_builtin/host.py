@@ -72,13 +72,14 @@ class BuiltinSlamHost:
         yaw_variance_rad2: float = 0.0,
     ) -> None:
         del position_variance_m2, yaw_variance_rad2
-        # Soft seed: the engine's continuous matcher owns small corrections.
-        # Hard-snapping here (periodic relocalize / startup refine passes)
-        # fought the tracker and made the pose ping-pong between two answers.
+        # Ignore tiny nudges the continuous matcher already owns. Periodic
+        # relocalize can report a 0.2–0.3 m drift fix — the old 0.35 m gate
+        # dropped those while manual global_localize (apply_map_pose_correction)
+        # still worked, which looked like "auto refine finds the right spot".
         current = self._engine.get_pose()
         dist = math.hypot(pose.x - current.x, pose.y - current.y)
         dyaw = abs(conv.normalize_angle(pose.theta - current.theta))
-        if dist <= 0.35 and dyaw <= math.radians(15.0):
+        if dist <= 0.15 and dyaw <= math.radians(8.0):
             return
         self._engine.set_pose(pose)
 

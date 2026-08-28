@@ -222,33 +222,62 @@ class BuiltinNavConfig:
     """Tuning for the in-module (ROS-free) navigator.
 
     Footprint / velocity limits stay top-level on ``NavConfig`` so both backends
-    share them. Goal tolerances default to the same numbers as ``Nav2Config``.
+    share them. Defaults are tuned for builtin SLAM + pure pursuit (not copied
+    from Nav2 MPPI/RPP template values).
     """
 
     # ``lazy_theta_star`` (default) or ``astar``.
     planner: str = BUILTIN_PLANNER_LAZY_THETA
-    lookahead_m: float = 1.0
+    # Pure-pursuit lookahead (mugger-dds RPP uses 0.25–0.7 m velocity-scaled;
+    # 1.0 m was Nav2-cart-ish and cut corners / overshot on diff-drive).
+    lookahead_m: float = 0.6
+    min_lookahead_m: float = 0.25
+    max_lookahead_m: float = 0.7
     replan_period_s: float = 1.0
     timeout_s: float = 300.0
     cost_scaling_factor: float = 4.0
-    # When None, NavConfig / Nav2Config tolerances are used at wire time.
-    xy_goal_tolerance: Optional[float] = None
-    yaw_goal_tolerance: Optional[float] = None
+    xy_goal_tolerance: float = 0.25  # meters
+    yaw_goal_tolerance: float = 0.35  # radians (~20 deg; mugger uses 0.6)
+    # Final approach: cap linear speed within this distance of the goal.
+    approach_dist_m: float = 0.35
+    # Post-process global plans (shortcut + resample) before following.
+    smooth_path: bool = True
+    smooth_sample_spacing_m: float = 0.10
+    # Rolling local costmap + DWA-style local planner for dynamic obstacles.
+    local_costmap_enabled: bool = True
+    local_costmap_width_m: float = 4.0
+    local_costmap_height_m: float = 4.0
+    local_costmap_resolution: float = 0.05
+    local_inflation_radius_m: float = 0.4
+    local_planner_enabled: bool = True
+    local_planner_sim_time_s: float = 1.5
+    local_planner_activate_cost: int = 200
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":
         if not d:
             return cls()
-        xy = d.get("xy_goal_tolerance", None)
-        yaw = d.get("yaw_goal_tolerance", None)
         return cls(
             planner=normalize_builtin_planner(d.get("planner", BUILTIN_PLANNER_LAZY_THETA)),
-            lookahead_m=float(d.get("lookahead_m", 1.0)),
+            lookahead_m=float(d.get("lookahead_m", 0.6)),
+            min_lookahead_m=float(d.get("min_lookahead_m", 0.25)),
+            max_lookahead_m=float(d.get("max_lookahead_m", 0.7)),
             replan_period_s=float(d.get("replan_period_s", 1.0)),
             timeout_s=float(d.get("timeout_s", 300.0)),
             cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),
-            xy_goal_tolerance=float(xy) if xy is not None else None,
-            yaw_goal_tolerance=float(yaw) if yaw is not None else None,
+            xy_goal_tolerance=float(d.get("xy_goal_tolerance", 0.25)),
+            yaw_goal_tolerance=float(d.get("yaw_goal_tolerance", 0.35)),
+            approach_dist_m=float(d.get("approach_dist_m", 0.35)),
+            smooth_path=bool(d.get("smooth_path", True)),
+            smooth_sample_spacing_m=float(d.get("smooth_sample_spacing_m", 0.10)),
+            local_costmap_enabled=bool(d.get("local_costmap_enabled", True)),
+            local_costmap_width_m=float(d.get("local_costmap_width_m", 4.0)),
+            local_costmap_height_m=float(d.get("local_costmap_height_m", 4.0)),
+            local_costmap_resolution=float(d.get("local_costmap_resolution", 0.05)),
+            local_inflation_radius_m=float(d.get("local_inflation_radius_m", 0.4)),
+            local_planner_enabled=bool(d.get("local_planner_enabled", True)),
+            local_planner_sim_time_s=float(d.get("local_planner_sim_time_s", 1.5)),
+            local_planner_activate_cost=int(d.get("local_planner_activate_cost", 200)),
         )
 
 
@@ -337,6 +366,12 @@ class SlamConfig:
     base: str
     lidars: List[LidarConfig]
     movement_sensor: Optional[str] = None
+    # Optional POSIX shm published by ``viam-labs:nav-stack:wit-imu`` (e.g.
+    # ``/viam-imu-wit``). When set, builtin SLAM prefers this over gRPC
+    # ``get_readings`` — same pattern as lidar ``shm_name``.
+    imu_shm_name: Optional[str] = None
+    imu_shm_region_size: int = 4096
+    imu_shm_max_age_s: float = 0.5
     # Optional IMU (or other) heading source. When set alongside wheel odometry
     # on ``movement_sensor``, yaw comes from here while translation comes from
     # the movement sensor — useful for skid-steer bases where wheel slip skews
@@ -676,6 +711,13 @@ class SlamConfig:
             base=d["base"],
             lidars=lidars,
             movement_sensor=d.get("movement_sensor"),
+            imu_shm_name=(
+                str(d["imu_shm_name"]).strip() or None
+                if d.get("imu_shm_name")
+                else None
+            ),
+            imu_shm_region_size=int(d.get("imu_shm_region_size", 4096)),
+            imu_shm_max_age_s=float(d.get("imu_shm_max_age_s", 0.5)),
             heading_sensor=d.get("heading_sensor"),
             movement_sensor_yaw_deg=float(d.get("movement_sensor_yaw_deg", 0.0)),
             movement_sensor_upside_down=bool(

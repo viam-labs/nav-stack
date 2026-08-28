@@ -8,7 +8,10 @@ from typing import Optional
 from ..nav.simple_motion import ObstacleConfig, SimpleMotionConfig, distance_m
 from ..ros import conversions as conv
 from .controller import FollowerConfig, compute_path_command
+from .local_costmap import LocalCostmap, LocalCostmapConfig
+from .local_planner import LocalPlannerConfig
 from .planner import path_blocked, plan_path
+from .smoother import smooth_plan_path
 from .types import NavStatus, PlanResult, Pose2D
 from .world_io import WorldIO
 
@@ -25,9 +28,12 @@ class NavSupervisor:
         cost_scaling_factor: float = 4.0,
         algorithm: str = "lazy_theta_star",
         replan_period_s: float = 1.0,
-        lookahead_m: float = 1.0,
+        lookahead_m: float = 0.6,
+        min_lookahead_m: float = 0.25,
+        max_lookahead_m: float = 0.7,
+        approach_dist_m: float = 0.35,
         xy_tolerance_m: float = 0.25,
-        yaw_tolerance_rad: float = 0.25,
+        yaw_tolerance_rad: float = 0.35,
         max_vel_x: float = 0.4,
         max_vel_theta: float = 1.0,
         min_cmd_vel_x: float = 0.0,
@@ -38,6 +44,16 @@ class NavSupervisor:
         stop_distance_m: float = 0.4,
         slow_distance_m: float = 1.0,
         scan_max_age_s: float = 2.0,
+        smooth_path: bool = True,
+        smooth_sample_spacing_m: float = 0.10,
+        local_costmap_enabled: bool = True,
+        local_costmap_width_m: float = 4.0,
+        local_costmap_height_m: float = 4.0,
+        local_costmap_resolution: float = 0.05,
+        local_inflation_radius_m: float = 0.4,
+        local_planner_enabled: bool = True,
+        local_planner_sim_time_s: float = 1.2,
+        local_planner_activate_cost: int = 200,
     ):
         self._world = world
         self._inflation = inflation_radius_m
@@ -47,11 +63,46 @@ class NavSupervisor:
         self._replan_period = replan_period_s
         self._timeout_s = timeout_s
         self._scan_max_age = scan_max_age_s
+        self._smooth_path = smooth_path
+        self._smooth_spacing = smooth_sample_spacing_m
+        self._local_costmap_enabled = local_costmap_enabled
+        self._local_planner = LocalPlannerConfig(
+            enabled=local_planner_enabled,
+            sim_time_s=local_planner_sim_time_s,
+            activate_cost_threshold=local_planner_activate_cost,
+        )
+        self._local_costmap = (
+            LocalCostmap(
+                LocalCostmapConfig(
+                    width_m=local_costmap_width_m,
+                    height_m=local_costmap_height_m,
+                    resolution=local_costmap_resolution,
+                    inflation_radius_m=local_inflation_radius_m,
+                    robot_radius_m=robot_radius_m,
+                    cost_scaling_factor=cost_scaling_factor,
+                )
+            )
+            if local_costmap_enabled
+            else None
+        )
+        # Cached global costmap for local window (rebuild ~1 Hz, not every tick).
+        self._global_occ_cache = None
+        self._global_costs_cache = None
+        self._global_cache_at = 0.0
+        self._local_view_cache = None
+        self._local_view_at = 0.0
+        self._local_update_period_s = 0.2
+        self._global_cache_period_s = 1.0
         self._cancel = threading.Event()
         self._status = NavStatus()
         self._status_lock = threading.Lock()
+        self._last_cmd_vx = 0.0
+        self._io_timeout_streak = 0
         self._follower = FollowerConfig(
             lookahead_m=lookahead_m,
+            min_lookahead_m=min_lookahead_m,
+            max_lookahead_m=max_lookahead_m,
+            approach_dist_m=approach_dist_m,
             waypoint_tolerance_m=max(0.1, xy_tolerance_m),
             motion=SimpleMotionConfig(
                 poll_interval_s=poll_interval_s,
@@ -112,7 +163,7 @@ class NavSupervisor:
             return PlanResult(
                 feasible=False, error_code=6, error_msg="occupancy map unavailable"
             )
-        return plan_path(
+        result = plan_path(
             map_data,
             pose,
             goal,
@@ -121,6 +172,18 @@ class NavSupervisor:
             cost_scaling_factor=self._cost_scaling,
             algorithm=self._algorithm,
         )
+        if result.feasible and self._smooth_path:
+            smoothed = smooth_plan_path(
+                result.path,
+                map_data,
+                inflation_radius_m=self._inflation,
+                robot_radius_m=self._robot_radius,
+                cost_scaling_factor=self._cost_scaling,
+                enabled=True,
+                sample_spacing_m=self._smooth_spacing,
+            )
+            result.path = smoothed
+        return result
 
     def _publish_plan_viz(self, result: PlanResult, goal: Pose2D, start: Optional[Pose2D]) -> None:
         preview = result.to_preview_dict(
@@ -234,11 +297,63 @@ class NavSupervisor:
                             return
 
                 scan = None
-                if self._follower.obstacle is not None and self._follower.obstacle.enabled:
-                    scan = self._world.get_scan(self._scan_max_age)
+                if (
+                    (
+                        self._follower.obstacle is not None
+                        and self._follower.obstacle.enabled
+                    )
+                    or self._local_costmap is not None
+                ):
+                    try:
+                        scan = self._world.get_scan(self._scan_max_age)
+                    except TimeoutError:
+                        scan = None
+
+                local_view = self._local_view_cache
+                if self._local_costmap is not None and (
+                    now - self._local_view_at >= self._local_update_period_s
+                    or local_view is None
+                ):
+                    if now - self._global_cache_at >= self._global_cache_period_s or (
+                        self._global_costs_cache is None
+                    ):
+                        try:
+                            map_data = self._world.get_map()
+                        except TimeoutError:
+                            map_data = None
+                        if map_data is not None:
+                            from .costmap import build_costmap, occupancy_from_bridge_map
+
+                            self._global_occ_cache = occupancy_from_bridge_map(map_data)
+                            self._global_costs_cache = build_costmap(
+                                self._global_occ_cache,
+                                inflation_radius_m=self._inflation,
+                                robot_radius_m=self._robot_radius,
+                                cost_scaling_factor=self._cost_scaling,
+                            )
+                            self._global_cache_at = now
+                    local_view = self._local_costmap.update(
+                        pose,
+                        scan,
+                        global_occ=self._global_occ_cache,
+                        global_costs=self._global_costs_cache,
+                    )
+                    self._local_view_cache = local_view
+                    self._local_view_at = now
 
                 cmd, progress = compute_path_command(
-                    pose, path, cfg=self._follower, scan=scan
+                    pose,
+                    path,
+                    cfg=self._follower,
+                    scan=scan,
+                    speed_mps=self._last_cmd_vx,
+                    local_view=local_view,
+                    local_planner=self._local_planner
+                    if self._local_costmap_enabled
+                    else None,
+                    robot_radius_m=self._robot_radius,
+                    min_cmd_vel_x=self._follower.motion.min_linear_mps,
+                    min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
                 )
                 self._set_status(
                     pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
@@ -246,6 +361,7 @@ class NavSupervisor:
                         k: progress[k]
                         for k in (
                             "obstacle",
+                            "local_planner",
                             "forward_clearance_m",
                             "cmd_vx_mps",
                             "cmd_vtheta_rad_s",
@@ -263,27 +379,63 @@ class NavSupervisor:
                     continue
 
                 if cmd.done:
-                    self._world.stop()
-                    self._set_status(state="succeeded", active=False, error_msg="")
-                    return
+                    goal_pose = Pose2D(
+                        path.points[-1][0], path.points[-1][1], path.goal_theta
+                    )
+                    at_goal = (
+                        distance_m(pose, goal_pose)
+                        <= self._follower.motion.xy_tolerance_m
+                        and abs(conv.normalize_angle(pose.theta - goal_pose.theta))
+                        <= self._follower.motion.yaw_tolerance_rad
+                    )
+                    if at_goal:
+                        self._world.stop()
+                        self._set_status(state="succeeded", active=False, error_msg="")
+                        return
 
                 # Stall detection.
+                # Pure spin (vx≈0) must not reset the stall timer — otherwise a
+                # stuck local-planner / rotate-in-place loop never replans.
                 if last_progress_pose is None:
                     last_progress_pose = pose
                     last_progress_at = now
                 else:
                     moved = distance_m(pose, last_progress_pose)
-                    turned = abs(
-                        conv.normalize_angle(pose.theta - last_progress_pose.theta)
-                    )
-                    if (
-                        moved >= self._follower.motion.stall_progress_m
-                        or turned >= self._follower.motion.stall_progress_rad
+                    translating = abs(float(cmd.vx)) >= 0.05
+                    if moved >= self._follower.motion.stall_progress_m and (
+                        translating or moved >= self._follower.motion.stall_progress_m * 2
                     ):
                         last_progress_pose = pose
                         last_progress_at = now
+                    elif translating:
+                        turned = abs(
+                            conv.normalize_angle(pose.theta - last_progress_pose.theta)
+                        )
+                        if turned >= self._follower.motion.stall_progress_rad:
+                            last_progress_pose = pose
+                            last_progress_at = now
+                        elif (
+                            now - last_progress_at
+                            >= self._follower.motion.stall_timeout_s
+                        ):
+                            replanned = self.plan(goal, start=pose)
+                            if (
+                                replanned.feasible
+                                and replanned.path.points != path.points
+                            ):
+                                path = replanned.path
+                                last_progress_at = now
+                                last_replan = now
+                            else:
+                                self._world.stop()
+                                self._set_status(
+                                    state="failed",
+                                    active=False,
+                                    error_msg="navigation stalled",
+                                )
+                                return
                     elif now - last_progress_at >= self._follower.motion.stall_timeout_s:
-                        # Try a replan once on stall before failing.
+                        # Spinning / stopped without XY progress — replan or fail.
                         replanned = self.plan(goal, start=pose)
                         if replanned.feasible and replanned.path.points != path.points:
                             path = replanned.path
@@ -294,11 +446,46 @@ class NavSupervisor:
                             self._set_status(
                                 state="failed",
                                 active=False,
-                                error_msg="navigation stalled",
+                                error_msg="navigation stalled (no forward progress)",
                             )
                             return
 
-                self._world.set_velocity(cmd.vx, cmd.vy, cmd.vtheta)
+                try:
+                    self._world.set_velocity(cmd.vx, cmd.vy, cmd.vtheta)
+                    self._io_timeout_streak = 0
+                except TimeoutError:
+                    # Transient event-loop starvation — don't abort the goal on
+                    # a single missed cmd_vel (common when local costmap was
+                    # rebuilding the full global map every tick).
+                    self._io_timeout_streak += 1
+                    if self._io_timeout_streak >= 5:
+                        raise
+                    time.sleep(poll)
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    # Motor "nearly 0 RPM" / similar drive rejects: skip tick.
+                    # Also treat gRPC GOAWAY / unavailable as transient while
+                    # resources flap (lidar USB reconnect storms).
+                    msg = str(exc).lower()
+                    if "nearly 0" in msg or "rpm" in msg:
+                        try:
+                            self._world.stop()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        time.sleep(poll)
+                        continue
+                    if (
+                        "goaway" in msg
+                        or "unavailable" in msg
+                        or "connection" in msg
+                    ):
+                        self._io_timeout_streak += 1
+                        if self._io_timeout_streak >= 8:
+                            raise
+                        time.sleep(poll)
+                        continue
+                    raise
+                self._last_cmd_vx = cmd.vx
                 time.sleep(poll)
 
             self._world.stop()

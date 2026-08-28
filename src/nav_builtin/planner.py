@@ -63,7 +63,7 @@ def _cell_step_cost(costs: np.ndarray, cell: Cell, base_step: float) -> float:
     return base_step * penalty
 
 
-def _line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
+def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
     """True if every cell on the Bresenham line from ``a`` to ``b`` is traversable.
 
     Also rejects diagonal corner-cuts: when the line steps diagonally, both
@@ -186,7 +186,7 @@ def _lazy_theta_star(
     def _set_vertex(s: Cell) -> None:
         """Validate (or repair) the lazy parent assumption when expanding ``s``."""
         p = parent[s]
-        if p == s or _line_of_sight(costs, p, s):
+        if p == s or line_of_sight(costs, p, s):
             return
         # No LOS to assumed parent: fall back to best visible closed neighbor.
         best_p = None
@@ -201,7 +201,7 @@ def _lazy_theta_star(
                 continue
             if not is_traversable(int(costs[n])):
                 continue
-            if not _line_of_sight(costs, n, s):
+            if not line_of_sight(costs, n, s):
                 continue
             # Euclidean parent→s (n is an 8-neighbor, but keep any-angle form).
             cand = g_score[n] + math.hypot(sy - ny, sx - nx)

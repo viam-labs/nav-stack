@@ -30,7 +30,7 @@ MODEL_A1 = 24
 MODEL_A3 = 49
 MODEL_S1 = 97
 
-BAUDRATES = (256000, 115200)
+BAUDRATES = (115200, 256000)
 
 
 class RPLidarError(RuntimeError):

@@ -16,6 +16,7 @@ from ..config import (
     SlamConfig,
 )
 from ..ros import conversions as conv
+from ..ros import imushm
 from ..ros import pcshm
 
 
@@ -64,6 +65,17 @@ class BuiltinSensors:
         self._scan_max_age_s = float(scan_max_age_s)
         self._scan_cache: Optional[conv.LaserScan2D] = None
         self._scan_cache_at = 0.0
+        self._imu_shm: Optional[imushm.Reader] = None
+        if cfg.imu_shm_name:
+            try:
+                self._imu_shm = imushm.Reader(
+                    cfg.imu_shm_name,
+                    region_size=int(cfg.imu_shm_region_size),
+                )
+                self._log(f"builtin SLAM reading IMU shm {cfg.imu_shm_name}")
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"IMU shm open failed ({cfg.imu_shm_name}): {exc}")
+                self._imu_shm = None
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -238,12 +250,45 @@ class BuiltinSensors:
             return None
 
     def get_odom(self) -> Optional[conv.OdomReading]:
+        sample = self._odom_from_imu_shm()
+        if sample is not None:
+            return sample
         if self._movement is None:
             return None
         try:
             return self._run(self._read_odom(), timeout=1.0)
         except Exception:  # noqa: BLE001
             return None
+
+    def _odom_from_imu_shm(self) -> Optional[conv.OdomReading]:
+        reader = self._imu_shm
+        if reader is None:
+            return None
+        try:
+            frame = reader.read_latest(max_age_s=float(self._cfg.imu_shm_max_age_s))
+        except Exception:  # noqa: BLE001
+            return None
+        if frame is None:
+            return None
+        cfg = self._cfg
+        sample = conv.parse_odom_from_readings(
+            {
+                "angular_velocity": {"x": frame.gx, "y": frame.gy, "z": frame.gz},
+                "linear_acceleration": {"x": frame.ax, "y": frame.ay, "z": frame.az},
+                "orientation": {
+                    "roll": frame.roll,
+                    "pitch": frame.pitch,
+                    "yaw": frame.yaw,
+                },
+            }
+        )
+        if cfg.movement_sensor_upside_down:
+            sample = conv.apply_sensor_upside_down(sample)
+        if cfg.movement_sensor_yaw_deg:
+            sample = conv.apply_sensor_mount_yaw(
+                sample, math.radians(cfg.movement_sensor_yaw_deg)
+            )
+        return sample
 
     async def _read_odom(self) -> conv.OdomReading:
         cfg = self._cfg

@@ -52,6 +52,10 @@ class RPLidarSerial:
                 ser = self._connect_serial(int(baud))
                 self._ser = ser
                 self.baudrate = int(baud)
+                if _port_looks_like_wit(ser):
+                    raise proto.RPLidarError(
+                        "port streams WitMotion IMU frames (not an RPLIDAR)"
+                    )
                 self._handshake()
                 return
             except Exception as exc:  # noqa: BLE001
@@ -65,7 +69,9 @@ class RPLidarSerial:
         raise proto.RPLidarError(
             f"failed to open RPLIDAR on {self.port!r} at {bauds}: {last!r}. "
             "If the lidar and IMU USB ports swapped, try the other /dev/ttyUSB* "
-            "or a /dev/serial/by-id/... path."
+            "or a /dev/serial/by-path/... path. If the UART opens but GET_INFO "
+            "times out, power-cycle the lidar (USB-UART can stay up while the "
+            "sensor MCU is hung/unpowered)."
         )
 
     @classmethod
@@ -77,26 +83,68 @@ class RPLidarSerial:
         timeout_s: float = 2.0,
         motor_warmup_s: float = 1.0,
         reset_settle_s: float = 0.5,
+        rounds: int = 8,
+        retry_sleep_s: float = 0.5,
     ) -> "RPLidarSerial":
-        """Try each port (and baud) until GET_INFO succeeds."""
-        errors: List[str] = []
-        for port in ports:
-            dev = cls(
-                port,
-                baudrate=baudrate,
-                timeout_s=timeout_s,
-                motor_warmup_s=motor_warmup_s,
-                reset_settle_s=reset_settle_s,
-            )
-            try:
-                dev.open()
-                return dev
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{port}: {exc!r}")
-                dev.close()
+        """Try each port until GET_INFO succeeds.
+
+        Retries ports that are exclusively locked (IMU still probing) and
+        re-lists candidates when a USB path vanishes mid-startup.
+        Soft claims from the IMU are advisory only — we still try those ports
+        last so a false WitMotion claim cannot permanently hide the lidar.
+        """
+        from .serial_ports import (
+            claim_serial_port,
+            is_port_busy_error,
+            is_port_missing_error,
+            list_candidate_serial_ports,
+            sort_unclaimed_first,
+            steal_serial_port,
+        )
+
+        errors: dict[str, str] = {}
+        candidates = list(ports)
+        for round_i in range(max(1, rounds)):
+            if round_i > 0:
+                refreshed = list_candidate_serial_ports(prefer_cp210=False)
+                if refreshed:
+                    candidates = refreshed
+            candidates = sort_unclaimed_first("lidar", candidates)
+            busy_seen = False
+            missing_seen = False
+            for port in candidates:
+                dev = cls(
+                    port,
+                    baudrate=baudrate,
+                    timeout_s=timeout_s,
+                    motor_warmup_s=motor_warmup_s,
+                    reset_settle_s=reset_settle_s,
+                )
+                try:
+                    dev.open()
+                    steal_serial_port("lidar", port)
+                    return dev
+                except Exception as exc:  # noqa: BLE001
+                    errors[port] = repr(exc)
+                    if is_port_busy_error(exc):
+                        busy_seen = True
+                    if is_port_missing_error(exc):
+                        missing_seen = True
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+            if round_i + 1 < rounds and (busy_seen or missing_seen):
+                time.sleep(retry_sleep_s)
+                continue
+            break
+        detail = "; ".join(f"{p}: {e}" for p, e in errors.items()) or "(no ports)"
         raise proto.RPLidarError(
             "no RPLIDAR responded on any candidate serial port. "
-            f"Tried: {', '.join(ports)}. Errors: {'; '.join(errors)}"
+            f"Tried: {', '.join(candidates)}. Errors: {detail}. "
+            "If a port is exclusively locked, the IMU may still be probing — "
+            "retry, or pin serial_path / depends_on so lidar starts first. "
+            "Check ls /dev/ttyUSB* /dev/serial/by-path for two devices."
         )
 
     def _connect_serial(self, baud: int):
@@ -129,8 +177,11 @@ class RPLidarSerial:
         time.sleep(0.05)
 
     def close(self) -> None:
+        from .serial_ports import release_serial_port
+
         ser = self._ser
         if ser is None:
+            release_serial_port(self.port)
             return
         try:
             self.stop()
@@ -143,6 +194,7 @@ class RPLidarSerial:
             except Exception:
                 pass
         self._ser = None
+        release_serial_port(self.port)
 
     def _write(self, data: bytes) -> None:
         self._ser.write(data)
@@ -329,3 +381,16 @@ class RPLidarSerial:
                 scan = []
             if quality > 0 and dist > 0:
                 scan.append((quality, angle, dist))
+
+
+def _port_looks_like_wit(ser, *, listen_s: float = 0.12) -> bool:
+    """True if the port is already streaming WitMotion frames.
+
+    Idle RPLIDARs are silent; WitMotion IMUs stream continuously. Skipping
+    those ports avoids multi-second GET_INFO timeouts on the IMU.
+    """
+    try:
+        from ..imu.wit_protocol import probe_is_wit
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(probe_is_wit(ser, listen_s=listen_s, min_packets=3))
