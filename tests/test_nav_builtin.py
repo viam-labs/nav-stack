@@ -131,6 +131,28 @@ def test_plan_path_marks_scan_for_dynamic_replan():
     assert paths_meaningfully_differ(baseline.path, blocked.path)
 
 
+def test_mark_path_ahead_forces_detour_on_replan():
+    m = _empty_map(size=80, resolution=0.05)
+    start = Pose2D(0.5, 2.0, 0.0)
+    goal = Pose2D(3.5, 2.0, 0.0)
+    baseline = plan_path(
+        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert baseline.feasible
+    mid = Pose2D(2.0, 2.0, 0.0)
+    blocked = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        blocked_path=baseline.path,
+        blocked_path_pose=mid,
+    )
+    assert blocked.feasible
+    assert paths_meaningfully_differ(baseline.path, blocked.path)
+
+
 def test_build_costmap_inflates_obstacles():
     occ = OccupancyGrid(
         grid=np.array(

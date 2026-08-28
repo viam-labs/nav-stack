@@ -14,11 +14,13 @@ from .costmap import (
     costmap_viz_dict,
     footprint_traversable,
     is_traversable,
+    mark_path_ahead_on_occupancy,
     mark_scan_on_occupancy,
     nearest_free_cell,
     nearest_free_pose,
     occupancy_from_bridge_map,
 )
+from .path_utils import closest_point_on_path
 from .local_costmap import LocalCostmapView
 from .local_planner import path_cost_ahead
 from .types import OccupancyGrid, Path2D, PlanResult, Pose2D
@@ -291,17 +293,58 @@ def paths_meaningfully_differ(
     a: Path2D,
     b: Path2D,
     *,
-    tol_m: float = 0.2,
+    tol_m: float = 0.25,
+    samples: int = 16,
 ) -> bool:
-    """True when two paths are not the same route within ``tol_m``."""
+    """True when two paths diverge by more than ``tol_m`` anywhere along the route."""
     if a.empty or b.empty:
         return True
     if len(a.points) != len(b.points):
+        # Different waypoint counts usually means a new Lazy Theta* route.
         return True
-    for (ax, ay), (bx, by) in zip(a.points, b.points):
-        if math.hypot(ax - bx, ay - by) > tol_m:
-            return True
-    return False
+
+    def _sample(path: Path2D) -> list[tuple[float, float]]:
+        pts = path.points
+        if len(pts) < 2:
+            return [pts[0]] if pts else []
+        seg_lens = []
+        cum = [0.0]
+        for i in range(len(pts) - 1):
+            length = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+            seg_lens.append(length)
+            cum.append(cum[-1] + length)
+        total = cum[-1]
+        if total < 1e-9:
+            return [pts[0]]
+        out: list[tuple[float, float]] = []
+        n = max(2, int(samples))
+        for k in range(n):
+            target = total * k / (n - 1)
+            for i in range(len(pts) - 1):
+                if cum[i + 1] + 1e-9 < target:
+                    continue
+                seg = seg_lens[i]
+                t = 0.0 if seg < 1e-9 else (target - cum[i]) / seg
+                t = max(0.0, min(1.0, t))
+                x = pts[i][0] + t * (pts[i + 1][0] - pts[i][0])
+                y = pts[i][1] + t * (pts[i + 1][1] - pts[i][1])
+                out.append((x, y))
+                break
+        return out
+
+    def _point_to_path_dist(x: float, y: float, path: Path2D) -> float:
+        pose = Pose2D(x, y, 0.0)
+        px, py, _, _ = closest_point_on_path(pose, path)
+        return math.hypot(x - px, y - py)
+
+    sa = _sample(a)
+    sb = _sample(b)
+    worst = 0.0
+    for x, y in sa:
+        worst = max(worst, _point_to_path_dist(x, y, b))
+    for x, y in sb:
+        worst = max(worst, _point_to_path_dist(x, y, a))
+    return worst > tol_m
 
 
 def path_blocked_local(
@@ -519,11 +562,16 @@ def plan_path(
     algorithm: str = DEFAULT_PLANNER,
     scan: Optional[conv.LaserScan2D] = None,
     scan_pose: Optional[conv.Pose2D] = None,
+    blocked_path: Optional[Path2D] = None,
+    blocked_path_pose: Optional[Pose2D] = None,
+    dynamic_obstacle_radius_m: float = 0.35,
 ) -> PlanResult:
     """Plan from a bridge-style map dict.
 
     When ``scan`` is supplied, hits are marked on the map so replans can route
     around dynamic obstacles (people, chairs) not in the static SLAM map.
+    When ``blocked_path`` is set, the current route segment ahead of the robot
+    is also marked so a retry must pick a different corridor.
 
     On success, ``result.costmap_viz`` holds an OccupancyGrid-style dict the
     nav-camera can render (inflated costs the planner actually used).
@@ -532,8 +580,18 @@ def plan_path(
         occ = occupancy_from_bridge_map(map_data)
     except (KeyError, TypeError, ValueError) as exc:
         return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
+    obs_r = max(float(dynamic_obstacle_radius_m), float(inflation_radius_m))
     if scan is not None and scan_pose is not None:
-        occ = mark_scan_on_occupancy(occ, scan_pose, scan)
+        occ = mark_scan_on_occupancy(
+            occ, scan_pose, scan, obstacle_radius_m=obs_r
+        )
+    if blocked_path is not None and blocked_path_pose is not None:
+        occ = mark_path_ahead_on_occupancy(
+            occ,
+            blocked_path,
+            blocked_path_pose,
+            radius_m=obs_r,
+        )
     costs = build_costmap(
         occ,
         inflation_radius_m=inflation_radius_m,

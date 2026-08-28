@@ -44,24 +44,97 @@ def scan_world_points(
     return np.column_stack([wx[finite], wy[finite]])
 
 
-def mark_scan_on_occupancy(
+def mark_points_on_occupancy(
     occ: OccupancyGrid,
-    pose: conv.Pose2D,
-    scan: conv.LaserScan2D,
+    points: np.ndarray,
+    *,
+    radius_m: float,
 ) -> OccupancyGrid:
-    """Copy ``occ`` with live scan hits marked occupied (for dynamic replanning)."""
+    """Mark occupied disks at world-frame points (for dynamic replanning)."""
     grid = occ.grid.copy()
-    hits = scan_world_points(pose, scan)
-    for wx, wy in hits:
+    if points.size == 0:
+        return OccupancyGrid(
+            grid=grid,
+            resolution=occ.resolution,
+            origin_x=occ.origin_x,
+            origin_y=occ.origin_y,
+        )
+    cells = max(1, int(math.ceil(float(radius_m) / occ.resolution)))
+    dy, dx = _disk_offsets(cells)
+    for wx, wy in points:
         row, col = occ.world_to_cell(float(wx), float(wy))
-        if occ.in_bounds(row, col):
-            grid[row, col] = 100
+        for ody, odx in zip(dy, dx):
+            rr, cc = row + int(ody), col + int(odx)
+            if occ.in_bounds(rr, cc):
+                grid[rr, cc] = 100
     return OccupancyGrid(
         grid=grid,
         resolution=occ.resolution,
         origin_x=occ.origin_x,
         origin_y=occ.origin_y,
     )
+
+
+def mark_scan_on_occupancy(
+    occ: OccupancyGrid,
+    pose: conv.Pose2D,
+    scan: conv.LaserScan2D,
+    *,
+    obstacle_radius_m: float = 0.35,
+) -> OccupancyGrid:
+    """Copy ``occ`` with inflated live scan hits (for dynamic replanning)."""
+    hits = scan_world_points(pose, scan)
+    return mark_points_on_occupancy(
+        occ, hits, radius_m=obstacle_radius_m
+    )
+
+
+def mark_path_ahead_on_occupancy(
+    occ: OccupancyGrid,
+    path,
+    pose,
+    *,
+    radius_m: float,
+    lookahead_m: float = 2.5,
+    sample_step_m: float = 0.08,
+) -> OccupancyGrid:
+    """Mark the current route segment ahead of the robot so replans must detour."""
+    from .path_utils import closest_point_on_path
+
+    pts = path.points
+    if len(pts) < 2:
+        return occ
+    _, _, _, along = closest_point_on_path(pose, path)
+    seg_lens: list[float] = []
+    cum = [0.0]
+    for i in range(len(pts) - 1):
+        length = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        seg_lens.append(length)
+        cum.append(cum[-1] + length)
+    total = cum[-1]
+    target_end = min(total, along + max(float(lookahead_m), sample_step_m))
+    samples: list[tuple[float, float]] = []
+    step = max(float(sample_step_m), occ.resolution * 0.5)
+    d = max(0.0, along)
+    while d <= target_end + 1e-9:
+        for i in range(len(pts) - 1):
+            if cum[i + 1] + 1e-9 < d:
+                continue
+            seg = seg_lens[i]
+            if seg < 1e-9:
+                t = 0.0
+            else:
+                t = (d - cum[i]) / seg
+            t = max(0.0, min(1.0, t))
+            x = pts[i][0] + t * (pts[i + 1][0] - pts[i][0])
+            y = pts[i][1] + t * (pts[i + 1][1] - pts[i][1])
+            samples.append((x, y))
+            break
+        d += step
+    if not samples:
+        return occ
+    arr = np.asarray(samples, dtype=np.float64)
+    return mark_points_on_occupancy(occ, arr, radius_m=radius_m)
 
 
 def occupancy_from_bridge_map(map_data: dict) -> OccupancyGrid:

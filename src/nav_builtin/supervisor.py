@@ -197,6 +197,9 @@ class NavSupervisor:
         goal: Pose2D,
         start: Optional[Pose2D] = None,
         scan: Optional[conv.LaserScan2D] = None,
+        *,
+        blocked_path: Optional[Path2D] = None,
+        blocked_path_pose: Optional[Pose2D] = None,
     ) -> PlanResult:
         pose = start if start is not None else self._world.get_pose()
         if pose is None:
@@ -218,6 +221,9 @@ class NavSupervisor:
             algorithm=self._algorithm,
             scan=scan,
             scan_pose=pose if scan is not None else None,
+            blocked_path=blocked_path,
+            blocked_path_pose=blocked_path_pose,
+            dynamic_obstacle_radius_m=max(self._inflation + 0.1, 0.35),
         )
         if result.feasible:
             result = connect_plan_start(
@@ -268,9 +274,16 @@ class NavSupervisor:
         scan: Optional[conv.LaserScan2D],
         *,
         require_different: bool = True,
+        failed_count: int = 0,
     ) -> Optional[Path2D]:
         """Replan from ``pose``, optionally marking live scan hits on the map."""
-        replanned = self.plan(goal, start=pose, scan=scan)
+        replanned = self.plan(
+            goal,
+            start=pose,
+            scan=scan,
+            blocked_path=path if failed_count >= 1 else None,
+            blocked_path_pose=pose if failed_count >= 1 else None,
+        )
         if not replanned.feasible:
             return None
         if require_different and not paths_meaningfully_differ(path, replanned.path):
@@ -448,7 +461,13 @@ class NavSupervisor:
                         and now - last_local_replan_at
                         >= self._replan_local_min_period_s
                     ):
-                        new_path = self._try_replan(goal, pose, path, scan)
+                        new_path = self._try_replan(
+                            goal,
+                            pose,
+                            path,
+                            scan,
+                            failed_count=failed_replan_while_blocked,
+                        )
                         last_local_replan_at = now
                         last_replan = now
                         if new_path is not None:
@@ -472,7 +491,7 @@ class NavSupervisor:
                     speed_mps=self._last_cmd_vx,
                     local_view=local_view,
                     local_planner=self._local_planner
-                    if self._local_costmap_enabled
+                    if self._local_costmap_enabled and not local_blocked
                     else None,
                     robot_radius_m=self._robot_radius,
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
@@ -524,7 +543,13 @@ class NavSupervisor:
                         backup_start = None
                         spin_stuck_since = None
                         backup_cooldown_until = now + self._backup_cooldown_s
-                        new_path = self._try_replan(goal, pose, path, scan)
+                        new_path = self._try_replan(
+                            goal,
+                            pose,
+                            path,
+                            scan,
+                            failed_count=failed_replan_while_blocked,
+                        )
                         if new_path is not None:
                             path = new_path
                             last_replan = now
@@ -626,7 +651,13 @@ class NavSupervisor:
                     or backup_exhausted
                 )
                 if should_replan:
-                    new_path = self._try_replan(goal, pose, path, scan)
+                    new_path = self._try_replan(
+                        goal,
+                        pose,
+                        path,
+                        scan,
+                        failed_count=failed_replan_while_blocked if local_blocked else 0,
+                    )
                     if new_path is not None:
                         path = new_path
                         last_replan = now
@@ -710,7 +741,13 @@ class NavSupervisor:
                             now - last_progress_at
                             >= self._follower.motion.stall_timeout_s
                         ):
-                            new_path = self._try_replan(goal, pose, path, scan)
+                            new_path = self._try_replan(
+                                goal,
+                                pose,
+                                path,
+                                scan,
+                                failed_count=failed_replan_while_blocked,
+                            )
                             if new_path is not None:
                                 path = new_path
                                 last_progress_at = now
@@ -726,7 +763,13 @@ class NavSupervisor:
                                 )
                                 return
                     elif now - last_progress_at >= self._follower.motion.stall_timeout_s:
-                        new_path = self._try_replan(goal, pose, path, scan)
+                        new_path = self._try_replan(
+                            goal,
+                            pose,
+                            path,
+                            scan,
+                            failed_count=failed_replan_while_blocked,
+                        )
                         if new_path is not None:
                             path = new_path
                             last_progress_at = now
