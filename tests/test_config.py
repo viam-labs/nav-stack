@@ -181,8 +181,31 @@ def test_slam_config_map_when_still_default_off_for_mir_style():
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
     assert cfg.map_when_still is False
     assert cfg.wall_yaw_correction is False
-    assert cfg.mapping_revisit_check is False
+    assert cfg.mapping_revisit_check is True
+    assert cfg.mapping_revisit_while_moving is True
     assert cfg.scan_accumulation_s == pytest.approx(0.0)
+
+
+def test_slam_config_revisit_while_moving_off_for_map_when_still():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": {"name": "livox", "scan_source": "point_cloud"},
+            "map_when_still": True,
+            "slam_backend": "slam_toolbox",
+        }
+    )
+    assert cfg.mapping_revisit_while_moving is False
+    cfg_on = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": {"name": "livox", "scan_source": "point_cloud"},
+            "map_when_still": True,
+            "slam_backend": "slam_toolbox",
+            "mapping_revisit_while_moving": True,
+        }
+    )
+    assert cfg_on.mapping_revisit_while_moving is True
 
 
 def test_slam_config_movement_sensor_yaw_deg():

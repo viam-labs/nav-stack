@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 from ..config import SLAM_BACKEND_BUILTIN
 from ..ros import conversions as conv
@@ -23,6 +23,9 @@ class BuiltinSlamHost:
         self.node = self
         self._map_updates_enabled = True
         self._visible_generation = 0
+        self._still_keyframe_hook: Optional[
+            Callable[[conv.LaserScan2D, List, conv.Pose2D], None]
+        ] = None
 
     @property
     def engine(self) -> BuiltinSlamEngine:
@@ -87,11 +90,26 @@ class BuiltinSlamHost:
         return self._engine.get_pose()
 
     def apply_map_pose_correction(self, pose: conv.Pose2D) -> Dict:
-        self._engine.set_pose(pose)
-        return {"status": "applied", "slam_backend": SLAM_BACKEND_BUILTIN}
+        return self._engine.apply_map_pose_correction(pose)
 
     def set_still_keyframe_hook(self, hook) -> None:
-        del hook
+        self._still_keyframe_hook = hook
+        self._engine.set_keyframe_hook(self._forward_still_keyframe)
+
+    def _forward_still_keyframe(
+        self,
+        scan: conv.LaserScan2D,
+        band_points: List,
+        pose: conv.Pose2D,
+    ) -> None:
+        hook = self._still_keyframe_hook
+        if hook is None:
+            return
+        hook(scan, band_points, pose)
+
+    def slam_bridge_status(self) -> Dict:
+        vx, vy, vtheta = self._engine.get_odom_twist()
+        return {"odom_velocity": {"vx": vx, "vy": vy, "vtheta": vtheta}}
 
     def nav_status(self) -> Dict:
         return {"active": False, "number_of_recoveries": 0, "state": "idle"}

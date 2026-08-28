@@ -166,6 +166,7 @@ class RosSlam(SLAM):
             self._manager = BuiltinSlamHost(self._engine)
             self._manager.start()
             self._start_mode(cfg.mode)
+            self._wire_still_keyframe_hook()
             backend = "builtin"
         else:
             from ..ros.manager import RosManager
@@ -429,23 +430,36 @@ class RosSlam(SLAM):
                 {"status": "skipped", "reason": "bridge_not_started"}
             )
 
-        # Only correct while parked: the odom shift must not land mid-hop, and
-        # the fresh lidar read has to match where the robot actually is.
+        # Motion gate: map_when_still + odom TF shift must not land mid-hop.
+        # Continuous-scan backends (builtin) can correct while driving; still
+        # skip fast spins where the scan is motion-distorted / match is weak.
         try:
             bridge_status = node.slam_bridge_status()
         except Exception:  # noqa: BLE001
             bridge_status = {}
         vel = bridge_status.get("odom_velocity") or {}
-        moving = (
-            math.hypot(float(vel.get("vx", 0.0)), float(vel.get("vy", 0.0)))
-            >= cfg.map_when_still_linear_speed_m_s
-            or abs(float(vel.get("vtheta", 0.0)))
-            >= cfg.map_when_still_yaw_rate_rad_s
+        linear_speed = math.hypot(
+            float(vel.get("vx", 0.0)), float(vel.get("vy", 0.0))
         )
-        if moving and apply_override is not True:
-            return self._publish_revisit_check(
-                {"status": "skipped", "reason": "moving"}
-            )
+        yaw_rate = abs(float(vel.get("vtheta", 0.0)))
+        moving = (
+            linear_speed >= cfg.map_when_still_linear_speed_m_s
+            or yaw_rate >= cfg.map_when_still_yaw_rate_rad_s
+        )
+        spinning_fast = yaw_rate >= float(cfg.mapping_revisit_max_yaw_rate_rad_s)
+        if apply_override is not True:
+            if spinning_fast:
+                return self._publish_revisit_check(
+                    {
+                        "status": "skipped",
+                        "reason": "spinning",
+                        "yaw_rate_rad_s": round(yaw_rate, 3),
+                    }
+                )
+            if moving and not cfg.mapping_revisit_while_moving:
+                return self._publish_revisit_check(
+                    {"status": "skipped", "reason": "moving"}
+                )
 
         current = mgr.get_pose_in_map()
         if current is None:

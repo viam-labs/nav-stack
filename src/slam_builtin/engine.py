@@ -17,6 +17,7 @@ from . import occupancy as occ
 from . import persistence
 from . import scan_match
 from .io_sensors import BuiltinSensors
+from .keyframes import MapKeyframeStore
 from .types import LogOddsGrid
 
 
@@ -78,6 +79,12 @@ class BuiltinSlamEngine:
         self._seed_localize_pending = cfg.mode == MODE_LOCALIZING
         self._last_seed_attempt_at = 0.0
         self._seed_min_score = 0.40
+        self._keyframes = MapKeyframeStore(
+            max_keyframes=int(cfg.builtin_mapping_keyframe_max)
+        )
+        self._keyframe_hook = None
+        self._last_odom_twist = (0.0, 0.0, 0.0)
+        self._last_loop_rebuild_at = 0.0
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -128,6 +135,7 @@ class BuiltinSlamEngine:
                     self._pose = conv.Pose2D(0.0, 0.0, 0.0)
                     self._last_odom_pose = None
                     self._last_odom_heading = None
+                    self._keyframes.clear()
                     self._invalidate_occ_cache()
                     self._generation += 1
             if mode == MODE_LOCALIZING:
@@ -154,8 +162,12 @@ class BuiltinSlamEngine:
             self._last_odom_pose = None
             self._last_odom_heading = None
             self._last_insert_pose = None
+            self._keyframes.clear()
             self._invalidate_occ_cache()
             self._generation += 1
+
+    def set_keyframe_hook(self, hook) -> None:
+        self._keyframe_hook = hook
 
     def set_pose(self, pose: conv.Pose2D) -> None:
         with self._lock:
@@ -167,6 +179,68 @@ class BuiltinSlamEngine:
             self._last_odom_pose = None
             self._last_odom_heading = None
             self._last_odom_time = None
+
+    def apply_map_pose_correction(self, matched_pose: conv.Pose2D) -> dict:
+        """Correct pose drift during mapping; optionally rebuild the grid."""
+        cfg = self._cfg
+        with self._lock:
+            current = self._pose
+            shift_m = math.hypot(
+                matched_pose.x - current.x, matched_pose.y - current.y
+            )
+            shift_deg = abs(
+                math.degrees(
+                    conv.normalize_angle(matched_pose.theta - current.theta)
+                )
+            )
+            rebuilt = False
+            keyframes_used = len(self._keyframes)
+            min_shift_m = float(cfg.mapping_revisit_min_shift_m)
+            min_shift_deg = float(cfg.mapping_revisit_min_shift_deg)
+            should_rebuild = (
+                self._mode == MODE_MAPPING
+                and cfg.builtin_rebuild_map_on_revisit
+                and keyframes_used > 0
+                and (
+                    shift_m >= min_shift_m or shift_deg >= min_shift_deg
+                )
+            )
+            if should_rebuild:
+                delta = conv.compose_poses(
+                    conv.invert_pose(current), matched_pose
+                )
+                anchor = self._keyframes.find_loop_anchor(matched_pose)
+                self._keyframes.apply_pose_delta_from(anchor + 1, delta)
+                self._grid = self._keyframes.rebuild_grid(
+                    resolution=self._grid.resolution
+                )
+                self._generation += 1
+                self._invalidate_occ_cache()
+                self._last_loop_rebuild_at = time.monotonic()
+                rebuilt = True
+                self._log(
+                    "builtin SLAM loop closure: rebuilt map from "
+                    f"{keyframes_used} keyframes (anchor={anchor}) "
+                    f"(shift={shift_m:.2f} m, {shift_deg:.1f} deg)"
+                )
+
+            self._pose = matched_pose
+            self._pending_match = None
+            self._pending_count = 0
+            self._seed_localize_pending = False
+            self._last_odom_pose = None
+            self._last_odom_heading = None
+            self._last_odom_time = None
+            self._last_insert_pose = matched_pose
+
+        return {
+            "applied": True,
+            "rebuilt": rebuilt,
+            "keyframes": keyframes_used,
+            "shift_m": round(shift_m, 3),
+            "shift_deg": round(shift_deg, 2),
+            "slam_backend": "builtin",
+        }
 
     def save_map(self, map_dir: Path) -> None:
         with self._lock:
@@ -197,6 +271,10 @@ class BuiltinSlamEngine:
     def get_pose(self) -> conv.Pose2D:
         with self._lock:
             return self._pose
+
+    def get_odom_twist(self) -> tuple[float, float, float]:
+        with self._lock:
+            return self._last_odom_twist
 
     def get_map(self) -> dict:
         with self._lock:
@@ -236,6 +314,8 @@ class BuiltinSlamEngine:
                 "last_scan_age_s": self._last_scan_age_s,
                 "generation": self._generation,
                 "seed_localize_pending": self._seed_localize_pending,
+                "keyframes": len(self._keyframes),
+                "last_loop_rebuild_at": self._last_loop_rebuild_at,
             }
 
     # -- loop ----------------------------------------------------------------
@@ -392,6 +472,14 @@ class BuiltinSlamEngine:
             self._last_insert_pose = pose
             self._last_insert_at = now
             self._updates += 1
+            if self._mode == MODE_MAPPING:
+                if self._keyframes.add(pose, scan):
+                    hook = self._keyframe_hook
+                    if hook is not None:
+                        try:
+                            hook(scan, [], pose)
+                        except Exception as exc:  # noqa: BLE001
+                            self._log(f"keyframe hook failed: {exc}")
             if self._updates % 20 == 0:
                 self._generation += 1
                 self._invalidate_occ_cache()
@@ -508,6 +596,7 @@ class BuiltinSlamEngine:
             self._last_odom_pose = odom.pose
             self._last_odom_time = now
             self._last_odom_heading = odom.pose.theta
+            self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
             if prev is None:
                 return self._pose
             delta = conv.compose_poses(conv.invert_pose(prev), odom.pose)
@@ -534,6 +623,7 @@ class BuiltinSlamEngine:
         if dt <= 0.0:
             if odom.heading_rad is not None and self._last_odom_heading is None:
                 self._last_odom_heading = odom.heading_rad
+            self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
             return self._pose
 
         dth = odom.vtheta * dt
@@ -547,6 +637,7 @@ class BuiltinSlamEngine:
                     dth = heading_delta
             self._last_odom_heading = odom.heading_rad
 
+        self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
         c = math.cos(self._pose.theta)
         s = math.sin(self._pose.theta)
         dx = (c * odom.vx - s * odom.vy) * dt

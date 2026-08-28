@@ -516,6 +516,17 @@ class SlamConfig:
     mapping_revisit_keyframe_max: int = 250
     mapping_revisit_keyframe_match_tol_m: float = 0.3
     mapping_revisit_keyframe_min_score: float = 0.55
+    # Builtin SLAM: rebuild the occupancy grid from stored scan keyframes when
+    # mapping_revisit corrects pose drift (eliminates duplicate corridor smear).
+    builtin_rebuild_map_on_revisit: bool = True
+    builtin_mapping_keyframe_max: int = 500
+    # Allow mapping revisit / loop-closure corrections while the robot is
+    # moving. Default on for continuous-scan backends (builtin); off when
+    # map_when_still is on, where odom TF shifts mid-hop are unsafe.
+    mapping_revisit_while_moving: bool = False
+    # Even with while_moving, skip corrections above this yaw rate — spinning
+    # motion-distorts the scan and hallway matches are unreliable.
+    mapping_revisit_max_yaw_rate_rad_s: float = 0.35
     # Safety cutoff for the SLAM/publish scan path: if mir-base reports a scan
     # cache age (get_laser_scan ``age_s``) above this, the bridge skips publishing
     # it rather than feeding SLAM/Nav2 a misregistered scan. Accurate age-based
@@ -730,7 +741,22 @@ class SlamConfig:
         mapping_revisit_check = bool(
             d.get(
                 "mapping_revisit_check",
-                map_when_still and all_point_cloud,
+                (map_when_still and all_point_cloud)
+                or (
+                    slam_backend == SLAM_BACKEND_BUILTIN and mode == MODE_MAPPING
+                ),
+            )
+        )
+        mapping_revisit_while_moving = bool(
+            d.get(
+                "mapping_revisit_while_moving",
+                # Continuous scanning: safe to correct mid-drive. map_when_still
+                # publishes sparse stop scans and shifts odom TF — keep parked.
+                (not map_when_still)
+                and (
+                    slam_backend == SLAM_BACKEND_BUILTIN
+                    or not all_point_cloud
+                ),
             )
         )
         return cls(
@@ -853,6 +879,16 @@ class SlamConfig:
             ),
             mapping_revisit_keyframe_min_score=float(
                 d.get("mapping_revisit_keyframe_min_score", 0.55)
+            ),
+            builtin_rebuild_map_on_revisit=bool(
+                d.get("builtin_rebuild_map_on_revisit", True)
+            ),
+            builtin_mapping_keyframe_max=int(
+                d.get("builtin_mapping_keyframe_max", 500)
+            ),
+            mapping_revisit_while_moving=mapping_revisit_while_moving,
+            mapping_revisit_max_yaw_rate_rad_s=float(
+                d.get("mapping_revisit_max_yaw_rate_rad_s", 0.35)
             ),
             scan_max_age_s=float(d.get("scan_max_age_s", 2.0)),
             base_velocity_convention=convention,

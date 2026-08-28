@@ -27,6 +27,9 @@ def test_slam_backend_default_is_builtin():
     assert cfg.slam_backend == SLAM_BACKEND_BUILTIN
     assert cfg.uses_builtin_slam()
     assert not cfg.uses_slam_toolbox()
+    assert cfg.mapping_revisit_check is True
+    assert cfg.mapping_revisit_while_moving is True
+    assert cfg.builtin_rebuild_map_on_revisit is True
 
 
 def test_slam_backend_toolbox_and_invalid():
@@ -377,3 +380,91 @@ def test_engine_set_pose_and_get_map(tmp_path: Path):
 
     diag = host.slam_diagnostics()
     assert diag["slam_backend"] == "builtin"
+
+
+def test_map_keyframe_store_rebuild_after_pose_delta():
+    from src.slam_builtin.keyframes import MapKeyframeStore
+
+    store = MapKeyframeStore(max_keyframes=10)
+    scan = conv.LaserScan2D(
+        np.array([2.0]),
+        0.0,
+        0.0,
+        0.1,
+        10.0,
+    )
+    store.add(conv.Pose2D(0.0, 0.0, 0.0), scan)
+    grid_ok = store.rebuild_grid(resolution=0.05)
+    row, col = grid_ok.world_to_cell(2.0, 0.0)
+    int16_ok = occ.to_occupancy_int16(grid_ok)
+    assert int16_ok[row, col] == 100
+
+    anchor = store.find_loop_anchor(conv.Pose2D(0.0, 0.0, 0.0))
+    assert anchor == 0
+    # Drifted leg after the anchor is corrected; anchor keyframe stays fixed.
+    store.add(conv.Pose2D(0.0, 0.5, 0.0), scan)
+    store.apply_pose_delta_from(anchor + 1, conv.Pose2D(0.0, -0.5, 0.0))
+    grid_fixed = store.rebuild_grid(resolution=0.05)
+    row_f, col_f = grid_fixed.world_to_cell(2.0, 0.0)
+    int16_fixed = occ.to_occupancy_int16(grid_fixed)
+    assert int16_fixed[row_f, col_f] == 100
+
+
+def test_apply_map_pose_correction_rebuilds_grid():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "maps_dir": "/tmp",
+            "mode": "mapping",
+            "mapping_revisit_min_shift_m": 0.05,
+            "mapping_revisit_min_shift_deg": 1.0,
+        }
+    )
+    engine = BuiltinSlamEngine(
+        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
+    )  # type: ignore[arg-type]
+    host = BuiltinSlamHost(engine)
+    scan = conv.LaserScan2D(np.array([2.0]), 0.0, 0.0, 0.1, 10.0)
+
+    with engine._lock:  # noqa: SLF001
+        engine._grid = occ.insert_scan(  # noqa: SLF001
+            engine._grid,
+            0.0,
+            0.0,
+            0.0,
+            np.array([2.0]),
+            0.0,
+            0.0,
+            range_min=0.1,
+            range_max=10.0,
+        )
+        engine._keyframes.add(conv.Pose2D(0.0, 0.0, 0.0), scan)
+        engine._pose = conv.Pose2D(0.0, 0.5, 0.0)
+
+    result = host.apply_map_pose_correction(conv.Pose2D(0.0, 0.0, 0.0))
+    assert result["applied"] is True
+    assert result["rebuilt"] is True
+    assert engine.get_pose().y == pytest.approx(0.0)
+    with engine._lock:  # noqa: SLF001
+        int16 = occ.to_occupancy_int16(engine._grid)  # noqa: SLF001
+        row, col = engine._grid.world_to_cell(2.0, 0.0)  # noqa: SLF001
+    assert int16[row, col] == 100
+
+
+def test_host_slam_bridge_status_reports_odom_twist():
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "mapping"}
+    )
+    odom = conv.OdomReading(0.2, 0.0, 0.1, pose=conv.Pose2D(0.0, 0.0, 0.0))
+    engine = BuiltinSlamEngine(
+        cfg,
+        _FakeSensors(odom=odom),
+        MapStore("/tmp"),
+        rate_hz=5.0,
+    )  # type: ignore[arg-type]
+    host = BuiltinSlamHost(engine)
+    engine._predict(odom, 1.0)  # noqa: SLF001
+    status = host.slam_bridge_status()
+    assert status["odom_velocity"]["vx"] == pytest.approx(0.2)
+    assert status["odom_velocity"]["vtheta"] == pytest.approx(0.1)
