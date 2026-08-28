@@ -107,33 +107,26 @@ class LocalCostmap:
         self._raw[blocked] = 100
 
     def _mark_scan(self, pose: conv.Pose2D, scan: conv.LaserScan2D) -> None:
-        ranges = np.asarray(scan.ranges, dtype=float)
-        if ranges.size == 0:
-            return
-        idx = np.arange(ranges.size)
-        valid = (
-            np.isfinite(ranges)
-            & (ranges >= float(scan.range_min))
-            & (
-                (not math.isfinite(scan.range_max))
-                | (ranges <= float(scan.range_max))
-            )
-        )
-        idx = idx[valid]
-        if idx.size == 0:
+        pts = scan.to_points()
+        if pts.size == 0:
             return
         max_beams = int(self._cfg.max_scan_beams)
-        if max_beams > 0 and idx.size > max_beams:
-            pick = np.linspace(0, idx.size - 1, max_beams, dtype=np.int32)
-            idx = idx[pick]
-        angles = float(scan.angle_min) + idx.astype(float) * float(scan.angle_increment)
-        dists = ranges[idx]
+        if max_beams > 0 and pts.shape[0] > max_beams:
+            pick = np.linspace(0, pts.shape[0] - 1, max_beams, dtype=np.int32)
+            pts = pts[pick]
+        scan_pose = scan.capture_pose
+        if scan_pose is not None:
+            dtheta = abs(conv.normalize_angle(pose.theta - scan_pose.theta))
+            dist = math.hypot(pose.x - scan_pose.x, pose.y - scan_pose.y)
+            if dtheta > math.radians(8.0) or dist > 0.08:
+                pts3 = np.column_stack([pts, np.zeros(len(pts))])
+                pts = conv.transform_points_between_poses(pts3, scan_pose, pose)[
+                    :, :2
+                ]
         cth = math.cos(pose.theta)
         sth = math.sin(pose.theta)
-        ca = np.cos(angles)
-        sa = np.sin(angles)
-        wx = pose.x + (cth * ca - sth * sa) * dists
-        wy = pose.y + (sth * ca + cth * sa) * dists
+        wx = pose.x + cth * pts[:, 0] - sth * pts[:, 1]
+        wy = pose.y + sth * pts[:, 0] + cth * pts[:, 1]
         cols = np.floor((wx - self._origin_x) / self._occ.resolution).astype(np.int32)
         rows = np.floor((wy - self._origin_y) / self._occ.resolution).astype(np.int32)
         inside = (rows >= 0) & (rows < self._h) & (cols >= 0) & (cols < self._w)

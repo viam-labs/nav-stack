@@ -55,6 +55,64 @@ def test_smooth_path_shortens_zigzag_astar():
     assert len(smooth.points) > len(jagged.points) // 2
 
 
+def test_local_costmap_respects_sensor_pose():
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=2.0,
+            height_m=2.0,
+            resolution=0.05,
+            inflation_radius_m=0.10,
+            robot_radius_m=0.05,
+            use_global_static=False,
+        )
+    )
+    pose = conv.Pose2D(1.0, 1.0, 0.0)
+    n = 36
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 1.0  # angle 0 = robot +X
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+        sensor_pose=conv.Pose2D(0.5, 0.0, 0.0),
+    )
+    view = lc.update(pose, scan)
+    # Hit should land ~1.5 m ahead in map (+X), not 1.0 m.
+    assert view.cost_at_world(2.5, 1.0) > 0
+    assert view.cost_at_world(1.0, 1.0) == 0
+
+
+def test_local_costmap_syncs_stale_scan_pose():
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=4.0,
+            height_m=4.0,
+            resolution=0.05,
+            inflation_radius_m=0.10,
+            robot_radius_m=0.05,
+            use_global_static=False,
+        )
+    )
+    n = 72
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 1.0  # angle 0 = robot +X
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+    current = conv.Pose2D(1.0, 0.0, 0.0)
+    view = lc.update(current, scan)
+    # Wall was at world (1, 0) when scanned; robot moved +1 m without re-scanning.
+    assert view.cost_at_world(1.0, 0.0) > 0
+    assert view.cost_at_world(2.0, 0.0) == 0
+
+
 def test_local_costmap_marks_scan_hit():
     lc = LocalCostmap(
         LocalCostmapConfig(

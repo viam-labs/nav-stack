@@ -1025,6 +1025,43 @@ class BridgeNode(Node):
         """Register callback ``(scan, band_points, map_pose)`` after still publish."""
         self._still_keyframe_hook = hook
 
+    def _cache_nav_scan_for_builtin(
+        self,
+        nav_scans: list,
+        *,
+        ref,
+        capture_pose: Optional[conv.Pose2D] = None,
+    ) -> None:
+        """Always-on base_link scan cache for builtin nav (independent of SLAM gates)."""
+        if not nav_scans:
+            return
+        nav_merged = (
+            nav_scans[0]
+            if len(nav_scans) == 1
+            else conv.merge_scans(
+                nav_scans,
+                num_bins=self._slam_cfg.scan_bins,
+                range_min=ref.min_range,
+                range_max=ref.max_range,
+            )
+        )
+        if not conv.scan_has_returns(nav_merged):
+            return
+        if capture_pose is None:
+            capture_pose = self.get_pose_in_map()
+        if capture_pose is not None:
+            nav_merged = conv.LaserScan2D(
+                ranges=nav_merged.ranges,
+                angle_min=nav_merged.angle_min,
+                angle_increment=nav_merged.angle_increment,
+                range_min=nav_merged.range_min,
+                range_max=nav_merged.range_max,
+                sensor_pose=nav_merged.sensor_pose,
+                capture_pose=capture_pose,
+            )
+        self._latest_scan = nav_merged
+        self._latest_scan_wall = time.monotonic()
+
     # -- scans ---------------------------------------------------------------
     def _on_scan_timer(self) -> None:
         # Advance the still/dwell tracker before the lidar read so this tick's
@@ -1171,6 +1208,14 @@ class BridgeNode(Node):
                 return
             self._stale_scan_warned = False
 
+        ref = self._slam_cfg.lidars[0]
+        nav_scans = (
+            base_link_scans
+            if base_link_scans
+            else [scan for _, scan in per_lidar_scans]
+        )
+        self._cache_nav_scan_for_builtin(nav_scans, ref=ref)
+
         if not self._still_gate_ready():
             # Accumulate during dwell for a dense pause scan; publish is gated.
             return
@@ -1188,7 +1233,6 @@ class BridgeNode(Node):
             self._imu_vy = 0.0
             self._imu_still_ticks = 0
 
-        ref = self._slam_cfg.lidars[0]
         merged_frame = self._frames.base_link
         if self._use_lidar_frame_scans and len(per_lidar_scans) == 1:
             merged = per_lidar_scans[0][1]
@@ -1231,9 +1275,11 @@ class BridgeNode(Node):
         for i, scan in per_lidar_scans:
             self._scan_pubs[i].publish(self._to_ros_scan(scan, f"laser_{i}", stamp))
 
-        self._latest_scan = merged
+        self._cache_nav_scan_for_builtin(
+            base_link_scans if base_link_scans else nav_scans,
+            ref=ref,
+        )
         now = time.monotonic()
-        self._latest_scan_wall = now
         self._scan_pub_times.append(now)
         self._apply_lidar_odometry(merged)
         self._merged_scan_pub.publish(

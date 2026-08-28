@@ -91,7 +91,8 @@ class NavSupervisor:
         self._global_cache_at = 0.0
         self._local_view_cache = None
         self._local_view_at = 0.0
-        self._local_update_period_s = 0.2
+        self._local_update_period_s = 0.1
+        self._local_scan_max_age_s = min(float(scan_max_age_s), 0.5)
         self._global_cache_period_s = 1.0
         self._cancel = threading.Event()
         self._status = NavStatus()
@@ -314,6 +315,27 @@ class NavSupervisor:
                     now - self._local_view_at >= self._local_update_period_s
                     or local_view is None
                 ):
+                    costmap_scan = scan
+                    if costmap_scan is None and self._local_scan_max_age_s > 0:
+                        try:
+                            costmap_scan = self._world.get_scan(
+                                self._local_scan_max_age_s
+                            )
+                        except TimeoutError:
+                            costmap_scan = None
+                    if (
+                        costmap_scan is not None
+                        and costmap_scan.capture_pose is None
+                    ):
+                        costmap_scan = conv.LaserScan2D(
+                            ranges=costmap_scan.ranges,
+                            angle_min=costmap_scan.angle_min,
+                            angle_increment=costmap_scan.angle_increment,
+                            range_min=costmap_scan.range_min,
+                            range_max=costmap_scan.range_max,
+                            sensor_pose=costmap_scan.sensor_pose,
+                            capture_pose=pose,
+                        )
                     if now - self._global_cache_at >= self._global_cache_period_s or (
                         self._global_costs_cache is None
                     ):
@@ -334,7 +356,7 @@ class NavSupervisor:
                             self._global_cache_at = now
                     local_view = self._local_costmap.update(
                         pose,
-                        scan,
+                        costmap_scan,
                         global_occ=self._global_occ_cache,
                         global_costs=self._global_costs_cache,
                     )

@@ -822,6 +822,8 @@ class LaserScan2D:
     range_max: float = float("inf")
     # Pose of the scanner in the target (e.g. base_link) frame.
     sensor_pose: Pose2D = Pose2D(0.0, 0.0, 0.0)
+    # Map pose of the robot when this scan was captured (for costmap sync).
+    capture_pose: Optional[Pose2D] = None
 
     def to_points(self) -> np.ndarray:
         """Return valid scan returns as ``(M, 2)`` XY points in the target frame."""

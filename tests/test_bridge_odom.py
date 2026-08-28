@@ -39,6 +39,17 @@ for _mod in (
 from src.ros import conversions as conv
 from src.ros.bridge import BridgeNode
 
+
+def _wire_scan_timer_cache(bridge) -> None:
+    bridge._latest_scan = None
+    bridge._latest_scan_wall = 0.0
+    bridge.get_pose_in_map = lambda: conv.Pose2D(0.0, 0.0, 0.0)
+    bridge._cache_nav_scan_for_builtin = (
+        lambda nav_scans, ref, capture_pose=None: BridgeNode._cache_nav_scan_for_builtin(
+            bridge, nav_scans, ref=ref, capture_pose=capture_pose
+        )
+    )
+
 _STILL_METHODS = (
     "_motion_is_still",
     "_gate_pose_tuple",
@@ -159,6 +170,7 @@ def test_scan_timer_stamps_scans_at_read_start(monkeypatch):
     bridge._bounded_scan_stamp = lambda read_start, age_s=0.0: read_start.to_msg()
     bridge._publish_scan_time_tf = MagicMock()
     bridge._still_gate_ready = lambda: True
+    _wire_scan_timer_cache(bridge)
     monkeypatch.setattr("src.ros.bridge.conv.merge_scans", lambda *a, **k: scan)
 
     BridgeNode._on_scan_timer(bridge)
@@ -213,6 +225,7 @@ def _scan_timer_bridge(lidar_pts, scan, *, scan_max_age_s=2.0):
     )
     bridge._publish_scan_time_tf = MagicMock()
     bridge._still_gate_ready = lambda: True
+    _wire_scan_timer_cache(bridge)
     return bridge, stamp
 
 

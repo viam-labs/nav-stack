@@ -110,6 +110,7 @@ class ViamWorldIO:
         self._map_cache_at = 0.0
         self._scan_cache: Optional[conv.LaserScan2D] = None
         self._scan_cache_at = 0.0
+        self._scan_cache_pose: Optional[conv.Pose2D] = None
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -179,11 +180,21 @@ class ViamWorldIO:
 
     def get_scan(self, max_age_s: float = 2.0) -> Optional[conv.LaserScan2D]:
         now = time.monotonic()
+        pose = self.get_pose()
         if (
             self._scan_cache is not None
             and now - self._scan_cache_at <= max_age_s
+            and self._scan_cache_pose is not None
+            and pose is not None
         ):
-            return self._scan_cache
+            dtheta = abs(
+                conv.normalize_angle(pose.theta - self._scan_cache_pose.theta)
+            )
+            dist = math.hypot(
+                pose.x - self._scan_cache_pose.x, pose.y - self._scan_cache_pose.y
+            )
+            if dtheta <= math.radians(12.0) and dist <= 0.12:
+                return self._scan_cache
         if not self._lidars:
             return self._scan_cache
         scans = []
@@ -198,8 +209,19 @@ class ViamWorldIO:
             if len(scans) == 1
             else conv.merge_scans(scans, self._scan_bins)
         )
+        if pose is not None:
+            merged = conv.LaserScan2D(
+                ranges=merged.ranges,
+                angle_min=merged.angle_min,
+                angle_increment=merged.angle_increment,
+                range_min=merged.range_min,
+                range_max=merged.range_max,
+                sensor_pose=merged.sensor_pose,
+                capture_pose=pose,
+            )
         self._scan_cache = merged
         self._scan_cache_at = now
+        self._scan_cache_pose = pose
         return merged
 
     def _pcd_to_scan(
@@ -294,10 +316,6 @@ class ViamWorldIO:
                 else raw_payload
             )
             mir_pts = conv.points_from_mir_laser_scan_payload(payload)
-            if mir_pts.sensor_scan is not None and conv.scan_has_returns(
-                mir_pts.sensor_scan
-            ):
-                return mir_pts.sensor_scan
             if mir_pts.base_link.size > 0:
                 return conv.points_to_scan(
                     mir_pts.base_link,
@@ -307,6 +325,10 @@ class ViamWorldIO:
                     range_min=lidar.min_range,
                     range_max=lidar.max_range,
                 )
+            if mir_pts.sensor_scan is not None and conv.scan_has_returns(
+                mir_pts.sensor_scan
+            ):
+                return mir_pts.sensor_scan
             return None
 
         if scan_source == LIDAR_SCAN_POINT_CLOUD or name in self._skip_get_laser_scan:
