@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ..ros import conversions as conv
 from .types import OccupancyGrid
 
 # Cost layers (uint8): 0 free … 253 inscribed, 254 lethal, 255 unknown.
@@ -13,6 +14,54 @@ LETHAL = 254
 INSCRIBED = 253
 UNKNOWN = 255
 FREE = 0
+
+
+def scan_world_points(
+    pose: conv.Pose2D,
+    scan: conv.LaserScan2D,
+    *,
+    max_beams: int = 360,
+) -> np.ndarray:
+    """Map-frame XY hits from a lidar scan (finite ranges only)."""
+    pts = scan.to_points()
+    if pts.size == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    if max_beams > 0 and pts.shape[0] > max_beams:
+        pick = np.linspace(0, pts.shape[0] - 1, max_beams, dtype=np.int32)
+        pts = pts[pick]
+    scan_pose = scan.capture_pose
+    if scan_pose is not None:
+        dtheta = abs(conv.normalize_angle(pose.theta - scan_pose.theta))
+        dist = math.hypot(pose.x - scan_pose.x, pose.y - scan_pose.y)
+        if dtheta > math.radians(8.0) or dist > 0.08:
+            pts3 = np.column_stack([pts, np.zeros(len(pts))])
+            pts = conv.transform_points_between_poses(pts3, scan_pose, pose)[:, :2]
+    cth = math.cos(pose.theta)
+    sth = math.sin(pose.theta)
+    wx = pose.x + cth * pts[:, 0] - sth * pts[:, 1]
+    wy = pose.y + sth * pts[:, 0] + cth * pts[:, 1]
+    finite = np.isfinite(wx) & np.isfinite(wy)
+    return np.column_stack([wx[finite], wy[finite]])
+
+
+def mark_scan_on_occupancy(
+    occ: OccupancyGrid,
+    pose: conv.Pose2D,
+    scan: conv.LaserScan2D,
+) -> OccupancyGrid:
+    """Copy ``occ`` with live scan hits marked occupied (for dynamic replanning)."""
+    grid = occ.grid.copy()
+    hits = scan_world_points(pose, scan)
+    for wx, wy in hits:
+        row, col = occ.world_to_cell(float(wx), float(wy))
+        if occ.in_bounds(row, col):
+            grid[row, col] = 100
+    return OccupancyGrid(
+        grid=grid,
+        resolution=occ.resolution,
+        origin_x=occ.origin_x,
+        origin_y=occ.origin_y,
+    )
 
 
 def occupancy_from_bridge_map(map_data: dict) -> OccupancyGrid:

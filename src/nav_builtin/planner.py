@@ -14,11 +14,15 @@ from .costmap import (
     costmap_viz_dict,
     footprint_traversable,
     is_traversable,
+    mark_scan_on_occupancy,
     nearest_free_cell,
     nearest_free_pose,
     occupancy_from_bridge_map,
 )
+from .local_costmap import LocalCostmapView
+from .local_planner import path_cost_ahead
 from .types import OccupancyGrid, Path2D, PlanResult, Pose2D
+from ..ros import conversions as conv
 
 PLANNER_ASTAR = "astar"
 PLANNER_LAZY_THETA = "lazy_theta_star"
@@ -283,6 +287,40 @@ def _search(algorithm: str) -> Callable[[np.ndarray, Cell, Cell], Optional[List[
     return _astar
 
 
+def paths_meaningfully_differ(
+    a: Path2D,
+    b: Path2D,
+    *,
+    tol_m: float = 0.2,
+) -> bool:
+    """True when two paths are not the same route within ``tol_m``."""
+    if a.empty or b.empty:
+        return True
+    if len(a.points) != len(b.points):
+        return True
+    for (ax, ay), (bx, by) in zip(a.points, b.points):
+        if math.hypot(ax - bx, ay - by) > tol_m:
+            return True
+    return False
+
+
+def path_blocked_local(
+    pose: Pose2D,
+    path: Path2D,
+    view: LocalCostmapView,
+    *,
+    cost_threshold: int = 200,
+    lookahead_m: float = 1.5,
+) -> bool:
+    """True when live local costs block the global path ahead of the robot."""
+    if path.empty:
+        return True
+    return (
+        path_cost_ahead(pose, path, view, lookahead_m=lookahead_m)
+        >= cost_threshold
+    )
+
+
 def _merge_path_prefix(prefix: Path2D, main: Path2D) -> Path2D:
     """Join two paths, dropping a duplicate junction point when they meet."""
     pp = prefix.points
@@ -308,6 +346,7 @@ def connect_plan_start(
     cost_scaling_factor: float = 4.0,
     algorithm: str = DEFAULT_PLANNER,
     xy_tolerance_m: float = 0.15,
+    scan: Optional[conv.LaserScan2D] = None,
 ) -> PlanResult:
     """Prepend a feasible segment when the robot cannot reach ``path[0]`` safely."""
     if not result.feasible or result.path.empty:
@@ -336,6 +375,8 @@ def connect_plan_start(
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
         algorithm=algorithm,
+        scan=scan,
+        scan_pose=pose if scan is not None else None,
     )
     if not bridge.feasible:
         return PlanResult(
@@ -476,8 +517,13 @@ def plan_path(
     robot_radius_m: float = 0.22,
     cost_scaling_factor: float = 4.0,
     algorithm: str = DEFAULT_PLANNER,
+    scan: Optional[conv.LaserScan2D] = None,
+    scan_pose: Optional[conv.Pose2D] = None,
 ) -> PlanResult:
     """Plan from a bridge-style map dict.
+
+    When ``scan`` is supplied, hits are marked on the map so replans can route
+    around dynamic obstacles (people, chairs) not in the static SLAM map.
 
     On success, ``result.costmap_viz`` holds an OccupancyGrid-style dict the
     nav-camera can render (inflated costs the planner actually used).
@@ -486,6 +532,8 @@ def plan_path(
         occ = occupancy_from_bridge_map(map_data)
     except (KeyError, TypeError, ValueError) as exc:
         return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
+    if scan is not None and scan_pose is not None:
+        occ = mark_scan_on_occupancy(occ, scan_pose, scan)
     costs = build_costmap(
         occ,
         inflation_radius_m=inflation_radius_m,

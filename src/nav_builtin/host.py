@@ -59,6 +59,7 @@ def make_builtin_navigator(
         backup_rear_clear_m=bcfg.backup_rear_clear_m,
         backup_max_attempts=bcfg.backup_max_attempts,
         backup_cooldown_s=bcfg.backup_cooldown_s,
+        replan_local_blocked_time_s=bcfg.replan_local_blocked_time_s,
         logger=logger,
     )
 

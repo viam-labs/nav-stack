@@ -261,6 +261,8 @@ class BuiltinNavConfig:
     backup_rear_clear_m: float = 0.45
     backup_max_attempts: int = 2
     backup_cooldown_s: float = 4.0
+    # Replan when the local costmap sees the path ahead blocked (dynamic obstacles).
+    replan_local_blocked_time_s: float = 1.0
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":
@@ -297,6 +299,9 @@ class BuiltinNavConfig:
             backup_rear_clear_m=float(d.get("backup_rear_clear_m", 0.45)),
             backup_max_attempts=int(d.get("backup_max_attempts", 2)),
             backup_cooldown_s=float(d.get("backup_cooldown_s", 4.0)),
+            replan_local_blocked_time_s=float(
+                d.get("replan_local_blocked_time_s", 1.0)
+            ),
         )
 
 

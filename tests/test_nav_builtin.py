@@ -15,7 +15,12 @@ from src.nav_builtin.costmap import (
     nearest_free_pose,
 )
 from src.nav_builtin.navigator import BuiltinNavigator
-from src.nav_builtin.planner import connect_plan_start, plan_on_costmap, plan_path
+from src.nav_builtin.planner import (
+    connect_plan_start,
+    paths_meaningfully_differ,
+    plan_on_costmap,
+    plan_path,
+)
 from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
 from src.ros import conversions as conv
 
@@ -93,6 +98,37 @@ def test_connect_plan_start_prepends_escape_from_blocked_pose():
     assert footprint_traversable(
         costs, occ, sx, sy, robot_radius_m=0.22
     )
+
+
+def test_plan_path_marks_scan_for_dynamic_replan():
+    m = _empty_map(size=60, resolution=0.05)
+    start = Pose2D(0.5, 1.5, 0.0)
+    goal = Pose2D(2.5, 1.5, 0.0)
+    baseline = plan_path(
+        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert baseline.feasible
+    n = 72
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 0.9
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    blocked = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        scan=scan,
+        scan_pose=conv.Pose2D(0.5, 1.5, 0.0),
+    )
+    assert blocked.feasible
+    assert paths_meaningfully_differ(baseline.path, blocked.path)
 
 
 def test_build_costmap_inflates_obstacles():

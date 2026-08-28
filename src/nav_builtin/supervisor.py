@@ -22,9 +22,15 @@ from .local_costmap import (
     reverse_backup_feasible,
 )
 from .local_planner import LocalPlannerConfig
-from .planner import path_blocked, plan_path, connect_plan_start
+from .planner import (
+    path_blocked,
+    path_blocked_local,
+    paths_meaningfully_differ,
+    plan_path,
+    connect_plan_start,
+)
 from .smoother import smooth_plan_path
-from .types import NavStatus, PlanResult, Pose2D
+from .types import NavStatus, Path2D, PlanResult, Pose2D
 from .world_io import WorldIO
 
 
@@ -74,6 +80,7 @@ class NavSupervisor:
         backup_rear_clear_m: float = 0.45,
         backup_max_attempts: int = 2,
         backup_cooldown_s: float = 4.0,
+        replan_local_blocked_time_s: float = 1.0,
     ):
         self._world = world
         self._inflation = inflation_radius_m
@@ -99,6 +106,8 @@ class NavSupervisor:
         self._backup_rear_clear_m = backup_rear_clear_m
         self._backup_max_attempts = max(0, int(backup_max_attempts))
         self._backup_cooldown_s = backup_cooldown_s
+        self._replan_local_blocked_time_s = replan_local_blocked_time_s
+        self._local_planner_activate_cost = local_planner_activate_cost
         self._local_costmap = (
             LocalCostmap(
                 LocalCostmapConfig(
@@ -181,7 +190,12 @@ class NavSupervisor:
             for k, v in kwargs.items():
                 setattr(self._status, k, v)
 
-    def plan(self, goal: Pose2D, start: Optional[Pose2D] = None) -> PlanResult:
+    def plan(
+        self,
+        goal: Pose2D,
+        start: Optional[Pose2D] = None,
+        scan: Optional[conv.LaserScan2D] = None,
+    ) -> PlanResult:
         pose = start if start is not None else self._world.get_pose()
         if pose is None:
             return PlanResult(
@@ -200,6 +214,8 @@ class NavSupervisor:
             robot_radius_m=self._robot_radius,
             cost_scaling_factor=self._cost_scaling,
             algorithm=self._algorithm,
+            scan=scan,
+            scan_pose=pose if scan is not None else None,
         )
         if result.feasible:
             result = connect_plan_start(
@@ -211,6 +227,7 @@ class NavSupervisor:
                 cost_scaling_factor=self._cost_scaling,
                 algorithm=self._algorithm,
                 xy_tolerance_m=self._follower.motion.xy_tolerance_m,
+                scan=scan,
             )
         if result.feasible and self._smooth_path:
             smoothed = smooth_plan_path(
@@ -240,6 +257,25 @@ class NavSupervisor:
         except Exception:  # noqa: BLE001 - viz is best-effort
             pass
         return preview
+
+    def _try_replan(
+        self,
+        goal: Pose2D,
+        pose: Pose2D,
+        path: Path2D,
+        scan: Optional[conv.LaserScan2D],
+        *,
+        require_different: bool = True,
+    ) -> Optional[Path2D]:
+        """Replan from ``pose``, optionally marking live scan hits on the map."""
+        replanned = self.plan(goal, start=pose, scan=scan)
+        if not replanned.feasible:
+            return None
+        if require_different and not paths_meaningfully_differ(path, replanned.path):
+            return None
+        preview = self._publish_plan_viz(replanned, goal, start=pose)
+        self._set_status(path=preview["path"], length_m=preview["length_m"])
+        return replanned.path
 
     def run_goal(self, goal: Pose2D) -> None:
         """Plan and follow until success, failure, or cancel. Blocking."""
@@ -278,6 +314,8 @@ class NavSupervisor:
             backup_start_cost = 0
             backup_attempts = 0
             backup_cooldown_until = 0.0
+            local_blocked_since: Optional[float] = None
+            vx_sign_history: list[tuple[float, int]] = []
             poll = self._follower.motion.poll_interval_s
 
             while time.monotonic() < deadline:
@@ -312,35 +350,6 @@ class NavSupervisor:
                     return
 
                 now = time.monotonic()
-                need_replan_check = now - last_replan >= self._replan_period
-                if need_replan_check:
-                    last_replan = now
-                    map_data = self._world.get_map()
-                    # Only replan when the current path is blocked. Soft periodic
-                    # replan was flipping Lazy Theta* routes every second and
-                    # making differential bases spin in place chasing a new
-                    # bearing.
-                    if map_data is not None and path_blocked(
-                        map_data,
-                        path,
-                        inflation_radius_m=self._inflation,
-                        robot_radius_m=self._robot_radius,
-                    ):
-                        replanned = self.plan(goal, start=pose)
-                        if replanned.feasible:
-                            path = replanned.path
-                            preview = self._publish_plan_viz(replanned, goal, start=pose)
-                            self._set_status(
-                                path=preview["path"], length_m=preview["length_m"]
-                            )
-                        else:
-                            self._world.stop()
-                            self._set_status(
-                                state="failed",
-                                active=False,
-                                error_msg=replanned.error_msg or "replan failed",
-                            )
-                            return
 
                 scan = None
                 if (
@@ -462,15 +471,14 @@ class NavSupervisor:
                         backup_start = None
                         spin_stuck_since = None
                         backup_cooldown_until = now + self._backup_cooldown_s
-                        replanned = self.plan(goal, start=pose)
-                        if replanned.feasible:
-                            path = replanned.path
-                            preview = self._publish_plan_viz(replanned, goal, start=pose)
-                            self._set_status(
-                                path=preview["path"], length_m=preview["length_m"]
-                            )
+                        new_path = self._try_replan(goal, pose, path, scan)
+                        if new_path is not None:
+                            path = new_path
                             last_replan = now
                             last_progress_at = now
+                            local_blocked_since = None
+                            backup_attempts = 0
+                            vx_sign_history.clear()
                         cmd = DriveCommand(0.0, 0.0, 0.0, False)
                     else:
                         cmd = DriveCommand(
@@ -530,6 +538,84 @@ class NavSupervisor:
                             spin_stuck_since = None
                 else:
                     spin_stuck_since = None
+
+                local_blocked = (
+                    local_view is not None
+                    and path_blocked_local(
+                        pose,
+                        path,
+                        local_view,
+                        cost_threshold=self._local_planner_activate_cost,
+                    )
+                )
+                if local_blocked:
+                    if local_blocked_since is None:
+                        local_blocked_since = now
+                else:
+                    local_blocked_since = None
+
+                if abs(cmd.vx) > 0.05:
+                    sign = 1 if cmd.vx > 0 else -1
+                    vx_sign_history.append((now, sign))
+                    vx_sign_history = [
+                        (t, s) for t, s in vx_sign_history if now - t <= 3.0
+                    ]
+                oscillating = False
+                if len(vx_sign_history) >= 4:
+                    flips = sum(
+                        1
+                        for i in range(1, len(vx_sign_history))
+                        if vx_sign_history[i][1] != vx_sign_history[i - 1][1]
+                    )
+                    oscillating = flips >= 3
+
+                replan_due = now - last_replan >= self._replan_period
+                map_data = None
+                static_blocked = False
+                if replan_due:
+                    map_data = self._world.get_map()
+                    static_blocked = map_data is not None and path_blocked(
+                        map_data,
+                        path,
+                        inflation_radius_m=self._inflation,
+                        robot_radius_m=self._robot_radius,
+                    )
+
+                sustained_local = (
+                    local_blocked
+                    and local_blocked_since is not None
+                    and now - local_blocked_since
+                    >= self._replan_local_blocked_time_s
+                )
+                backup_exhausted = (
+                    backup_attempts >= self._backup_max_attempts and local_blocked
+                )
+                should_replan = replan_due and (
+                    static_blocked
+                    or sustained_local
+                    or (oscillating and local_blocked)
+                    or backup_exhausted
+                )
+                if should_replan:
+                    new_path = self._try_replan(goal, pose, path, scan)
+                    if new_path is not None:
+                        path = new_path
+                        last_replan = now
+                        last_progress_at = now
+                        local_blocked_since = None
+                        backup_attempts = 0
+                        vx_sign_history.clear()
+                        spin_stuck_since = None
+                    elif static_blocked:
+                        self._world.stop()
+                        self._set_status(
+                            state="failed",
+                            active=False,
+                            error_msg="replan failed (path blocked)",
+                        )
+                        return
+                    else:
+                        last_replan = now
 
                 self._set_status(
                     pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
@@ -594,14 +680,13 @@ class NavSupervisor:
                             now - last_progress_at
                             >= self._follower.motion.stall_timeout_s
                         ):
-                            replanned = self.plan(goal, start=pose)
-                            if (
-                                replanned.feasible
-                                and replanned.path.points != path.points
-                            ):
-                                path = replanned.path
+                            new_path = self._try_replan(goal, pose, path, scan)
+                            if new_path is not None:
+                                path = new_path
                                 last_progress_at = now
                                 last_replan = now
+                                local_blocked_since = None
+                                backup_attempts = 0
                             else:
                                 self._world.stop()
                                 self._set_status(
@@ -611,12 +696,13 @@ class NavSupervisor:
                                 )
                                 return
                     elif now - last_progress_at >= self._follower.motion.stall_timeout_s:
-                        # Spinning / stopped without XY progress — replan or fail.
-                        replanned = self.plan(goal, start=pose)
-                        if replanned.feasible and replanned.path.points != path.points:
-                            path = replanned.path
+                        new_path = self._try_replan(goal, pose, path, scan)
+                        if new_path is not None:
+                            path = new_path
                             last_progress_at = now
                             last_replan = now
+                            local_blocked_since = None
+                            backup_attempts = 0
                         else:
                             self._world.stop()
                             self._set_status(

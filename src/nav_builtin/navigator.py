@@ -55,6 +55,7 @@ class BuiltinNavigator:
         backup_rear_clear_m: float = 0.45,
         backup_max_attempts: int = 2,
         backup_cooldown_s: float = 4.0,
+        replan_local_blocked_time_s: float = 1.0,
         logger=None,
     ):
         self._world = world
@@ -96,6 +97,7 @@ class BuiltinNavigator:
             backup_rear_clear_m=backup_rear_clear_m,
             backup_max_attempts=backup_max_attempts,
             backup_cooldown_s=backup_cooldown_s,
+            replan_local_blocked_time_s=replan_local_blocked_time_s,
         )
         self._lock = threading.Lock()
         self._worker: Optional[threading.Thread] = None
