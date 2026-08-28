@@ -47,14 +47,21 @@ def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
 
 
-def _effective_lookahead(cfg: FollowerConfig, *, speed_mps: float) -> float:
+def _effective_lookahead(
+    cfg: FollowerConfig,
+    *,
+    speed_mps: float,
+    near_goal: bool = False,
+) -> float:
     """Velocity-scaled lookahead (mugger-dds RPP: 0.25–0.7 m at ~1 s horizon)."""
     lo = min(cfg.min_lookahead_m, cfg.max_lookahead_m)
     hi = max(cfg.min_lookahead_m, cfg.max_lookahead_m)
-    scaled = max(lo, min(hi, abs(speed_mps) * 1.0))
-    if lo <= cfg.lookahead_m <= hi:
-        return max(lo, min(hi, cfg.lookahead_m if speed_mps < 0.05 else scaled))
-    return scaled
+    if near_goal:
+        return lo
+    # Do not shrink lookahead when crawling — that pulls the pursuit target in
+    # and caps linear speed in a slow/shimmy feedback loop.
+    horizon = max(cfg.lookahead_m, abs(speed_mps) * 1.2)
+    return max(lo, min(hi, horizon))
 
 
 def lookahead_pose(
@@ -150,14 +157,17 @@ def compute_follow_command(
             motion,
         )
 
-    linear_cmd = _clamp(dist * 0.6, max_linear)
-    if dist < motion.xy_tolerance_m * 3:
-        linear_cmd = min(linear_cmd, max_linear * 0.4)
-    if cfg.approach_dist_m > 0 and dist < cfg.approach_dist_m:
-        floor = max(0.1, max_linear * 0.25)
-        linear_cmd = min(linear_cmd, floor)
-    # Scale linear with bearing so we don't plow sideways.
-    bearing_scale = max(0.25, 1.0 - (abs(bearing) / cfg.rotate_in_place_rad) * 0.6)
+    linear_cmd = _clamp(dist * 0.75, max_linear)
+    if final_yaw is not None:
+        # Final approach to goal XY — ease in.
+        if cfg.approach_dist_m > 0 and dist < cfg.approach_dist_m:
+            cap = max(0.12, max_linear * 0.35)
+            linear_cmd = min(linear_cmd, cap)
+    elif abs(bearing) < math.radians(25.0):
+        # On-path cruise: don't crawl when bearing is good.
+        linear_cmd = max(max_linear * 0.55, min(max_linear, linear_cmd))
+    # Scale linear with bearing so we don't plow sideways (less aggressive).
+    bearing_scale = max(0.45, 1.0 - (abs(bearing) / cfg.rotate_in_place_rad) * 0.45)
     linear_cmd *= bearing_scale
     angular_cmd = _clamp(bearing * 1.8, max_angular)
     return apply_velocity_floor(
@@ -177,19 +187,22 @@ def compute_path_command(
     robot_radius_m: float = 0.22,
     min_cmd_vel_x: float = 0.0,
     min_cmd_vel_theta: float = 0.0,
+    local_planner_active: bool = False,
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``."""
     est_speed = cfg.motion.max_linear_mps * 0.5 if speed_mps is None else speed_mps
-    lookahead = _effective_lookahead(cfg, speed_mps=est_speed)
+    near_goal = distance_m(
+        current, Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
+    ) <= (cfg.motion.xy_tolerance_m * 2.0)
+    lookahead = _effective_lookahead(
+        cfg, speed_mps=est_speed, near_goal=near_goal
+    )
     target, idx, is_final = lookahead_pose(
         current,
         path,
         lookahead_m=lookahead,
         waypoint_tolerance_m=cfg.waypoint_tolerance_m,
     )
-    near_goal = distance_m(
-        current, Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
-    ) <= (cfg.motion.xy_tolerance_m * 2.0)
     bearing = heading_error_rad(
         current.theta, math.atan2(target.y - current.y, target.x - current.x)
     )
@@ -211,6 +224,7 @@ def compute_path_command(
             robot_radius_m=robot_radius_m,
             min_cmd_vel_x=min_cmd_vel_x,
             min_cmd_vel_theta=min_cmd_vel_theta,
+            local_planner_active=local_planner_active,
         )
         if local_cmd is not None:
             cmd = local_cmd

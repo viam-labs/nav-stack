@@ -332,6 +332,7 @@ class NavSupervisor:
             local_blocked_since: Optional[float] = None
             last_local_replan_at = 0.0
             failed_replan_while_blocked = 0
+            local_planner_active = False
             vx_sign_history: list[tuple[float, int]] = []
             poll = self._follower.motion.poll_interval_s
 
@@ -496,7 +497,9 @@ class NavSupervisor:
                     robot_radius_m=self._robot_radius,
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
                     min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
+                    local_planner_active=local_planner_active,
                 )
+                local_planner_active = bool(progress.get("local_planner"))
 
                 allow_backup = (
                     self._backup_enabled

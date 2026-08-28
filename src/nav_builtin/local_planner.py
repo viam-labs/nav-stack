@@ -18,6 +18,7 @@ class LocalPlannerConfig:
     # Soft inflation on a mapped wall is normal — only wake DWA when the path
     # ahead is nearly blocked (live obstacle or tight squeeze).
     activate_cost_threshold: int = 200
+    deactivate_cost_threshold: int = 120
     path_clearance_lookahead_m: float = 1.2
     path_weight: float = 2.0
     goal_weight: float = 1.0
@@ -109,10 +110,17 @@ def should_use_local_planner(
     path: Path2D,
     view: LocalCostmapView,
     cfg: LocalPlannerConfig,
+    *,
+    currently_active: bool = False,
 ) -> bool:
     if not cfg.enabled:
         return False
-    if cfg.activate_cost_threshold <= 0:
+    threshold = (
+        cfg.deactivate_cost_threshold
+        if currently_active
+        else cfg.activate_cost_threshold
+    )
+    if threshold <= 0:
         return True
     ahead = path_cost_ahead(
         pose,
@@ -120,7 +128,7 @@ def should_use_local_planner(
         view,
         lookahead_m=cfg.path_clearance_lookahead_m,
     )
-    return ahead >= cfg.activate_cost_threshold
+    return ahead >= threshold
 
 
 def compute_local_command(
@@ -134,9 +142,12 @@ def compute_local_command(
     robot_radius_m: float,
     min_cmd_vel_x: float = 0.0,
     min_cmd_vel_theta: float = 0.0,
+    local_planner_active: bool = False,
 ) -> Optional[DriveCommand]:
     """Sample (vx, vtheta) rollouts; return best safe command or None if not needed."""
-    if not should_use_local_planner(pose, path, view, cfg):
+    if not should_use_local_planner(
+        pose, path, view, cfg, currently_active=local_planner_active
+    ):
         return None
 
     goal = path.points[-1]

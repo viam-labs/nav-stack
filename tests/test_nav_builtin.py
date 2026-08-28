@@ -370,7 +370,29 @@ def test_follow_command_translates_while_gently_turning():
     assert cmd.vtheta != 0.0
 
 
-def test_follow_command_rotates_in_place_when_facing_away():
+def test_follow_command_cruises_when_aligned():
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(0.0, 0.0, -2.29)
+    target = Pose2D(-0.38, -2.96, 0.0)  # ~0.04 rad bearing, ~1 m ahead
+    cmd = compute_follow_command(current, target, cfg=cfg, final_yaw=None)
+    assert not cmd.done
+    assert cmd.vx >= 0.33
+
+
+def test_follow_command_approach_cap_only_at_goal():
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.max_linear_mps = 0.6
+    cfg.approach_dist_m = 0.35
+    current = Pose2D(0.0, 0.0, 0.0)
+    near = Pose2D(0.2, 0.0, 0.0)
+    mid = compute_follow_command(current, near, cfg=cfg, final_yaw=None)
+    goal = compute_follow_command(current, near, cfg=cfg, final_yaw=0.0)
+    assert mid.vx > goal.vx
     from src.nav_builtin.controller import compute_follow_command
 
     cfg = FollowerConfig()
