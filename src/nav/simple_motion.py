@@ -69,6 +69,25 @@ def normalize_angle(rad: float) -> float:
     return conv.normalize_angle(rad)
 
 
+def rear_clearance_m(
+    scan: conv.LaserScan2D,
+    *,
+    half_cone_rad: float = math.radians(60.0),
+) -> float:
+    """Minimum range in the rear arc (scan frame, rear ≈ |bearing| > π − half)."""
+    ranges = np.asarray(scan.ranges, dtype=float)
+    n = len(ranges)
+    if n == 0:
+        return math.inf
+    angles = scan.angle_min + np.arange(n) * scan.angle_increment
+    angles = np.arctan2(np.sin(angles), np.cos(angles))
+    in_rear = np.abs(angles) >= (math.pi - half_cone_rad)
+    valid = in_rear & np.isfinite(ranges) & (ranges >= scan.range_min)
+    if not valid.any():
+        return math.inf
+    return float(ranges[valid].min())
+
+
 def cone_min_range(scan: conv.LaserScan2D, lo_rad: float, hi_rad: float) -> float:
     """Minimum finite in-range return whose bearing lies in ``[lo, hi]`` (radians).
 

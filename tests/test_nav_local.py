@@ -6,6 +6,7 @@ import math
 import numpy as np
 import pytest
 
+from src.nav.simple_motion import rear_clearance_m
 from src.nav_builtin.controller import FollowerConfig, compute_path_command
 from src.nav_builtin.costmap import build_costmap, occupancy_from_bridge_map
 from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig, footprint_collides
@@ -22,6 +23,21 @@ def _empty_map(size: int = 40, resolution: float = 0.05) -> dict:
         "origin_x": 0.0,
         "origin_y": 0.0,
     }
+
+
+def test_rear_clearance_m_ignores_forward_returns():
+    n = 36
+    ranges = np.full(n, 3.0)
+    ranges[0] = 0.4  # rear beam (angle ≈ −π)
+    ranges[n // 2] = 0.25  # forward beam — must not dominate rear reading
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    assert rear_clearance_m(scan) == pytest.approx(0.4)
 
 
 def test_smooth_path_shortens_zigzag_astar():
@@ -170,6 +186,49 @@ def test_local_costmap_marks_scan_hit():
     assert view.cost_at_world(2.0, 1.0) > 0
 
 
+def test_local_planner_prefers_reverse_when_blocked_ahead():
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=3.0,
+            height_m=3.0,
+            resolution=0.05,
+            inflation_radius_m=0.15,
+            robot_radius_m=0.08,
+            use_global_static=False,
+        )
+    )
+    pose = Pose2D(1.5, 1.5, 0.0)
+    n = 36
+    ranges = np.full(n, 3.0)
+    ranges[n // 2] = 0.35
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(pose, scan)
+    path = Path2D(points=((1.5, 1.5), (2.5, 1.5)), goal_theta=0.0)
+    cfg = LocalPlannerConfig(
+        enabled=True,
+        activate_cost_threshold=1,
+        sim_time_s=1.0,
+        max_vel_x_reverse_m=0.15,
+    )
+    cmd = compute_local_command(
+        pose,
+        path,
+        view,
+        cfg=cfg,
+        max_vel_x=0.4,
+        max_vel_theta=1.0,
+        robot_radius_m=0.08,
+    )
+    assert cmd is not None
+    assert cmd.vx < 0.0
+
+
 def test_local_planner_avoids_marked_obstacle():
     lc = LocalCostmap(
         LocalCostmapConfig(
@@ -273,7 +332,7 @@ def test_compute_path_command_uses_local_planner_when_blocked():
         robot_radius_m=0.08,
     )
     assert progress.get("local_planner") is True
-    assert cmd.vx >= 0.0
+    assert cmd.vx <= 0.35
 
 
 def test_footprint_collides_outside_map():

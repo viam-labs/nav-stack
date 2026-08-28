@@ -5,7 +5,13 @@ import threading
 import time
 from typing import Optional
 
-from ..nav.simple_motion import ObstacleConfig, SimpleMotionConfig, distance_m
+from ..nav.simple_motion import (
+    DriveCommand,
+    ObstacleConfig,
+    SimpleMotionConfig,
+    distance_m,
+    rear_clearance_m,
+)
 from ..ros import conversions as conv
 from .controller import FollowerConfig, compute_path_command
 from .local_costmap import LocalCostmap, LocalCostmapConfig
@@ -54,6 +60,12 @@ class NavSupervisor:
         local_planner_enabled: bool = True,
         local_planner_sim_time_s: float = 1.2,
         local_planner_activate_cost: int = 200,
+        local_planner_max_vel_x_reverse_m: float = 0.15,
+        backup_enabled: bool = True,
+        backup_stuck_time_s: float = 1.5,
+        backup_dist_m: float = 0.35,
+        backup_speed_mps: float = 0.15,
+        backup_rear_clear_m: float = 0.45,
     ):
         self._world = world
         self._inflation = inflation_radius_m
@@ -70,7 +82,13 @@ class NavSupervisor:
             enabled=local_planner_enabled,
             sim_time_s=local_planner_sim_time_s,
             activate_cost_threshold=local_planner_activate_cost,
+            max_vel_x_reverse_m=local_planner_max_vel_x_reverse_m,
         )
+        self._backup_enabled = backup_enabled
+        self._backup_stuck_time_s = backup_stuck_time_s
+        self._backup_dist_m = backup_dist_m
+        self._backup_speed_mps = backup_speed_mps
+        self._backup_rear_clear_m = backup_rear_clear_m
         self._local_costmap = (
             LocalCostmap(
                 LocalCostmapConfig(
@@ -233,6 +251,9 @@ class NavSupervisor:
             last_replan = time.monotonic()
             last_progress_pose: Optional[Pose2D] = None
             last_progress_at = time.monotonic()
+            spin_stuck_since: Optional[float] = None
+            backup_active = False
+            backup_start: Optional[Pose2D] = None
             poll = self._follower.motion.poll_interval_s
 
             while time.monotonic() < deadline:
@@ -386,6 +407,71 @@ class NavSupervisor:
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
                     min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
                 )
+
+                if backup_active and backup_start is not None:
+                    backed_m = distance_m(pose, backup_start)
+                    rear = (
+                        rear_clearance_m(scan)
+                        if scan is not None
+                        else math.inf
+                    )
+                    if (
+                        backed_m >= self._backup_dist_m
+                        or rear < self._backup_rear_clear_m * 0.85
+                    ):
+                        backup_active = False
+                        backup_start = None
+                        spin_stuck_since = None
+                        replanned = self.plan(goal, start=pose)
+                        if replanned.feasible:
+                            path = replanned.path
+                            preview = self._publish_plan_viz(replanned, goal, start=pose)
+                            self._set_status(
+                                path=preview["path"], length_m=preview["length_m"]
+                            )
+                            last_replan = now
+                            last_progress_at = now
+                        cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                    else:
+                        cmd = DriveCommand(
+                            -self._backup_speed_mps, 0.0, 0.0, False
+                        )
+                        progress = {
+                            **progress,
+                            "local_planner": False,
+                            "obstacle": "backup",
+                            "cmd_vx_mps": cmd.vx,
+                            "cmd_vtheta_rad_s": cmd.vtheta,
+                        }
+                elif (
+                    self._backup_enabled
+                    and scan is not None
+                    and progress.get("local_planner")
+                    and abs(cmd.vx) < 0.05
+                    and abs(cmd.vtheta) > 0.1
+                ):
+                    if spin_stuck_since is None:
+                        spin_stuck_since = now
+                    elif (
+                        now - spin_stuck_since >= self._backup_stuck_time_s
+                        and rear_clearance_m(scan) >= self._backup_rear_clear_m
+                    ):
+                        backup_active = True
+                        backup_start = pose
+                        spin_stuck_since = None
+                        cmd = DriveCommand(
+                            -self._backup_speed_mps, 0.0, 0.0, False
+                        )
+                        progress = {
+                            **progress,
+                            "local_planner": False,
+                            "obstacle": "backup",
+                            "cmd_vx_mps": cmd.vx,
+                            "cmd_vtheta_rad_s": cmd.vtheta,
+                        }
+                else:
+                    spin_stuck_since = None
+
                 self._set_status(
                     pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
                     progress={

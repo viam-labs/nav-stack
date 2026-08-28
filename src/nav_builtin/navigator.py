@@ -47,6 +47,12 @@ class BuiltinNavigator:
         local_planner_enabled: bool = True,
         local_planner_sim_time_s: float = 1.2,
         local_planner_activate_cost: int = 200,
+        local_planner_max_vel_x_reverse_m: float = 0.15,
+        backup_enabled: bool = True,
+        backup_stuck_time_s: float = 1.5,
+        backup_dist_m: float = 0.35,
+        backup_speed_mps: float = 0.15,
+        backup_rear_clear_m: float = 0.45,
         logger=None,
     ):
         self._world = world
@@ -80,6 +86,12 @@ class BuiltinNavigator:
             local_planner_enabled=local_planner_enabled,
             local_planner_sim_time_s=local_planner_sim_time_s,
             local_planner_activate_cost=local_planner_activate_cost,
+            local_planner_max_vel_x_reverse_m=local_planner_max_vel_x_reverse_m,
+            backup_enabled=backup_enabled,
+            backup_stuck_time_s=backup_stuck_time_s,
+            backup_dist_m=backup_dist_m,
+            backup_speed_mps=backup_speed_mps,
+            backup_rear_clear_m=backup_rear_clear_m,
         )
         self._lock = threading.Lock()
         self._worker: Optional[threading.Thread] = None

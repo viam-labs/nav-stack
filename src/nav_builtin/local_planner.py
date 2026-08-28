@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 from ..nav.simple_motion import DriveCommand, apply_velocity_floor
 from ..ros import conversions as conv
 from .path_utils import closest_point_on_path
+from .costmap import INSCRIBED
 from .local_costmap import LocalCostmapView, footprint_collides, max_cost_along_segment
 from .types import Path2D, Pose2D
 
@@ -22,7 +23,11 @@ class LocalPlannerConfig:
     goal_weight: float = 1.0
     speed_weight: float = 0.5
     obstacle_weight: float = 3.0
-    vx_samples: int = 4
+    # Reverse samples (Nav2 caps ~0.15 m/s) so DWA can back out of nose-first blocks.
+    max_vel_x_reverse_m: float = 0.15
+    reverse_speed_weight: float = 0.85
+    spin_penalty: float = 1.0  # prefer translate (incl. reverse) over rotate-only
+    vx_samples: int = 5
     vtheta_samples: int = 5
     sim_time_s: float = 1.2
     sim_dt_s: float = 0.15
@@ -136,12 +141,23 @@ def compute_local_command(
 
     goal = path.points[-1]
     gx, gy = goal[0], goal[1]
+    ahead_cost = path_cost_ahead(
+        pose,
+        path,
+        view,
+        lookahead_m=cfg.path_clearance_lookahead_m,
+    )
+    path_blocked_ahead = ahead_cost >= cfg.activate_cost_threshold
+    max_reverse = min(float(cfg.max_vel_x_reverse_m), float(max_vel_x))
     best: Optional[Tuple[float, float, float]] = None
-    n_vx = max(2, int(cfg.vx_samples))
+    n_vx = max(3, int(cfg.vx_samples))
     n_vt = max(3, int(cfg.vtheta_samples))
 
     for i in range(n_vx):
-        vx = max_vel_x * i / (n_vx - 1)
+        if n_vx == 1:
+            vx = 0.0
+        else:
+            vx = -max_reverse + (max_vel_x + max_reverse) * i / (n_vx - 1)
         for j in range(n_vt):
             vtheta = -max_vel_theta + (2.0 * max_vel_theta) * j / (n_vt - 1)
             rollout = _simulate(
@@ -156,6 +172,13 @@ def compute_local_command(
                 for p in rollout
             ):
                 continue
+            if path_blocked_ahead and vx > 0 and ahead_cost >= INSCRIBED:
+                continue
+            if path_blocked_ahead and vx > 0 and any(
+                view.cost_at_world(p.x, p.y) >= cfg.activate_cost_threshold
+                for p in rollout[1:]
+            ):
+                continue
             end = rollout[-1]
             path_dist = _path_distance_m(path, end.x, end.y)
             goal_dist = math.hypot(end.x - gx, end.y - gy)
@@ -164,12 +187,27 @@ def compute_local_command(
                 c = view.cost_at_world(p.x, p.y)
                 if c > 0:
                     obs_pen += c / 253.0
+            if vx >= 0.0:
+                speed_term = cfg.speed_weight * vx
+                if path_blocked_ahead and vx > 1e-3:
+                    speed_term *= 0.15
+            elif path_blocked_ahead:
+                speed_term = cfg.speed_weight * cfg.reverse_speed_weight * abs(vx)
+            else:
+                speed_term = cfg.speed_weight * 0.35 * abs(vx)
+            path_pen = cfg.path_weight * path_dist
+            goal_pen = cfg.goal_weight * goal_dist
+            if vx < 0 and path_blocked_ahead:
+                path_pen *= 0.2
+                goal_pen *= 0.2
             score = (
-                -cfg.path_weight * path_dist
-                - cfg.goal_weight * goal_dist
-                + cfg.speed_weight * vx
+                -path_pen
+                - goal_pen
+                + speed_term
                 - cfg.obstacle_weight * obs_pen
             )
+            if abs(vx) < 1e-3 and abs(vtheta) > 1e-3 and path_blocked_ahead:
+                score -= cfg.spin_penalty
             if best is None or score > best[2]:
                 best = (vx, vtheta, score)
 

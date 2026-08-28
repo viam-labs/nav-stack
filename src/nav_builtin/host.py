@@ -51,6 +51,12 @@ def make_builtin_navigator(
         local_planner_enabled=bcfg.local_planner_enabled,
         local_planner_sim_time_s=bcfg.local_planner_sim_time_s,
         local_planner_activate_cost=bcfg.local_planner_activate_cost,
+        local_planner_max_vel_x_reverse_m=bcfg.local_planner_max_vel_x_reverse_m,
+        backup_enabled=bcfg.backup_enabled,
+        backup_stuck_time_s=bcfg.backup_stuck_time_s,
+        backup_dist_m=bcfg.backup_dist_m,
+        backup_speed_mps=bcfg.backup_speed_mps,
+        backup_rear_clear_m=bcfg.backup_rear_clear_m,
         logger=logger,
     )
 
