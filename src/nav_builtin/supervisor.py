@@ -74,13 +74,14 @@ class NavSupervisor:
         local_planner_activate_cost: int = 200,
         local_planner_max_vel_x_reverse_m: float = 0.15,
         backup_enabled: bool = True,
-        backup_stuck_time_s: float = 1.5,
-        backup_dist_m: float = 0.35,
-        backup_speed_mps: float = 0.15,
+        backup_stuck_time_s: float = 3.0,
+        backup_dist_m: float = 0.30,
+        backup_speed_mps: float = 0.12,
         backup_rear_clear_m: float = 0.45,
-        backup_max_attempts: int = 2,
+        backup_max_attempts: int = 1,
         backup_cooldown_s: float = 4.0,
-        replan_local_blocked_time_s: float = 1.0,
+        replan_local_blocked_time_s: float = 0.3,
+        replan_local_min_period_s: float = 0.5,
     ):
         self._world = world
         self._inflation = inflation_radius_m
@@ -107,6 +108,7 @@ class NavSupervisor:
         self._backup_max_attempts = max(0, int(backup_max_attempts))
         self._backup_cooldown_s = backup_cooldown_s
         self._replan_local_blocked_time_s = replan_local_blocked_time_s
+        self._replan_local_min_period_s = replan_local_min_period_s
         self._local_planner_activate_cost = local_planner_activate_cost
         self._local_costmap = (
             LocalCostmap(
@@ -315,6 +317,8 @@ class NavSupervisor:
             backup_attempts = 0
             backup_cooldown_until = 0.0
             local_blocked_since: Optional[float] = None
+            last_local_replan_at = 0.0
+            failed_replan_while_blocked = 0
             vx_sign_history: list[tuple[float, int]] = []
             poll = self._follower.motion.poll_interval_s
 
@@ -426,6 +430,40 @@ class NavSupervisor:
                         except Exception:  # noqa: BLE001 - viz is best-effort
                             pass
 
+                local_blocked = (
+                    local_view is not None
+                    and path_blocked_local(
+                        pose,
+                        path,
+                        local_view,
+                        cost_threshold=self._local_planner_activate_cost,
+                    )
+                )
+                if local_blocked:
+                    if local_blocked_since is None:
+                        local_blocked_since = now
+                    if (
+                        now - local_blocked_since
+                        >= self._replan_local_blocked_time_s
+                        and now - last_local_replan_at
+                        >= self._replan_local_min_period_s
+                    ):
+                        new_path = self._try_replan(goal, pose, path, scan)
+                        last_local_replan_at = now
+                        last_replan = now
+                        if new_path is not None:
+                            path = new_path
+                            local_blocked_since = None
+                            failed_replan_while_blocked = 0
+                            backup_attempts = 0
+                            vx_sign_history.clear()
+                            spin_stuck_since = None
+                        else:
+                            failed_replan_while_blocked += 1
+                else:
+                    local_blocked_since = None
+                    failed_replan_while_blocked = 0
+
                 cmd, progress = compute_path_command(
                     pose,
                     path,
@@ -439,6 +477,21 @@ class NavSupervisor:
                     robot_radius_m=self._robot_radius,
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
                     min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
+                )
+
+                allow_backup = (
+                    self._backup_enabled
+                    and scan is not None
+                    and local_view is not None
+                    and progress.get("local_planner")
+                    and abs(cmd.vx) < 0.05
+                    and abs(cmd.vtheta) > 0.1
+                    and backup_attempts < self._backup_max_attempts
+                    and now >= backup_cooldown_until
+                    and (
+                        not local_blocked
+                        or failed_replan_while_blocked >= 2
+                    )
                 )
 
                 if backup_active and backup_start is not None:
@@ -477,6 +530,7 @@ class NavSupervisor:
                             last_replan = now
                             last_progress_at = now
                             local_blocked_since = None
+                            failed_replan_while_blocked = 0
                             backup_attempts = 0
                             vx_sign_history.clear()
                         cmd = DriveCommand(0.0, 0.0, 0.0, False)
@@ -491,16 +545,7 @@ class NavSupervisor:
                             "cmd_vx_mps": cmd.vx,
                             "cmd_vtheta_rad_s": cmd.vtheta,
                         }
-                elif (
-                    self._backup_enabled
-                    and scan is not None
-                    and local_view is not None
-                    and progress.get("local_planner")
-                    and abs(cmd.vx) < 0.05
-                    and abs(cmd.vtheta) > 0.1
-                    and backup_attempts < self._backup_max_attempts
-                    and now >= backup_cooldown_until
-                ):
+                elif allow_backup:
                     if spin_stuck_since is None:
                         spin_stuck_since = now
                     elif now - spin_stuck_since >= self._backup_stuck_time_s:
@@ -538,21 +583,6 @@ class NavSupervisor:
                             spin_stuck_since = None
                 else:
                     spin_stuck_since = None
-
-                local_blocked = (
-                    local_view is not None
-                    and path_blocked_local(
-                        pose,
-                        path,
-                        local_view,
-                        cost_threshold=self._local_planner_activate_cost,
-                    )
-                )
-                if local_blocked:
-                    if local_blocked_since is None:
-                        local_blocked_since = now
-                else:
-                    local_blocked_since = None
 
                 if abs(cmd.vx) > 0.05:
                     sign = 1 if cmd.vx > 0 else -1
@@ -592,7 +622,6 @@ class NavSupervisor:
                 )
                 should_replan = replan_due and (
                     static_blocked
-                    or sustained_local
                     or (oscillating and local_blocked)
                     or backup_exhausted
                 )
@@ -603,6 +632,7 @@ class NavSupervisor:
                         last_replan = now
                         last_progress_at = now
                         local_blocked_since = None
+                        failed_replan_while_blocked = 0
                         backup_attempts = 0
                         vx_sign_history.clear()
                         spin_stuck_since = None

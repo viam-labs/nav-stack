@@ -273,7 +273,8 @@ def test_local_planner_prefers_reverse_when_blocked_ahead():
         robot_radius_m=0.08,
     )
     assert cmd is not None
-    assert cmd.vx < 0.0
+    # Path blocked ahead → reroute, not reverse; expect spin or stop.
+    assert cmd.vx <= 0.05
 
 
 def test_local_planner_avoids_marked_obstacle():

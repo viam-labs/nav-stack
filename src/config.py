@@ -255,14 +255,15 @@ class BuiltinNavConfig:
     local_planner_max_vel_x_reverse_m: float = 0.15
     # Nav2-style backup when local planner spins in place with clear rear space.
     backup_enabled: bool = True
-    backup_stuck_time_s: float = 1.5
-    backup_dist_m: float = 0.35
-    backup_speed_mps: float = 0.15
+    backup_stuck_time_s: float = 3.0
+    backup_dist_m: float = 0.30
+    backup_speed_mps: float = 0.12
     backup_rear_clear_m: float = 0.45
-    backup_max_attempts: int = 2
+    backup_max_attempts: int = 1
     backup_cooldown_s: float = 4.0
     # Replan when the local costmap sees the path ahead blocked (dynamic obstacles).
-    replan_local_blocked_time_s: float = 1.0
+    replan_local_blocked_time_s: float = 0.3
+    replan_local_min_period_s: float = 0.5
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":
@@ -293,15 +294,16 @@ class BuiltinNavConfig:
                 d.get("local_planner_max_vel_x_reverse_m", 0.15)
             ),
             backup_enabled=bool(d.get("backup_enabled", True)),
-            backup_stuck_time_s=float(d.get("backup_stuck_time_s", 1.5)),
-            backup_dist_m=float(d.get("backup_dist_m", 0.35)),
-            backup_speed_mps=float(d.get("backup_speed_mps", 0.15)),
+            backup_stuck_time_s=float(d.get("backup_stuck_time_s", 3.0)),
+            backup_dist_m=float(d.get("backup_dist_m", 0.30)),
+            backup_speed_mps=float(d.get("backup_speed_mps", 0.12)),
             backup_rear_clear_m=float(d.get("backup_rear_clear_m", 0.45)),
-            backup_max_attempts=int(d.get("backup_max_attempts", 2)),
+            backup_max_attempts=int(d.get("backup_max_attempts", 1)),
             backup_cooldown_s=float(d.get("backup_cooldown_s", 4.0)),
             replan_local_blocked_time_s=float(
-                d.get("replan_local_blocked_time_s", 1.0)
+                d.get("replan_local_blocked_time_s", 0.3)
             ),
+            replan_local_min_period_s=float(d.get("replan_local_min_period_s", 0.5)),
         )
 
 

@@ -49,13 +49,14 @@ class BuiltinNavigator:
         local_planner_activate_cost: int = 200,
         local_planner_max_vel_x_reverse_m: float = 0.15,
         backup_enabled: bool = True,
-        backup_stuck_time_s: float = 1.5,
-        backup_dist_m: float = 0.35,
-        backup_speed_mps: float = 0.15,
+        backup_stuck_time_s: float = 3.0,
+        backup_dist_m: float = 0.30,
+        backup_speed_mps: float = 0.12,
         backup_rear_clear_m: float = 0.45,
-        backup_max_attempts: int = 2,
+        backup_max_attempts: int = 1,
         backup_cooldown_s: float = 4.0,
-        replan_local_blocked_time_s: float = 1.0,
+        replan_local_blocked_time_s: float = 0.3,
+        replan_local_min_period_s: float = 0.5,
         logger=None,
     ):
         self._world = world
@@ -98,6 +99,7 @@ class BuiltinNavigator:
             backup_max_attempts=backup_max_attempts,
             backup_cooldown_s=backup_cooldown_s,
             replan_local_blocked_time_s=replan_local_blocked_time_s,
+            replan_local_min_period_s=replan_local_min_period_s,
         )
         self._lock = threading.Lock()
         self._worker: Optional[threading.Thread] = None

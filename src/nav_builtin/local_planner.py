@@ -158,6 +158,9 @@ def compute_local_command(
             vx = 0.0
         else:
             vx = -max_reverse + (max_vel_x + max_reverse) * i / (n_vx - 1)
+        # When the path ahead is blocked, reroute — don't creep backward here.
+        if path_blocked_ahead and vx < -1e-3:
+            continue
         for j in range(n_vt):
             vtheta = -max_vel_theta + (2.0 * max_vel_theta) * j / (n_vt - 1)
             rollout = _simulate(
