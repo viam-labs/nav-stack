@@ -43,7 +43,7 @@ class BuiltinNavigator:
         local_costmap_width_m: float = 4.0,
         local_costmap_height_m: float = 4.0,
         local_costmap_resolution: float = 0.05,
-        local_inflation_radius_m: float = 0.4,
+        local_inflation_radius_m: float = 0.25,
         local_planner_enabled: bool = True,
         local_planner_sim_time_s: float = 1.2,
         local_planner_activate_cost: int = 200,

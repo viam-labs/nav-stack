@@ -248,7 +248,7 @@ class BuiltinNavConfig:
     local_costmap_width_m: float = 4.0
     local_costmap_height_m: float = 4.0
     local_costmap_resolution: float = 0.05
-    local_inflation_radius_m: float = 0.4
+    local_inflation_radius_m: float = 0.25
     local_planner_enabled: bool = True
     local_planner_sim_time_s: float = 1.5
     local_planner_activate_cost: int = 200
@@ -274,7 +274,7 @@ class BuiltinNavConfig:
             local_costmap_width_m=float(d.get("local_costmap_width_m", 4.0)),
             local_costmap_height_m=float(d.get("local_costmap_height_m", 4.0)),
             local_costmap_resolution=float(d.get("local_costmap_resolution", 0.05)),
-            local_inflation_radius_m=float(d.get("local_inflation_radius_m", 0.4)),
+            local_inflation_radius_m=float(d.get("local_inflation_radius_m", 0.25)),
             local_planner_enabled=bool(d.get("local_planner_enabled", True)),
             local_planner_sim_time_s=float(d.get("local_planner_sim_time_s", 1.5)),
             local_planner_activate_cost=int(d.get("local_planner_activate_cost", 200)),
