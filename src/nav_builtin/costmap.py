@@ -51,10 +51,10 @@ def build_costmap(
 ) -> np.ndarray:
     """Return (H, W) uint8 costmap.
 
-    Occupied / unknown cells become lethal. Free cells near obstacles get
-    exponentially decaying cost within ``inflation_radius_m``. Cells inside
-    ``robot_radius_m`` of a lethal cell are marked inscribed (treated as blocked
-    by the planner).
+    Occupied / unknown cells become lethal. Cells within
+    ``max(inflation_radius_m, robot_radius_m)`` of a lethal cell are marked
+    inscribed (non-traversable for global planning). ``robot_radius_m`` is
+    still used for footprint collision checks in the local planner.
     """
     h, w = occ.height, occ.width
     costs = np.full((h, w), FREE, dtype=np.uint8)
@@ -65,9 +65,15 @@ def build_costmap(
     costs[raw < 0] = UNKNOWN  # unknown stays unknown; planner treats as lethal
 
     res = max(float(occ.resolution), 1e-6)
-    inflate_cells = max(0, int(math.ceil(inflation_radius_m / res)))
-    inscribed_cells = max(0, int(math.ceil(robot_radius_m / res)))
-    if inflate_cells == 0 and inscribed_cells == 0:
+    # Full inflation radius is hard-blocked for planning (Lazy Theta* treats
+    # soft costs as free and would shortcut through a partial halo).
+    clearance_m = max(float(inflation_radius_m), float(robot_radius_m))
+    inscribed_cells = max(0, int(math.ceil(clearance_m / res)))
+    inflate_cells = max(
+        inscribed_cells,
+        max(0, int(math.ceil(float(inflation_radius_m) / res))),
+    )
+    if inscribed_cells == 0 and inflate_cells == 0:
         return costs
 
     # Seed from occupied (not unknown-only) so unknown voids don't inflate.

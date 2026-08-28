@@ -965,7 +965,7 @@ class NavConfig:
     max_vel_theta: float = 1.5  # rad/s
     acc_lim_x: float = 1.0
     acc_lim_theta: float = 2.0
-    inflation_radius: float = 0.55
+    inflation_radius: float = 0.25
     cmd_vel_timeout: float = 2.0  # seconds (watchdog)
     # Reactive obstacle avoidance for simple (non-Nav2) go_to_* motion.
     simple_avoid_obstacles: bool = True
@@ -1006,7 +1006,7 @@ class NavConfig:
             max_vel_theta=float(d.get("max_vel_theta", 1.5)),
             acc_lim_x=float(d.get("acc_lim_x", 1.0)),
             acc_lim_theta=float(d.get("acc_lim_theta", 2.0)),
-            inflation_radius=float(d.get("inflation_radius", 0.55)),
+            inflation_radius=float(d.get("inflation_radius", 0.25)),
             cmd_vel_timeout=float(d.get("cmd_vel_timeout", 2.0)),
             simple_avoid_obstacles=bool(d.get("simple_avoid_obstacles", True)),
             simple_stop_distance=float(d.get("simple_stop_distance", 0.4)),

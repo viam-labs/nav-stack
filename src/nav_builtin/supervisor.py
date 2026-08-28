@@ -23,7 +23,7 @@ class NavSupervisor:
         self,
         world: WorldIO,
         *,
-        inflation_radius_m: float = 0.55,
+        inflation_radius_m: float = 0.25,
         robot_radius_m: float = 0.22,
         cost_scaling_factor: float = 4.0,
         algorithm: str = "lazy_theta_star",

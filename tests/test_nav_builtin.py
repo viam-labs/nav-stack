@@ -83,6 +83,29 @@ def test_costmap_viz_dict_shows_inflation_gradient():
     assert d["resolution"] == 0.05
 
 
+def test_plan_respects_inflation_radius():
+    """Lazy Theta* must not shortcut through the soft inflation halo."""
+    grid = np.zeros((40, 40), dtype=np.int16)
+    grid[20, 20] = 100  # pillar at map center
+    m = {"grid": grid, "resolution": 0.1, "origin_x": 0.0, "origin_y": 0.0}
+    start = Pose2D(0.5, 2.0, 0.0)
+    goal = Pose2D(3.5, 2.0, 0.0)
+    occ = OccupancyGrid(
+        grid=grid, resolution=0.1, origin_x=0.0, origin_y=0.0
+    )
+    costs = build_costmap(
+        occ, inflation_radius_m=0.35, robot_radius_m=0.05, cost_scaling_factor=3.0
+    )
+    # With the fix, 0.35 m halo is inscribed — path cannot pass through x≈2, y≈2.
+    result = plan_on_costmap(
+        occ, costs, start, goal, algorithm="lazy_theta_star"
+    )
+    assert result.feasible
+    for x, y in result.path.points:
+        r, c = occ.world_to_cell(x, y)
+        assert is_traversable(int(costs[r, c]))
+
+
 def test_plan_straight_line_on_empty_map():
     m = _empty_map()
     start = Pose2D(0.25, 0.25, 0.0)
@@ -92,8 +115,8 @@ def test_plan_straight_line_on_empty_map():
     )
     assert result.feasible
     assert len(result.path.points) >= 2
-    assert result.path.points[0][0] == pytest.approx(start.x)
-    assert result.path.points[-1][0] == pytest.approx(goal.x)
+    assert result.path.points[0][0] == pytest.approx(start.x, abs=0.15)
+    assert result.path.points[-1][0] == pytest.approx(goal.x, abs=0.15)
     preview = result.to_preview_dict(goal=(goal.x, goal.y, goal.theta), start=start)
     assert preview["feasible"] is True
     assert preview["point_count"] >= 2

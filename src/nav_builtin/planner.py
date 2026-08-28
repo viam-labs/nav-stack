@@ -332,11 +332,15 @@ def plan_on_costmap(
 
     cells = _simplify(cells)
     world = tuple(occ.cell_to_world(r, c) for r, c in cells)
-    # Ensure exact start/goal endpoints for the controller.
+    # Keep endpoints on snapped free cells so exact poses don't pull the path
+    # through the inflation halo.
     if world:
-        world = ((start.x, start.y),) + world[1:-1] + ((goal.x, goal.y),)
-        if len(world) < 2:
-            world = ((start.x, start.y), (goal.x, goal.y))
+        start_xy = occ.cell_to_world(start_cell[0], start_cell[1])
+        goal_xy = occ.cell_to_world(goal_cell[0], goal_cell[1])
+        if len(world) >= 2:
+            world = (start_xy,) + world[1:-1] + (goal_xy,)
+        else:
+            world = (start_xy, goal_xy)
 
     return PlanResult(
         feasible=True,
