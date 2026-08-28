@@ -960,9 +960,9 @@ class NavConfig:
     base: str
     kinematics: str = DIFFERENTIAL
     robot_radius: float = 0.22  # meters
-    max_vel_x: float = 0.4  # m/s
+    max_vel_x: float = 0.6  # m/s
     max_vel_y: float = 0.0  # m/s (omni only)
-    max_vel_theta: float = 1.0  # rad/s
+    max_vel_theta: float = 1.5  # rad/s
     acc_lim_x: float = 1.0
     acc_lim_theta: float = 2.0
     inflation_radius: float = 0.55
@@ -1001,9 +1001,9 @@ class NavConfig:
             base=d["base"],
             kinematics=kinematics,
             robot_radius=float(d.get("robot_radius", 0.22)),
-            max_vel_x=float(d.get("max_vel_x", 0.4)),
+            max_vel_x=float(d.get("max_vel_x", 0.6)),
             max_vel_y=float(d.get("max_vel_y", 0.0)),
-            max_vel_theta=float(d.get("max_vel_theta", 1.0)),
+            max_vel_theta=float(d.get("max_vel_theta", 1.5)),
             acc_lim_x=float(d.get("acc_lim_x", 1.0)),
             acc_lim_theta=float(d.get("acc_lim_theta", 2.0)),
             inflation_radius=float(d.get("inflation_radius", 0.55)),

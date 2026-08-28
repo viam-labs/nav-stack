@@ -605,10 +605,10 @@ def test_diffdrive_small_base_profile():
     assert fp["use_rotate_to_heading"] is True
     assert fp["allow_reversing"] is False
     # Yaw slew must track RPP demand (4 * max_vel_theta), in RPP and smoother.
-    assert fp["max_angular_accel"] == 4.0
+    assert fp["max_angular_accel"] == 6.0
     vs = params["velocity_smoother"]["ros__parameters"]
-    assert vs["max_accel"] == [1.0, 0.0, 4.0]
-    assert vs["max_decel"] == [-1.5, 0.0, -6.0]
+    assert vs["max_accel"] == [1.0, 0.0, 6.0]
+    assert vs["max_decel"] == [-1.5, 0.0, -9.0]
 
 
 def test_diffdrive_user_followpath_overrides_survive():
