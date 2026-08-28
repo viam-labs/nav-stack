@@ -202,3 +202,77 @@ def nearest_free_cell(
                 if 0 <= yy < h and 0 <= xx < w and is_traversable(int(costs[yy, xx])):
                     return yy, xx
     return None
+
+
+def footprint_max_cost(
+    costs: np.ndarray,
+    occ: OccupancyGrid,
+    x_m: float,
+    y_m: float,
+    *,
+    robot_radius_m: float,
+) -> int:
+    """Maximum layered cost under a circular robot footprint."""
+    res = occ.resolution
+    cells = max(1, int(math.ceil(float(robot_radius_m) / res)))
+    row, col = occ.world_to_cell(x_m, y_m)
+    h, w = costs.shape
+    r2 = cells * cells
+    worst = FREE
+    for dy in range(-cells, cells + 1):
+        for dx in range(-cells, cells + 1):
+            if dx * dx + dy * dy > r2:
+                continue
+            rr, cc = row + dy, col + dx
+            if not (0 <= rr < h and 0 <= cc < w):
+                return LETHAL
+            worst = max(worst, int(costs[rr, cc]))
+    return worst
+
+
+def footprint_traversable(
+    costs: np.ndarray,
+    occ: OccupancyGrid,
+    x_m: float,
+    y_m: float,
+    *,
+    robot_radius_m: float,
+) -> bool:
+    """True when the full robot disk at ``(x_m, y_m)`` is traversable."""
+    return is_traversable(
+        footprint_max_cost(
+            costs, occ, x_m, y_m, robot_radius_m=robot_radius_m
+        )
+    )
+
+
+def nearest_free_pose(
+    costs: np.ndarray,
+    occ: OccupancyGrid,
+    x_m: float,
+    y_m: float,
+    *,
+    robot_radius_m: float,
+    max_radius_cells: int = 40,
+) -> Optional[Tuple[float, float]]:
+    """Find a nearby pose whose full footprint is traversable."""
+    if footprint_traversable(
+        costs, occ, x_m, y_m, robot_radius_m=robot_radius_m
+    ):
+        return x_m, y_m
+    row, col = occ.world_to_cell(x_m, y_m)
+    h, w = costs.shape
+    for r in range(1, max_radius_cells + 1):
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if max(abs(dy), abs(dx)) != r:
+                    continue
+                yy, xx = row + dy, col + dx
+                if not (0 <= yy < h and 0 <= xx < w):
+                    continue
+                wx, wy = occ.cell_to_world(yy, xx)
+                if footprint_traversable(
+                    costs, occ, wx, wy, robot_radius_m=robot_radius_m
+                ):
+                    return wx, wy
+    return None

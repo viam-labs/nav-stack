@@ -22,7 +22,7 @@ from .local_costmap import (
     reverse_backup_feasible,
 )
 from .local_planner import LocalPlannerConfig
-from .planner import path_blocked, plan_path
+from .planner import path_blocked, plan_path, connect_plan_start
 from .smoother import smooth_plan_path
 from .types import NavStatus, PlanResult, Pose2D
 from .world_io import WorldIO
@@ -201,6 +201,17 @@ class NavSupervisor:
             cost_scaling_factor=self._cost_scaling,
             algorithm=self._algorithm,
         )
+        if result.feasible:
+            result = connect_plan_start(
+                map_data,
+                pose,
+                result,
+                inflation_radius_m=self._inflation,
+                robot_radius_m=self._robot_radius,
+                cost_scaling_factor=self._cost_scaling,
+                algorithm=self._algorithm,
+                xy_tolerance_m=self._follower.motion.xy_tolerance_m,
+            )
         if result.feasible and self._smooth_path:
             smoothed = smooth_plan_path(
                 result.path,

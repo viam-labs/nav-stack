@@ -7,9 +7,15 @@ import numpy as np
 import pytest
 
 from src.nav_builtin.controller import FollowerConfig, compute_path_command, lookahead_pose
-from src.nav_builtin.costmap import LETHAL, build_costmap, is_traversable
+from src.nav_builtin.costmap import (
+    LETHAL,
+    build_costmap,
+    footprint_traversable,
+    is_traversable,
+    nearest_free_pose,
+)
 from src.nav_builtin.navigator import BuiltinNavigator
-from src.nav_builtin.planner import plan_on_costmap, plan_path
+from src.nav_builtin.planner import connect_plan_start, plan_on_costmap, plan_path
 from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
 from src.ros import conversions as conv
 
@@ -36,6 +42,57 @@ def _wall_map() -> dict:
         "origin_x": 0.0,
         "origin_y": 0.0,
     }
+
+
+def test_nearest_free_pose_requires_clear_footprint():
+    grid = np.zeros((40, 40), dtype=np.int16)
+    grid[20, 20] = 100
+    occ = OccupancyGrid(grid=grid, resolution=0.1, origin_x=0.0, origin_y=0.0)
+    costs = build_costmap(
+        occ, inflation_radius_m=0.25, robot_radius_m=0.22, cost_scaling_factor=4.0
+    )
+    # Center cell is lethal; center point overlaps inscribed halo at r=0.22 m.
+    assert not footprint_traversable(
+        costs, occ, 2.05, 2.05, robot_radius_m=0.22
+    )
+    free = nearest_free_pose(
+        costs, occ, 2.05, 2.05, robot_radius_m=0.22, max_radius_cells=12
+    )
+    assert free is not None
+    assert footprint_traversable(
+        costs, occ, free[0], free[1], robot_radius_m=0.22
+    )
+
+
+def test_connect_plan_start_prepends_escape_from_blocked_pose():
+    m = _empty_map(size=60, resolution=0.05)
+    grid = m["grid"]
+    grid[30, 30] = 100
+    start = Pose2D(1.52, 1.52, 0.0)  # inside pillar inflation
+    goal = Pose2D(2.5, 1.52, 0.0)
+    main = plan_path(
+        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert main.feasible
+    connected = connect_plan_start(
+        m,
+        start,
+        main,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+    )
+    assert connected.feasible
+    assert len(connected.path.points) >= len(main.path.points)
+    occ = OccupancyGrid(
+        grid=grid, resolution=0.05, origin_x=0.0, origin_y=0.0
+    )
+    costs = build_costmap(
+        occ, inflation_radius_m=0.25, robot_radius_m=0.22, cost_scaling_factor=4.0
+    )
+    sx, sy = connected.path.points[0]
+    assert footprint_traversable(
+        costs, occ, sx, sy, robot_radius_m=0.22
+    )
 
 
 def test_build_costmap_inflates_obstacles():

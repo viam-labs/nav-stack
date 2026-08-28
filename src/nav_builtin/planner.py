@@ -12,8 +12,10 @@ from .costmap import (
     INSCRIBED,
     build_costmap,
     costmap_viz_dict,
+    footprint_traversable,
     is_traversable,
     nearest_free_cell,
+    nearest_free_pose,
     occupancy_from_bridge_map,
 )
 from .types import OccupancyGrid, Path2D, PlanResult, Pose2D
@@ -281,6 +283,76 @@ def _search(algorithm: str) -> Callable[[np.ndarray, Cell, Cell], Optional[List[
     return _astar
 
 
+def _merge_path_prefix(prefix: Path2D, main: Path2D) -> Path2D:
+    """Join two paths, dropping a duplicate junction point when they meet."""
+    pp = prefix.points
+    mp = main.points
+    if not pp:
+        return main
+    if not mp:
+        return prefix
+    if math.hypot(pp[-1][0] - mp[0][0], pp[-1][1] - mp[0][1]) <= 1e-3:
+        merged = pp[:-1] + mp
+    else:
+        merged = pp + mp
+    return Path2D(points=merged, goal_theta=main.goal_theta)
+
+
+def connect_plan_start(
+    map_data: dict,
+    pose: Pose2D,
+    result: PlanResult,
+    *,
+    inflation_radius_m: float,
+    robot_radius_m: float,
+    cost_scaling_factor: float = 4.0,
+    algorithm: str = DEFAULT_PLANNER,
+    xy_tolerance_m: float = 0.15,
+) -> PlanResult:
+    """Prepend a feasible segment when the robot cannot reach ``path[0]`` safely."""
+    if not result.feasible or result.path.empty:
+        return result
+    try:
+        occ = occupancy_from_bridge_map(map_data)
+    except (KeyError, TypeError, ValueError) as exc:
+        return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
+    costs = build_costmap(
+        occ,
+        inflation_radius_m=inflation_radius_m,
+        robot_radius_m=robot_radius_m,
+        cost_scaling_factor=cost_scaling_factor,
+    )
+    sx, sy = result.path.points[0]
+    at_start = math.hypot(pose.x - sx, pose.y - sy) <= xy_tolerance_m
+    if at_start and footprint_traversable(
+        costs, occ, pose.x, pose.y, robot_radius_m=robot_radius_m
+    ):
+        return result
+    bridge = plan_path(
+        map_data,
+        pose,
+        Pose2D(sx, sy, pose.theta),
+        inflation_radius_m=inflation_radius_m,
+        robot_radius_m=robot_radius_m,
+        cost_scaling_factor=cost_scaling_factor,
+        algorithm=algorithm,
+    )
+    if not bridge.feasible:
+        return PlanResult(
+            feasible=False,
+            error_code=8,
+            error_msg="cannot reach plan start from current pose",
+        )
+    merged = _merge_path_prefix(bridge.path, result.path)
+    out = PlanResult(
+        feasible=True,
+        path=merged,
+        planning_time_s=result.planning_time_s + bridge.planning_time_s,
+        costmap_viz=result.costmap_viz,
+    )
+    return out
+
+
 def plan_on_costmap(
     occ: OccupancyGrid,
     costs: np.ndarray,
@@ -288,14 +360,62 @@ def plan_on_costmap(
     goal: Pose2D,
     *,
     snap_radius_cells: int = 40,
+    robot_radius_m: float = 0.22,
     algorithm: str = DEFAULT_PLANNER,
 ) -> PlanResult:
     t0 = time.perf_counter()
-    sr, sc = occ.world_to_cell(start.x, start.y)
-    gr, gc = occ.world_to_cell(goal.x, goal.y)
-
-    start_cell = nearest_free_cell(costs, sr, sc, max_radius_cells=snap_radius_cells)
-    goal_cell = nearest_free_cell(costs, gr, gc, max_radius_cells=snap_radius_cells)
+    if robot_radius_m > 0.0:
+        start_xy = nearest_free_pose(
+            costs,
+            occ,
+            start.x,
+            start.y,
+            robot_radius_m=robot_radius_m,
+            max_radius_cells=snap_radius_cells,
+        )
+        goal_xy = nearest_free_pose(
+            costs,
+            occ,
+            goal.x,
+            goal.y,
+            robot_radius_m=robot_radius_m,
+            max_radius_cells=snap_radius_cells,
+        )
+        if start_xy is None:
+            return PlanResult(
+                feasible=False,
+                error_code=1,
+                error_msg="start pose is in lethal / unknown space",
+                planning_time_s=time.perf_counter() - t0,
+            )
+        if goal_xy is None:
+            return PlanResult(
+                feasible=False,
+                error_code=2,
+                error_msg="goal pose is in lethal / unknown space",
+                planning_time_s=time.perf_counter() - t0,
+            )
+        start_cell = occ.world_to_cell(start_xy[0], start_xy[1])
+        goal_cell = occ.world_to_cell(goal_xy[0], goal_xy[1])
+    else:
+        sr, sc = occ.world_to_cell(start.x, start.y)
+        gr, gc = occ.world_to_cell(goal.x, goal.y)
+        start_cell = nearest_free_cell(
+            costs, sr, sc, max_radius_cells=snap_radius_cells
+        )
+        goal_cell = nearest_free_cell(
+            costs, gr, gc, max_radius_cells=snap_radius_cells
+        )
+        start_xy = (
+            occ.cell_to_world(start_cell[0], start_cell[1])
+            if start_cell is not None
+            else None
+        )
+        goal_xy = (
+            occ.cell_to_world(goal_cell[0], goal_cell[1])
+            if goal_cell is not None
+            else None
+        )
     if start_cell is None:
         return PlanResult(
             feasible=False,
@@ -334,9 +454,7 @@ def plan_on_costmap(
     world = tuple(occ.cell_to_world(r, c) for r, c in cells)
     # Keep endpoints on snapped free cells so exact poses don't pull the path
     # through the inflation halo.
-    if world:
-        start_xy = occ.cell_to_world(start_cell[0], start_cell[1])
-        goal_xy = occ.cell_to_world(goal_cell[0], goal_cell[1])
+    if world and start_xy is not None and goal_xy is not None:
         if len(world) >= 2:
             world = (start_xy,) + world[1:-1] + (goal_xy,)
         else:
@@ -374,7 +492,9 @@ def plan_path(
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
     )
-    result = plan_on_costmap(occ, costs, start, goal, algorithm=algorithm)
+    result = plan_on_costmap(
+        occ, costs, start, goal, algorithm=algorithm, robot_radius_m=robot_radius_m
+    )
     result.costmap_viz = costmap_viz_dict(occ, costs)
     return result
 
