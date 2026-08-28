@@ -114,6 +114,63 @@ def map_pose_to_odom_pose(map_pose: Pose2D, map_to_odom: Pose2D) -> Pose2D:
     return compose_poses(invert_pose(map_to_odom), map_pose)
 
 
+def costmap_frame_to_map(cm: dict, frame_to_map: Pose2D) -> dict:
+    """Re-rasterize an axis-aligned occupancy grid into the map frame.
+
+    ``frame_to_map`` is the transform from the costmap's source frame (e.g.
+    odom for Nav2 ``local_costmap``) into map: ``map_xy = frame_to_map ∘ src_xy``.
+    """
+    grid = np.asarray(cm["grid"])
+    if grid.ndim != 2 or grid.size == 0:
+        return cm
+    res = float(cm["resolution"])
+    ox, oy = float(cm["origin_x"]), float(cm["origin_y"])
+    h, w = grid.shape
+
+    map_xs: list[float] = []
+    map_ys: list[float] = []
+    cells: list[tuple[int, int, int]] = []
+    for row in range(h):
+        for col in range(w):
+            val = int(grid[row, col])
+            if val < 0:
+                continue
+            fx = ox + (col + 0.5) * res
+            fy = oy + (row + 0.5) * res
+            mp = compose_poses(frame_to_map, Pose2D(fx, fy, 0.0))
+            map_xs.append(mp.x)
+            map_ys.append(mp.y)
+            cells.append((row, col, val))
+
+    if not cells:
+        return cm
+
+    min_x = min(map_xs) - res
+    min_y = min(map_ys) - res
+    max_x = max(map_xs) + res
+    max_y = max(map_ys) + res
+    out_w = max(1, int(math.ceil((max_x - min_x) / res)))
+    out_h = max(1, int(math.ceil((max_y - min_y) / res)))
+    out = np.full((out_h, out_w), -1, dtype=np.int16)
+
+    for row, col, val in cells:
+        fx = ox + (col + 0.5) * res
+        fy = oy + (row + 0.5) * res
+        mp = compose_poses(frame_to_map, Pose2D(fx, fy, 0.0))
+        oc = int((mp.x - min_x) / res)
+        orow = int((mp.y - min_y) / res)
+        if 0 <= orow < out_h and 0 <= oc < out_w:
+            prev = int(out[orow, oc])
+            out[orow, oc] = val if prev < 0 else max(prev, val)
+
+    return {
+        "grid": out,
+        "resolution": res,
+        "origin_x": min_x,
+        "origin_y": min_y,
+    }
+
+
 @dataclass(frozen=True)
 class OdomReading:
     """Body-frame twist plus optional pose/heading hints from the sensor."""

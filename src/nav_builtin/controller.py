@@ -190,12 +190,16 @@ def compute_path_command(
     near_goal = distance_m(
         current, Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
     ) <= (cfg.motion.xy_tolerance_m * 2.0)
+    bearing = heading_error_rad(
+        current.theta, math.atan2(target.y - current.y, target.x - current.x)
+    )
 
     local_active = False
     if (
         local_view is not None
         and local_planner is not None
         and not near_goal
+        and abs(bearing) <= cfg.rotate_in_place_rad
     ):
         local_cmd = compute_local_command(
             current,
@@ -212,8 +216,6 @@ def compute_path_command(
             cmd = local_cmd
             cmd = apply_velocity_floor(cmd, cfg.motion)
             local_active = True
-        else:
-            local_cmd = None
 
     if not local_active:
         if is_final or near_goal:
@@ -249,9 +251,7 @@ def compute_path_command(
         "path_length_m": _path_length(path),
         "obstacle": obstacle_state,
         "forward_clearance_m": None if math.isinf(forward_clearance) else forward_clearance,
-        "bearing_error_rad": heading_error_rad(
-            current.theta, math.atan2(target.y - current.y, target.x - current.x)
-        ),
+        "bearing_error_rad": bearing,
         "cmd_vx_mps": cmd.vx,
         "cmd_vy_mps": cmd.vy,
         "cmd_vtheta_rad_s": cmd.vtheta,

@@ -94,6 +94,23 @@ class BridgeWorldIO:
         with getattr(node, "_viz_lock", self._viz_lock):
             node._viz_global_costmap = cm  # noqa: SLF001
 
+    def set_viz_local_costmap(self, costmap: dict) -> None:
+        """Publish the rolling local costmap for operator UIs."""
+        node = self._get_node()
+        if node is None or not costmap:
+            return
+        grid = costmap.get("grid")
+        if grid is None:
+            return
+        cm = {
+            "grid": np.asarray(grid),
+            "resolution": float(costmap["resolution"]),
+            "origin_x": float(costmap["origin_x"]),
+            "origin_y": float(costmap["origin_y"]),
+        }
+        with getattr(node, "_viz_lock", self._viz_lock):
+            node._viz_local_costmap = cm  # noqa: SLF001
+
 
 # Explicit Protocol satisfaction for type checkers.
 def _check_protocol() -> None:

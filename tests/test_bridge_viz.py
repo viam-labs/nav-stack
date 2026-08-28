@@ -54,6 +54,7 @@ def _viz_stub():
         _viz_local_plan=(),
         _viz_plan_history=deque(maxlen=8),
         _viz_global_costmap=None,
+        _viz_local_costmap=None,
         _viz_footprint=(),
         _viz_goal=None,
         _latest_map=None,
@@ -114,6 +115,7 @@ def test_viz_snapshot_shape():
     snap = BridgeNode.viz_snapshot(b)
     assert set(snap) == {
         "costmap",
+        "local_costmap",
         "map",
         "global_plan",
         "plan_history",

@@ -340,6 +340,15 @@ class NavSupervisor:
                     )
                     self._local_view_cache = local_view
                     self._local_view_at = now
+                    if self._local_costmap_enabled:
+                        from .costmap import local_view_viz_dict
+
+                        try:
+                            self._world.set_viz_local_costmap(
+                                local_view_viz_dict(local_view)
+                            )
+                        except Exception:  # noqa: BLE001 - viz is best-effort
+                            pass
 
                 cmd, progress = compute_path_command(
                     pose,

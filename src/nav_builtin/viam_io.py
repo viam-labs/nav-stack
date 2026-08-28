@@ -389,6 +389,11 @@ class ViamWorldIO:
             return
         self._viz.set_costmap(costmap)
 
+    def set_viz_local_costmap(self, costmap: dict) -> None:
+        if self._viz is None:
+            return
+        self._viz.set_local_costmap(costmap)
+
 
 def _sanitize_base_cmd(
     vx: float, vy: float, vtheta: float

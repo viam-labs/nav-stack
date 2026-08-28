@@ -825,9 +825,8 @@ class NavServiceBase(Motion):
 
         if cmd == "get_costmap":
             # Inflated costmap for operator UIs (nav-stack-ui Costmap toggle).
-            # Nav2 backend: prefer /global_costmap/costmap, else /map.
-            # Builtin backend: build the same inflation the planner uses from map
-            # so the UI is not stuck on an un-inflated occupancy grid.
+            # ``layer``: ``auto`` (local while navigating, else global), ``local``,
+            # or ``global``. Nav2 local costmap is reprojected from odom → map.
             from ..runtime import get_nav_view
 
             view = get_nav_view(self.name)
@@ -835,9 +834,14 @@ class NavServiceBase(Motion):
                 return {"available": False, "reason": "viz_unavailable"}
 
             cfg = self._require_cfg()
+            layer_req = str(command.get("layer", "auto")).lower()
+            if layer_req not in ("local", "global", "auto"):
+                layer_req = "auto"
 
             def _fetch():
                 import time as _time
+
+                from ..ros.conversions import costmap_frame_to_map
 
                 if hasattr(view, "enable_viz"):
                     view.enable_viz(8)
@@ -846,15 +850,40 @@ class NavServiceBase(Motion):
                     if hasattr(view, "viz_snapshot")
                     else view.snapshot()
                 )
-                cm = snap.get("costmap")
-                if cfg.uses_builtin_nav():
+
+                nav_active = False
+                try:
+                    nav_active = bool(runtime.manager.nav_status().get("active"))
+                except Exception:  # noqa: BLE001
+                    pass
+                use_local = layer_req == "local" or (
+                    layer_req == "auto" and nav_active
+                )
+                layer_used = "global"
+                cm = None
+
+                if use_local:
+                    local_cm = snap.get("local_costmap")
+                    if local_cm is not None and local_cm.get("grid") is not None:
+                        if not cfg.uses_builtin_nav() and hasattr(
+                            view, "_lookup_map_to_odom"
+                        ):
+                            m2o = view._lookup_map_to_odom()
+                            if m2o is not None:
+                                local_cm = costmap_frame_to_map(local_cm, m2o)
+                        cm = local_cm
+                        layer_used = "local"
+
+                if cm is None:
+                    cm = snap.get("costmap")
+                if cfg.uses_builtin_nav() and layer_used == "global":
                     now = _time.monotonic()
                     cached = self._builtin_costmap_cache
                     if (
                         cached is not None
                         and now - self._builtin_costmap_cache_at < 1.0
                     ):
-                        return cached
+                        return cached, layer_used
                     mp = snap.get("map")
                     if mp is None and hasattr(view, "get_map"):
                         mp = view.get_map()
@@ -903,9 +932,9 @@ class NavServiceBase(Motion):
                             pass
                 if cm is None:
                     cm = snap.get("map")
-                return cm
+                return cm, layer_used
 
-            cm = await asyncio.to_thread(_fetch)
+            cm, layer_used = await asyncio.to_thread(_fetch)
             if not cm or cm.get("grid") is None:
                 return {"available": False, "reason": "no_costmap"}
 
@@ -924,6 +953,7 @@ class NavServiceBase(Motion):
             u8 = np.where(grid < 0, 255, np.clip(grid, 0, 100)).astype(np.uint8)
             return {
                 "available": True,
+                "layer": layer_used,
                 "origin_x": float(cm["origin_x"]),
                 "origin_y": float(cm["origin_y"]),
                 "resolution": resolution,

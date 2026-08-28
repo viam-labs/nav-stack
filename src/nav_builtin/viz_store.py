@@ -16,6 +16,7 @@ class NavVizStore:
         self._lock = threading.Lock()
         self._map: Optional[dict] = None
         self._costmap: Optional[dict] = None
+        self._local_costmap: Optional[dict] = None
         self._global_plan: tuple = ()
         self._plan_history: list = []
         self._local_plan: tuple = ()
@@ -48,6 +49,18 @@ class NavVizStore:
                 self._costmap = None
                 return
             self._costmap = {
+                "grid": np.asarray(costmap["grid"]),
+                "resolution": float(costmap["resolution"]),
+                "origin_x": float(costmap["origin_x"]),
+                "origin_y": float(costmap["origin_y"]),
+            }
+
+    def set_local_costmap(self, costmap: Optional[dict]) -> None:
+        with self._lock:
+            if costmap is None:
+                self._local_costmap = None
+                return
+            self._local_costmap = {
                 "grid": np.asarray(costmap["grid"]),
                 "resolution": float(costmap["resolution"]),
                 "origin_x": float(costmap["origin_x"]),
@@ -91,6 +104,16 @@ class NavVizStore:
                         "origin_y": self._costmap["origin_y"],
                     }
                     if self._costmap is not None
+                    else None
+                ),
+                "local_costmap": (
+                    {
+                        "grid": self._local_costmap["grid"],
+                        "resolution": self._local_costmap["resolution"],
+                        "origin_x": self._local_costmap["origin_x"],
+                        "origin_y": self._local_costmap["origin_y"],
+                    }
+                    if self._local_costmap is not None
                     else None
                 ),
                 "map": self._map,

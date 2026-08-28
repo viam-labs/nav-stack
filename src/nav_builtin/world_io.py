@@ -41,3 +41,7 @@ class WorldIO(Protocol):
     def set_viz_costmap(self, costmap: dict) -> None:
         """Optional inflated costmap for nav-camera; default no-op."""
         return None
+
+    def set_viz_local_costmap(self, costmap: dict) -> None:
+        """Optional rolling local costmap for operator UIs; default no-op."""
+        return None

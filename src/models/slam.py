@@ -222,14 +222,16 @@ class RosSlam(SLAM):
         """Restart mode-gated background tasks after a runtime mode switch.
 
         ``start_mapping`` / ``start_localizing`` change ``cfg.mode`` outside
-        reconfigure; without this, e.g. periodic relocalize would never start
-        after switching to localizing.
+        reconfigure; without this, e.g. periodic relocalize / startup
+        global_localize would never start after switching to localizing.
         """
         loop = asyncio.get_event_loop()
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
+        self._cancel_startup_global_localize_task()
         self._schedule_periodic_relocalize(loop)
         self._schedule_mapping_revisit(loop)
+        self._schedule_startup_global_localize(loop)
 
     def _schedule_mapping_revisit(self, loop: asyncio.AbstractEventLoop) -> None:
         cfg = self._cfg
@@ -1004,6 +1006,11 @@ class RosSlam(SLAM):
         post_apply_refine_options = dict(
             cfg.global_localize_on_start_post_apply_refine_options
         )
+        LOGGER.info(
+            "scheduling startup global_localize (full_map=%s delay=%.1fs)",
+            options.get("full_map", True),
+            delay_s,
+        )
         self._startup_global_localize_task = loop.create_task(
             self._run_startup_global_localize(
                 options,
@@ -1075,16 +1082,24 @@ class RosSlam(SLAM):
         if mgr is None:
             return True
         deadline = time.monotonic() + timeout_s
+        last_log = 0.0
         while time.monotonic() < deadline:
             try:
                 if mgr.slam_running():
                     await self._read_merged_scan()  # raises when no returns yet
                     self._load_active_occupancy_map("auto")
+                    LOGGER.info("startup global_localize readiness: slam+scan+map ok")
                     return True
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - not ready yet; keep polling
-                pass
+            except Exception as exc:  # noqa: BLE001 - not ready yet; keep polling
+                now = time.monotonic()
+                if now - last_log >= 10.0:
+                    LOGGER.info(
+                        "startup global_localize waiting for readiness: %s",
+                        exc,
+                    )
+                    last_log = now
             await asyncio.sleep(poll_interval_s)
         if timeout_s > 0.0:
             LOGGER.warning(

@@ -454,6 +454,7 @@ class BridgeNode(Node):
         self._viz_lock = threading.Lock()
         self._viz_enabled = False
         self._viz_global_costmap: Optional[Dict] = None
+        self._viz_local_costmap: Optional[Dict] = None
         self._viz_global_plan: tuple = ()  # current /plan, tuple of (x, y)
         self._viz_local_plan: tuple = ()  # current /local_plan
         self._viz_plan_history: Deque[tuple] = deque(maxlen=8)  # older /plan versions
@@ -2510,6 +2511,13 @@ class BridgeNode(Node):
             **sub_kwargs,
         )
         self.create_subscription(
+            OccupancyGrid,
+            "/local_costmap/costmap",
+            self._guarded(self._on_viz_local_costmap),
+            _LATCHED_QOS,
+            **sub_kwargs,
+        )
+        self.create_subscription(
             Path, "/plan", self._guarded(self._on_viz_global_plan), 10, **sub_kwargs
         )
         self.create_subscription(
@@ -2539,6 +2547,19 @@ class BridgeNode(Node):
         }
         with self._viz_lock:
             self._viz_global_costmap = cm
+
+    def _on_viz_local_costmap(self, msg: OccupancyGrid) -> None:
+        grid = np.array(msg.data, dtype=np.int16).reshape(
+            msg.info.height, msg.info.width
+        )
+        cm = {
+            "grid": grid,
+            "resolution": msg.info.resolution,
+            "origin_x": msg.info.origin.position.x,
+            "origin_y": msg.info.origin.position.y,
+        }
+        with self._viz_lock:
+            self._viz_local_costmap = cm
 
     @staticmethod
     def _path_points(msg: Path) -> tuple:
@@ -2578,6 +2599,7 @@ class BridgeNode(Node):
         with self._viz_lock:
             snap = {
                 "costmap": self._viz_global_costmap,
+                "local_costmap": self._viz_local_costmap,
                 "map": self._latest_map,
                 "global_plan": self._viz_global_plan,
                 "plan_history": list(self._viz_plan_history),

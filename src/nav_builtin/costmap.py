@@ -166,6 +166,16 @@ def costmap_viz_dict(
     }
 
 
+def local_view_viz_dict(view) -> dict:
+    """Rolling local costmap for operator UIs (already in map frame)."""
+    return {
+        "grid": costs_to_occupancy_viz(view.costs),
+        "resolution": float(view.occ.resolution),
+        "origin_x": float(view.origin_x),
+        "origin_y": float(view.origin_y),
+    }
+
+
 def nearest_free_cell(
     costs: np.ndarray,
     row: int,

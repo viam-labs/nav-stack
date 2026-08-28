@@ -72,6 +72,12 @@ class BuiltinSlamEngine:
         self._occ_cache: Optional[OccupancyMap] = None
         self._occ_cache_generation = -1
         self._occ_cache_known = 0.0
+        # Localizing mode: do not odom-track from (0,0) until a full-map seed
+        # succeeds. Without this the robot "assumes start" until the async
+        # startup global_localize task eventually fires.
+        self._seed_localize_pending = cfg.mode == MODE_LOCALIZING
+        self._last_seed_attempt_at = 0.0
+        self._seed_min_score = 0.40
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -124,6 +130,20 @@ class BuiltinSlamEngine:
                     self._last_odom_heading = None
                     self._invalidate_occ_cache()
                     self._generation += 1
+            if mode == MODE_LOCALIZING:
+                self._seed_localize_pending = True
+                self._last_seed_attempt_at = 0.0
+                self._last_odom_pose = None
+                self._last_odom_heading = None
+                self._last_odom_time = None
+                self._pending_match = None
+                self._pending_count = 0
+                self._log(
+                    "builtin SLAM awaiting full-map seed localize "
+                    "(will not assume start pose)"
+                )
+            else:
+                self._seed_localize_pending = False
 
     def reset_map(self) -> None:
         with self._lock:
@@ -142,6 +162,11 @@ class BuiltinSlamEngine:
             self._pose = pose
             self._pending_match = None
             self._pending_count = 0
+            # External relocalize / startup global_localize counts as seeded.
+            self._seed_localize_pending = False
+            self._last_odom_pose = None
+            self._last_odom_heading = None
+            self._last_odom_time = None
 
     def save_map(self, map_dir: Path) -> None:
         with self._lock:
@@ -210,6 +235,7 @@ class BuiltinSlamEngine:
                 "last_prior_score": self._last_prior_score,
                 "last_scan_age_s": self._last_scan_age_s,
                 "generation": self._generation,
+                "seed_localize_pending": self._seed_localize_pending,
             }
 
     # -- loop ----------------------------------------------------------------
@@ -231,6 +257,22 @@ class BuiltinSlamEngine:
         scan = self._sensors.get_scan(max_age_s=scan_age)
         odom = self._sensors.get_odom()
         now = time.monotonic()
+
+        with self._lock:
+            seed_pending = (
+                self._mode == MODE_LOCALIZING and self._seed_localize_pending
+            )
+
+        if seed_pending:
+            # Hold absolute pose at whatever set_pose/origin is until a full-map
+            # seed lands — do not odom-integrate from an assumed start point.
+            if scan is None:
+                return
+            if now - self._last_seed_attempt_at < 2.0:
+                return
+            self._last_seed_attempt_at = now
+            self._try_seed_global_localize(scan)
+            return
 
         with self._lock:
             self._ticks += 1
@@ -263,6 +305,58 @@ class BuiltinSlamEngine:
 
         if self._mode == MODE_MAPPING:
             self._maybe_insert_scan(scan, now)
+
+    def _try_seed_global_localize(self, scan) -> bool:
+        """Full-map match once scans are available; apply if score is trusted."""
+        from ..nav.global_localize import global_localize_scan
+
+        with self._lock:
+            if self._occ_cache_known < 0.02 and self._generation == 0:
+                # Map not loaded yet.
+                try:
+                    occ_map = self._occupancy_for_match()
+                except Exception:  # noqa: BLE001
+                    return False
+            else:
+                occ_map = self._occupancy_for_match()
+            known = self._occ_cache_known
+        if known < 0.02:
+            return False
+        try:
+            result = global_localize_scan(
+                occ_map,
+                scan,
+                hint=None,
+                full_map=True,
+                coarse_position_step_m=0.6,
+                coarse_yaw_step_deg=18.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"seed global localize failed: {exc}")
+            return False
+        score = float(result.score)
+        if not math.isfinite(score) or score < self._seed_min_score:
+            self._log(
+                f"seed global localize weak (score={score:.3f} "
+                f"ray_mae={result.ray_mae_m:.3f}); retrying"
+            )
+            return False
+        pose = result.pose
+        with self._lock:
+            self._pose = pose
+            self._seed_localize_pending = False
+            self._last_odom_pose = None
+            self._last_odom_heading = None
+            self._last_odom_time = None
+            self._pending_match = None
+            self._pending_count = 0
+            self._last_match_score = score
+        self._log(
+            f"seed global localize applied "
+            f"x={pose.x:.2f} y={pose.y:.2f} th={pose.theta:.2f} "
+            f"score={score:.3f} ray_mae={result.ray_mae_m:.3f}"
+        )
+        return True
 
     def _maybe_insert_scan(self, scan, now: float) -> None:
         """Ray-cast into the grid only after movement or a timeout.

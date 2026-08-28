@@ -117,6 +117,43 @@ def test_local_planner_avoids_marked_obstacle():
     assert cmd.vx < 0.35 or abs(cmd.vtheta) > 0.1
 
 
+def test_compute_path_command_defers_local_planner_when_misaligned():
+    """DWA forward creep with zero turn while |bearing| > 75° causes shimmy loops."""
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=2.0,
+            height_m=2.0,
+            resolution=0.05,
+            inflation_radius_m=0.15,
+            robot_radius_m=0.08,
+            use_global_static=False,
+        )
+    )
+    # Facing ~129° while the path runs east — same failure mode as large bearing error.
+    pose = Pose2D(0.5, 1.0, 2.26)
+    scan = conv.LaserScan2D(
+        angle_min=-0.1,
+        angle_increment=0.1,
+        range_min=0.05,
+        range_max=10.0,
+        ranges=np.array([0.8]),
+    )
+    view = lc.update(pose, scan)
+    path = Path2D(points=((0.5, 1.0), (2.0, 1.0)), goal_theta=0.0)
+    cmd, progress = compute_path_command(
+        pose,
+        path,
+        cfg=FollowerConfig(),
+        local_view=view,
+        local_planner=LocalPlannerConfig(enabled=True, activate_cost_threshold=1),
+        robot_radius_m=0.08,
+    )
+    assert progress.get("local_planner") is False
+    assert abs(progress["bearing_error_rad"]) > math.radians(75.0)
+    assert cmd.vx == 0.0
+    assert abs(cmd.vtheta) > 0.05
+
+
 def test_compute_path_command_uses_local_planner_when_blocked():
     lc = LocalCostmap(
         LocalCostmapConfig(
