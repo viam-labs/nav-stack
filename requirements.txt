@@ -4,7 +4,7 @@
 # tf2_ros, slam_toolbox, nav2_*) are NOT installed via pip. They are provided by the
 # system ROS2 installation that is sourced via the ROS_ENV environment variable
 # (see setup.sh / run.sh). Only pure-Python deps belong here.
-viam-sdk>=0.30.0
+viam-sdk>=0.79.1
 numpy>=1.24
 PyYAML>=6.0
 # Pillow renders the nav-camera occupancy/plan overlay to PNG.
