@@ -45,6 +45,19 @@ class RPLidarSerial:
             return
         if _pyserial is None:
             raise proto.RPLidarError("pyserial is not installed")
+        from .serial_ports import port_chip_family, usb_serial_open_lock
+
+        # Default stack: lidar=CP210, Wit=CH340. Opening CH340 for lidar probe
+        # knocks the IMU (and CAN) on the shared hub.
+        if port_chip_family(self.port) == "ch340":
+            raise proto.RPLidarError(
+                f"refusing {self.port!r}: CH340 is reserved for WitMotion IMU; "
+                "use the Silicon Labs CP210 by-id path for RPLIDAR."
+            )
+        with usb_serial_open_lock():
+            self._open_unlocked()
+
+    def _open_unlocked(self) -> None:
         from .serial_ports import shares_usb_hub_with_can
 
         self._hub_soft = bool(shares_usb_hub_with_can(self.port))
@@ -59,6 +72,9 @@ class RPLidarSerial:
                 self.port,
             )
         bauds = (self.baudrate,) if self.baudrate else proto.BAUDRATES
+        if self._hub_soft and not self.baudrate:
+            # Prefer 1M first without closing between bauds (already in-place).
+            bauds = proto.BAUDRATES
         last = None
         ser = None
         try:
@@ -70,7 +86,12 @@ class RPLidarSerial:
                         ser.baudrate = int(baud)
                     self.baudrate = int(baud)
                     self._clear()
-                    if _port_looks_like_wit(ser):
+                    # CP210 is never Wit on this stack — skip the listen probe.
+                    from .serial_ports import port_chip_family
+
+                    if port_chip_family(self.port) != "cp210" and _port_looks_like_wit(
+                        ser
+                    ):
                         raise proto.RPLidarError(
                             "port streams WitMotion IMU frames (not an RPLIDAR)"
                         )
@@ -119,14 +140,17 @@ class RPLidarSerial:
         last so a false WitMotion claim cannot permanently hide the lidar.
         """
         from .serial_ports import (
+            drop_claimed_by_other,
             is_port_busy_error,
             is_port_missing_error,
             list_candidate_serial_ports,
-            sort_unclaimed_first,
+            port_chip_family,
             steal_serial_port,
+            usb_serial_open_lock,
         )
 
         errors: dict[str, str] = {}
+        chip = chip or "cp210"
         candidates = list(ports)
         list_kwargs = dict(
             prefer_cp210=prefer_cp210,
@@ -134,12 +158,18 @@ class RPLidarSerial:
             include_tty_acm=include_tty_acm,
             exclude=exclude,
         )
-        for round_i in range(max(1, rounds)):
+        for round_i in range(max(1, min(rounds, 3))):
             if round_i > 0:
                 refreshed = list_candidate_serial_ports(**list_kwargs)
                 if refreshed:
                     candidates = refreshed
-            candidates = sort_unclaimed_first("lidar", candidates)
+            # Never probe the IMU's CH340 once claimed (or by chip family).
+            candidates = drop_claimed_by_other("lidar", candidates)
+            candidates = [
+                p
+                for p in candidates
+                if port_chip_family(p) != "ch340"
+            ]
             busy_seen = False
             missing_seen = False
             for port in candidates:
@@ -151,7 +181,8 @@ class RPLidarSerial:
                     reset_settle_s=reset_settle_s,
                 )
                 try:
-                    dev.open()
+                    with usb_serial_open_lock():
+                        dev._open_unlocked()
                     steal_serial_port("lidar", port)
                     return dev
                 except Exception as exc:  # noqa: BLE001
@@ -161,7 +192,8 @@ class RPLidarSerial:
                     if is_port_missing_error(exc):
                         missing_seen = True
                     try:
-                        dev.close()
+                        with usb_serial_open_lock():
+                            dev.close()
                     except Exception:
                         pass
             if round_i + 1 < rounds and (busy_seen or missing_seen):
@@ -172,17 +204,16 @@ class RPLidarSerial:
         raise proto.RPLidarError(
             "no RPLIDAR responded on any candidate serial port. "
             f"Tried: {', '.join(candidates)}. Errors: {detail}. "
-            "If a port is exclusively locked, the IMU may still be probing — "
-            "retry, or pin serial_path / depends_on so lidar starts first. "
-            "Autodetect skips USB-CAN/ttyACM; pin serial_path or set "
-            "include_tty_acm=true only if needed. "
-            "Check ls /dev/serial/by-id for CP210 (lidar) vs CH340 (IMU)."
+            "Lidar autodetect only probes CP210, never CH340 (Wit IMU). "
+            "Pin serial_path to the Silicon Labs by-id device."
         )
 
     def _connect_serial(self, baud: int):
         """Open the UART; hub-safe mode avoids exclusive/DTR when CAN shares the hub."""
-        from .serial_ports import is_safe_sensor_serial_port
+        from .serial_ports import is_safe_sensor_serial_port, port_chip_family
 
+        if port_chip_family(self.port) == "ch340":
+            raise proto.RPLidarError(f"refusing CH340 port {self.port!r} (Wit IMU)")
         if not is_safe_sensor_serial_port(self.port):
             raise proto.RPLidarError(
                 f"refusing to open {self.port!r}: not a known lidar UART bridge "

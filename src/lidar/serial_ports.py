@@ -16,6 +16,10 @@ LOGGER = logging.getLogger(__name__)
 _claims_lock = threading.Lock()
 _claims: Dict[str, str] = {}  # realpath -> owner ("lidar" | "imu")
 
+# Serialize all USB-serial open/close across lidar + IMU. Concurrent opens on
+# the same hub (CP210 + CH340 + CAN) reset sibling devices.
+_usb_open_lock = threading.RLock()
+
 # USB VID:PID that must never be opened. Opening / resetting these (or their
 # hub siblings via aggressive probes) knocks SocketCAN offline.
 # 1d50:606f = OpenMoko / Geschwister Schneider / CANable / candleLight (gs_usb).
@@ -457,6 +461,37 @@ def _realpath(port: str) -> str:
         return os.path.realpath(port)
     except OSError:
         return port
+
+
+def usb_serial_open_lock() -> threading.RLock:
+    """Process-wide lock held while opening/closing USB-serial ports."""
+    return _usb_open_lock
+
+
+def port_chip_family(path: str) -> Optional[str]:
+    """Return ``\"cp210\"``, ``\"ch340\"``, or None for unknown/other."""
+    lowered = path.lower()
+    aliases = [path] + _by_id_aliases(_realpath(path))
+    blob = " ".join(a.lower() for a in aliases)
+    if "silicon_labs" in blob or "cp210" in blob:
+        return "cp210"
+    if "1a86" in blob or "wch" in blob or "ch340" in blob or "ch341" in blob:
+        return "ch340"
+    driver = _tty_driver_name(path)
+    if driver == "cp210x":
+        return "cp210"
+    if driver in ("ch341", "ch343"):
+        return "ch340"
+    if "silicon_labs" in lowered or "cp210" in lowered:
+        return "cp210"
+    if "1a86" in lowered:
+        return "ch340"
+    return None
+
+
+def drop_claimed_by_other(owner: str, ports: List[str]) -> List[str]:
+    """Omit ports another driver already owns — never probe them."""
+    return [p for p in ports if not is_serial_claimed_by_other(owner, p)]
 
 
 def claim_serial_port(owner: str, port: str) -> None:

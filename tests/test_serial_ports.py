@@ -276,6 +276,20 @@ def test_shares_usb_hub_with_can_detects_sibling():
         assert shares_usb_hub_with_can("/dev/ttyUSB0")
 
 
+def test_port_chip_family_and_wit_skips_cp210():
+    from src.lidar.serial_ports import port_chip_family
+
+    assert (
+        port_chip_family(
+            "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_x-if00-port0"
+        )
+        == "cp210"
+    )
+    assert (
+        port_chip_family("/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0") == "ch340"
+    )
+
+
 def test_normalize_exclude_list():
     assert normalize_exclude_list("can0, ttyACM") == ["can0", "ttyACM"]
     assert normalize_exclude_list(["a", "b"]) == ["a", "b"]

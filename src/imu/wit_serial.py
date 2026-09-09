@@ -1,6 +1,7 @@
 """Serial session for a WitMotion IMU."""
 from __future__ import annotations
 
+import logging
 import time
 from typing import List, Optional
 
@@ -10,6 +11,8 @@ try:
     import serial as _pyserial
 except ImportError:  # pragma: no cover
     _pyserial = None
+
+LOGGER = logging.getLogger(__name__)
 
 
 class WitSerial:
@@ -37,28 +40,49 @@ class WitSerial:
     def open(self) -> None:
         if _pyserial is None:
             raise WitError("pyserial is not installed")
+        from ..lidar.serial_ports import (
+            port_chip_family,
+            shares_usb_hub_with_can,
+            usb_serial_open_lock,
+        )
+
+        # Never open the lidar's CP210 — that resets the shared hub / kills scan.
+        if port_chip_family(self.port) == "cp210":
+            raise WitError(
+                f"refusing {self.port!r}: CP210 is reserved for RPLIDAR on this "
+                "stack (Wit is CH340). Pin serial_path to the 1a86 by-id device."
+            )
+
+        with usb_serial_open_lock():
+            self._open_unlocked()
+
+    def _open_unlocked(self) -> None:
         from ..lidar.serial_ports import shares_usb_hub_with_can
 
         self._hub_soft = bool(shares_usb_hub_with_can(self.port))
         if self._hub_soft:
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "WitMotion %s shares a USB hub with a CAN adapter — hub-safe open "
-                "(no exclusive lock, in-place baud). Prefer moving CAN to another "
-                "USB controller if can0 still drops.",
+            LOGGER.warning(
+                "WitMotion %s shares a USB hub with CAN — hub-safe open. "
+                "Not probing CP210 (lidar) ports.",
                 self.port,
             )
-        bauds = (self.baudrate,) if self.baudrate else BAUDRATES
+        # On a shared hub, only try the primary baud to avoid retune churn.
+        if self.baudrate:
+            bauds: tuple = (int(self.baudrate),)
+        elif self._hub_soft:
+            bauds = (115200,)
+        else:
+            bauds = BAUDRATES
         last = None
         ser = None
         try:
             ser = self._connect(int(bauds[0]))
+            probe_s = 0.35 if self._hub_soft else 0.7
             for baud in bauds:
                 try:
                     if int(getattr(ser, "baudrate", 0) or 0) != int(baud):
                         ser.baudrate = int(baud)
-                    if not probe_is_wit(ser, listen_s=0.7, min_packets=3):
+                    if not probe_is_wit(ser, listen_s=probe_s, min_packets=3):
                         raise WitError(f"no WitMotion frames at baud={baud}")
                     self._ser = ser
                     self.baudrate = int(baud)
@@ -76,8 +100,7 @@ class WitSerial:
         self._ser = None
         raise WitError(
             f"failed to open WitMotion IMU on {self.port!r} at {bauds}: {last!r}. "
-            "If the lidar and IMU USB ports swapped, set serial_autodetect=true "
-            "or pin a stable /dev/serial/by-id/... path (not by-path)."
+            "Pin /dev/serial/by-id/...1a86... (CH340), not the Silicon Labs lidar port."
         )
 
     @classmethod
@@ -88,7 +111,7 @@ class WitSerial:
         baudrate: Optional[int] = None,
         timeout_s: float = 0.2,
         exclude_ports: Optional[List[str]] = None,
-        rounds: int = 8,
+        rounds: int = 3,
         retry_sleep_s: float = 0.5,
         prefer_cp210: bool = False,
         chip: Optional[str] = None,
@@ -98,14 +121,18 @@ class WitSerial:
         """Try each port until WitMotion frames are seen (skips silent lidars)."""
         from ..lidar.serial_ports import (
             claim_serial_port,
+            drop_claimed_by_other,
             is_port_busy_error,
             is_port_missing_error,
             list_candidate_serial_ports,
-            sort_unclaimed_first,
+            port_chip_family,
+            usb_serial_open_lock,
         )
 
         skip = set(exclude_ports or [])
         errors: dict = {}
+        # Default: CH340 only — never probe CP210 (lidar) during IMU detect.
+        chip = chip or "ch340"
         candidates = list(ports)
         list_kwargs = dict(
             prefer_cp210=prefer_cp210,
@@ -118,15 +145,20 @@ class WitSerial:
                 refreshed = list_candidate_serial_ports(**list_kwargs)
                 if refreshed:
                     candidates = refreshed
-            candidates = sort_unclaimed_first("imu", candidates)
+            # Never open a port the lidar already owns (hub reset / steal).
+            candidates = drop_claimed_by_other("imu", candidates)
+            candidates = [
+                p
+                for p in candidates
+                if p not in skip and port_chip_family(p) != "cp210"
+            ]
             busy_seen = False
             missing_seen = False
             for port in candidates:
-                if port in skip:
-                    continue
                 dev = cls(port, baudrate=baudrate, timeout_s=timeout_s)
                 try:
-                    dev.open()
+                    with usb_serial_open_lock():
+                        dev._open_unlocked()
                     claim_serial_port("imu", port)
                     return dev
                 except Exception as exc:  # noqa: BLE001
@@ -136,7 +168,8 @@ class WitSerial:
                     if is_port_missing_error(exc):
                         missing_seen = True
                     try:
-                        dev.close()
+                        with usb_serial_open_lock():
+                            dev.close()
                     except Exception:
                         pass
             if round_i + 1 < rounds and (busy_seen or missing_seen):
@@ -147,13 +180,14 @@ class WitSerial:
         raise WitError(
             "no WitMotion IMU responded on any candidate serial port. "
             f"Tried: {', '.join(candidates)}. Errors: {detail}. "
-            "Autodetect skips USB-CAN/ttyACM; pin a /dev/serial/by-id/... path "
-            "or set serial_exclude / include_tty_acm if needed."
+            "IMU autodetect only probes CH340 (1a86), never CP210 (lidar)."
         )
 
     def _connect(self, baud: int):
-        from ..lidar.serial_ports import is_safe_sensor_serial_port
+        from ..lidar.serial_ports import is_safe_sensor_serial_port, port_chip_family
 
+        if port_chip_family(self.port) == "cp210":
+            raise WitError(f"refusing CP210 port {self.port!r} (lidar)")
         if not is_safe_sensor_serial_port(self.port):
             raise WitError(
                 f"refusing to open {self.port!r}: not a known IMU UART bridge "
@@ -188,13 +222,14 @@ class WitSerial:
         return self._parser.feed(chunk) if chunk else 0
 
     def close(self) -> None:
-        from ..lidar.serial_ports import release_serial_port
+        from ..lidar.serial_ports import release_serial_port, usb_serial_open_lock
 
-        ser = self._ser
-        self._ser = None
-        if ser is not None and self._owns_port:
-            try:
-                ser.close()
-            except Exception:
-                pass
+        with usb_serial_open_lock():
+            ser = self._ser
+            self._ser = None
+            if ser is not None and self._owns_port:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
         release_serial_port(self.port)
