@@ -185,6 +185,13 @@ class RPLidarShm(Camera):
         self._last_error = reason
         LOGGER.warning("rplidar %r kick #%d: %s", self.name, self._kick_count, reason)
         self._stall_abort.set()
+        device = self._device
+        if device is not None and getattr(device, "_hub_soft", False) is True:
+            try:
+                device.soft_restart()
+            except Exception:
+                pass
+            return
         self._close_device()
 
     def _open_device(self) -> None:
@@ -297,7 +304,15 @@ class RPLidarShm(Camera):
                     if self._stop.is_set():
                         return
                     LOGGER.error("rplidar %r scan loop exited: %s", self.name, exc)
-                    self._close_device()
+                    # Closing USB on a hub shared with CAN resets can0. Prefer a
+                    # protocol-only restart when hub-soft mode is active.
+                    if device is not None and getattr(device, "_hub_soft", False) is True:
+                        try:
+                            device.soft_restart()
+                        except Exception:
+                            pass
+                    else:
+                        self._close_device()
                     self._stall_abort.clear()
                     if self._wait_backoff(backoff):
                         return

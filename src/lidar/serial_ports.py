@@ -343,6 +343,78 @@ def _tty_bound_to_can_netdev(path: str) -> bool:
     return False
 
 
+def _usb_device_sysfs(path: str) -> Optional[str]:
+    """Return the USB device sysfs dir (has idVendor) for a tty path."""
+    tty_dev = _sysfs_tty_dir(path)
+    if not tty_dev:
+        return None
+    try:
+        cur = os.path.realpath(tty_dev)
+    except OSError:
+        return None
+    for _ in range(10):
+        if os.path.exists(os.path.join(cur, "idVendor")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def shares_usb_hub_with_can(path: str) -> bool:
+    """True if this UART shares a USB hub with a Geschwister Schneider / CANable.
+
+    Opening/closing UART bridges (exclusive lock, DTR, baud reopen, USB reset)
+    on a cheap hub resets sibling ports — ``can0`` drops even though we never
+    open the CAN device itself.
+    """
+    usb_dev = _usb_device_sysfs(path)
+    if not usb_dev:
+        # Fall back: any known CAN adapter present on the machine → soft mode.
+        return _any_can_adapter_present()
+    hub = os.path.dirname(usb_dev)
+    try:
+        siblings = os.listdir(hub)
+    except OSError:
+        return _any_can_adapter_present()
+    for name in siblings:
+        sib = os.path.join(hub, name)
+        vid = _read_text(os.path.join(sib, "idVendor")).lower()
+        pid = _read_text(os.path.join(sib, "idProduct")).lower()
+        if vid and pid and (vid, pid) in _CAN_USB_IDS:
+            return True
+    # SocketCAN netdev under the same hub prefix.
+    for net in glob.glob("/sys/class/net/can*"):
+        try:
+            net_dev = os.path.realpath(os.path.join(net, "device"))
+        except OSError:
+            continue
+        cur = net_dev
+        for _ in range(8):
+            if cur == hub or cur.startswith(hub + os.sep):
+                return True
+            if os.path.exists(os.path.join(cur, "idVendor")):
+                parent = os.path.dirname(cur)
+                if parent == hub:
+                    return True
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+    return False
+
+
+def _any_can_adapter_present() -> bool:
+    for node in glob.glob("/sys/bus/usb/devices/*"):
+        vid = _read_text(os.path.join(node, "idVendor")).lower()
+        pid = _read_text(os.path.join(node, "idProduct")).lower()
+        if (vid, pid) in _CAN_USB_IDS:
+            return True
+    return bool(glob.glob("/sys/class/net/can*"))
+
+
 def _by_id_aliases(real: str) -> List[str]:
     out: List[str] = []
     for path in glob.glob("/dev/serial/by-id/usb-*"):

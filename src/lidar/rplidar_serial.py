@@ -37,6 +37,7 @@ class RPLidarSerial:
         self._ser = serial_port
         self._owns_port = serial_port is None
         self.info: dict = {}
+        self._hub_soft = False  # shared USB hub with CAN — avoid DTR/exclusive/reset
 
     def open(self) -> None:
         if self._ser is not None:
@@ -44,32 +45,52 @@ class RPLidarSerial:
             return
         if _pyserial is None:
             raise proto.RPLidarError("pyserial is not installed")
+        from .serial_ports import shares_usb_hub_with_can
+
+        self._hub_soft = bool(shares_usb_hub_with_can(self.port))
+        if self._hub_soft:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "RPLIDAR %s shares a USB hub with a CAN adapter — using hub-safe "
+                "open (no exclusive lock, no DTR, no USB reset, in-place baud). "
+                "Move the Geschwister Schneider adapter to another USB controller "
+                "if can0 still drops.",
+                self.port,
+            )
         bauds = (self.baudrate,) if self.baudrate else proto.BAUDRATES
         last = None
-        for baud in bauds:
-            ser = None
+        ser = None
+        try:
+            ser = self._connect_serial(int(bauds[0]))
+            self._ser = ser
+            for baud in bauds:
+                try:
+                    if int(getattr(ser, "baudrate", 0) or 0) != int(baud):
+                        ser.baudrate = int(baud)
+                    self.baudrate = int(baud)
+                    self._clear()
+                    if _port_looks_like_wit(ser):
+                        raise proto.RPLidarError(
+                            "port streams WitMotion IMU frames (not an RPLIDAR)"
+                        )
+                    self._handshake()
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    continue
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+        if ser is not None:
             try:
-                ser = self._connect_serial(int(baud))
-                self._ser = ser
-                self.baudrate = int(baud)
-                if _port_looks_like_wit(ser):
-                    raise proto.RPLidarError(
-                        "port streams WitMotion IMU frames (not an RPLIDAR)"
-                    )
-                self._handshake()
-                return
-            except Exception as exc:  # noqa: BLE001
-                last = exc
-                if ser is not None:
-                    try:
-                        ser.close()
-                    except Exception:
-                        pass
-                self._ser = None
+                ser.close()
+            except Exception:
+                pass
+        self._ser = None
         raise proto.RPLidarError(
             f"failed to open RPLIDAR on {self.port!r} at {bauds}: {last!r}. "
             "If the lidar and IMU USB ports swapped, try the other /dev/ttyUSB* "
-            "or a /dev/serial/by-path/... path. If the UART opens but GET_INFO "
+            "or a /dev/serial/by-id/... path. If the UART opens but GET_INFO "
             "times out, power-cycle the lidar (USB-UART can stay up while the "
             "sensor MCU is hung/unpowered)."
         )
@@ -159,7 +180,7 @@ class RPLidarSerial:
         )
 
     def _connect_serial(self, baud: int):
-        """Open the UART like viam-modules/rplidar: no DTR/DSR flow control."""
+        """Open the UART; hub-safe mode avoids exclusive/DTR when CAN shares the hub."""
         from .serial_ports import is_safe_sensor_serial_port
 
         if not is_safe_sensor_serial_port(self.port):
@@ -174,7 +195,11 @@ class RPLidarSerial:
             timeout=self.timeout_s,
             dsrdtr=False,
             rtscts=False,
+            xonxoff=False,
         )
+        # exclusive=True issues USB ioctls that reset flaky hubs hosting CAN.
+        if self._hub_soft:
+            return _pyserial.Serial(self.port, **kwargs)
         try:
             return _pyserial.Serial(self.port, exclusive=True, **kwargs)
         except TypeError:
@@ -187,11 +212,8 @@ class RPLidarSerial:
             if callable(fn):
                 fn()
         self._clear()
-        # A1 motor off (DTR high) until start_scan, matching post-connect idle state.
-        if hasattr(ser, "dtr"):
-            ser.dtr = True
-        if hasattr(ser, "rts"):
-            ser.rts = False
+        # Never toggle DTR/RTS here — that USB control transfer resets sibling
+        # CAN adapters on the same hub. A1 motor DTR is set only after GET_INFO.
         time.sleep(0.05)
 
     def close(self) -> None:
@@ -203,7 +225,9 @@ class RPLidarSerial:
             return
         try:
             self.stop()
-            self.stop_motor()
+            # Avoid stop_motor DTR toggle in hub-soft mode (CAN sibling).
+            if not self._hub_soft:
+                self.stop_motor()
         except Exception:
             pass
         if self._owns_port:
@@ -283,15 +307,21 @@ class RPLidarSerial:
             self._clear()
 
         last: Optional[Exception] = None
-        for attempt in (
+        attempts = [
             lambda: None,
             lambda: (self.stop(), time.sleep(0.05), self._clear()),
-            lambda: (
-                self._write(proto.command(proto.CMD_RESET)),
-                time.sleep(self.reset_settle_s),
-                self._clear(),
-            ),
-        ):
+        ]
+        # USB RESET re-enumerates the CP210 and often resets the whole hub —
+        # fatal for sibling CAN. Only try it when not hub-soft.
+        if not self._hub_soft:
+            attempts.append(
+                lambda: (
+                    self._write(proto.command(proto.CMD_RESET)),
+                    time.sleep(self.reset_settle_s),
+                    self._clear(),
+                )
+            )
+        for attempt in attempts:
             try:
                 attempt()
                 self.info = self.get_info()
@@ -304,6 +334,16 @@ class RPLidarSerial:
         status, code = self.get_health()
         if status == 2:
             raise proto.RPLidarError(f"RPLIDAR health error code={code}")
+        # A1 only: park motor via DTR after we know the model (skip if hub-soft).
+        model = int(self.info.get("model") or 0)
+        if (
+            not self._hub_soft
+            and not proto.is_tof_lidar(model)
+            and not proto.is_s_series(model)
+            and self._ser is not None
+            and hasattr(self._ser, "dtr")
+        ):
+            self._ser.dtr = True
 
     def _clear(self) -> None:
         ser = self._ser
@@ -336,7 +376,6 @@ class RPLidarSerial:
             return
         model = int(self.info.get("model") or 0)
         # TOF (S1/S2/S3): HQ RPM command — same as Slamtec SDK startMotor().
-        # Without this, EXPRESS may ACK (0x85 descriptor) then stream silence.
         if proto.is_tof_lidar(model):
             self._write(
                 proto.command_with_payload(
@@ -345,12 +384,16 @@ class RPLidarSerial:
                 )
             )
             return
-        # Triangle A1/A2/A3: USB DTR motor enable.
+        # Triangle A1: USB DTR — skipped on hubs shared with CAN.
+        if self._hub_soft:
+            return
         if hasattr(self._ser, "dtr"):
             self._ser.dtr = False
 
     def stop_motor(self) -> None:
         if proto.is_tof_lidar(int(self.info.get("model") or 0)):
+            return
+        if self._hub_soft:
             return
         if hasattr(self._ser, "dtr"):
             self._ser.dtr = True
@@ -359,6 +402,17 @@ class RPLidarSerial:
         self._write(proto.command(proto.CMD_STOP))
         time.sleep(0.01)
         self._clear()
+
+    def soft_restart(self) -> None:
+        """Stop the stream without closing USB — required on hubs shared with CAN."""
+        try:
+            self.stop()
+        except Exception:
+            pass
+        try:
+            self._clear()
+        except Exception:
+            pass
 
     def _get_lidar_conf(
         self, conf_type: int, reserve: bytes = b"", *, abort_check=None

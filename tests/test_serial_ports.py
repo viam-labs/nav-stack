@@ -250,6 +250,32 @@ def test_serial_exclude_extra_substring():
     assert "Silicon_Labs" in ports[0]
 
 
+def test_shares_usb_hub_with_can_detects_sibling():
+    from src.lidar.serial_ports import shares_usb_hub_with_can
+
+    def read_text(p: str) -> str:
+        if p.endswith("idVendor") and "1-1.4" in p:
+            return "1d50"
+        if p.endswith("idProduct") and "1-1.4" in p:
+            return "606f"
+        if p.endswith("idVendor"):
+            return "10c4"
+        if p.endswith("idProduct"):
+            return "ea60"
+        return ""
+
+    with (
+        patch(
+            "src.lidar.serial_ports._usb_device_sysfs",
+            return_value="/sys/bus/usb/devices/1-1.3",
+        ),
+        patch("src.lidar.serial_ports.os.listdir", return_value=["1-1.3", "1-1.4"]),
+        patch("src.lidar.serial_ports._read_text", side_effect=read_text),
+        patch("src.lidar.serial_ports.glob.glob", return_value=[]),
+    ):
+        assert shares_usb_hub_with_can("/dev/ttyUSB0")
+
+
 def test_normalize_exclude_list():
     assert normalize_exclude_list("can0, ttyACM") == ["can0", "ttyACM"]
     assert normalize_exclude_list(["a", "b"]) == ["a", "b"]

@@ -28,6 +28,7 @@ class WitSerial:
         self._ser = None
         self._parser = WitStreamParser()
         self._owns_port = True
+        self._hub_soft = False
 
     @property
     def sample(self) -> WitSample:
@@ -36,26 +37,43 @@ class WitSerial:
     def open(self) -> None:
         if _pyserial is None:
             raise WitError("pyserial is not installed")
+        from ..lidar.serial_ports import shares_usb_hub_with_can
+
+        self._hub_soft = bool(shares_usb_hub_with_can(self.port))
+        if self._hub_soft:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "WitMotion %s shares a USB hub with a CAN adapter — hub-safe open "
+                "(no exclusive lock, in-place baud). Prefer moving CAN to another "
+                "USB controller if can0 still drops.",
+                self.port,
+            )
         bauds = (self.baudrate,) if self.baudrate else BAUDRATES
         last = None
-        for baud in bauds:
-            ser = None
+        ser = None
+        try:
+            ser = self._connect(int(bauds[0]))
+            for baud in bauds:
+                try:
+                    if int(getattr(ser, "baudrate", 0) or 0) != int(baud):
+                        ser.baudrate = int(baud)
+                    if not probe_is_wit(ser, listen_s=0.7, min_packets=3):
+                        raise WitError(f"no WitMotion frames at baud={baud}")
+                    self._ser = ser
+                    self.baudrate = int(baud)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+                    continue
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+        if ser is not None:
             try:
-                ser = self._connect(int(baud))
-                if not probe_is_wit(ser, listen_s=0.7, min_packets=3):
-                    raise WitError(f"no WitMotion frames at baud={baud}")
-                self._ser = ser
-                self.baudrate = int(baud)
-                # Keep buffered packets from the probe.
-                return
-            except Exception as exc:  # noqa: BLE001
-                last = exc
-                if ser is not None:
-                    try:
-                        ser.close()
-                    except Exception:
-                        pass
-                self._ser = None
+                ser.close()
+            except Exception:
+                pass
+        self._ser = None
         raise WitError(
             f"failed to open WitMotion IMU on {self.port!r} at {bauds}: {last!r}. "
             "If the lidar and IMU USB ports swapped, set serial_autodetect=true "
@@ -148,7 +166,10 @@ class WitSerial:
             timeout=self.timeout_s,
             dsrdtr=False,
             rtscts=False,
+            xonxoff=False,
         )
+        if self._hub_soft:
+            return _pyserial.Serial(self.port, **kwargs)
         try:
             return _pyserial.Serial(self.port, exclusive=True, **kwargs)
         except TypeError:
