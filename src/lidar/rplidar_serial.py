@@ -397,15 +397,17 @@ class RPLidarSerial:
     ) -> int:
         """Start typical Express scan (viam ``StartScan(false, true)``).
 
-        Returns the answer type (``DENSE_CAPSULED_TYPE`` for S2/S3 DenseBoost).
+        Returns the answer type from the live descriptor (``0x85`` DenseBoost on
+        S2/S3). Queried conf ans-type can disagree with what the device actually
+        streams, so we trust the descriptor.
         """
         self.start_motor()
         if self.motor_warmup_s > 0:
             time.sleep(self.motor_warmup_s)
         if abort_check is not None and abort_check():
             raise proto.RPLidarError("scan aborted")
-        mode_id, ans_type = self._typical_scan_mode(abort_check=abort_check)
-        # SDK: working_mode is mode id unless STD/EXPRESS sentinel.
+        mode_id, _expected_ans = self._typical_scan_mode(abort_check=abort_check)
+        # SDK: working_mode is mode id unless STD(0)/EXPRESS(1) sentinel constants.
         working_mode = 0 if mode_id in (0, 1) else (mode_id & 0xFF)
         self._write(
             proto.command_with_payload(
@@ -414,10 +416,16 @@ class RPLidarSerial:
             )
         )
         size, single, dtype = self._read_descriptor(abort_check=abort_check)
-        if single or dtype != ans_type:
+        if single:
             raise proto.RPLidarError(
                 f"unexpected express descriptor size={size} single={single} "
-                f"type=0x{dtype:02X} (expected type=0x{ans_type:02X})"
+                f"type=0x{dtype:02X}"
+            )
+        if dtype not in (proto.DENSE_CAPSULED_TYPE, proto.CAPSULED_TYPE):
+            raise proto.RPLidarError(
+                f"unsupported express answer type=0x{dtype:02X} "
+                f"(want dense 0x{proto.DENSE_CAPSULED_TYPE:02X} or "
+                f"capsule 0x{proto.CAPSULED_TYPE:02X})"
             )
         if dtype == proto.DENSE_CAPSULED_TYPE and size < proto.DENSE_CAPSULE_LEN:
             raise proto.RPLidarError(
