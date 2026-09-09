@@ -190,10 +190,12 @@ class RosNavigationExternal(NavServiceBase):
         map_store: MapStore,
         dependencies: Mapping[ResourceName, ResourceBase],
     ) -> None:
+        from ..ros.availability import require_rclpy
         from ..ros.manager import RosManager
         from ..ros.odom_source import TypedMovementSensorOdom, TypedOdomConfig
         from ..ros.sensor_io import build_io_provider
 
+        require_rclpy("navigation-external nav_backend=nav2")
         bridge_cfg = ext.bridge
         movement_sensor = (
             cast(

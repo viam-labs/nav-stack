@@ -1,30 +1,32 @@
 # nav-stack
 
-A Viam navigation stack that wraps the ROS2 **Nav2** and **slam_toolbox** packages,
-so any Viam base can map an environment, localize within it, and navigate to named
-locations or arbitrary map points while avoiding obstacles.
+A Viam navigation stack for mapping, localization, and obstacle-aware navigation
+on any Viam base. **Defaults are ROS-free** (`slam_backend: builtin`,
+`nav_backend: builtin`). Optional ROS 2 backends (`slam_toolbox`, Nav2) remain
+available on Ubuntu when you set `REQUIRE_ROS=1` at setup.
 
-This module (`viam-labs:nav-stack`) provides four models:
+This module (`viam-labs:nav-stack`) provides:
 
 | Model | API | Purpose |
 | --- | --- | --- |
-| `viam-labs:nav-stack:slam` | `rdk:service:slam` | Mapping + localization via slam_toolbox. Standard SLAM API (live map, position) + map management. |
-| `viam-labs:nav-stack:navigation` | `rdk:service:motion` | Nav2 via Motion `MoveOnMap`, plus named locations, zones, and simple `go_to_*` via `DoCommand`. |
-| `viam-labs:nav-stack:navigation-external` | `rdk:service:motion` | Same Motion + DoCommand surface, driven by **any** `rdk:service:slam` instead of the bundled slam_toolbox. Runs its own sensor bridge. |
-| `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders the navigation service's Nav2 costmap + active plan(s), robot pose, footprint and goal as a live camera image. Works with either navigation model / any SLAM backend. |
+| `viam-labs:nav-stack:slam` | `rdk:service:slam` | Mapping + localization (builtin occupancy by default; optional slam_toolbox). |
+| `viam-labs:nav-stack:navigation` | `rdk:service:motion` | Builtin MoveOnMap (default); optional Nav2. Named locations, zones, `go_to_*` via `DoCommand`. |
+| `viam-labs:nav-stack:navigation-external` | `rdk:service:motion` | Same Motion + DoCommand surface against **any** `rdk:service:slam`. Builtin path is fully ROS-free. |
+| `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders costmap + plan(s), pose, footprint and goal as a live camera image. |
+| `viam-labs:nav-stack:rplidar` / `wit-imu` / `shm-pointcloud` | camera / movement_sensor | Optional sensor helpers with POSIX shm for low-latency builtin paths. |
 
 ## How it works
 
-The module bundles/orchestrates ROS2 and bridges it to your Viam components:
+**Builtin (default):** SLAM and navigation run in-process over Viam APIs (lidar
+point clouds / shm, movement sensor, `Base.SetVelocity`). No ROS install required.
 
-- Reads each Viam lidar -> publishes `/scan_<i>` (per lidar) and a merged `/scan`
-  for slam_toolbox.
-- Publishes odometry (`/odom`) and the `odom -> base_link` TF from a Viam movement
-  sensor; publishes static `base_link -> laser_<i>` TFs from each lidar mount.
-- Runs slam_toolbox (mapping or localization) and Nav2 (planner + controller +
-  layered costmaps + behavior tree).
-- Subscribes Nav2's `/cmd_vel` and drives the Viam base — only while navigating,
-  with a watchdog that stops the base if commands go stale.
+**Optional ROS path:** set `REQUIRE_ROS=1` and use `slam_backend: slam_toolbox`
+and/or `nav_backend: nav2`. The module then:
+
+- Reads each Viam lidar -> publishes `/scan_<i>` and a merged `/scan`
+- Publishes odometry (`/odom`) and `odom -> base_link` TF from a movement sensor
+- Runs slam_toolbox and/or Nav2
+- Subscribes Nav2 `/cmd_vel` and drives the Viam base while navigating
 
 ```mermaid
 flowchart LR
@@ -39,29 +41,48 @@ flowchart LR
 
 ## Prerequisites
 
-- A Linux host (arm64 or x86_64) running `viam-server` on **Ubuntu 22.04, 24.04, or 26.04**.
-  **Pi 5 recommendation:** Ubuntu **24.04 LTS** (Jazzy). Ubuntu 26.04 (Lyrical) may install `ros-base` but Nav2 / slam_toolbox apt packages are often missing on arm64 until ROS publishes them for that distro.
-- On first deploy, `setup.sh` runs automatically (`first_run` in `meta.json`) and will:
-  1. Verify the Ubuntu version and pick a matching ROS 2 distro (LTS default):
-     - 22.04 → **Humble**
-     - 24.04 → **Jazzy** (set `ROS_DISTRO=kilted` for Kilted Kaiju)
-     - 26.04 → **Lyrical Luth**
-  2. **Install** ROS 2, Nav2, and slam_toolbox via `apt` if they are missing (`AUTO_INSTALL_DEPS=1`, the default).
-  3. Create the Python venv and install pip dependencies.
-  4. Write `.ros_env` so `run.sh` can source ROS without a manual module env block.
-
-Set `AUTO_INSTALL_DEPS=0` in the module `env` block to only check and fail if system packages are missing.
-
-`ROS_ENV` in the module config is **optional** after `setup.sh` has run; override it when you want a non-default distro (e.g. Kilted on 24.04):
+- A host running `viam-server` with Python 3 (Linux is typical; macOS can run the
+  **builtin** path where serial/shm allow).
+- Defaults are **ROS-free**: `slam_backend: builtin` and `nav_backend: builtin`.
+  On first deploy, `setup.sh` creates the Python venv and does **not** require
+  Ubuntu or apt-install ROS.
+- Optional ROS backends (`slam_backend: slam_toolbox`, `nav_backend: nav2`) need
+  **Ubuntu 22.04 / 24.04 / 26.04**. Set in the module `env` block and re-run setup:
 
 ```json
 "env": {
+  "REQUIRE_ROS": "1",
+  "AUTO_INSTALL_DEPS": "1"
+}
+```
+
+  With `REQUIRE_ROS=1`, setup will:
+  1. Verify Ubuntu and pick a matching ROS 2 distro (LTS default):
+     - 22.04 → **Humble**
+     - 24.04 → **Jazzy** (set `ROS_DISTRO=kilted` for Kilted Kaiju)
+     - 26.04 → **Lyrical Luth**
+  2. **Install** ROS 2, Nav2, and slam_toolbox via `apt` if missing (`AUTO_INSTALL_DEPS=1`).
+  3. Write `.ros_env` so `run.sh` can source ROS.
+
+  **Pi 5 recommendation for ROS backends:** Ubuntu **24.04 LTS** (Jazzy). Ubuntu 26.04
+  (Lyrical) may install `ros-base` but Nav2 / slam_toolbox apt packages are often
+  missing on arm64 until ROS publishes them for that distro.
+
+Set `AUTO_INSTALL_DEPS=0` with `REQUIRE_ROS=1` to only check and fail if system
+packages are missing. `INSTALL_ROS=1` is an alias for `REQUIRE_ROS=1`.
+
+`ROS_ENV` in the module config is **optional** after ROS setup has run; override it
+when you want a non-default distro (e.g. Kilted on 24.04):
+
+```json
+"env": {
+  "REQUIRE_ROS": "1",
   "ROS_DISTRO": "kilted",
   "AUTO_INSTALL_DEPS": "1"
 }
 ```
 
-Manual install (if you prefer to provision the image yourself):
+Manual ROS install (if you prefer to provision the image yourself):
 
 ```bash
 sudo apt-get install ros-$ROS_DISTRO-ros-base \
@@ -69,6 +90,9 @@ sudo apt-get install ros-$ROS_DISTRO-ros-base \
                      ros-$ROS_DISTRO-nav2-bringup \
                      ros-$ROS_DISTRO-slam-toolbox
 ```
+
+If ROS is already on the machine, default (ROS-free) setup still records it in
+`.ros_env` so you can select toolbox/Nav2 later without a second apt pass.
 
 - A configured Viam **base**, one or more **lidars** (configured as `camera`
   components returning point clouds; a true 2D lidar is ideal, depth cameras work
@@ -548,7 +572,7 @@ the current map heading in place when XY is already right).
 ## Development
 
 ```bash
-./setup.sh                 # create venv + verify ROS deps
+./setup.sh                 # create venv (add REQUIRE_ROS=1 for ROS backends)
 python -m pytest tests/    # pure-Python unit tests (no ROS needed)
 ./build.sh                 # package module.tar.gz
 ```

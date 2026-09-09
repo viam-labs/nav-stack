@@ -169,8 +169,10 @@ class RosSlam(SLAM):
             self._wire_still_keyframe_hook()
             backend = "builtin"
         else:
+            from ..ros.availability import require_rclpy
             from ..ros.manager import RosManager
 
+            require_rclpy("slam_backend=slam_toolbox")
             self._manager = RosManager(cfg, logger=LOGGER)
             self._manager.start(self._build_io(), loop)
             # _build_io before start has no bridge node yet; rewire so drive/stop

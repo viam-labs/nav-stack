@@ -2,7 +2,7 @@
   "module_id": "viam-labs:nav-stack",
   "visibility": "public",
   "url": "https://github.com/viam-labs/nav-stack",
-  "description": "A Viam navigation stack wrapping the ROS2 Nav2 and slam_toolbox packages for mapping, localization, and obstacle-aware navigation on any Viam base.",
+  "description": "Mapping, localization, and obstacle-aware navigation on any Viam base. Defaults are ROS-free (builtin SLAM + nav); optional slam_toolbox / Nav2 on Ubuntu when REQUIRE_ROS=1.",
   "models": [
     {
       "api": "rdk:service:slam",

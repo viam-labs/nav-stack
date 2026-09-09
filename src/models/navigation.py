@@ -2,15 +2,10 @@
 
 Default ``nav_backend: builtin`` drives the in-module navigator over Viam APIs
 only (``ViamWorldIO`` + ``BuiltinNavHost``): SLAM ``get_grid`` / ``GetPosition``,
-lidar shm/cameras, ``Base.SetVelocity``. No RosManager, no bridge registration,
-no Nav2.
+lidar shm/cameras, ``Base.SetVelocity``. No RosManager, no bridge, no Nav2.
 
-Set ``nav_backend: nav2`` to launch ROS2 Nav2 against the SLAM service's shared
-ROS context (legacy).
-
-Note: the companion ``viam-labs:nav-stack:slam`` model still uses ROS
-(slam_toolbox) for mapping. For a fully ROS-free robot, use
-``navigation-external`` against any non-ROS ``rdk:service:slam``.
+Set ``nav_backend: nav2`` for legacy ROS2 Nav2 (requires ``REQUIRE_ROS=1`` at
+setup). Or use ``navigation-external`` against any ``rdk:service:slam``.
 """
 from __future__ import annotations
 
@@ -173,6 +168,9 @@ class RosNavigation(NavServiceBase):
             return
 
         # Legacy Nav2 path: share the SLAM RosManager / bridge.
+        from ..ros.availability import require_rclpy
+
+        require_rclpy("nav_backend=nav2")
         if hasattr(slam_rt.manager, "set_builtin_world"):
             slam_rt.manager.set_builtin_world(None)
         slam_service = cfg.slam_service

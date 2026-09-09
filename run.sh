@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Entrypoint for the nav-stack module. Sources the ROS2 environment (so rclpy and
-# the ROS2 message/launch packages are importable), activates the Python venv, and
-# starts the module server.
+# Entrypoint for the nav-stack module. Activates the Python venv and starts the
+# module server. If setup wrote .ros_env (or ROS_ENV is set), sources ROS 2 so
+# slam_toolbox / Nav2 backends can import rclpy — optional for builtin slam/nav.
 set -euo pipefail
 
 cd "$(dirname "$0")"
