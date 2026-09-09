@@ -31,7 +31,7 @@ from viam.utils import struct_to_dict
 
 from ..imu.wit_protocol import WitError
 from ..imu.wit_serial import WitSerial
-from ..lidar.serial_ports import list_candidate_serial_ports
+from ..lidar.serial_ports import list_candidate_serial_ports, normalize_exclude_list
 from ..ros import imushm
 
 LOGGER = getLogger(__name__)
@@ -69,6 +69,9 @@ class WitImu(MovementSensor):
         self._gx = self._gy = self._gz = 0.0
         self._roll = self._pitch = self._yaw = 0.0
         self._mx = self._my = self._mz = 0.0
+        self._serial_exclude: list[str] = []
+        self._serial_chip: Optional[str] = None
+        self._include_tty_acm = False
 
     @classmethod
     def new(
@@ -92,6 +95,9 @@ class WitImu(MovementSensor):
         baud = attrs.get("serial_baud_rate", attrs.get("baud_rate", attrs.get("baudrate")))
         if baud is not None and int(baud) not in (0, 9600, 115200):
             raise ValueError("wit-imu serial_baud_rate must be 9600 or 115200")
+        chip = str(attrs.get("serial_chip") or "").strip().lower() or None
+        if chip not in (None, "cp210", "ch340"):
+            raise ValueError("wit-imu serial_chip must be cp210, ch340, or omitted")
         return [], []
 
     def reconfigure(
@@ -110,6 +116,12 @@ class WitImu(MovementSensor):
         self._shm_name = _shm_name_for(self.name, explicit)
         self._publish_hz = float(attrs.get("publish_hz", 50.0))
         self._serial_path = serial_path or None
+        self._serial_exclude = normalize_exclude_list(attrs.get("serial_exclude"))
+        chip = str(attrs.get("serial_chip") or "").strip().lower() or None
+        if chip not in (None, "cp210", "ch340"):
+            raise ValueError("wit-imu serial_chip must be cp210, ch340, or omitted")
+        self._serial_chip = chip
+        self._include_tty_acm = bool(attrs.get("include_tty_acm", False))
         self._stop.clear()
         self._open_device()
         region = int(attrs.get("shm_region_size", imushm.DEFAULT_REGION_SIZE))
@@ -131,10 +143,21 @@ class WitImu(MovementSensor):
             dev = WitSerial(self._serial_path, baudrate=self._baudrate)
             dev.open()
         elif self._serial_autodetect:
-            # Protocol detect only — chip brands vary (this robot: Wit on CH340,
-            # RPLIDAR on CP210). Hard chip filters caused false mismatches.
-            ports = list_candidate_serial_ports(prefer_cp210=False)
-            dev = WitSerial.open_first_working(ports, baudrate=self._baudrate)
+            # CH340 first on this robot (Wit); never probe USB-CAN / ttyACM.
+            ports = list_candidate_serial_ports(
+                prefer_cp210=False,
+                chip=self._serial_chip or "ch340",
+                include_tty_acm=self._include_tty_acm,
+                exclude=self._serial_exclude,
+            )
+            dev = WitSerial.open_first_working(
+                ports,
+                baudrate=self._baudrate,
+                prefer_cp210=False,
+                chip=self._serial_chip or "ch340",
+                include_tty_acm=self._include_tty_acm,
+                exclude=self._serial_exclude,
+            )
             self._serial_path = dev.port
             LOGGER.info("nav-stack wit-imu autodetected serial=%s", self._serial_path)
         else:

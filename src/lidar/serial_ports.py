@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 
 # In-process registry so lidar + IMU (same module process) don't steal each
@@ -13,27 +14,79 @@ from typing import Dict, List, Optional
 _claims_lock = threading.Lock()
 _claims: Dict[str, str] = {}  # realpath -> owner ("lidar" | "imu")
 
+# by-id / path substrings that must never be opened (USB-CAN, etc.).
+# Opening these with exclusive=True knocks down SocketCAN / slcand.
+_EXCLUDE_SUBSTRINGS = (
+    "canable",
+    "cantact",
+    "candle",
+    "gs_usb",
+    "geschmacksrichtung",  # OpenMoko CANable product string
+    "slcan",
+    "socketcan",
+    "usb2can",
+    "usb-to-can",
+    "usb_to_can",
+    "ixxat",
+    "peak_system",
+    "pcan",
+    "kvaser",
+    "can_usb",
+    "canusb",
+    "canbus",
+    "can-bus",
+    "lawicel",
+)
+
+# Prefer these UART bridge chips for lidar/IMU; unknown ACM gadgets are skipped.
+_SENSOR_CHIP_SUBSTRINGS = (
+    "silicon_labs",
+    "cp210",
+    "1a86",  # WCH CH340 / CH341
+    "wch.cn",
+    "wch_",
+    "usb_serial",  # common CH340 by-id: usb-1a86_USB_Serial-...
+    "ftdi",
+    "ft232",
+    "ft230",
+    "prolific",
+    "pl2303",
+)
+
 
 def list_candidate_serial_ports(
     *,
     prefer_cp210: bool = True,
     chip: Optional[str] = None,
+    include_tty_acm: bool = False,
+    exclude: Optional[Sequence[str]] = None,
 ) -> List[str]:
-    """Return serial device candidates.
+    """Return serial device candidates safe to probe for lidar / IMU.
 
-    ``prefer_cp210=True``: Silicon Labs / CP210 by-id first.
-    ``prefer_cp210=False``: by-path / non-CP210 first.
+    Skips USB-CAN and other non-sensor adapters so exclusive opens cannot
+    disrupt SocketCAN / slcand. Prefers ``/dev/serial/by-id`` over by-path.
+
+    ``prefer_cp210=True``: Silicon Labs / CP210 by-id first (typical RPLIDAR).
+    ``prefer_cp210=False``: non-CP210 (CH340) first (typical WitMotion).
 
     ``chip`` hard-filters when both adapters are present:
-      - ``\"cp210\"``: only Silicon Labs / CP210 devices (WitMotion IMU)
-      - ``\"ch340\"``: only non-CP210 USB-serial (typical CH340 RPLIDAR)
+      - ``\"cp210\"``: only Silicon Labs / CP210 devices
+      - ``\"ch340\"``: only non-CP210 USB-serial (typical CH340)
       - ``None``: no chip filter
+
+    ``include_tty_acm``: also consider ``/dev/ttyACM*`` (off by default —
+    CANable / CDC gadgets live there; RPLIDAR / Wit are almost always ttyUSB).
+
+    ``exclude``: extra path substrings to skip (from config ``serial_exclude``).
     """
     seen: set[str] = set()
     out: List[str] = []
+    extra_exclude = tuple(str(x) for x in (exclude or []) if str(x).strip())
 
     def add(path: str) -> None:
         if path in seen:
+            return
+        if _should_skip_port(path, extra_exclude=extra_exclude):
             return
         seen.add(path)
         out.append(path)
@@ -44,8 +97,7 @@ def list_candidate_serial_ports(
     other_id = [p for p in by_id if p not in cp210]
     cp210_reals = {_realpath(p) for p in cp210}
 
-    # Prefer by-id over by-path: by-path can linger after USB re-enumeration and
-    # open with EIO while the live by-id → ttyUSBn link still works.
+    # Prefer by-id over by-path: by-path can linger after USB re-enumeration.
     if prefer_cp210:
         for path in cp210:
             add(path)
@@ -61,14 +113,26 @@ def list_candidate_serial_ports(
         for path in by_path:
             add(path)
 
-    for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*"):
-        for path in sorted(glob.glob(pattern)):
+    # Only fall back to raw tty nodes when by-id/by-path yielded nothing useful.
+    # Always skip ttyACM unless explicitly enabled (CAN / CDC collision).
+    if not out:
+        for path in sorted(glob.glob("/dev/ttyUSB*")):
+            add(path)
+        if include_tty_acm:
+            for path in sorted(glob.glob("/dev/ttyACM*")):
+                add(path)
+    elif include_tty_acm:
+        for path in sorted(glob.glob("/dev/ttyACM*")):
             add(path)
 
     deduped = _dedupe_by_realpath(out)
+    # Drop unknown gadgets when by-id naming is available (keep CH340/CP210/FTDI).
+    sensorish = [p for p in deduped if _looks_like_sensor_uart(p) or not _has_by_id_name(p)]
+    if sensorish:
+        deduped = sensorish
+
     if chip == "cp210":
         filtered = [p for p in deduped if _realpath(p) in cp210_reals or _is_cp210_id(p)]
-        # Fall back to full list if no CP210 is enumerated yet (USB still probing).
         return filtered or deduped
     if chip == "ch340":
         filtered = [
@@ -78,6 +142,75 @@ def list_candidate_serial_ports(
         ]
         return filtered or deduped
     return deduped
+
+
+def normalize_exclude_list(value) -> List[str]:
+    """Parse ``serial_exclude`` from Viam attrs (list, tuple, or comma string)."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [p.strip() for p in value.split(",") if p.strip()]
+    if isinstance(value, (list, tuple)):
+        out: List[str] = []
+        for item in value:
+            out.extend(normalize_exclude_list(item))
+        return out
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _should_skip_port(path: str, *, extra_exclude: Sequence[str] = ()) -> bool:
+    lowered = path.lower()
+    for token in _EXCLUDE_SUBSTRINGS:
+        if token in lowered:
+            return True
+    for token in extra_exclude:
+        if token.lower() in lowered:
+            return True
+    # Resolve aliases and re-check by-id siblings for the same tty.
+    real = _realpath(path)
+    for sibling in _by_id_aliases(real):
+        sib = sibling.lower()
+        for token in _EXCLUDE_SUBSTRINGS:
+            if token in sib:
+                return True
+        for token in extra_exclude:
+            if token.lower() in sib:
+                return True
+    return False
+
+
+def _by_id_aliases(real: str) -> List[str]:
+    out: List[str] = []
+    for path in glob.glob("/dev/serial/by-id/usb-*"):
+        try:
+            if os.path.realpath(path) == real:
+                out.append(path)
+        except OSError:
+            continue
+    return out
+
+
+def _has_by_id_name(path: str) -> bool:
+    return "/serial/by-id/" in path.replace("\\", "/")
+
+
+def _looks_like_sensor_uart(path: str) -> bool:
+    """True for known USB-UART bridge naming used by RPLIDAR / Wit adapters."""
+    lowered = path.lower()
+    if any(token in lowered for token in _SENSOR_CHIP_SUBSTRINGS):
+        return True
+    real = _realpath(path)
+    for sibling in _by_id_aliases(real):
+        sib = sibling.lower()
+        if any(token in sib for token in _SENSOR_CHIP_SUBSTRINGS):
+            return True
+    # by-path / raw ttyUSB with no by-id: allow (legacy setups).
+    if not _by_id_aliases(real) and (
+        re.search(r"/ttyUSB\d+$", real) or "/serial/by-path/" in path
+    ):
+        return True
+    return False
 
 
 def _is_cp210_id(path: str) -> bool:

@@ -85,6 +85,10 @@ class RPLidarSerial:
         reset_settle_s: float = 0.5,
         rounds: int = 8,
         retry_sleep_s: float = 0.5,
+        prefer_cp210: bool = True,
+        chip: Optional[str] = None,
+        include_tty_acm: bool = False,
+        exclude: Optional[List[str]] = None,
     ) -> "RPLidarSerial":
         """Try each port until GET_INFO succeeds.
 
@@ -94,7 +98,6 @@ class RPLidarSerial:
         last so a false WitMotion claim cannot permanently hide the lidar.
         """
         from .serial_ports import (
-            claim_serial_port,
             is_port_busy_error,
             is_port_missing_error,
             list_candidate_serial_ports,
@@ -104,10 +107,15 @@ class RPLidarSerial:
 
         errors: dict[str, str] = {}
         candidates = list(ports)
+        list_kwargs = dict(
+            prefer_cp210=prefer_cp210,
+            chip=chip,
+            include_tty_acm=include_tty_acm,
+            exclude=exclude,
+        )
         for round_i in range(max(1, rounds)):
             if round_i > 0:
-                # Lidar is usually CP210; Wit/CH340 first wastes timeouts.
-                refreshed = list_candidate_serial_ports(prefer_cp210=True)
+                refreshed = list_candidate_serial_ports(**list_kwargs)
                 if refreshed:
                     candidates = refreshed
             candidates = sort_unclaimed_first("lidar", candidates)
@@ -145,7 +153,9 @@ class RPLidarSerial:
             f"Tried: {', '.join(candidates)}. Errors: {detail}. "
             "If a port is exclusively locked, the IMU may still be probing — "
             "retry, or pin serial_path / depends_on so lidar starts first. "
-            "Check ls /dev/ttyUSB* /dev/serial/by-path for two devices."
+            "Autodetect skips USB-CAN/ttyACM; pin serial_path or set "
+            "include_tty_acm=true only if needed. "
+            "Check ls /dev/serial/by-id for CP210 (lidar) vs CH340 (IMU)."
         )
 
     def _connect_serial(self, baud: int):

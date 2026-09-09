@@ -72,6 +72,10 @@ class WitSerial:
         exclude_ports: Optional[List[str]] = None,
         rounds: int = 8,
         retry_sleep_s: float = 0.5,
+        prefer_cp210: bool = False,
+        chip: Optional[str] = None,
+        include_tty_acm: bool = False,
+        exclude: Optional[List[str]] = None,
     ) -> "WitSerial":
         """Try each port until WitMotion frames are seen (skips silent lidars)."""
         from ..lidar.serial_ports import (
@@ -85,9 +89,15 @@ class WitSerial:
         skip = set(exclude_ports or [])
         errors: dict = {}
         candidates = list(ports)
+        list_kwargs = dict(
+            prefer_cp210=prefer_cp210,
+            chip=chip,
+            include_tty_acm=include_tty_acm,
+            exclude=exclude,
+        )
         for round_i in range(max(1, rounds)):
             if round_i > 0:
-                refreshed = list_candidate_serial_ports(prefer_cp210=False)
+                refreshed = list_candidate_serial_ports(**list_kwargs)
                 if refreshed:
                     candidates = refreshed
             candidates = sort_unclaimed_first("imu", candidates)
@@ -118,7 +128,9 @@ class WitSerial:
         detail = "; ".join(f"{p}: {e}" for p, e in errors.items()) or "(no ports)"
         raise WitError(
             "no WitMotion IMU responded on any candidate serial port. "
-            f"Tried: {', '.join(candidates)}. Errors: {detail}"
+            f"Tried: {', '.join(candidates)}. Errors: {detail}. "
+            "Autodetect skips USB-CAN/ttyACM; pin a /dev/serial/by-id/... path "
+            "or set serial_exclude / include_tty_acm if needed."
         )
 
     def _connect(self, baud: int):

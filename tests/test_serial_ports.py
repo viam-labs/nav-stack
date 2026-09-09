@@ -157,3 +157,83 @@ def test_eio_counts_as_missing_for_retry():
             "SerialException(5, \"could not open port: [Errno 5] Input/output error\")"
         )
     )
+
+
+def test_autodetect_skips_can_and_ttyacm():
+    fake_id = [
+        "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+        "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_abc-if00-port0",
+        "/dev/serial/by-id/usb-OpenMoko_Geschmacksrichtung_CANable_123-if00-port0",
+        "/dev/serial/by-id/usb-Prototype_CANtact_if00-port0",
+    ]
+    fake_acm = ["/dev/ttyACM0", "/dev/ttyACM1"]
+
+    def fake_glob(pat: str):
+        if "by-id" in pat:
+            return list(fake_id)
+        if "by-path" in pat:
+            return []
+        if "ttyACM" in pat:
+            return list(fake_acm)
+        if "ttyUSB" in pat:
+            return []
+        return []
+
+    def realpath(p: str) -> str:
+        if "1a86" in p:
+            return "/dev/ttyUSB0"
+        if "Silicon" in p:
+            return "/dev/ttyUSB1"
+        if "CANable" in p or "OpenMoko" in p:
+            return "/dev/ttyACM0"
+        if "CANtact" in p:
+            return "/dev/ttyACM1"
+        return p
+
+    with (
+        patch("src.lidar.serial_ports.glob.glob", side_effect=fake_glob),
+        patch("src.lidar.serial_ports.os.path.exists", return_value=True),
+        patch("src.lidar.serial_ports.os.path.realpath", side_effect=realpath),
+    ):
+        ports = list_candidate_serial_ports(prefer_cp210=True)
+        lidar = list_candidate_serial_ports(prefer_cp210=True, chip="cp210")
+        imu = list_candidate_serial_ports(prefer_cp210=False, chip="ch340")
+
+    assert all("CAN" not in p and "OpenMoko" not in p for p in ports)
+    assert all(not p.startswith("/dev/ttyACM") for p in ports)
+    assert lidar[0].startswith("/dev/serial/by-id/usb-Silicon_Labs")
+    assert imu[0].startswith("/dev/serial/by-id/usb-1a86")
+
+
+def test_serial_exclude_extra_substring():
+    fake_id = [
+        "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+        "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0",
+    ]
+
+    def fake_glob(pat: str):
+        if "by-id" in pat:
+            return list(fake_id)
+        return []
+
+    with (
+        patch("src.lidar.serial_ports.glob.glob", side_effect=fake_glob),
+        patch("src.lidar.serial_ports.os.path.exists", return_value=True),
+        patch(
+            "src.lidar.serial_ports.os.path.realpath",
+            side_effect=lambda p: (
+                "/dev/ttyUSB0" if "1a86" in p else "/dev/ttyUSB1" if "Silicon" in p else p
+            ),
+        ),
+    ):
+        ports = list_candidate_serial_ports(exclude=["1a86"])
+
+    assert len(ports) == 1
+    assert "Silicon_Labs" in ports[0]
+
+
+def test_normalize_exclude_list():
+    from src.lidar.serial_ports import normalize_exclude_list
+
+    assert normalize_exclude_list("can0, ttyACM") == ["can0", "ttyACM"]
+    assert normalize_exclude_list(["a", "b"]) == ["a", "b"]

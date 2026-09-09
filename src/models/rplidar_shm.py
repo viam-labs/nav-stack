@@ -26,7 +26,7 @@ from viam.utils import struct_to_dict
 
 from ..lidar.rplidar_protocol import RPLidarError, model_name, scan_to_xyz_m
 from ..lidar.rplidar_serial import RPLidarSerial
-from ..lidar.serial_ports import list_candidate_serial_ports
+from ..lidar.serial_ports import list_candidate_serial_ports, normalize_exclude_list
 from ..ros import conversions as conv
 from ..ros import pcshm
 
@@ -76,6 +76,9 @@ class RPLidarShm(Camera):
         self._max_reconnect_backoff_s = 15.0
         self._max_publish_gap_s = 5.0
         self._stall_thread: Optional[threading.Thread] = None
+        self._serial_exclude: list[str] = []
+        self._serial_chip: Optional[str] = None
+        self._include_tty_acm = False
 
     def _join_timeout_s(self) -> float:
         """Long enough for scan loop to exit reconnect backoff and UART reads."""
@@ -104,6 +107,9 @@ class RPLidarShm(Camera):
             raise ValueError(
                 "rplidar requires attributes.serial_path or serial_autodetect=true"
             )
+        chip = str(attrs.get("serial_chip") or "").strip().lower() or None
+        if chip not in (None, "cp210", "ch340"):
+            raise ValueError("rplidar serial_chip must be cp210, ch340, or omitted")
         return [], []
 
     def reconfigure(
@@ -128,6 +134,12 @@ class RPLidarShm(Camera):
         self._max_reconnect_backoff_s = float(attrs.get("max_reconnect_backoff_s", 15.0))
         self._max_publish_gap_s = float(attrs.get("max_publish_gap_s", 5.0))
         self._serial_path = serial_path or None
+        self._serial_exclude = normalize_exclude_list(attrs.get("serial_exclude"))
+        chip = str(attrs.get("serial_chip") or "").strip().lower() or None
+        if chip not in (None, "cp210", "ch340"):
+            raise ValueError("rplidar serial_chip must be cp210, ch340, or omitted")
+        self._serial_chip = chip
+        self._include_tty_acm = bool(attrs.get("include_tty_acm", False))
         self._stall_abort.clear()
         self._scan_loop_progress_wall = None
         self._kick_count = 0
@@ -190,14 +202,23 @@ class RPLidarShm(Camera):
             )
             dev.open()
         elif self._serial_autodetect:
-            # Prefer CP210 (typical RPLIDAR adapter); still protocol-detects Wit.
-            ports = list_candidate_serial_ports(prefer_cp210=True)
+            # CP210 first (typical RPLIDAR); never probe USB-CAN / ttyACM.
+            ports = list_candidate_serial_ports(
+                prefer_cp210=True,
+                chip=self._serial_chip or "cp210",
+                include_tty_acm=self._include_tty_acm,
+                exclude=self._serial_exclude,
+            )
             dev = RPLidarSerial.open_first_working(
                 ports,
                 baudrate=self._baudrate,
                 timeout_s=self._timeout_s,
                 motor_warmup_s=self._motor_warmup_s,
                 reset_settle_s=self._reset_settle_s,
+                prefer_cp210=True,
+                chip=self._serial_chip or "cp210",
+                include_tty_acm=self._include_tty_acm,
+                exclude=self._serial_exclude,
             )
             self._serial_path = dev.port
             LOGGER.info("nav-stack rplidar autodetected serial=%s", self._serial_path)
