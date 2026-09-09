@@ -134,6 +134,13 @@ class WitSerial:
         )
 
     def _connect(self, baud: int):
+        from ..lidar.serial_ports import is_safe_sensor_serial_port
+
+        if not is_safe_sensor_serial_port(self.port):
+            raise WitError(
+                f"refusing to open {self.port!r}: not a known IMU UART bridge "
+                "(or USB id is a CAN adapter such as OpenMoko 1d50:606f)"
+            )
         kwargs = dict(
             baudrate=baud,
             parity=_pyserial.PARITY_NONE,

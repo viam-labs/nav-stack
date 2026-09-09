@@ -160,6 +160,13 @@ class RPLidarSerial:
 
     def _connect_serial(self, baud: int):
         """Open the UART like viam-modules/rplidar: no DTR/DSR flow control."""
+        from .serial_ports import is_safe_sensor_serial_port
+
+        if not is_safe_sensor_serial_port(self.port):
+            raise proto.RPLidarError(
+                f"refusing to open {self.port!r}: not a known lidar UART bridge "
+                "(or USB id is a CAN adapter such as OpenMoko 1d50:606f)"
+            )
         kwargs = dict(
             baudrate=baud,
             parity=_pyserial.PARITY_NONE,

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from src.lidar.serial_ports import _dedupe_by_realpath, list_candidate_serial_ports
+from src.lidar.serial_ports import (
+    _dedupe_by_realpath,
+    is_safe_sensor_serial_port,
+    list_candidate_serial_ports,
+    normalize_exclude_list,
+)
 
 
 def test_candidate_ports_prefer_cp2102_by_id():
@@ -16,8 +21,6 @@ def test_candidate_ports_prefer_cp2102_by_id():
     def fake_glob(pat: str):
         if "by-id" in pat:
             return [p for p in fake if "by-id" in p]
-        if "ttyUSB" in pat:
-            return [p for p in fake if "ttyUSB" in p]
         return []
 
     with (
@@ -27,10 +30,14 @@ def test_candidate_ports_prefer_cp2102_by_id():
             "src.lidar.serial_ports.os.path.realpath",
             side_effect=lambda p: p,
         ),
+        patch("src.lidar.serial_ports._usb_vid_pid_for_port", return_value=None),
+        patch("src.lidar.serial_ports._tty_driver_name", return_value="cp210x"),
+        patch("src.lidar.serial_ports._tty_bound_to_can_netdev", return_value=False),
     ):
         ports = list_candidate_serial_ports()
 
     assert ports[0].startswith("/dev/serial/by-id/usb-Silicon_Labs")
+    assert all("/ttyUSB" not in p for p in ports)
 
 
 def test_dedupe_collapses_by_id_and_by_path_aliases():
@@ -82,22 +89,16 @@ def test_chip_filter_separates_cp210_and_ch340():
         "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
         "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0",
     ]
-    fake_path = [
-        "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0",
-        "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:1:1.0-port0",
-    ]
 
     def fake_glob(pat: str):
         if "by-id" in pat:
             return list(fake_id)
-        if "by-path" in pat:
-            return list(fake_path)
         return []
 
     def realpath(p: str) -> str:
-        if "1a86" in p or "0:2" in p:
+        if "1a86" in p:
             return "/dev/ttyUSB2"
-        if "Silicon" in p or "0:1" in p:
+        if "Silicon" in p:
             return "/dev/ttyUSB1"
         return p
 
@@ -105,6 +106,9 @@ def test_chip_filter_separates_cp210_and_ch340():
         patch("src.lidar.serial_ports.glob.glob", side_effect=fake_glob),
         patch("src.lidar.serial_ports.os.path.exists", return_value=True),
         patch("src.lidar.serial_ports.os.path.realpath", side_effect=realpath),
+        patch("src.lidar.serial_ports._usb_vid_pid_for_port", return_value=None),
+        patch("src.lidar.serial_ports._tty_driver_name", return_value="cp210x"),
+        patch("src.lidar.serial_ports._tty_bound_to_can_netdev", return_value=False),
     ):
         imu_ports = list_candidate_serial_ports(prefer_cp210=True, chip="cp210")
         lidar_ports = list_candidate_serial_ports(prefer_cp210=False, chip="ch340")
@@ -114,27 +118,21 @@ def test_chip_filter_separates_cp210_and_ch340():
     assert all(realpath(p) == "/dev/ttyUSB2" for p in lidar_ports)
 
 
-def test_prefer_cp210_false_puts_by_id_before_by_path():
+def test_prefer_cp210_false_puts_ch340_first():
     fake_id = [
         "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
         "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0",
-    ]
-    fake_path = [
-        "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0",
-        "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:1:1.0-port0",
     ]
 
     def fake_glob(pat: str):
         if "by-id" in pat:
             return list(fake_id)
-        if "by-path" in pat:
-            return list(fake_path)
         return []
 
     def realpath(p: str) -> str:
-        if "1a86" in p or "0:2" in p:
+        if "1a86" in p:
             return "/dev/ttyUSB2"
-        if "Silicon" in p or "0:1" in p:
+        if "Silicon" in p:
             return "/dev/ttyUSB1"
         return p
 
@@ -142,6 +140,9 @@ def test_prefer_cp210_false_puts_by_id_before_by_path():
         patch("src.lidar.serial_ports.glob.glob", side_effect=fake_glob),
         patch("src.lidar.serial_ports.os.path.exists", return_value=True),
         patch("src.lidar.serial_ports.os.path.realpath", side_effect=realpath),
+        patch("src.lidar.serial_ports._usb_vid_pid_for_port", return_value=None),
+        patch("src.lidar.serial_ports._tty_driver_name", return_value="ch341"),
+        patch("src.lidar.serial_ports._tty_bound_to_can_netdev", return_value=False),
     ):
         ports = list_candidate_serial_ports(prefer_cp210=False)
 
@@ -159,24 +160,24 @@ def test_eio_counts_as_missing_for_retry():
     )
 
 
-def test_autodetect_skips_can_and_ttyacm():
+def test_autodetect_never_lists_openmoko_can_or_by_path():
     fake_id = [
         "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
         "/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_abc-if00-port0",
-        "/dev/serial/by-id/usb-OpenMoko_Geschmacksrichtung_CANable_123-if00-port0",
-        "/dev/serial/by-id/usb-Prototype_CANtact_if00-port0",
+        "/dev/serial/by-id/usb-OpenMoko_Inc._Geschwister_Schneider_CAN_adapter_123-if00-port0",
+        "/dev/serial/by-id/usb-1d50_606f_CAN_if00-port0",
     ]
-    fake_acm = ["/dev/ttyACM0", "/dev/ttyACM1"]
+    fake_path = [
+        "/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.4:1.0-port0",
+    ]
 
     def fake_glob(pat: str):
         if "by-id" in pat:
             return list(fake_id)
         if "by-path" in pat:
-            return []
+            return list(fake_path)
         if "ttyACM" in pat:
-            return list(fake_acm)
-        if "ttyUSB" in pat:
-            return []
+            return ["/dev/ttyACM0"]
         return []
 
     def realpath(p: str) -> str:
@@ -184,25 +185,39 @@ def test_autodetect_skips_can_and_ttyacm():
             return "/dev/ttyUSB0"
         if "Silicon" in p:
             return "/dev/ttyUSB1"
-        if "CANable" in p or "OpenMoko" in p:
+        if "OpenMoko" in p or "1d50" in p or "ttyACM" in p:
             return "/dev/ttyACM0"
-        if "CANtact" in p:
-            return "/dev/ttyACM1"
+        if "by-path" in p:
+            return "/dev/ttyACM0"
         return p
 
     with (
         patch("src.lidar.serial_ports.glob.glob", side_effect=fake_glob),
         patch("src.lidar.serial_ports.os.path.exists", return_value=True),
         patch("src.lidar.serial_ports.os.path.realpath", side_effect=realpath),
+        patch("src.lidar.serial_ports._usb_vid_pid_for_port", return_value=None),
+        patch("src.lidar.serial_ports._tty_driver_name", return_value="cp210x"),
+        patch("src.lidar.serial_ports._tty_bound_to_can_netdev", return_value=False),
     ):
         ports = list_candidate_serial_ports(prefer_cp210=True)
         lidar = list_candidate_serial_ports(prefer_cp210=True, chip="cp210")
         imu = list_candidate_serial_ports(prefer_cp210=False, chip="ch340")
 
-    assert all("CAN" not in p and "OpenMoko" not in p for p in ports)
-    assert all(not p.startswith("/dev/ttyACM") for p in ports)
+    joined = " ".join(ports)
+    assert "OpenMoko" not in joined
+    assert "1d50" not in joined
+    assert "by-path" not in joined
+    assert "ttyACM" not in joined
     assert lidar[0].startswith("/dev/serial/by-id/usb-Silicon_Labs")
     assert imu[0].startswith("/dev/serial/by-id/usb-1a86")
+
+
+def test_refuse_openmoko_vid_pid():
+    with patch(
+        "src.lidar.serial_ports._usb_vid_pid_for_port",
+        return_value=("1d50", "606f"),
+    ):
+        assert not is_safe_sensor_serial_port("/dev/ttyACM0")
 
 
 def test_serial_exclude_extra_substring():
@@ -225,6 +240,9 @@ def test_serial_exclude_extra_substring():
                 "/dev/ttyUSB0" if "1a86" in p else "/dev/ttyUSB1" if "Silicon" in p else p
             ),
         ),
+        patch("src.lidar.serial_ports._usb_vid_pid_for_port", return_value=None),
+        patch("src.lidar.serial_ports._tty_driver_name", return_value="cp210x"),
+        patch("src.lidar.serial_ports._tty_bound_to_can_netdev", return_value=False),
     ):
         ports = list_candidate_serial_ports(exclude=["1a86"])
 
@@ -233,7 +251,30 @@ def test_serial_exclude_extra_substring():
 
 
 def test_normalize_exclude_list():
-    from src.lidar.serial_ports import normalize_exclude_list
-
     assert normalize_exclude_list("can0, ttyACM") == ["can0", "ttyACM"]
     assert normalize_exclude_list(["a", "b"]) == ["a", "b"]
+
+
+def test_chip_filter_does_not_fallback_to_other_chips():
+    fake_id = [
+        "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+    ]
+
+    def fake_glob(pat: str):
+        if "by-id" in pat:
+            return list(fake_id)
+        return []
+
+    with (
+        patch("src.lidar.serial_ports.glob.glob", side_effect=fake_glob),
+        patch("src.lidar.serial_ports.os.path.exists", return_value=True),
+        patch(
+            "src.lidar.serial_ports.os.path.realpath",
+            side_effect=lambda p: "/dev/ttyUSB0" if "1a86" in p else p,
+        ),
+        patch("src.lidar.serial_ports._usb_vid_pid_for_port", return_value=None),
+        patch("src.lidar.serial_ports._tty_driver_name", return_value="ch341"),
+        patch("src.lidar.serial_ports._tty_bound_to_can_netdev", return_value=False),
+    ):
+        # Lidar asking for CP210 must not fall back to CH340.
+        assert list_candidate_serial_ports(chip="cp210") == []

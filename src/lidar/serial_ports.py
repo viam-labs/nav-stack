@@ -3,25 +3,41 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
-import re
 import threading
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+
+LOGGER = logging.getLogger(__name__)
 
 # In-process registry so lidar + IMU (same module process) don't steal each
 # other's port during parallel resource startup.
 _claims_lock = threading.Lock()
 _claims: Dict[str, str] = {}  # realpath -> owner ("lidar" | "imu")
 
-# by-id / path substrings that must never be opened (USB-CAN, etc.).
-# Opening these with exclusive=True knocks down SocketCAN / slcand.
+# USB VID:PID that must never be opened. Opening / resetting these (or their
+# hub siblings via aggressive probes) knocks SocketCAN offline.
+# 1d50:606f = OpenMoko / Geschwister Schneider / CANable / candleLight (gs_usb).
+_CAN_USB_IDS: Set[Tuple[str, str]] = {
+    ("1d50", "606f"),  # candleLight / CANable / Geschwister Schneider
+    ("08d8", "0008"),  # IXXAT USB-to-CAN
+    ("0c72", "000c"),  # PEAK PCAN-USB (common)
+    ("0c72", "000d"),
+}
+
+# by-id / path substrings that must never be opened.
 _EXCLUDE_SUBSTRINGS = (
     "canable",
     "cantact",
     "candle",
     "gs_usb",
-    "geschmacksrichtung",  # OpenMoko CANable product string
+    "geschwister",  # OpenMoko Geschwister Schneider CAN
+    "geschmacksrichtung",
+    "openmoko",
+    "schneider_can",
+    "1d50_606f",
+    "1d50:606f",
     "slcan",
     "socketcan",
     "usb2can",
@@ -38,19 +54,30 @@ _EXCLUDE_SUBSTRINGS = (
     "lawicel",
 )
 
-# Prefer these UART bridge chips for lidar/IMU; unknown ACM gadgets are skipped.
-_SENSOR_CHIP_SUBSTRINGS = (
+# Autodetect allowlist: only these UART-bridge by-id tokens (lidar / IMU).
+_ALLOW_BY_ID_SUBSTRINGS = (
     "silicon_labs",
     "cp210",
     "1a86",  # WCH CH340 / CH341
     "wch.cn",
     "wch_",
-    "usb_serial",  # common CH340 by-id: usb-1a86_USB_Serial-...
     "ftdi",
     "ft232",
     "ft230",
     "prolific",
     "pl2303",
+)
+
+# Kernel USB-serial drivers we will open. Anything else (cdc_acm, etc.) is skip.
+_ALLOW_TTY_DRIVERS = frozenset(
+    {
+        "cp210x",
+        "ch341",
+        "ch343",
+        "ftdi_sio",
+        "pl2303",
+        "usbserial",  # generic wrapper sometimes shown as parent
+    }
 )
 
 
@@ -63,22 +90,16 @@ def list_candidate_serial_ports(
 ) -> List[str]:
     """Return serial device candidates safe to probe for lidar / IMU.
 
-    Skips USB-CAN and other non-sensor adapters so exclusive opens cannot
-    disrupt SocketCAN / slcand. Prefers ``/dev/serial/by-id`` over by-path.
+    Autodetect is **allowlist-only**:
+      - ``/dev/serial/by-id/usb-*`` matching known UART chips (CP210/CH340/…)
+      - sysfs driver must be a USB-UART bridge (not ``cdc_acm``)
+      - USB VID:PID must not be a known CAN adapter (e.g. ``1d50:606f``)
 
-    ``prefer_cp210=True``: Silicon Labs / CP210 by-id first (typical RPLIDAR).
-    ``prefer_cp210=False``: non-CP210 (CH340) first (typical WitMotion).
-
-    ``chip`` hard-filters when both adapters are present:
-      - ``\"cp210\"``: only Silicon Labs / CP210 devices
-      - ``\"ch340\"``: only non-CP210 USB-serial (typical CH340)
-      - ``None``: no chip filter
-
-    ``include_tty_acm``: also consider ``/dev/ttyACM*`` (off by default —
-    CANable / CDC gadgets live there; RPLIDAR / Wit are almost always ttyUSB).
-
-    ``exclude``: extra path substrings to skip (from config ``serial_exclude``).
+    Never probes by-path, raw ``ttyACM*``, or unknown gadgets — those are how
+    Geschwister Schneider / CANable adapters get exclusive-opened or the hub
+    gets reset and ``can0`` drops.
     """
+    _ = include_tty_acm  # retained for config compat; ACM never auto-probed
     seen: set[str] = set()
     out: List[str] = []
     extra_exclude = tuple(str(x) for x in (exclude or []) if str(x).strip())
@@ -86,62 +107,76 @@ def list_candidate_serial_ports(
     def add(path: str) -> None:
         if path in seen:
             return
-        if _should_skip_port(path, extra_exclude=extra_exclude):
+        if not is_safe_sensor_serial_port(path, extra_exclude=extra_exclude):
             return
         seen.add(path)
         out.append(path)
 
-    by_path = sorted(glob.glob("/dev/serial/by-path/*"))
     by_id = sorted(glob.glob("/dev/serial/by-id/usb-*"))
-    cp210 = [p for p in by_id if _is_cp210_id(p)]
-    other_id = [p for p in by_id if p not in cp210]
+    # Strict allowlist: only named UART bridges. No by-path / ttyUSB / ttyACM.
+    allowed = [p for p in by_id if _by_id_allowlisted(p)]
+    cp210 = [p for p in allowed if _is_cp210_id(p)]
+    other_id = [p for p in allowed if p not in cp210]
     cp210_reals = {_realpath(p) for p in cp210}
 
-    # Prefer by-id over by-path: by-path can linger after USB re-enumeration.
     if prefer_cp210:
         for path in cp210:
             add(path)
         for path in other_id:
-            add(path)
-        for path in by_path:
             add(path)
     else:
         for path in other_id:
             add(path)
         for path in cp210:
             add(path)
-        for path in by_path:
-            add(path)
-
-    # Only fall back to raw tty nodes when by-id/by-path yielded nothing useful.
-    # Always skip ttyACM unless explicitly enabled (CAN / CDC collision).
-    if not out:
-        for path in sorted(glob.glob("/dev/ttyUSB*")):
-            add(path)
-        if include_tty_acm:
-            for path in sorted(glob.glob("/dev/ttyACM*")):
-                add(path)
-    elif include_tty_acm:
-        for path in sorted(glob.glob("/dev/ttyACM*")):
-            add(path)
 
     deduped = _dedupe_by_realpath(out)
-    # Drop unknown gadgets when by-id naming is available (keep CH340/CP210/FTDI).
-    sensorish = [p for p in deduped if _looks_like_sensor_uart(p) or not _has_by_id_name(p)]
-    if sensorish:
-        deduped = sensorish
 
     if chip == "cp210":
         filtered = [p for p in deduped if _realpath(p) in cp210_reals or _is_cp210_id(p)]
-        return filtered or deduped
+        # Do NOT fall back to non-CP210 — that reintroduces wrong-port probes.
+        return filtered
     if chip == "ch340":
         filtered = [
             p
             for p in deduped
             if _realpath(p) not in cp210_reals and not _is_cp210_id(p)
         ]
-        return filtered or deduped
+        return filtered
     return deduped
+
+
+def is_safe_sensor_serial_port(
+    path: str, *, extra_exclude: Sequence[str] = ()
+) -> bool:
+    """False for CAN adapters / unknown USB gadgets — never open these."""
+    if _should_skip_port(path, extra_exclude=extra_exclude):
+        return False
+    if _usb_id_is_can(path):
+        LOGGER.warning(
+            "skipping serial port %s: USB id matches CAN adapter denylist", path
+        )
+        return False
+    if _tty_bound_to_can_netdev(path):
+        LOGGER.warning("skipping serial port %s: tied to SocketCAN netdev", path)
+        return False
+    driver = _tty_driver_name(path)
+    if driver and driver not in _ALLOW_TTY_DRIVERS and driver != "usbserial":
+        # cdc_acm / gs_usb / etc.
+        if driver in ("cdc_acm", "gs_usb", "slcan", "usb_wwan"):
+            LOGGER.warning(
+                "skipping serial port %s: kernel driver %r is not a UART bridge",
+                path,
+                driver,
+            )
+            return False
+    # Allowlist by-id name when present.
+    aliases = _by_id_aliases(_realpath(path))
+    if aliases and not any(_by_id_allowlisted(a) for a in aliases):
+        return False
+    if _has_by_id_name(path) and not _by_id_allowlisted(path):
+        return False
+    return True
 
 
 def normalize_exclude_list(value) -> List[str]:
@@ -159,6 +194,11 @@ def normalize_exclude_list(value) -> List[str]:
     return [text] if text else []
 
 
+def _by_id_allowlisted(path: str) -> bool:
+    lowered = path.lower()
+    return any(token in lowered for token in _ALLOW_BY_ID_SUBSTRINGS)
+
+
 def _should_skip_port(path: str, *, extra_exclude: Sequence[str] = ()) -> bool:
     lowered = path.lower()
     for token in _EXCLUDE_SUBSTRINGS:
@@ -167,7 +207,6 @@ def _should_skip_port(path: str, *, extra_exclude: Sequence[str] = ()) -> bool:
     for token in extra_exclude:
         if token.lower() in lowered:
             return True
-    # Resolve aliases and re-check by-id siblings for the same tty.
     real = _realpath(path)
     for sibling in _by_id_aliases(real):
         sib = sibling.lower()
@@ -176,6 +215,130 @@ def _should_skip_port(path: str, *, extra_exclude: Sequence[str] = ()) -> bool:
                 return True
         for token in extra_exclude:
             if token.lower() in sib:
+                return True
+    return False
+
+
+def _sysfs_tty_dir(path: str) -> Optional[str]:
+    real = _realpath(path)
+    base = os.path.basename(real)
+    if not base.startswith("tty"):
+        return None
+    candidate = f"/sys/class/tty/{base}/device"
+    if os.path.isdir(candidate) or os.path.islink(candidate):
+        return candidate
+    return None
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _usb_vid_pid_for_port(path: str) -> Optional[Tuple[str, str]]:
+    """Walk sysfs from a tty node up to the USB device; return (vid, pid)."""
+    tty_dev = _sysfs_tty_dir(path)
+    if not tty_dev:
+        return None
+    try:
+        cur = os.path.realpath(tty_dev)
+    except OSError:
+        return None
+    for _ in range(8):
+        vid = _read_text(os.path.join(cur, "idVendor")).lower()
+        pid = _read_text(os.path.join(cur, "idProduct")).lower()
+        if vid and pid:
+            return vid, pid
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def _usb_id_is_can(path: str) -> bool:
+    pair = _usb_vid_pid_for_port(path)
+    if pair and pair in _CAN_USB_IDS:
+        return True
+    # Also match by-id spelling usb-1d50_606f_...
+    lowered = path.lower()
+    if "1d50_606f" in lowered or "1d50:606f" in lowered:
+        return True
+    for sibling in _by_id_aliases(_realpath(path)):
+        s = sibling.lower()
+        if "1d50_606f" in s or "1d50:606f" in s or "openmoko" in s:
+            return True
+    return False
+
+
+def _tty_driver_name(path: str) -> Optional[str]:
+    tty_dev = _sysfs_tty_dir(path)
+    if not tty_dev:
+        return None
+    driver_link = os.path.join(tty_dev, "driver")
+    try:
+        if os.path.islink(driver_link) or os.path.exists(driver_link):
+            return os.path.basename(os.path.realpath(driver_link))
+    except OSError:
+        return None
+    # usb-serial child: .../ttyUSB0/device -> ../.. may be the usb-serial iface
+    try:
+        parent = os.path.realpath(os.path.join(tty_dev, ".."))
+        driver_link = os.path.join(parent, "driver")
+        if os.path.exists(driver_link):
+            return os.path.basename(os.path.realpath(driver_link))
+    except OSError:
+        pass
+    return None
+
+
+def _tty_bound_to_can_netdev(path: str) -> bool:
+    """True if this USB device also hosts a SocketCAN netdev (gs_usb etc.)."""
+    pair = _usb_vid_pid_for_port(path)
+    tty_dev = _sysfs_tty_dir(path)
+    usb_roots: List[str] = []
+    if tty_dev:
+        try:
+            cur = os.path.realpath(tty_dev)
+            for _ in range(8):
+                if os.path.exists(os.path.join(cur, "idVendor")):
+                    usb_roots.append(cur)
+                    break
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+        except OSError:
+            pass
+
+    for net in glob.glob("/sys/class/net/can*"):
+        try:
+            net_dev = os.path.realpath(os.path.join(net, "device"))
+        except OSError:
+            continue
+        for root in usb_roots:
+            if net_dev == root or net_dev.startswith(root + os.sep):
+                return True
+            if root.startswith(net_dev + os.sep):
+                return True
+        if pair:
+            vid = _read_text(os.path.join(net_dev, "idVendor")).lower()
+            pid = _read_text(os.path.join(net_dev, "idProduct")).lower()
+            # Walk up for idVendor on netdev's USB parent
+            cur = net_dev
+            for _ in range(6):
+                vid = _read_text(os.path.join(cur, "idVendor")).lower() or vid
+                pid = _read_text(os.path.join(cur, "idProduct")).lower() or pid
+                if vid and pid:
+                    break
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+            if vid and pid and (vid, pid) == pair:
                 return True
     return False
 
@@ -193,24 +356,6 @@ def _by_id_aliases(real: str) -> List[str]:
 
 def _has_by_id_name(path: str) -> bool:
     return "/serial/by-id/" in path.replace("\\", "/")
-
-
-def _looks_like_sensor_uart(path: str) -> bool:
-    """True for known USB-UART bridge naming used by RPLIDAR / Wit adapters."""
-    lowered = path.lower()
-    if any(token in lowered for token in _SENSOR_CHIP_SUBSTRINGS):
-        return True
-    real = _realpath(path)
-    for sibling in _by_id_aliases(real):
-        sib = sibling.lower()
-        if any(token in sib for token in _SENSOR_CHIP_SUBSTRINGS):
-            return True
-    # by-path / raw ttyUSB with no by-id: allow (legacy setups).
-    if not _by_id_aliases(real) and (
-        re.search(r"/ttyUSB\d+$", real) or "/serial/by-path/" in path
-    ):
-        return True
-    return False
 
 
 def _is_cp210_id(path: str) -> bool:
