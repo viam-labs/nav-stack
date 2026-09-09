@@ -1,8 +1,8 @@
 """Minimal Slamtec RPLIDAR UART protocol (SCAN / INFO / HEALTH / STOP).
 
-Compatible with A1/A2/A3-class devices on 115200 or 256000 baud. Frame layout
-follows the public Slamtec interface protocol; polar→XYZ matches the Viam
-rplidar module (180° about Y so +X is the flipped lidar heading).
+Compatible with A1/A3 (115200/256000) and S1/S2/S3 (S2/S3 use 1M baud).
+Frame layout follows the public Slamtec interface protocol; polar→XYZ matches
+the Viam rplidar module (180° about Y so +X is the flipped lidar heading).
 """
 
 from __future__ import annotations
@@ -26,15 +26,36 @@ HEALTH_TYPE = 0x06
 SCAN_TYPE = 0x81
 
 # Viam rplidar model bytes (rplidar.go rplidarModelByteMap).
+# Encoding is (major<<4)|submodel: A1=0x18, A3=0x31, S1=0x61, S2=0x71, S3=0x81.
 MODEL_A1 = 24
 MODEL_A3 = 49
 MODEL_S1 = 97
+MODEL_S2 = 113
+MODEL_S3 = 129
 
-BAUDRATES = (115200, 256000)
+MODEL_NAMES = {
+    MODEL_A1: "A1",
+    MODEL_A3: "A3",
+    MODEL_S1: "S1",
+    MODEL_S2: "S2",
+    MODEL_S3: "S3",
+}
+
+# Probe order matches viam-modules/rplidar: 1M (S2/S3), 256k (A3/S1), 115200 (A1).
+BAUDRATES = (1000000, 256000, 115200)
 
 
 class RPLidarError(RuntimeError):
     pass
+
+
+def is_s_series(model: int) -> bool:
+    """S-series lidars manage motor spin themselves — do not toggle DTR."""
+    return int(model) in (MODEL_S1, MODEL_S2, MODEL_S3)
+
+
+def model_name(model: int) -> str:
+    return MODEL_NAMES.get(int(model), f"unknown(0x{int(model):02X})")
 
 
 def command(cmd: int) -> bytes:

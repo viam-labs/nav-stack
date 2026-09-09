@@ -314,15 +314,14 @@ class RPLidarSerial:
     def start_motor(self) -> None:
         if self._ser is None:
             return
-        model = int(self.info.get("model") or 0)
-        if model == proto.MODEL_S1:
+        # S-series (S1/S2/S3) manage motor spin themselves — do not toggle DTR.
+        if proto.is_s_series(int(self.info.get("model") or 0)):
             return
         if hasattr(self._ser, "dtr"):
             self._ser.dtr = False
 
     def stop_motor(self) -> None:
-        model = int(self.info.get("model") or 0)
-        if model == proto.MODEL_S1:
+        if proto.is_s_series(int(self.info.get("model") or 0)):
             return
         if hasattr(self._ser, "dtr"):
             self._ser.dtr = True

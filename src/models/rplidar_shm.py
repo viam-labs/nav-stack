@@ -24,7 +24,7 @@ from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
 from viam.utils import struct_to_dict
 
-from ..lidar.rplidar_protocol import RPLidarError, scan_to_xyz_m
+from ..lidar.rplidar_protocol import RPLidarError, model_name, scan_to_xyz_m
 from ..lidar.rplidar_serial import RPLidarSerial
 from ..lidar.serial_ports import list_candidate_serial_ports
 from ..ros import conversions as conv
@@ -154,12 +154,14 @@ class RPLidarShm(Camera):
                 daemon=True,
             )
             self._stall_thread.start()
+        model_byte = self._info.get("model")
         LOGGER.info(
-            "nav-stack rplidar %r serial=%s baud=%s model=%s shm=%s",
+            "nav-stack rplidar %r serial=%s baud=%s model=%s (%s) shm=%s",
             self.name,
             self._serial_path,
             self._device.baudrate if self._device else None,
-            self._info.get("model"),
+            model_byte,
+            model_name(int(model_byte or 0)),
             self._shm_name,
         )
 
