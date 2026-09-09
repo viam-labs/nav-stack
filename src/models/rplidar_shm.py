@@ -190,9 +190,8 @@ class RPLidarShm(Camera):
             )
             dev.open()
         elif self._serial_autodetect:
-            # Protocol detect only (skip Wit streams; require GET_INFO). Chip
-            # brands are not reliable — office unit has RPLIDAR on CP210.
-            ports = list_candidate_serial_ports(prefer_cp210=False)
+            # Prefer CP210 (typical RPLIDAR adapter); still protocol-detects Wit.
+            ports = list_candidate_serial_ports(prefer_cp210=True)
             dev = RPLidarSerial.open_first_working(
                 ports,
                 baudrate=self._baudrate,

@@ -106,7 +106,8 @@ class RPLidarSerial:
         candidates = list(ports)
         for round_i in range(max(1, rounds)):
             if round_i > 0:
-                refreshed = list_candidate_serial_ports(prefer_cp210=False)
+                # Lidar is usually CP210; Wit/CH340 first wastes timeouts.
+                refreshed = list_candidate_serial_ports(prefer_cp210=True)
                 if refreshed:
                     candidates = refreshed
             candidates = sort_unclaimed_first("lidar", candidates)
@@ -208,9 +209,11 @@ class RPLidarSerial:
         *,
         context: str = "",
         abort_check: Optional[Callable[[], bool]] = None,
+        deadline: Optional[float] = None,
     ) -> bytes:
         buf = bytearray()
-        deadline = time.monotonic() + max(self.timeout_s, 1.0) + (n * 0.05)
+        if deadline is None:
+            deadline = time.monotonic() + max(self.timeout_s, 1.0) + (n * 0.05)
         while len(buf) < n:
             if abort_check is not None and abort_check():
                 raise proto.RPLidarError("scan aborted")
@@ -223,7 +226,7 @@ class RPLidarSerial:
                 if len(buf) == 0:
                     hint = (
                         " (no bytes — wrong serial_path, lidar powered off, "
-                        "or another process owns the port)"
+                        "motor not spinning, or another process owns the port)"
                     )
                 raise proto.RPLidarError(
                     f"short read {len(buf)}/{n}{(' during ' + context) if context else ''}{hint}"
@@ -314,15 +317,23 @@ class RPLidarSerial:
     def start_motor(self) -> None:
         if self._ser is None:
             return
-        # Match viam-modules/rplidar: S-series do not use DTR motor control.
-        # (TOF spin is started by EXPRESS_SCAN / firmware, not USB DTR.)
-        if proto.is_s_series(int(self.info.get("model") or 0)):
+        model = int(self.info.get("model") or 0)
+        # TOF (S1/S2/S3): HQ RPM command — same as Slamtec SDK startMotor().
+        # Without this, EXPRESS may ACK (0x85 descriptor) then stream silence.
+        if proto.is_tof_lidar(model):
+            self._write(
+                proto.command_with_payload(
+                    proto.CMD_HQ_MOTOR_SPEED_CTRL,
+                    proto.encode_hq_motor_rpm(proto.DEFAULT_TOF_RPM),
+                )
+            )
             return
+        # Triangle A1/A2/A3: USB DTR motor enable.
         if hasattr(self._ser, "dtr"):
             self._ser.dtr = False
 
     def stop_motor(self) -> None:
-        if proto.is_s_series(int(self.info.get("model") or 0)):
+        if proto.is_tof_lidar(int(self.info.get("model") or 0)):
             return
         if hasattr(self._ser, "dtr"):
             self._ser.dtr = True
@@ -401,12 +412,14 @@ class RPLidarSerial:
         S2/S3). Queried conf ans-type can disagree with what the device actually
         streams, so we trust the descriptor.
         """
+        # Match SDK: resolve typical mode, then stop → motor → EXPRESS_SCAN.
+        mode_id, _expected_ans = self._typical_scan_mode(abort_check=abort_check)
+        self.stop()
         self.start_motor()
         if self.motor_warmup_s > 0:
             time.sleep(self.motor_warmup_s)
         if abort_check is not None and abort_check():
             raise proto.RPLidarError("scan aborted")
-        mode_id, _expected_ans = self._typical_scan_mode(abort_check=abort_check)
         # SDK: working_mode is mode id unless STD(0)/EXPRESS(1) sentinel constants.
         working_mode = 0 if mode_id in (0, 1) else (mode_id & 0xFF)
         self._write(
@@ -434,21 +447,35 @@ class RPLidarSerial:
         return int(dtype)
 
     def _read_dense_capsule(
-        self, *, abort_check: Optional[Callable[[], bool]] = None
+        self,
+        *,
+        abort_check: Optional[Callable[[], bool]] = None,
+        timeout_s: Optional[float] = None,
     ) -> bytes:
         """Resync and read one 84-byte dense capsule with checksum check."""
-        deadline = time.monotonic() + max(self.timeout_s, 2.0)
+        wait_s = max(
+            float(timeout_s) if timeout_s is not None else self.timeout_s,
+            2.0,
+        )
+        deadline = time.monotonic() + wait_s
         while time.monotonic() < deadline:
             if abort_check is not None and abort_check():
                 raise proto.RPLidarError("scan aborted")
-            b0 = self._read_exact(1, abort_check=abort_check)[0]
+            b0 = self._read_exact(
+                1, context="dense sync", abort_check=abort_check, deadline=deadline
+            )[0]
             if (b0 >> 4) != proto.EXP_SYNC_1:
                 continue
-            b1 = self._read_exact(1, abort_check=abort_check)[0]
+            b1 = self._read_exact(
+                1, context="dense sync", abort_check=abort_check, deadline=deadline
+            )[0]
             if (b1 >> 4) != proto.EXP_SYNC_2:
                 continue
             rest = self._read_exact(
-                proto.DENSE_CAPSULE_LEN - 2, abort_check=abort_check
+                proto.DENSE_CAPSULE_LEN - 2,
+                context="dense capsule",
+                abort_check=abort_check,
+                deadline=deadline,
             )
             raw = bytes((b0, b1)) + rest
             if proto.dense_capsule_checksum_ok(raw):
@@ -517,8 +544,11 @@ class RPLidarSerial:
                 f"express scan answer type 0x{ans_type:02X} not implemented "
                 f"(need DenseBoost 0x{proto.DENSE_CAPSULED_TYPE:02X} for S2/S3)"
             )
-        # First capsule is often incomplete; seed then decode on each new one.
-        prev = self._read_dense_capsule(abort_check=abort_check)
+        # First capsule needs spin-up headroom after HQ motor + EXPRESS ACK.
+        first_timeout = max(self.timeout_s, self.motor_warmup_s, 5.0)
+        prev = self._read_dense_capsule(
+            abort_check=abort_check, timeout_s=first_timeout
+        )
         scan: List[Measurement] = []
         last_complete = time.monotonic()
         while True:

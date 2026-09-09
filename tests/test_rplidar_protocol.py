@@ -32,19 +32,29 @@ def test_baudrates_probe_1m_first():
     assert 115200 in proto.BAUDRATES
 
 
-def test_s_series_skips_dtr_motor():
+def test_tof_sends_hq_motor_not_dtr():
     class _Ser:
         def __init__(self):
             self.dtr = True
+            self.writes: list[bytes] = []
+
+        def write(self, data):
+            self.writes.append(bytes(data))
+
+        def flush(self):
+            pass
 
     for model in (proto.MODEL_S1, proto.MODEL_S2, proto.MODEL_S3):
-        lidar = RPLidarSerial("/dev/null", serial_port=_Ser())
+        ser = _Ser()
+        lidar = RPLidarSerial("/dev/null", serial_port=ser)
         lidar.info = {"model": model}
         lidar.start_motor()
-        assert lidar._ser.dtr is True
-        lidar._ser.dtr = False
+        assert ser.dtr is True
+        assert ser.writes, "expected HQ motor command"
+        assert ser.writes[0][1] == proto.CMD_HQ_MOTOR_SPEED_CTRL
+        ser.dtr = False
         lidar.stop_motor()
-        assert lidar._ser.dtr is False
+        assert ser.dtr is False  # TOF stop_motor is a no-op for DTR
 
 
 def test_a1_toggles_dtr_motor():
