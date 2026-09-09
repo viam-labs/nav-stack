@@ -44,6 +44,8 @@ def list_candidate_serial_ports(
     other_id = [p for p in by_id if p not in cp210]
     cp210_reals = {_realpath(p) for p in cp210}
 
+    # Prefer by-id over by-path: by-path can linger after USB re-enumeration and
+    # open with EIO while the live by-id → ttyUSBn link still works.
     if prefer_cp210:
         for path in cp210:
             add(path)
@@ -52,11 +54,11 @@ def list_candidate_serial_ports(
         for path in by_path:
             add(path)
     else:
-        for path in by_path:
-            add(path)
         for path in other_id:
             add(path)
         for path in cp210:
+            add(path)
+        for path in by_path:
             add(path)
 
     for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*"):
@@ -173,15 +175,19 @@ def is_port_busy_error(exc: BaseException) -> bool:
 
 def is_port_missing_error(exc: BaseException) -> bool:
     errno = getattr(exc, "errno", None)
-    if errno in (2, 6, 19):  # ENOENT / ENXIO / ENODEV
+    # Include EIO (5): common after USB hub reset / path swap while the
+    # kernel still exposes a stale node; retry rounds often recover.
+    if errno in (2, 5, 6, 19):  # ENOENT / EIO / ENXIO / ENODEV
         return True
     args = getattr(exc, "args", ())
-    if args and args[0] in (2, 6, 19):
+    if args and args[0] in (2, 5, 6, 19):
         return True
     msg = str(exc).lower()
     return (
         "no such device" in msg
         or "no such file or directory" in msg
+        or "input/output error" in msg
         or "[errno 19]" in msg
+        or "[errno 5]" in msg
         or "[errno 2]" in msg
     )

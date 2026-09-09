@@ -59,7 +59,7 @@ class WitSerial:
         raise WitError(
             f"failed to open WitMotion IMU on {self.port!r} at {bauds}: {last!r}. "
             "If the lidar and IMU USB ports swapped, set serial_autodetect=true "
-            "or use a unique /dev/serial/by-path/... path."
+            "or pin a stable /dev/serial/by-id/... path (not by-path)."
         )
 
     @classmethod

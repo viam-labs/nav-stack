@@ -114,18 +114,46 @@ def test_chip_filter_separates_cp210_and_ch340():
     assert all(realpath(p) == "/dev/ttyUSB2" for p in lidar_ports)
 
 
-def test_sort_unclaimed_first_still_includes_claimed():
-    from src.lidar.serial_ports import (
-        claim_serial_port,
-        release_serial_port,
-        sort_unclaimed_first,
-    )
+def test_prefer_cp210_false_puts_by_id_before_by_path():
+    fake_id = [
+        "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+        "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0",
+    ]
+    fake_path = [
+        "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0",
+        "/dev/serial/by-path/platform-xhci-hcd.1-usb-0:1:1.0-port0",
+    ]
 
-    claim_serial_port("imu", "/dev/ttyUSB2")
-    try:
-        ordered = sort_unclaimed_first(
-            "lidar", ["/dev/ttyUSB2", "/dev/ttyUSB1"]
+    def fake_glob(pat: str):
+        if "by-id" in pat:
+            return list(fake_id)
+        if "by-path" in pat:
+            return list(fake_path)
+        return []
+
+    def realpath(p: str) -> str:
+        if "1a86" in p or "0:2" in p:
+            return "/dev/ttyUSB2"
+        if "Silicon" in p or "0:1" in p:
+            return "/dev/ttyUSB1"
+        return p
+
+    with (
+        patch("src.lidar.serial_ports.glob.glob", side_effect=fake_glob),
+        patch("src.lidar.serial_ports.os.path.exists", return_value=True),
+        patch("src.lidar.serial_ports.os.path.realpath", side_effect=realpath),
+    ):
+        ports = list_candidate_serial_ports(prefer_cp210=False)
+
+    assert ports[0].startswith("/dev/serial/by-id/usb-1a86")
+    assert ports[1].startswith("/dev/serial/by-id/usb-Silicon_Labs")
+
+
+def test_eio_counts_as_missing_for_retry():
+    from src.lidar.serial_ports import is_port_missing_error
+
+    assert is_port_missing_error(
+        Exception(
+            "SerialException(5, \"could not open port: [Errno 5] Input/output error\")"
         )
-        assert ordered == ["/dev/ttyUSB1", "/dev/ttyUSB2"]
-    finally:
-        release_serial_port("/dev/ttyUSB2")
+    )
