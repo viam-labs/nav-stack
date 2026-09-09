@@ -314,7 +314,8 @@ class RPLidarSerial:
     def start_motor(self) -> None:
         if self._ser is None:
             return
-        # S-series (S1/S2/S3) manage motor spin themselves — do not toggle DTR.
+        # Match viam-modules/rplidar: S-series do not use DTR motor control.
+        # (TOF spin is started by EXPRESS_SCAN / firmware, not USB DTR.)
         if proto.is_s_series(int(self.info.get("model") or 0)):
             return
         if hasattr(self._ser, "dtr"):
@@ -331,7 +332,54 @@ class RPLidarSerial:
         time.sleep(0.01)
         self._clear()
 
+    def _get_lidar_conf(
+        self, conf_type: int, reserve: bytes = b"", *, abort_check=None
+    ) -> bytes:
+        self._write(
+            proto.command_with_payload(
+                proto.CMD_GET_LIDAR_CONF,
+                proto.encode_get_lidar_conf(conf_type, reserve),
+            )
+        )
+        size, single, dtype = self._read_descriptor(abort_check=abort_check)
+        if dtype != proto.GET_LIDAR_CONF_TYPE or not single:
+            raise proto.RPLidarError(
+                f"unexpected lidar conf descriptor type={dtype} single={single}"
+            )
+        raw = self._read_exact(size, abort_check=abort_check)
+        if len(raw) < 4:
+            raise proto.RPLidarError("lidar conf response too short")
+        reply_type = int.from_bytes(raw[:4], "little")
+        if reply_type != conf_type:
+            raise proto.RPLidarError(
+                f"lidar conf type mismatch asked={conf_type} got={reply_type}"
+            )
+        return raw[4:]
+
+    def _typical_scan_mode(self, *, abort_check=None) -> Tuple[int, int]:
+        """Return ``(working_mode_id, answer_type)`` for Express typical scan."""
+        # Firmware < 1.24 has no GET_LIDAR_CONF; fall back to classic Express.
+        fw = self.info.get("firmware") or (0, 0)
+        fw_u16 = (int(fw[0]) << 8) | int(fw[1])
+        if fw_u16 < ((0x1 << 8) | 24):
+            return 1, proto.CAPSULED_TYPE  # EXPRESS mode id / capsulated ans
+        payload = self._get_lidar_conf(
+            proto.CONF_SCAN_MODE_TYPICAL, abort_check=abort_check
+        )
+        if len(payload) < 2:
+            raise proto.RPLidarError("typical scan mode response too short")
+        mode_id = int.from_bytes(payload[:2], "little")
+        ans_payload = self._get_lidar_conf(
+            proto.CONF_SCAN_MODE_ANS_TYPE,
+            mode_id.to_bytes(2, "little"),
+            abort_check=abort_check,
+        )
+        if not ans_payload:
+            raise proto.RPLidarError("scan mode ans type response empty")
+        return mode_id, int(ans_payload[0])
+
     def start_scan(self, *, abort_check: Optional[Callable[[], bool]] = None) -> None:
+        """Legacy 5-byte SCAN (A1/A3). Prefer ``start_express_scan`` for S2/S3."""
         self.start_motor()
         if self.motor_warmup_s > 0:
             time.sleep(self.motor_warmup_s)
@@ -344,6 +392,61 @@ class RPLidarSerial:
                 f"unexpected scan descriptor size={size} single={single} type={dtype}"
             )
 
+    def start_express_scan(
+        self, *, abort_check: Optional[Callable[[], bool]] = None
+    ) -> int:
+        """Start typical Express scan (viam ``StartScan(false, true)``).
+
+        Returns the answer type (``DENSE_CAPSULED_TYPE`` for S2/S3 DenseBoost).
+        """
+        self.start_motor()
+        if self.motor_warmup_s > 0:
+            time.sleep(self.motor_warmup_s)
+        if abort_check is not None and abort_check():
+            raise proto.RPLidarError("scan aborted")
+        mode_id, ans_type = self._typical_scan_mode(abort_check=abort_check)
+        # SDK: working_mode is mode id unless STD/EXPRESS sentinel.
+        working_mode = 0 if mode_id in (0, 1) else (mode_id & 0xFF)
+        self._write(
+            proto.command_with_payload(
+                proto.CMD_EXPRESS_SCAN,
+                proto.encode_express_scan_payload(working_mode),
+            )
+        )
+        size, single, dtype = self._read_descriptor(abort_check=abort_check)
+        if single or dtype != ans_type:
+            raise proto.RPLidarError(
+                f"unexpected express descriptor size={size} single={single} "
+                f"type=0x{dtype:02X} (expected type=0x{ans_type:02X})"
+            )
+        if dtype == proto.DENSE_CAPSULED_TYPE and size < proto.DENSE_CAPSULE_LEN:
+            raise proto.RPLidarError(
+                f"dense capsule descriptor size {size} < {proto.DENSE_CAPSULE_LEN}"
+            )
+        return int(dtype)
+
+    def _read_dense_capsule(
+        self, *, abort_check: Optional[Callable[[], bool]] = None
+    ) -> bytes:
+        """Resync and read one 84-byte dense capsule with checksum check."""
+        deadline = time.monotonic() + max(self.timeout_s, 2.0)
+        while time.monotonic() < deadline:
+            if abort_check is not None and abort_check():
+                raise proto.RPLidarError("scan aborted")
+            b0 = self._read_exact(1, abort_check=abort_check)[0]
+            if (b0 >> 4) != proto.EXP_SYNC_1:
+                continue
+            b1 = self._read_exact(1, abort_check=abort_check)[0]
+            if (b1 >> 4) != proto.EXP_SYNC_2:
+                continue
+            rest = self._read_exact(
+                proto.DENSE_CAPSULE_LEN - 2, abort_check=abort_check
+            )
+            raw = bytes((b0, b1)) + rest
+            if proto.dense_capsule_checksum_ok(raw):
+                return raw
+        raise proto.RPLidarError("dense capsule sync timed out")
+
     def iter_scans(
         self,
         *,
@@ -352,6 +455,18 @@ class RPLidarSerial:
         max_stall_s: float = 5.0,
         abort_check: Optional[Callable[[], bool]] = None,
     ) -> Iterator[List[Measurement]]:
+        model = int(self.info.get("model") or 0)
+        # S2/S3 (and other TOF): match viam-modules/rplidar StartScan(false, true)
+        # → typical Express / DenseBoost. Legacy SCAN only yields sparse/stalled
+        # 5-byte nodes ("short read 1/5") on these units.
+        if proto.is_tof_lidar(model) or proto.is_s_series(model):
+            yield from self._iter_express_scans(
+                min_points=min_points,
+                max_stall_s=max_stall_s,
+                abort_check=abort_check,
+            )
+            return
+
         self.start_scan(abort_check=abort_check)
         scan: List[Measurement] = []
         last_complete = time.monotonic()
@@ -380,6 +495,46 @@ class RPLidarSerial:
                 scan = []
             if quality > 0 and dist > 0:
                 scan.append((quality, angle, dist))
+
+    def _iter_express_scans(
+        self,
+        *,
+        min_points: int = 20,
+        max_stall_s: float = 5.0,
+        abort_check: Optional[Callable[[], bool]] = None,
+    ) -> Iterator[List[Measurement]]:
+        ans_type = self.start_express_scan(abort_check=abort_check)
+        if ans_type != proto.DENSE_CAPSULED_TYPE:
+            raise proto.RPLidarError(
+                f"express scan answer type 0x{ans_type:02X} not implemented "
+                f"(need DenseBoost 0x{proto.DENSE_CAPSULED_TYPE:02X} for S2/S3)"
+            )
+        # First capsule is often incomplete; seed then decode on each new one.
+        prev = self._read_dense_capsule(abort_check=abort_check)
+        scan: List[Measurement] = []
+        last_complete = time.monotonic()
+        while True:
+            if abort_check is not None and abort_check():
+                raise proto.RPLidarError("scan aborted")
+            if max_stall_s > 0 and time.monotonic() - last_complete > max_stall_s:
+                raise proto.RPLidarError(
+                    f"no complete dense scan in {max_stall_s:.1f}s"
+                )
+            curr = self._read_dense_capsule(abort_check=abort_check)
+            try:
+                samples = proto.decode_dense_capsule_pair(prev, curr)
+            except proto.RPLidarError:
+                prev = curr
+                continue
+            prev = curr
+            for quality, angle, dist, new_scan in samples:
+                if new_scan:
+                    if len(scan) >= min_points:
+                        last_complete = time.monotonic()
+                        yield scan
+                    scan = []
+                if quality > 0 and dist > 0:
+                    scan.append((quality, angle, dist))
 
 
 def _port_looks_like_wit(ser, *, listen_s: float = 0.12) -> bool:

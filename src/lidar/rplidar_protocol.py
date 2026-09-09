@@ -1,8 +1,8 @@
-"""Minimal Slamtec RPLIDAR UART protocol (SCAN / INFO / HEALTH / STOP).
+"""Minimal Slamtec RPLIDAR UART protocol (SCAN / INFO / HEALTH / STOP / EXPRESS).
 
-Compatible with A1/A3 (115200/256000) and S1/S2/S3 (S2/S3 use 1M baud).
-Frame layout follows the public Slamtec interface protocol; polar→XYZ matches
-the Viam rplidar module (180° about Y so +X is the flipped lidar heading).
+A1/A3 use legacy 5-byte SCAN at 115200/256000. S2/S3 (1M baud) use typical
+Express / DenseBoost capsules — same path as viam-modules/rplidar
+``StartScan(false, true)``.
 """
 
 from __future__ import annotations
@@ -17,13 +17,29 @@ CMD_RESET = 0x40
 CMD_SCAN = 0x20
 CMD_GET_INFO = 0x50
 CMD_GET_HEALTH = 0x52
+CMD_EXPRESS_SCAN = 0x82
+CMD_GET_LIDAR_CONF = 0x84
+CMD_HQ_MOTOR_SPEED_CTRL = 0xA8
 
 INFO_LEN = 20
 HEALTH_LEN = 3
 NODE_LEN = 5
+DENSE_CAPSULE_LEN = 84
 INFO_TYPE = 0x04
 HEALTH_TYPE = 0x06
 SCAN_TYPE = 0x81
+GET_LIDAR_CONF_TYPE = 0x20
+DENSE_CAPSULED_TYPE = 0x85
+CAPSULED_TYPE = 0x82
+
+CONF_SCAN_MODE_TYPICAL = 0x0000007C
+CONF_SCAN_MODE_ANS_TYPE = 0x00000075
+DEFAULT_TOF_RPM = 600
+TOF_MIN_MAJOR_ID = 5  # model>>4 > 5 → TOF (S1/S2/S3)
+
+EXP_SYNC_1 = 0xA
+EXP_SYNC_2 = 0x5
+EXP_SYNC_BIT = 1 << 15
 
 # Viam rplidar model bytes (rplidar.go rplidarModelByteMap).
 # Encoding is (major<<4)|submodel: A1=0x18, A3=0x31, S1=0x61, S2=0x71, S3=0x81.
@@ -50,8 +66,13 @@ class RPLidarError(RuntimeError):
 
 
 def is_s_series(model: int) -> bool:
-    """S-series lidars manage motor spin themselves — do not toggle DTR."""
+    """S1/S2/S3 family — use Express/DenseBoost (not legacy SCAN / DTR motor)."""
     return int(model) in (MODEL_S1, MODEL_S2, MODEL_S3)
+
+
+def is_tof_lidar(model: int) -> bool:
+    """Slamtec SDK: ``(model >> 4) > 5`` marks TOF units (S1/S2/S3)."""
+    return (int(model) >> 4) > TOF_MIN_MAJOR_ID
 
 
 def model_name(model: int) -> str:
@@ -60,6 +81,19 @@ def model_name(model: int) -> str:
 
 def command(cmd: int) -> bytes:
     return bytes((SYNC, cmd))
+
+
+def command_with_payload(cmd: int, payload: bytes) -> bytes:
+    """Request with payload (EXPRESS_SCAN, GET_LIDAR_CONF, HQ motor, …)."""
+    payload = bytes(payload)
+    size = len(payload)
+    if size > 255:
+        raise RPLidarError(f"payload too large ({size})")
+    flagged = cmd | 0x80
+    checksum = SYNC ^ flagged ^ size
+    for b in payload:
+        checksum ^= b
+    return bytes((SYNC, flagged, size)) + payload + bytes((checksum & 0xFF,))
 
 
 def descriptor(size: int, single: bool, dtype: int) -> bytes:
@@ -175,3 +209,62 @@ def encode_scan_stream(scans: Iterable[Sequence[Tuple[int, float, float]]]) -> b
             )
             first = False
     return bytes(buf)
+
+
+def encode_hq_motor_rpm(rpm: int = DEFAULT_TOF_RPM) -> bytes:
+    return int(rpm).to_bytes(2, "little")
+
+
+def encode_express_scan_payload(working_mode: int = 0, working_flags: int = 0) -> bytes:
+    return bytes((int(working_mode) & 0xFF,)) + int(working_flags).to_bytes(
+        2, "little"
+    ) + (0).to_bytes(2, "little")
+
+
+def encode_get_lidar_conf(conf_type: int, reserve: bytes = b"") -> bytes:
+    payload = int(conf_type).to_bytes(4, "little") + (reserve + bytes(32))[:32]
+    return payload
+
+
+def dense_capsule_checksum_ok(raw: bytes) -> bool:
+    if len(raw) != DENSE_CAPSULE_LEN:
+        return False
+    if (raw[0] >> 4) != EXP_SYNC_1 or (raw[1] >> 4) != EXP_SYNC_2:
+        return False
+    recv = (raw[0] & 0x0F) | ((raw[1] & 0x0F) << 4)
+    checksum = 0
+    for b in raw[2:]:
+        checksum ^= b
+    return checksum == recv
+
+
+def decode_dense_capsule_pair(
+    prev: bytes, curr: bytes
+) -> List[Tuple[int, float, float, bool]]:
+    """Unpack one dense capsule using the previous capsule's start angle.
+
+    Returns ``(quality, angle_deg, distance_mm, new_scan)`` samples (40).
+    Mirrors Slamtec ``_dense_capsuleToNormal``.
+    """
+    if len(prev) != DENSE_CAPSULE_LEN or len(curr) != DENSE_CAPSULE_LEN:
+        raise RPLidarError("dense capsule length")
+    curr_start_q8 = (int.from_bytes(curr[2:4], "little") & 0x7FFF) << 2
+    prev_start_q8 = (int.from_bytes(prev[2:4], "little") & 0x7FFF) << 2
+    diff_q8 = curr_start_q8 - prev_start_q8
+    if prev_start_q8 > curr_start_q8:
+        diff_q8 += 360 << 8
+    angle_inc_q16 = (diff_q8 << 8) // 40
+    current_angle_q16 = prev_start_q8 << 8
+    out: List[Tuple[int, float, float, bool]] = []
+    for pos in range(40):
+        dist = int.from_bytes(prev[4 + pos * 2 : 6 + pos * 2], "little")
+        angle_q6 = current_angle_q16 >> 10
+        new_scan = ((current_angle_q16 + angle_inc_q16) % (360 << 16)) < angle_inc_q16
+        current_angle_q16 += angle_inc_q16
+        if angle_q6 < 0:
+            angle_q6 += 360 << 6
+        if angle_q6 >= (360 << 6):
+            angle_q6 -= 360 << 6
+        quality = 0x2F if dist else 0
+        out.append((quality, angle_q6 / 64.0, float(dist), bool(new_scan)))
+    return out
