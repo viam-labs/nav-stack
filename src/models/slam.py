@@ -149,6 +149,7 @@ class RosSlam(SLAM):
 
         loop = asyncio.get_event_loop()
         if cfg.uses_builtin_slam():
+            odom_reader = self._make_typed_odom_reader()
             sensors = BuiltinSensors(
                 cfg=cfg,
                 cameras=self._cameras,
@@ -159,6 +160,7 @@ class RosSlam(SLAM):
                 logger=LOGGER.info,
                 skip_get_laser_scan=self._skip_get_laser_scan,
                 scan_max_age_s=float(cfg.scan_max_age_s or 2.0),
+                odom_reader=odom_reader,
             )
             self._engine = BuiltinSlamEngine(
                 cfg, sensors, self._map_store, logger=LOGGER.info
@@ -1271,13 +1273,28 @@ class RosSlam(SLAM):
                     await asyncio.sleep(max(retry_delay_s, 0.0))
 
     # -- ROS IO --------------------------------------------------------------
+    def _make_typed_odom_reader(self):
+        """Portable GetLinearVelocity / GetAngularVelocity reader for wheel odom."""
+        if self._movement_sensor is None:
+            return None
+        from ..ros.odom_source import TypedMovementSensorOdom, TypedOdomConfig
+
+        assert self._cfg is not None
+        return TypedMovementSensorOdom(
+            self._movement_sensor,
+            TypedOdomConfig(
+                velocity_convention=self._cfg.base_velocity_convention,
+            ),
+            logger=LOGGER,
+        )
+
     def _build_io(self):
         from ..ros.sensor_io import build_io_provider
 
         assert self._cfg is not None
-        # Built-in path: read odometry from the movement sensor's get_readings()
-        # (odom_reader=None). The external-SLAM model reuses this same builder
-        # with a typed MovementSensor reader injected.
+        # Prefer typed MovementSensor getters (GetLinearVelocity / AngularVelocity)
+        # so velocity-only wheeled odometry (no Position / sparse get_readings)
+        # still feeds /odom. Same reader as navigation-external.
         node = self._manager.node if self._manager else None
         return build_io_provider(
             base=self._base,
@@ -1286,7 +1303,7 @@ class RosSlam(SLAM):
             movement_sensor=self._movement_sensor,
             heading_sensor=self._heading_sensor,
             skip_get_laser_scan=self._skip_get_laser_scan,
-            odom_reader=None,
+            odom_reader=self._make_typed_odom_reader(),
             logger=LOGGER,
             record_cmd_vel=getattr(node, "record_cmd_vel", None),
             shm_lidar=self._shm_lidar,
@@ -1369,6 +1386,11 @@ class RosSlam(SLAM):
                 "vtheta": sample.vtheta,
                 "has_pose": sample.pose is not None,
                 "has_heading": sample.heading_rad is not None,
+                "has_twist": (
+                    abs(sample.vx) > 1e-9
+                    or abs(sample.vy) > 1e-9
+                    or abs(sample.vtheta) > 1e-9
+                ),
                 "has_acceleration": sample.ax is not None and sample.ay is not None,
             }
             if sample.ax is not None and sample.ay is not None:
@@ -1435,7 +1457,15 @@ class RosSlam(SLAM):
                     "vtheta": sample.vtheta,
                     "has_pose": sample.pose is not None,
                     "has_heading": sample.heading_rad is not None,
+                    "has_twist": (
+                        abs(sample.vx) > 1e-9
+                        or abs(sample.vy) > 1e-9
+                        or abs(sample.vtheta) > 1e-9
+                    ),
                 }
+                debug = sensors.odom_debug()
+                if debug:
+                    odom_probe["raw"] = debug
         except Exception as exc:  # noqa: BLE001
             odom_probe["error"] = repr(exc)
         return {"lidars": lidars, "odometry": odom_probe}

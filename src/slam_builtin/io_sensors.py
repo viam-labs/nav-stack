@@ -51,6 +51,7 @@ class BuiltinSensors:
         logger=None,
         skip_get_laser_scan: Optional[set] = None,
         scan_max_age_s: float = 2.0,
+        odom_reader=None,
     ):
         self._cfg = cfg
         self._cameras = dict(cameras or {})
@@ -59,6 +60,7 @@ class BuiltinSensors:
         self._shm = shm_lidar
         self._loop = loop
         self._logger = logger
+        self._odom_reader = odom_reader
         self._skip_get_laser_scan = (
             skip_get_laser_scan if skip_get_laser_scan is not None else set()
         )
@@ -292,7 +294,10 @@ class BuiltinSensors:
 
     async def _read_odom(self) -> conv.OdomReading:
         cfg = self._cfg
-        sample = conv.parse_odom_from_readings(await self._movement.get_readings())
+        if self._odom_reader is not None:
+            sample = await self._odom_reader.read()
+        else:
+            sample = conv.parse_odom_from_readings(await self._movement.get_readings())
         if cfg.movement_sensor_upside_down:
             sample = conv.apply_sensor_upside_down(sample)
         if cfg.movement_sensor_yaw_deg:
@@ -311,3 +316,13 @@ class BuiltinSensors:
                     )
                 sample = conv.merge_odom_heading(sample, heading)
         return sample
+
+    def odom_debug(self) -> dict:
+        """Raw typed-getter snapshot from the last odom read (if any)."""
+        reader = self._odom_reader
+        if reader is None:
+            return {"source": "get_readings"}
+        debug = getattr(reader, "debug_dict", None)
+        if callable(debug):
+            return debug()
+        return {"source": "typed"}

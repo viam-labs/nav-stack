@@ -4,9 +4,9 @@ Both navigation-capable models feed the ROS bridge the same four Viam-backed
 callables — lidar point reads, odometry reads, drive, and stop. The only
 difference is *how odometry is read*:
 
-* built-in SLAM parses the movement sensor's ``get_readings()`` dict, and
-* the external-SLAM path uses the portable typed MovementSensor API
-  (:class:`~.odom_source.TypedMovementSensorOdom`).
+* built-in SLAM and external-SLAM both prefer the portable typed
+  MovementSensor API (:class:`~.odom_source.TypedMovementSensorOdom`) when an
+  ``odom_reader`` is supplied; otherwise the ``get_readings`` parser is used.
 
 So this builder takes an optional ``odom_reader``: when provided it supplies the
 raw sample; otherwise the ``get_readings`` parser is used. Either way the same

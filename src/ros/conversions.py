@@ -229,13 +229,22 @@ def _parse_ros_odom_pose_block(readings: Mapping) -> Optional[Pose2D]:
 
 
 def _xyz_from_reading(value) -> Optional[Tuple[float, float, float]]:
-    """Extract ``(x, y, z)`` from a dict or Viam Vector3-like object."""
+    """Extract ``(x, y, z)`` from a dict or Viam Vector3-like object.
+
+    Missing dict keys default to ``0.0`` — protobuf JSON often omits zero
+    fields (e.g. ``{y: 0.009}`` with x/z unset), which must still parse as a
+    valid velocity rather than "no data".
+    """
     if value is None:
         return None
     if isinstance(value, Mapping):
-        if not all(k in value for k in ("x", "y", "z")):
+        if not any(k in value for k in ("x", "y", "z")):
             return None
-        return float(value["x"]), float(value["y"]), float(value["z"])
+        return (
+            float(value.get("x", 0.0) or 0.0),
+            float(value.get("y", 0.0) or 0.0),
+            float(value.get("z", 0.0) or 0.0),
+        )
     try:
         return float(value.x), float(value.y), float(value.z)
     except (AttributeError, TypeError, ValueError):
@@ -453,31 +462,14 @@ def parse_odom_twist_from_readings(readings: Mapping) -> Tuple[float, float, flo
     # Viam MovementSensor API: GetAngularVelocity is degrees/sec (same as
     # mir-base's angular_velocity_dps). Do NOT treat this as rad/s.
     ang_xyz = _xyz_from_reading(readings.get("angular_velocity"))
-
-    for prefix in ("linear_velocity", "velocity"):
-        block = readings.get(prefix)
-        if isinstance(block, Mapping) and all(k in block for k in ("x", "y", "z")):
-            # Ambiguous units (m/s vs mm/s). Prefer explicit ``linear_velocity_mps``.
-            if ang_xyz is not None:
-                # Yaw rate must come from angular_velocity when present; the
-                # linear block's z is vertical velocity, not a turn rate.
-                return (
-                    float(block["x"]),
-                    float(block["y"]),
-                    math.radians(float(ang_xyz[2])),
-                )
-            return (
-                float(block["x"]),
-                float(block["y"]),
-                math.radians(float(block.get("z", 0.0))),
-            )
-
+    lin_xyz = _xyz_from_reading(
+        readings.get("linear_velocity", readings.get("velocity"))
+    )
+    if lin_xyz is not None:
+        vtheta = math.radians(float(ang_xyz[2])) if ang_xyz is not None else 0.0
+        return float(lin_xyz[0]), float(lin_xyz[1]), vtheta
     if ang_xyz is not None:
-        vx = vy = 0.0
-        lin_xyz = _xyz_from_reading(readings.get("linear_velocity"))
-        if lin_xyz is not None:
-            vx, vy, _ = lin_xyz
-        return (vx, vy, math.radians(float(ang_xyz[2])))
+        return 0.0, 0.0, math.radians(float(ang_xyz[2]))
     return 0.0, 0.0, 0.0
 
 

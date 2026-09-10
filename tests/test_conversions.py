@@ -439,6 +439,19 @@ def test_parse_odom_twist_prefers_angular_velocity_for_yaw_rate():
     assert math.isclose(vtheta, math.radians(30.0))
 
 
+def test_parse_odom_twist_partial_vector3_dict():
+    """Protobuf JSON often omits zero fields — {y: 0.009} must still parse."""
+    vx, vy, vtheta = conv.parse_odom_twist_from_readings(
+        {
+            "linear_velocity": {"y": 0.009},
+            "angular_velocity": {},
+        }
+    )
+    assert math.isclose(vx, 0.0)
+    assert math.isclose(vy, 0.009)
+    assert math.isclose(vtheta, 0.0)
+
+
 def test_parse_odom_from_readings_viam_vector3_objects():
     """Viam often returns Vector3/Euler objects, not plain dicts."""
 

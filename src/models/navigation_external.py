@@ -219,6 +219,7 @@ class RosNavigationExternal(NavServiceBase):
                 TypedOdomConfig(
                     trust_pose=ext.trust_movement_sensor_pose,
                     snap_heading=ext.snap_heading,
+                    velocity_convention=bridge_cfg.base_velocity_convention,
                 ),
                 logger=LOGGER,
             )

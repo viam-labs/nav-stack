@@ -113,13 +113,47 @@ def test_wheel_path_uses_linear_velocity_and_skips_accel():
         lv=(0.5, 0.0, 0.0),
         la=(1.0, 1.0, 9.81),
     )
-    reading, _ = _read(s)
+    # Explicit ROS convention: +x forward (legacy test fixture).
+    reading, _ = _read(s, TypedOdomConfig(velocity_convention="ros"))
     assert reading.vx == pytest.approx(0.5)
     assert reading.vy == pytest.approx(0.0)
     assert reading.vtheta == pytest.approx(math.radians(10.0))
     # Wheel twist present -> never double-integrate accel.
     assert reading.ax is None and reading.ay is None
     assert "get_linear_acceleration" not in s.calls
+
+
+def test_viam_y_forward_linear_velocity_remaps_to_ros_vx():
+    """Agilex / wheeled: GetLinearVelocity.y is forward; remap to ROS vx."""
+    s = FakeMovementSensor(
+        angular_velocity=True,
+        linear_velocity=True,
+        av=(0.0, 0.0, 0.0),
+        lv=(0.0, 0.009, 0.0),  # proto-style: only y set
+    )
+    reading, reader = _read(s, TypedOdomConfig(velocity_convention="viam"))
+    assert reading.vx == pytest.approx(0.009)
+    assert reading.vy == pytest.approx(0.0, abs=1e-12)
+    assert reading.vtheta == pytest.approx(0.0)
+    assert reading.pose is None  # velocity-only sensor
+    dbg = reader.debug_dict()
+    assert dbg["raw_lv_y"] == pytest.approx(0.009)
+    assert dbg["raw_lv_x"] == pytest.approx(0.0)
+    assert dbg["remapped"] is True
+    assert dbg["raw_av_z_deg_s"] == pytest.approx(0.0)
+    assert dbg["velocity_convention"] == "viam"
+
+
+def test_empty_angular_vector3_is_valid_zero_rate():
+    s = FakeMovementSensor(
+        angular_velocity=True,
+        linear_velocity=True,
+        av=(0.0, 0.0, 0.0),
+        lv=(0.0, 0.0, 0.0),
+    )
+    reading, reader = _read(s, TypedOdomConfig(velocity_convention="viam"))
+    assert reading.vtheta == 0.0
+    assert reader.debug_dict()["raw_av_z_deg_s"] == 0.0
 
 
 def test_snap_heading_from_orientation():

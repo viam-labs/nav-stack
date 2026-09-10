@@ -1,11 +1,11 @@
 """Typed MovementSensor -> ``OdomReading`` reader.
 
-The built-in SLAM path parses a movement sensor's ``get_readings()`` dict, whose
-key shapes are implementation-specific (``linear_velocity_mps``, nested
-``orientation`` blocks, ``position_x_m`` aliases, ...). That is brittle across
-arbitrary movement sensors.
+The built-in SLAM path historically parsed a movement sensor's ``get_readings()``
+dict, whose key shapes are implementation-specific. That is brittle across
+arbitrary movement sensors (e.g. Agilex Tracer odometry advertises typed
+velocity but may omit or sparsely serialize the same fields in readings).
 
-This reader instead uses the portable contract: call ``get_properties()`` once to
+This reader uses the portable contract: call ``get_properties()`` once to
 discover which typed getters the sensor implements, then call only those. It
 produces the same sensor-frame :class:`~..ros.conversions.OdomReading` the
 readings parser does, so the downstream mount-yaw / upside-down / heading
@@ -14,23 +14,28 @@ corrections (see ``slam.py``) compose unchanged.
 Capability -> field mapping:
 
 * ``angular_velocity``  -> ``vtheta``       (deg/s -> rad/s)
-* ``linear_velocity``   -> ``vx, vy``       (body forward/left; wheel-twist path)
+* ``linear_velocity``   -> ``vx, vy``       (ROS body: x forward, y left)
 * ``linear_acceleration`` + ``orientation`` -> ``ax, ay`` (gravity removed; IMU path)
 * ``orientation`` / ``compass_heading`` -> ``heading_rad``  (only if ``snap_heading``)
 * ``position`` + ``orientation`` -> ``pose`` (only if ``trust_pose``)
 
 ``Position`` is ignored by default: many IMUs advertise it while double-
 integrating acceleration (drifts quadratically), which is unusable as odometry.
+
+When ``velocity_convention`` is ``viam`` / ``mir`` (Y-forward wheeled bases),
+``GetLinearVelocity`` is remapped into ROS body frame: forward on ``y`` becomes
+``vx``, lateral on ``x`` becomes ``vy`` (same swap as wheeled-odometry readings).
 """
 from __future__ import annotations
 
 import asyncio
 import math
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 from viam.components.movement_sensor import MovementSensor
 
+from ..config import BASE_VELOCITY_VIAM, BASE_VELOCITY_Y_FORWARD
 from . import conversions as conv
 
 
@@ -56,6 +61,25 @@ class TypedOdomConfig:
     # Position is a trustworthy fused/wheel estimate. Uses the Viam lat/lng ->
     # (y, x) map-frame overload when read.
     trust_pose: bool = False
+    # How GetLinearVelocity is framed. ``viam`` / ``mir``: +y is forward (Tracer,
+    # rdk:builtin:wheeled). ``ros``: +x is forward.
+    velocity_convention: str = BASE_VELOCITY_VIAM
+
+
+@dataclass
+class TypedOdomDebug:
+    """Last raw typed-getter snapshot for ``sensor_probe`` / status."""
+
+    source: str = "typed"
+    linear_velocity_supported: bool = False
+    angular_velocity_supported: bool = False
+    position_supported: bool = False
+    raw_lv_x: Optional[float] = None
+    raw_lv_y: Optional[float] = None
+    raw_lv_z: Optional[float] = None
+    raw_av_z_deg_s: Optional[float] = None
+    velocity_convention: str = BASE_VELOCITY_VIAM
+    remapped: bool = False
 
 
 class TypedMovementSensorOdom:
@@ -71,6 +95,9 @@ class TypedMovementSensorOdom:
         self._cfg = cfg or TypedOdomConfig()
         self._logger = logger
         self._props: Optional[MovementSensor.Properties] = None
+        self.last_debug: TypedOdomDebug = TypedOdomDebug(
+            velocity_convention=self._cfg.velocity_convention
+        )
 
     async def properties(self) -> MovementSensor.Properties:
         """Cache and return the sensor's capabilities (fetched once)."""
@@ -83,7 +110,8 @@ class TypedMovementSensorOdom:
                     f"linear_velocity={self._props.linear_velocity_supported} "
                     f"linear_acceleration={self._props.linear_acceleration_supported} "
                     f"orientation={self._props.orientation_supported} "
-                    f"position={self._props.position_supported}"
+                    f"position={self._props.position_supported} "
+                    f"velocity_convention={self._cfg.velocity_convention}"
                 )
         return self._props
 
@@ -126,14 +154,30 @@ class TypedMovementSensorOdom:
         pose = None
         heading_rad = None
         ax = ay = None
+        remapped = False
+        raw_lv = (None, None, None)
+        raw_av_z = None
 
         if "av" in results:
             # Viam AngularVelocity is degrees/s (CCW +).
-            vtheta = math.radians(float(results["av"].z))
+            # Unset protobuf fields decode as 0.0 — treat as valid (parked).
+            raw_av_z = float(getattr(results["av"], "z", 0.0) or 0.0)
+            vtheta = math.radians(raw_av_z)
 
         if "lv" in results:
-            lv = results["lv"]  # body frame: x forward, y left (m/s)
-            vx, vy = float(lv.x), float(lv.y)
+            lv = results["lv"]
+            # Missing Vector3 components default to 0.0 (proto omit-empty).
+            lx = float(getattr(lv, "x", 0.0) or 0.0)
+            ly = float(getattr(lv, "y", 0.0) or 0.0)
+            lz = float(getattr(lv, "z", 0.0) or 0.0)
+            raw_lv = (lx, ly, lz)
+            if cfg.velocity_convention in BASE_VELOCITY_Y_FORWARD:
+                # Viam Y-forward / X-lateral -> ROS x-forward / y-left.
+                # Match wheeled-odometry readings remap: vx=y, vy=-x.
+                vx, vy = ly, -lx
+                remapped = True
+            else:
+                vx, vy = lx, ly
 
         rpy = None
         if "orient" in results:
@@ -158,6 +202,34 @@ class TypedMovementSensorOdom:
             # geo_point convention for non-georeferenced maps.
             pose = conv.Pose2D(float(geo.longitude), float(geo.latitude), rpy[2])
 
+        self.last_debug = TypedOdomDebug(
+            source="typed",
+            linear_velocity_supported=bool(p.linear_velocity_supported),
+            angular_velocity_supported=bool(p.angular_velocity_supported),
+            position_supported=bool(p.position_supported),
+            raw_lv_x=raw_lv[0],
+            raw_lv_y=raw_lv[1],
+            raw_lv_z=raw_lv[2],
+            raw_av_z_deg_s=raw_av_z,
+            velocity_convention=cfg.velocity_convention,
+            remapped=remapped,
+        )
+
         return conv.OdomReading(
             vx, vy, vtheta, pose=pose, heading_rad=heading_rad, ax=ax, ay=ay
         )
+
+    def debug_dict(self) -> Dict[str, Any]:
+        d = self.last_debug
+        return {
+            "source": d.source,
+            "linear_velocity_supported": d.linear_velocity_supported,
+            "angular_velocity_supported": d.angular_velocity_supported,
+            "position_supported": d.position_supported,
+            "raw_lv_x": d.raw_lv_x,
+            "raw_lv_y": d.raw_lv_y,
+            "raw_lv_z": d.raw_lv_z,
+            "raw_av_z_deg_s": d.raw_av_z_deg_s,
+            "velocity_convention": d.velocity_convention,
+            "remapped": d.remapped,
+        }
