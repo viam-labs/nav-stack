@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from viam.components.movement_sensor import MovementSensor
