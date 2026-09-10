@@ -246,9 +246,25 @@ class WitImu(MovementSensor):
     async def get_orientation(
         self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs
     ):
+        """Return orientation as a Viam OrientationVector protobuf.
+
+        Matches ``viam-modules/wit-motion``: the AHRS state is Z-Y-X euler from
+        the 0x53 angle packet (degrees scaled by /32768*180, stored as radians).
+        When nearly level, encode yaw directly as a planar OV (``o_z=1``,
+        ``theta`` = yaw degrees) so clients that read ``theta`` as heading match
+        the Wit yaw packet — same value ``Orientation()`` exposes as
+        ``EulerAngles.Yaw`` in the Go module.
+        """
         del extra, timeout, kwargs
+        from viam.proto.common import Orientation
+
         with self._lock:
-            ea = EulerAngles(roll=self._roll, pitch=self._pitch, yaw=self._yaw)
+            roll, pitch, yaw = self._roll, self._pitch, self._yaw
+        # Near-level: preserve AHRS yaw in OV.theta (degrees). Avoids quat→OV
+        # axis tilt when roll/pitch are small but noisy.
+        if abs(roll) <= math.radians(15.0) and abs(pitch) <= math.radians(15.0):
+            return Orientation(o_x=0.0, o_y=0.0, o_z=1.0, theta=math.degrees(yaw))
+        ea = EulerAngles(roll=roll, pitch=pitch, yaw=yaw)
         return ea.to_quaternion().to_orientation_vector().to_proto()
 
     async def get_compass_heading(

@@ -80,6 +80,11 @@ class FakeMovementSensor:
         self._count("get_compass_heading")
         return self._compass
 
+    async def get_readings(self, **kw):
+        self._count("get_readings")
+        # No euler block by default — forces GetOrientation path (OV).
+        return {}
+
 
 def _read(sensor, cfg=None):
     reader = TypedMovementSensorOdom(sensor, cfg)
@@ -230,11 +235,44 @@ def test_read_typed_heading_from_orientation():
         orientation=True,
         orient=(0.0, 0.0, 1.0, -62.9),
     )
-    yaw, source = asyncio.run(read_typed_heading(s))
+    yaw, source, dbg = asyncio.run(read_typed_heading(s))
     assert source == "orientation"
     assert yaw == pytest.approx(math.radians(-62.9), abs=1e-3)
     assert "get_orientation" in s.calls
-    assert "get_readings" not in s.calls
+    assert dbg["orientation"]["ov_theta_deg"] == pytest.approx(-62.9, abs=1e-3)
+
+
+def test_read_typed_heading_prefers_native_euler_like_wit_motion():
+    """viam-modules/wit-motion exposes EulerAngles.Yaw; prefer readings.yaw."""
+
+    class WitLike(FakeMovementSensor):
+        async def get_readings(self, **kw):
+            self._count("get_readings")
+            return {
+                "orientation": {
+                    "roll": 0.0,
+                    "pitch": 0.0,
+                    "yaw": math.radians(90.0),
+                }
+            }
+
+    s = WitLike(orientation=True, orient=(0.0, 0.0, 1.0, 22.5))  # OV deliberately wrong
+    yaw, source, dbg = asyncio.run(read_typed_heading(s))
+    assert source == "orientation_euler"
+    assert yaw == pytest.approx(math.radians(90.0))
+    assert dbg["native_yaw_deg"] == pytest.approx(90.0)
+    # OV still captured for probe comparison.
+    assert dbg["orientation"]["ov_theta_deg"] == pytest.approx(22.5)
+
+
+def test_planar_ov_theta_is_yaw_not_axis_atan2():
+    from src.ros import conversions as conv
+
+    # 90° about +Z must yield yaw=90°, even with slight axis tilt noise.
+    r, p, y = conv.orientation_vector_to_rpy(0.02, -0.01, 0.999, 90.0, theta_unit="deg")
+    assert r == pytest.approx(0.0)
+    assert p == pytest.approx(0.0)
+    assert y == pytest.approx(math.radians(90.0))
 
 
 def test_sync_heading_aligns_twist_integrator():

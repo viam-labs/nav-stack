@@ -1470,8 +1470,10 @@ class RosSlam(SLAM):
                 heading_dbg = getattr(sensors, "heading_debug", None)
                 if callable(heading_dbg):
                     hd = heading_dbg()
-                    if hd.get("source"):
-                        odom_probe["heading_source"] = hd.get("source")
+                    if hd:
+                        odom_probe["heading"] = hd
+                        if hd.get("source"):
+                            odom_probe["heading_source"] = hd.get("source")
                 debug = sensors.odom_debug()
                 if debug:
                     odom_probe["raw"] = debug

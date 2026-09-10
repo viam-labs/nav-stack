@@ -312,9 +312,13 @@ class BuiltinSensors:
         if self._heading is None:
             self._heading_debug = {"source": "none", "heading_rad": None}
             return sample
-        heading, source = await read_typed_heading(self._heading)
+        heading, source, heading_dbg = await read_typed_heading(self._heading)
         if heading is None:
-            self._heading_debug = {"source": source or "none", "heading_rad": None}
+            self._heading_debug = {
+                "source": source or "none",
+                "heading_rad": None,
+                **heading_dbg,
+            }
             return sample
         if cfg.heading_sensor_invert:
             heading = conv.normalize_angle(-heading)
@@ -329,7 +333,8 @@ class BuiltinSensors:
         self._heading_debug = {
             "source": source,
             "heading_rad": heading,
-            "heading_deg": math.degrees(heading),
+            "heading_deg": round(math.degrees(heading), 3),
+            **heading_dbg,
         }
         return sample
 

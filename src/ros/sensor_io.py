@@ -214,7 +214,7 @@ def build_io_provider(
         if heading_sensor is not None:
             from .odom_source import read_typed_heading
 
-            heading, _source = await read_typed_heading(heading_sensor)
+            heading, _source, _dbg = await read_typed_heading(heading_sensor)
             if heading is not None:
                 if cfg.heading_sensor_invert:
                     heading = conv.normalize_angle(-heading)

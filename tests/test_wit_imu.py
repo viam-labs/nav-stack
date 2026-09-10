@@ -39,6 +39,17 @@ def test_scale_le_u16_zero():
     assert scale_le_u16(0, 0, 180.0) == pytest.approx(0.0)
 
 
+def test_parser_orient_yaw_90_matches_wit_motion_scale():
+    """Official Wit scale (/32768*180) — same as viam-modules/wit-motion."""
+    parser = WitStreamParser()
+    # Signed int16 for +90°: 90/180*32768 = 16384.
+    yaw = struct.pack("<h", 16384)
+    payload = b"\x00\x00\x00\x00" + yaw + b"\x00\x00"
+    n = parser.feed(_frame(TYPE_ORIENT, payload))
+    assert n == 1
+    assert parser.sample.yaw == pytest.approx(math.radians(90.0))
+
+
 def test_parser_accel_gyro_orient():
     parser = WitStreamParser()
     # Three frames: accel, gyro, orient around zero.

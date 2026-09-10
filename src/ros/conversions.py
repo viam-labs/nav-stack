@@ -60,15 +60,86 @@ def euler_from_orientation_vector(
 
     Shared by the external-SLAM pose reader and the typed movement-sensor reader
     so the orientation-vector -> Euler projection lives in one place.
+
+    ``theta_deg`` is the Orientation **protobuf** convention (degrees). For a
+    near-vertical axis (``|o_z|≈1``), yaw is taken directly from ``theta`` —
+    that is the rotation about +Z — rather than relying solely on a full
+    quaternion→Euler decomposition that can under-report yaw when the axis is
+    slightly tilted.
     """
+    return orientation_vector_to_rpy(o_x, o_y, o_z, theta_deg)
+
+
+def orientation_vector_to_rpy(
+    o_x: float,
+    o_y: float,
+    o_z: float,
+    theta: float,
+    *,
+    theta_unit: str = "deg",
+) -> Tuple[float, float, float]:
+    """Convert an orientation vector to (roll, pitch, yaw) radians.
+
+    ``theta_unit`` is ``"deg"`` for protobuf ``Orientation.theta`` and ``"rad"``
+    for in-memory ``spatialmath.OrientationVector.theta``.
+    """
+    ox, oy, oz = float(o_x), float(o_y), float(o_z)
+    theta_rad = float(theta) if theta_unit == "rad" else math.radians(float(theta))
+    # Planar / near-level: axis ≈ ±Z → yaw *is* the rotation angle about Z.
+    # Using theta directly avoids quat→Euler under-rotation when oX/oY are
+    # small but non-zero (common with a vibrating IMU).
+    axis_norm = math.sqrt(ox * ox + oy * oy + oz * oz) or 1.0
+    oz_n = oz / axis_norm
+    lateral = math.sqrt(ox * ox + oy * oy) / axis_norm
+    if abs(oz_n) >= 0.9 and lateral <= 0.35:
+        yaw = theta_rad if oz_n >= 0.0 else -theta_rad
+        return 0.0, 0.0, normalize_angle(yaw)
+
     from viam.proto.common import Orientation
     from viam.spatialmath import OrientationVector
 
+    theta_deg = math.degrees(theta_rad)
     ov = OrientationVector.from_proto(
-        Orientation(o_x=o_x, o_y=o_y, o_z=o_z, theta=theta_deg)
+        Orientation(o_x=ox, o_y=oy, o_z=oz, theta=theta_deg)
     )
     e = ov.to_quaternion().to_euler_angles()
     return e.roll, e.pitch, e.yaw
+
+
+def yaw_rad_from_viam_orientation(orient) -> Tuple[float, Dict[str, float]]:
+    """Extract yaw (rad) from a GetOrientation result + raw fields for probes.
+
+    Accepts protobuf ``Orientation`` (theta in degrees) or spatialmath
+    ``OrientationVector`` (theta in radians).
+    """
+    ox = float(getattr(orient, "o_x", 0.0) or 0.0)
+    oy = float(getattr(orient, "o_y", 0.0) or 0.0)
+    oz = float(getattr(orient, "o_z", 0.0) or 0.0)
+    theta_raw = float(getattr(orient, "theta", 0.0) or 0.0)
+    type_name = type(orient).__name__
+    # spatialmath OrientationVector stores theta in radians; protobuf uses degrees.
+    if type_name == "OrientationVector" or hasattr(orient, "_handle"):
+        theta_unit = "rad"
+        theta_deg = math.degrees(theta_raw)
+        theta_rad = theta_raw
+    else:
+        theta_unit = "deg"
+        theta_deg = theta_raw
+        theta_rad = math.radians(theta_raw)
+    _roll, _pitch, yaw = orientation_vector_to_rpy(
+        ox, oy, oz, theta_raw, theta_unit=theta_unit
+    )
+    meta = {
+        "o_x": ox,
+        "o_y": oy,
+        "o_z": oz,
+        "theta_raw": theta_raw,
+        "theta_unit": theta_unit,
+        "ov_theta_deg": theta_deg,
+        "ov_theta_rad": theta_rad,
+        "yaw_deg": math.degrees(yaw),
+    }
+    return float(yaw), meta
 
 
 @dataclass(frozen=True)

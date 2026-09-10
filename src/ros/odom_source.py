@@ -39,7 +39,7 @@ import asyncio
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from viam.components.movement_sensor import MovementSensor
 
@@ -285,43 +285,77 @@ class TypedMovementSensorOdom:
         }
 
 
-async def read_typed_heading(sensor) -> tuple[Optional[float], str]:
+async def read_typed_heading(sensor) -> tuple[Optional[float], str, Dict[str, Any]]:
     """Read yaw (rad) from a MovementSensor via typed getters.
 
-    Prefers ``GetOrientation`` (AHRS), then ``GetCompassHeading``, then
-    ``get_readings()`` as a last resort. Returns ``(yaw_rad, source)`` where
-    ``source`` is ``orientation`` / ``compass`` / ``readings`` / ``none``.
+    Matches ``viam-modules/wit-motion``: the Wit 0x53 angle packet is Z-Y-X
+    euler in degrees, stored as radians (``EulerAngles.Yaw``). Prefer that
+    native euler when ``get_readings().orientation.yaw`` is present. Otherwise
+    use ``GetOrientation``; for a near-vertical axis, yaw is the OrientationVector
+    ``theta`` (rotation about +Z), not an axis-component atan2.
+
+    Returns ``(yaw_rad, source, debug)``.
     """
+    debug: Dict[str, Any] = {}
+
+    # Always capture GetOrientation raw OV for sensor_probe diagnosis.
+    orient = None
     try:
         props = await sensor.get_properties()
     except Exception:  # noqa: BLE001
         props = None
-
     if props is not None and getattr(props, "orientation_supported", False):
         try:
             orient = await sensor.get_orientation()
-            rpy = conv.euler_from_orientation_vector(
-                float(getattr(orient, "o_x", 0.0) or 0.0),
-                float(getattr(orient, "o_y", 0.0) or 0.0),
-                float(getattr(orient, "o_z", 0.0) or 0.0),
-                float(getattr(orient, "theta", 0.0) or 0.0),
-            )
-            return float(rpy[2]), "orientation"
-        except Exception:  # noqa: BLE001
-            pass
+            _yaw_ov, meta = conv.yaw_rad_from_viam_orientation(orient)
+            debug["orientation"] = {
+                "o_x": meta["o_x"],
+                "o_y": meta["o_y"],
+                "o_z": meta["o_z"],
+                "theta": meta["theta_raw"],
+                "theta_unit": meta["theta_unit"],
+                "ov_theta_deg": round(meta["ov_theta_deg"], 3),
+                "yaw_from_ov_deg": round(meta["yaw_deg"], 3),
+            }
+            debug["yaw_from_ov_rad"] = _yaw_ov
+        except Exception as exc:  # noqa: BLE001
+            debug["orientation_error"] = repr(exc)
+
+    # Native AHRS euler (Wit 0x53 / wit-motion EulerAngles.Yaw).
+    try:
+        readings = await sensor.get_readings()
+        orient_block = (
+            readings.get("orientation") if isinstance(readings, Mapping) else None
+        )
+        if isinstance(orient_block, Mapping) and "yaw" in orient_block:
+            yaw = float(orient_block["yaw"])
+            debug["native_yaw_rad"] = yaw
+            debug["native_yaw_deg"] = round(math.degrees(yaw), 3)
+            if "roll" in orient_block:
+                debug["native_roll_deg"] = round(
+                    math.degrees(float(orient_block["roll"])), 3
+                )
+            if "pitch" in orient_block:
+                debug["native_pitch_deg"] = round(
+                    math.degrees(float(orient_block["pitch"])), 3
+                )
+            return yaw, "orientation_euler", debug
+        parsed = conv.parse_heading_sensor_readings(readings)
+        if parsed is not None:
+            debug["readings_yaw_deg"] = round(math.degrees(parsed), 3)
+            return float(parsed), "readings", debug
+    except Exception:  # noqa: BLE001
+        pass
+
+    if "yaw_from_ov_rad" in debug:
+        return float(debug["yaw_from_ov_rad"]), "orientation", debug
 
     if props is not None and getattr(props, "compass_heading_supported", False):
         try:
             deg = float(await sensor.get_compass_heading())
-            return math.radians(deg), "compass"
+            debug["compass_deg"] = deg
+            return math.radians(deg), "compass", debug
         except Exception:  # noqa: BLE001
             pass
 
-    try:
-        readings = await sensor.get_readings()
-        yaw = conv.parse_heading_sensor_readings(readings)
-        if yaw is not None:
-            return float(yaw), "readings"
-    except Exception:  # noqa: BLE001
-        pass
-    return None, "none"
+    return None, "none", debug
