@@ -723,3 +723,42 @@ def test_builtin_sensors_get_scan_fresh_dedupes_same_revolution(monkeypatch):
     assert sensors.get_scan(2.0) is c
     assert calls["n"] == 3
     assert sensors.scan_age_s() < 0.5
+
+
+def test_apply_heading_from_shm_skips_grpc():
+    import asyncio
+
+    from src.ros import imushm
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    class _HeadingBoom:
+        async def get_angular_velocity(self, **_):
+            raise AssertionError("heading must come from shm")
+
+        async def get_orientation(self, **_):
+            raise AssertionError("heading must come from shm")
+
+        async def get_readings(self, **_):
+            raise AssertionError("heading must come from shm")
+
+    class _FakeImuShm:
+        def read_latest(self, max_age_s=None):
+            del max_age_s
+            return imushm.ImuShmSample(
+                ax=0, ay=0, az=9.8, gx=0, gy=0, gz=12.0,
+                roll=0, pitch=0, yaw=math.radians(42.0),
+            )
+
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "heading_sensor": "wit", "imu_shm_name": "/viam-imu-wit"}
+    )
+    sensors = BuiltinSensors(
+        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=_HeadingBoom(),
+        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+    )
+    sensors._imu_shm = _FakeImuShm()  # noqa: SLF001
+    out = sensors._apply_heading_from_shm(conv.OdomReading(0.1, 0.0, 0.0))  # noqa: SLF001
+    assert out is not None
+    assert math.degrees(out.heading_rad) == pytest.approx(42.0)
+    assert out.vtheta == pytest.approx(math.radians(12.0))
+    assert sensors.heading_debug()["source"] == "imu_shm"

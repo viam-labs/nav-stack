@@ -17,7 +17,7 @@ class BridgeWorldIO:
     callable ``get_node`` so callers keep a stable WorldIO instance.
     """
 
-    def __init__(self, get_node, *, drive_timeout_s: float = 2.0):
+    def __init__(self, get_node, *, drive_timeout_s: float = 5.0):
         self._get_node = get_node
         self._drive_timeout_s = drive_timeout_s
         self._viz_lock = threading.Lock()

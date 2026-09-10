@@ -57,6 +57,7 @@ class BuiltinNavigator:
         backup_cooldown_s: float = 4.0,
         replan_local_blocked_time_s: float = 0.3,
         replan_local_min_period_s: float = 0.5,
+        drive_timeout_streak: int = 20,
         logger=None,
     ):
         self._world = world
@@ -100,6 +101,7 @@ class BuiltinNavigator:
             backup_cooldown_s=backup_cooldown_s,
             replan_local_blocked_time_s=replan_local_blocked_time_s,
             replan_local_min_period_s=replan_local_min_period_s,
+            drive_timeout_streak=drive_timeout_streak,
         )
         self._lock = threading.Lock()
         self._worker: Optional[threading.Thread] = None

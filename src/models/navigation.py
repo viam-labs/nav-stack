@@ -145,6 +145,7 @@ class RosNavigation(NavServiceBase):
                 scan_max_age_s=float(
                     getattr(slam_rt.slam_cfg, "scan_max_age_s", 2.0) or 2.0
                 ),
+                drive_timeout_s=float(getattr(cfg.builtin, "drive_timeout_s", 5.0)),
                 logger=lambda m: LOGGER.info(m),
             )
             navigator = make_builtin_navigator(

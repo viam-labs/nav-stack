@@ -33,6 +33,23 @@ LIDAR_SCAN_SOURCES = {
     LIDAR_SCAN_POINT_CLOUD,
 }
 
+
+def default_lidar_shm_name(component_name: str) -> str:
+    """Match ``viam-labs:nav-stack:rplidar`` default writer name."""
+    import re
+
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "", str(component_name)) or "lidar"
+    return f"/viam-pc-{slug}"
+
+
+def default_imu_shm_name(component_name: str) -> str:
+    """Match ``viam-labs:nav-stack:wit-imu`` default writer name."""
+    import re
+
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "", str(component_name)) or "imu"
+    return f"/viam-imu-{slug}"
+
+
 IMU_ODOM_COAST = "coast"
 IMU_ODOM_ACCEL_ONLY = "accel_only"
 IMU_ODOM_NONE = "none"
@@ -104,6 +121,8 @@ class LidarConfig:
     # Optional POSIX shm object (e.g. ``/viam-pc-lidar``) in the
     # viam-shared-memory-test double-buffer layout. When set, scan paths
     # (bridge + builtin ViamWorldIO) try shm before ``get_point_cloud``.
+    # Omitted → default ``/viam-pc-<name>`` (matches nav-stack rplidar). Set
+    # ``shm_name: ""`` to disable shm and force gRPC.
     shm_name: Optional[str] = None
     shm_region_size: int = 2 * 1024 * 1024
     # If true, never fall back to gRPC GetPointCloud when shm is empty/missing.
@@ -112,22 +131,28 @@ class LidarConfig:
     @classmethod
     def from_dict(cls, d: Mapping) -> "LidarConfig":
         if isinstance(d, str):
-            return cls(name=d)
+            name = d
+            return cls(name=name, shm_name=default_lidar_shm_name(name))
         mount = d.get("mount", {}) or {}
         scan_source = str(d.get("scan_source", LIDAR_SCAN_AUTO))
         if scan_source not in LIDAR_SCAN_SOURCES:
             raise ValueError(
                 f"lidar scan_source must be one of {sorted(LIDAR_SCAN_SOURCES)}"
             )
-        shm_name = d.get("shm_name")
-        shm_name_s = str(shm_name).strip() if shm_name else ""
+        name = d["name"]
+        if "shm_name" in d:
+            raw = d.get("shm_name")
+            shm_name_s = str(raw).strip() if raw else ""
+            shm_name = shm_name_s or None
+        else:
+            shm_name = default_lidar_shm_name(str(name))
         region = int(
             d.get("shm_region_size", d.get("shm_region_size_bytes", 2 * 1024 * 1024))
         )
         if region <= 0 or region % 2 != 0:
             raise ValueError("lidar shm_region_size must be a positive even byte count")
         return cls(
-            name=d["name"],
+            name=name,
             x=float(mount.get("x", d.get("x", 0.0))),
             y=float(mount.get("y", d.get("y", 0.0))),
             z=float(mount.get("z", d.get("z", 0.0))),
@@ -140,7 +165,7 @@ class LidarConfig:
             z_max=float(d.get("z_max", 2.0)),
             scan_source=scan_source,
             points_in_base_link=bool(d.get("points_in_base_link", False)),
-            shm_name=shm_name_s or None,
+            shm_name=shm_name,
             shm_region_size=region,
             shm_required=bool(d.get("shm_required", False)),
         )
@@ -250,6 +275,11 @@ class BuiltinNavConfig:
     max_lookahead_m: float = 0.7
     replan_period_s: float = 1.0
     timeout_s: float = 300.0
+    # Base.SetVelocity wait on the shared module event loop. Mapping+SLAM can
+    # briefly starve the loop; 2s was aborting goals on capable hardware.
+    drive_timeout_s: float = 5.0
+    # Consecutive SetVelocity timeouts before aborting the goal.
+    drive_timeout_streak: int = 20
     cost_scaling_factor: float = 4.0
     xy_goal_tolerance: float = 0.25  # meters
     yaw_goal_tolerance: float = 0.35  # radians (~20 deg; mugger uses 0.6)
@@ -291,6 +321,8 @@ class BuiltinNavConfig:
             max_lookahead_m=float(d.get("max_lookahead_m", 0.7)),
             replan_period_s=float(d.get("replan_period_s", 1.0)),
             timeout_s=float(d.get("timeout_s", 300.0)),
+            drive_timeout_s=float(d.get("drive_timeout_s", 5.0)),
+            drive_timeout_streak=int(d.get("drive_timeout_streak", 20)),
             cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),
             xy_goal_tolerance=float(d.get("xy_goal_tolerance", 0.25)),
             yaw_goal_tolerance=float(d.get("yaw_goal_tolerance", 0.35)),
@@ -774,15 +806,21 @@ class SlamConfig:
                 ),
             )
         )
+        heading_sensor = d.get("heading_sensor")
+        if "imu_shm_name" in d:
+            raw_imu = d.get("imu_shm_name")
+            imu_shm_name = str(raw_imu).strip() or None if raw_imu else None
+        elif heading_sensor:
+            # Prefer wit-imu POSIX shm over gRPC heading (keeps the shared
+            # module event loop free for Base.SetVelocity during nav).
+            imu_shm_name = default_imu_shm_name(str(heading_sensor))
+        else:
+            imu_shm_name = None
         return cls(
             base=d["base"],
             lidars=lidars,
             movement_sensor=d.get("movement_sensor"),
-            imu_shm_name=(
-                str(d["imu_shm_name"]).strip() or None
-                if d.get("imu_shm_name")
-                else None
-            ),
+            imu_shm_name=imu_shm_name,
             imu_shm_region_size=int(d.get("imu_shm_region_size", 4096)),
             imu_shm_max_age_s=float(d.get("imu_shm_max_age_s", 0.5)),
             heading_sensor=d.get("heading_sensor"),

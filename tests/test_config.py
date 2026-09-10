@@ -80,8 +80,31 @@ def test_lidar_config_mount_pitch_roll():
     )
     assert cfg.lidars[0].pitch == pytest.approx(0.035)
     assert cfg.lidars[0].roll == 0.0
-    assert cfg.lidars[0].shm_name is None
+    assert cfg.lidars[0].shm_name == "/viam-pc-livox"
     assert cfg.lidars[0].shm_required is False
+
+
+def test_lidar_shm_name_empty_disables_default():
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": {"name": "rplidar", "shm_name": ""}}
+    )
+    assert cfg.lidars[0].shm_name is None
+
+
+def test_imu_shm_defaults_from_heading_sensor():
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "heading_sensor": "wit"}
+    )
+    assert cfg.imu_shm_name == "/viam-imu-wit"
+    cfg2 = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "heading_sensor": "wit",
+            "imu_shm_name": "",
+        }
+    )
+    assert cfg2.imu_shm_name is None
 
 
 def test_lidar_config_shm_fields():

@@ -87,7 +87,7 @@ class ViamWorldIO:
         viz: Optional[NavVizStore] = None,
         shm_lidar=None,
         scan_max_age_s: float = 2.0,
-        drive_timeout_s: float = 2.0,
+        drive_timeout_s: float = 5.0,
         map_cache_s: float = 1.0,
         scan_bins: int = 360,
         logger=None,

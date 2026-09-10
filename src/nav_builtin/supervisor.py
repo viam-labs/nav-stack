@@ -82,6 +82,7 @@ class NavSupervisor:
         backup_cooldown_s: float = 4.0,
         replan_local_blocked_time_s: float = 0.3,
         replan_local_min_period_s: float = 0.5,
+        drive_timeout_streak: int = 20,
     ):
         self._world = world
         self._inflation = inflation_radius_m
@@ -94,6 +95,7 @@ class NavSupervisor:
         self._smooth_path = smooth_path
         self._smooth_spacing = smooth_sample_spacing_m
         self._local_costmap_enabled = local_costmap_enabled
+        self._drive_timeout_streak = max(1, int(drive_timeout_streak))
         self._local_planner = LocalPlannerConfig(
             enabled=local_planner_enabled,
             sim_time_s=local_planner_sim_time_s,
@@ -793,10 +795,10 @@ class NavSupervisor:
                     self._io_timeout_streak = 0
                 except TimeoutError:
                     # Transient event-loop starvation — don't abort the goal on
-                    # a single missed cmd_vel (common when local costmap was
-                    # rebuilding the full global map every tick).
+                    # a single missed cmd_vel (common when SLAM mapping + lidar
+                    # gRPC share the module loop with Base.SetVelocity).
                     self._io_timeout_streak += 1
-                    if self._io_timeout_streak >= 5:
+                    if self._io_timeout_streak >= self._drive_timeout_streak:
                         raise
                     time.sleep(poll)
                     continue
@@ -818,7 +820,9 @@ class NavSupervisor:
                         or "connection" in msg
                     ):
                         self._io_timeout_streak += 1
-                        if self._io_timeout_streak >= 8:
+                        if self._io_timeout_streak >= max(
+                            8, self._drive_timeout_streak
+                        ):
                             raise
                         time.sleep(poll)
                         continue

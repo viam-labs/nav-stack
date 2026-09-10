@@ -159,6 +159,7 @@ class RosNavigationExternal(NavServiceBase):
             viz=viz,
             shm_lidar=self._shm_lidar,
             scan_max_age_s=float(ext.bridge.scan_max_age_s or 2.0),
+            drive_timeout_s=float(getattr(ext.nav.builtin, "drive_timeout_s", 5.0)),
             logger=lambda m: LOGGER.info(m),
         )
         navigator = make_builtin_navigator(

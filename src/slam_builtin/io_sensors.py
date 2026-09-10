@@ -313,17 +313,87 @@ class BuiltinSensors:
         # or skip the dedicated heading_sensor merge.
         if self._movement is not None:
             try:
-                return self._run(self._read_odom(), timeout=1.0)
+                sample = self._run(self._read_odom_wheels(), timeout=1.0)
             except Exception:  # noqa: BLE001
-                pass
+                sample = None
+            if sample is not None:
+                headed = self._apply_heading_prefer_shm(sample)
+                if headed is not None:
+                    return headed
         sample = self._odom_from_imu_shm()
         if sample is None:
             return None
-        if self._heading is not None:
-            try:
-                sample = self._run(self._apply_heading(sample), timeout=1.0)
-            except Exception:  # noqa: BLE001
-                pass
+        if sample.heading_rad is not None and self._heading is None:
+            return sample
+        headed = self._apply_heading_prefer_shm(sample)
+        return headed if headed is not None else sample
+
+    def _apply_heading_prefer_shm(
+        self, sample: conv.OdomReading
+    ) -> Optional[conv.OdomReading]:
+        """Merge heading without touching the event loop when IMU shm is fresh."""
+        if self._heading is None and self._imu_shm is None:
+            return sample
+        shm = self._apply_heading_from_shm(sample)
+        if shm is not None:
+            return shm
+        if self._heading is None:
+            return sample
+        try:
+            return self._run(self._apply_heading(sample), timeout=1.0)
+        except Exception:  # noqa: BLE001
+            return sample
+
+    def _apply_heading_from_shm(
+        self, sample: conv.OdomReading
+    ) -> Optional[conv.OdomReading]:
+        """Absolute yaw (+ gyro rate) from wit-imu shm — no gRPC / event loop."""
+        reader = self._imu_shm
+        if reader is None:
+            return None
+        try:
+            frame = reader.read_latest(max_age_s=float(self._cfg.imu_shm_max_age_s))
+        except Exception:  # noqa: BLE001
+            return None
+        if frame is None or frame.yaw is None:
+            return None
+        cfg = self._cfg
+        now = time.monotonic()
+        raw = float(frame.yaw)
+        gz_rad_s = math.radians(float(frame.gz or 0.0))
+        heading = raw
+        if cfg.heading_sensor_invert:
+            heading = conv.normalize_angle(-heading)
+            gz_rad_s = -gz_rad_s
+        if cfg.heading_sensor_yaw_deg:
+            heading = conv.normalize_angle(
+                heading - math.radians(cfg.heading_sensor_yaw_deg)
+            )
+        self._gyro_heading_rad = raw
+        self._gyro_heading_t = now
+        # Prefer Wit gyro rate over sparse wheel ω when the chassis is spinning.
+        if abs(gz_rad_s) > 1e-4 or abs(sample.vtheta) < 1e-6:
+            sample = conv.OdomReading(
+                sample.vx,
+                sample.vy,
+                gz_rad_s,
+                pose=sample.pose,
+                heading_rad=sample.heading_rad,
+                ax=sample.ax,
+                ay=sample.ay,
+            )
+        sample = conv.merge_odom_heading(sample, heading)
+        sync = getattr(self._odom_reader, "sync_heading", None)
+        if callable(sync):
+            sync(heading)
+        self._heading_debug = {
+            "source": "imu_shm",
+            "heading_rad": heading,
+            "heading_deg": round(math.degrees(heading), 3),
+            "ahrs_yaw_deg": round(math.degrees(raw), 3),
+            "ahrs_source": "imu_shm",
+            "gyro_z_deg_s": round(math.degrees(gz_rad_s), 3),
+        }
         return sample
 
     def _odom_from_imu_shm(self) -> Optional[conv.OdomReading]:
@@ -453,7 +523,8 @@ class BuiltinSensors:
         }
         return sample
 
-    async def _read_odom(self) -> conv.OdomReading:
+    async def _read_odom_wheels(self) -> conv.OdomReading:
+        """Wheel / movement_sensor twist (+pose) without heading_sensor RPCs."""
         cfg = self._cfg
         if self._odom_reader is not None:
             sample = await self._odom_reader.read()
@@ -465,7 +536,10 @@ class BuiltinSensors:
             sample = conv.apply_sensor_mount_yaw(
                 sample, math.radians(cfg.movement_sensor_yaw_deg)
             )
-        return await self._apply_heading(sample)
+        return sample
+
+    async def _read_odom(self) -> conv.OdomReading:
+        return await self._apply_heading(await self._read_odom_wheels())
 
     def odom_debug(self) -> dict:
         """Raw typed-getter snapshot from the last odom read (if any)."""
