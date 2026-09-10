@@ -61,16 +61,16 @@ def _near_goal_command(
     next tick (back inside the ball) flips to final-yaw with the opposite
     sign — classic goal-swing. Stay in this mode for an expanded ball.
 
-    Large final-yaw errors must be pure-spin first. When final yaw is already
-    within tolerance but XY is not, face the goal point and drive — holding
-    goal θ while creeping at <0.05 m/s causes a butt-wiggle and trips
-    ``navigation stalled (no forward progress)`` (stall only counts
-    ``|vx| >= 0.05`` as translating).
+    Close XY first while still away from the goal point. Only pure-spin for
+    final yaw once inside ~2× ``xy_tolerance`` — spinning for goal θ at
+    0.7–1 m out never arrives (vx=0 forever while yaw hunts).
     """
     xy_tol = motion.xy_tolerance_m
     yaw_tol = motion.yaw_tolerance_rad
     yaw_cap = min(0.40, motion.max_angular_rad_s)
     spin_first_rad = max(yaw_tol * 1.5, math.radians(35.0))
+    # Inside this radius, settling final yaw in place is OK / preferred.
+    yaw_settle_m = max(xy_tol * 2.0, 0.40)
 
     def _spin_yaw() -> DriveCommand:
         vtheta = _clamp(yaw_err * 0.85, yaw_cap)
@@ -78,40 +78,49 @@ def _near_goal_command(
             vtheta = math.copysign(0.10, yaw_err)
         return DriveCommand(0.0, 0.0, vtheta, False)
 
-    if abs(yaw_err) > spin_first_rad:
-        return _spin_yaw()
-
-    if dist <= xy_tol:
-        return _spin_yaw()
-
-    # Final yaw already good — close XY facing the goal point.
-    if abs(yaw_err) <= yaw_tol:
+    def _close_xy() -> DriveCommand:
+        """Face the goal point (or reverse) and close distance."""
+        if abs(bearing) > math.radians(100.0):
+            crawl = min(0.15, max(0.08, motion.max_linear_mps * 0.25))
+            rev_bearing = conv.normalize_angle(bearing + math.pi)
+            return apply_velocity_floor(
+                DriveCommand(
+                    -min(crawl, dist * 0.7),
+                    0.0,
+                    _clamp(rev_bearing * 1.2, yaw_cap),
+                    False,
+                ),
+                motion,
+            )
         if abs(bearing) > math.radians(45.0):
-            # Point at the goal (or its reverse) before translating.
-            if abs(bearing) > math.radians(100.0):
-                # Goal behind: reverse-crawl while nudging.
-                crawl = min(0.15, max(0.08, motion.max_linear_mps * 0.25))
-                rev_bearing = conv.normalize_angle(bearing + math.pi)
-                return apply_velocity_floor(
-                    DriveCommand(
-                        -min(crawl, dist * 0.7),
-                        0.0,
-                        _clamp(rev_bearing * 1.2, yaw_cap),
-                        False,
-                    ),
-                    motion,
-                )
             return apply_velocity_floor(
                 DriveCommand(0.0, 0.0, _clamp(bearing * 1.5, yaw_cap), False),
                 motion,
             )
-        # Aligned enough to drive — keep vx above stall's translating floor.
         crawl = min(0.18, max(0.08, motion.max_linear_mps * 0.30))
         vx = min(crawl, max(0.08, dist * 0.7))
         return apply_velocity_floor(
             DriveCommand(vx, 0.0, _clamp(bearing * 1.5, yaw_cap), False),
             motion,
         )
+
+    # On the spot: only final yaw remains.
+    if dist <= xy_tol:
+        return _spin_yaw()
+
+    # Still metres out: ignore final yaw and close XY. A large goal-θ error
+    # used to trigger spin-first here and leave the robot rotating in place.
+    if dist > yaw_settle_m:
+        return _close_xy()
+
+    # Near the XY ball with a large final-yaw error: spin before crawling so
+    # we don't translate while hunting ±π of goal θ.
+    if abs(yaw_err) > spin_first_rad:
+        return _spin_yaw()
+
+    # Final yaw already good — close remaining XY facing the goal point.
+    if abs(yaw_err) <= yaw_tol:
+        return _close_xy()
 
     crawl = min(0.08, max(0.04, motion.max_linear_mps * 0.15))
     if abs(bearing) > math.radians(100.0):
