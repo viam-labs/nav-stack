@@ -327,6 +327,7 @@ class NavSupervisor:
             last_replan = time.monotonic()
             last_progress_pose: Optional[Pose2D] = None
             last_progress_at = time.monotonic()
+            last_progress_dist = float("inf")
             spin_stuck_since: Optional[float] = None
             backup_active = False
             backup_start: Optional[Pose2D] = None
@@ -749,17 +750,36 @@ class NavSupervisor:
                 # Stall detection.
                 # Pure spin (vx≈0) must not reset the stall timer — otherwise a
                 # stuck local-planner / rotate-in-place loop never replans.
+                goal_pose_stall = Pose2D(
+                    path.points[-1][0], path.points[-1][1], path.goal_theta
+                )
+                dist_goal = distance_m(pose, goal_pose_stall)
+                near_goal_stall = (
+                    dist_goal <= self._follower.motion.xy_tolerance_m * 2.0
+                )
+                # Near goal, tiny crawls are real progress — don't require 0.05 m/s.
+                translating_floor = 0.03 if near_goal_stall else 0.05
+                stall_limit_s = self._follower.motion.stall_timeout_s * (
+                    2.0 if near_goal_stall else 1.0
+                )
                 if last_progress_pose is None:
                     last_progress_pose = pose
                     last_progress_at = now
+                    last_progress_dist = dist_goal
                 else:
                     moved = distance_m(pose, last_progress_pose)
-                    translating = abs(float(cmd.vx)) >= 0.05
-                    if moved >= self._follower.motion.stall_progress_m and (
-                        translating or moved >= self._follower.motion.stall_progress_m * 2
+                    closing = dist_goal < last_progress_dist - 0.01
+                    translating = abs(float(cmd.vx)) >= translating_floor
+                    if closing or (
+                        moved >= self._follower.motion.stall_progress_m
+                        and (
+                            translating
+                            or moved >= self._follower.motion.stall_progress_m * 2
+                        )
                     ):
                         last_progress_pose = pose
                         last_progress_at = now
+                        last_progress_dist = dist_goal
                     elif translating:
                         turned = abs(
                             conv.normalize_angle(pose.theta - last_progress_pose.theta)
@@ -767,10 +787,8 @@ class NavSupervisor:
                         if turned >= self._follower.motion.stall_progress_rad:
                             last_progress_pose = pose
                             last_progress_at = now
-                        elif (
-                            now - last_progress_at
-                            >= self._follower.motion.stall_timeout_s
-                        ):
+                            last_progress_dist = dist_goal
+                        elif now - last_progress_at >= stall_limit_s:
                             new_path = self._try_replan(
                                 goal,
                                 pose,
@@ -781,6 +799,7 @@ class NavSupervisor:
                             if new_path is not None:
                                 path = new_path
                                 last_progress_at = now
+                                last_progress_dist = dist_goal
                                 last_replan = now
                                 local_blocked_since = None
                                 backup_attempts = 0
@@ -792,7 +811,7 @@ class NavSupervisor:
                                     error_msg="navigation stalled",
                                 )
                                 return
-                    elif now - last_progress_at >= self._follower.motion.stall_timeout_s:
+                    elif now - last_progress_at >= stall_limit_s:
                         new_path = self._try_replan(
                             goal,
                             pose,
@@ -803,6 +822,7 @@ class NavSupervisor:
                         if new_path is not None:
                             path = new_path
                             last_progress_at = now
+                            last_progress_dist = dist_goal
                             last_replan = now
                             local_blocked_since = None
                             backup_attempts = 0

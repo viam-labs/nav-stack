@@ -427,6 +427,24 @@ def test_follow_command_no_sign_flip_across_xy_tolerance():
     assert abs(cmd_out.vtheta) <= 0.40 + 1e-6
 
 
+def test_follow_command_yaw_settled_closes_xy_without_wiggle():
+    """Repro: yaw already at goal θ, 0.38 m out — must drive, not creep+stall."""
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_linear_mps = 0.6
+    # Face goal yaw already; goal is ahead-left (~bearing not tiny).
+    current = Pose2D(0.333, 0.631, -1.659)
+    goal = Pose2D(0.694, 0.496, -1.606)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert abs(cmd.vx) >= 0.05 or abs(cmd.vtheta) >= 0.1
+    # Must not be the old tiny crawl that stall ignores.
+    if abs(cmd.vx) > 1e-6:
+        assert abs(cmd.vx) >= 0.05
+
+
 def test_follow_command_large_yaw_spins_before_crawl():
     """Status repro: ~140° final yaw at 0.3 m must not translate while spinning."""
     from src.nav_builtin.controller import compute_follow_command
