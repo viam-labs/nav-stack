@@ -32,6 +32,12 @@ def _get_laser_scan_not_implemented(exc: BaseException) -> bool:
     )
 
 
+def _scan_content_key(scan: conv.LaserScan2D) -> int:
+    """Cheap identity for one lidar revolution (dedupe repeated fetches)."""
+    ranges = np.asarray(scan.ranges, dtype=np.float32)
+    return hash((ranges.size, ranges.tobytes()))
+
+
 def _shm_error_is_stale(detail: object) -> bool:
     return "frame too old" in str(detail).lower()
 
@@ -66,11 +72,12 @@ class BuiltinSensors:
         )
         self._scan_max_age_s = float(scan_max_age_s)
         self._scan_cache: Optional[conv.LaserScan2D] = None
-        self._scan_cache_at = 0.0
+        self._scan_cache_at = 0.0  # first time this exact scan content was seen
+        self._scan_cache_key: Optional[int] = None
+        self._scan_fetch_at = 0.0
         self._heading_debug: dict = {"source": "none", "heading_rad": None}
-        # Gyro-integrated yaw from heading_sensor AngularVelocity (wit-motion
-        # exposes deg/s). AHRS 0x53 yaw is often magnetometer-sticky indoors;
-        # gyro tracks physical turns for the SLAM prior.
+        # Gyro-integrated yaw fallback from heading_sensor AngularVelocity
+        # (wit-motion exposes deg/s); used only when no absolute orientation.
         self._gyro_heading_rad: Optional[float] = None
         self._gyro_heading_t: Optional[float] = None
         self._imu_shm: Optional[imushm.Reader] = None
@@ -104,31 +111,74 @@ class BuiltinSensors:
             fut.cancel()
             raise
 
-    def get_scan(self, max_age_s: float = 2.0) -> Optional[conv.LaserScan2D]:
+    # Do not hammer the lidar faster than it can publish a revolution.
+    _SCAN_MIN_REFETCH_S = 0.04
+
+    def get_scan(
+        self, max_age_s: float = 2.0, *, fresh: bool = False
+    ) -> Optional[conv.LaserScan2D]:
+        """Latest merged 2D scan.
+
+        ``fresh=False`` (nav/costmap consumers): reuse the cached scan while it
+        is younger than ``max_age_s``.
+
+        ``fresh=True`` (SLAM engine): always re-fetch (rate-limited to the lidar
+        period) so the scan is captured at the same time as the odom/heading it
+        is paired with. Re-using one scan for ``max_age_s`` while the heading
+        prior kept rotating smeared every wall into a ring during turns. The
+        same object is returned while the lidar content has not changed, so the
+        caller can skip matching/inserting a scan it already consumed.
+        """
         now = time.monotonic()
-        if (
-            self._scan_cache is not None
-            and now - self._scan_cache_at <= max_age_s
-        ):
-            return self._scan_cache
+        cached = self._scan_cache
+        if cached is not None:
+            age = now - self._scan_cache_at
+            if not fresh and age <= max_age_s:
+                return cached
+            if fresh and now - self._scan_fetch_at < self._SCAN_MIN_REFETCH_S:
+                return cached if age <= max_age_s else None
         lidars: Sequence[LidarConfig] = self._cfg.lidars
         if not lidars:
-            return self._scan_cache
+            return self._stale_or_none(max_age_s, now, fresh)
+        self._scan_fetch_at = now
         scans = []
         for lidar in lidars:
             scan = self._read_lidar_scan_sync(lidar, max_age_s=max_age_s)
             if scan is not None:
                 scans.append(scan)
         if not scans:
-            return self._scan_cache
+            return self._stale_or_none(max_age_s, now, fresh)
         merged = (
             scans[0]
             if len(scans) == 1
             else conv.merge_scans(scans, self._cfg.scan_bins)
         )
+        key = _scan_content_key(merged)
+        if cached is not None and key == self._scan_cache_key:
+            # Same lidar revolution as before: keep the object and its
+            # first-seen time (best capture-time estimate).
+            return cached if now - self._scan_cache_at <= max_age_s else None
         self._scan_cache = merged
+        self._scan_cache_key = key
         self._scan_cache_at = now
         return merged
+
+    def _stale_or_none(
+        self, max_age_s: float, now: float, fresh: bool
+    ) -> Optional[conv.LaserScan2D]:
+        cached = self._scan_cache
+        if not fresh:
+            # Legacy nav behaviour: last known scan is better than nothing.
+            return cached
+        if cached is not None and now - self._scan_cache_at <= max_age_s:
+            return cached
+        return None
+
+    def scan_age_s(self) -> float:
+        """Seconds since the current cached scan content was first seen."""
+        if self._scan_cache is None:
+            return float("nan")
+        return max(0.0, time.monotonic() - self._scan_cache_at)
 
     def _pcd_to_scan(self, raw: bytes, lidar: LidarConfig) -> conv.LaserScan2D:
         pts = conv.parse_pcd(raw)

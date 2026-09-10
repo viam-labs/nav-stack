@@ -604,3 +604,122 @@ def test_apply_heading_gyro_fallback_only_without_orientation():
     sensors._gyro_heading_t -= 0.2  # noqa: SLF001  pretend 200 ms elapsed
     out = asyncio.run(sensors._apply_heading(sample))  # noqa: SLF001
     assert math.degrees(out.heading_rad) == pytest.approx(18.0, abs=0.5)
+
+
+def _wall_scan(n: int = 360, dist: float = 3.0) -> conv.LaserScan2D:
+    return conv.LaserScan2D(
+        ranges=np.full(n, dist),
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.1,
+        range_max=10.0,
+    )
+
+
+def test_engine_does_not_reinsert_same_scan_while_heading_turns(tmp_path: Path):
+    """A scan object already inserted must not be painted again at new yaw."""
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": str(tmp_path), "mode": "mapping"}
+    )
+    scan = _wall_scan()
+    heading = {"th": 0.0}
+
+    class _Sensors(_FakeSensors):
+        def get_scan(self, max_age_s: float = 2.0, *, fresh: bool = False):
+            assert fresh  # engine must ask for a fresh scan
+            return self._scan
+
+        def get_odom(self):
+            return conv.OdomReading(
+                0.0, 0.0, 0.0, pose=conv.Pose2D(0.0, 0.0, heading["th"]),
+                heading_rad=heading["th"],
+            )
+
+        def scan_age_s(self):
+            return 0.01
+
+    sensors = _Sensors(scan=scan)
+    engine = BuiltinSlamEngine(cfg, sensors, MapStore(str(tmp_path)), rate_hz=10.0)  # type: ignore[arg-type]
+    engine._tick()  # noqa: SLF001  prev pose seeds
+    engine._tick()  # noqa: SLF001  first insert of this scan
+    inserted = engine._updates  # noqa: SLF001
+    assert inserted == 1
+    # Heading rotates 10 deg per tick; the same scan object must not be re-inserted.
+    for i in range(1, 8):
+        heading["th"] = math.radians(10.0 * i)
+        engine._tick()  # noqa: SLF001
+    assert engine._updates == inserted  # noqa: SLF001
+    assert engine.get_pose().theta == pytest.approx(math.radians(70.0), abs=1e-6)
+    assert engine.diagnostics()["last_scan_age_s"] == pytest.approx(0.01)
+    # A new scan object is inserted once more.
+    sensors._scan = _wall_scan()  # noqa: SLF001
+    engine._tick()  # noqa: SLF001
+    assert engine._updates == inserted + 1  # noqa: SLF001
+
+
+def test_engine_skips_insert_when_spinning_fast(tmp_path: Path):
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": str(tmp_path), "mode": "mapping"}
+    )
+    heading = {"th": 0.0}
+
+    class _Sensors(_FakeSensors):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def get_scan(self, max_age_s: float = 2.0, *, fresh: bool = False):
+            self.n += 1
+            return _wall_scan(dist=3.0 + 0.001 * self.n)  # new object each tick
+
+        def get_odom(self):
+            return conv.OdomReading(
+                0.0, 0.0, 0.0, pose=conv.Pose2D(0.0, 0.0, heading["th"]),
+                heading_rad=heading["th"],
+            )
+
+    sensors = _Sensors()
+    engine = BuiltinSlamEngine(cfg, sensors, MapStore(str(tmp_path)), rate_hz=10.0)  # type: ignore[arg-type]
+    engine._tick()  # noqa: SLF001
+    engine._tick()  # noqa: SLF001
+    before = engine._updates  # noqa: SLF001
+    # ~30 deg in one 10 Hz tick ≈ 300 deg/s → insert skipped, pose still tracks.
+    engine._last_tick_at -= 0.1  # noqa: SLF001
+    heading["th"] = math.radians(30.0)
+    engine._tick()  # noqa: SLF001
+    assert engine._updates == before  # noqa: SLF001
+    assert engine.diagnostics()["insert_skips_turning"] == 1
+    assert engine.get_pose().theta == pytest.approx(math.radians(30.0), abs=1e-6)
+
+
+def test_builtin_sensors_get_scan_fresh_dedupes_same_revolution(monkeypatch):
+    import asyncio
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
+    sensors = BuiltinSensors(
+        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
+        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+    )
+    scans = [_wall_scan(dist=3.0), _wall_scan(dist=3.0), _wall_scan(dist=3.2)]
+    calls = {"n": 0}
+
+    def _read(lidar, *, max_age_s):
+        del lidar, max_age_s
+        s = scans[min(calls["n"], len(scans) - 1)]
+        calls["n"] += 1
+        return s
+
+    monkeypatch.setattr(sensors, "_read_lidar_scan_sync", _read)
+    monkeypatch.setattr(sensors, "_SCAN_MIN_REFETCH_S", 0.0)
+    a = sensors.get_scan(0.75, fresh=True)
+    b = sensors.get_scan(0.75, fresh=True)  # identical content → same object
+    assert a is b
+    c = sensors.get_scan(0.75, fresh=True)  # changed content → new object
+    assert c is not a
+    assert calls["n"] == 3
+    # Non-fresh callers keep the cache without refetching.
+    assert sensors.get_scan(2.0) is c
+    assert calls["n"] == 3
+    assert sensors.scan_age_s() < 0.5

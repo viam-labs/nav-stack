@@ -63,6 +63,11 @@ class BuiltinSlamEngine:
         self._last_match_score = float("nan")
         self._last_prior_score = float("nan")
         self._last_scan_age_s = float("nan")
+        self._last_scan_obj: Optional[conv.LaserScan2D] = None
+        self._last_tick_pose: Optional[conv.Pose2D] = None
+        self._last_tick_at: Optional[float] = None
+        self._last_yaw_rate = 0.0
+        self._insert_skips_turning = 0
         self._ticks = 0
         self._updates = 0
         self._match_accepts = 0
@@ -317,6 +322,8 @@ class BuiltinSlamEngine:
                 "last_match_score": self._last_match_score,
                 "last_prior_score": self._last_prior_score,
                 "last_scan_age_s": self._last_scan_age_s,
+                "yaw_rate_deg_s": round(math.degrees(self._last_yaw_rate), 2),
+                "insert_skips_turning": self._insert_skips_turning,
                 "generation": self._generation,
                 "seed_localize_pending": self._seed_localize_pending,
                 "keyframes": len(self._keyframes),
@@ -339,9 +346,24 @@ class BuiltinSlamEngine:
         # the robot was when the scan was taken; keep the age tight even if
         # the nav-facing scan_max_age_s is generous.
         scan_age = min(float(self._cfg.scan_max_age_s or 2.0), 0.75)
-        scan = self._sensors.get_scan(max_age_s=scan_age)
+        get_scan = self._sensors.get_scan
+        try:
+            scan = get_scan(max_age_s=scan_age, fresh=True)
+        except TypeError:  # test doubles without the ``fresh`` kwarg
+            scan = get_scan(max_age_s=scan_age)
         odom = self._sensors.get_odom()
         now = time.monotonic()
+        age_fn = getattr(self._sensors, "scan_age_s", None)
+        if callable(age_fn):
+            try:
+                self._last_scan_age_s = float(age_fn())
+            except Exception:  # noqa: BLE001
+                pass
+        # A scan object we already matched/inserted must not be re-used at a
+        # newer pose: during a turn that paints the same wall at every heading.
+        new_scan = scan is not None and scan is not self._last_scan_obj
+        if scan is not None:
+            self._last_scan_obj = scan
 
         with self._lock:
             seed_pending = (
@@ -361,9 +383,17 @@ class BuiltinSlamEngine:
 
         with self._lock:
             self._ticks += 1
+            prev_pose, prev_at = self._last_tick_pose, self._last_tick_at
             predicted = self._predict(odom, now)
             self._pose = predicted
-            if scan is None:
+            self._last_tick_pose, self._last_tick_at = predicted, now
+            yaw_rate = 0.0
+            if prev_pose is not None and prev_at is not None and now > prev_at:
+                yaw_rate = abs(
+                    conv.normalize_angle(predicted.theta - prev_pose.theta)
+                ) / (now - prev_at)
+            self._last_yaw_rate = yaw_rate
+            if scan is None or not new_scan:
                 return
             occ_map = self._occupancy_for_match()
             known = self._occ_cache_known
@@ -389,7 +419,16 @@ class BuiltinSlamEngine:
                     self._match_rejects += 1
 
         if self._mode == MODE_MAPPING:
-            self._maybe_insert_scan(scan, now)
+            if yaw_rate > self._MAX_INSERT_YAW_RATE:
+                # One lidar revolution (~100 ms) is skewed by yaw_rate*0.1 s;
+                # inserting it during a fast spin paints walls as arcs.
+                self._insert_skips_turning += 1
+            else:
+                self._maybe_insert_scan(scan, now)
+
+    # Above this yaw rate a revolution is skewed >~5 deg; keep matching but
+    # do not bake the skewed scan into the map.
+    _MAX_INSERT_YAW_RATE = math.radians(45.0)
 
     def _try_seed_global_localize(self, scan) -> bool:
         """Full-map match once scans are available; apply if score is trusted."""
