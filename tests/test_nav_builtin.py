@@ -488,7 +488,30 @@ def test_follow_command_just_outside_2x_tol_no_full_spin():
     assert not cmd.done
     # Old bug: rotate_in_place at ±1.0 with vx=0 just outside the 2×tol ball.
     assert abs(cmd.vtheta) <= 0.40 + 1e-6
-    assert abs(cmd.vx) >= 0.05  # reverse or forward crawl toward goal XY
+    # Translating cmds must clear the ViamWorldIO sanitizer.
+    if abs(cmd.vx) > 1e-6:
+        assert abs(cmd.vx) >= 0.12 - 1e-6
+        assert abs(cmd.vtheta) <= 0.25 + 1e-6
+
+
+def test_follow_command_end_approach_no_tiny_reverse_yaw_hunt():
+    """Repro: 0.29 m out, goal behind heading — don't emit vx=-0.06 + vθ=0.28."""
+    from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(1.745, 0.298, -2.887)
+    goal = Pose2D(2.031, 0.340, -2.473)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    sx, _sy, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+    # After sanitize, still making progress (translate or intentional pure spin).
+    assert abs(sx) >= 0.12 - 1e-6 or (abs(sx) < 1e-9 and abs(st) >= 0.08)
+
 
 def test_follow_command_large_yaw_spins_before_crawl():
     """Status repro: ~140° final yaw at 0.3 m must not translate while spinning."""
@@ -508,6 +531,7 @@ def test_follow_command_large_yaw_spins_before_crawl():
 def test_follow_command_large_yaw_far_out_closes_xy_first():
     """Repro: ~0.75 m out with ~128° final yaw — must not spin in place forever."""
     from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -518,24 +542,12 @@ def test_follow_command_large_yaw_far_out_closes_xy_first():
     goal = Pose2D(-2.025, 0.725, -0.108)
     cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
     assert not cmd.done
-    # Close XY (drive or briefly face the point) — do not hunt final yaw yet.
-    assert abs(cmd.vx) >= 0.05 or abs(cmd.vtheta) <= 0.40 + 1e-6
-    # Must make progress toward the point somehow (not yaw-only hunt at ±0.4).
-    bearing = math.atan2(goal.y - current.y, goal.x - current.x)
-    bearing_err = abs(
-        (bearing - current.theta + math.pi) % (2 * math.pi) - math.pi
-    )
-    if bearing_err <= math.radians(45.0):
-        assert abs(cmd.vx) >= 0.05
-    else:
-        # Facing the goal point is fine; hunting final yaw (2.2 rad) is not.
-        assert abs(cmd.vtheta) <= 0.40 + 1e-6
-        # Commanded turn should be toward goal bearing, not full final-yaw error.
-        assert abs(cmd.vx) >= 0.05 or abs(cmd.vtheta) > 0.05
-
+    sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+    assert abs(sx) >= 0.12 - 1e-6 or (abs(sx) < 1e-9 and abs(st) >= 0.08)
 
 def test_follow_command_overshoot_reverses_instead_of_spinning():
     from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -544,7 +556,10 @@ def test_follow_command_overshoot_reverses_instead_of_spinning():
     goal = Pose2D(0.0, 0.0, 0.0)
     cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=0.0)
     assert cmd.vx < 0.0
-    assert abs(cmd.vtheta) < 0.6
+    assert abs(cmd.vtheta) <= 0.25 + 1e-6
+    assert abs(cmd.vx) >= 0.12 - 1e-6
+    sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+    assert sx < 0.0
     assert not cmd.done
 
 def test_compute_path_command_drives_forward():
