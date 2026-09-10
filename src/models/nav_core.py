@@ -884,19 +884,37 @@ class NavServiceBase(Motion):
                         and now - self._builtin_costmap_cache_at < 1.0
                     ):
                         return cached, layer_used
-                    mp = snap.get("map")
-                    if mp is None and hasattr(view, "get_map"):
-                        mp = view.get_map()
+                    # Always refresh from the live SLAM/world map — never prefer
+                    # snap["map"], which is only updated when something else
+                    # called world.get_map() (often stale throughout mapping).
+                    mp = None
+                    world = getattr(runtime.manager, "_world", None)
+                    if world is None:
+                        world = getattr(runtime.manager, "_builtin_world", None)
+                    if world is not None and hasattr(world, "get_map"):
+                        try:
+                            mp = world.get_map()
+                        except Exception:  # noqa: BLE001
+                            mp = None
                     if mp is None or mp.get("grid") is None:
-                        # Refresh from ViamWorldIO / BuiltinNavHost when viz is cold.
-                        world = getattr(runtime.manager, "_world", None)
-                        if world is None:
-                            world = getattr(runtime.manager, "_builtin_world", None)
-                        if world is not None and hasattr(world, "get_map"):
+                        # BuiltinNavHost / BridgeNode expose get_map directly.
+                        if hasattr(runtime.manager, "get_map"):
                             try:
-                                mp = world.get_map()
+                                mp = runtime.manager.get_map()
                             except Exception:  # noqa: BLE001
                                 mp = None
+                        if (mp is None or mp.get("grid") is None) and hasattr(
+                            getattr(runtime.manager, "node", None), "get_map"
+                        ):
+                            try:
+                                mp = runtime.manager.node.get_map()
+                            except Exception:  # noqa: BLE001
+                                mp = None
+                    if mp is None or mp.get("grid") is None:
+                        if hasattr(view, "get_map"):
+                            mp = view.get_map()
+                    if mp is None or mp.get("grid") is None:
+                        mp = snap.get("map")
                     if mp is not None and mp.get("grid") is not None:
                         from ..nav_builtin.costmap import (
                             build_costmap,
@@ -916,8 +934,10 @@ class NavServiceBase(Motion):
                         cm = costmap_viz_dict(occ, costs)
                         self._builtin_costmap_cache = cm
                         self._builtin_costmap_cache_at = now
-                        # Keep nav-camera in sync with what the UI sees.
+                        # Keep nav-camera / viz store in sync with the live map.
                         try:
+                            if hasattr(view, "set_map"):
+                                view.set_map(mp)
                             if hasattr(view, "set_costmap"):
                                 view.set_costmap(cm)
                             elif hasattr(view, "_viz_lock"):
