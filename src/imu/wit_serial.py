@@ -209,6 +209,28 @@ class WitSerial:
         except TypeError:
             return _pyserial.Serial(self.port, **kwargs)
 
+    def write_command(self, payload: bytes, *, settle_s: float = 0.15) -> None:
+        """Write one ``FF AA ..`` register command and pause for the device."""
+        ser = self._ser
+        if ser is None:
+            raise WitError("write_command on closed port")
+        ser.write(payload)
+        try:
+            ser.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        if settle_s > 0:
+            time.sleep(settle_s)
+
+    def configure(self, algorithm: str = "keep", *, zero_yaw: bool = False) -> int:
+        """Send the startup config sequence; returns number of commands sent."""
+        from .wit_protocol import config_commands
+
+        cmds = config_commands(algorithm, zero_yaw=zero_yaw)
+        for cmd in cmds:
+            self.write_command(cmd)
+        return len(cmds)
+
     def poll(self) -> int:
         """Read available bytes; return packets parsed this call."""
         ser = self._ser

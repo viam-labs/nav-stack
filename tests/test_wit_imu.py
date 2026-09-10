@@ -7,10 +7,13 @@ import struct
 import pytest
 
 from src.imu.wit_protocol import (
+    CMD_UNLOCK,
     TYPE_ACCEL,
     TYPE_GYRO,
     TYPE_ORIENT,
+    WitError,
     WitStreamParser,
+    config_commands,
     scale_le_u16,
 )
 from src.ros import imushm
@@ -157,3 +160,67 @@ def test_serial_ports_prefer_by_path_for_imu():
     b = list_candidate_serial_ports(prefer_cp210=False)
     assert isinstance(a, list)
     assert isinstance(b, list)
+
+
+def test_parser_yaw_decode_matches_datasheet_and_exposes_raw():
+    """Datasheet: Yaw = ((YawH<<8)|YawL)/32768*180 deg. 169.14 -> 178.86 must
+    decode 1:1 (no extra scaling), and the raw u16 is exposed for verification."""
+    parser = WitStreamParser()
+    for deg in (169.14, 178.86, -102.31, 90.0):
+        payload = b"\x00\x00\x00\x00" + _u16_pair(deg, 180.0) + b"\x00\x00"
+        assert parser.feed(_frame(TYPE_ORIENT, payload)) == 1
+        s = parser.sample
+        assert s.yaw_deg_decoded == pytest.approx(deg, abs=0.01)
+        assert math.degrees(s.yaw) == pytest.approx(deg, abs=0.01)
+        assert s.yaw_raw_u16 == int(round(deg / 180.0 * 32768.0)) & 0xFFFF
+    assert parser.sample.angle_packets == 4
+    # A 90 deg physical turn must move decoded yaw 90 deg.
+    a = scale_le_u16(*_u16_pair(169.14, 180.0), 180.0)
+    b = scale_le_u16(*_u16_pair(169.14 + 90.0 - 360.0, 180.0), 180.0)
+    assert ((b - a + 180.0) % 360.0) - 180.0 == pytest.approx(90.0, abs=0.01)
+
+
+def test_parser_gyro_decode_raw_and_counts():
+    parser = WitStreamParser()
+    payload = b"\x00\x00\x00\x00" + _u16_pair(45.0, 2000.0) + b"\x00\x00"
+    parser.feed(_frame(TYPE_GYRO, payload))
+    s = parser.sample
+    assert s.gz == pytest.approx(45.0, abs=0.1)
+    assert s.gz_raw_u16 == int(round(45.0 / 2000.0 * 32768.0))
+    assert s.gyro_packets == 1
+
+
+def test_config_commands_wit_register_protocol():
+    assert config_commands("keep") == []
+    assert config_commands("6axis") == [CMD_UNLOCK, bytes.fromhex("ffaa240100")]
+    assert config_commands("9axis") == [CMD_UNLOCK, bytes.fromhex("ffaa240000")]
+    assert config_commands("6axis", zero_yaw=True) == [
+        CMD_UNLOCK,
+        bytes.fromhex("ffaa240100"),
+        bytes.fromhex("ffaa010400"),
+    ]
+    assert config_commands("keep", zero_yaw=True) == [CMD_UNLOCK, bytes.fromhex("ffaa010400")]
+    # Never saves to flash.
+    assert all(c != bytes.fromhex("ffaa000000") for c in config_commands("6axis", zero_yaw=True))
+    with pytest.raises(WitError):
+        config_commands("3axis")
+
+
+def test_wit_serial_configure_writes_sequence():
+    from src.imu.wit_serial import WitSerial
+
+    class _Port:
+        def __init__(self):
+            self.writes = []
+
+        def write(self, b):
+            self.writes.append(bytes(b))
+
+        def flush(self):
+            pass
+
+    dev = WitSerial("/dev/null")
+    dev._ser = _Port()  # noqa: SLF001
+    n = dev.configure("6axis", zero_yaw=False)
+    assert n == 2
+    assert dev._ser.writes == [CMD_UNLOCK, bytes.fromhex("ffaa240100")]  # noqa: SLF001

@@ -29,7 +29,7 @@ from viam.resource.types import Model, ModelFamily
 from viam.spatialmath import EulerAngles
 from viam.utils import struct_to_dict
 
-from ..imu.wit_protocol import WitError
+from ..imu.wit_protocol import ALGORITHMS, WitError, WitSample
 from ..imu.wit_serial import WitSerial
 from ..lidar.serial_ports import list_candidate_serial_ports, normalize_exclude_list
 from ..ros import imushm
@@ -72,6 +72,11 @@ class WitImu(MovementSensor):
         self._serial_exclude: list[str] = []
         self._serial_chip: Optional[str] = None
         self._include_tty_acm = False
+        self._algorithm = "6axis"
+        self._zero_yaw_on_start = False
+        self._config_sent = 0
+        self._config_error: Optional[str] = None
+        self._raw = WitSample()
 
     @classmethod
     def new(
@@ -98,6 +103,9 @@ class WitImu(MovementSensor):
         chip = str(attrs.get("serial_chip") or "").strip().lower() or None
         if chip not in (None, "cp210", "ch340"):
             raise ValueError("wit-imu serial_chip must be cp210, ch340, or omitted")
+        algo = str(attrs.get("algorithm", "6axis") or "6axis").strip().lower()
+        if algo not in ALGORITHMS:
+            raise ValueError(f"wit-imu algorithm must be one of {ALGORITHMS}")
         return [], []
 
     def reconfigure(
@@ -122,8 +130,11 @@ class WitImu(MovementSensor):
             raise ValueError("wit-imu serial_chip must be cp210, ch340, or omitted")
         self._serial_chip = chip
         self._include_tty_acm = bool(attrs.get("include_tty_acm", False))
+        self._algorithm = str(attrs.get("algorithm", "6axis") or "6axis").strip().lower()
+        self._zero_yaw_on_start = bool(attrs.get("zero_yaw_on_start", False))
         self._stop.clear()
         self._open_device()
+        self._configure_device()
         region = int(attrs.get("shm_region_size", imushm.DEFAULT_REGION_SIZE))
         self._shm = imushm.Writer(self._shm_name, region_size=region)
         self._thread = threading.Thread(
@@ -164,6 +175,35 @@ class WitImu(MovementSensor):
             raise ValueError("wit-imu requires serial_path or serial_autodetect")
         self._device = dev
 
+    def _configure_device(self) -> None:
+        """Push algorithm / yaw-zero to the device (not saved to flash).
+
+        Default ``algorithm: "6axis"`` makes the 0x53 yaw pure gyro integration.
+        In 9-axis mode the yaw is magnetometer-corrected and, mounted on a
+        steel chassis, the local field rotates *with* the robot — yaw then
+        under-reports real turns by ~5-10x. SLAM handles the slow 6-axis drift.
+        """
+        self._config_sent = 0
+        self._config_error = None
+        dev = self._device
+        if dev is None:
+            return
+        try:
+            self._config_sent = dev.configure(
+                self._algorithm, zero_yaw=self._zero_yaw_on_start
+            )
+            if self._config_sent:
+                LOGGER.info(
+                    "nav-stack wit-imu %r sent %d config cmds (algorithm=%s zero_yaw=%s)",
+                    self.name,
+                    self._config_sent,
+                    self._algorithm,
+                    self._zero_yaw_on_start,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._config_error = repr(exc)
+            LOGGER.warning("wit-imu %r device config failed: %s", self.name, exc)
+
     def _read_loop(self) -> None:
         period = 1.0 / max(self._publish_hz, 1.0)
         while not self._stop.is_set():
@@ -181,6 +221,14 @@ class WitImu(MovementSensor):
                     self._mx, self._my, self._mz = s.mx, s.my, s.mz
                     self._has_mag = s.has_mag
                     self._packets = s.packets
+                    self._raw = WitSample(
+                        yaw_raw_u16=s.yaw_raw_u16,
+                        yaw_deg_decoded=s.yaw_deg_decoded,
+                        gz_raw_u16=s.gz_raw_u16,
+                        angle_packets=s.angle_packets,
+                        gyro_packets=s.gyro_packets,
+                        bad_readings=s.bad_readings,
+                    )
                 if self._shm is not None:
                     self._shm.write_sample(
                         imushm.ImuShmSample(
@@ -344,12 +392,30 @@ class WitImu(MovementSensor):
                 "serial_path": self._serial_path,
                 "shm_name": self._shm_name,
                 "packets": self._packets,
+                "algorithm": self._algorithm,
+                "config_cmds_sent": self._config_sent,
+                # Straight-off-the-wire decode trail: yaw_deg_decoded must equal
+                # wrap(yaw_raw_u16 * 180 / 32768) and match orientation.yaw_deg.
+                "raw": self._raw_dict(),
             }
             if self._has_mag:
                 out["magnetometer"] = {"x": self._mx, "y": self._my, "z": self._mz}
             if self._last_error:
                 out["last_error"] = self._last_error
+            if self._config_error:
+                out["config_error"] = self._config_error
             return out
+
+    def _raw_dict(self) -> Dict[str, Any]:
+        r = self._raw
+        return {
+            "yaw_u16": r.yaw_raw_u16,
+            "yaw_deg_decoded": round(r.yaw_deg_decoded, 3),
+            "gz_u16": r.gz_raw_u16,
+            "angle_packets": r.angle_packets,
+            "gyro_packets": r.gyro_packets,
+            "bad_readings": r.bad_readings,
+        }
 
     async def do_command(
         self, command: Mapping[str, Any], *, timeout: Optional[float] = None, **kwargs
@@ -367,7 +433,25 @@ class WitImu(MovementSensor):
                     "has_mag": self._has_mag,
                     "last_error": self._last_error,
                     "yaw_rad": self._yaw,
+                    "yaw_deg": math.degrees(self._yaw),
+                    "algorithm": self._algorithm,
+                    "config_cmds_sent": self._config_sent,
+                    "config_error": self._config_error,
+                    "raw": self._raw_dict(),
                 }
+        if cmd in ("zero_yaw", "set_algorithm"):
+            dev = self._device
+            if dev is None:
+                raise RuntimeError("wit-imu device not open")
+            algo = str(command.get("algorithm") or "keep").lower()
+            if cmd == "zero_yaw":
+                sent = await asyncio.to_thread(dev.configure, algo, zero_yaw=True)
+            else:
+                if algo not in ALGORITHMS or algo == "keep":
+                    raise ValueError("set_algorithm needs algorithm: 6axis|9axis")
+                sent = await asyncio.to_thread(dev.configure, algo, zero_yaw=False)
+                self._algorithm = algo
+            return {"sent": sent, "algorithm": algo}
         raise ValueError(f"unknown wit-imu command {cmd!r}")
 
 

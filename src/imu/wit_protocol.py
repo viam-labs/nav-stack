@@ -25,6 +25,40 @@ TYPE_MAG = 0x54
 BAUDRATES = (115200, 9600)
 G = 9.80665
 
+# --- Host → device config (WitMotion register protocol, FF AA REG LO HI) ---
+CMD_UNLOCK = bytes((0xFF, 0xAA, 0x69, 0x88, 0xB5))
+REG_SAVE = 0x00
+REG_CALSW = 0x01
+REG_AXIS6 = 0x24  # 0 = 9-axis (mag-fused yaw), 1 = 6-axis (gyro-integrated yaw)
+CALSW_ZERO_YAW = 0x04  # "Z-axis angle to zero" (6-axis mode only)
+ALGORITHMS = ("6axis", "9axis", "keep")
+
+
+def cmd_set_register(reg: int, value: int) -> bytes:
+    """``FF AA reg lo hi`` register write."""
+    value &= 0xFFFF
+    return bytes((0xFF, 0xAA, reg & 0xFF, value & 0xFF, (value >> 8) & 0xFF))
+
+
+def config_commands(algorithm: str = "keep", *, zero_yaw: bool = False) -> list[bytes]:
+    """Startup command sequence (each needs ~100-200 ms spacing on the wire).
+
+    Nothing is saved to flash (no ``REG_SAVE``) so the device reverts on power
+    cycle; the sequence is re-sent every time the component starts.
+    """
+    if algorithm not in ALGORITHMS:
+        raise WitError(f"unknown Wit algorithm {algorithm!r}; use one of {ALGORITHMS}")
+    out: list[bytes] = []
+    if algorithm != "keep" or zero_yaw:
+        out.append(CMD_UNLOCK)
+    if algorithm == "6axis":
+        out.append(cmd_set_register(REG_AXIS6, 1))
+    elif algorithm == "9axis":
+        out.append(cmd_set_register(REG_AXIS6, 0))
+    if zero_yaw:
+        out.append(cmd_set_register(REG_CALSW, CALSW_ZERO_YAW))
+    return out
+
 
 class WitError(RuntimeError):
     pass
@@ -63,6 +97,12 @@ class WitSample:
     has_mag: bool = False
     packets: int = 0
     bad_readings: int = 0
+    # Raw decode trail for scale verification (0x53 / 0x52 packets).
+    yaw_raw_u16: int = 0  # (YawH<<8)|YawL straight off the wire
+    yaw_deg_decoded: float = 0.0  # scale(yaw_raw_u16, 180) before deg→rad
+    gz_raw_u16: int = 0
+    angle_packets: int = 0
+    gyro_packets: int = 0
 
 
 @dataclass
@@ -112,10 +152,17 @@ class WitStreamParser:
             s.gx = scale_le_u16(line[1], line[2], 2000.0)
             s.gy = scale_le_u16(line[3], line[4], 2000.0)
             s.gz = scale_le_u16(line[5], line[6], 2000.0)
+            s.gz_raw_u16 = (line[6] << 8) | line[5]
+            s.gyro_packets += 1
         elif typ == TYPE_ORIENT:
+            # Fused Euler angles: raw16 * 180 / 32768 degrees (wraps at ±180).
             s.roll = math.radians(scale_le_u16(line[1], line[2], 180.0))
             s.pitch = math.radians(scale_le_u16(line[3], line[4], 180.0))
-            s.yaw = math.radians(scale_le_u16(line[5], line[6], 180.0))
+            yaw_deg = scale_le_u16(line[5], line[6], 180.0)
+            s.yaw = math.radians(yaw_deg)
+            s.yaw_raw_u16 = (line[6] << 8) | line[5]
+            s.yaw_deg_decoded = yaw_deg
+            s.angle_packets += 1
         elif typ == TYPE_ACCEL:
             s.ax = scale_le_u16(line[1], line[2], 16.0) * G
             s.ay = scale_le_u16(line[3], line[4], 16.0) * G
