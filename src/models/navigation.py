@@ -37,8 +37,10 @@ from ..runtime import (
     get_slam,
     get_slam_service,
     register_bridge,
+    register_nav_host,
     register_nav_viz,
     unregister_bridge,
+    unregister_nav_host,
     unregister_nav_viz,
 )
 
@@ -173,6 +175,7 @@ class RosNavigation(NavServiceBase):
             self._simple_nav_cancel.set()
 
         unregister_nav_viz(self.name)
+        unregister_nav_host(self.name)
         unregister_bridge(self.name)
         self._viz = None
         if self._builtin_runtime is not None:
@@ -217,6 +220,7 @@ class RosNavigation(NavServiceBase):
                 shm_lidar=slam_rt.shm_lidar,
             )
             register_nav_viz(self.name, viz)
+            register_nav_host(self.name, host)
             self._refresh_zone_masks()
             LOGGER.info(
                 f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}, "
@@ -250,6 +254,7 @@ class RosNavigation(NavServiceBase):
         await self._cancel_simple_nav()
         unregister_bridge(self.name)
         unregister_nav_viz(self.name)
+        unregister_nav_host(self.name)
         if self._builtin_runtime is not None:
             try:
                 self._builtin_runtime.manager.shutdown()

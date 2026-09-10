@@ -931,6 +931,31 @@ def test_periodic_relocalize_cycle_skips_during_navigation():
     slam._global_localize.assert_not_awaited()
 
 
+def test_is_navigation_active_sees_registered_builtin_nav_host():
+    """BuiltinSlamHost always reports idle; registered nav host is the source of truth."""
+    from src.runtime import any_navigation_active, register_nav_host, unregister_nav_host
+
+    unregister_nav_host("nav-test-active")
+    assert any_navigation_active() is False
+
+    host = MagicMock()
+    host.nav_status.return_value = {"active": True, "state": "active"}
+    register_nav_host("nav-test-active", host)
+    try:
+        slam = RosSlam("slam-test-active")
+        slam._manager = MagicMock()
+        slam._manager.nav_status.return_value = {
+            "active": False,
+            "state": "idle",
+        }  # BuiltinSlamHost shape
+        cancel = MagicMock()
+        slam._cancel_startup_global_localize_task = cancel
+        assert slam._is_navigation_active() is True
+        cancel.assert_called_once()
+    finally:
+        unregister_nav_host("nav-test-active")
+
+
 def test_periodic_relocalize_cycle_skips_while_startup_running():
     slam = _relocalize_slam()
     pending = MagicMock()

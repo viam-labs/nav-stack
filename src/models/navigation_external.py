@@ -53,8 +53,10 @@ from ..ros.shm_lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
     register_bridge,
+    register_nav_host,
     register_nav_viz,
     unregister_bridge,
+    unregister_nav_host,
     unregister_nav_viz,
 )
 from .nav_core import NavServiceBase
@@ -99,6 +101,7 @@ class RosNavigationExternal(NavServiceBase):
             self._simple_nav_cancel.set()
         unregister_bridge(self.name)
         unregister_nav_viz(self.name)
+        unregister_nav_host(self.name)
         if self._manager is not None:
             try:
                 self._manager.shutdown()
@@ -176,6 +179,7 @@ class RosNavigationExternal(NavServiceBase):
             shm_lidar=self._shm_lidar,
         )
         register_nav_viz(self.name, viz)
+        register_nav_host(self.name, host)
         self._refresh_zone_masks()
         LOGGER.info(
             f"nav-stack navigation-external '{self.name}' configured "

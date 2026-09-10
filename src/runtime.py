@@ -137,3 +137,33 @@ def get_nav_view(nav_name: str) -> Optional[object]:
     if viz is not None:
         return viz
     return get_bridge(nav_name)
+
+
+# Builtin (and Nav2) navigation hosts, keyed by motion service name. SLAM uses
+# this so ``_is_navigation_active`` works when the SLAM manager is
+# BuiltinSlamHost (which always reports nav idle).
+_NAV_HOSTS: Dict[str, object] = {}
+
+
+def register_nav_host(nav_name: str, host: object) -> None:
+    with _LOCK:
+        _NAV_HOSTS[nav_name] = host
+
+
+def unregister_nav_host(nav_name: str) -> None:
+    with _LOCK:
+        _NAV_HOSTS.pop(nav_name, None)
+
+
+def any_navigation_active() -> bool:
+    """True if any registered navigation host reports an active goal."""
+    with _LOCK:
+        hosts = list(_NAV_HOSTS.values())
+    for host in hosts:
+        try:
+            status = host.nav_status()
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(status, dict) and status.get("active"):
+            return True
+    return False

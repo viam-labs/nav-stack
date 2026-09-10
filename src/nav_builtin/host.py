@@ -124,7 +124,26 @@ class BuiltinNavHost:
         return True
 
     def navigate(self, x: float, y: float, theta: float) -> None:
+        self._abort_slam_background_localize()
         self._builtin_nav.navigate(x, y, theta)
+
+    def _abort_slam_background_localize(self) -> None:
+        """Stop startup global_localize so SetVelocity is not starved."""
+        name = getattr(self._nav_cfg, "slam_service", None)
+        if not name:
+            return
+        try:
+            from ..runtime import get_slam_service
+
+            svc = get_slam_service(str(name))
+        except Exception:  # noqa: BLE001
+            return
+        abort = getattr(svc, "abort_background_localize", None)
+        if callable(abort):
+            try:
+                abort()
+            except Exception:  # noqa: BLE001
+                pass
 
     def compute_path(self, *args, **kwargs) -> Dict:
         return self._builtin_nav.compute_path(*args, **kwargs)

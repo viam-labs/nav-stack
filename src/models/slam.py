@@ -47,6 +47,7 @@ from ..ros import conversions as conv
 from ..ros.shm_lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
+    any_navigation_active,
     register_slam,
     register_slam_service,
     unregister_slam,
@@ -1059,14 +1060,36 @@ class RosSlam(SLAM):
             )
         )
 
+    def abort_background_localize(self) -> None:
+        """Cancel startup global_localize so navigation can drive the base.
+
+        Full-map matching runs in an executor, but readiness polls / scan reads
+        still contend on the shared module loop with ``Base.SetVelocity``.
+        """
+        self._cancel_startup_global_localize_task()
+
     def _is_navigation_active(self) -> bool:
-        mgr = self._manager
-        if mgr is None:
-            return False
-        try:
-            return bool(mgr.nav_status().get("active", False))
-        except Exception:  # noqa: BLE001 - nav stack may not be up yet
-            return False
+        """True when a navigation goal is in flight.
+
+        Builtin SLAM's manager (``BuiltinSlamHost``) always reports nav idle —
+        the real active flag lives on the registered ``BuiltinNavHost``. Without
+        that lookup, startup/periodic ``global_localize`` keeps running during
+        MoveOnMap and starves ``Base.SetVelocity`` (``last_drive.issued: false``,
+        ``Viam IO timed out``) — mapping mode looked fine because those localize
+        tasks never start.
+        """
+        active = any_navigation_active()
+        if not active:
+            mgr = self._manager
+            if mgr is not None:
+                try:
+                    active = bool(mgr.nav_status().get("active", False))
+                except Exception:  # noqa: BLE001 - nav stack may not be up yet
+                    active = False
+        if active:
+            # Free the event loop for SetVelocity; refine passes check this too.
+            self._cancel_startup_global_localize_task()
+        return active
 
     @staticmethod
     def _startup_global_localize_quality(
