@@ -118,13 +118,15 @@ def test_wheel_path_uses_linear_velocity_and_skips_accel():
     assert reading.vx == pytest.approx(0.5)
     assert reading.vy == pytest.approx(0.0)
     assert reading.vtheta == pytest.approx(math.radians(10.0))
+    # Velocity-only path dead-reckons an odom pose from twist.
+    assert reading.pose is not None
     # Wheel twist present -> never double-integrate accel.
     assert reading.ax is None and reading.ay is None
     assert "get_linear_acceleration" not in s.calls
 
 
-def test_viam_y_forward_linear_velocity_remaps_to_ros_vx():
-    """Agilex / wheeled: GetLinearVelocity.y is forward; remap to ROS vx."""
+def test_viam_y_forward_keeps_forward_on_vy():
+    """Agilex / wheeled: GetLinearVelocity.y is forward; keep it on odom vy."""
     s = FakeMovementSensor(
         angular_velocity=True,
         linear_velocity=True,
@@ -132,16 +134,39 @@ def test_viam_y_forward_linear_velocity_remaps_to_ros_vx():
         lv=(0.0, 0.009, 0.0),  # proto-style: only y set
     )
     reading, reader = _read(s, TypedOdomConfig(velocity_convention="viam"))
-    assert reading.vx == pytest.approx(0.009)
-    assert reading.vy == pytest.approx(0.0, abs=1e-12)
+    assert reading.vx == pytest.approx(0.0, abs=1e-12)
+    assert reading.vy == pytest.approx(0.009)
     assert reading.vtheta == pytest.approx(0.0)
-    assert reading.pose is None  # velocity-only sensor
+    assert reading.pose is not None  # twist integrator
     dbg = reader.debug_dict()
     assert dbg["raw_lv_y"] == pytest.approx(0.009)
     assert dbg["raw_lv_x"] == pytest.approx(0.0)
-    assert dbg["remapped"] is True
+    assert dbg["remapped"] is False
     assert dbg["raw_av_z_deg_s"] == pytest.approx(0.0)
     assert dbg["velocity_convention"] == "viam"
+
+
+def test_viam_twist_integrator_moves_forward_in_ros_world():
+    """Y-forward body vy integrates to +X in the ROS world (theta=0)."""
+    s = FakeMovementSensor(
+        angular_velocity=True,
+        linear_velocity=True,
+        av=(0.0, 0.0, 0.0),
+        lv=(0.0, 0.5, 0.0),
+    )
+    times = iter([100.0, 100.2])
+    reader = TypedMovementSensorOdom(
+        s,
+        TypedOdomConfig(velocity_convention="viam"),
+        clock=lambda: next(times),
+    )
+    first = asyncio.run(reader.read())
+    second = asyncio.run(reader.read())
+    assert first.pose is not None and second.pose is not None
+    assert first.pose.x == pytest.approx(0.0)
+    assert second.pose.x == pytest.approx(0.1)  # 0.5 m/s * 0.2 s
+    assert second.pose.y == pytest.approx(0.0, abs=1e-12)
+    assert second.vy == pytest.approx(0.5)
 
 
 def test_empty_angular_vector3_is_valid_zero_rate():

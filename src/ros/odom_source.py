@@ -14,7 +14,7 @@ corrections (see ``slam.py``) compose unchanged.
 Capability -> field mapping:
 
 * ``angular_velocity``  -> ``vtheta``       (deg/s -> rad/s)
-* ``linear_velocity``   -> ``vx, vy``       (ROS body: x forward, y left)
+* ``linear_velocity``   -> ``vx, vy``       (sensor-native body frame)
 * ``linear_acceleration`` + ``orientation`` -> ``ax, ay`` (gravity removed; IMU path)
 * ``orientation`` / ``compass_heading`` -> ``heading_rad``  (only if ``snap_heading``)
 * ``position`` + ``orientation`` -> ``pose`` (only if ``trust_pose``)
@@ -22,14 +22,22 @@ Capability -> field mapping:
 ``Position`` is ignored by default: many IMUs advertise it while double-
 integrating acceleration (drifts quadratically), which is unusable as odometry.
 
-When ``velocity_convention`` is ``viam`` / ``mir`` (Y-forward wheeled bases),
-``GetLinearVelocity`` is remapped into ROS body frame: forward on ``y`` becomes
-``vx``, lateral on ``x`` becomes ``vy`` (same swap as wheeled-odometry readings).
+``velocity_convention`` selects the sensor body frame for twist fields:
+
+* ``viam`` / ``mir``: keep Y-forward (``vy`` = forward, ``vx`` = right). Do **not**
+  apply the ROS forward→x swap.
+* ``ros``: keep X-forward (``vx`` = forward, ``vy`` = left).
+
+When linear velocity is available but ``trust_pose`` is off, this reader
+dead-reckons an odom ``pose`` from twist (so ``has_pose`` is true for
+velocity-only wheeled sensors). Integration uses a ROS-style world frame
+(theta=0 faces +X) with convention-aware body→world kinematics.
 """
 from __future__ import annotations
 
 import asyncio
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -90,14 +98,22 @@ class TypedMovementSensorOdom:
         sensor: MovementSensor,
         cfg: Optional[TypedOdomConfig] = None,
         logger=None,
+        *,
+        clock=time.monotonic,
     ):
         self._sensor = sensor
         self._cfg = cfg or TypedOdomConfig()
         self._logger = logger
+        self._clock = clock
         self._props: Optional[MovementSensor.Properties] = None
         self.last_debug: TypedOdomDebug = TypedOdomDebug(
             velocity_convention=self._cfg.velocity_convention
         )
+        # Dead-reckon pose from twist when the sensor has no trusted Position.
+        self._integ_x = 0.0
+        self._integ_y = 0.0
+        self._integ_th = 0.0
+        self._integ_t: Optional[float] = None
 
     async def properties(self) -> MovementSensor.Properties:
         """Cache and return the sensor's capabilities (fetched once)."""
@@ -114,6 +130,30 @@ class TypedMovementSensorOdom:
                     f"velocity_convention={self._cfg.velocity_convention}"
                 )
         return self._props
+
+    def _integrate_twist_pose(
+        self, vx: float, vy: float, vtheta: float, now: float
+    ) -> conv.Pose2D:
+        """Integrate sensor-native twist into a ROS-world odom pose."""
+        if self._integ_t is None:
+            self._integ_t = now
+            return conv.Pose2D(self._integ_x, self._integ_y, self._integ_th)
+
+        dt = max(0.0, min(now - self._integ_t, 0.5))
+        self._integ_t = now
+        if dt > 0.0:
+            c = math.cos(self._integ_th)
+            s = math.sin(self._integ_th)
+            if self._cfg.velocity_convention in BASE_VELOCITY_Y_FORWARD:
+                # Body: +y forward, +x right → world (theta=0 faces +X).
+                self._integ_x += (c * vy + s * vx) * dt
+                self._integ_y += (s * vy - c * vx) * dt
+            else:
+                # ROS body: +x forward, +y left.
+                self._integ_x += (c * vx - s * vy) * dt
+                self._integ_y += (s * vx + c * vy) * dt
+            self._integ_th = conv.normalize_angle(self._integ_th + vtheta * dt)
+        return conv.Pose2D(self._integ_x, self._integ_y, self._integ_th)
 
     async def read(self) -> conv.OdomReading:
         p = await self.properties()
@@ -171,13 +211,10 @@ class TypedMovementSensorOdom:
             ly = float(getattr(lv, "y", 0.0) or 0.0)
             lz = float(getattr(lv, "z", 0.0) or 0.0)
             raw_lv = (lx, ly, lz)
-            if cfg.velocity_convention in BASE_VELOCITY_Y_FORWARD:
-                # Viam Y-forward / X-lateral -> ROS x-forward / y-left.
-                # Match wheeled-odometry readings remap: vx=y, vy=-x.
-                vx, vy = ly, -lx
-                remapped = True
-            else:
-                vx, vy = lx, ly
+            # Keep sensor-native axes. ROS forward→x conversion belongs in the
+            # ROS bridge publish path, not here (builtin probe expects viam
+            # forward on vy).
+            vx, vy = lx, ly
 
         rpy = None
         if "orient" in results:
@@ -201,6 +238,10 @@ class TypedMovementSensorOdom:
             # Viam lat/lng overloaded as map-frame (y, x) — matches the SLAM/nav
             # geo_point convention for non-georeferenced maps.
             pose = conv.Pose2D(float(geo.longitude), float(geo.latitude), rpy[2])
+        elif use_lv:
+            # Velocity-only wheeled sensors: build odom pose from twist so
+            # sensor_probe.has_pose / absolute-odom predict both work.
+            pose = self._integrate_twist_pose(vx, vy, vtheta, self._clock())
 
         self.last_debug = TypedOdomDebug(
             source="typed",

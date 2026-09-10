@@ -58,6 +58,21 @@ def ros_cmd_vel_to_viam_linear_mm_s(
     return vx_mps * 1000.0, vy_mps * 1000.0
 
 
+def sensor_twist_to_ros_body(
+    vx: float,
+    vy: float,
+    convention: str = BASE_VELOCITY_VIAM,
+) -> tuple[float, float]:
+    """Map sensor-native body linear twist to ROS body (x forward, y left).
+
+    ``viam`` / ``mir``: sensor +y is forward, +x is right → ROS ``(vy, -vx)``.
+    ``ros``: already X-forward / Y-left — pass through.
+    """
+    if convention in BASE_VELOCITY_Y_FORWARD:
+        return float(vy), -float(vx)
+    return float(vx), float(vy)
+
+
 @dataclass
 class LidarConfig:
     """A single lidar and its mount transform (base_link -> laser_N)."""

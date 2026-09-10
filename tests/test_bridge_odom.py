@@ -69,7 +69,13 @@ def _bind_still(bridge):
 def _odom_bridge_stub(*, sample: conv.OdomReading):
     bridge = SimpleNamespace(
         _io=SimpleNamespace(read_odometry=MagicMock(return_value=sample)),
-        _slam_cfg=SimpleNamespace(odom_rate_hz=15.0, scan_rate_hz=10.0),
+        # Unit tests inject ROS-frame twists; production typed readers keep
+        # sensor-native axes and the bridge converts via this convention.
+        _slam_cfg=SimpleNamespace(
+            odom_rate_hz=15.0,
+            scan_rate_hz=10.0,
+            base_velocity_convention="ros",
+        ),
         _odom=conv.Pose2D(0.0, 0.0, 0.0),
         _gate_odom=conv.Pose2D(0.0, 0.0, 0.0),
         _last_odom_time=0.0,

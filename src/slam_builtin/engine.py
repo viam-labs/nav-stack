@@ -9,7 +9,12 @@ from typing import Optional
 
 import numpy as np
 
-from ..config import MODE_LOCALIZING, MODE_MAPPING, SlamConfig
+from ..config import (
+    BASE_VELOCITY_Y_FORWARD,
+    MODE_LOCALIZING,
+    MODE_MAPPING,
+    SlamConfig,
+)
 from ..nav.global_localize import OccupancyMap
 from ..nav.maps import MapStore
 from ..ros import conversions as conv
@@ -640,8 +645,14 @@ class BuiltinSlamEngine:
         self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
         c = math.cos(self._pose.theta)
         s = math.sin(self._pose.theta)
-        dx = (c * odom.vx - s * odom.vy) * dt
-        dy = (s * odom.vx + c * odom.vy) * dt
+        vx, vy = odom.vx, odom.vy
+        if getattr(self._cfg, "base_velocity_convention", "viam") in BASE_VELOCITY_Y_FORWARD:
+            # Sensor-native Y-forward / X-right → map (theta=0 faces +X).
+            dx = (c * vy + s * vx) * dt
+            dy = (s * vy - c * vx) * dt
+        else:
+            dx = (c * vx - s * vy) * dt
+            dy = (s * vx + c * vy) * dt
         return conv.Pose2D(
             self._pose.x + dx,
             self._pose.y + dy,

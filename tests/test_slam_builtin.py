@@ -326,6 +326,21 @@ def test_predict_uses_heading_delta_not_absolute():
     assert abs(p1.theta - math.radians(100.0)) > 0.5
 
 
+def test_predict_viam_twist_forward_on_vy():
+    """Default viam convention: body vy is forward → map +X at theta=0."""
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "mapping"}
+    )
+    store = MapStore("/tmp")
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), store, rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 50.0
+    engine._predict(conv.OdomReading(0.0, 0.5, 0.0), t0)  # noqa: SLF001
+    pose = engine._predict(conv.OdomReading(0.0, 0.5, 0.0), t0 + 0.2)  # noqa: SLF001
+    assert pose.x == pytest.approx(0.1)
+    assert pose.y == pytest.approx(0.0, abs=1e-12)
+
+
 class _FakeSensors:
     def __init__(self, scan=None, odom=None):
         self._scan = scan

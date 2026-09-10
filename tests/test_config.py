@@ -8,6 +8,7 @@ from src.config import (
     NavConfig,
     SlamConfig,
     ros_cmd_vel_to_viam_linear_mm_s,
+    sensor_twist_to_ros_body,
 )
 
 
@@ -772,6 +773,16 @@ def test_base_velocity_convention_mir_alias_normalizes_to_viam():
     lx, ly = ros_cmd_vel_to_viam_linear_mm_s(0.5, -0.1, cfg.base_velocity_convention)
     assert lx == pytest.approx(-100.0)
     assert ly == pytest.approx(500.0)
+
+
+def test_sensor_twist_to_ros_body_viam_y_forward():
+    # Sensor: forward on y=0.019, no lateral → ROS forward on vx.
+    ros_vx, ros_vy = sensor_twist_to_ros_body(0.0, 0.019, "viam")
+    assert ros_vx == pytest.approx(0.019)
+    assert ros_vy == pytest.approx(0.0)
+    ros_vx, ros_vy = sensor_twist_to_ros_body(0.5, -0.1, "ros")
+    assert ros_vx == pytest.approx(0.5)
+    assert ros_vy == pytest.approx(-0.1)
 
 
 def test_min_cmd_vel_defaults_and_legacy_alias():

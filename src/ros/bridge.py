@@ -64,6 +64,7 @@ from ..config import (
     NavConfig,
     SlamConfig,
     ros_cmd_vel_to_viam_linear_mm_s,
+    sensor_twist_to_ros_body,
 )
 from . import conversions as conv
 
@@ -1426,6 +1427,12 @@ class BridgeNode(Node):
         now = time.monotonic()
         raw_dt = now - self._last_odom_time
         self._last_odom_time = now
+        convention = getattr(self._slam_cfg, "base_velocity_convention", "viam")
+        # Typed reader keeps sensor-native twist (viam: forward on vy). ROS
+        # odom / TF / IMU coast expect ROS body (forward on vx).
+        ros_vx, ros_vy = sensor_twist_to_ros_body(
+            float(sample.vx), float(sample.vy), convention
+        )
         if sample.pose is not None:
             self._odom = sample.pose
             self._gate_odom = sample.pose
@@ -1433,11 +1440,19 @@ class BridgeNode(Node):
             self._imu_vy = 0.0
             self._has_wheel_twist = True
             stamp = self.get_clock().now().to_msg()
-            self._publish_odom_snapshot(
-                stamp, float(sample.vx), float(sample.vy), sample.vtheta
-            )
+            self._publish_odom_snapshot(stamp, ros_vx, ros_vy, sample.vtheta)
             return
 
+        # Use ROS-frame twist for the rest of the dead-reckon path.
+        sample = conv.OdomReading(
+            ros_vx,
+            ros_vy,
+            sample.vtheta,
+            pose=sample.pose,
+            heading_rad=sample.heading_rad,
+            ax=sample.ax,
+            ay=sample.ay,
+        )
         dt = self._bounded_odom_dt(raw_dt)
         self._last_imu_ax = sample.ax
         if dt > 0:
