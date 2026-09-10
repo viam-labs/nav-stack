@@ -58,6 +58,7 @@ class BuiltinNavigator:
         replan_local_blocked_time_s: float = 0.3,
         replan_local_min_period_s: float = 0.5,
         drive_timeout_streak: int = 20,
+        yaw_align_timeout_s: float = 6.0,
         logger=None,
     ):
         self._world = world
@@ -70,6 +71,9 @@ class BuiltinNavigator:
             algorithm=algorithm,
             replan_period_s=replan_period_s,
             lookahead_m=lookahead_m,
+            min_lookahead_m=min_lookahead_m,
+            max_lookahead_m=max_lookahead_m,
+            approach_dist_m=approach_dist_m,
             xy_tolerance_m=xy_tolerance_m,
             yaw_tolerance_rad=yaw_tolerance_rad,
             max_vel_x=max_vel_x,
@@ -102,6 +106,7 @@ class BuiltinNavigator:
             replan_local_blocked_time_s=replan_local_blocked_time_s,
             replan_local_min_period_s=replan_local_min_period_s,
             drive_timeout_streak=drive_timeout_streak,
+            yaw_align_timeout_s=yaw_align_timeout_s,
         )
         self._lock = threading.Lock()
         self._worker: Optional[threading.Thread] = None

@@ -423,8 +423,23 @@ def test_follow_command_no_sign_flip_across_xy_tolerance():
     cmd_out = compute_follow_command(outside, goal, cfg=cfg, final_yaw=0.0)
     assert cmd_in.vtheta < 0.0
     assert cmd_out.vtheta < 0.0 or cmd_out.vx < 0.0  # reverse crawl or CW yaw
-    assert abs(cmd_in.vtheta) <= 0.55 + 1e-6
-    assert abs(cmd_out.vtheta) <= 0.55 + 1e-6
+    assert abs(cmd_in.vtheta) <= 0.40 + 1e-6
+    assert abs(cmd_out.vtheta) <= 0.40 + 1e-6
+
+
+def test_follow_command_large_yaw_spins_before_crawl():
+    """Status repro: ~140° final yaw at 0.3 m must not translate while spinning."""
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    current = Pose2D(2.52, 1.40, 1.08)
+    goal = Pose2D(2.79, 1.56, -2.76)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert cmd.vx == 0.0
+    assert abs(cmd.vtheta) > 0.0
+    assert abs(cmd.vtheta) <= 0.40 + 1e-6
 
 
 def test_follow_command_overshoot_reverses_instead_of_spinning():
@@ -432,7 +447,7 @@ def test_follow_command_overshoot_reverses_instead_of_spinning():
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
-    # Past the goal, still facing roughly the approach direction.
+    # Past the goal, yaw already aligned with goal θ.
     current = Pose2D(0.40, 0.0, 0.0)
     goal = Pose2D(0.0, 0.0, 0.0)
     cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=0.0)

@@ -83,11 +83,13 @@ class NavSupervisor:
         replan_local_blocked_time_s: float = 0.3,
         replan_local_min_period_s: float = 0.5,
         drive_timeout_streak: int = 20,
+        yaw_align_timeout_s: float = 6.0,
     ):
         self._world = world
         self._inflation = inflation_radius_m
         self._robot_radius = robot_radius_m
         self._cost_scaling = cost_scaling_factor
+        self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
         self._algorithm = algorithm
         self._replan_period = replan_period_s
         self._timeout_s = timeout_s
@@ -336,6 +338,7 @@ class NavSupervisor:
             failed_replan_while_blocked = 0
             local_planner_active = False
             vx_sign_history: list[tuple[float, int]] = []
+            xy_ok_since: Optional[float] = None
             poll = self._follower.motion.poll_interval_s
 
             while time.monotonic() < deadline:
@@ -360,14 +363,36 @@ class NavSupervisor:
 
                 # Goal reached?
                 goal_pose = Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta)
-                if (
+                xy_ok = (
                     distance_m(pose, goal_pose) <= self._follower.motion.xy_tolerance_m
-                    and abs(conv.normalize_angle(pose.theta - goal_pose.theta))
+                )
+                yaw_ok = (
+                    abs(conv.normalize_angle(pose.theta - goal_pose.theta))
                     <= self._follower.motion.yaw_tolerance_rad
-                ):
+                )
+                now = time.monotonic()
+                if xy_ok and yaw_ok:
                     self._world.stop()
                     self._set_status(state="succeeded", active=False, error_msg="")
                     return
+                if xy_ok:
+                    if xy_ok_since is None:
+                        xy_ok_since = now
+                    elif (
+                        self._yaw_align_timeout_s > 0.0
+                        and now - xy_ok_since >= self._yaw_align_timeout_s
+                    ):
+                        # On the spot but final yaw won't settle (noisy heading
+                        # prior, or goal θ far from approach). Accept XY.
+                        self._world.stop()
+                        self._set_status(
+                            state="succeeded",
+                            active=False,
+                            error_msg="",
+                        )
+                        return
+                else:
+                    xy_ok_since = None
 
                 now = time.monotonic()
 

@@ -62,6 +62,7 @@ def make_builtin_navigator(
         replan_local_blocked_time_s=bcfg.replan_local_blocked_time_s,
         replan_local_min_period_s=bcfg.replan_local_min_period_s,
         drive_timeout_streak=int(getattr(bcfg, "drive_timeout_streak", 20)),
+        yaw_align_timeout_s=float(getattr(bcfg, "yaw_align_timeout_s", 6.0)),
         logger=logger,
     )
 

@@ -59,24 +59,36 @@ def _near_goal_command(
     Outside ``xy_tolerance`` the normal law tracks bearing-to-point; a 1–2 cm
     overshoot makes that bearing ≈ ±π and commands ±max_vel_theta, then the
     next tick (back inside the ball) flips to final-yaw with the opposite
-    sign — classic goal-swing. Stay in this mode for an expanded ball and
-    reverse-crawl when the goal is behind instead of spinning 180°.
+    sign — classic goal-swing. Stay in this mode for an expanded ball.
+
+    Large final-yaw errors (common when MoveOnMap goal θ differs from the
+    approach heading) must be pure-spin: translating while spinning ~140°
+    orbits the goal and looks like back-and-forth hunting. Obstacle clearance
+    is unrelated — status still shows ``obstacle: clear``.
     """
     xy_tol = motion.xy_tolerance_m
     yaw_tol = motion.yaw_tolerance_rad
     # Soft cap: full max_vel_theta (often 1.5) overshoots and reverses.
-    yaw_cap = min(0.55, motion.max_angular_rad_s)
+    yaw_cap = min(0.40, motion.max_angular_rad_s)
+    # Above this, finish yaw before any crawl / reverse (≈ 35°).
+    spin_first_rad = max(yaw_tol * 1.5, math.radians(35.0))
 
-    if dist <= xy_tol:
-        # Hold XY, finish yaw. No stiction floor — that bang-bangs near tol.
-        vtheta = _clamp(yaw_err, yaw_cap)
-        if abs(yaw_err) > yaw_tol and abs(vtheta) < 0.12:
-            vtheta = math.copysign(0.12, yaw_err)
+    def _spin_yaw() -> DriveCommand:
+        # Proportional with floor so we keep turning; no stiction bang-bang.
+        vtheta = _clamp(yaw_err * 0.85, yaw_cap)
+        if abs(yaw_err) > yaw_tol and abs(vtheta) < 0.10:
+            vtheta = math.copysign(0.10, yaw_err)
         return DriveCommand(0.0, 0.0, vtheta, False)
 
-    crawl = min(0.10, max(0.05, motion.max_linear_mps * 0.18))
+    if abs(yaw_err) > spin_first_rad:
+        return _spin_yaw()
+
+    if dist <= xy_tol:
+        return _spin_yaw()
+
+    crawl = min(0.08, max(0.04, motion.max_linear_mps * 0.15))
     if abs(bearing) > math.radians(100.0):
-        # Goal behind (overshoot): reverse toward it; nudge final yaw gently.
+        # Goal behind (overshoot), yaw already close: reverse toward it.
         return DriveCommand(
             -min(crawl, dist * 0.55),
             0.0,
@@ -84,12 +96,8 @@ def _near_goal_command(
             False,
         )
 
-    # Goal ahead but outside xy_tol: slow approach. Prefer final yaw once
-    # close so we don't RIP on a large bearing while already near.
-    if dist <= xy_tol * 1.25:
-        vtheta = _clamp(yaw_err * 0.9, yaw_cap)
-    else:
-        vtheta = _clamp(bearing * 1.2, yaw_cap)
+    # Goal ahead, yaw close enough: slow XY approach with gentle yaw nudge.
+    vtheta = _clamp(yaw_err * 0.9, yaw_cap)
     vx = min(crawl, dist * 0.55)
     if abs(bearing) > math.radians(60.0):
         vx *= 0.35

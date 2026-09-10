@@ -307,6 +307,9 @@ class BuiltinNavConfig:
     cost_scaling_factor: float = 4.0
     xy_goal_tolerance: float = 0.25  # meters
     yaw_goal_tolerance: float = 0.35  # radians (~20 deg; mugger uses 0.6)
+    # After XY is inside tolerance, accept the goal if final yaw still has not
+    # settled (noisy heading / goal θ far from approach). 0 disables.
+    yaw_align_timeout_s: float = 6.0
     # Final approach: cap linear speed within this distance of the goal.
     approach_dist_m: float = 0.35
     # Post-process global plans (shortcut + resample) before following.
@@ -350,6 +353,7 @@ class BuiltinNavConfig:
             cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),
             xy_goal_tolerance=float(d.get("xy_goal_tolerance", 0.25)),
             yaw_goal_tolerance=float(d.get("yaw_goal_tolerance", 0.35)),
+            yaw_align_timeout_s=float(d.get("yaw_align_timeout_s", 6.0)),
             approach_dist_m=float(d.get("approach_dist_m", 0.35)),
             smooth_path=bool(d.get("smooth_path", True)),
             smooth_sample_spacing_m=float(d.get("smooth_sample_spacing_m", 0.10)),
