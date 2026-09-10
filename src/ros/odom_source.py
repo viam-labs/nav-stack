@@ -260,6 +260,15 @@ class TypedMovementSensorOdom:
             vx, vy, vtheta, pose=pose, heading_rad=heading_rad, ax=ax, ay=ay
         )
 
+    def sync_heading(self, heading_rad: float) -> None:
+        """Align the twist integrator yaw with an external absolute heading.
+
+        Called after a dedicated ``heading_sensor`` supplies orientation so
+        subsequent dead-reckoned XY steps use the magnetometer/AHRS yaw instead
+        of a drifting gyro-only integrator angle.
+        """
+        self._integ_th = float(heading_rad)
+
     def debug_dict(self) -> Dict[str, Any]:
         d = self.last_debug
         return {
@@ -274,3 +283,45 @@ class TypedMovementSensorOdom:
             "velocity_convention": d.velocity_convention,
             "remapped": d.remapped,
         }
+
+
+async def read_typed_heading(sensor) -> tuple[Optional[float], str]:
+    """Read yaw (rad) from a MovementSensor via typed getters.
+
+    Prefers ``GetOrientation`` (AHRS), then ``GetCompassHeading``, then
+    ``get_readings()`` as a last resort. Returns ``(yaw_rad, source)`` where
+    ``source`` is ``orientation`` / ``compass`` / ``readings`` / ``none``.
+    """
+    try:
+        props = await sensor.get_properties()
+    except Exception:  # noqa: BLE001
+        props = None
+
+    if props is not None and getattr(props, "orientation_supported", False):
+        try:
+            orient = await sensor.get_orientation()
+            rpy = conv.euler_from_orientation_vector(
+                float(getattr(orient, "o_x", 0.0) or 0.0),
+                float(getattr(orient, "o_y", 0.0) or 0.0),
+                float(getattr(orient, "o_z", 0.0) or 0.0),
+                float(getattr(orient, "theta", 0.0) or 0.0),
+            )
+            return float(rpy[2]), "orientation"
+        except Exception:  # noqa: BLE001
+            pass
+
+    if props is not None and getattr(props, "compass_heading_supported", False):
+        try:
+            deg = float(await sensor.get_compass_heading())
+            return math.radians(deg), "compass"
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        readings = await sensor.get_readings()
+        yaw = conv.parse_heading_sensor_readings(readings)
+        if yaw is not None:
+            return float(yaw), "readings"
+    except Exception:  # noqa: BLE001
+        pass
+    return None, "none"

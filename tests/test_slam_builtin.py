@@ -341,6 +341,35 @@ def test_predict_viam_twist_forward_on_vy():
     assert pose.y == pytest.approx(0.0, abs=1e-12)
 
 
+def test_predict_pose_plus_heading_uses_heading_delta_for_yaw():
+    """Wheel pose + dedicated heading: yaw follows heading_sensor, not gyro."""
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "mapping"}
+    )
+    store = MapStore("/tmp")
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), store, rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 10.0
+    odom0 = conv.OdomReading(
+        0.0,
+        0.0,
+        0.5,  # noisy gyro rate — must not drive yaw when heading is present
+        pose=conv.Pose2D(0.0, 0.0, math.radians(10.0)),
+        heading_rad=math.radians(10.0),
+    )
+    engine._predict(odom0, t0)  # noqa: SLF001
+    odom1 = conv.OdomReading(
+        0.0,
+        0.0,
+        0.5,
+        pose=conv.Pose2D(0.0, 0.0, math.radians(25.0)),
+        heading_rad=math.radians(25.0),
+    )
+    pose = engine._predict(odom1, t0 + 0.1)  # noqa: SLF001
+    assert pose.x == pytest.approx(0.0, abs=1e-9)
+    assert pose.theta == pytest.approx(math.radians(15.0), abs=1e-6)
+
+
 class _FakeSensors:
     def __init__(self, scan=None, odom=None):
         self._scan = scan

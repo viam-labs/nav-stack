@@ -212,8 +212,9 @@ def build_io_provider(
                 sample, math.radians(cfg.movement_sensor_yaw_deg)
             )
         if heading_sensor is not None:
-            heading_readings = await heading_sensor.get_readings()
-            heading = conv.parse_heading_sensor_readings(heading_readings)
+            from .odom_source import read_typed_heading
+
+            heading, _source = await read_typed_heading(heading_sensor)
             if heading is not None:
                 if cfg.heading_sensor_invert:
                     heading = conv.normalize_angle(-heading)
@@ -222,6 +223,9 @@ def build_io_provider(
                         heading - math.radians(cfg.heading_sensor_yaw_deg)
                     )
                 sample = conv.merge_odom_heading(sample, heading)
+                sync = getattr(odom_reader, "sync_heading", None)
+                if callable(sync):
+                    sync(heading)
         return sample
 
     async def drive_base(

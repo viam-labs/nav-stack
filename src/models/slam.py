@@ -1463,6 +1463,15 @@ class RosSlam(SLAM):
                         or abs(sample.vtheta) > 1e-9
                     ),
                 }
+                if sample.heading_rad is not None:
+                    odom_probe["heading_deg"] = round(
+                        math.degrees(sample.heading_rad), 2
+                    )
+                heading_dbg = getattr(sensors, "heading_debug", None)
+                if callable(heading_dbg):
+                    hd = heading_dbg()
+                    if hd.get("source"):
+                        odom_probe["heading_source"] = hd.get("source")
                 debug = sensors.odom_debug()
                 if debug:
                     odom_probe["raw"] = debug

@@ -531,20 +531,20 @@ def parse_heading_sensor_readings(readings: Mapping) -> Optional[float]:
 
 
 def merge_odom_heading(reading: OdomReading, heading_rad: float) -> OdomReading:
-    """Apply ``heading_rad`` to a wheel-odometry sample (pose or heading field)."""
-    if reading.pose is not None:
-        return OdomReading(
-            reading.vx,
-            reading.vy,
-            reading.vtheta,
-            pose=Pose2D(reading.pose.x, reading.pose.y, heading_rad),
-            ax=reading.ax,
-            ay=reading.ay,
-        )
+    """Apply ``heading_rad`` to a wheel-odometry sample (pose and heading field).
+
+    Always sets ``heading_rad`` so diagnostics (``has_heading``) stay true when a
+    dedicated heading sensor supplied yaw — even if an integrated/trusted pose
+    is also present.
+    """
+    pose = reading.pose
+    if pose is not None:
+        pose = Pose2D(pose.x, pose.y, heading_rad)
     return OdomReading(
         reading.vx,
         reading.vy,
         reading.vtheta,
+        pose=pose,
         heading_rad=heading_rad,
         ax=reading.ax,
         ay=reading.ay,

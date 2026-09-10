@@ -344,7 +344,7 @@ def test_merge_odom_heading_with_wheel_pose():
     assert merged.pose.x == 1.0
     assert merged.pose.y == 2.0
     assert merged.pose.theta == 1.5
-    assert merged.heading_rad is None
+    assert merged.heading_rad == 1.5
 
 
 def test_merge_odom_heading_with_wheel_twist_only():

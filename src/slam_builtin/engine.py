@@ -600,11 +600,26 @@ class BuiltinSlamEngine:
             prev = self._last_odom_pose
             self._last_odom_pose = odom.pose
             self._last_odom_time = now
-            self._last_odom_heading = odom.pose.theta
             self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
             if prev is None:
+                if odom.heading_rad is not None:
+                    self._last_odom_heading = odom.heading_rad
+                elif odom.pose is not None:
+                    self._last_odom_heading = odom.pose.theta
                 return self._pose
             delta = conv.compose_poses(conv.invert_pose(prev), odom.pose)
+            # Prefer dedicated heading_sensor deltas for yaw so velocity-only
+            # wheel odom does not dead-reckon heading from gyro vtheta alone.
+            if odom.heading_rad is not None:
+                if self._last_odom_heading is not None:
+                    heading_delta = conv.normalize_angle(
+                        odom.heading_rad - self._last_odom_heading
+                    )
+                    if abs(heading_delta) <= math.radians(40.0):
+                        delta = conv.Pose2D(delta.x, delta.y, heading_delta)
+                self._last_odom_heading = odom.heading_rad
+            else:
+                self._last_odom_heading = odom.pose.theta
             # Gate implausible per-tick jumps (heading snap, odom reset).
             if (
                 math.hypot(delta.x, delta.y) > 0.5

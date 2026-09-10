@@ -67,6 +67,7 @@ class BuiltinSensors:
         self._scan_max_age_s = float(scan_max_age_s)
         self._scan_cache: Optional[conv.LaserScan2D] = None
         self._scan_cache_at = 0.0
+        self._heading_debug: dict = {"source": "none", "heading_rad": None}
         self._imu_shm: Optional[imushm.Reader] = None
         if cfg.imu_shm_name:
             try:
@@ -252,15 +253,23 @@ class BuiltinSensors:
             return None
 
     def get_odom(self) -> Optional[conv.OdomReading]:
+        # Prefer wheel/movement odometry when configured. IMU shm is a fallback
+        # for IMU-only setups; it must not starve a velocity-only wheeled sensor
+        # or skip the dedicated heading_sensor merge.
+        if self._movement is not None:
+            try:
+                return self._run(self._read_odom(), timeout=1.0)
+            except Exception:  # noqa: BLE001
+                pass
         sample = self._odom_from_imu_shm()
-        if sample is not None:
-            return sample
-        if self._movement is None:
+        if sample is None:
             return None
-        try:
-            return self._run(self._read_odom(), timeout=1.0)
-        except Exception:  # noqa: BLE001
-            return None
+        if self._heading is not None:
+            try:
+                sample = self._run(self._apply_heading(sample), timeout=1.0)
+            except Exception:  # noqa: BLE001
+                pass
+        return sample
 
     def _odom_from_imu_shm(self) -> Optional[conv.OdomReading]:
         reader = self._imu_shm
@@ -284,12 +293,44 @@ class BuiltinSensors:
                 },
             }
         )
+        # SHM orientation is an absolute yaw prior for IMU-only odom.
+        if sample.heading_rad is None and frame.yaw is not None:
+            sample = conv.merge_odom_heading(sample, float(frame.yaw))
         if cfg.movement_sensor_upside_down:
             sample = conv.apply_sensor_upside_down(sample)
         if cfg.movement_sensor_yaw_deg:
             sample = conv.apply_sensor_mount_yaw(
                 sample, math.radians(cfg.movement_sensor_yaw_deg)
             )
+        return sample
+
+    async def _apply_heading(self, sample: conv.OdomReading) -> conv.OdomReading:
+        """Merge dedicated heading_sensor yaw into ``sample`` (typed getters)."""
+        from ..ros.odom_source import read_typed_heading
+
+        cfg = self._cfg
+        if self._heading is None:
+            self._heading_debug = {"source": "none", "heading_rad": None}
+            return sample
+        heading, source = await read_typed_heading(self._heading)
+        if heading is None:
+            self._heading_debug = {"source": source or "none", "heading_rad": None}
+            return sample
+        if cfg.heading_sensor_invert:
+            heading = conv.normalize_angle(-heading)
+        if cfg.heading_sensor_yaw_deg:
+            heading = conv.normalize_angle(
+                heading - math.radians(cfg.heading_sensor_yaw_deg)
+            )
+        sample = conv.merge_odom_heading(sample, heading)
+        sync = getattr(self._odom_reader, "sync_heading", None)
+        if callable(sync):
+            sync(heading)
+        self._heading_debug = {
+            "source": source,
+            "heading_rad": heading,
+            "heading_deg": math.degrees(heading),
+        }
         return sample
 
     async def _read_odom(self) -> conv.OdomReading:
@@ -304,25 +345,20 @@ class BuiltinSensors:
             sample = conv.apply_sensor_mount_yaw(
                 sample, math.radians(cfg.movement_sensor_yaw_deg)
             )
-        if self._heading is not None:
-            heading_readings = await self._heading.get_readings()
-            heading = conv.parse_heading_sensor_readings(heading_readings)
-            if heading is not None:
-                if cfg.heading_sensor_invert:
-                    heading = conv.normalize_angle(-heading)
-                if cfg.heading_sensor_yaw_deg:
-                    heading = conv.normalize_angle(
-                        heading - math.radians(cfg.heading_sensor_yaw_deg)
-                    )
-                sample = conv.merge_odom_heading(sample, heading)
-        return sample
+        return await self._apply_heading(sample)
 
     def odom_debug(self) -> dict:
         """Raw typed-getter snapshot from the last odom read (if any)."""
         reader = self._odom_reader
-        if reader is None:
-            return {"source": "get_readings"}
-        debug = getattr(reader, "debug_dict", None)
-        if callable(debug):
-            return debug()
-        return {"source": "typed"}
+        out: dict = {"source": "get_readings"}
+        if reader is not None:
+            debug = getattr(reader, "debug_dict", None)
+            out = debug() if callable(debug) else {"source": "typed"}
+        heading = dict(self._heading_debug)
+        if heading:
+            out = {**out, "heading": heading}
+        return out
+
+    def heading_debug(self) -> dict:
+        """Last dedicated heading_sensor snapshot for ``sensor_probe``."""
+        return dict(self._heading_debug)

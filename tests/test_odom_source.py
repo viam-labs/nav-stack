@@ -9,7 +9,11 @@ pytest.importorskip("viam.spatialmath")
 from viam.proto.common import GeoPoint, Orientation, Vector3
 from viam.components.movement_sensor import MovementSensor
 
-from src.ros.odom_source import TypedMovementSensorOdom, TypedOdomConfig
+from src.ros.odom_source import (
+    TypedMovementSensorOdom,
+    TypedOdomConfig,
+    read_typed_heading,
+)
 
 
 class FakeMovementSensor:
@@ -218,3 +222,33 @@ def test_empty_sensor_returns_zero_reading():
     reading, _ = _read(s)
     assert (reading.vx, reading.vy, reading.vtheta) == (0.0, 0.0, 0.0)
     assert reading.ax is None and reading.pose is None
+
+
+def test_read_typed_heading_from_orientation():
+    # OrientationVector: +z axis, theta -62.9 deg → yaw ≈ -62.9 deg.
+    s = FakeMovementSensor(
+        orientation=True,
+        orient=(0.0, 0.0, 1.0, -62.9),
+    )
+    yaw, source = asyncio.run(read_typed_heading(s))
+    assert source == "orientation"
+    assert yaw == pytest.approx(math.radians(-62.9), abs=1e-3)
+    assert "get_orientation" in s.calls
+    assert "get_readings" not in s.calls
+
+
+def test_sync_heading_aligns_twist_integrator():
+    s = FakeMovementSensor(linear_velocity=True, lv=(0.0, 0.5, 0.0))
+    times = iter([10.0, 10.2])
+    reader = TypedMovementSensorOdom(
+        s,
+        TypedOdomConfig(velocity_convention="viam"),
+        clock=lambda: next(times),
+    )
+    asyncio.run(reader.read())
+    reader.sync_heading(math.radians(90.0))
+    second = asyncio.run(reader.read())
+    # After sync to +90°, body +y forward integrates along world +Y.
+    assert second.pose is not None
+    assert second.pose.x == pytest.approx(0.0, abs=1e-9)
+    assert second.pose.y == pytest.approx(0.1)
