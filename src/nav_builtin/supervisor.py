@@ -341,11 +341,15 @@ class NavSupervisor:
             local_planner_active = False
             vx_sign_history: list[tuple[float, int]] = []
             xy_ok_since: Optional[float] = None
+            last_tick_pose: Optional[Pose2D] = None
             poll = self._follower.motion.poll_interval_s
             # Only validate the next few metres — full-path static checks on
             # long goals trip on far unknown/inflation and abort immediately.
             path_block_horizon_m = 5.0
-            static_replan_fail_limit = 3
+            # Abort only when the route stays blocked *and* lidar is not clear.
+            # Clearance + stall/timeout still end hopeless runs.
+            static_replan_fail_limit = 5
+            pose_jump_replan_m = 1.5
 
             while time.monotonic() < deadline:
                 if self._cancel.is_set():
@@ -663,7 +667,13 @@ class NavSupervisor:
                 replan_due = now - last_replan >= self._replan_period
                 map_data = None
                 static_blocked = False
-                if replan_due:
+                pose_jumped = False
+                if last_tick_pose is not None:
+                    pose_jumped = (
+                        distance_m(pose, last_tick_pose) >= pose_jump_replan_m
+                    )
+                last_tick_pose = pose
+                if replan_due or pose_jumped:
                     map_data = self._world.get_map()
                     static_blocked = map_data is not None and path_blocked(
                         map_data,
@@ -673,6 +683,10 @@ class NavSupervisor:
                         from_pose=pose,
                         ahead_m=path_block_horizon_m,
                     )
+                    # Large localization corrections invalidate the old polyline;
+                    # force a replan even if the first few metres still look free.
+                    if pose_jumped:
+                        static_blocked = True
 
                 sustained_local = (
                     local_blocked
@@ -683,17 +697,21 @@ class NavSupervisor:
                 backup_exhausted = (
                     backup_attempts >= self._backup_max_attempts and local_blocked
                 )
-                should_replan = replan_due and (
+                should_replan = (replan_due or pose_jumped) and (
                     static_blocked
                     or (oscillating and local_blocked)
                     or backup_exhausted
                 )
                 if should_replan:
+                    # On static/pose-jump recovery, accept any feasible plan —
+                    # require_different would reject a valid near-identical route
+                    # and count it as "replan failed".
                     new_path = self._try_replan(
                         goal,
                         pose,
                         path,
                         scan,
+                        require_different=not static_blocked,
                         failed_count=failed_replan_while_blocked if local_blocked else 0,
                     )
                     if new_path is not None:
@@ -707,12 +725,18 @@ class NavSupervisor:
                         vx_sign_history.clear()
                         spin_stuck_since = None
                     elif static_blocked:
-                        # Keep following while nearby path is contested — a
-                        # single failed global replan on a long route used to
-                        # abort immediately (often mid-spin at the start).
                         failed_static_replan += 1
                         last_replan = now
-                        if failed_static_replan >= static_replan_fail_limit:
+                        lidar_clear = progress.get("obstacle") == "clear"
+                        clearance = progress.get("forward_clearance_m")
+                        has_room = clearance is None or float(clearance) >= 0.35
+                        # Keep following while the robot can still see open space;
+                        # a mid-route localization jump often fails a few replans
+                        # before the map/pose settle.
+                        if (
+                            failed_static_replan >= static_replan_fail_limit
+                            and not (lidar_clear and has_room)
+                        ):
                             self._world.stop()
                             self._set_status(
                                 state="failed",
