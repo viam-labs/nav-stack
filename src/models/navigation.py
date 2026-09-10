@@ -66,6 +66,40 @@ from .nav_core import (  # noqa: F401
 LOGGER = getLogger(__name__)
 
 
+def _in_process_pose_provider(manager):
+    """Sync map-frame pose from the SLAM host (builtin engine or ROS bridge)."""
+
+    def _get():
+        if manager is None:
+            return None
+        getter = getattr(manager, "get_pose_in_map", None)
+        if callable(getter):
+            return getter()
+        node = getattr(manager, "node", None)
+        if node is not None and hasattr(node, "get_pose_in_map"):
+            return node.get_pose_in_map()
+        return None
+
+    return _get
+
+
+def _in_process_map_provider(manager):
+    """Sync occupancy dict from the SLAM host when available."""
+
+    def _get():
+        if manager is None:
+            return None
+        getter = getattr(manager, "get_map", None)
+        if callable(getter):
+            return getter()
+        node = getattr(manager, "node", None)
+        if node is not None and hasattr(node, "get_map"):
+            return node.get_map()
+        return None
+
+    return _get
+
+
 class RosNavigation(NavServiceBase):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "nav-stack"), "navigation")
 
@@ -146,6 +180,8 @@ class RosNavigation(NavServiceBase):
                     getattr(slam_rt.slam_cfg, "scan_max_age_s", 2.0) or 2.0
                 ),
                 drive_timeout_s=float(getattr(cfg.builtin, "drive_timeout_s", 5.0)),
+                pose_provider=_in_process_pose_provider(slam_rt.manager),
+                map_provider=_in_process_map_provider(slam_rt.manager),
                 logger=lambda m: LOGGER.info(m),
             )
             navigator = make_builtin_navigator(

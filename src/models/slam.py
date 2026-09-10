@@ -1535,9 +1535,19 @@ class RosSlam(SLAM):
 
     # -- SLAM API ------------------------------------------------------------
     async def get_position(self, *, timeout: Optional[float] = None, **kwargs) -> Pose:
-        node = self._manager.node if self._manager else None
-        pose2d = node.get_pose_in_map() if node else None
+        mgr = self._manager
+        pose2d = None
+        if mgr is not None:
+            getter = getattr(mgr, "get_pose_in_map", None)
+            if callable(getter):
+                pose2d = getter()
+            if pose2d is None:
+                node = getattr(mgr, "node", None)
+                if node is not None and hasattr(node, "get_pose_in_map"):
+                    pose2d = node.get_pose_in_map()
         if pose2d is None:
+            # Viam SLAM API requires a Pose; origin means "unknown" to some
+            # clients. Builtin nav bypasses this via in-process pose_provider.
             return Pose(x=0.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
         offset = float(
             getattr(self._cfg, "map_pose_yaw_offset_deg", 0.0) if self._cfg else 0.0

@@ -142,6 +142,9 @@ class BuiltinNavHost:
             drive = last()
             if drive is not None:
                 status["last_drive"] = drive
+        src = getattr(self._world, "pose_source", None)
+        if callable(src):
+            status["pose_source"] = src()
         return status
 
     def nav2_diagnostics(self, fast: bool = False) -> Dict:

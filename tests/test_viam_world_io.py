@@ -202,3 +202,44 @@ def test_viam_world_io_prefers_shm_scan():
         writer.close()
         pcshm._try_unlink(name)
         loop.close()
+
+
+@pytest.mark.asyncio
+async def test_viam_world_io_prefers_in_process_pose_provider():
+    loop = asyncio.get_event_loop()
+    live = {"pose": conv.Pose2D(-0.130, 0.607, math.radians(84.7))}
+
+    async def _boom_get_position():
+        raise AssertionError("GetPosition must not be used when pose_provider works")
+
+    slam = MagicMock()
+    slam.get_position = AsyncMock(side_effect=_boom_get_position)
+    slam.do_command = AsyncMock(return_value={})
+    base = MagicMock()
+    base.set_velocity = AsyncMock()
+
+    world = ViamWorldIO(
+        slam=slam,
+        base=base,
+        loop=loop,
+        cameras={},
+        lidars=[],
+        pose_provider=lambda: live["pose"],
+        map_provider=lambda: {
+            "grid": np.zeros((2, 2), dtype=np.int16),
+            "resolution": 0.05,
+            "origin_x": 0.0,
+            "origin_y": 0.0,
+        },
+    )
+    p2 = await asyncio.to_thread(world.get_pose)
+    assert p2 is not None
+    assert p2.x == pytest.approx(-0.130)
+    assert p2.y == pytest.approx(0.607)
+    assert p2.theta == pytest.approx(math.radians(84.7))
+    assert world.pose_source() == "in_process"
+    # Simulate robot motion — status pose must track the provider.
+    live["pose"] = conv.Pose2D(1.0, 2.0, 0.5)
+    p3 = await asyncio.to_thread(world.get_pose)
+    assert p3.x == pytest.approx(1.0)
+    assert p3.y == pytest.approx(2.0)

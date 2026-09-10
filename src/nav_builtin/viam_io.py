@@ -6,7 +6,7 @@ import base64
 import math
 import struct
 import time
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 import numpy as np
 from viam.proto.common import Vector3
@@ -91,6 +91,8 @@ class ViamWorldIO:
         map_cache_s: float = 1.0,
         scan_bins: int = 360,
         logger=None,
+        pose_provider: Optional[Callable[[], Optional[conv.Pose2D]]] = None,
+        map_provider: Optional[Callable[[], Optional[dict]]] = None,
     ):
         self._slam = slam
         self._base = base
@@ -105,6 +107,12 @@ class ViamWorldIO:
         self._map_cache_s = map_cache_s
         self._scan_bins = scan_bins
         self._logger = logger
+        # Prefer in-process SLAM engine reads over gRPC GetPosition/get_grid.
+        # Same-module dependency RPCs share the module event loop with the nav
+        # worker's run_coroutine_threadsafe waits and can return the SLAM API's
+        # origin placeholder (0,0,0) or stall — which freezes bearing_error.
+        self._pose_provider = pose_provider
+        self._map_provider = map_provider
         self._skip_get_laser_scan: set[str] = set()
         self._map_cache: Optional[dict] = None
         self._map_cache_at = 0.0
@@ -112,10 +120,7 @@ class ViamWorldIO:
         self._scan_cache_at = 0.0
         self._scan_cache_pose: Optional[conv.Pose2D] = None
         self._last_drive: Optional[dict] = None
-
-    def last_drive(self) -> Optional[dict]:
-        """Most recent SetVelocity mapping (ROS rad/s → Viam mm/s + deg/s)."""
-        return dict(self._last_drive) if self._last_drive else None
+        self._pose_source: str = "none"
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -139,6 +144,14 @@ class ViamWorldIO:
                 f"Viam IO timed out after {timeout:.1f}s"
             ) from exc
 
+    def last_drive(self) -> Optional[dict]:
+        """Most recent SetVelocity mapping (ROS rad/s → Viam mm/s + deg/s)."""
+        return dict(self._last_drive) if self._last_drive else None
+
+    def pose_source(self) -> str:
+        """How the last ``get_pose`` was obtained (``in_process`` / ``get_position`` / …)."""
+        return self._pose_source
+
     def get_map(self) -> Optional[dict]:
         now = time.monotonic()
         if (
@@ -146,6 +159,17 @@ class ViamWorldIO:
             and now - self._map_cache_at < self._map_cache_s
         ):
             return self._map_cache
+        if self._map_provider is not None:
+            try:
+                parsed = self._map_provider()
+            except Exception:  # noqa: BLE001
+                parsed = None
+            if parsed is not None and parsed.get("grid") is not None:
+                self._map_cache = parsed
+                self._map_cache_at = now
+                if self._viz is not None:
+                    self._viz.set_map(parsed)
+                return parsed
         try:
             resp = self._run(
                 self._slam.do_command({"command": "get_grid"}),
@@ -169,16 +193,38 @@ class ViamWorldIO:
         return parsed
 
     def get_pose(self) -> Optional[conv.Pose2D]:
+        """Map-frame pose in meters / radians.
+
+        Prefers an in-process ``pose_provider`` (builtin SLAM engine / bridge
+        node) so the nav control loop does not re-enter the module event loop
+        via ``GetPosition``. Falls back to SLAM ``GetPosition`` (mm + deg OV →
+        m + rad).
+        """
+        if self._pose_provider is not None:
+            try:
+                p2 = self._pose_provider()
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"pose_provider failed: {exc}")
+                p2 = None
+            if p2 is not None:
+                self._pose_source = "in_process"
+                if self._viz is not None:
+                    self._viz.set_pose(p2)
+                return p2
         try:
             pose = self._run(self._slam.get_position(), timeout=2.0)
         except Exception:  # noqa: BLE001
+            self._pose_source = "get_position_error"
             return None
         if pose is None:
+            self._pose_source = "get_position_none"
             return None
         try:
             p2 = slam_pose_to_pose2d(pose)
         except Exception:  # noqa: BLE001
+            self._pose_source = "get_position_convert_error"
             return None
+        self._pose_source = "get_position"
         if self._viz is not None:
             self._viz.set_pose(p2)
         return p2
