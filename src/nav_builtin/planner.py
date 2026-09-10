@@ -612,8 +612,16 @@ def path_blocked(
     inflation_radius_m: float,
     robot_radius_m: float,
     sample_step_m: float = 0.15,
+    from_pose: Optional[Pose2D] = None,
+    ahead_m: Optional[float] = None,
 ) -> bool:
-    """True if any sample along ``path`` is non-traversable on a fresh costmap."""
+    """True if any sample along ``path`` is non-traversable on a fresh costmap.
+
+    When ``from_pose`` is set, only the portion of the path from the closest
+    projection forward is checked (optionally limited to ``ahead_m``). Checking
+    the entire multi-tens-of-metres plan every second falsely trips on far
+    unknown/inflation cells and hard-fails long goals immediately.
+    """
     if path.empty:
         return True
     occ = occupancy_from_bridge_map(map_data)
@@ -623,16 +631,41 @@ def path_blocked(
         robot_radius_m=robot_radius_m,
     )
     pts = path.points
-    for i in range(len(pts) - 1):
+    start_seg = 0
+    start_t = 0.0
+    remaining_budget = float("inf") if ahead_m is None else max(0.0, float(ahead_m))
+    if from_pose is not None and len(pts) >= 2:
+        cx, cy, start_seg, _along = closest_point_on_path(from_pose, path)
+        start_seg = min(max(0, start_seg), len(pts) - 2)
+        x0, y0 = pts[start_seg]
+        x1, y1 = pts[start_seg + 1]
+        dx, dy = x1 - x0, y1 - y0
+        seg2 = dx * dx + dy * dy
+        if seg2 < 1e-12:
+            start_t = 0.0
+        else:
+            start_t = max(0.0, min(1.0, ((cx - x0) * dx + (cy - y0) * dy) / seg2))
+
+    for i in range(start_seg, len(pts) - 1):
+        if remaining_budget <= 0.0:
+            break
         x0, y0 = pts[i]
         x1, y1 = pts[i + 1]
         seg = math.hypot(x1 - x0, y1 - y0)
-        n = max(1, int(math.ceil(seg / sample_step_m)))
+        t0 = start_t if i == start_seg else 0.0
+        usable = seg * (1.0 - t0)
+        if usable < 1e-9:
+            continue
+        check_len = min(usable, remaining_budget)
+        n = max(1, int(math.ceil(check_len / sample_step_m)))
         for k in range(n + 1):
-            t = k / n
+            frac = check_len / seg if seg > 1e-9 else 0.0
+            t = t0 + (k / n) * frac
+            t = max(0.0, min(1.0, t))
             x = x0 + t * (x1 - x0)
             y = y0 + t * (y1 - y0)
             r, c = occ.world_to_cell(x, y)
             if not occ.in_bounds(r, c) or not is_traversable(int(costs[r, c])):
                 return True
+        remaining_budget -= check_len
     return False

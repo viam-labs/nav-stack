@@ -17,6 +17,7 @@ from src.nav_builtin.costmap import (
 from src.nav_builtin.navigator import BuiltinNavigator
 from src.nav_builtin.planner import (
     connect_plan_start,
+    path_blocked,
     paths_meaningfully_differ,
     plan_on_costmap,
     plan_path,
@@ -334,6 +335,33 @@ def test_plan_fails_when_goal_in_lethal():
     )
     assert result.feasible is False
     assert result.error_code != 0
+
+
+def test_path_blocked_horizon_ignores_far_obstacle():
+    """Long routes must not fail static checks on far-ahead map changes."""
+    m = _empty_map(size=80, resolution=0.1)
+    # Lethal pillar ~1.5 m along +x — outside a short horizon from origin.
+    m["grid"][10, 15] = 100
+    path = Path2D(
+        points=tuple((0.1 * i, 1.0) for i in range(40)),
+        goal_theta=0.0,
+    )
+    assert path_blocked(
+        m,
+        path,
+        inflation_radius_m=0.2,
+        robot_radius_m=0.1,
+        from_pose=Pose2D(0.0, 1.0, 0.0),
+        ahead_m=0.8,
+    ) is False
+    assert path_blocked(
+        m,
+        path,
+        inflation_radius_m=0.2,
+        robot_radius_m=0.1,
+        from_pose=Pose2D(0.0, 1.0, 0.0),
+        ahead_m=2.0,
+    ) is True
 
 
 def test_lookahead_advances_along_path():

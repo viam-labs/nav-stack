@@ -337,10 +337,15 @@ class NavSupervisor:
             local_blocked_since: Optional[float] = None
             last_local_replan_at = 0.0
             failed_replan_while_blocked = 0
+            failed_static_replan = 0
             local_planner_active = False
             vx_sign_history: list[tuple[float, int]] = []
             xy_ok_since: Optional[float] = None
             poll = self._follower.motion.poll_interval_s
+            # Only validate the next few metres — full-path static checks on
+            # long goals trip on far unknown/inflation and abort immediately.
+            path_block_horizon_m = 5.0
+            static_replan_fail_limit = 3
 
             while time.monotonic() < deadline:
                 if self._cancel.is_set():
@@ -665,6 +670,8 @@ class NavSupervisor:
                         path,
                         inflation_radius_m=self._inflation,
                         robot_radius_m=self._robot_radius,
+                        from_pose=pose,
+                        ahead_m=path_block_horizon_m,
                     )
 
                 sustained_local = (
@@ -695,17 +702,24 @@ class NavSupervisor:
                         last_progress_at = now
                         local_blocked_since = None
                         failed_replan_while_blocked = 0
+                        failed_static_replan = 0
                         backup_attempts = 0
                         vx_sign_history.clear()
                         spin_stuck_since = None
                     elif static_blocked:
-                        self._world.stop()
-                        self._set_status(
-                            state="failed",
-                            active=False,
-                            error_msg="replan failed (path blocked)",
-                        )
-                        return
+                        # Keep following while nearby path is contested — a
+                        # single failed global replan on a long route used to
+                        # abort immediately (often mid-spin at the start).
+                        failed_static_replan += 1
+                        last_replan = now
+                        if failed_static_replan >= static_replan_fail_limit:
+                            self._world.stop()
+                            self._set_status(
+                                state="failed",
+                                active=False,
+                                error_msg="replan failed (path blocked)",
+                            )
+                            return
                     else:
                         last_replan = now
 
