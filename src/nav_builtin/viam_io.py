@@ -96,6 +96,9 @@ class ViamWorldIO:
     ):
         self._slam = slam
         self._base = base
+        self._base_name = str(
+            getattr(base, "name", None) or getattr(base, "_name", None) or base
+        )
         self._loop = loop
         self._cameras = dict(cameras or {})
         self._lidars = list(lidars or [])
@@ -195,12 +198,13 @@ class ViamWorldIO:
     def get_pose(self) -> Optional[conv.Pose2D]:
         """Map-frame pose in meters / radians from the configured SLAM service.
 
-        Order (same map frame the planner uses):
+        Prefer **sync** sources so the control loop does not schedule
+        ``GetPosition`` on the shared module event loop every tick (that
+        starves ``Base.SetVelocity``). Order:
 
-        1. Sync ``slam.get_position_pose2d()`` when the dependency is our
-           in-module SLAM — same source as ``GetPosition``, no event-loop hop.
-        2. Async ``GetPosition`` (mm + deg OV → m + rad) every control tick.
-        3. Optional ``pose_provider`` hook (tests / non-SLAM hosts only).
+        1. Sync ``slam.get_position_pose2d()`` when the dependency is local RosSlam.
+        2. ``pose_provider`` (in-process registered SLAM service / engine).
+        3. Async ``GetPosition`` only as a last resort (remote SLAM).
         """
         # Only call sync helpers declared on the SLAM class (local RosSlam).
         # Instance MagicMock / gRPC stubs must not invent get_position_pose2d.
@@ -216,13 +220,6 @@ class ViamWorldIO:
                     self._viz.set_pose(p2)
                 return p2
 
-        via_api = self._pose_from_get_position()
-        if via_api is not None:
-            self._pose_source = "get_position"
-            if self._viz is not None:
-                self._viz.set_pose(via_api)
-            return via_api
-
         if self._pose_provider is not None:
             try:
                 p2 = self._pose_provider()
@@ -234,6 +231,13 @@ class ViamWorldIO:
                 if self._viz is not None:
                     self._viz.set_pose(p2)
                 return p2
+
+        via_api = self._pose_from_get_position()
+        if via_api is not None:
+            self._pose_source = "get_position"
+            if self._viz is not None:
+                self._viz.set_pose(via_api)
+            return via_api
 
         self._pose_source = "none"
         return None
@@ -435,13 +439,16 @@ class ViamWorldIO:
         lx_mm, ly_mm, ang_deg_s = ros_twist_to_viam_set_velocity(
             vx, vy, vtheta, self._convention
         )
-        self._last_drive = {
+        intent = {
             "ros_vx_mps": vx,
             "ros_vy_mps": vy,
             "ros_vtheta_rad_s": vtheta,
             "viam_linear_x_mm_s": lx_mm,
             "viam_linear_y_mm_s": ly_mm,
             "viam_angular_z_deg_s": ang_deg_s,
+            "base": self._base_name,
+            "issued": False,
+            "error": None,
         }
         try:
             self._run(
@@ -455,17 +462,33 @@ class ViamWorldIO:
             # Wheeled bases reject non-zero but tiny wheel RPM ("nearly 0").
             # Snap to a clean stop or pure spin and retry once.
             if not _is_near_zero_rpm_error(exc):
-                raise
-            if abs(vtheta) >= 0.15:
-                self._run(
-                    self._base.set_velocity(
-                        linear=Vector3(x=0.0, y=0.0, z=0.0),
-                        angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
-                    ),
-                    timeout=self._drive_timeout_s,
+                intent["error"] = str(exc).strip() or type(exc).__name__
+                self._last_drive = intent
+                self._log(
+                    f"SetVelocity failed on base {self._base_name!r}: {intent['error']}"
                 )
-            else:
-                self.stop()
+                raise
+            try:
+                if abs(vtheta) >= 0.15:
+                    self._run(
+                        self._base.set_velocity(
+                            linear=Vector3(x=0.0, y=0.0, z=0.0),
+                            angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
+                        ),
+                        timeout=self._drive_timeout_s,
+                    )
+                else:
+                    self.stop()
+            except Exception as retry_exc:  # noqa: BLE001
+                intent["error"] = str(retry_exc).strip() or type(retry_exc).__name__
+                self._last_drive = intent
+                self._log(
+                    f"SetVelocity retry failed on base {self._base_name!r}: "
+                    f"{intent['error']}"
+                )
+                raise
+        intent["issued"] = True
+        self._last_drive = intent
 
     def stop(self) -> None:
         try:
@@ -476,8 +499,29 @@ class ViamWorldIO:
                 ),
                 timeout=self._drive_timeout_s,
             )
-        except Exception:  # noqa: BLE001
-            pass
+            self._last_drive = {
+                "ros_vx_mps": 0.0,
+                "ros_vy_mps": 0.0,
+                "ros_vtheta_rad_s": 0.0,
+                "viam_linear_x_mm_s": 0.0,
+                "viam_linear_y_mm_s": 0.0,
+                "viam_angular_z_deg_s": 0.0,
+                "base": self._base_name,
+                "issued": True,
+                "error": None,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self._last_drive = {
+                "ros_vx_mps": 0.0,
+                "ros_vy_mps": 0.0,
+                "ros_vtheta_rad_s": 0.0,
+                "viam_linear_x_mm_s": 0.0,
+                "viam_linear_y_mm_s": 0.0,
+                "viam_angular_z_deg_s": 0.0,
+                "base": self._base_name,
+                "issued": False,
+                "error": str(exc).strip() or type(exc).__name__,
+            }
 
     def set_viz_plan(
         self,

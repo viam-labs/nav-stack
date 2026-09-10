@@ -58,6 +58,28 @@ def get_slam(name: str) -> Optional[SlamRuntime]:
         return _REGISTRY.get(name)
 
 
+# The live SLAM *service object* (RosSlam), keyed by resource name. Builtin nav
+# uses this for sync ``get_position_pose2d`` when the motion dependency is a
+# gRPC client stub — async GetPosition every control tick starves Base.SetVelocity
+# on the shared module event loop.
+_SLAM_SERVICES: Dict[str, object] = {}
+
+
+def register_slam_service(name: str, service: object) -> None:
+    with _LOCK:
+        _SLAM_SERVICES[name] = service
+
+
+def unregister_slam_service(name: str) -> None:
+    with _LOCK:
+        _SLAM_SERVICES.pop(name, None)
+
+
+def get_slam_service(name: str) -> Optional[object]:
+    with _LOCK:
+        return _SLAM_SERVICES.get(name)
+
+
 # Live bridge nodes, keyed by the *navigation* service name that owns/drives
 # them. Published so the ``nav-camera`` component can find the running
 # ``BridgeNode`` in-process and read Nav2 costmap/plan/pose data for rendering,

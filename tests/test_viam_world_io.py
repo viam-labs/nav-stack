@@ -91,6 +91,7 @@ async def test_viam_world_io_map_pose_drive():
     assert args.kwargs["angular"].z == pytest.approx(-math.degrees(1.0))
     drive = world.last_drive()
     assert drive is not None
+    assert drive["issued"] is True
     assert drive["ros_vtheta_rad_s"] == pytest.approx(-1.0)
     assert drive["viam_angular_z_deg_s"] == pytest.approx(-math.degrees(1.0))
 
@@ -225,7 +226,7 @@ async def test_viam_world_io_prefers_slam_get_position_pose2d_sync():
         loop=loop,
         cameras={},
         lidars=[],
-        # Stale provider must not win over slam GetPosition sync.
+        # Provider is secondary to local slam sync helper.
         pose_provider=lambda: conv.Pose2D(0.0, 0.0, 0.0),
         map_provider=lambda: {
             "grid": np.zeros((2, 2), dtype=np.int16),
@@ -247,7 +248,33 @@ async def test_viam_world_io_prefers_slam_get_position_pose2d_sync():
 
 
 @pytest.mark.asyncio
-async def test_viam_world_io_uses_async_get_position_when_no_sync_helper():
+async def test_viam_world_io_prefers_pose_provider_over_async_get_position():
+    """Sync provider must win so SetVelocity keeps event-loop bandwidth."""
+    loop = asyncio.get_event_loop()
+
+    async def _boom():
+        raise AssertionError("async GetPosition must not run when pose_provider works")
+
+    slam = MagicMock(spec=["get_position", "do_command"])
+    slam.get_position = AsyncMock(side_effect=_boom)
+    slam.do_command = AsyncMock(return_value={})
+    live = {"pose": conv.Pose2D(-0.130, 0.607, math.radians(84.7))}
+    world = ViamWorldIO(
+        slam=slam,
+        base=MagicMock(),
+        loop=loop,
+        cameras={},
+        lidars=[],
+        pose_provider=lambda: live["pose"],
+    )
+    p2 = await asyncio.to_thread(world.get_pose)
+    assert p2.x == pytest.approx(-0.130)
+    assert world.pose_source() == "in_process"
+    slam.get_position.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_viam_world_io_uses_async_get_position_when_no_sync_source():
     loop = asyncio.get_event_loop()
     slam = MagicMock(spec=["get_position", "do_command"])
     slam.get_position = AsyncMock(
@@ -262,8 +289,6 @@ async def test_viam_world_io_uses_async_get_position_when_no_sync_helper():
         loop=loop,
         cameras={},
         lidars=[],
-        # Stale in-process must not mask GetPosition.
-        pose_provider=lambda: conv.Pose2D(0.0, 0.0, 0.0),
     )
     p2 = await asyncio.to_thread(world.get_pose)
     assert p2 is not None
@@ -274,23 +299,52 @@ async def test_viam_world_io_uses_async_get_position_when_no_sync_helper():
 
 
 @pytest.mark.asyncio
-async def test_viam_world_io_pose_provider_is_last_resort():
+async def test_viam_world_io_last_drive_issued_only_after_set_velocity():
     loop = asyncio.get_event_loop()
-
-    async def _boom():
-        raise TimeoutError("GetPosition unavailable")
-
+    base = MagicMock()
+    base.name = "tracer"
+    base.set_velocity = AsyncMock()
     slam = MagicMock(spec=["get_position", "do_command"])
-    slam.get_position = AsyncMock(side_effect=_boom)
+    slam.get_position = AsyncMock(
+        return_value=SimpleNamespace(
+            x=0.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0
+        )
+    )
     world = ViamWorldIO(
         slam=slam,
-        base=MagicMock(),
+        base=base,
         loop=loop,
         cameras={},
         lidars=[],
-        pose_provider=lambda: conv.Pose2D(0.5, -0.25, 0.1),
+        base_velocity_convention="viam",
     )
-    p2 = await asyncio.to_thread(world.get_pose)
-    assert p2 is not None
-    assert p2.x == pytest.approx(0.5)
-    assert world.pose_source() == "in_process"
+    await asyncio.to_thread(world.set_velocity, 0.2, 0.0, -1.0)
+    drive = world.last_drive()
+    assert drive is not None
+    assert drive["issued"] is True
+    assert drive["error"] is None
+    assert drive["base"] == "tracer"
+    assert drive["viam_linear_y_mm_s"] == pytest.approx(200.0)
+    assert drive["viam_angular_z_deg_s"] == pytest.approx(-math.degrees(1.0))
+    base.set_velocity.assert_awaited()
+
+    base.set_velocity = AsyncMock(side_effect=TimeoutError("Viam IO timed out after 5.0s"))
+    with pytest.raises(TimeoutError):
+        await asyncio.to_thread(world.set_velocity, 0.3, 0.0, 0.0)
+    drive = world.last_drive()
+    assert drive["issued"] is False
+    assert "timed out" in (drive["error"] or "").lower()
+    assert drive["viam_linear_y_mm_s"] == pytest.approx(300.0)
+
+
+def test_sync_slam_pose_provider_uses_registered_service(monkeypatch):
+    from src.models import navigation as nav_mod
+
+    class _Svc:
+        def get_position_pose2d(self):
+            return conv.Pose2D(1.25, -0.5, 0.3)
+
+    monkeypatch.setattr(nav_mod, "get_slam_service", lambda _n: _Svc())
+    monkeypatch.setattr(nav_mod, "get_slam", lambda _n: None)
+    provider = nav_mod._sync_slam_pose_provider("slam")
+    assert provider() == conv.Pose2D(1.25, -0.5, 0.3)

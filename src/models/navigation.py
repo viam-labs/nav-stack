@@ -35,6 +35,7 @@ from ..nav_builtin import (
 from ..runtime import (
     SlamRuntime,
     get_slam,
+    get_slam_service,
     register_bridge,
     register_nav_viz,
     unregister_bridge,
@@ -64,6 +65,40 @@ from .nav_core import (  # noqa: F401
 )
 
 LOGGER = getLogger(__name__)
+
+
+def _sync_slam_pose_provider(slam_service_name: str):
+    """Sync map pose from the live in-process SLAM service (no event-loop hop).
+
+    The motion dependency is often a gRPC client stub even for same-module SLAM.
+    Calling ``GetPosition`` every control tick then contends with ``SetVelocity``
+    on the shared loop — commands are computed (and were previously recorded in
+    ``last_drive`` before the call) while the base never moves. Always re-resolve
+    the registered service / runtime so SLAM reconfigure cannot leave a stale host.
+    """
+
+    def _get():
+        svc = get_slam_service(slam_service_name)
+        if svc is not None:
+            fn = getattr(type(svc), "get_position_pose2d", None)
+            if callable(fn):
+                try:
+                    return fn(svc)
+                except Exception:  # noqa: BLE001
+                    pass
+        rt = get_slam(slam_service_name)
+        if rt is None or rt.manager is None:
+            return None
+        manager = rt.manager
+        getter = getattr(manager, "get_pose_in_map", None)
+        if callable(getter):
+            return getter()
+        node = getattr(manager, "node", None)
+        if node is not None and hasattr(node, "get_pose_in_map"):
+            return node.get_pose_in_map()
+        return None
+
+    return _get
 
 
 def _in_process_map_provider(slam_service_name: str):
@@ -165,6 +200,7 @@ class RosNavigation(NavServiceBase):
                     getattr(slam_rt.slam_cfg, "scan_max_age_s", 2.0) or 2.0
                 ),
                 drive_timeout_s=float(getattr(cfg.builtin, "drive_timeout_s", 5.0)),
+                pose_provider=_sync_slam_pose_provider(cfg.slam_service),
                 map_provider=_in_process_map_provider(cfg.slam_service),
                 logger=lambda m: LOGGER.info(m),
             )

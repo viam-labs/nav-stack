@@ -45,7 +45,13 @@ from ..nav import pause_keyframes, slice_match
 from ..nav.maps import MapStore, validate_map_name
 from ..ros import conversions as conv
 from ..ros.shm_lidar import ShmPointCloudClient
-from ..runtime import SlamRuntime, register_slam, unregister_slam
+from ..runtime import (
+    SlamRuntime,
+    register_slam,
+    register_slam_service,
+    unregister_slam,
+    unregister_slam_service,
+)
 from ..slam_builtin import BuiltinSlamEngine, BuiltinSlamHost
 from ..slam_builtin.io_sensors import BuiltinSensors
 
@@ -200,6 +206,7 @@ class RosSlam(SLAM):
                 shm_lidar=self._shm_lidar,
             ),
         )
+        register_slam_service(self.name, self)
         LOGGER.info(
             f"nav-stack SLAM '{self.name}' configured in {cfg.mode} mode "
             f"(slam_backend={backend})"
@@ -2163,6 +2170,7 @@ class RosSlam(SLAM):
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
         unregister_slam(self.name)
+        unregister_slam_service(self.name)
         self._shm_lidar.close()
         if self._manager is not None:
             self._manager.shutdown()
