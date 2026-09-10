@@ -393,6 +393,9 @@ def test_follow_command_approach_cap_only_at_goal():
     mid = compute_follow_command(current, near, cfg=cfg, final_yaw=None)
     goal = compute_follow_command(current, near, cfg=cfg, final_yaw=0.0)
     assert mid.vx > goal.vx
+
+
+def test_follow_command_rotate_in_place_when_goal_behind():
     from src.nav_builtin.controller import compute_follow_command
 
     cfg = FollowerConfig()
@@ -402,6 +405,40 @@ def test_follow_command_approach_cap_only_at_goal():
     assert cmd.vx == 0.0
     assert abs(cmd.vtheta) > 0.0
 
+
+def test_follow_command_no_sign_flip_across_xy_tolerance():
+    """XY jitter across xy_tol must not reverse saturated turn direction."""
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.max_angular_rad_s = 1.5
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    goal = Pose2D(0.0, 0.0, 0.0)
+    # Facing ~57°, need to turn CW (negative) to final yaw 0.
+    inside = Pose2D(0.10, 0.0, 1.0)
+    # Slight overshoot past the goal — old law RIP'd CCW on ±π bearing.
+    outside = Pose2D(-0.30, 0.0, 1.0)
+    cmd_in = compute_follow_command(inside, goal, cfg=cfg, final_yaw=0.0)
+    cmd_out = compute_follow_command(outside, goal, cfg=cfg, final_yaw=0.0)
+    assert cmd_in.vtheta < 0.0
+    assert cmd_out.vtheta < 0.0 or cmd_out.vx < 0.0  # reverse crawl or CW yaw
+    assert abs(cmd_in.vtheta) <= 0.55 + 1e-6
+    assert abs(cmd_out.vtheta) <= 0.55 + 1e-6
+
+
+def test_follow_command_overshoot_reverses_instead_of_spinning():
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    # Past the goal, still facing roughly the approach direction.
+    current = Pose2D(0.40, 0.0, 0.0)
+    goal = Pose2D(0.0, 0.0, 0.0)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=0.0)
+    assert cmd.vx < 0.0
+    assert abs(cmd.vtheta) < 0.6
+    assert not cmd.done
 
 def test_compute_path_command_drives_forward():
     path = Path2D(points=((0.0, 0.0), (2.0, 0.0)), goal_theta=0.0)

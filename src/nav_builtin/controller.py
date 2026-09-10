@@ -47,6 +47,55 @@ def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
 
 
+def _near_goal_command(
+    *,
+    yaw_err: float,
+    bearing: float,
+    dist: float,
+    motion: SimpleMotionConfig,
+) -> DriveCommand:
+    """Hold / crawl near the goal without bearing-RIP oscillation.
+
+    Outside ``xy_tolerance`` the normal law tracks bearing-to-point; a 1–2 cm
+    overshoot makes that bearing ≈ ±π and commands ±max_vel_theta, then the
+    next tick (back inside the ball) flips to final-yaw with the opposite
+    sign — classic goal-swing. Stay in this mode for an expanded ball and
+    reverse-crawl when the goal is behind instead of spinning 180°.
+    """
+    xy_tol = motion.xy_tolerance_m
+    yaw_tol = motion.yaw_tolerance_rad
+    # Soft cap: full max_vel_theta (often 1.5) overshoots and reverses.
+    yaw_cap = min(0.55, motion.max_angular_rad_s)
+
+    if dist <= xy_tol:
+        # Hold XY, finish yaw. No stiction floor — that bang-bangs near tol.
+        vtheta = _clamp(yaw_err, yaw_cap)
+        if abs(yaw_err) > yaw_tol and abs(vtheta) < 0.12:
+            vtheta = math.copysign(0.12, yaw_err)
+        return DriveCommand(0.0, 0.0, vtheta, False)
+
+    crawl = min(0.10, max(0.05, motion.max_linear_mps * 0.18))
+    if abs(bearing) > math.radians(100.0):
+        # Goal behind (overshoot): reverse toward it; nudge final yaw gently.
+        return DriveCommand(
+            -min(crawl, dist * 0.55),
+            0.0,
+            _clamp(yaw_err * 0.7, yaw_cap * 0.7),
+            False,
+        )
+
+    # Goal ahead but outside xy_tol: slow approach. Prefer final yaw once
+    # close so we don't RIP on a large bearing while already near.
+    if dist <= xy_tol * 1.25:
+        vtheta = _clamp(yaw_err * 0.9, yaw_cap)
+    else:
+        vtheta = _clamp(bearing * 1.2, yaw_cap)
+    vx = min(crawl, dist * 0.55)
+    if abs(bearing) > math.radians(60.0):
+        vx *= 0.35
+    return apply_velocity_floor(DriveCommand(vx, 0.0, vtheta, False), motion)
+
+
 def _effective_lookahead(
     cfg: FollowerConfig,
     *,
@@ -130,19 +179,24 @@ def compute_follow_command(
     dist = distance_m(current, target)
     heading_to_target = math.atan2(target.y - current.y, target.x - current.x)
     bearing = heading_error_rad(current.theta, heading_to_target)
+    xy_tol = motion.xy_tolerance_m
 
-    # Final pose: hold XY then finish yaw.
-    if final_yaw is not None and dist <= motion.xy_tolerance_m:
+    if final_yaw is not None:
         yaw_err = heading_error_rad(current.theta, final_yaw)
-        if abs(yaw_err) <= motion.yaw_tolerance_rad:
+        if dist <= xy_tol and abs(yaw_err) <= motion.yaw_tolerance_rad:
             return DriveCommand(0.0, 0.0, 0.0, True)
-        return apply_velocity_floor(
-            DriveCommand(0.0, 0.0, _clamp(yaw_err, motion.max_angular_rad_s), False),
-            motion,
-        )
+        # Expanded ball (2× tol): latch near-goal behavior so XY jitter cannot
+        # flip between final-yaw and bearing-RIP.
+        if dist <= xy_tol * 2.0:
+            return _near_goal_command(
+                yaw_err=yaw_err,
+                bearing=bearing,
+                dist=dist,
+                motion=motion,
+            )
 
     # Intermediate pursuit target reached — not navigation complete.
-    if final_yaw is None and dist <= motion.xy_tolerance_m * 0.5:
+    if final_yaw is None and dist <= xy_tol * 0.5:
         return DriveCommand(0.0, 0.0, 0.0, False)
 
     max_linear = motion.max_linear_mps
@@ -159,9 +213,9 @@ def compute_follow_command(
 
     linear_cmd = _clamp(dist * 0.75, max_linear)
     if final_yaw is not None:
-        # Final approach to goal XY — ease in.
+        # Final approach to goal XY — ease in (tighter than mid-path cruise).
         if cfg.approach_dist_m > 0 and dist < cfg.approach_dist_m:
-            cap = max(0.12, max_linear * 0.35)
+            cap = max(0.08, max_linear * 0.22)
             linear_cmd = min(linear_cmd, cap)
     elif abs(bearing) < math.radians(25.0):
         # On-path cruise: don't crawl when bearing is good.
@@ -237,6 +291,7 @@ def compute_path_command(
             cmd = compute_follow_command(
                 current, goal, cfg=cfg, final_yaw=path.goal_theta
             )
+            bearing = heading_error_rad(current.theta, path.goal_theta)
         else:
             cmd = compute_follow_command(current, target, cfg=cfg, final_yaw=None)
 
