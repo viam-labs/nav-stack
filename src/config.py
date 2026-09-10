@@ -333,7 +333,11 @@ class BuiltinNavConfig:
     backup_rear_clear_m: float = 0.45
     backup_max_attempts: int = 1
     backup_cooldown_s: float = 4.0
-    # Replan when the local costmap sees the path ahead blocked (dynamic obstacles).
+    # Nav2 Wait analogue: stop and wait for a dynamic blocker to clear before
+    # the first local replan (people crossing). Matches nav2.recovery_wait_duration.
+    recovery_wait_duration_s: float = 2.0
+    # Legacy grace before local replan; effective wait is
+    # max(recovery_wait_duration_s, replan_local_blocked_time_s).
     replan_local_blocked_time_s: float = 0.3
     replan_local_min_period_s: float = 0.5
 
@@ -375,6 +379,7 @@ class BuiltinNavConfig:
             backup_rear_clear_m=float(d.get("backup_rear_clear_m", 0.45)),
             backup_max_attempts=int(d.get("backup_max_attempts", 1)),
             backup_cooldown_s=float(d.get("backup_cooldown_s", 4.0)),
+            recovery_wait_duration_s=float(d.get("recovery_wait_duration_s", 2.0)),
             replan_local_blocked_time_s=float(
                 d.get("replan_local_blocked_time_s", 0.3)
             ),

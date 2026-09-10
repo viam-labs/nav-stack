@@ -375,6 +375,20 @@ def test_nav_config_nav_backend_nav2():
     assert cfg.builtin.lookahead_m == 0.6
 
 
+def test_builtin_recovery_wait_defaults_match_nav2_tune():
+    cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    assert cfg.builtin.recovery_wait_duration_s == pytest.approx(2.0)
+    assert cfg.nav2.recovery_wait_duration == pytest.approx(2.0)
+    tuned = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "builtin": {"recovery_wait_duration_s": 3.5},
+        }
+    )
+    assert tuned.builtin.recovery_wait_duration_s == pytest.approx(3.5)
+
+
 def test_nav_config_bad_nav_backend():
     with pytest.raises(ValueError, match="nav_backend"):
         NavConfig.from_dict(

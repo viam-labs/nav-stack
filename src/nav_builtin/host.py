@@ -59,6 +59,7 @@ def make_builtin_navigator(
         backup_rear_clear_m=bcfg.backup_rear_clear_m,
         backup_max_attempts=bcfg.backup_max_attempts,
         backup_cooldown_s=bcfg.backup_cooldown_s,
+        recovery_wait_duration_s=bcfg.recovery_wait_duration_s,
         replan_local_blocked_time_s=bcfg.replan_local_blocked_time_s,
         replan_local_min_period_s=bcfg.replan_local_min_period_s,
         drive_timeout_streak=int(getattr(bcfg, "drive_timeout_streak", 20)),

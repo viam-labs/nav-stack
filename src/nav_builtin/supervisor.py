@@ -80,6 +80,7 @@ class NavSupervisor:
         backup_rear_clear_m: float = 0.45,
         backup_max_attempts: int = 1,
         backup_cooldown_s: float = 4.0,
+        recovery_wait_duration_s: float = 2.0,
         replan_local_blocked_time_s: float = 0.3,
         replan_local_min_period_s: float = 0.5,
         drive_timeout_streak: int = 20,
@@ -111,7 +112,8 @@ class NavSupervisor:
         self._backup_rear_clear_m = backup_rear_clear_m
         self._backup_max_attempts = max(0, int(backup_max_attempts))
         self._backup_cooldown_s = backup_cooldown_s
-        self._replan_local_blocked_time_s = replan_local_blocked_time_s
+        self._recovery_wait_duration_s = max(0.0, float(recovery_wait_duration_s))
+        self._replan_local_blocked_time_s = max(0.0, float(replan_local_blocked_time_s))
         self._replan_local_min_period_s = replan_local_min_period_s
         self._local_planner_activate_cost = local_planner_activate_cost
         self._local_costmap = (
@@ -490,13 +492,21 @@ class NavSupervisor:
                         cost_threshold=self._local_planner_activate_cost,
                     )
                 )
+                # Nav2 Wait analogue: hold still so transient movers can clear
+                # before we burn a detour replan.
+                wait_before_replan_s = max(
+                    self._recovery_wait_duration_s,
+                    self._replan_local_blocked_time_s,
+                )
+                waiting_for_clear = False
                 if local_blocked:
                     if local_blocked_since is None:
                         local_blocked_since = now
-                    if (
-                        now - local_blocked_since
-                        >= self._replan_local_blocked_time_s
-                        and now - last_local_replan_at
+                    blocked_for = now - local_blocked_since
+                    if blocked_for < wait_before_replan_s:
+                        waiting_for_clear = True
+                    elif (
+                        now - last_local_replan_at
                         >= self._replan_local_min_period_s
                     ):
                         new_path = self._try_replan(
@@ -529,7 +539,9 @@ class NavSupervisor:
                     speed_mps=self._last_cmd_vx,
                     local_view=local_view,
                     local_planner=self._local_planner
-                    if self._local_costmap_enabled and not local_blocked
+                    if self._local_costmap_enabled
+                    and not local_blocked
+                    and not waiting_for_clear
                     else None,
                     robot_radius_m=self._robot_radius,
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
@@ -537,6 +549,23 @@ class NavSupervisor:
                     local_planner_active=local_planner_active,
                 )
                 local_planner_active = bool(progress.get("local_planner"))
+
+                if waiting_for_clear:
+                    # Stop and let the blocker move; don't trip stall timeout.
+                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                    progress = {
+                        **progress,
+                        "obstacle": "wait",
+                        "local_planner": False,
+                        "cmd_vx_mps": 0.0,
+                        "cmd_vtheta_rad_s": 0.0,
+                    }
+                    last_progress_at = now
+                    last_progress_pose = pose
+                    last_progress_dist = distance_m(
+                        pose,
+                        Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta),
+                    ) if path.points else last_progress_dist
 
                 allow_backup = (
                     self._backup_enabled
@@ -547,6 +576,7 @@ class NavSupervisor:
                     and abs(cmd.vtheta) > 0.1
                     and backup_attempts < self._backup_max_attempts
                     and now >= backup_cooldown_until
+                    and not waiting_for_clear
                     and (
                         not local_blocked
                         or failed_replan_while_blocked >= 2
@@ -688,12 +718,6 @@ class NavSupervisor:
                     if pose_jumped:
                         static_blocked = True
 
-                sustained_local = (
-                    local_blocked
-                    and local_blocked_since is not None
-                    and now - local_blocked_since
-                    >= self._replan_local_blocked_time_s
-                )
                 backup_exhausted = (
                     backup_attempts >= self._backup_max_attempts and local_blocked
                 )
