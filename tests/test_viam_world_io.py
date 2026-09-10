@@ -243,3 +243,75 @@ async def test_viam_world_io_prefers_in_process_pose_provider():
     p3 = await asyncio.to_thread(world.get_pose)
     assert p3.x == pytest.approx(1.0)
     assert p3.y == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_viam_world_io_overrides_stale_origin_in_process_pose():
+    """Stale provider at origin + live GetPosition → trust GetPosition."""
+    loop = asyncio.get_event_loop()
+    slam = MagicMock()
+    slam.get_position = AsyncMock(
+        return_value=SimpleNamespace(
+            x=-130.0, y=607.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=84.7
+        )
+    )
+    slam.do_command = AsyncMock(return_value={})
+    world = ViamWorldIO(
+        slam=slam,
+        base=MagicMock(),
+        loop=loop,
+        cameras={},
+        lidars=[],
+        pose_provider=lambda: conv.Pose2D(0.0, 0.0, 0.0),
+    )
+    p2 = await asyncio.to_thread(world.get_pose)
+    assert p2 is not None
+    assert p2.x == pytest.approx(-0.130)
+    assert p2.y == pytest.approx(0.607)
+    assert world.pose_source() == "get_position_override"
+    slam.get_position.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_viam_world_io_keeps_origin_when_get_position_also_origin():
+    loop = asyncio.get_event_loop()
+    slam = MagicMock()
+    slam.get_position = AsyncMock(
+        return_value=SimpleNamespace(
+            x=0.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0
+        )
+    )
+    world = ViamWorldIO(
+        slam=slam,
+        base=MagicMock(),
+        loop=loop,
+        cameras={},
+        lidars=[],
+        pose_provider=lambda: conv.Pose2D(0.0, 0.0, 0.0),
+    )
+    p2 = await asyncio.to_thread(world.get_pose)
+    assert p2 is not None
+    assert p2.x == pytest.approx(0.0)
+    assert p2.y == pytest.approx(0.0)
+    assert world.pose_source() == "in_process"
+
+
+def test_in_process_pose_provider_resolves_live_slam_manager(monkeypatch):
+    from src.models import navigation as nav_mod
+
+    stale = MagicMock()
+    stale.get_pose_in_map.return_value = conv.Pose2D(0.0, 0.0, 0.0)
+    live = MagicMock()
+    live.get_pose_in_map.return_value = conv.Pose2D(1.25, -0.5, 0.3)
+    slot = {"manager": stale}
+
+    class _Rt:
+        @property
+        def manager(self):
+            return slot["manager"]
+
+    monkeypatch.setattr(nav_mod, "get_slam", lambda _name: _Rt())
+    provider = nav_mod._in_process_pose_provider("slam")
+    assert provider() == conv.Pose2D(0.0, 0.0, 0.0)
+    slot["manager"] = live
+    assert provider() == conv.Pose2D(1.25, -0.5, 0.3)

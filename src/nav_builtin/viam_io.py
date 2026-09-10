@@ -197,37 +197,61 @@ class ViamWorldIO:
 
         Prefers an in-process ``pose_provider`` (builtin SLAM engine / bridge
         node) so the nav control loop does not re-enter the module event loop
-        via ``GetPosition``. Falls back to SLAM ``GetPosition`` (mm + deg OV →
-        m + rad).
+        via ``GetPosition`` on every tick. Falls back to SLAM ``GetPosition``
+        (mm + deg OV → m + rad). If the in-process pose is stuck at the origin
+        while ``GetPosition`` reports motion, trust GetPosition — that pattern
+        means the provider closed over a stale SLAM host after reconfigure.
         """
+        in_proc: Optional[conv.Pose2D] = None
         if self._pose_provider is not None:
             try:
-                p2 = self._pose_provider()
+                in_proc = self._pose_provider()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"pose_provider failed: {exc}")
-                p2 = None
-            if p2 is not None:
-                self._pose_source = "in_process"
+                in_proc = None
+
+        in_at_origin = in_proc is not None and (
+            math.hypot(in_proc.x, in_proc.y) < 0.02
+            and abs(in_proc.theta) < math.radians(2.0)
+        )
+        need_api = in_proc is None or in_at_origin
+        via_api = self._pose_from_get_position() if need_api else None
+
+        if in_at_origin and via_api is not None:
+            api_moved = math.hypot(via_api.x, via_api.y) > 0.05 or abs(
+                via_api.theta
+            ) > math.radians(5.0)
+            if api_moved:
+                self._pose_source = "get_position_override"
                 if self._viz is not None:
-                    self._viz.set_pose(p2)
-                return p2
+                    self._viz.set_pose(via_api)
+                return via_api
+
+        if in_proc is not None:
+            self._pose_source = "in_process"
+            if self._viz is not None:
+                self._viz.set_pose(in_proc)
+            return in_proc
+
+        if via_api is not None:
+            self._pose_source = "get_position"
+            if self._viz is not None:
+                self._viz.set_pose(via_api)
+            return via_api
+        self._pose_source = "none"
+        return None
+
+    def _pose_from_get_position(self) -> Optional[conv.Pose2D]:
         try:
             pose = self._run(self._slam.get_position(), timeout=2.0)
         except Exception:  # noqa: BLE001
-            self._pose_source = "get_position_error"
             return None
         if pose is None:
-            self._pose_source = "get_position_none"
             return None
         try:
-            p2 = slam_pose_to_pose2d(pose)
+            return slam_pose_to_pose2d(pose)
         except Exception:  # noqa: BLE001
-            self._pose_source = "get_position_convert_error"
             return None
-        self._pose_source = "get_position"
-        if self._viz is not None:
-            self._viz.set_pose(p2)
-        return p2
 
     def get_scan(self, max_age_s: float = 2.0) -> Optional[conv.LaserScan2D]:
         now = time.monotonic()

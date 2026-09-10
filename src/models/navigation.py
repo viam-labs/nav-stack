@@ -66,12 +66,20 @@ from .nav_core import (  # noqa: F401
 LOGGER = getLogger(__name__)
 
 
-def _in_process_pose_provider(manager):
-    """Sync map-frame pose from the SLAM host (builtin engine or ROS bridge)."""
+def _in_process_pose_provider(slam_service_name: str):
+    """Sync map-frame pose from the *current* SLAM host (re-resolves each call).
+
+    Must not close over a ``manager`` instance from configure-time: SLAM
+    reconfigure replaces ``SlamRuntime.manager`` / the engine, and a stale
+    host stays forever at the origin while ``GetPosition`` on the live service
+    keeps moving — exactly the nav-while-mapping stall we saw.
+    """
 
     def _get():
-        if manager is None:
+        rt = get_slam(slam_service_name)
+        if rt is None or rt.manager is None:
             return None
+        manager = rt.manager
         getter = getattr(manager, "get_pose_in_map", None)
         if callable(getter):
             return getter()
@@ -83,12 +91,14 @@ def _in_process_pose_provider(manager):
     return _get
 
 
-def _in_process_map_provider(manager):
-    """Sync occupancy dict from the SLAM host when available."""
+def _in_process_map_provider(slam_service_name: str):
+    """Sync occupancy dict from the current SLAM host (re-resolves each call)."""
 
     def _get():
-        if manager is None:
+        rt = get_slam(slam_service_name)
+        if rt is None or rt.manager is None:
             return None
+        manager = rt.manager
         getter = getattr(manager, "get_map", None)
         if callable(getter):
             return getter()
@@ -180,8 +190,8 @@ class RosNavigation(NavServiceBase):
                     getattr(slam_rt.slam_cfg, "scan_max_age_s", 2.0) or 2.0
                 ),
                 drive_timeout_s=float(getattr(cfg.builtin, "drive_timeout_s", 5.0)),
-                pose_provider=_in_process_pose_provider(slam_rt.manager),
-                map_provider=_in_process_map_provider(slam_rt.manager),
+                pose_provider=_in_process_pose_provider(cfg.slam_service),
+                map_provider=_in_process_map_provider(cfg.slam_service),
                 logger=lambda m: LOGGER.info(m),
             )
             navigator = make_builtin_navigator(
