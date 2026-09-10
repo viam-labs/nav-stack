@@ -512,3 +512,95 @@ def test_host_slam_bridge_status_reports_odom_twist():
     status = host.slam_bridge_status()
     assert status["odom_velocity"]["vx"] == pytest.approx(0.2)
     assert status["odom_velocity"]["vtheta"] == pytest.approx(0.1)
+
+
+class _WitLike:
+    """heading_sensor stub: absolute AHRS yaw + (possibly empty) gyro."""
+
+    def __init__(self, yaw_deg: float, gz_deg_s: float = 0.0):
+        self.yaw_deg = yaw_deg
+        self.gz_deg_s = gz_deg_s
+        self.orientation_ok = True
+
+    async def get_angular_velocity(self, **_):
+        from viam.proto.common import Vector3
+
+        return Vector3(x=0.0, y=0.0, z=self.gz_deg_s)
+
+    async def get_orientation(self, **_):
+        from viam.proto.common import Orientation
+
+        if not self.orientation_ok:
+            raise NotImplementedError("no orientation")
+        return Orientation(o_x=0.0, o_y=0.0, o_z=1.0, theta=self.yaw_deg)
+
+    async def get_readings(self, **_):
+        if not self.orientation_ok:
+            return {}
+        return {"orientation": {"yaw": math.radians(self.yaw_deg)}}
+
+
+def _sensors_with_heading(wit, **cfg_extra):
+    import asyncio
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "movement_sensor": "odom", "heading_sensor": "wit", **cfg_extra}
+    )
+    return BuiltinSensors(
+        cfg=cfg,
+        cameras={},
+        movement_sensor=None,
+        heading_sensor=wit,
+        shm_lidar=None,
+        loop=asyncio.new_event_loop(),
+        odom_reader=None,
+    )
+
+
+def test_apply_heading_prefers_absolute_ahrs_yaw_over_gyro():
+    import asyncio
+
+    wit = _WitLike(167.69, gz_deg_s=0.0)
+    sensors = _sensors_with_heading(wit)
+    sample = conv.OdomReading(0.0, 0.1, 0.0)
+    out = asyncio.run(sensors._apply_heading(sample))  # noqa: SLF001
+    dbg = sensors.heading_debug()
+    assert dbg["source"] == "orientation_euler"
+    assert dbg["heading_deg"] == pytest.approx(167.69, abs=0.01)
+    assert dbg["ahrs_yaw_deg"] == pytest.approx(167.69, abs=0.01)
+    assert dbg["gyro_z_deg_s"] == 0.0
+    assert out.heading_rad == pytest.approx(math.radians(167.69))
+    # 90 deg physical turn moves the prior 90 deg even with a dead gyro.
+    wit.yaw_deg = -102.31
+    out = asyncio.run(sensors._apply_heading(sample))  # noqa: SLF001
+    assert math.degrees(
+        conv.normalize_angle(out.heading_rad - math.radians(167.69))
+    ) == pytest.approx(90.0, abs=0.01)
+
+
+def test_apply_heading_yaw_offset_not_compounded():
+    import asyncio
+
+    wit = _WitLike(10.0)
+    sensors = _sensors_with_heading(wit, heading_sensor_yaw_deg=30.0)
+    sample = conv.OdomReading(0.0, 0.0, 0.0)
+    for _ in range(5):
+        out = asyncio.run(sensors._apply_heading(sample))  # noqa: SLF001
+    assert math.degrees(out.heading_rad) == pytest.approx(-20.0, abs=1e-6)
+
+
+def test_apply_heading_gyro_fallback_only_without_orientation():
+    import asyncio
+
+    wit = _WitLike(0.0, gz_deg_s=90.0)
+    wit.orientation_ok = False
+    sensors = _sensors_with_heading(wit)
+    sample = conv.OdomReading(0.0, 0.0, 0.0)
+    out = asyncio.run(sensors._apply_heading(sample))  # noqa: SLF001
+    assert sensors.heading_debug()["source"] == "gyro_integrated"
+    assert out.vtheta == pytest.approx(math.radians(90.0))
+    sensors._gyro_heading_t -= 0.2  # noqa: SLF001  pretend 200 ms elapsed
+    out = asyncio.run(sensors._apply_heading(sample))  # noqa: SLF001
+    assert math.degrees(out.heading_rad) == pytest.approx(18.0, abs=0.5)

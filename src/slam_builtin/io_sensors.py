@@ -312,13 +312,16 @@ class BuiltinSensors:
     async def _apply_heading(self, sample: conv.OdomReading) -> conv.OdomReading:
         """Merge dedicated heading_sensor into ``sample``.
 
-        Follows ``viam-modules/wit-motion`` API surfaces:
+        Priority (``viam-modules/wit-motion`` API surfaces):
 
-        * ``GetAngularVelocity`` (deg/s) → yaw *rate* for odom ``vtheta`` and a
-          gyro-integrated heading prior (tracks physical turns).
-        * ``GetOrientation`` / readings euler yaw → diagnostic AHRS only; indoor
-          magnetometer AHRS often under-reports turn magnitude, so it must not
-          drive the SLAM yaw prior.
+        1. Absolute orientation (``GetOrientation`` / readings euler yaw) → the
+           heading prior, ``source`` = ``orientation_euler`` / ``orientation`` /
+           ``readings`` / ``compass``.
+        2. Only when no absolute orientation is readable: integrate
+           ``GetAngularVelocity.z`` (deg/s) → ``source: gyro_integrated`` and
+           use the gyro rate as odom ``vtheta``.
+
+        ``gyro_z_deg_s`` is always reported for diagnostics when readable.
         """
         from ..ros.odom_source import read_typed_heading
 
@@ -338,38 +341,40 @@ class BuiltinSensors:
 
         ahrs_yaw, ahrs_source, heading_dbg = await read_typed_heading(self._heading)
         heading_dbg = dict(heading_dbg)
+        if gz_rad_s is not None:
+            heading_dbg["gyro_z_deg_s"] = round(math.degrees(gz_rad_s), 3)
+
+        # ``raw`` is in the sensor frame; invert / yaw_deg are applied to the
+        # output only, never folded back into the integrator state.
         if ahrs_yaw is not None:
             heading_dbg["ahrs_yaw_deg"] = round(math.degrees(ahrs_yaw), 3)
             heading_dbg["ahrs_source"] = ahrs_source
-
-        if gz_rad_s is not None:
-            heading_dbg["gyro_z_deg_s"] = round(math.degrees(gz_rad_s), 3)
-            if self._gyro_heading_t is None:
-                # Seed once from AHRS if available, else 0.
-                self._gyro_heading_rad = (
-                    float(ahrs_yaw) if ahrs_yaw is not None else 0.0
-                )
+            raw = float(ahrs_yaw)
+            source = ahrs_source
+            # Keep the gyro fallback continuous with the absolute heading.
+            self._gyro_heading_rad = raw
+            self._gyro_heading_t = now
+        elif gz_rad_s is not None:
+            if self._gyro_heading_rad is None or self._gyro_heading_t is None:
+                self._gyro_heading_rad = 0.0
             else:
                 dt = max(0.0, min(now - self._gyro_heading_t, 0.5))
                 self._gyro_heading_rad = conv.normalize_angle(
                     float(self._gyro_heading_rad) + gz_rad_s * dt
                 )
             self._gyro_heading_t = now
-            heading = float(self._gyro_heading_rad)
+            raw = float(self._gyro_heading_rad)
             source = "gyro_integrated"
-            # Authoritative yaw rate from Wit gyro (overrides sparse wheel ω).
+            vtheta = -gz_rad_s if cfg.heading_sensor_invert else gz_rad_s
             sample = conv.OdomReading(
                 sample.vx,
                 sample.vy,
-                gz_rad_s,
+                vtheta,
                 pose=sample.pose,
                 heading_rad=sample.heading_rad,
                 ax=sample.ax,
                 ay=sample.ay,
             )
-        elif ahrs_yaw is not None:
-            heading = float(ahrs_yaw)
-            source = ahrs_source
         else:
             self._heading_debug = {
                 "source": "none",
@@ -378,25 +383,13 @@ class BuiltinSensors:
             }
             return sample
 
+        heading = raw
         if cfg.heading_sensor_invert:
             heading = conv.normalize_angle(-heading)
-            if gz_rad_s is not None:
-                sample = conv.OdomReading(
-                    sample.vx,
-                    sample.vy,
-                    -sample.vtheta,
-                    pose=sample.pose,
-                    heading_rad=sample.heading_rad,
-                    ax=sample.ax,
-                    ay=sample.ay,
-                )
-                self._gyro_heading_rad = heading
         if cfg.heading_sensor_yaw_deg:
             heading = conv.normalize_angle(
                 heading - math.radians(cfg.heading_sensor_yaw_deg)
             )
-            if self._gyro_heading_rad is not None:
-                self._gyro_heading_rad = heading
 
         sample = conv.merge_odom_heading(sample, heading)
         sync = getattr(self._odom_reader, "sync_heading", None)
