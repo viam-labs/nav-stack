@@ -17,10 +17,11 @@ from src.ros import imushm
 
 
 def _frame(typ: int, values_le: bytes) -> bytes:
+    """One wit-motion ``ReadString('U')`` line: type|8data|cs|0x55 (11 bytes)."""
     assert len(values_le) == 8
-    body = bytes([0x55, typ]) + values_le
-    checksum = sum(body) & 0xFF
-    return body + bytes([checksum])
+    wire = bytes([0x55, typ]) + values_le
+    checksum = sum(wire) & 0xFF
+    return bytes([typ]) + values_le + bytes([checksum, 0x55])
 
 
 def _u16_pair(value: float, r: float) -> bytes:
@@ -37,6 +38,27 @@ def _u16_pair(value: float, r: float) -> bytes:
 
 def test_scale_le_u16_zero():
     assert scale_le_u16(0, 0, 180.0) == pytest.approx(0.0)
+
+
+def test_parser_accepts_classic_wire_stream_like_device():
+    """Device wire is 0x55|type|data|cs; Go ReadString consumes sync then 11-byte lines."""
+    parser = WitStreamParser()
+    yaw = struct.pack("<h", 16384)  # +90°
+    payload = b"\x00\x00\x00\x00" + yaw + b"\x00\x00"
+    # Two classic frames back-to-back (second sync terminates the first Go line).
+    wire = b"".join(
+        [
+            bytes([0x55, TYPE_ORIENT]) + payload + bytes([
+                sum(bytes([0x55, TYPE_ORIENT]) + payload) & 0xFF
+            ]),
+            bytes([0x55, TYPE_GYRO]) + (b"\x00" * 8) + bytes([
+                sum(bytes([0x55, TYPE_GYRO]) + b"\x00" * 8) & 0xFF
+            ]),
+        ]
+    )
+    n = parser.feed(wire)
+    assert n >= 1
+    assert parser.sample.yaw == pytest.approx(math.radians(90.0))
 
 
 def test_parser_orient_yaw_90_matches_wit_motion_scale():

@@ -85,7 +85,6 @@ class FakeMovementSensor:
         # No euler block by default — forces GetOrientation path (OV).
         return {}
 
-
 def _read(sensor, cfg=None):
     reader = TypedMovementSensorOdom(sensor, cfg)
     return asyncio.run(reader.read()), reader

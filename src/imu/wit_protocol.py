@@ -1,18 +1,22 @@
 """WitMotion UART frame parsing (BWT61CL / BWT901 / HWT901B / similar).
 
-Ported from ``viam/wit-motion`` ``imuwit.parseWIT``:
-frames start with ``0x55``, then type ``0x51``..``0x54``, then 8 data bytes +
-checksum (we tolerate streams where the next ``0x55`` delimits the previous
-frame, matching the Go ``ReadString('U')`` behaviour).
+Framing and scaling match ``viam-modules/wit-motion`` ``imuwit``:
+
+* Sync on ``0x55`` (``'U'``) the same way Go ``bufio.ReadString('U')`` does:
+  each accepted line is ``type | 8 payload bytes | checksum | 0x55`` (11 bytes),
+  with ``line[0]`` = packet type (no leading sync in the parse buffer).
+* ``scale(lo, hi, r)`` is the same unsigned remap into ``[-r, r)``.
+* Angle packets (``0x53``) convert degrees → radians; gyro (``0x52``) stays deg/s
+  for the Viam ``GetAngularVelocity`` API (same as the Go module).
 """
 from __future__ import annotations
 
 import math
 import struct
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Optional
 
-SYNC = 0x55
+SYNC = 0x55  # 'U' — same delimiter as wit-motion ReadString('U')
 TYPE_ACCEL = 0x51
 TYPE_GYRO = 0x52
 TYPE_ORIENT = 0x53
@@ -27,9 +31,9 @@ class WitError(RuntimeError):
 
 
 def scale_le_u16(lo: int, hi: int, r: float) -> float:
-    """Map little-endian uint16 into ``[-r, r)`` (WitMotion datasheet scale)."""
-    x = float((hi << 8) | lo) / 32768.0
-    x *= r
+    """Map little-endian uint16 into ``[-r, r)`` — identical to wit-motion ``scale``."""
+    x = float((int(hi) << 8) | int(lo)) / 32768.0  # 0 -> 2
+    x *= r  # 0 -> 2r
     x += r
     x = math.fmod(x, r * 2.0)
     x -= r
@@ -37,7 +41,8 @@ def scale_le_u16(lo: int, hi: int, r: float) -> float:
 
 
 def mag_le_i16(lo: int, hi: int) -> float:
-    raw = struct.unpack("<h", bytes((lo, hi)))[0]
+    """Signed magnetometer count — wit-motion ``convertMagByteToTesla``."""
+    raw = struct.unpack("<h", bytes((lo & 0xFF, hi & 0xFF)))[0]
     return float(raw)
 
 
@@ -46,10 +51,10 @@ class WitSample:
     ax: float = 0.0  # m/s^2
     ay: float = 0.0
     az: float = 0.0
-    gx: float = 0.0  # deg/s
+    gx: float = 0.0  # deg/s (Viam / wit-motion AngularVelocity)
     gy: float = 0.0
     gz: float = 0.0
-    roll: float = 0.0  # rad
+    roll: float = 0.0  # rad (wit-motion EulerAngles)
     pitch: float = 0.0
     yaw: float = 0.0
     mx: float = 0.0  # µT
@@ -57,67 +62,70 @@ class WitSample:
     mz: float = 0.0
     has_mag: bool = False
     packets: int = 0
+    bad_readings: int = 0
 
 
 @dataclass
 class WitStreamParser:
-    """Incremental byte stream → ``WitSample`` updates."""
+    """Incremental byte stream → ``WitSample`` (wit-motion ReadString framing)."""
 
     sample: WitSample = field(default_factory=WitSample)
     _buf: bytearray = field(default_factory=bytearray)
 
     def feed(self, data: bytes) -> int:
-        """Ingest bytes; return number of packets parsed."""
+        """Ingest bytes; return number of 11-byte frames accepted this call."""
         if not data:
             return 0
         self._buf.extend(data)
         parsed = 0
-        # Frame: 0x55 | type | 8 payload bytes | checksum  (11 bytes total)
+        # Mirror Go: line, err := portReader.ReadString('U') with len(line)==11.
+        # Stream: ... [type][8 data][cs][U] [type][8 data][cs][U] ...
+        # after an initial sync U is consumed as a short (len≠11) discard.
         while True:
             try:
-                start = self._buf.index(SYNC)
+                end = self._buf.index(SYNC)
             except ValueError:
-                self._buf.clear()
+                # Keep a little tail so a split frame can complete next feed.
+                if len(self._buf) > 64:
+                    del self._buf[:-64]
                 break
-            if start > 0:
-                del self._buf[:start]
-            if len(self._buf) < 11:
-                break
-            frame = bytes(self._buf[:11])
-            if frame[0] != SYNC:
-                del self._buf[0]
+            line = bytes(self._buf[: end + 1])
+            del self._buf[: end + 1]
+            if len(line) != 11:
+                self.sample.bad_readings += 1
                 continue
-            # Soft checksum: sum of first 10 bytes & 0xFF == byte 10 (many clones
-            # are flaky; still accept known types even if checksum mismatches).
-            typ = frame[1]
-            if typ not in (TYPE_ACCEL, TYPE_GYRO, TYPE_ORIENT, TYPE_MAG):
-                del self._buf[0]
-                continue
-            self._apply(typ, frame[2:10])
-            del self._buf[:11]
-            parsed += 1
-            self.sample.packets += 1
+            if self._parse_go_line(line):
+                parsed += 1
+                self.sample.packets += 1
+            else:
+                self.sample.bad_readings += 1
         return parsed
 
-    def _apply(self, typ: int, payload: bytes) -> None:
+    def _parse_go_line(self, line: bytes) -> bool:
+        """Parse one wit-motion ``parseWIT`` line (``line[0]`` = type)."""
+        typ = line[0]
+        if typ not in (TYPE_ACCEL, TYPE_GYRO, TYPE_ORIENT, TYPE_MAG):
+            return False
+        # line[1:9] payload, line[9] checksum, line[10] == SYNC
         s = self.sample
-        if typ == TYPE_ACCEL:
-            s.ax = scale_le_u16(payload[0], payload[1], 16.0) * G
-            s.ay = scale_le_u16(payload[2], payload[3], 16.0) * G
-            s.az = scale_le_u16(payload[4], payload[5], 16.0) * G
-        elif typ == TYPE_GYRO:
-            s.gx = scale_le_u16(payload[0], payload[1], 2000.0)
-            s.gy = scale_le_u16(payload[2], payload[3], 2000.0)
-            s.gz = scale_le_u16(payload[4], payload[5], 2000.0)
+        if typ == TYPE_GYRO:
+            s.gx = scale_le_u16(line[1], line[2], 2000.0)
+            s.gy = scale_le_u16(line[3], line[4], 2000.0)
+            s.gz = scale_le_u16(line[5], line[6], 2000.0)
         elif typ == TYPE_ORIENT:
-            s.roll = math.radians(scale_le_u16(payload[0], payload[1], 180.0))
-            s.pitch = math.radians(scale_le_u16(payload[2], payload[3], 180.0))
-            s.yaw = math.radians(scale_le_u16(payload[4], payload[5], 180.0))
+            s.roll = math.radians(scale_le_u16(line[1], line[2], 180.0))
+            s.pitch = math.radians(scale_le_u16(line[3], line[4], 180.0))
+            s.yaw = math.radians(scale_le_u16(line[5], line[6], 180.0))
+        elif typ == TYPE_ACCEL:
+            s.ax = scale_le_u16(line[1], line[2], 16.0) * G
+            s.ay = scale_le_u16(line[3], line[4], 16.0) * G
+            s.az = scale_le_u16(line[5], line[6], 16.0) * G
         elif typ == TYPE_MAG:
             s.has_mag = True
-            s.mx = mag_le_i16(payload[0], payload[1])
-            s.my = mag_le_i16(payload[2], payload[3])
-            s.mz = mag_le_i16(payload[4], payload[5])
+            s.mx = mag_le_i16(line[1], line[2])
+            s.my = mag_le_i16(line[3], line[4])
+            s.mz = mag_le_i16(line[5], line[6])
+        return True
 
 
 def probe_is_wit(ser, *, listen_s: float = 0.6, min_packets: int = 3) -> bool:

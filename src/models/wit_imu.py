@@ -331,6 +331,15 @@ class WitImu(MovementSensor):
                     "roll": self._roll,
                     "pitch": self._pitch,
                     "yaw": self._yaw,
+                    # Explicit aliases for probes / wit-motion comparison.
+                    "yaw_deg": math.degrees(self._yaw),
+                    "roll_deg": math.degrees(self._roll),
+                    "pitch_deg": math.degrees(self._pitch),
+                },
+                "angular_velocity_deg_s": {
+                    "x": self._gx,
+                    "y": self._gy,
+                    "z": self._gz,
                 },
                 "serial_path": self._serial_path,
                 "shm_name": self._shm_name,
