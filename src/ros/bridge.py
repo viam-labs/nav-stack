@@ -69,6 +69,7 @@ from ..config import (
     sensor_twist_to_ros_body,
 )
 from . import conversions as conv
+from .io_provider import IOProvider
 
 
 def measured_hz(
@@ -109,20 +110,6 @@ _COMPUTE_PATH_ACTION_CLIENT_NAME = "compute_path_to_pose"
 def _quat_msg(yaw: float) -> Quaternion:
     x, y, z, w = conv.yaw_to_quaternion(yaw)
     return Quaternion(x=x, y=y, z=z, w=w)
-
-
-class IOProvider:
-    """Adapter the bridge uses to talk to Viam components.
-
-    The navigation/SLAM models supply concrete async callables; the bridge stays
-    free of any Viam SDK imports.
-    """
-
-    def __init__(self, read_lidar_points, read_odometry, drive_base, stop_base):
-        self.read_lidar_points = read_lidar_points  # async (name) -> (N,3) np.ndarray
-        self.read_odometry = read_odometry  # async () -> conv.OdomReading
-        self.drive_base = drive_base  # async (vx, vy, vtheta) -> None
-        self.stop_base = stop_base  # async () -> None
 
 
 class BridgeNode(Node):

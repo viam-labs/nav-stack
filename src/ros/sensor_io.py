@@ -1,8 +1,8 @@
-"""Shared builder for the bridge's :class:`~.bridge.IOProvider`.
+"""Shared builder for :class:`~.io_provider.IOProvider`.
 
-Both navigation-capable models feed the ROS bridge the same four Viam-backed
-callables — lidar point reads, odometry reads, drive, and stop. The only
-difference is *how odometry is read*:
+Both navigation-capable models (and ROS-free ``global_localize``) feed the same
+four Viam-backed callables — lidar point reads, odometry reads, drive, and stop.
+The only difference is *how odometry is read*:
 
 * built-in SLAM and external-SLAM both prefer the portable typed
   MovementSensor API (:class:`~.odom_source.TypedMovementSensorOdom`) when an
@@ -12,6 +12,8 @@ So this builder takes an optional ``odom_reader``: when provided it supplies the
 raw sample; otherwise the ``get_readings`` parser is used. Either way the same
 mount-yaw / upside-down / heading-sensor corrections are applied, so odometry
 behaves identically regardless of the read path.
+
+Importing this module must not require ``rclpy`` (builtin SLAM path).
 """
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ from ..config import (
     ros_twist_to_viam_set_velocity,
 )
 from . import conversions as conv
-from .bridge import IOProvider
+from .io_provider import IOProvider
 from . import pcshm
 from .shm_lidar import ShmPointCloudClient
 
