@@ -218,15 +218,16 @@ def compute_follow_command(
         yaw_err = heading_error_rad(current.theta, final_yaw)
         if dist <= xy_tol and abs(yaw_err) <= motion.yaw_tolerance_rad:
             return DriveCommand(0.0, 0.0, 0.0, True)
-        # Expanded ball (2× tol): latch near-goal behavior so XY jitter cannot
-        # flip between final-yaw and bearing-RIP.
-        if dist <= xy_tol * 2.0:
-            return _near_goal_command(
-                yaw_err=yaw_err,
-                bearing=bearing,
-                dist=dist,
-                motion=motion,
-            )
+        # Always use the near-goal law once we are pursuing the goal pose
+        # (final_yaw set). Gating on 2× xy_tol left a dead band (~0.5–0.8 m)
+        # where is_final still targets the goal but rotate_in_place commanded
+        # ±max_vel_theta — classic near-goal butt-wiggle with vx=0.
+        return _near_goal_command(
+            yaw_err=yaw_err,
+            bearing=bearing,
+            dist=dist,
+            motion=motion,
+        )
 
     # Intermediate pursuit target reached — not navigation complete.
     if final_yaw is None and dist <= xy_tol * 0.5:
@@ -245,12 +246,7 @@ def compute_follow_command(
         )
 
     linear_cmd = _clamp(dist * 0.75, max_linear)
-    if final_yaw is not None:
-        # Final approach to goal XY — ease in (tighter than mid-path cruise).
-        if cfg.approach_dist_m > 0 and dist < cfg.approach_dist_m:
-            cap = max(0.08, max_linear * 0.22)
-            linear_cmd = min(linear_cmd, cap)
-    elif abs(bearing) < math.radians(25.0):
+    if abs(bearing) < math.radians(25.0):
         # On-path cruise: don't crawl when bearing is good.
         linear_cmd = max(max_linear * 0.55, min(max_linear, linear_cmd))
     # Scale linear with bearing so we don't plow sideways (less aggressive).
@@ -278,9 +274,14 @@ def compute_path_command(
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``."""
     est_speed = cfg.motion.max_linear_mps * 0.5 if speed_mps is None else speed_mps
-    near_goal = distance_m(
-        current, Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
-    ) <= (cfg.motion.xy_tolerance_m * 2.0)
+    goal_xy = Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
+    dist_goal = distance_m(current, goal_xy)
+    # Keep local planner off and use final-yaw pursuit for the whole approach.
+    near_goal = dist_goal <= max(
+        cfg.motion.xy_tolerance_m * 2.0,
+        cfg.approach_dist_m * 2.0,
+        0.8,
+    )
     lookahead = _effective_lookahead(
         cfg, speed_mps=est_speed, near_goal=near_goal
     )

@@ -473,6 +473,23 @@ def test_follow_command_yaw_settled_closes_xy_without_wiggle():
         assert abs(cmd.vx) >= 0.05
 
 
+def test_follow_command_just_outside_2x_tol_no_full_spin():
+    """Repro: ~0.53 m out, yaw nearly settled — must not ±max_vel_theta wiggle."""
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(-1.131, 1.022, -1.038)
+    goal = Pose2D(-1.652, 0.918, -0.738)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    # Old bug: rotate_in_place at ±1.0 with vx=0 just outside the 2×tol ball.
+    assert abs(cmd.vtheta) <= 0.40 + 1e-6
+    assert abs(cmd.vx) >= 0.05  # reverse or forward crawl toward goal XY
+
 def test_follow_command_large_yaw_spins_before_crawl():
     """Status repro: ~140° final yaw at 0.3 m must not translate while spinning."""
     from src.nav_builtin.controller import compute_follow_command
