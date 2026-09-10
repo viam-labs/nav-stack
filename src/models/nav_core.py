@@ -50,7 +50,7 @@ from viam.proto.service.motion import (
 from viam.services.motion import Motion
 from viam.utils import ValueTypes
 
-from ..config import OMNI, Nav2Config, NavConfig, ros_cmd_vel_to_viam_linear_mm_s
+from ..config import OMNI, Nav2Config, NavConfig, ros_twist_to_viam_set_velocity
 from ..nav import zones as zones_mod
 from ..nav.locations import LocationStore
 from ..nav.maps import MapHandle
@@ -1235,8 +1235,8 @@ class NavServiceBase(Motion):
             vtheta = math.radians(float(command["angular_z_deg_s"]))
         duration_s = max(0.1, min(float(command.get("duration_s", 1.5)), 5.0))
 
-        lx, ly = ros_cmd_vel_to_viam_linear_mm_s(
-            vx, vy, runtime.slam_cfg.base_velocity_convention
+        lx, ly, ang_deg_s = ros_twist_to_viam_set_velocity(
+            vx, vy, vtheta, runtime.slam_cfg.base_velocity_convention
         )
         if io is not None:
             await io.drive_base(vx, vy, vtheta)
@@ -1249,7 +1249,7 @@ class NavServiceBase(Motion):
                 raise RuntimeError("base unavailable")
             await base.set_velocity(
                 linear=Vector3(x=lx, y=ly, z=0.0),
-                angular=Vector3(x=0.0, y=0.0, z=math.degrees(vtheta)),
+                angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
             )
             await asyncio.sleep(duration_s)
             await base.set_velocity(
@@ -1264,7 +1264,7 @@ class NavServiceBase(Motion):
                 "ros_vtheta_rad_s": vtheta,
                 "viam_linear_x_mm_s": lx,
                 "viam_linear_y_mm_s": ly,
-                "viam_angular_z_deg_s": math.degrees(vtheta),
+                "viam_angular_z_deg_s": ang_deg_s,
             },
             "duration_s": duration_s,
         }
@@ -1338,10 +1338,10 @@ class NavServiceBase(Motion):
             node = getattr(runtime.manager, "node", None)
             if node is not None:
                 node.record_cmd_vel(vx, vy, vtheta, source="simple")
-            lx, ly = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, convention)
+            lx, ly, ang_deg_s = ros_twist_to_viam_set_velocity(vx, vy, vtheta, convention)
             await base.set_velocity(
                 linear=Vector3(x=lx, y=ly, z=0),
-                angular=Vector3(x=0, y=0, z=math.degrees(vtheta)),
+                angular=Vector3(x=0, y=0, z=ang_deg_s),
             )
 
         def _on_progress(progress: dict) -> None:

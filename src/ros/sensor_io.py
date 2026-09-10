@@ -24,7 +24,7 @@ from viam.utils import struct_to_dict
 from ..config import (
     LIDAR_SCAN_GET_LASER_SCAN,
     LIDAR_SCAN_POINT_CLOUD,
-    ros_cmd_vel_to_viam_linear_mm_s,
+    ros_twist_to_viam_set_velocity,
 )
 from . import conversions as conv
 from .bridge import IOProvider
@@ -239,12 +239,12 @@ def build_io_provider(
         # pre-snap Nav2 command — see BridgeNode._on_drive_timer).
         if record_cmd_vel is not None and record_source is not None:
             record_cmd_vel(vx, vy, vtheta, source=record_source)
-        lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(
-            vx, vy, cfg.base_velocity_convention
+        lx_mm, ly_mm, ang_deg_s = ros_twist_to_viam_set_velocity(
+            vx, vy, vtheta, cfg.base_velocity_convention
         )
         await base.set_velocity(
             linear=Vector3(x=lx_mm, y=ly_mm, z=0.0),
-            angular=Vector3(x=0.0, y=0.0, z=math.degrees(vtheta)),
+            angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
         )
 
     async def stop_base():

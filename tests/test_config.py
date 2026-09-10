@@ -8,6 +8,8 @@ from src.config import (
     NavConfig,
     SlamConfig,
     ros_cmd_vel_to_viam_linear_mm_s,
+    ros_twist_to_viam_set_velocity,
+    ros_vtheta_to_viam_angular_deg_s,
     sensor_twist_to_ros_body,
 )
 
@@ -797,6 +799,16 @@ def test_base_velocity_convention_mir_alias_normalizes_to_viam():
     assert lx == pytest.approx(-100.0)
     assert ly == pytest.approx(500.0)
 
+
+
+def test_ros_vtheta_to_viam_angular_is_degrees():
+    import math
+    # -1 rad/s must become ~-57.3 deg/s at Base.SetVelocity (Viam API).
+    assert ros_vtheta_to_viam_angular_deg_s(-1.0) == pytest.approx(-math.degrees(1.0))
+    lx, ly, az = ros_twist_to_viam_set_velocity(0.5, 0.0, -1.0, "viam")
+    assert lx == pytest.approx(0.0)  # Y-forward: ROS vx -> linear.y
+    assert ly == pytest.approx(500.0)
+    assert az == pytest.approx(-math.degrees(1.0))
 
 def test_sensor_twist_to_ros_body_viam_y_forward():
     # Sensor: forward on y=0.019, no lateral → ROS forward on vx.

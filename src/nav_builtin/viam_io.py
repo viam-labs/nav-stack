@@ -16,7 +16,7 @@ from ..config import (
     LIDAR_SCAN_GET_LASER_SCAN,
     LIDAR_SCAN_POINT_CLOUD,
     LidarConfig,
-    ros_cmd_vel_to_viam_linear_mm_s,
+    ros_twist_to_viam_set_velocity,
 )
 from ..ros import conversions as conv
 from ..ros.external_slam import parse_get_grid, slam_pose_to_pose2d
@@ -111,6 +111,11 @@ class ViamWorldIO:
         self._scan_cache: Optional[conv.LaserScan2D] = None
         self._scan_cache_at = 0.0
         self._scan_cache_pose: Optional[conv.Pose2D] = None
+        self._last_drive: Optional[dict] = None
+
+    def last_drive(self) -> Optional[dict]:
+        """Most recent SetVelocity mapping (ROS rad/s → Viam mm/s + deg/s)."""
+        return dict(self._last_drive) if self._last_drive else None
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -360,12 +365,22 @@ class ViamWorldIO:
 
     def set_velocity(self, vx: float, vy: float, vtheta: float) -> None:
         vx, vy, vtheta = _sanitize_base_cmd(vx, vy, vtheta)
-        lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, self._convention)
+        lx_mm, ly_mm, ang_deg_s = ros_twist_to_viam_set_velocity(
+            vx, vy, vtheta, self._convention
+        )
+        self._last_drive = {
+            "ros_vx_mps": vx,
+            "ros_vy_mps": vy,
+            "ros_vtheta_rad_s": vtheta,
+            "viam_linear_x_mm_s": lx_mm,
+            "viam_linear_y_mm_s": ly_mm,
+            "viam_angular_z_deg_s": ang_deg_s,
+        }
         try:
             self._run(
                 self._base.set_velocity(
                     linear=Vector3(x=lx_mm, y=ly_mm, z=0.0),
-                    angular=Vector3(x=0.0, y=0.0, z=math.degrees(vtheta)),
+                    angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
                 ),
                 timeout=self._drive_timeout_s,
             )
@@ -378,7 +393,7 @@ class ViamWorldIO:
                 self._run(
                     self._base.set_velocity(
                         linear=Vector3(x=0.0, y=0.0, z=0.0),
-                        angular=Vector3(x=0.0, y=0.0, z=math.degrees(vtheta)),
+                        angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
                     ),
                     timeout=self._drive_timeout_s,
                 )

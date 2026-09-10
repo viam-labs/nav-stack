@@ -64,6 +64,8 @@ from ..config import (
     NavConfig,
     SlamConfig,
     ros_cmd_vel_to_viam_linear_mm_s,
+    ros_vtheta_to_viam_angular_deg_s,
+    ros_twist_to_viam_set_velocity,
     sensor_twist_to_ros_body,
 )
 from . import conversions as conv
@@ -1631,7 +1633,9 @@ class BridgeNode(Node):
     ) -> None:
         """Remember the last ROS body-frame cmd and its Viam SetVelocity mapping."""
         convention = getattr(self._slam_cfg, "base_velocity_convention", "viam")
-        lx_mm, ly_mm = ros_cmd_vel_to_viam_linear_mm_s(vx, vy, convention)
+        lx_mm, ly_mm, ang_deg_s = ros_twist_to_viam_set_velocity(
+            vx, vy, vtheta, convention
+        )
         now = time.monotonic()
         self._last_cmd_vel_wall = now
         entry = {
@@ -1642,7 +1646,7 @@ class BridgeNode(Node):
             "ros_vtheta_rad_s": round(float(vtheta), 4),
             "viam_linear_x_mm_s": round(float(lx_mm), 1),
             "viam_linear_y_mm_s": round(float(ly_mm), 1),
-            "viam_angular_z_deg_s": round(math.degrees(float(vtheta)), 2),
+            "viam_angular_z_deg_s": round(float(ang_deg_s), 2),
             "convention": convention,
             "age_s": 0.0,
         }

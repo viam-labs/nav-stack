@@ -75,6 +75,30 @@ def ros_cmd_vel_to_viam_linear_mm_s(
     return vx_mps * 1000.0, vy_mps * 1000.0
 
 
+def ros_vtheta_to_viam_angular_deg_s(vtheta_rad_s: float) -> float:
+    """Convert ROS/nav angular rate (rad/s) to Viam ``Base.SetVelocity`` deg/s.
+
+    Viam's protobuf / Python SDK document ``angular.z`` as degrees per second.
+    Controllers, Nav2 ``cmd_vel``, and builtin nav keep rad/s internally
+    (``max_vel_theta``, ``min_cmd_vel_theta``, ``cmd_vtheta_rad_s``); convert
+    only at the SetVelocity call site — never change those config/status units.
+    """
+    import math
+
+    return math.degrees(float(vtheta_rad_s))
+
+
+def ros_twist_to_viam_set_velocity(
+    vx_mps: float,
+    vy_mps: float,
+    vtheta_rad_s: float,
+    convention: str = BASE_VELOCITY_VIAM,
+) -> tuple[float, float, float]:
+    """ROS body twist → Viam SetVelocity ``(linear.x_mm_s, linear.y_mm_s, angular.z_deg_s)``."""
+    lx, ly = ros_cmd_vel_to_viam_linear_mm_s(vx_mps, vy_mps, convention)
+    return lx, ly, ros_vtheta_to_viam_angular_deg_s(vtheta_rad_s)
+
+
 def sensor_twist_to_ros_body(
     vx: float,
     vy: float,

@@ -137,6 +137,11 @@ class BuiltinNavHost:
     def nav_status(self) -> Dict:
         status = self._builtin_nav.nav_status()
         status["nav_backend"] = NAV_BACKEND_BUILTIN
+        last = getattr(self._world, "last_drive", None)
+        if callable(last):
+            drive = last()
+            if drive is not None:
+                status["last_drive"] = drive
         return status
 
     def nav2_diagnostics(self, fast: bool = False) -> Dict:

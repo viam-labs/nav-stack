@@ -83,12 +83,16 @@ async def test_viam_world_io_map_pose_drive():
     assert p2.y == pytest.approx(-0.5)
     assert p2.theta == pytest.approx(math.pi / 2)
 
-    await asyncio.to_thread(world.set_velocity, 0.2, 0.0, 0.1)
+    await asyncio.to_thread(world.set_velocity, 0.2, 0.0, -1.0)
     base.set_velocity.assert_awaited()
     args = base.set_velocity.await_args
-    # viam convention: ROS vx -> Viam linear.y
+    # viam convention: ROS vx -> Viam linear.y; angular is deg/s not rad/s
     assert args.kwargs["linear"].y == pytest.approx(200.0)
-    assert args.kwargs["angular"].z == pytest.approx(math.degrees(0.1))
+    assert args.kwargs["angular"].z == pytest.approx(-math.degrees(1.0))
+    drive = world.last_drive()
+    assert drive is not None
+    assert drive["ros_vtheta_rad_s"] == pytest.approx(-1.0)
+    assert drive["viam_angular_z_deg_s"] == pytest.approx(-math.degrees(1.0))
 
 
 def test_nav_viz_store_snapshot_shape():
