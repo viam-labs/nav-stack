@@ -205,26 +205,28 @@ def test_viam_world_io_prefers_shm_scan():
 
 
 @pytest.mark.asyncio
-async def test_viam_world_io_prefers_in_process_pose_provider():
+async def test_viam_world_io_prefers_slam_get_position_pose2d_sync():
     loop = asyncio.get_event_loop()
     live = {"pose": conv.Pose2D(-0.130, 0.607, math.radians(84.7))}
 
-    async def _boom_get_position():
-        raise AssertionError("GetPosition must not be used when pose_provider works")
+    class _Slam:
+        def get_position_pose2d(self):
+            return live["pose"]
 
-    slam = MagicMock()
-    slam.get_position = AsyncMock(side_effect=_boom_get_position)
-    slam.do_command = AsyncMock(return_value={})
-    base = MagicMock()
-    base.set_velocity = AsyncMock()
+        async def get_position(self):
+            raise AssertionError("async GetPosition must not run when sync pose works")
+
+        async def do_command(self, *_a, **_k):
+            return {}
 
     world = ViamWorldIO(
-        slam=slam,
-        base=base,
+        slam=_Slam(),
+        base=MagicMock(),
         loop=loop,
         cameras={},
         lidars=[],
-        pose_provider=lambda: live["pose"],
+        # Stale provider must not win over slam GetPosition sync.
+        pose_provider=lambda: conv.Pose2D(0.0, 0.0, 0.0),
         map_provider=lambda: {
             "grid": np.zeros((2, 2), dtype=np.int16),
             "resolution": 0.05,
@@ -237,8 +239,7 @@ async def test_viam_world_io_prefers_in_process_pose_provider():
     assert p2.x == pytest.approx(-0.130)
     assert p2.y == pytest.approx(0.607)
     assert p2.theta == pytest.approx(math.radians(84.7))
-    assert world.pose_source() == "in_process"
-    # Simulate robot motion — status pose must track the provider.
+    assert world.pose_source() == "get_position_sync"
     live["pose"] = conv.Pose2D(1.0, 2.0, 0.5)
     p3 = await asyncio.to_thread(world.get_pose)
     assert p3.x == pytest.approx(1.0)
@@ -246,10 +247,9 @@ async def test_viam_world_io_prefers_in_process_pose_provider():
 
 
 @pytest.mark.asyncio
-async def test_viam_world_io_overrides_stale_origin_in_process_pose():
-    """Stale provider at origin + live GetPosition → trust GetPosition."""
+async def test_viam_world_io_uses_async_get_position_when_no_sync_helper():
     loop = asyncio.get_event_loop()
-    slam = MagicMock()
+    slam = MagicMock(spec=["get_position", "do_command"])
     slam.get_position = AsyncMock(
         return_value=SimpleNamespace(
             x=-130.0, y=607.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=84.7
@@ -262,56 +262,35 @@ async def test_viam_world_io_overrides_stale_origin_in_process_pose():
         loop=loop,
         cameras={},
         lidars=[],
+        # Stale in-process must not mask GetPosition.
         pose_provider=lambda: conv.Pose2D(0.0, 0.0, 0.0),
     )
     p2 = await asyncio.to_thread(world.get_pose)
     assert p2 is not None
     assert p2.x == pytest.approx(-0.130)
     assert p2.y == pytest.approx(0.607)
-    assert world.pose_source() == "get_position_override"
+    assert world.pose_source() == "get_position"
     slam.get_position.assert_awaited()
 
 
 @pytest.mark.asyncio
-async def test_viam_world_io_keeps_origin_when_get_position_also_origin():
+async def test_viam_world_io_pose_provider_is_last_resort():
     loop = asyncio.get_event_loop()
-    slam = MagicMock()
-    slam.get_position = AsyncMock(
-        return_value=SimpleNamespace(
-            x=0.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0
-        )
-    )
+
+    async def _boom():
+        raise TimeoutError("GetPosition unavailable")
+
+    slam = MagicMock(spec=["get_position", "do_command"])
+    slam.get_position = AsyncMock(side_effect=_boom)
     world = ViamWorldIO(
         slam=slam,
         base=MagicMock(),
         loop=loop,
         cameras={},
         lidars=[],
-        pose_provider=lambda: conv.Pose2D(0.0, 0.0, 0.0),
+        pose_provider=lambda: conv.Pose2D(0.5, -0.25, 0.1),
     )
     p2 = await asyncio.to_thread(world.get_pose)
     assert p2 is not None
-    assert p2.x == pytest.approx(0.0)
-    assert p2.y == pytest.approx(0.0)
+    assert p2.x == pytest.approx(0.5)
     assert world.pose_source() == "in_process"
-
-
-def test_in_process_pose_provider_resolves_live_slam_manager(monkeypatch):
-    from src.models import navigation as nav_mod
-
-    stale = MagicMock()
-    stale.get_pose_in_map.return_value = conv.Pose2D(0.0, 0.0, 0.0)
-    live = MagicMock()
-    live.get_pose_in_map.return_value = conv.Pose2D(1.25, -0.5, 0.3)
-    slot = {"manager": stale}
-
-    class _Rt:
-        @property
-        def manager(self):
-            return slot["manager"]
-
-    monkeypatch.setattr(nav_mod, "get_slam", lambda _name: _Rt())
-    provider = nav_mod._in_process_pose_provider("slam")
-    assert provider() == conv.Pose2D(0.0, 0.0, 0.0)
-    slot["manager"] = live
-    assert provider() == conv.Pose2D(1.25, -0.5, 0.3)

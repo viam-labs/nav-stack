@@ -1534,20 +1534,32 @@ class RosSlam(SLAM):
         return self._cfg is not None and self._cfg.active_map == name
 
     # -- SLAM API ------------------------------------------------------------
-    async def get_position(self, *, timeout: Optional[float] = None, **kwargs) -> Pose:
+    def get_position_pose2d(self) -> Optional[conv.Pose2D]:
+        """Sync map-frame pose in meters / radians (same source as ``GetPosition``).
+
+        Builtin nav calls this from its control-loop thread so pose feedback does
+        not hop through the module event loop via the async SLAM API. Returns
+        ``None`` when the pose is unknown (unlike ``GetPosition``, which must
+        return an origin placeholder for the Viam API).
+        """
         mgr = self._manager
-        pose2d = None
-        if mgr is not None:
-            getter = getattr(mgr, "get_pose_in_map", None)
-            if callable(getter):
-                pose2d = getter()
-            if pose2d is None:
-                node = getattr(mgr, "node", None)
-                if node is not None and hasattr(node, "get_pose_in_map"):
-                    pose2d = node.get_pose_in_map()
+        if mgr is None:
+            return None
+        getter = getattr(mgr, "get_pose_in_map", None)
+        if callable(getter):
+            pose2d = getter()
+            if pose2d is not None:
+                return pose2d
+        node = getattr(mgr, "node", None)
+        if node is not None and hasattr(node, "get_pose_in_map"):
+            return node.get_pose_in_map()
+        return None
+
+    async def get_position(self, *, timeout: Optional[float] = None, **kwargs) -> Pose:
+        pose2d = self.get_position_pose2d()
         if pose2d is None:
             # Viam SLAM API requires a Pose; origin means "unknown" to some
-            # clients. Builtin nav bypasses this via in-process pose_provider.
+            # clients. Builtin nav uses ``get_position_pose2d`` (None) instead.
             return Pose(x=0.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
         offset = float(
             getattr(self._cfg, "map_pose_yaw_offset_deg", 0.0) if self._cfg else 0.0

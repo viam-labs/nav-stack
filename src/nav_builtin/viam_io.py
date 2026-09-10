@@ -193,51 +193,48 @@ class ViamWorldIO:
         return parsed
 
     def get_pose(self) -> Optional[conv.Pose2D]:
-        """Map-frame pose in meters / radians.
+        """Map-frame pose in meters / radians from the configured SLAM service.
 
-        Prefers an in-process ``pose_provider`` (builtin SLAM engine / bridge
-        node) so the nav control loop does not re-enter the module event loop
-        via ``GetPosition`` on every tick. Falls back to SLAM ``GetPosition``
-        (mm + deg OV → m + rad). If the in-process pose is stuck at the origin
-        while ``GetPosition`` reports motion, trust GetPosition — that pattern
-        means the provider closed over a stale SLAM host after reconfigure.
+        Order (same map frame the planner uses):
+
+        1. Sync ``slam.get_position_pose2d()`` when the dependency is our
+           in-module SLAM — same source as ``GetPosition``, no event-loop hop.
+        2. Async ``GetPosition`` (mm + deg OV → m + rad) every control tick.
+        3. Optional ``pose_provider`` hook (tests / non-SLAM hosts only).
         """
-        in_proc: Optional[conv.Pose2D] = None
-        if self._pose_provider is not None:
+        # Only call sync helpers declared on the SLAM class (local RosSlam).
+        # Instance MagicMock / gRPC stubs must not invent get_position_pose2d.
+        if callable(getattr(type(self._slam), "get_position_pose2d", None)):
             try:
-                in_proc = self._pose_provider()
+                p2 = self._slam.get_position_pose2d()
             except Exception as exc:  # noqa: BLE001
-                self._log(f"pose_provider failed: {exc}")
-                in_proc = None
-
-        in_at_origin = in_proc is not None and (
-            math.hypot(in_proc.x, in_proc.y) < 0.02
-            and abs(in_proc.theta) < math.radians(2.0)
-        )
-        need_api = in_proc is None or in_at_origin
-        via_api = self._pose_from_get_position() if need_api else None
-
-        if in_at_origin and via_api is not None:
-            api_moved = math.hypot(via_api.x, via_api.y) > 0.05 or abs(
-                via_api.theta
-            ) > math.radians(5.0)
-            if api_moved:
-                self._pose_source = "get_position_override"
+                self._log(f"get_position_pose2d failed: {exc}")
+                p2 = None
+            if p2 is not None:
+                self._pose_source = "get_position_sync"
                 if self._viz is not None:
-                    self._viz.set_pose(via_api)
-                return via_api
+                    self._viz.set_pose(p2)
+                return p2
 
-        if in_proc is not None:
-            self._pose_source = "in_process"
-            if self._viz is not None:
-                self._viz.set_pose(in_proc)
-            return in_proc
-
+        via_api = self._pose_from_get_position()
         if via_api is not None:
             self._pose_source = "get_position"
             if self._viz is not None:
                 self._viz.set_pose(via_api)
             return via_api
+
+        if self._pose_provider is not None:
+            try:
+                p2 = self._pose_provider()
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"pose_provider failed: {exc}")
+                p2 = None
+            if p2 is not None:
+                self._pose_source = "in_process"
+                if self._viz is not None:
+                    self._viz.set_pose(p2)
+                return p2
+
         self._pose_source = "none"
         return None
 
