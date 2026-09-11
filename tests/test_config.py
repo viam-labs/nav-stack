@@ -353,6 +353,41 @@ def test_slam_config_requires_lidar():
         SlamConfig.from_dict({"base": "b"})
 
 
+def test_slam_config_obstacles_only_lidar():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidars": [
+                {"name": "rplidar"},
+                {
+                    "name": "depth",
+                    "scan_source": "point_cloud",
+                    "obstacles_only": True,
+                    "max_range": 4.0,
+                },
+            ],
+        }
+    )
+    assert cfg.lidars[0].obstacles_only is False
+    assert cfg.lidars[1].obstacles_only is True
+    assert [l.name for l in cfg.slam_lidars()] == ["rplidar"]
+    # Mapping lidar is not point_cloud-only → do not apply Livox SLAM defaults.
+    assert cfg.map_when_still is False
+    assert cfg.imu_odom_mode == "coast"
+
+
+def test_slam_config_rejects_all_obstacles_only():
+    with pytest.raises(ValueError, match="obstacles_only"):
+        SlamConfig.from_dict(
+            {
+                "base": "b",
+                "lidars": [
+                    {"name": "depth", "obstacles_only": True},
+                ],
+            }
+        )
+
+
 def test_slam_config_bad_mode():
     with pytest.raises(ValueError):
         SlamConfig.from_dict({"base": "b", "lidar": "f", "mode": "wat"})

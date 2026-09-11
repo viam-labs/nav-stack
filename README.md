@@ -143,6 +143,23 @@ need multi-host DDS. `get_status` reports `ros_domain_id`,
 
 A single lidar can be given as `"lidar": "front-lidar"`.
 
+Per-lidar options include mount pose, `scan_source` (`auto` / `get_laser_scan` /
+`point_cloud`), height band (`z_min` / `z_max`), and `obstacles_only` (when
+`true`, the sensor is used only for obstacle avoidance — not SLAM matching or
+mapping). Example depth camera for avoidance only:
+
+```json
+{
+  "name": "depth-cam",
+  "scan_source": "point_cloud",
+  "obstacles_only": true,
+  "max_range": 4.0,
+  "z_min": 0.05,
+  "z_max": 1.5,
+  "mount": { "x": 0.15, "y": 0.0, "z": 0.4, "theta": 0.0 }
+}
+```
+
 **Tuning via Viam config (no YAML editing required):**
 
 | Attribute | Service | Description |
@@ -586,4 +603,7 @@ costmap-filter wiring require an on-device ROS2 + Nav2 environment to validate.
 - 2D ground-robot navigation (slam_toolbox + Nav2 are 2D). One base per service.
 - Differential and omnidirectional kinematics supported; Ackermann is out of scope.
 - Multi-lidar merging for SLAM assumes roughly coplanar lidars with accurate mount
-  transforms; all lidars still contribute to Nav2 obstacle avoidance regardless.
+  transforms; all lidars still contribute to Nav2 / builtin obstacle avoidance
+  regardless. Set ``"obstacles_only": true`` on a lidar (e.g. a short-range depth
+  camera) to include it in avoidance / local costmap only — it is excluded from
+  SLAM scan-matching and map updates.

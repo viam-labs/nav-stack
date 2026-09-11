@@ -233,7 +233,8 @@ class BridgeNode(Node):
         # vs the App arrow in one transform (laser↔mount round-trip made
         # mount.theta "do nothing" for arrow-vs-wall alignment diagnostics).
         self._point_cloud_lidars = any(
-            lidar.scan_source == LIDAR_SCAN_POINT_CLOUD for lidar in slam_cfg.lidars
+            lidar.scan_source == LIDAR_SCAN_POINT_CLOUD
+            for lidar in slam_cfg.slam_lidars()
         )
         self._use_lidar_frame_scans = (
             self._point_cloud_lidars and not self._map_when_still
@@ -1067,7 +1068,8 @@ class BridgeNode(Node):
         # then drives into obstacles the lidar plainly sees).
         read_start = self.get_clock().now()
         per_lidar_scans = []
-        base_link_scans = []
+        # (scan, obstacles_only) — base_link projections for merge / nav cache.
+        base_link_scans: List[tuple] = []
         cloud_chunks: List[np.ndarray] = []
         scan_age_s: Optional[float] = None
         lidar_timeout = max(float(self._slam_cfg.sensor_read_timeout_s), 1.0)
@@ -1087,7 +1089,7 @@ class BridgeNode(Node):
             if isinstance(lidar_data, conv.LidarPoints):
                 sensor_scan = lidar_data.sensor_scan
                 base_pts_arr = np.asarray(lidar_data.base_link, dtype=float)
-                if base_pts_arr.size:
+                if base_pts_arr.size and not lidar.obstacles_only:
                     cloud_chunks.append(base_pts_arr)
                 if lidar_data.age_s is not None:
                     scan_age_s = (
@@ -1129,6 +1131,7 @@ class BridgeNode(Node):
                 if (
                     self._scan_accumulation_s > 0.0
                     and lidar.scan_source == LIDAR_SCAN_POINT_CLOUD
+                    and not lidar.obstacles_only
                 ):
                     # Tag the frame with the pose at capture time (read start),
                     # not after the read returned — misaligned poses smear the
@@ -1166,9 +1169,9 @@ class BridgeNode(Node):
                 if not conv.scan_has_returns(sensor_scan):
                     continue
 
-            per_lidar_scans.append((i, sensor_scan))
+            per_lidar_scans.append((i, sensor_scan, lidar.obstacles_only))
             if base_link_scan is not None and conv.scan_has_returns(base_link_scan):
-                base_link_scans.append(base_link_scan)
+                base_link_scans.append((base_link_scan, lidar.obstacles_only))
 
         if not per_lidar_scans:
             if not self._empty_scan_warned:
@@ -1198,13 +1201,31 @@ class BridgeNode(Node):
                 return
             self._stale_scan_warned = False
 
-        ref = self._slam_cfg.lidars[0]
+        ref = next(
+            (lidar for lidar in self._slam_cfg.lidars if not lidar.obstacles_only),
+            self._slam_cfg.lidars[0],
+        )
         nav_scans = (
-            base_link_scans
+            [scan for scan, _ in base_link_scans]
             if base_link_scans
-            else [scan for _, scan in per_lidar_scans]
+            else [scan for _, scan, _ in per_lidar_scans]
         )
         self._cache_nav_scan_for_builtin(nav_scans, ref=ref)
+
+        # SLAM matching/mapping uses mapping sensors only.
+        slam_per = [
+            (i, scan) for i, scan, obstacles_only in per_lidar_scans if not obstacles_only
+        ]
+        slam_base = [
+            scan for scan, obstacles_only in base_link_scans if not obstacles_only
+        ]
+        if not slam_per:
+            # OA-only returns are enough for nav costmap; nothing for /scan.
+            stamp = self._bounded_scan_stamp(read_start, age_s=scan_age_s or 0.0)
+            self._publish_scan_time_tf(stamp)
+            for i, scan, _obstacles_only in per_lidar_scans:
+                self._scan_pubs[i].publish(self._to_ros_scan(scan, f"laser_{i}", stamp))
+            return
 
         if not self._still_gate_ready():
             # Accumulate during dwell for a dense pause scan; publish is gated.
@@ -1224,14 +1245,14 @@ class BridgeNode(Node):
             self._imu_still_ticks = 0
 
         merged_frame = self._frames.base_link
-        if self._use_lidar_frame_scans and len(per_lidar_scans) == 1:
-            merged = per_lidar_scans[0][1]
-            merged_frame = f"laser_{per_lidar_scans[0][0]}"
+        if self._use_lidar_frame_scans and len(slam_per) == 1:
+            merged = slam_per[0][1]
+            merged_frame = f"laser_{slam_per[0][0]}"
         else:
             scans_to_merge = (
-                base_link_scans
-                if len(base_link_scans) == len(per_lidar_scans)
-                else [scan for _, scan in per_lidar_scans]
+                slam_base
+                if len(slam_base) == len(slam_per)
+                else [scan for _, scan in slam_per]
             )
             merged = conv.merge_scans(
                 scans_to_merge,
@@ -1262,11 +1283,11 @@ class BridgeNode(Node):
         # ("earlier than all the data in the transform cache") — a sample at
         # the scan time makes the lookup succeed by construction.
         self._publish_scan_time_tf(stamp)
-        for i, scan in per_lidar_scans:
+        for i, scan, _obstacles_only in per_lidar_scans:
             self._scan_pubs[i].publish(self._to_ros_scan(scan, f"laser_{i}", stamp))
 
         self._cache_nav_scan_for_builtin(
-            base_link_scans if base_link_scans else nav_scans,
+            [scan for scan, _ in base_link_scans] if base_link_scans else nav_scans,
             ref=ref,
         )
         now = time.monotonic()

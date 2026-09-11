@@ -151,6 +151,10 @@ class LidarConfig:
     shm_region_size: int = 2 * 1024 * 1024
     # If true, never fall back to gRPC GetPointCloud when shm is empty/missing.
     shm_required: bool = False
+    # When true, this sensor feeds nav obstacle avoidance / local costmap only —
+    # it is excluded from SLAM scan-matching and map updates. Use for a short-
+    # range depth camera alongside a real lidar.
+    obstacles_only: bool = False
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "LidarConfig":
@@ -192,6 +196,7 @@ class LidarConfig:
             shm_name=shm_name,
             shm_region_size=region,
             shm_required=bool(d.get("shm_required", False)),
+            obstacles_only=bool(d.get("obstacles_only", False)),
         )
 
 
@@ -689,6 +694,12 @@ class SlamConfig:
         if not lidars_raw:
             raise ValueError("at least one lidar is required ('lidars' or 'lidar')")
         lidars = [LidarConfig.from_dict(x) for x in lidars_raw]
+        slam_lidars = [lidar for lidar in lidars if not lidar.obstacles_only]
+        if not slam_lidars:
+            raise ValueError(
+                "at least one lidar must have obstacles_only=false "
+                "(needed for SLAM matching/mapping)"
+            )
         mode = d.get("mode", MODE_MAPPING)
         if mode not in SLAM_MODES:
             raise ValueError(f"mode must be one of {sorted(SLAM_MODES)}")
@@ -709,8 +720,10 @@ class SlamConfig:
         if convention == BASE_VELOCITY_MIR:
             convention = BASE_VELOCITY_VIAM
         frames_d = d.get("frames", {}) or {}
-        all_point_cloud = bool(lidars) and all(
-            lidar.scan_source == LIDAR_SCAN_POINT_CLOUD for lidar in lidars
+        # Point-cloud SLAM defaults follow mapping sensors only — an
+        # obstacles_only depth cam must not flip Livox-style tuning on/off.
+        all_point_cloud = bool(slam_lidars) and all(
+            lidar.scan_source == LIDAR_SCAN_POINT_CLOUD for lidar in slam_lidars
         )
         imu_odom_mode = str(
             d.get(
@@ -728,7 +741,7 @@ class SlamConfig:
         stb_raw = dict(d.get("slam_toolbox", {}) or {})
         slam_params_raw = dict(d.get("slam_params", {}) or {})
         if all_point_cloud:
-            max_lidar_range = max(lidar.max_range for lidar in lidars)
+            max_lidar_range = max(lidar.max_range for lidar in slam_lidars)
             # Real travel gates matter for Livox: with minimum_travel_* at 0,
             # slam_toolbox scan-matches every noisy non-repetitive frame while
             # parked and imprints walls at slightly different poses each time.
@@ -1094,6 +1107,10 @@ class SlamConfig:
         if self.heading_sensor:
             deps.append(self.heading_sensor)
         return deps
+
+    def slam_lidars(self) -> List[LidarConfig]:
+        """Lidars used for SLAM matching/mapping (excludes ``obstacles_only``)."""
+        return [lidar for lidar in self.lidars if not lidar.obstacles_only]
 
     def uses_builtin_slam(self) -> bool:
         return self.slam_backend == SLAM_BACKEND_BUILTIN

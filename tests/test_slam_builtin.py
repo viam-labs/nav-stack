@@ -725,6 +725,37 @@ def test_builtin_sensors_get_scan_fresh_dedupes_same_revolution(monkeypatch):
     assert sensors.scan_age_s() < 0.5
 
 
+def test_builtin_sensors_get_scan_skips_obstacles_only(monkeypatch):
+    import asyncio
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidars": [
+                {"name": "front"},
+                {"name": "depth", "obstacles_only": True},
+            ],
+        }
+    )
+    sensors = BuiltinSensors(
+        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
+        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+    )
+    seen = []
+
+    def _read(lidar, *, max_age_s):
+        del max_age_s
+        seen.append(lidar.name)
+        return _wall_scan(dist=2.0)
+
+    monkeypatch.setattr(sensors, "_read_lidar_scan_sync", _read)
+    monkeypatch.setattr(sensors, "_SCAN_MIN_REFETCH_S", 0.0)
+    assert sensors.get_scan(1.0, fresh=True) is not None
+    assert seen == ["front"]
+
+
 def test_apply_heading_from_shm_skips_grpc():
     import asyncio
 

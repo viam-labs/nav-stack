@@ -275,6 +275,8 @@ class ViamWorldIO:
             return self._scan_cache
         scans = []
         for lidar in self._lidars:
+            # Include obstacles_only sensors — this path is for nav avoidance /
+            # local costmap, not SLAM matching.
             scan = self._read_lidar_scan_sync(lidar, max_age_s=max_age_s)
             if scan is not None:
                 scans.append(scan)

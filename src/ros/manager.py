@@ -651,7 +651,8 @@ class RosManager:
             rp.setdefault("minimum_travel_distance", 0.0)
             rp.setdefault("minimum_travel_heading", 0.0)
         elif getattr(self._slam_cfg, "map_when_still", False) and any(
-            lidar.scan_source == "point_cloud" for lidar in self._slam_cfg.lidars
+            lidar.scan_source == "point_cloud"
+            for lidar in self._slam_cfg.slam_lidars()
         ):
             # Stop-and-go Livox: bridge gates /scan. slam_toolbox always uses
             # odom→base as the match prior — widen the real correlative search

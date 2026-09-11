@@ -381,7 +381,8 @@ class RosSlam(SLAM):
         # Height slices need 3D points; ``auto`` lidars may still deliver them,
         # and if they turn out 2D-only the verify simply reports no data.
         if all(
-            lidar.scan_source == LIDAR_SCAN_GET_LASER_SCAN for lidar in cfg.lidars
+            lidar.scan_source == LIDAR_SCAN_GET_LASER_SCAN
+            for lidar in cfg.slam_lidars()
         ):
             return None
         if self._slice_library is None:
@@ -1351,6 +1352,7 @@ class RosSlam(SLAM):
                 "name": lidar.name,
                 "scan_source": lidar.scan_source,
                 "shm_name": lidar.shm_name,
+                "obstacles_only": bool(lidar.obstacles_only),
             }
             try:
                 data = await io.read_lidar_points(lidar.name)
@@ -1449,6 +1451,7 @@ class RosSlam(SLAM):
                 "name": lidar.name,
                 "scan_source": lidar.scan_source,
                 "shm_name": lidar.shm_name,
+                "obstacles_only": bool(lidar.obstacles_only),
             }
             try:
                 scan = await asyncio.to_thread(
@@ -1710,6 +1713,7 @@ class RosSlam(SLAM):
                         "max_range": lidar.max_range,
                         "shm_name": lidar.shm_name,
                         "shm_required": lidar.shm_required,
+                        "obstacles_only": bool(lidar.obstacles_only),
                     }
                     for lidar in self._cfg.lidars
                 ]
@@ -1964,6 +1968,8 @@ class RosSlam(SLAM):
             [np.empty((0, 2)) for _ in bands] if bands else []
         )
         for lidar in self._cfg.lidars:
+            if lidar.obstacles_only:
+                continue
             points = await io.read_lidar_points(lidar.name)
             mount = conv.Pose2D(lidar.x, lidar.y, lidar.theta)
             # Prefer base_link points: for MiR get_laser_scan this already merges

@@ -128,6 +128,9 @@ class BuiltinSensors:
         prior kept rotating smeared every wall into a ring during turns. The
         same object is returned while the lidar content has not changed, so the
         caller can skip matching/inserting a scan it already consumed.
+
+        Sensors with ``obstacles_only=true`` are omitted (nav costmap reads them
+        via ViamWorldIO instead).
         """
         now = time.monotonic()
         cached = self._scan_cache
@@ -143,6 +146,8 @@ class BuiltinSensors:
         self._scan_fetch_at = now
         scans = []
         for lidar in lidars:
+            if lidar.obstacles_only:
+                continue
             scan = self._read_lidar_scan_sync(lidar, max_age_s=max_age_s)
             if scan is not None:
                 scans.append(scan)
