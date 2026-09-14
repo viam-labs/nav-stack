@@ -243,14 +243,25 @@ def test_avoidance_stops_and_turns_to_clearer_side():
 
 
 def test_avoidance_holds_spin_when_front_occupied():
-    """Rotate-to-heading must not keep spinning into a person dead ahead."""
+    """Rotate-to-heading must freeze for a true nose collision."""
     cmd = DriveCommand(0.0, 0.0, 0.5, False)
     scan = _scan_with({0.0: 0.1})
-    obs = ObstacleConfig(stop_distance_m=0.4, slow_distance_m=1.0)
+    obs = ObstacleConfig(stop_distance_m=0.4, slow_distance_m=1.0, spin_collision_m=0.22)
     out, state, clr = apply_obstacle_avoidance(cmd, scan, obs, max_angular_rad_s=0.8)
     assert state == "hold"
     assert out.vx == 0.0 and out.vtheta == 0.0
     assert clr == pytest.approx(0.1)
+
+
+def test_avoidance_allows_corridor_spin_with_wall_at_stop_distance():
+    """Wall at stop_distance ahead must not freeze rotate-to-heading."""
+    cmd = DriveCommand(0.0, 0.0, 0.5, False)
+    scan = _scan_with({0.0: 0.35})  # typical corridor wall during a 90° spin
+    obs = ObstacleConfig(stop_distance_m=0.4, slow_distance_m=1.0, spin_collision_m=0.22)
+    out, state, clr = apply_obstacle_avoidance(cmd, scan, obs, max_angular_rad_s=0.8)
+    assert state == "clear"
+    assert out == cmd
+    assert clr == pytest.approx(0.35)
 
 
 def test_avoidance_allows_spin_in_open_space():
@@ -264,8 +275,8 @@ def test_avoidance_allows_spin_in_open_space():
 
 
 def test_avoidance_holds_spin_into_near_flank():
-    cmd = DriveCommand(0.0, 0.0, -0.5, False)  # CW → right flank
-    scan = _scan_with({0.0: 5.0, -math.radians(45): 0.2})
+    cmd = DriveCommand(0.0, 0.0, -0.5, False)  # CW → right flank outside front cone
+    scan = _scan_with({0.0: 5.0, -math.radians(50): 0.2})
     obs = ObstacleConfig(stop_distance_m=0.4, slow_distance_m=1.0)
     out, state, clr = apply_obstacle_avoidance(cmd, scan, obs, max_angular_rad_s=0.8)
     assert state == "hold"

@@ -1075,7 +1075,7 @@ def test_compute_path_command_drives_forward():
 
 
 def test_compute_path_command_holds_rotate_into_person():
-    """Rotate-to-heading with a body in the front stop bubble must full-stop."""
+    """Rotate-to-heading with a body in the nose collision bubble must full-stop."""
     import numpy as np
 
     from src.geom import conversions as conv
@@ -1088,15 +1088,19 @@ def test_compute_path_command_holds_rotate_into_person():
     # Forward in base frame ≈ bin at angle 0.
     angle_min = -math.pi
     angle_increment = 2 * math.pi / 72
-    ranges[int((0.0 - angle_min) / angle_increment) % 72] = 0.25
+    ranges[int((0.0 - angle_min) / angle_increment) % 72] = 0.15
     scan = conv.LaserScan2D(ranges, angle_min, angle_increment, range_min=0.05)
-    cfg = FollowerConfig(obstacle=ObstacleConfig(stop_distance_m=0.4, slow_distance_m=1.0))
+    cfg = FollowerConfig(
+        obstacle=ObstacleConfig(
+            stop_distance_m=0.4, slow_distance_m=1.0, spin_collision_m=0.22
+        )
+    )
     cmd, progress = compute_path_command(
         current, path, cfg=cfg, scan=scan, rotate_active=True
     )
     assert progress["obstacle"] == "hold"
     assert cmd.vx == 0.0 and cmd.vtheta == 0.0
-    assert progress["forward_clearance_m"] == pytest.approx(0.25)
+    assert progress["forward_clearance_m"] == pytest.approx(0.15)
 
 
 class _FakeWorld:
