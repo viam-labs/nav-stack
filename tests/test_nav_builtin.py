@@ -674,6 +674,25 @@ def test_pursuit_corrects_crosstrack_toward_path():
     assert cmd.vx > 0.12
 
 
+def test_pursuit_crosstrack_deadband_zeros_kappa():
+    """Sub-deadband lateral error must not command a turn (pose-noise floor)."""
+    from src.nav_builtin.controller import pursuit_command
+
+    cfg = FollowerConfig()
+    cfg.crosstrack_deadband_m = 0.04
+    cfg.curvature_smoothing = 1.0  # no EMA; raw κ only
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(0.0, 0.0, 0.0)
+    # |y_l| = 0.02 < deadband → κ = 0 → straight cruise.
+    cmd, rotating = pursuit_command(current, Pose2D(1.0, 0.02, 0.0), cfg=cfg)
+    assert not rotating
+    assert cmd.vx > 0.12
+    assert abs(cmd.vtheta) < 1e-9
+    # Just outside the deadband: still corrects.
+    cmd2, _ = pursuit_command(current, Pose2D(1.0, 0.05, 0.0), cfg=cfg)
+    assert cmd2.vtheta > 0.0
+
+
 def test_pursuit_rotate_to_heading_has_hysteresis():
     from src.nav_builtin.controller import pursuit_command
 
@@ -730,7 +749,7 @@ def test_pursuit_respects_skid_steer_wheel_envelope():
     cfg.motion.max_linear_mps = 0.4
     current = Pose2D(0.0, 0.0, 0.0)
     for deg in range(-58, 59, 4):
-        for L in (0.6, 0.8, 1.2):
+        for L in (0.6, 0.9, 1.2, 1.5):
             tgt = Pose2D(L * math.cos(math.radians(deg)), L * math.sin(math.radians(deg)), 0.0)
             cmd, rotating = pursuit_command(current, tgt, cfg=cfg)
             assert not rotating

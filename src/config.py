@@ -369,14 +369,14 @@ class BuiltinNavConfig:
 
     # ``lazy_theta_star`` (default) or ``astar``.
     planner: str = BUILTIN_PLANNER_LAZY_THETA
-    # Regulated pure pursuit lookahead: velocity-scaled (2 s) and clamped to
+    # Regulated pure pursuit lookahead: velocity-scaled and clamped to
     # [min, max]; ``lookahead_m`` is the fallback when starting from rest.
     # Longer = smoother / less sensitive to SLAM pose jitter but cuts corners
-    # more; shorter = tighter tracking. Below ~0.6 m real SLAM noise (2–3 cm,
-    # 2–3°) shows up as visible heading wag on a skid-steer.
-    lookahead_m: float = 0.8
-    min_lookahead_m: float = 0.6
-    max_lookahead_m: float = 1.2
+    # more; shorter = tighter tracking. Below ~0.9 m real SLAM noise shows up
+    # as S-curve hunting on a skid-steer.
+    lookahead_m: float = 1.1
+    min_lookahead_m: float = 0.9
+    max_lookahead_m: float = 1.5
     replan_period_s: float = 1.0
     timeout_s: float = 300.0
     # Base.SetVelocity wait on the shared module event loop. Mapping+SLAM can
@@ -395,8 +395,10 @@ class BuiltinNavConfig:
     # Final approach: cap linear speed within this distance of the goal.
     approach_dist_m: float = 0.35
     # Post-process global plans (shortcut + resample) before following.
+    # Coarser than 0.10 m: densify jogs at ~cell scale were feeding pure-pursuit
+    # κ flicker on long straights.
     smooth_path: bool = True
-    smooth_sample_spacing_m: float = 0.10
+    smooth_sample_spacing_m: float = 0.15
     # Rolling local costmap + DWA-style local planner for dynamic obstacles.
     local_costmap_enabled: bool = True
     local_costmap_width_m: float = 4.0
@@ -429,9 +431,9 @@ class BuiltinNavConfig:
             return cls()
         return cls(
             planner=normalize_builtin_planner(d.get("planner", BUILTIN_PLANNER_LAZY_THETA)),
-            lookahead_m=float(d.get("lookahead_m", 1.0)),
-            min_lookahead_m=float(d.get("min_lookahead_m", 0.7)),
-            max_lookahead_m=float(d.get("max_lookahead_m", 1.4)),
+            lookahead_m=float(d.get("lookahead_m", 1.1)),
+            min_lookahead_m=float(d.get("min_lookahead_m", 0.9)),
+            max_lookahead_m=float(d.get("max_lookahead_m", 1.5)),
             replan_period_s=float(d.get("replan_period_s", 1.0)),
             timeout_s=float(d.get("timeout_s", 300.0)),
             drive_timeout_s=float(d.get("drive_timeout_s", 5.0)),
@@ -443,7 +445,7 @@ class BuiltinNavConfig:
             yaw_align_timeout_s=float(d.get("yaw_align_timeout_s", 4.0)),
             approach_dist_m=float(d.get("approach_dist_m", 0.35)),
             smooth_path=bool(d.get("smooth_path", True)),
-            smooth_sample_spacing_m=float(d.get("smooth_sample_spacing_m", 0.10)),
+            smooth_sample_spacing_m=float(d.get("smooth_sample_spacing_m", 0.15)),
             local_costmap_enabled=bool(d.get("local_costmap_enabled", True)),
             local_costmap_width_m=float(d.get("local_costmap_width_m", 4.0)),
             local_costmap_height_m=float(d.get("local_costmap_height_m", 4.0)),

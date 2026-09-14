@@ -32,17 +32,20 @@ class FollowerConfig:
     tightens the turn, and the lookahead low-passes SLAM pose jitter.
     """
 
-    # Pure pursuit's noise gain is ~2v(σ_xy + L·σ_yaw)/L²: SLAM jitter of
-    # 2–3 cm / 2–3° at L=0.4–0.6 m produced ±0.2 rad/s heading wag on the real
-    # robot. 0.6–1.2 m halves that at the cost of a ~0.1–0.15 m corner cut,
-    # which sits well inside the planner's clearance preference.
-    lookahead_m: float = 0.8
-    min_lookahead_m: float = 0.6
-    max_lookahead_m: float = 1.2
-    lookahead_time_s: float = 2.0
-    # Blend commanded curvature with the previous tick's (EMA weight on the
-    # new value). Smooths pose-noise-driven κ flicker without changing the arc.
-    curvature_smoothing: float = 0.6
+    # Longer lookahead damps SLAM pose/heading jitter on skid-steer. The dock
+    # corridor snake was hunting at L≈0.6–1.2 m; 0.9–1.5 m trades a bit more
+    # corner cut (still inside clearance_preference) for a straighter trail.
+    lookahead_m: float = 1.1
+    min_lookahead_m: float = 0.9
+    max_lookahead_m: float = 1.5
+    lookahead_time_s: float = 2.5
+    # EMA weight on *new* curvature (rest from previous tick). Lower = calmer
+    # mid-path ω; 0.35 ≈ 0.3 s memory at 10 Hz.
+    curvature_smoothing: float = 0.35
+    # Ignore |y_l| below this when computing κ so pose noise and densify jogs
+    # do not flip vθ every tick on a long straight. Rotate-to-heading still
+    # uses the raw bearing.
+    crosstrack_deadband_m: float = 0.04
     approach_dist_m: float = 0.35
     waypoint_tolerance_m: float = 0.15
     # Rotate-to-heading: stop translating when the lookahead bearing exceeds
@@ -328,7 +331,11 @@ def pursuit_command(
         w = math.copysign(max(min(abs(alpha) * 1.5, rot_max), rot_floor), alpha)
         return DriveCommand(0.0, 0.0, w, False), True
 
-    kappa = 2.0 * y_l / l2
+    y_steer = y_l
+    deadband = max(0.0, float(cfg.crosstrack_deadband_m))
+    if deadband > 0.0 and abs(y_steer) < deadband:
+        y_steer = 0.0
+    kappa = 2.0 * y_steer / l2
     # Smooth κ across ticks (pose noise → κ flicker), unless we just started
     # translating (no previous arc to blend with).
     prev_kappa = _prev_curvature(prev_cmd)

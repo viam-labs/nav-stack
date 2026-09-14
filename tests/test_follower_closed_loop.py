@@ -254,10 +254,11 @@ def test_offset_start_converges_without_overshoot():
     """Start 0.35 m left of the path: converge smoothly, no oscillation across it."""
     log = _run(_straight(), Pose2D(0.0, 0.35, 0.0), cfg=_robot_cfg())
     assert log.reached
-    # Never swing past the line by more than a few cm.
-    assert min(log.crosstrack) > -0.06
-    # Settled on the line for the last stretch.
-    assert max(abs(c) for c in log.crosstrack[-30:]) < 0.06
+    # Longer lookahead + κ smoothing overshoots a few more cm than Stanley-style
+    # gain, but must not reverse into a snake.
+    assert min(log.crosstrack) > -0.10
+    # Settled on the line for the last stretch (inside deadband is fine).
+    assert max(abs(c) for c in log.crosstrack[-30:]) < 0.08
     assert log.sign_flips() <= 2
 
 
@@ -336,7 +337,7 @@ def test_harsh_straight_keeps_heading(seed: int):
     log = _run(_straight(), Pose2D(0.0, 0.0, math.radians(4.0)), cfg=_robot_cfg(), seed=seed, **_HARSH)
     assert log.reached
     assert log.rejections == 0
-    assert max(abs(c) for c in log.crosstrack) < 0.12
+    assert max(abs(c) for c in log.crosstrack) < 0.15
     assert log.max_heading_err < math.radians(12.0)
     assert log.sign_flips() <= 2
 
