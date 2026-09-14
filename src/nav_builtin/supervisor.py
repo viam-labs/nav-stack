@@ -347,6 +347,7 @@ class NavSupervisor:
             failed_replan_while_blocked = 0
             failed_static_replan = 0
             local_planner_active = False
+            prev_local_cmd: Optional[DriveCommand] = None
             vx_sign_history: list[tuple[float, int]] = []
             xy_ok_since: Optional[float] = None
             last_tick_pose: Optional[Pose2D] = None
@@ -474,6 +475,7 @@ class NavSupervisor:
                     or self._local_costmap is not None
                 ):
                     try:
+                        # Full merge (incl. depth) for reactive cone slowing.
                         scan = self._world.get_scan(self._scan_max_age)
                     except TimeoutError:
                         scan = None
@@ -483,14 +485,28 @@ class NavSupervisor:
                     now - self._local_view_at >= self._local_update_period_s
                     or local_view is None
                 ):
-                    costmap_scan = scan
-                    if costmap_scan is None and self._local_scan_max_age_s > 0:
+                    # Lidar-only for the rolling local costmap / DWA. Depth is
+                    # noisy+laggy and was flipping left/right detours every tick.
+                    costmap_scan = None
+                    try:
+                        costmap_scan = self._world.get_scan(
+                            self._local_scan_max_age_s
+                            if self._local_scan_max_age_s > 0
+                            else self._scan_max_age,
+                            include_obstacles_only=False,
+                        )
+                    except TypeError:
+                        # Older WorldIO stubs without the kwarg.
                         try:
                             costmap_scan = self._world.get_scan(
                                 self._local_scan_max_age_s
+                                if self._local_scan_max_age_s > 0
+                                else self._scan_max_age
                             )
                         except TimeoutError:
                             costmap_scan = None
+                    except TimeoutError:
+                        costmap_scan = None
                     if (
                         costmap_scan is not None
                         and costmap_scan.capture_pose is None
@@ -605,8 +621,13 @@ class NavSupervisor:
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
                     min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
                     local_planner_active=local_planner_active,
+                    prev_local_cmd=prev_local_cmd,
                 )
                 local_planner_active = bool(progress.get("local_planner"))
+                if local_planner_active:
+                    prev_local_cmd = cmd
+                else:
+                    prev_local_cmd = None
 
                 if waiting_for_clear:
                     # Stop and let the blocker move; don't trip stall timeout.

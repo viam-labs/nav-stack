@@ -947,7 +947,7 @@ class _FakeWorld:
     def get_pose(self):
         return self.pose
 
-    def get_scan(self, max_age_s: float = 2.0):
+    def get_scan(self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True):
         return None
 
     def get_localization_hold(self):

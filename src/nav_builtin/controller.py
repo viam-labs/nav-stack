@@ -321,6 +321,7 @@ def compute_path_command(
     min_cmd_vel_x: float = 0.0,
     min_cmd_vel_theta: float = 0.0,
     local_planner_active: bool = False,
+    prev_local_cmd: Optional[DriveCommand] = None,
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``."""
     est_speed = cfg.motion.max_linear_mps * 0.5 if speed_mps is None else speed_mps
@@ -363,6 +364,7 @@ def compute_path_command(
             min_cmd_vel_x=min_cmd_vel_x,
             min_cmd_vel_theta=min_cmd_vel_theta,
             local_planner_active=local_planner_active,
+            prev_cmd=prev_local_cmd if local_planner_active else None,
         )
         if local_cmd is not None:
             cmd = local_cmd

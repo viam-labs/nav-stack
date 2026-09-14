@@ -268,11 +268,15 @@ class ViamWorldIO:
         except Exception:  # noqa: BLE001
             return None
 
-    def get_scan(self, max_age_s: float = 2.0) -> Optional[conv.LaserScan2D]:
+    def get_scan(
+        self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True
+    ) -> Optional[conv.LaserScan2D]:
         now = time.monotonic()
         pose = self.get_pose()
+        # Merged cache includes depth; only reuse when the caller wants that.
         if (
-            self._scan_cache is not None
+            include_obstacles_only
+            and self._scan_cache is not None
             and now - self._scan_cache_at <= max_age_s
             and self._scan_cache_pose is not None
             and pose is not None
@@ -301,28 +305,30 @@ class ViamWorldIO:
                         sensor_pose=provided.sensor_pose,
                         capture_pose=pose,
                     )
-                self._scan_cache = provided
-                self._scan_cache_at = now
-                self._scan_cache_pose = pose
+                if include_obstacles_only:
+                    self._scan_cache = provided
+                    self._scan_cache_at = now
+                    self._scan_cache_pose = pose
                 return provided
         if not self._lidars:
-            return self._scan_cache
+            return self._scan_cache if include_obstacles_only else None
         scans = []
         for lidar in self._lidars:
-            # Include obstacles_only sensors — this path is for nav avoidance /
-            # local costmap, not SLAM matching.
+            # Depth (obstacles_only) is for reactive slowing — not the rolling
+            # local costmap / DWA. Including it there caused phantom blobs and
+            # left/right chatter after the depth camera was added.
+            if lidar.obstacles_only and not include_obstacles_only:
+                continue
             scan = self._read_lidar_scan_sync(lidar, max_age_s=max_age_s)
             if scan is None:
                 continue
             if pose is not None and lidar.obstacles_only:
-                # Depth is rate-limited/async: re-express into the live body frame
-                # or drop when the robot has moved too far (phantom obstacles).
                 scan = self._align_obstacles_scan_to_pose(scan, pose)
                 if scan is None:
                     continue
             scans.append(scan)
         if not scans:
-            return self._scan_cache
+            return self._scan_cache if include_obstacles_only else None
         merged = (
             scans[0]
             if len(scans) == 1
@@ -338,9 +344,10 @@ class ViamWorldIO:
                 sensor_pose=merged.sensor_pose,
                 capture_pose=pose,
             )
-        self._scan_cache = merged
-        self._scan_cache_at = now
-        self._scan_cache_pose = pose
+        if include_obstacles_only:
+            self._scan_cache = merged
+            self._scan_cache_at = now
+            self._scan_cache_pose = pose
         return merged
 
     def _map_pose_now(self) -> Optional[conv.Pose2D]:

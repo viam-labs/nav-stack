@@ -20,7 +20,9 @@ class WorldIO(Protocol):
     def get_pose(self) -> Optional[conv.Pose2D]:
         ...
 
-    def get_scan(self, max_age_s: float = 2.0) -> Optional[conv.LaserScan2D]:
+    def get_scan(
+        self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True
+    ) -> Optional[conv.LaserScan2D]:
         ...
 
     def set_velocity(self, vx: float, vy: float, vtheta: float) -> None:
