@@ -1,31 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-for _mod in (
-    "rclpy",
-    "rclpy.node",
-    "rclpy.qos",
-    "rclpy.action",
-    "geometry_msgs",
-    "geometry_msgs.msg",
-    "nav_msgs",
-    "nav_msgs.msg",
-    "sensor_msgs",
-    "sensor_msgs.msg",
-    "std_msgs",
-    "std_msgs.msg",
-    "tf2_ros",
-    "nav2_msgs",
-    "nav2_msgs.action",
-):
-    sys.modules.setdefault(_mod, MagicMock())
 
 pytest.importorskip("viam")
 

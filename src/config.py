@@ -1,7 +1,7 @@
 """Typed configuration objects parsed from Viam component attributes.
 
 Keeping these as plain dataclasses (no Viam or ROS imports) makes the parsing
-logic easy to unit-test and shareable between the models and the ROS layer.
+logic easy to unit-test and shareable between the models and the runtime layer.
 """
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def ros_vtheta_to_viam_angular_deg_s(vtheta_rad_s: float) -> float:
     """Convert ROS/nav angular rate (rad/s) to Viam ``Base.SetVelocity`` deg/s.
 
     Viam's protobuf / Python SDK document ``angular.z`` as degrees per second.
-    Controllers, Nav2 ``cmd_vel``, and builtin nav keep rad/s internally
+    Controllers and builtin nav keep rad/s internally
     (``max_vel_theta``, ``min_cmd_vel_theta``, ``cmd_vtheta_rad_s``); convert
     only at the SetVelocity call site — never change those config/status units.
     """
@@ -203,7 +203,7 @@ class LidarConfig:
     max_range: float = 25.0  # meters
     # Height band for 3D lidars / depth cameras when ``get_point_cloud`` returns
     # points in ``base_link`` (Z = height above the floor). Keeps floor/ceiling
-    # out of the 2D scan fed to slam_toolbox.
+    # out of the 2D scan fed to builtin SLAM.
     z_min: float = -0.2
     z_max: float = 2.0
     # How to read this lidar: ``auto`` tries mir-base-style ``get_laser_scan``
@@ -284,12 +284,11 @@ class LidarConfig:
 
 @dataclass
 class SlamToolboxConfig:
-    """Common slam_toolbox ROS parameters exposed via Viam config.
+    """Shared map / scan settings used by builtin SLAM.
 
-    Top-level ``mode`` on the SLAM service (``mapping`` / ``localizing``) selects
-    the slam_toolbox node and sets its ``mode`` parameter. Additional tuning lives
-    under the ``slam_toolbox`` attribute block. Use ``slam_params`` for any other
-    slam_toolbox keys not listed here.
+    Historically named for slam_toolbox; kept under the ``slam_toolbox`` attribute
+    block so existing configs keep working. Builtin engine reads ``resolution``,
+    ``max_laser_range``, and travel gates from here.
     """
 
     resolution: float = 0.05  # meters/cell
@@ -330,12 +329,19 @@ class SlamToolboxConfig:
 
 
 NAV_BACKEND_BUILTIN = "builtin"
+# Rejected at parse time (historical aliases).
 NAV_BACKEND_NAV2 = "nav2"
-NAV_BACKENDS = frozenset({NAV_BACKEND_BUILTIN, NAV_BACKEND_NAV2})
+NAV_BACKENDS = frozenset({NAV_BACKEND_BUILTIN})
 
 SLAM_BACKEND_BUILTIN = "builtin"
+# Rejected at parse time (historical aliases).
 SLAM_BACKEND_TOOLBOX = "slam_toolbox"
-SLAM_BACKENDS = frozenset({SLAM_BACKEND_BUILTIN, SLAM_BACKEND_TOOLBOX})
+SLAM_BACKENDS = frozenset({SLAM_BACKEND_BUILTIN})
+
+_ROS_REMOVED_HINT = (
+    "ROS/Nav2/slam_toolbox product paths were removed; use slam_backend/nav_backend "
+    "'builtin' only. For the last ROS release, check out git tag pre-ros-removal."
+)
 
 BUILTIN_PLANNER_ASTAR = "astar"
 BUILTIN_PLANNER_LAZY_THETA = "lazy_theta_star"
@@ -370,11 +376,10 @@ def normalize_builtin_planner(name: Optional[str]) -> str:
 
 @dataclass
 class BuiltinNavConfig:
-    """Tuning for the in-module (ROS-free) navigator.
+    """Tuning for the in-module navigator.
 
-    Footprint / velocity limits stay top-level on ``NavConfig`` so both backends
-    share them. Defaults are tuned for builtin SLAM + pure pursuit (not copied
-    from Nav2 MPPI/RPP template values).
+    Footprint / velocity limits stay top-level on ``NavConfig``. Defaults are
+    tuned for builtin SLAM + pure pursuit.
     """
 
     # ``lazy_theta_star`` (default) or ``astar``.
@@ -481,79 +486,6 @@ class BuiltinNavConfig:
 
 
 @dataclass
-class Nav2Config:
-    """Common Nav2 ROS parameters exposed via Viam config.
-
-    Velocity, footprint, and inflation defaults remain top-level on the navigation
-    service for convenience. Additional tuning lives under the ``nav2`` attribute
-    block. Use ``nav2_params`` for any other Nav2 keys not listed here.
-    """
-
-    xy_goal_tolerance: float = 0.25  # meters
-    yaw_goal_tolerance: float = 0.25  # radians
-    planner_tolerance: float = 0.5  # meters
-    cost_scaling_factor: float = 4.0
-    local_costmap_width: float = 4.0  # meters
-    local_costmap_height: float = 4.0  # meters
-    costmap_resolution: float = 0.05  # meters/cell
-    # Must match the params template default: this dict always overrides the
-    # template, so a stale default here silently clobbers template retuning.
-    # 10 Hz (not Nav2's stock 20) keeps MPPI within a Pi 5's budget.
-    controller_frequency: float = 10.0  # Hz
-    # Global replan rate (BT RateController). Stock Nav2's 1 Hz: each replan
-    # costs a plan + smooth + path handoff, and 2 Hz measurably starves the
-    # controller loop on a Pi running slam_toolbox alongside. Raise it on
-    # faster hardware if you need quicker reaction to blocked paths.
-    replan_frequency: float = 1.0  # Hz
-    # Progress checker: how long with almost no movement before FollowPath
-    # fails into recovery. Stock template was 30 s (very patient); 10 s exits
-    # reverse/spin loops sooner on stuck carts.
-    progress_movement_time_allowance: float = 10.0  # seconds
-    # Outer NavigateRecovery retries (spin/backup/wait/clear cycle). Stock is 6.
-    navigate_recovery_retries: int = 4
-    # Wait behavior duration inside the recovery RoundRobin (stock 5 s).
-    recovery_wait_duration: float = 2.0  # seconds
-
-    def to_override_dict(self) -> dict:
-        """Flat leaf keys applied to the generated Nav2 params template.
-
-        Costmap width/height are applied separately as integers (Jazzy rejects
-        doubles for those parameters). Replan / recovery-retry knobs are applied
-        by rewriting the navigate-to-pose behavior tree XML, not here.
-        """
-        return {
-            "xy_goal_tolerance": self.xy_goal_tolerance,
-            "yaw_goal_tolerance": self.yaw_goal_tolerance,
-            "tolerance": self.planner_tolerance,
-            "cost_scaling_factor": self.cost_scaling_factor,
-            "resolution": self.costmap_resolution,
-            "controller_frequency": self.controller_frequency,
-            "movement_time_allowance": self.progress_movement_time_allowance,
-        }
-
-    @classmethod
-    def from_dict(cls, d: Mapping) -> "Nav2Config":
-        if not d:
-            return cls()
-        return cls(
-            xy_goal_tolerance=float(d.get("xy_goal_tolerance", 0.25)),
-            yaw_goal_tolerance=float(d.get("yaw_goal_tolerance", 0.25)),
-            planner_tolerance=float(d.get("planner_tolerance", 0.5)),
-            cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),
-            local_costmap_width=float(d.get("local_costmap_width", 4.0)),
-            local_costmap_height=float(d.get("local_costmap_height", 4.0)),
-            costmap_resolution=float(d.get("costmap_resolution", 0.05)),
-            controller_frequency=float(d.get("controller_frequency", 10.0)),
-            replan_frequency=float(d.get("replan_frequency", 1.0)),
-            progress_movement_time_allowance=float(
-                d.get("progress_movement_time_allowance", 10.0)
-            ),
-            navigate_recovery_retries=int(d.get("navigate_recovery_retries", 4)),
-            recovery_wait_duration=float(d.get("recovery_wait_duration", 2.0)),
-        )
-
-
-@dataclass
 class Frames:
     map: str = "map"
     odom: str = "odom"
@@ -592,13 +524,13 @@ class SlamConfig:
     heading_sensor_yaw_deg: float = 0.0
     # Negate the dedicated heading sensor's yaw (upside-down heading IMU).
     heading_sensor_invert: bool = False
-    # Added to GetPosition yaw only (App arrow vs map PCD). Does not change ROS
-    # TF / slam_toolbox. Prefer fixing lidar ``mount.theta`` (see status probe
+    # Added to GetPosition yaw only (App arrow vs map PCD). Prefer fixing lidar
+    # ``mount.theta`` (see status probe
     # ``nearest_return_bearing_deg``) — a cosmetic ±45 rarely means TF and PCD
     # disagree; more often the Livox +X is off base_link forward.
     map_pose_yaw_offset_deg: float = 0.0
     mode: str = MODE_MAPPING
-    # Default: in-process occupancy SLAM. Set ``slam_toolbox`` to keep ROS.
+    # Builtin occupancy SLAM only.
     slam_backend: str = SLAM_BACKEND_BUILTIN
     maps_dir: str = "/root/.viam/nav-stack/maps"
     active_map: Optional[str] = None
@@ -606,9 +538,8 @@ class SlamConfig:
     scan_rate_hz: float = 10.0
     odom_rate_hz: float = 20.0
     sensor_read_timeout_s: float = 10.0
-    # External-SLAM navigation (navigation-external) tunables: how fast the
-    # ExternalSlamPublisher polls the Viam SLAM service for pose/grid and how far
-    # in the future map->odom is stamped. Ignored by the built-in slam_toolbox path.
+    # External-SLAM navigation (navigation-external) poll rates (unused by builtin
+    # slam; retained for config compatibility).
     external_pose_rate_hz: float = 10.0
     external_grid_rate_hz: float = 1.5
     external_transform_timeout_s: float = 0.2
@@ -743,8 +674,8 @@ class SlamConfig:
     # local scan-match on an interval and re-localizes when pose has drifted.
     periodic_relocalize: bool = True
     periodic_relocalize_interval_s: float = 20.0
-    # Shorter interval while Nav2 is active (localization drift shows up as planner
-    # failures / recoveries mid-goal).
+    # Shorter interval while navigation is active (localization drift shows up as
+    # planner failures / recoveries mid-goal).
     periodic_relocalize_nav_interval_s: float = 15.0
     # Below this match score, or above this ray MAE (m), the local match is not
     # trusted; the watchdog then tries a full-map global_localize (like manual).
@@ -770,8 +701,8 @@ class SlamConfig:
     localize_jump_agree_deg: float = 15.0
     localize_jump_large_m: float = 0.75
     localize_jump_large_deg: float = 25.0
-    # When Nav2 reports this many recoveries on the active goal, skip the cheap
-    # local match and run full-map global_localize immediately.
+    # When navigation reports this many recoveries on the active goal, skip the
+    # cheap local match and run full-map global_localize immediately.
     periodic_relocalize_nav_recoveries_threshold: int = 2
     periodic_relocalize_full_map_on_low_quality: bool = True
     periodic_relocalize_during_navigation: bool = True
@@ -815,10 +746,13 @@ class SlamConfig:
         slam_backend = str(
             d.get("slam_backend", SLAM_BACKEND_BUILTIN) or SLAM_BACKEND_BUILTIN
         )
+        if slam_backend == SLAM_BACKEND_TOOLBOX:
+            raise ValueError(
+                f"slam_backend={slam_backend!r} is no longer supported. {_ROS_REMOVED_HINT}"
+            )
         if slam_backend not in SLAM_BACKENDS:
             raise ValueError(
-                f"slam_backend must be one of {sorted(SLAM_BACKENDS)}, "
-                f"got {slam_backend!r}"
+                f"slam_backend must be {SLAM_BACKEND_BUILTIN!r}, got {slam_backend!r}"
             )
         if sim.enabled and slam_backend != SLAM_BACKEND_BUILTIN:
             raise ValueError(
@@ -1261,7 +1195,7 @@ class SlamConfig:
         return self.slam_backend == SLAM_BACKEND_BUILTIN
 
     def uses_slam_toolbox(self) -> bool:
-        return self.slam_backend == SLAM_BACKEND_TOOLBOX
+        return False
 
 
 @dataclass
@@ -1277,7 +1211,7 @@ class NavConfig:
     acc_lim_theta: float = 2.0
     inflation_radius: float = 0.25
     cmd_vel_timeout: float = 2.0  # seconds (watchdog)
-    # Reactive obstacle avoidance for simple (non-Nav2) go_to_* motion.
+    # Reactive obstacle avoidance for simple go_to_* motion.
     simple_avoid_obstacles: bool = True
     simple_stop_distance: float = 0.4  # meters: stop forward + turn away inside this
     simple_slow_distance: float = 1.0  # meters: scale speed down inside this
@@ -1285,16 +1219,11 @@ class NavConfig:
     # rosbridge lidar reads; too small makes avoidance fail closed (no drive).
     simple_scan_max_age: float = 2.0
     # Optional stiction floors (m/s and rad/s) for simple go_to_* motion only.
-    # Nav2 cmd_vel is never floored: independently bumping its linear and angular
-    # components distorts MPPI curvature and turns gentle corrections into loops.
-    # Not the Nav2 ``min_vel_x`` param (reverse speed limit).
     min_cmd_vel_x: float = 0.0
     min_cmd_vel_theta: float = 0.0
-    # Default: in-module planner/controller. Set to "nav2" to keep ROS Nav2.
+    # Builtin navigator only.
     nav_backend: str = NAV_BACKEND_BUILTIN
     builtin: BuiltinNavConfig = field(default_factory=BuiltinNavConfig)
-    nav2: Nav2Config = field(default_factory=Nav2Config)
-    nav2_params: Mapping = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "NavConfig":
@@ -1302,9 +1231,13 @@ class NavConfig:
         if kinematics not in KINEMATICS:
             raise ValueError(f"kinematics must be one of {sorted(KINEMATICS)}")
         backend = str(d.get("nav_backend", NAV_BACKEND_BUILTIN) or NAV_BACKEND_BUILTIN)
+        if backend == NAV_BACKEND_NAV2:
+            raise ValueError(
+                f"nav_backend={backend!r} is no longer supported. {_ROS_REMOVED_HINT}"
+            )
         if backend not in NAV_BACKENDS:
             raise ValueError(
-                f"nav_backend must be one of {sorted(NAV_BACKENDS)}, got {backend!r}"
+                f"nav_backend must be {NAV_BACKEND_BUILTIN!r}, got {backend!r}"
             )
         return cls(
             slam_service=d["slam_service"],
@@ -1331,15 +1264,13 @@ class NavConfig:
             ),
             nav_backend=backend,
             builtin=BuiltinNavConfig.from_dict(d.get("builtin", {}) or {}),
-            nav2=Nav2Config.from_dict(d.get("nav2", {}) or {}),
-            nav2_params=d.get("nav2_params", {}) or {},
         )
 
     def uses_builtin_nav(self) -> bool:
-        return self.nav_backend == NAV_BACKEND_BUILTIN
+        return True
 
     def uses_nav2(self) -> bool:
-        return self.nav_backend == NAV_BACKEND_NAV2
+        return False
 
     def required_dependencies(self) -> List[str]:
         return [self.slam_service, self.base]
@@ -1349,10 +1280,10 @@ class NavConfig:
 class ExternalNavConfig:
     """Config for ``viam-labs:nav-stack:navigation-external``.
 
-    Drives Nav2 from an arbitrary Viam ``rdk:service:slam`` (not the built-in
-    slam_toolbox). One flat attributes block yields both a sensor-bridge
-    ``SlamConfig`` (base, lidars, movement sensor, odom tuning) and a ``NavConfig``
-    (Nav2 + navigation behavior); ``slam_service`` names the SLAM dependency.
+    Drives builtin navigation from an arbitrary Viam ``rdk:service:slam``.
+    One flat attributes block yields both a sensor ``SlamConfig`` (base, lidars,
+    movement sensor, odom tuning) and a ``NavConfig``; ``slam_service`` names the
+    SLAM dependency.
     """
 
     slam_service: str
@@ -1375,7 +1306,7 @@ class ExternalNavConfig:
         )
 
     def required_dependencies(self) -> List[str]:
-        # Union of Nav2 deps (slam_service, base) and bridge deps (base, lidars,
+        # Union of nav deps (slam_service, base) and sensor deps (base, lidars,
         # movement/heading sensors), de-duplicated preserving order.
         deps = [*self.nav.required_dependencies(), *self.bridge.required_dependencies()]
         return list(dict.fromkeys(deps))
@@ -1385,10 +1316,10 @@ class ExternalNavConfig:
 class NavCameraConfig:
     """Config for ``viam-labs:nav-stack:nav-camera``.
 
-    A visualization camera that renders the running navigation service's Nav2
+    A visualization camera that renders the running navigation service's
     global costmap with the active plan(s), robot pose, footprint and goal
     overlaid. ``navigation`` names the ``navigation`` / ``navigation-external``
-    service whose in-process bridge supplies the data.
+    service whose in-process viz store supplies the data.
     """
 
     navigation: str
@@ -1437,5 +1368,5 @@ class NavCameraConfig:
 
     def required_dependencies(self) -> List[str]:
         # Depend on the navigation service so Viam constructs it (and registers
-        # its bridge) before this camera.
+        # its viz store) before this camera.
         return [self.navigation]

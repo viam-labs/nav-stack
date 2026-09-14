@@ -1,4 +1,4 @@
-"""Duck-typed RosManager stand-in for ``slam_backend: builtin``."""
+"""Duck-typed SLAM host for ``slam_backend: builtin``."""
 from __future__ import annotations
 
 import math
@@ -11,7 +11,7 @@ from .engine import BuiltinSlamEngine
 
 
 class BuiltinSlamHost:
-    """SLAM surface used by ``RosSlam`` when there is no slam_toolbox/ROS.
+    """SLAM surface used by ``RosSlam`` for builtin occupancy mapping.
 
     Implements the methods ``slam.py`` calls on ``runtime.manager`` /
     ``manager.node``. ``node`` is self (same object) so
@@ -31,7 +31,7 @@ class BuiltinSlamHost:
     def engine(self) -> BuiltinSlamEngine:
         return self._engine
 
-    # -- RosManager-like -----------------------------------------------------
+    # -- Lifecycle ------------------------------------------------------------
     def start(self, io_provider=None, loop=None) -> None:
         del io_provider, loop
         self._engine.start()
@@ -116,7 +116,9 @@ class BuiltinSlamHost:
 
     def slam_diagnostics(self) -> Dict:
         d = self._engine.diagnostics()
-        d["slam_toolbox_lifecycle"] = "n/a"
+        d["slam_backend"] = SLAM_BACKEND_BUILTIN
+        d["slam_toolbox_lifecycle"] = "n/a"  # legacy key; always n/a for builtin
+
         d["bridge"] = {"ok": True, "slam_backend": SLAM_BACKEND_BUILTIN}
         return d
 

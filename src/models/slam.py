@@ -1,8 +1,7 @@
 """SLAM service model: ``viam-labs:nav-stack:slam``.
 
-Wraps slam_toolbox (via the ROS manager/bridge) to provide mapping and
-localization for any Viam base, and exposes the standard Viam SLAM service API plus
-map-management / mode / initial-pose commands through ``DoCommand``.
+Builtin occupancy SLAM on any Viam base. Exposes the standard Viam SLAM service
+API plus map-management / mode / initial-pose commands through ``DoCommand``.
 """
 from __future__ import annotations
 
@@ -71,7 +70,7 @@ class RosSlam(SLAM):
     def __init__(self, name: str):
         super().__init__(name)
         self._cfg: Optional[SlamConfig] = None
-        # RosManager (slam_toolbox) or BuiltinSlamHost (builtin).
+        # BuiltinSlamHost.
         self._manager = None
         self._engine: Optional[BuiltinSlamEngine] = None
         self._map_store: Optional[MapStore] = None
@@ -174,57 +173,42 @@ class RosSlam(SLAM):
 
         loop = asyncio.get_event_loop()
         sim_sensors = None
-        if cfg.uses_builtin_slam():
-            if cfg.uses_sim():
-                from ..sim import SimSensors, ensure_sim_world_from_slam_cfg
+        if cfg.uses_sim():
+            from ..sim import SimSensors, ensure_sim_world_from_slam_cfg
 
-                world = ensure_sim_world_from_slam_cfg(cfg)
-                sensors = SimSensors(world)
-                sim_sensors = sensors
-            else:
-                odom_reader = self._make_typed_odom_reader()
-                sensors = BuiltinSensors(
-                    cfg=cfg,
-                    cameras=self._cameras,
-                    movement_sensor=self._movement_sensor,
-                    heading_sensor=self._heading_sensor,
-                    shm_lidar=self._shm_lidar,
-                    loop=loop,
-                    logger=LOGGER.info,
-                    skip_get_laser_scan=self._skip_get_laser_scan,
-                    scan_max_age_s=float(cfg.scan_max_age_s or 2.0),
-                    odom_reader=odom_reader,
-                )
-            self._engine = BuiltinSlamEngine(
-                cfg, sensors, self._map_store, logger=LOGGER.info
-            )
-            if cfg.uses_sim():
-                # SimWorld is ground truth: SLAM pose tracks the body each tick.
-                # Do not teleport the body when localize jumps the estimate —
-                # that caused OOB freezes and big visible jumps.
-                seed = conv.Pose2D(
-                    cfg.sim.seed_x, cfg.sim.seed_y, cfg.sim.seed_theta
-                )
-                self._engine.set_pose(seed)
-            self._manager = BuiltinSlamHost(self._engine)
-            self._manager.start()
-            self._start_mode(cfg.mode)
-            self._wire_still_keyframe_hook()
-            backend = "builtin+sim" if cfg.uses_sim() else "builtin"
+            world = ensure_sim_world_from_slam_cfg(cfg)
+            sensors = SimSensors(world)
+            sim_sensors = sensors
         else:
-            from ..ros.availability import require_rclpy
-            from ..ros.manager import RosManager
-
-            require_rclpy("slam_backend=slam_toolbox")
-            self._manager = RosManager(cfg, logger=LOGGER)
-            self._manager.start(self._build_io(), loop)
-            # _build_io before start has no bridge node yet; rewire so drive/stop
-            # can record cmd_vel into get_status.
-            if self._manager.node is not None:
-                self._manager.node._io = self._build_io()
-            self._start_mode(cfg.mode)
-            self._wire_still_keyframe_hook()
-            backend = "slam_toolbox"
+            odom_reader = self._make_typed_odom_reader()
+            sensors = BuiltinSensors(
+                cfg=cfg,
+                cameras=self._cameras,
+                movement_sensor=self._movement_sensor,
+                heading_sensor=self._heading_sensor,
+                shm_lidar=self._shm_lidar,
+                loop=loop,
+                logger=LOGGER.info,
+                skip_get_laser_scan=self._skip_get_laser_scan,
+                scan_max_age_s=float(cfg.scan_max_age_s or 2.0),
+                odom_reader=odom_reader,
+            )
+        self._engine = BuiltinSlamEngine(
+            cfg, sensors, self._map_store, logger=LOGGER.info
+        )
+        if cfg.uses_sim():
+            # SimWorld is ground truth: SLAM pose tracks the body each tick.
+            # Do not teleport the body when localize jumps the estimate —
+            # that caused OOB freezes and big visible jumps.
+            seed = conv.Pose2D(
+                cfg.sim.seed_x, cfg.sim.seed_y, cfg.sim.seed_theta
+            )
+            self._engine.set_pose(seed)
+        self._manager = BuiltinSlamHost(self._engine)
+        self._manager.start()
+        self._start_mode(cfg.mode)
+        self._wire_still_keyframe_hook()
+        backend = "builtin+sim" if cfg.uses_sim() else "builtin"
 
         self._schedule_startup_global_localize(loop)
         self._schedule_periodic_relocalize(loop)
@@ -1490,7 +1474,7 @@ class RosSlam(SLAM):
     async def _probe_sensors(self) -> dict:
         """One-shot lidar + odom read for get_status (does not affect /scan)."""
         assert self._cfg is not None
-        if self._cfg.uses_builtin_slam() and self._engine is not None:
+        if self._engine is not None:
             return await self._probe_sensors_builtin()
         io = self._build_io()
         lidars: list[dict] = []
@@ -2206,7 +2190,7 @@ class RosSlam(SLAM):
         live = node.get_map()
         if live is None:
             raise RuntimeError(
-                "no occupancy map available; save the map or wait for /map from slam_toolbox"
+                "no occupancy map available; save the map or wait for mapping to produce a grid"
             )
         return load_occupancy_from_bridge_map(live), "live"
 

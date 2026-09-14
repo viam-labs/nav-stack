@@ -147,11 +147,8 @@ def test_builtin_nav_host_status():
     nav = make_builtin_navigator(world, cfg)
     host = BuiltinNavHost(nav, world, viz, nav_cfg=cfg)
     assert host.nav_backend() == "builtin"
-    assert host.nav_action_ready() is True
     status = host.nav_status()
     assert status["nav_backend"] == "builtin"
-    diag = host.nav2_diagnostics()
-    assert diag["nav2_processes_running"] is False
 
 
 def test_viam_world_io_prefers_shm_scan():

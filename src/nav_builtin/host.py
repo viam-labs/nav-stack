@@ -1,4 +1,4 @@
-"""Duck-typed RosManager stand-in for ROS-free builtin navigation."""
+"""Duck-typed nav host for builtin navigation."""
 from __future__ import annotations
 
 from typing import Dict, Optional
@@ -70,11 +70,11 @@ def make_builtin_navigator(
 
 
 class BuiltinNavHost:
-    """Nav surface used by ``NavServiceBase`` when there is no ROS/RosManager.
+    """Nav surface used by ``NavServiceBase`` for builtin navigation.
 
     Implements the methods ``nav_core`` calls on ``runtime.manager`` for
-    navigate / plan / pose / scan / status. ``node`` is None (zones / Nav2
-    filters are not published).
+    navigate / plan / pose / scan / status. ``node`` is None (no zone filter
+    publisher).
     """
 
     def __init__(
@@ -103,27 +103,8 @@ class BuiltinNavHost:
             self._world, nav_cfg, logger=self._builtin_nav._logger  # noqa: SLF001
         )
 
-    def ensure_nav2(self, nav_cfg: NavConfig, params_path) -> None:
-        del params_path
-        self.set_nav_config(nav_cfg)
-
-    def ensure_nav2_async(self, nav_cfg: NavConfig, params_path) -> None:
-        self.ensure_nav2(nav_cfg, params_path)
-
-    def stop_nav2(self) -> None:
-        self._builtin_nav.cancel()
-
     def nav_backend(self) -> str:
         return NAV_BACKEND_BUILTIN
-
-    def nav2_running(self) -> bool:
-        return False
-
-    def nav2_startup_in_progress(self) -> bool:
-        return False
-
-    def nav_action_ready(self) -> bool:
-        return True
 
     def navigate(self, x: float, y: float, theta: float) -> None:
         self._abort_slam_background_localize()
@@ -169,17 +150,6 @@ class BuiltinNavHost:
             status["pose_source"] = src()
         return status
 
-    def nav2_diagnostics(self, fast: bool = False) -> Dict:
-        del fast
-        return {
-            "nav_backend": NAV_BACKEND_BUILTIN,
-            "nav2_processes_running": False,
-            "nav2_startup_in_progress": False,
-            "nav_action_ready": True,
-            "core_nodes_present": True,
-            "missing_core_nodes": [],
-        }
-
     def get_pose_in_map(self) -> Optional[conv.Pose2D]:
         return self._world.get_pose()
 
@@ -194,7 +164,7 @@ class BuiltinNavHost:
         origin_x: float,
         origin_y: float,
     ) -> None:
-        # Builtin costmap does not consume Nav2 keepout/speed topics yet.
+        # Builtin costmap does not consume keepout/speed zone masks yet.
         del keepout_mask, speed_mask, resolution, origin_x, origin_y
 
     def shutdown(self) -> None:

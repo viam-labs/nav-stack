@@ -5,21 +5,8 @@ surface, shared :class:`~.nav_core.NavServiceBase`), but instead of borrowing
 the built-in SLAM model's in-process runtime it drives navigation from an
 **arbitrary Viam ``rdk:service:slam``** dependency.
 
-Default ``nav_backend`` is ``builtin``. In that mode there is **no ROS**: map
-and pose come from the SLAM service (``get_grid`` / ``GetPosition``), scans from
-lidar cameras, and drive from ``Base.SetVelocity``.
-
-With ``nav_backend: nav2`` it stands up its own ROS runtime:
-
-* a :class:`~..ros.manager.RosManager` that runs the sensor bridge (lidars ->
-  ``/scan``, movement sensor -> ``/odom`` + ``odom->base_link`` TF) but **not**
-  slam_toolbox, and
-* an :class:`~..ros.external_slam.ExternalSlamPublisher` (started by the bridge
-  when given ``external_slam``) that republishes the Viam SLAM service's pose and
-  occupancy grid as ``map->odom`` + ``/map``.
-
-Odometry (Nav2 path only) is read through the portable typed MovementSensor API
-(:class:`~..ros.odom_source.TypedMovementSensorOdom`).
+ROS-free: map and pose come from the SLAM service (``get_grid`` / ``GetPosition``),
+scans from lidar cameras / shm, and drive from ``Base.SetVelocity``.
 """
 from __future__ import annotations
 
@@ -30,7 +17,6 @@ from typing_extensions import Self
 
 from viam.components.base import Base
 from viam.components.camera import Camera
-from viam.components.movement_sensor import MovementSensor
 from viam.logging import getLogger
 from viam.proto.app.robot import ServiceConfig
 from viam.proto.common import ResourceName
@@ -52,10 +38,8 @@ from ..nav_builtin import (
 from ..ros.shm_lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
-    register_bridge,
     register_nav_host,
     register_nav_viz,
-    unregister_bridge,
     unregister_nav_host,
     unregister_nav_viz,
 )
@@ -99,7 +83,6 @@ class RosNavigationExternal(NavServiceBase):
     def _teardown(self) -> None:
         if self._simple_nav_cancel is not None:
             self._simple_nav_cancel.set()
-        unregister_bridge(self.name)
         unregister_nav_viz(self.name)
         unregister_nav_host(self.name)
         if self._manager is not None:
@@ -136,11 +119,7 @@ class RosNavigationExternal(NavServiceBase):
         map_store.get_or_create_map(active)
         map_store.set_active_map(active)
 
-        if ext.nav.uses_builtin_nav():
-            self._configure_builtin(ext, slam, cameras, map_store)
-            return
-
-        self._configure_nav2(ext, slam, cameras, map_store, dependencies)
+        self._configure_builtin(ext, slam, cameras, map_store)
 
     def _configure_builtin(
         self,
@@ -183,110 +162,8 @@ class RosNavigationExternal(NavServiceBase):
         self._refresh_zone_masks()
         LOGGER.info(
             f"nav-stack navigation-external '{self.name}' configured "
-            f"({ext.nav.kinematics}, nav_backend=builtin, ROS-free) against "
+            f"({ext.nav.kinematics}, nav_backend=builtin) against "
             f"SLAM service {ext.slam_service!r}"
-        )
-
-    def _configure_nav2(
-        self,
-        ext: ExternalNavConfig,
-        slam,
-        cameras: dict,
-        map_store: MapStore,
-        dependencies: Mapping[ResourceName, ResourceBase],
-    ) -> None:
-        from ..ros.availability import require_rclpy
-        from ..ros.manager import RosManager
-        from ..ros.odom_source import TypedMovementSensorOdom, TypedOdomConfig
-        from ..ros.sensor_io import build_io_provider
-
-        require_rclpy("navigation-external nav_backend=nav2")
-        bridge_cfg = ext.bridge
-        movement_sensor = (
-            cast(
-                MovementSensor,
-                dependencies[MovementSensor.get_resource_name(bridge_cfg.movement_sensor)],
-            )
-            if bridge_cfg.movement_sensor
-            else None
-        )
-        heading_sensor = (
-            cast(
-                MovementSensor,
-                dependencies[MovementSensor.get_resource_name(bridge_cfg.heading_sensor)],
-            )
-            if bridge_cfg.heading_sensor
-            else None
-        )
-        odom_reader = (
-            TypedMovementSensorOdom(
-                movement_sensor,
-                TypedOdomConfig(
-                    trust_pose=ext.trust_movement_sensor_pose,
-                    snap_heading=ext.snap_heading,
-                    velocity_convention=bridge_cfg.base_velocity_convention,
-                ),
-                logger=LOGGER,
-            )
-            if movement_sensor is not None
-            else None
-        )
-        io = build_io_provider(
-            base=self._base,
-            cameras=cameras,
-            cfg=bridge_cfg,
-            movement_sensor=movement_sensor,
-            heading_sensor=heading_sensor,
-            skip_get_laser_scan=set(),
-            odom_reader=odom_reader,
-            logger=LOGGER,
-            shm_lidar=self._shm_lidar,
-        )
-
-        self._manager = RosManager(bridge_cfg, logger=LOGGER, external_slam=slam)
-        loop = asyncio.get_event_loop()
-        self._manager.start(io, loop, nav_cfg=ext.nav)
-        node = self._manager.node
-        if node is not None:
-            node._io = build_io_provider(
-                base=self._base,
-                cameras=cameras,
-                cfg=bridge_cfg,
-                movement_sensor=movement_sensor,
-                heading_sensor=heading_sensor,
-                skip_get_laser_scan=set(),
-                odom_reader=odom_reader,
-                logger=LOGGER,
-                record_cmd_vel=node.record_cmd_vel,
-                shm_lidar=self._shm_lidar,
-            )
-
-        loc_check = (
-            node._external.localization_check
-            if node is not None and node._external is not None
-            else {"status": "unknown"}
-        )
-        self._runtime = SlamRuntime(
-            self._manager,
-            map_store,
-            bridge_cfg,
-            loc_check,
-            cameras=cameras,
-            shm_lidar=self._shm_lidar,
-        )
-        register_bridge(
-            self.name,
-            lambda: self._manager.node if self._manager is not None else None,
-        )
-
-        self._manager.set_nav_config(ext.nav)
-        params_path = self._write_nav2_params(ext.nav)
-        self._manager.ensure_nav2_async(ext.nav, params_path)
-        self._refresh_zone_masks()
-        LOGGER.info(
-            f"nav-stack navigation-external '{self.name}' configured "
-            f"({ext.nav.kinematics}, nav_backend=nav2) against "
-            f"SLAM service {ext.slam_service!r}; Nav2 starting in background"
         )
 
     async def close(self) -> None:

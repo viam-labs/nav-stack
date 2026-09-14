@@ -9,7 +9,6 @@ import pytest
 
 from src.config import (
     SLAM_BACKEND_BUILTIN,
-    SLAM_BACKEND_TOOLBOX,
     SlamConfig,
 )
 from src.nav.maps import MapStore
@@ -33,11 +32,10 @@ def test_slam_backend_default_is_builtin():
 
 
 def test_slam_backend_toolbox_and_invalid():
-    cfg = SlamConfig.from_dict(
-        {"base": "b", "lidar": "front", "slam_backend": "slam_toolbox"}
-    )
-    assert cfg.slam_backend == SLAM_BACKEND_TOOLBOX
-    assert cfg.uses_slam_toolbox()
+    with pytest.raises(ValueError, match="pre-ros-removal|slam_toolbox"):
+        SlamConfig.from_dict(
+            {"base": "b", "lidar": "front", "slam_backend": "slam_toolbox"}
+        )
     with pytest.raises(ValueError, match="slam_backend"):
         SlamConfig.from_dict(
             {"base": "b", "lidar": "front", "slam_backend": "cartographer"}

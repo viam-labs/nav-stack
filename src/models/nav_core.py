@@ -1,24 +1,20 @@
-"""Shared navigation-service core for the nav-stack Nav2 models.
+"""Shared navigation-service core for the nav-stack models.
 
-Both navigation models — the built-in ``viam-labs:nav-stack:navigation`` (which
-borrows the SLAM model's in-process ROS runtime) and the external-SLAM
-``viam-labs:nav-stack:navigation-external`` (which builds its own runtime around
-an arbitrary ``rdk:service:slam`` dependency) — share the Motion API
-(``MoveOnMap`` / plan queries), the full DoCommand surface, Nav2 params
-generation, and simple closed-loop motion. That logic lives here in
-``NavServiceBase``; the concrete models differ only in how they obtain a
-``SlamRuntime`` (``_resolve_runtime``) and how they stand it up (``reconfigure``).
+Both navigation models — ``viam-labs:nav-stack:navigation`` (borrows the SLAM
+model's in-process runtime) and ``viam-labs:nav-stack:navigation-external``
+(builds its own runtime around an arbitrary ``rdk:service:slam``) — share the
+Motion API (``MoveOnMap`` / plan queries), DoCommand surface, and simple
+closed-loop motion. That logic lives here in ``NavServiceBase``; the concrete
+models differ only in how they obtain a ``SlamRuntime`` (``_resolve_runtime``)
+and how they stand it up (``reconfigure``).
 """
 from __future__ import annotations
 
 import asyncio
 import math
-import os
-import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import List, Mapping, Optional, Sequence
 
 from google.protobuf.timestamp_pb2 import Timestamp
@@ -50,7 +46,7 @@ from viam.proto.service.motion import (
 from viam.services.motion import Motion
 from viam.utils import ValueTypes
 
-from ..config import OMNI, Nav2Config, NavConfig, ros_twist_to_viam_set_velocity
+from ..config import NavConfig, ros_twist_to_viam_set_velocity
 from ..nav import zones as zones_mod
 from ..nav.locations import LocationStore
 from ..nav.maps import MapHandle
@@ -66,13 +62,6 @@ from ..nav.zones import ZoneStore
 from ..ros import conversions as conv
 
 LOGGER = getLogger(__name__)
-
-_PARAMS_TEMPLATE = Path(__file__).resolve().parent.parent.parent / "params" / "nav2_params.yaml"
-_BT_FALLBACK = (
-    Path(__file__).resolve().parent.parent.parent
-    / "params"
-    / "navigate_to_pose_w_replanning_and_recovery.xml"
-)
 
 _TERMINAL_PLAN_STATES = frozenset(
     {
@@ -127,7 +116,7 @@ class _SuspendedNav:
     y: float
     theta: float
     name: Optional[str] = None
-    motion: str = "nav2"  # "nav2" | "simple"
+    motion: str = "builtin"  # "builtin" | "simple"
     reason: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -145,7 +134,7 @@ class _SuspendedNav:
 
 
 class NavServiceBase(Motion):
-    """Runtime-agnostic Nav2 orchestration shared by the navigation models.
+    """Runtime-agnostic navigation orchestration shared by the navigation models.
 
     Subclasses must implement :meth:`_resolve_runtime` (return the active
     ``SlamRuntime`` or ``None``) and :meth:`reconfigure`.
@@ -164,7 +153,6 @@ class NavServiceBase(Motion):
         self._plan_status_history: List[PlanStatusWithID] = []
         self._logged_motion_ignored: bool = False
         self._last_preview_plan: Optional[dict] = None
-        self._last_mppi_profile: dict = {}
         # Set by ``suspend``; cleared by ``resume``, ``cancel``, ``stop_plan``,
         # or any new navigate / MoveOnMap / simple go.
         self._suspended: Optional[_SuspendedNav] = None
@@ -250,7 +238,7 @@ class NavServiceBase(Motion):
         if (obstacles or configuration) and not self._logged_motion_ignored:
             LOGGER.info(
                 "MoveOnMap obstacles/configuration are ignored in v1 "
-                "(Nav2 costmaps still use live lidar)"
+                "(costmaps still use live lidar)"
             )
             self._logged_motion_ignored = True
 
@@ -258,7 +246,7 @@ class NavServiceBase(Motion):
         runtime = self._require_runtime()
         mgr = runtime.manager
 
-        # Preview-only: plan with Nav2's ComputePathToPose, do not drive.
+        # Preview-only: plan a path, do not drive.
         extra = extra or {}
         if bool(extra.get("preview") or extra.get("plan_only")):
             preview = await asyncio.to_thread(
@@ -449,7 +437,7 @@ class NavServiceBase(Motion):
         if execution is None:
             return
         if execution.state == PlanState.PLAN_STATE_STOPPED:
-            # Explicit stop_plan / superseded — do not overwrite from Nav2.
+            # Explicit stop_plan / superseded — do not overwrite from live nav.
             self._upsert_plan_status_history(execution)
             return
         try:
@@ -495,76 +483,6 @@ class NavServiceBase(Motion):
             )
         )
 
-    # -- nav2 params ---------------------------------------------------------
-    def _write_nav2_params(self, cfg: NavConfig) -> Path:
-        try:
-            import yaml
-        except Exception as exc:  # pragma: no cover
-            raise RuntimeError("PyYAML required to generate Nav2 params") from exc
-
-        with open(_PARAMS_TEMPLATE) as fh:
-            params = yaml.safe_load(fh)
-
-        overrides = {
-            "robot_radius": cfg.robot_radius,
-            "inflation_radius": cfg.inflation_radius,
-            "max_vel_x": cfg.max_vel_x,
-            "max_vel_y": cfg.max_vel_y if cfg.kinematics == OMNI else 0.0,
-            "max_vel_theta": cfg.max_vel_theta,
-            "min_vel_x": -cfg.max_vel_x,
-            "min_vel_y": -cfg.max_vel_y if cfg.kinematics == OMNI else 0.0,
-            "acc_lim_x": cfg.acc_lim_x,
-            "acc_lim_theta": cfg.acc_lim_theta,
-            "holonomic_robot": cfg.kinematics == OMNI,
-            **cfg.nav2.to_override_dict(),
-        }
-        _apply_nav2_tuning(params, overrides)
-        _apply_velocity_limits(params, cfg)
-        user_params: dict = {}
-        if cfg.nav2_params:
-            user_params = _normalize_nav2_user_params(dict(cfg.nav2_params), params)
-            _deep_merge(params, user_params)
-            # User may override FollowPath.vx_min after our wiring; keep the
-            # smoother's reverse cap aligned so it cannot exceed MPPI again.
-            _sync_smoother_reverse_to_mppi(params)
-        # DiffDrive skid-steer cannot use stock MPPI — it converges to vx=0
-        # micro-yaw. Swap to Regulated Pure Pursuit; user_params re-merge on
-        # top so explicit nav2_params overrides survive the swap.
-        _apply_diffdrive_controller(params, cfg, user_params)
-        _apply_local_costmap_size(params, cfg.nav2)
-        _sync_mppi_model_dt(params)
-
-        runtime = self._resolve_runtime()
-        _set_obstacle_sources(params, len(runtime.slam_cfg.lidars))
-        runtime_dir = Path(runtime.slam_cfg.maps_dir).expanduser() / ".runtime"
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        # Small DiffDrive bases follow the path with a short lookahead, so raw
-        # NavFn grid zigzag feeds curvature noise straight into cmd_vel; run
-        # the path through smoother_server. Cart / omni BTs stay unchanged.
-        # NavigateRecovery retries come from nav2.navigate_recovery_retries
-        # (default 4) — BackUp/Spin/clear then replan when stuck near obstacles.
-        bt_path = _write_nav2_bt_xml(
-            runtime_dir,
-            cfg.nav2,
-            smooth_path=cfg.kinematics != OMNI and _is_small_base(cfg),
-        )
-        try:
-            bt_params = params.setdefault("bt_navigator", {}).setdefault(
-                "ros__parameters", {}
-            )
-            # Honor an explicit user BT path from nav2_params; otherwise point
-            # at the tuned tree generated from replan_frequency / recovery knobs.
-            if not bt_params.get("default_nav_to_pose_bt_xml"):
-                bt_params["default_nav_to_pose_bt_xml"] = str(bt_path)
-        except (AttributeError, TypeError):
-            pass
-        _validate_nav2_params_structure(params)
-        out = runtime_dir / "nav2_params.yaml"
-        with open(out, "w") as fh:
-            yaml.safe_dump(params, fh, sort_keys=False)
-        self._last_mppi_profile = _mppi_profile_snapshot(params)
-        return out
-
     # -- store helpers -------------------------------------------------------
     def _active_handle(self) -> MapHandle:
         runtime = self._require_runtime()
@@ -583,7 +501,7 @@ class NavServiceBase(Motion):
         runtime = self._require_runtime()
         node = getattr(runtime.manager, "node", None)
         if node is None:
-            # Builtin / ROS-free host: no Nav2 costmap filters to publish into.
+            # Builtin host: no costmap-filter publisher.
             return
         grid = node.get_map() if node else None
         if not grid:
@@ -664,10 +582,8 @@ class NavServiceBase(Motion):
             return {"status": "deleted"}
 
         # -- navigation --
-        # navigate/cancel/status run ros2 CLI subprocesses and TF waits (seconds
-        # on a Pi). They must not run on the module event loop: the bridge
-        # marshals odom/lidar reads and cmd_vel onto this loop, so blocking here
-        # stalls TF/scans (Nav2 extrapolation errors) and deadlocks stop_base.
+        # navigate/cancel/status may block (planning / drive). Keep them off the
+        # module event loop so Base.SetVelocity and sensor reads stay responsive.
         if cmd == "navigate_to_location":
             loc = self._locations().get(str(command["name"]))
             self._suspended = None
@@ -758,13 +674,12 @@ class NavServiceBase(Motion):
         if cmd in ("get_status", "describe_motion", "what_am_i_doing"):
             def _status():
                 status = mgr.nav_status()
-                status.update(mgr.nav2_diagnostics())
                 simple = dict(self._simple_nav_status)
                 status["simple_nav"] = simple
                 if simple.get("state") == "active":
                     status["active"] = True
                     status["motion"] = "simple"
-                    # Prefer simple-nav target when active (Nav2 goal may be stale).
+                    # Prefer simple-nav target when active (builtin goal may be stale).
                     target = simple.get("target")
                     if isinstance(target, dict):
                         status["goal"] = dict(target)
@@ -774,7 +689,6 @@ class NavServiceBase(Motion):
                     goal["name"] = self._active_goal_name
                     status["goal"] = goal
                 status["localization_check"] = dict(runtime.localization_check)
-                status["mppi_profile"] = dict(self._last_mppi_profile)
                 suspended = self._suspended
                 status["suspended"] = suspended is not None
                 status["suspended_goal"] = (
@@ -791,42 +705,10 @@ class NavServiceBase(Motion):
                 max_vel_x=float(cfg.max_vel_x),
                 max_vel_theta=float(cfg.max_vel_theta),
             )
-        if cmd == "start_nav2":
-            cfg = self._require_cfg()
-            if cfg.uses_builtin_nav():
-                return {
-                    "status": "skipped",
-                    "reason": "nav_backend is builtin; set nav_backend: nav2 to use Nav2",
-                    "nav_backend": cfg.nav_backend,
-                }
-            runtime.manager.set_nav_config(cfg)
-            params_path = self._write_nav2_params(cfg)
-            await asyncio.to_thread(runtime.manager.ensure_nav2, cfg, params_path)
-            return {"status": "nav2_started", **runtime.manager.nav2_diagnostics()}
-        if cmd == "restart_nav2":
-            # Unconditional stop + start: guarantees regenerated params are
-            # loaded even when Nav2 currently looks healthy.
-            cfg = self._require_cfg()
-            if cfg.uses_builtin_nav():
-                return {
-                    "status": "skipped",
-                    "reason": "nav_backend is builtin; set nav_backend: nav2 to use Nav2",
-                    "nav_backend": cfg.nav_backend,
-                }
-            runtime.manager.set_nav_config(cfg)
-            params_path = self._write_nav2_params(cfg)
-
-            def _restart():
-                runtime.manager.stop_nav2()
-                runtime.manager.ensure_nav2(cfg, params_path)
-
-            await asyncio.to_thread(_restart)
-            return {"status": "nav2_restarted", **runtime.manager.nav2_diagnostics()}
-
         if cmd == "get_costmap":
             # Inflated costmap for operator UIs (nav-stack-ui Costmap toggle).
             # ``layer``: ``auto`` (local while navigating, else global), ``local``,
-            # or ``global``. Nav2 local costmap is reprojected from odom → map.
+            # or ``global``.
             from ..runtime import get_nav_view
 
             view = get_nav_view(self.name)
@@ -840,8 +722,6 @@ class NavServiceBase(Motion):
 
             def _fetch():
                 import time as _time
-
-                from ..ros.conversions import costmap_frame_to_map
 
                 if hasattr(view, "enable_viz"):
                     view.enable_viz(8)
@@ -865,18 +745,12 @@ class NavServiceBase(Motion):
                 if use_local:
                     local_cm = snap.get("local_costmap")
                     if local_cm is not None and local_cm.get("grid") is not None:
-                        if not cfg.uses_builtin_nav() and hasattr(
-                            view, "_lookup_map_to_odom"
-                        ):
-                            m2o = view._lookup_map_to_odom()
-                            if m2o is not None:
-                                local_cm = costmap_frame_to_map(local_cm, m2o)
                         cm = local_cm
                         layer_used = "local"
 
                 if cm is None:
                     cm = snap.get("costmap")
-                if cfg.uses_builtin_nav() and layer_used == "global":
+                if layer_used == "global":
                     now = _time.monotonic()
                     cached = self._builtin_costmap_cache
                     if (
@@ -897,17 +771,9 @@ class NavServiceBase(Motion):
                         except Exception:  # noqa: BLE001
                             mp = None
                     if mp is None or mp.get("grid") is None:
-                        # BuiltinNavHost / BridgeNode expose get_map directly.
                         if hasattr(runtime.manager, "get_map"):
                             try:
                                 mp = runtime.manager.get_map()
-                            except Exception:  # noqa: BLE001
-                                mp = None
-                        if (mp is None or mp.get("grid") is None) and hasattr(
-                            getattr(runtime.manager, "node", None), "get_map"
-                        ):
-                            try:
-                                mp = runtime.manager.node.get_map()
                             except Exception:  # noqa: BLE001
                                 mp = None
                     if mp is None or mp.get("grid") is None:
@@ -969,7 +835,7 @@ class NavServiceBase(Motion):
                 grid = grid[::stride, ::stride]
             height, width = int(grid.shape[0]), int(grid.shape[1])
             resolution = float(cm["resolution"]) * stride
-            # 255 = unknown (-1); 0 free; 1..100 cost (Nav2 OccupancyGrid convention).
+            # 255 = unknown (-1); 0 free; 1..100 cost.
             u8 = np.where(grid < 0, 255, np.clip(grid, 0, 100)).astype(np.uint8)
             return {
                 "available": True,
@@ -998,15 +864,21 @@ class NavServiceBase(Motion):
                 float(pose.get("theta", 0.0)),
             )
         # Default to the robot's current pose in the map.
-        node = runtime.manager.node
-        cur = node.get_pose_in_map() if node else None
+        mgr = runtime.manager
+        cur = None
+        getter = getattr(mgr, "get_pose_in_map", None)
+        if callable(getter):
+            cur = getter()
+        if cur is None:
+            node = getattr(mgr, "node", None)
+            cur = node.get_pose_in_map() if node else None
         if cur is None:
             raise RuntimeError("current pose unavailable; provide an explicit pose")
         return store.add(str(command["name"]), cur.x, cur.y, cur.theta)
 
     # -- suspend / resume (cancel + remembered goal) -------------------------
     def _snapshot_active_goal(self) -> Optional[_SuspendedNav]:
-        """Capture the in-flight Nav2 or simple-nav target, if any."""
+        """Capture the in-flight builtin or simple-nav target, if any."""
         name = self._active_goal_name
         simple = self._simple_nav_status
         if simple.get("state") == "active":
@@ -1035,7 +907,7 @@ class NavServiceBase(Motion):
                 y=float(goal["y"]),
                 theta=float(goal.get("theta", 0.0)),
                 name=name,
-                motion="nav2",
+                motion="builtin",
             )
 
         execution = self._plan_execution
@@ -1050,7 +922,7 @@ class NavServiceBase(Motion):
                 y=pose2d.y,
                 theta=pose2d.theta,
                 name=name,
-                motion="nav2",
+                motion="builtin",
             )
         return None
 
@@ -1071,7 +943,7 @@ class NavServiceBase(Motion):
                 "goal": self._suspended.to_dict(),
             }
         if snapshot is None:
-            raise ValueError("nothing to suspend (no active Nav2 or simple-nav goal)")
+            raise ValueError("nothing to suspend (no active builtin or simple-nav goal)")
 
         snapshot.reason = reason_s
         runtime = self._require_runtime()
@@ -1152,7 +1024,7 @@ class NavServiceBase(Motion):
             "execution_id": execution_id,
         }
 
-    # -- simple closed-loop navigation (map frame, no Nav2) ------------------
+    # -- simple closed-loop navigation (map frame) ---------------------------
     async def _start_simple_go(
         self,
         x: float,
@@ -1195,7 +1067,7 @@ class NavServiceBase(Motion):
         self._simple_nav_task = None
         self._simple_nav_cancel = None
         # Only zero the base when simple nav was actually running. Always
-        # stopping here races Nav2 SetVelocity and can wipe angular mid-turn.
+        # stopping here races builtin SetVelocity and can wipe angular mid-turn.
         if was_active or had_running_task:
             await self._stop_base()
         if was_active:
@@ -1270,7 +1142,7 @@ class NavServiceBase(Motion):
         }
 
     async def _plan_preview(self, command: Mapping, mgr) -> dict:
-        """Run Nav2 ComputePathToPose and cache the result for execute_plan."""
+        """Run path planning and cache the result for execute_plan."""
         from ..ros import conversions as conv
 
         x = float(command["x"])
@@ -1310,7 +1182,7 @@ class NavServiceBase(Motion):
         if base is None:
             raise RuntimeError("navigation base dependency missing")
 
-        # Stop any in-flight Nav2 goal; the caller has already canceled any
+        # Stop any in-flight builtin goal; the caller has already canceled any
         # previous simple-nav run (see _start_simple_go).
         await asyncio.to_thread(runtime.manager.cancel)
 
@@ -1320,7 +1192,7 @@ class NavServiceBase(Motion):
         motion_cfg = config_from_nav(
             max_vel_x=cfg.max_vel_x,
             max_vel_theta=cfg.max_vel_theta,
-            yaw_tolerance_rad=cfg.nav2.yaw_goal_tolerance,
+            yaw_tolerance_rad=cfg.builtin.yaw_goal_tolerance,
             min_linear_mps=cfg.min_cmd_vel_x,
             min_angular_rad_s=cfg.min_cmd_vel_theta,
         )
@@ -1411,632 +1283,3 @@ class NavServiceBase(Motion):
             if self._simple_nav_task is asyncio.current_task():
                 self._simple_nav_task = None
 
-
-# ---------------------------------------------------------------------------
-# Nav2 params generation helpers (pure functions, shared by both models)
-# ---------------------------------------------------------------------------
-def _find_template_section_paths(template: Mapping, key: str) -> list:
-    """Return paths to every nested mapping named ``key`` inside the template.
-
-    Used to relocate plugin-section overrides (e.g. ``FollowPath``,
-    ``inflation_layer``) that users put at the top level of ``nav2_params``.
-    """
-    paths: list = []
-
-    def _walk(node: Mapping, path: tuple) -> None:
-        for k, v in node.items():
-            if not isinstance(v, Mapping):
-                continue
-            if k == key:
-                paths.append(path + (k,))
-            else:
-                _walk(v, path + (k,))
-
-    _walk(template, ())
-    return paths
-
-
-def _coerce_types_to_template(user_node: dict, template_node: Mapping) -> None:
-    """Cast user override leaf types to match the template's declared types.
-
-    Viam config attributes arrive through protobuf Structs, which turn every
-    JSON number into a double. ROS 2 parameters are strictly typed, so a user
-    writing ``"default_server_timeout": 200`` produces ``200.0`` in the merged
-    YAML and the owning node dies at startup with "expected [integer] got
-    [double]". Wherever the template declares an integer at the same path,
-    whole-number floats are cast back to int (and ints are widened to float
-    where the template declares a double). Bools and non-integral floats are
-    left untouched; params absent from the template cannot be inferred.
-    """
-    for key, value in user_node.items():
-        tmpl = template_node.get(key)
-        if isinstance(value, dict) and isinstance(tmpl, Mapping):
-            _coerce_types_to_template(value, tmpl)
-            continue
-        if isinstance(value, bool) or isinstance(tmpl, bool):
-            continue
-        if isinstance(tmpl, int) and isinstance(value, float) and value.is_integer():
-            user_node[key] = int(value)
-        elif isinstance(tmpl, float) and isinstance(value, int):
-            user_node[key] = float(value)
-
-
-def _normalize_nav2_user_params(user_params: dict, template: Mapping) -> dict:
-    """Rewrite user ``nav2_params`` into the strict rcl-compatible structure.
-
-    Handles the two natural-but-invalid forms config authors write:
-
-    * node overrides missing the ``ros__parameters`` wrapper, e.g.
-      ``{"controller_server": {"max_vel_x": 1}}``
-    * plugin sections hoisted to the top level, e.g. ``{"FollowPath": {...}}``
-      which really lives at ``controller_server/ros__parameters/FollowPath``
-
-    Merging either form unfixed corrupts the generated params file and crashes
-    every Nav2 node at startup (rcl: "Cannot have a value before ros__parameters").
-
-    Leaf values are then type-coerced against the template (protobuf delivers
-    all numbers as doubles; ROS 2 params are strictly typed).
-    """
-    normalized: dict = {}
-    relocated: dict = {}
-    for key, value in user_params.items():
-        if not isinstance(value, Mapping):
-            normalized[key] = value
-            continue
-        value = dict(value)
-        template_node = template.get(key)
-        if template_node is None:
-            # Not a top-level node: relocate plugin sections (FollowPath,
-            # inflation_layer, ...) to wherever they live in the template.
-            section_paths = _find_template_section_paths(template, key)
-            if section_paths:
-                for path in section_paths:
-                    cursor = relocated
-                    for part in path[:-1]:
-                        cursor = cursor.setdefault(part, {})
-                    _deep_merge(
-                        cursor.setdefault(path[-1], {}), value
-                    )
-                continue
-            normalized[key] = value
-            continue
-        doubled = (
-            isinstance(template_node, Mapping) and key in template_node
-        )  # local_costmap/global_costmap use a doubled namespace
-        if doubled and "ros__parameters" not in value and key not in value:
-            value = {key: value}
-        inner_template = template_node.get(key) if doubled else template_node
-        target = value.get(key) if doubled and key in value else value
-        if (
-            isinstance(inner_template, Mapping)
-            and "ros__parameters" in inner_template
-            and isinstance(target, dict)
-            and "ros__parameters" not in target
-        ):
-            wrapped = {"ros__parameters": target}
-            if doubled:
-                value = {key: wrapped}
-            else:
-                value = wrapped
-        normalized[key] = value
-    if relocated:
-        _deep_merge(normalized, relocated)
-    _coerce_types_to_template(normalized, template)
-    return normalized
-
-
-def _validate_nav2_params_structure(params: Mapping) -> None:
-    """Reject param trees the rcl YAML parser would refuse to load.
-
-    Every top-level node entry must nest all values under ``ros__parameters``
-    (possibly through namespace dicts). Failing fast here surfaces the offending
-    key instead of letting every Nav2 server die at launch with a parse error.
-    """
-
-    def _check(node, path: str) -> None:
-        if not isinstance(node, Mapping):
-            raise ValueError(
-                f"invalid nav2_params: {path!r} must be a mapping that nests values "
-                "under 'ros__parameters'"
-            )
-        if "ros__parameters" in node:
-            extras = [k for k in node if k != "ros__parameters"]
-            if extras:
-                raise ValueError(
-                    f"invalid nav2_params: {path!r} has keys {extras} outside "
-                    "'ros__parameters'"
-                )
-            return
-        for key, value in node.items():
-            if not isinstance(value, Mapping):
-                raise ValueError(
-                    f"invalid nav2_params: value {path + '/' + str(key)!r} appears "
-                    "before 'ros__parameters'"
-                )
-            _check(value, path + "/" + str(key))
-
-    for top, value in params.items():
-        _check(value, str(top))
-
-
-def _sync_mppi_model_dt(params: dict) -> None:
-    """Keep MPPI ``model_dt`` >= the controller period (1/controller_frequency).
-
-    MPPI's on_configure() raises "Controller period more then model dt" when
-    1/controller_frequency > model_dt; that fails the controller_server
-    lifecycle transition and aborts the whole Nav2 bringup. Lowering
-    controller_frequency (e.g. 10 -> 5 Hz on a loaded Pi) without also raising
-    model_dt trips this. Snap model_dt up to the controller period so the two
-    can never drift out of sync, regardless of how the frequency was set
-    (top-level nav2 config or raw nav2_params override).
-    """
-    try:
-        cs = params["controller_server"]["ros__parameters"]
-        freq = float(cs["controller_frequency"])
-        fp = cs["FollowPath"]
-    except (KeyError, TypeError, ValueError):
-        return
-    if not isinstance(fp, dict) or freq <= 0:
-        return
-    if "nav2_mppi_controller" not in str(fp.get("plugin", "")):
-        return
-    period = 1.0 / freq
-    try:
-        current = float(fp.get("model_dt", 0.0))
-    except (TypeError, ValueError):
-        current = 0.0
-    if current < period:
-        fp["model_dt"] = period
-
-
-def _apply_local_costmap_size(params: dict, nav2_cfg: Nav2Config) -> None:
-    """Set rolling local costmap dimensions (Jazzy requires integer width/height)."""
-    try:
-        lc = params["local_costmap"]["local_costmap"]["ros__parameters"]
-    except (KeyError, TypeError):
-        return
-    lc["width"] = int(nav2_cfg.local_costmap_width)
-    lc["height"] = int(nav2_cfg.local_costmap_height)
-
-
-def _resolve_bt_template() -> Path:
-    """Prefer the distro-installed Nav2 BT; fall back to the shipped Jazzy copy."""
-    distro = os.environ.get("ROS_DISTRO", "").strip()
-    if distro:
-        candidate = Path(
-            f"/opt/ros/{distro}/share/nav2_bt_navigator/behavior_trees"
-            "/navigate_to_pose_w_replanning_and_recovery.xml"
-        )
-        if candidate.is_file():
-            return candidate
-    return _BT_FALLBACK
-
-
-def _inject_smooth_path_bt(text: str) -> str:
-    """Wrap the ``ComputePathToPose`` action with a ``SmoothPath`` step.
-
-    ``smoothed_path`` overwrites ``{path}`` in place; ``ForceSuccess`` keeps a
-    smoothing hiccup from failing navigation (the raw path is already on the
-    blackboard). Works on both the distro-installed tree and the shipped
-    fallback since both use a self-closing ``<ComputePathToPose .../>``.
-    """
-    if "<SmoothPath" in text:
-        return text
-    m = re.search(r"<ComputePathToPose\b[^>]*/>", text)
-    if m is None:
-        return text
-    smooth = (
-        '<SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" '
-        'smoother_id="simple_smoother" max_smoothing_duration="1.0" '
-        'check_for_collisions="false"/>'
-    )
-    wrapped = (
-        '<Sequence name="ComputeAndSmoothPath">'
-        f"{m.group(0)}<ForceSuccess>{smooth}</ForceSuccess>"
-        "</Sequence>"
-    )
-    return text[: m.start()] + wrapped + text[m.end():]
-
-
-def _tune_nav2_bt_xml(
-    text: str,
-    *,
-    replan_hz: float,
-    navigate_recovery_retries: int,
-    recovery_wait_duration: float,
-    smooth_path: bool = False,
-) -> str:
-    """Rewrite replan rate / recovery patience fields in a Nav2 BT XML string."""
-    hz = max(0.1, float(replan_hz))
-    retries = max(0, int(navigate_recovery_retries))
-    wait_s = max(0.0, float(recovery_wait_duration))
-    if smooth_path:
-        text = _inject_smooth_path_bt(text)
-    text = re.sub(
-        r'(RateController\s+hz=")[^"]+(")',
-        rf"\g<1>{hz:.1f}\g<2>",
-        text,
-        count=1,
-    )
-    text = re.sub(
-        r'(RecoveryNode\s+number_of_retries=")[^"]+("\s+name="NavigateRecovery")',
-        rf"\g<1>{retries}\g<2>",
-        text,
-        count=1,
-    )
-    text = re.sub(
-        r'(Wait\s+wait_duration=")[^"]+(")',
-        rf"\g<1>{wait_s:.1f}\g<2>",
-        text,
-        count=1,
-    )
-    return text
-
-
-def _write_nav2_bt_xml(
-    runtime_dir: Path, nav2_cfg: Nav2Config, *, smooth_path: bool = False
-) -> Path:
-    """Write a navigate-to-pose BT tuned from ``nav2`` config into ``runtime_dir``."""
-    template = _resolve_bt_template()
-    text = template.read_text(encoding="utf-8")
-    text = _tune_nav2_bt_xml(
-        text,
-        replan_hz=nav2_cfg.replan_frequency,
-        navigate_recovery_retries=nav2_cfg.navigate_recovery_retries,
-        recovery_wait_duration=nav2_cfg.recovery_wait_duration,
-        smooth_path=smooth_path,
-    )
-    out = runtime_dir / "navigate_to_pose_w_replanning_and_recovery.xml"
-    out.write_text(text, encoding="utf-8")
-    return out
-
-
-def _set_obstacle_sources(params: Mapping, n_lidars: int) -> None:
-    """Replace the single ``scan`` obstacle source with one per lidar (``scan_0``..).
-
-    Each lidar publishes ``/scan_<i>`` in its own frame, letting the costmap mark
-    and clear obstacles from every lidar (including units at different heights).
-    """
-    if n_lidars <= 1:
-        return
-    names = [f"scan_{i}" for i in range(n_lidars)]
-    for costmap_key in ("local_costmap", "global_costmap"):
-        try:
-            obstacle = params[costmap_key][costmap_key]["ros__parameters"]["obstacle_layer"]
-        except (KeyError, TypeError):
-            continue
-        template = obstacle.pop("scan", {})
-        obstacle["observation_sources"] = " ".join(names)
-        for i, name in enumerate(names):
-            entry = dict(template)
-            entry["topic"] = f"/scan_{i}"
-            obstacle[name] = entry
-
-
-def _apply_velocity_limits(params: dict, cfg: NavConfig) -> None:
-    """Wire top-level velocity/accel attributes into MPPI + velocity_smoother.
-
-    The flat override pass only matches identical key names (``max_vel_x``),
-    but MPPI uses ``vx_max``/``wz_max`` and the smoother uses arrays — so the
-    user's configured speed limits silently never reached the controller.
-
-    Reverse is intentionally capped (``<= 0.15 m/s``) for both MPPI and the
-    velocity smoother. Allowing the smoother full ``-max_vel_x`` while MPPI is
-    limited lets recoveries / stale cmd bursts command hard reverse that the
-    controller never intended — dangerous on skid-steer / low-traction bases.
-    """
-    omni = cfg.kinematics == OMNI
-    vy = cfg.max_vel_y if omni else 0.0
-    # Modest reverse for small overshoots; diff-drive with vx_min=0 must spin
-    # fully around instead. Cap magnitude so reverse never matches full forward.
-    reverse_mps = -min(float(cfg.max_vel_x), 0.15)
-    try:
-        fp = params["controller_server"]["ros__parameters"]["FollowPath"]
-    except (KeyError, TypeError):
-        fp = None
-    if isinstance(fp, dict):
-        fp["motion_model"] = "Omni" if omni else "DiffDrive"
-        fp["vx_max"] = cfg.max_vel_x
-        fp["vx_min"] = reverse_mps
-        fp["vy_max"] = vy
-        fp["wz_max"] = cfg.max_vel_theta
-        fp["ax_max"] = cfg.acc_lim_x
-        fp["ax_min"] = -cfg.acc_lim_x
-        fp["az_max"] = cfg.acc_lim_theta
-    try:
-        vs = params["velocity_smoother"]["ros__parameters"]
-    except (KeyError, TypeError):
-        vs = None
-    if isinstance(vs, dict):
-        vs["max_velocity"] = [cfg.max_vel_x, vy, cfg.max_vel_theta]
-        vs["min_velocity"] = [reverse_mps, -vy, -cfg.max_vel_theta]
-        vs["max_accel"] = [cfg.acc_lim_x, cfg.acc_lim_x if omni else 0.0, cfg.acc_lim_theta]
-        # Allow braking harder than accelerating (safety), but keep it bounded
-        # so the smoother actually smooths instead of passing jerks through.
-        vs["max_decel"] = [
-            -1.5 * cfg.acc_lim_x,
-            -1.5 * cfg.acc_lim_x if omni else 0.0,
-            -1.5 * cfg.acc_lim_theta,
-        ]
-
-
-def _sync_smoother_reverse_to_mppi(params: dict) -> None:
-    """Keep velocity_smoother min_velocity[0] aligned with controller reverse."""
-    try:
-        fp = params["controller_server"]["ros__parameters"]["FollowPath"]
-        vs = params["velocity_smoother"]["ros__parameters"]
-    except (KeyError, TypeError):
-        return
-    if not isinstance(fp, dict) or not isinstance(vs, dict):
-        return
-    if "vx_min" in fp:
-        vx_min = float(fp["vx_min"])
-    elif "min_linear_vel" in fp:
-        vx_min = float(fp["min_linear_vel"])
-    else:
-        return
-    min_vel = vs.get("min_velocity")
-    if isinstance(min_vel, list) and min_vel:
-        vs["min_velocity"] = [vx_min, *min_vel[1:]]
-    elif isinstance(min_vel, tuple) and min_vel:
-        vs["min_velocity"] = [vx_min, *list(min_vel[1:])]
-
-
-# Bases at or below this radius get the "nimble" DiffDrive profile (Viam
-# Rover class). Larger carts (MiR class) keep the carpet-tested values.
-_SMALL_BASE_RADIUS_M = 0.15
-
-
-def _is_small_base(cfg: NavConfig) -> bool:
-    try:
-        return float(cfg.robot_radius) <= _SMALL_BASE_RADIUS_M
-    except (TypeError, ValueError):
-        return False
-
-
-def _user_subtree(user_params: Optional[Mapping], *path: str) -> Mapping:
-    """Fetch a nested mapping out of normalized user nav2_params (or {})."""
-    node: object = user_params or {}
-    for key in path:
-        if not isinstance(node, Mapping):
-            return {}
-        node = node.get(key, {})
-    return node if isinstance(node, Mapping) else {}
-
-
-def _apply_diffdrive_controller(
-    params: dict, cfg: NavConfig, user_params: Optional[Mapping] = None
-) -> None:
-    """Use Regulated Pure Pursuit for DiffDrive instead of MPPI.
-
-    MPPI on this skid-steer repeatedly converges to ``vx=0`` with
-    ``|ω|≈0.05–0.1``. RPP tracks a lookahead with forward motion. Also:
-    open-loop smoother (CLOSED_LOOP fights carpet stiction), no RPP collision
-    freeze, and a looser progress checker so weak first motion is not an
-    instant abort.
-
-    Two profiles, gated on ``robot_radius``:
-
-    * cart (> 0.15 m, e.g. MiR): the carpet-tested values, unchanged.
-      ``use_rotate_to_heading: false`` because stop-and-spin is useless there.
-    * small (<= 0.15 m, e.g. Viam Rover): the cart geometry made these bases
-      spin in place — ``regulated_linear_scaling_min_speed`` at half top speed
-      inflated ω (RPP computes ω = v·curvature after flooring v), and the
-      velocity-scaled lookahead collapsed to 0.3 m, where curvature = 2y/L²
-      explodes. Longer minimum lookahead, a real speed floor, rotate-to-heading
-      for large heading errors, and yaw accel the smoother can actually track.
-
-    ``user_params`` (normalized ``nav2_params``) re-merges on top so explicit
-    FollowPath / progress_checker / velocity_smoother overrides win. A user
-    who sets ``FollowPath.plugin`` opts out of this profile entirely.
-    """
-    if cfg.kinematics == OMNI:
-        return
-    try:
-        cs = params["controller_server"]["ros__parameters"]
-    except (KeyError, TypeError):
-        return
-    if not isinstance(cs, dict):
-        return
-    user_cs = _user_subtree(user_params, "controller_server", "ros__parameters")
-    user_fp = user_cs.get("FollowPath")
-    if isinstance(user_fp, Mapping) and user_fp.get("plugin"):
-        # Explicit controller choice: leave the merged template alone.
-        return
-    small = _is_small_base(cfg)
-    reverse_mps = -min(float(cfg.max_vel_x), 0.15)
-    if small:
-        min_speed = min(0.10, 0.5 * float(cfg.max_vel_x))
-        min_radius = 0.35
-        lookahead, min_lookahead, max_lookahead = 0.55, 0.45, 0.9
-        # Smoother slew must keep up with RPP's ω demand or pursuit limit-cycles
-        # (lag distance approaching the lookahead distance = oscillation).
-        yaw_accel = max(float(cfg.acc_lim_theta), 4.0 * float(cfg.max_vel_theta))
-    else:
-        min_speed = max(0.12, 0.5 * float(cfg.max_vel_x))
-        min_radius = 0.9
-        lookahead, min_lookahead, max_lookahead = 0.6, 0.3, 0.9
-        yaw_accel = float(cfg.acc_lim_theta)
-    # Keep both Jazzy (desired_linear_vel) and newer (max_linear_vel) names.
-    cs["FollowPath"] = {
-        "plugin": (
-            "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-        ),
-        "desired_linear_vel": cfg.max_vel_x,
-        "max_linear_vel": cfg.max_vel_x,
-        "min_linear_vel": reverse_mps,
-        "max_angular_vel": cfg.max_vel_theta,
-        "min_angular_vel": -cfg.max_vel_theta,
-        "max_linear_accel": cfg.acc_lim_x,
-        "max_linear_decel": -1.5 * cfg.acc_lim_x,
-        "max_angular_accel": yaw_accel,
-        "max_angular_decel": -1.5 * yaw_accel,
-        "lookahead_dist": lookahead,
-        "min_lookahead_dist": min_lookahead,
-        "max_lookahead_dist": max_lookahead,
-        "lookahead_time": 1.5,
-        "rotate_to_heading_angular_vel": min(float(cfg.max_vel_theta), 1.0),
-        "rotate_to_heading_min_angle": 0.785,
-        "use_velocity_scaled_lookahead_dist": True,
-        "min_approach_linear_velocity": max(0.08, min_speed * 0.5),
-        "approach_velocity_scaling_dist": 0.6,
-        # Global planner already avoids obstacles. Local RPP collision checks
-        # often freeze the cart in inflation (cmd zero → progress fail → Spin).
-        "use_collision_detection": False,
-        "use_regulated_linear_velocity_scaling": True,
-        "use_cost_regulated_linear_velocity_scaling": False,
-        "regulated_linear_scaling_min_radius": min_radius,
-        "regulated_linear_scaling_min_speed": min_speed,
-        # Carts on carpet must never stop-and-spin; a small rover pivots
-        # cleanly, and arcing through a >45° heading error is what spun it.
-        "use_rotate_to_heading": small,
-        "allow_reversing": False,
-        "transform_tolerance": 10.0,
-    }
-    if isinstance(user_fp, Mapping) and user_fp:
-        _deep_merge(cs["FollowPath"], user_fp)
-    progress = cs.get("progress_checker")
-    if isinstance(progress, dict):
-        try:
-            radius = float(progress.get("required_movement_radius", 0.25))
-        except (TypeError, ValueError):
-            radius = 0.25
-        progress["required_movement_radius"] = min(radius, 0.15)
-        try:
-            allow = float(progress.get("movement_time_allowance", 10.0))
-        except (TypeError, ValueError):
-            allow = 10.0
-        progress["movement_time_allowance"] = max(allow, 30.0)
-        user_progress = user_cs.get("progress_checker")
-        if isinstance(user_progress, Mapping) and user_progress:
-            _deep_merge(progress, user_progress)
-    try:
-        vs = params["velocity_smoother"]["ros__parameters"]
-    except (KeyError, TypeError):
-        vs = None
-    if isinstance(vs, dict):
-        # CLOSED_LOOP + carpet stiction: smoother never sees motion and
-        # collapses useful cmds. Open-loop ramps match test_drive.
-        vs["feedback"] = "OPEN_LOOP"
-        vs["deadband_velocity"] = [0.0, 0.0, 0.0]
-        if small:
-            accel = vs.get("max_accel")
-            decel = vs.get("max_decel")
-            if isinstance(accel, list) and len(accel) == 3:
-                vs["max_accel"] = [accel[0], accel[1], yaw_accel]
-            if isinstance(decel, list) and len(decel) == 3:
-                vs["max_decel"] = [decel[0], decel[1], -1.5 * yaw_accel]
-        user_vs = _user_subtree(user_params, "velocity_smoother", "ros__parameters")
-        if user_vs:
-            _deep_merge(vs, user_vs)
-    _sync_smoother_reverse_to_mppi(params)
-
-
-def _mppi_profile_snapshot(params: dict) -> dict:
-    """Compact FollowPath settings for get_status diagnostics."""
-    try:
-        fp = params["controller_server"]["ros__parameters"]["FollowPath"]
-    except (KeyError, TypeError):
-        return {}
-    if not isinstance(fp, dict):
-        return {}
-    plugin = str(fp.get("plugin", ""))
-    out: dict = {"plugin": plugin}
-    if "regulated_pure_pursuit" in plugin:
-        out.update(
-            {
-                "desired_linear_vel": fp.get(
-                    "desired_linear_vel", fp.get("max_linear_vel")
-                ),
-                "max_angular_vel": fp.get("max_angular_vel"),
-                "use_rotate_to_heading": fp.get("use_rotate_to_heading"),
-                "allow_reversing": fp.get("allow_reversing"),
-                "lookahead_dist": fp.get("lookahead_dist"),
-                "min_lookahead_dist": fp.get("min_lookahead_dist"),
-                "min_approach_linear_velocity": fp.get("min_approach_linear_velocity"),
-                "use_collision_detection": fp.get("use_collision_detection"),
-                "regulated_linear_scaling_min_radius": fp.get(
-                    "regulated_linear_scaling_min_radius"
-                ),
-                "regulated_linear_scaling_min_speed": fp.get(
-                    "regulated_linear_scaling_min_speed"
-                ),
-            }
-        )
-    else:
-        critics = {}
-        for name in (
-            "PathFollowCritic",
-            "PathAlignCritic",
-            "PathAngleCritic",
-            "PreferForwardCritic",
-            "GoalCritic",
-            "GoalAngleCritic",
-            "VelocityDeadbandCritic",
-        ):
-            section = fp.get(name)
-            if not isinstance(section, dict):
-                continue
-            critics[name] = {
-                "enabled": bool(section.get("enabled", True)),
-                "threshold_to_consider": section.get("threshold_to_consider"),
-                "cost_weight": section.get("cost_weight"),
-            }
-        out.update(
-            {
-                "vx_max": fp.get("vx_max"),
-                "vx_min": fp.get("vx_min"),
-                "wz_max": fp.get("wz_max"),
-                "motion_model": fp.get("motion_model"),
-                "critics": critics,
-            }
-        )
-    try:
-        vs = params["velocity_smoother"]["ros__parameters"]
-        if isinstance(vs, dict):
-            out["smoother_feedback"] = vs.get("feedback")
-            out["smoother_deadband"] = vs.get("deadband_velocity")
-            out["smoother_min_velocity"] = vs.get("min_velocity")
-    except (KeyError, TypeError):
-        pass
-    return out
-
-
-def _deep_merge(obj: dict, overrides: Mapping) -> None:
-    """Recursively merge ``overrides`` into nested Nav2 param dicts."""
-    for key, value in overrides.items():
-        if (
-            key in obj
-            and isinstance(obj[key], dict)
-            and isinstance(value, Mapping)
-        ):
-            _deep_merge(obj[key], value)
-        else:
-            obj[key] = value
-
-
-def _apply_nav2_tuning(params: dict, overrides: Mapping) -> None:
-    """Apply user tuning without clobbering unrelated ``tolerance`` keys."""
-    leaf_overrides = dict(overrides)
-    planner_tol = leaf_overrides.pop("tolerance", None)
-    _apply_overrides(params, leaf_overrides)
-    if planner_tol is not None:
-        try:
-            params["planner_server"]["ros__parameters"]["GridBased"]["tolerance"] = (
-                planner_tol
-            )
-        except (KeyError, TypeError):
-            pass
-
-
-def _apply_overrides(obj, overrides: Mapping) -> None:
-    """Recursively set any leaf key present in ``overrides`` (best-effort tuning)."""
-    if isinstance(obj, dict):
-        for key, value in list(obj.items()):
-            if key in overrides and not isinstance(value, (dict, list)):
-                obj[key] = overrides[key]
-            else:
-                _apply_overrides(value, overrides)
-    elif isinstance(obj, list):
-        for item in obj:
-            _apply_overrides(item, overrides)

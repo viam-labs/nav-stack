@@ -129,7 +129,7 @@ def describe_goal_relative(
         sector = "behind and to the right"
 
     phrase = f"goal{label_bit} is about {dist:.1f} m {sector}"
-    # Prefer path distance from Nav2 when it's meaningfully different.
+    # Prefer path distance from the planner when it's meaningfully different.
     if (
         isinstance(distance_remaining, (int, float))
         and math.isfinite(float(distance_remaining))
@@ -316,7 +316,7 @@ def summarize_nav_motion(
     if simple.get("state") == "active":
         motion = "simple"
     elif active and not motion:
-        motion = "nav2"
+        motion = "builtin"
 
     dist = status.get("distance_remaining")
     if dist is None:
@@ -346,7 +346,7 @@ def summarize_nav_motion(
     elif motion == "builtin":
         context_bits.append("builtin navigating")
     elif active:
-        context_bits.append("Nav2 navigating")
+        context_bits.append("navigating")
     else:
         context_bits.append(f"state {state}")
 

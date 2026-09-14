@@ -1,17 +1,14 @@
 """Navigation visualization camera: ``viam-labs:nav-stack:nav-camera``.
 
 A read-only Viam ``rdk:component:camera`` that renders what the navigation
-service is doing — the Nav2 **global costmap** (so you see the inflated cost
-surface the planner actually reasons over) with the **active global plan**, the
-**local plan**, a fading **history of superseded plans** for the current goal,
-the **robot pose + footprint**, and the **goal marker** drawn on top.
+service is doing — the **global costmap** (inflated cost surface the planner
+reasons over) with the **active global plan**, the **local plan**, a fading
+**history of superseded plans** for the current goal, the **robot pose +
+footprint**, and the **goal marker** drawn on top.
 
-It reads straight from the running navigation service's in-process
-:class:`~..ros.bridge.BridgeNode` (found via the process-global bridge registry
-keyed by the ``navigation`` config attribute), so there is no extra ROS process
-and no RPC round-trip. Because it consumes only Nav2's standard costmap/plan
-topics, it works with **any** SLAM backend (built-in slam_toolbox or an external
-``rdk:service:slam``), not just one algorithm.
+It reads from the running navigation service's in-process viz store (keyed by
+the ``navigation`` config attribute). Works with ``navigation`` or
+``navigation-external``.
 
 Point in the Viam app's camera stream at this component to watch planning live.
 """

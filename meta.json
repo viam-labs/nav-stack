@@ -2,22 +2,22 @@
   "module_id": "viam-labs:nav-stack",
   "visibility": "public",
   "url": "https://github.com/viam-labs/nav-stack",
-  "description": "Mapping, localization, and obstacle-aware navigation on any Viam base. Defaults are ROS-free (builtin SLAM + nav); optional slam_toolbox / Nav2 on Ubuntu when REQUIRE_ROS=1.",
+  "description": "Mapping, localization, and obstacle-aware navigation on any Viam base. Builtin SLAM + builtin nav only (no ROS).",
   "models": [
     {
       "api": "rdk:service:slam",
       "model": "viam-labs:nav-stack:slam",
-      "short_description": "SLAM: builtin occupancy (default) or slam_toolbox; mapping and localization on a Viam base."
+      "short_description": "Builtin occupancy SLAM: mapping and localization on a Viam base."
     },
     {
       "api": "rdk:service:motion",
       "model": "viam-labs:nav-stack:navigation",
-      "short_description": "Builtin MoveOnMap over Viam APIs (ROS-free); Nav2 optional."
+      "short_description": "Builtin MoveOnMap over Viam APIs (ROS-free)."
     },
     {
       "api": "rdk:service:motion",
       "model": "viam-labs:nav-stack:navigation-external",
-      "short_description": "MoveOnMap from any slam; builtin path is fully ROS-free."
+      "short_description": "MoveOnMap from any Viam slam service (ROS-free)."
     },
     {
       "api": "rdk:component:camera",

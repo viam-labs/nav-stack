@@ -157,7 +157,7 @@ def mark_path_ahead_on_occupancy(
 
 
 def occupancy_from_bridge_map(map_data: dict) -> OccupancyGrid:
-    """Build OccupancyGrid from BridgeNode.get_map() dict."""
+    """Build OccupancyGrid from a get_map-style dict (grid + origin + resolution)."""
     grid = np.asarray(map_data["grid"], dtype=np.int16)
     if grid.ndim != 2:
         raise ValueError(f"occupancy grid must be 2D, got shape {grid.shape}")

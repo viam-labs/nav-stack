@@ -149,7 +149,7 @@ def test_sim_slam_pose_tracks_world_not_teleport(tmp_path: Path):
 
 
 def test_sim_config_requires_builtin_backend():
-    with pytest.raises(ValueError, match="slam_backend=builtin"):
+    with pytest.raises(ValueError, match="slam_toolbox|slam_backend=builtin|pre-ros-removal"):
         SlamConfig.from_dict(
             {
                 "base": "sim-base",

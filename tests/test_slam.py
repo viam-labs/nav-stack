@@ -1,32 +1,11 @@
 from pathlib import Path
 import asyncio
 import math
-import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from src.config import MODE_LOCALIZING, MODE_MAPPING, SlamConfig
-
-# Stub ROS 2 Python deps so model tests run without a ROS install.
-for _mod in (
-    "rclpy",
-    "rclpy.node",
-    "rclpy.qos",
-    "rclpy.action",
-    "geometry_msgs",
-    "geometry_msgs.msg",
-    "nav_msgs",
-    "nav_msgs.msg",
-    "sensor_msgs",
-    "sensor_msgs.msg",
-    "std_msgs",
-    "std_msgs.msg",
-    "tf2_ros",
-    "nav2_msgs",
-    "nav2_msgs.action",
-):
-    sys.modules.setdefault(_mod, MagicMock())
 
 pytest.importorskip("viam")
 
@@ -35,7 +14,7 @@ from src.nav.maps import MapStore
 from src.ros import conversions as conv
 
 
-def test_get_status_includes_bridge_and_sensor_probe(tmp_path: Path):
+def test_get_status_includes_diagnostics_and_sensor_probe(tmp_path: Path):
     slam = RosSlam("slam")
     store = MapStore(str(tmp_path))
     store.create_map("floor1")
@@ -56,7 +35,7 @@ def test_get_status_includes_bridge_and_sensor_probe(tmp_path: Path):
     )
     slam._manager = MagicMock()
     slam._manager.slam_diagnostics.return_value = {
-        "slam_toolbox_running": True,
+        "slam_backend": "builtin",
         "scan_publishing": True,
         "scan_valid_returns": 120,
         "odom_tf_age_s": 0.1,
@@ -70,7 +49,7 @@ def test_get_status_includes_bridge_and_sensor_probe(tmp_path: Path):
 
     result = asyncio.run(slam.do_command({"command": "get_status"}))
 
-    assert result["slam_toolbox_running"] is True
+    assert result["slam_backend"] == "builtin"
     assert result["active_map"] == "floor1"
     assert result["movement_sensor"] == "imu"
     assert result["sensor_probe"]["lidars"][0]["scan_valid_returns"] == 120
@@ -86,7 +65,7 @@ def test_get_status_skips_sensor_probe_when_disabled(tmp_path: Path):
         {"base": "b", "lidar": "f", "mode": "mapping", "active_map": "floor1"}
     )
     slam._manager = MagicMock()
-    slam._manager.slam_diagnostics.return_value = {"slam_toolbox_running": True}
+    slam._manager.slam_diagnostics.return_value = {"slam_backend": "builtin"}
     slam._probe_sensors = AsyncMock()
 
     asyncio.run(slam.do_command({"command": "get_status", "probe_sensors": False}))
@@ -646,7 +625,7 @@ def test_stop_base_zeros_velocity_without_full_stop():
     assert kwargs["angular"].z == 0.0
 
 
-def test_nav2_drive_base_sends_angular_z_to_viam_base():
+def test_drive_base_sends_angular_z_to_viam_base():
     slam = RosSlam("slam")
     slam._cfg = MagicMock(
         base_velocity_convention="viam",
@@ -668,7 +647,7 @@ def test_nav2_drive_base_sends_angular_z_to_viam_base():
     io = slam._build_io()
     asyncio.run(io.drive_base(0.5, 0.0, -1.0))
 
-    node.record_cmd_vel.assert_called_once_with(0.5, 0.0, -1.0, source="nav2")
+    node.record_cmd_vel.assert_called_once_with(0.5, 0.0, -1.0, source="builtin")
     slam._base.set_velocity.assert_awaited_once()
     kwargs = slam._base.set_velocity.await_args.kwargs
     assert kwargs["linear"].x == 0.0

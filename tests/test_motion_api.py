@@ -71,7 +71,6 @@ def _configured_nav(*, nav_status=None, pose=None) -> tuple[RosNavigation, Magic
     mgr.get_pose_in_map = MagicMock(
         return_value=pose if pose is not None else Pose2D(1.0, 2.0, 0.5)
     )
-    mgr.nav2_diagnostics = MagicMock(return_value={})
     runtime = SimpleNamespace(manager=mgr, localization_check={})
     nav._resolve_runtime = MagicMock(return_value=runtime)  # type: ignore[method-assign]
     nav._base = MagicMock()
@@ -209,7 +208,7 @@ def test_suspend_resume_move_on_map():
     assert suspended["status"] == "suspended"
     assert suspended["goal"]["x"] == pytest.approx(1.0)
     assert suspended["goal"]["y"] == pytest.approx(0.0)
-    assert suspended["goal"]["motion"] == "nav2"
+    assert suspended["goal"]["motion"] == "builtin"
     assert suspended["goal"]["reason"] == "safety"
     mgr.cancel.assert_called()
     plan = asyncio.run(nav.get_plan("my-base", execution_id=execution_id))

@@ -240,10 +240,9 @@ def build_io_provider(
         vy: float,
         vtheta: float,
         *,
-        record_source: Optional[str] = "nav2",
+        record_source: Optional[str] = "builtin",
     ):
-        # ``record_source=None`` skips history (caller already recorded the
-        # pre-snap Nav2 command — see BridgeNode._on_drive_timer).
+        # ``record_source=None`` skips history (caller already recorded).
         if record_cmd_vel is not None and record_source is not None:
             record_cmd_vel(vx, vy, vtheta, source=record_source)
         lx_mm, ly_mm, ang_deg_s = ros_twist_to_viam_set_velocity(
@@ -256,8 +255,7 @@ def build_io_provider(
 
     async def stop_base():
         # MiR base.stop() also calls REST stop_immediately (PAUSE), which drops
-        # Manualcontrol and kills the rosbridge /cmd_vel session. Nav2 only needs
-        # zeros.
+        # Manualcontrol. Prefer SetVelocity zeros.
         if record_cmd_vel is not None:
             record_cmd_vel(0.0, 0.0, 0.0, source="stop")
         await base.set_velocity(

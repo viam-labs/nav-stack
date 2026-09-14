@@ -1,12 +1,11 @@
 """Process-global registry linking the SLAM and navigation models.
 
-Both models live in the same module process. The SLAM model owns the ROS manager
-and the map store; the navigation model (which ``depends_on`` the SLAM service)
-looks the shared runtime up by the SLAM service's resource name so it can launch
-Nav2 against the same rclpy context and read the active map's locations/zones.
+Both models live in the same module process. The SLAM model owns the map store
+and builtin SLAM host; the navigation model (which ``depends_on`` the SLAM
+service) looks the shared runtime up by the SLAM service's resource name.
 
-Builtin nav (``nav_backend: builtin``) may also register a ``NavVizStore`` so
-nav-camera / get_costmap work without a ROS bridge.
+Builtin nav registers a ``NavVizStore`` so nav-camera / get_costmap can render
+without a ROS bridge.
 """
 from __future__ import annotations
 
@@ -36,7 +35,7 @@ class SlamRuntime:
         )
         # Lidar camera resources (name -> Camera), for ViamWorldIO scan reads.
         self.cameras = dict(cameras or {})
-        # Shared POSIX-shm PCD client (bridge + builtin nav).
+        # Shared POSIX-shm PCD client (builtin nav).
         self.shm_lidar = shm_lidar
         # Optional SimSensors when ``sim.enabled`` (nav obstacle scans).
         self.sim_sensors = sim_sensors
@@ -83,40 +82,9 @@ def get_slam_service(name: str) -> Optional[object]:
         return _SLAM_SERVICES.get(name)
 
 
-# Live bridge nodes, keyed by the *navigation* service name that owns/drives
-# them. Published so the ``nav-camera`` component can find the running
-# ``BridgeNode`` in-process and read Nav2 costmap/plan/pose data for rendering,
-# without a Viam RPC round-trip. Value is a ``ros.bridge.BridgeNode`` or a
-# zero-arg callable returning the current node (so a SLAM restart that swaps
-# the manager/node cannot leave the registry pointing at a dead node). Typed
-# as ``object`` here to keep this module import-light and ROS-free.
-_BRIDGES: Dict[str, object] = {}
-
-# Builtin-nav viz stores (same key as navigation service name). Used when there
-# is no ROS bridge (navigation-external + builtin) or when nav writes overlays
-# via ViamWorldIO instead of Nav2 topics.
+# Builtin-nav viz stores, keyed by navigation service name (nav-camera /
+# get_costmap).
 _NAV_VIZ: Dict[str, object] = {}
-
-
-def register_bridge(nav_name: str, node_or_provider: object) -> None:
-    with _LOCK:
-        _BRIDGES[nav_name] = node_or_provider
-
-
-def unregister_bridge(nav_name: str) -> None:
-    with _LOCK:
-        _BRIDGES.pop(nav_name, None)
-
-
-def get_bridge(nav_name: str) -> Optional[object]:
-    with _LOCK:
-        entry = _BRIDGES.get(nav_name)
-    if callable(entry):
-        try:
-            return entry()
-        except Exception:  # noqa: BLE001 - a failing provider means no bridge
-            return None
-    return entry
 
 
 def register_nav_viz(nav_name: str, viz: object) -> None:
@@ -135,16 +103,12 @@ def get_nav_viz(nav_name: str) -> Optional[object]:
 
 
 def get_nav_view(nav_name: str) -> Optional[object]:
-    """Prefer builtin viz store, else ROS bridge (nav-camera / get_costmap)."""
-    viz = get_nav_viz(nav_name)
-    if viz is not None:
-        return viz
-    return get_bridge(nav_name)
+    """Return the builtin viz store for nav-camera / get_costmap."""
+    return get_nav_viz(nav_name)
 
 
-# Builtin (and Nav2) navigation hosts, keyed by motion service name. SLAM uses
-# this so ``_is_navigation_active`` works when the SLAM manager is
-# BuiltinSlamHost (which always reports nav idle).
+# Navigation hosts, keyed by motion service name. SLAM uses this so
+# ``_is_navigation_active`` works with BuiltinSlamHost.
 _NAV_HOSTS: Dict[str, object] = {}
 
 
