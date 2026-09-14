@@ -56,6 +56,11 @@ class ObstacleConfig:
     slow_distance_m: float = 1.0  # inside this: scale linear speed down
     front_cone_half_rad: float = math.radians(35.0)  # forward "will I hit it" cone
     side_cone_rad: float = math.radians(100.0)  # left/right span for turn decision
+    # While spinning (vx≈0), freeze only for true nose collisions — NOT the full
+    # stop_distance. Using stop_distance here froze rotate-to-heading whenever a
+    # corridor wall swept through the front cone (~0.3–0.5 m), then soft loc
+    # could resume translating while still misaligned toward an obstacle.
+    spin_collision_m: float = 0.22
     # Ignore scans older than this. Generous by default: MiR rosbridge lidar
     # reads can lag, and a too-tight window makes get_base_scan return None so
     # avoidance silently no-ops (robot drives blind).
@@ -114,20 +119,51 @@ def apply_obstacle_avoidance(
     *,
     max_angular_rad_s: float,
 ) -> tuple["DriveCommand", str, float]:
-    """Adjust a forward drive command for obstacles seen in ``scan``.
+    """Adjust a drive command for obstacles seen in ``scan``.
 
     Returns ``(command, state, forward_clearance_m)`` where state is one of
-    ``clear`` / ``slow`` / ``avoid`` / ``no_scan``. Only forward motion
-    (``vx > 0``) is affected; in-place rotation (final-heading, or an active
-    avoid turn) passes through so the robot can still spin to safety.
+    ``clear`` / ``slow`` / ``avoid`` / ``hold`` / ``no_scan``.
+
+    Forward motion (``vx > 0``): slow inside ``slow_distance``, and at
+    ``stop_distance`` stop translating and turn toward the clearer side
+    (``avoid``).
+
+    In-place rotation / reverse (``vx <= 0``): freeze (``hold``) only for a
+    true nose collision (``spin_collision_m``) or when swinging the bumper into
+    a near hit on the **turn-side flank** (outside the front cone). A wall at
+    normal ``stop_distance`` straight ahead must **not** freeze rotate-to-heading
+    — that is how corridor 90° turns work.
 
     When avoidance is enabled but ``scan`` is None (no fresh data), forward
     motion is suppressed as a fail-safe — driving blind defeats the purpose of
-    the feature and is how the robot ends up nosing into obstacles it "can't
-    see". Rotation is preserved so the robot can still finish a final heading.
+    the feature. Rotation is preserved when translating so a final heading can
+    still finish; a pure spin with no scan is left alone (same as clear space).
     """
-    if not obs.enabled or cmd.done or cmd.vx <= 0.0:
+    if not obs.enabled or cmd.done:
         return cmd, "clear", math.inf
+
+    if cmd.vx <= 0.0:
+        if scan is None:
+            return cmd, "clear", math.inf
+        half = float(obs.front_cone_half_rad)
+        forward = cone_min_range(scan, -half, half)
+        nose = max(0.05, float(obs.spin_collision_m))
+        stop = float(obs.stop_distance_m)
+        if forward <= nose:
+            # True collision bubble only (person / wall pressed against bumper).
+            return DriveCommand(0.0, 0.0, 0.0, False), "hold", forward
+        if abs(cmd.vtheta) > 1e-6:
+            # Turn-side flank outside the front cone — don't use [0, side], which
+            # re-includes straight ahead and freezes every corridor spin.
+            side = float(obs.side_cone_rad)
+            if cmd.vtheta > 0.0:
+                flank = cone_min_range(scan, half, side)
+            else:
+                flank = cone_min_range(scan, -side, -half)
+            if flank <= stop:
+                clr = forward if math.isfinite(forward) else flank
+                return DriveCommand(0.0, 0.0, 0.0, False), "hold", clr
+        return cmd, "clear", forward
 
     if scan is None:
         return DriveCommand(0.0, 0.0, cmd.vtheta, False), "no_scan", math.inf

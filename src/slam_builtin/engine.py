@@ -185,6 +185,24 @@ class BuiltinSlamEngine:
             self._invalidate_occ_cache()
             self._generation += 1
 
+    def clear_obstacles(
+        self, x_m: float, y_m: float, radius_m: float
+    ) -> dict:
+        """Erase occupied cells in a disk (map frame meters). Builtin only."""
+        with self._lock:
+            cleared = occ.clear_disk(self._grid, x_m, y_m, radius_m)
+            if cleared:
+                self._invalidate_occ_cache()
+                self._generation += 1
+            return {
+                "cleared_cells": int(cleared),
+                "x": float(x_m),
+                "y": float(y_m),
+                "radius_m": float(radius_m),
+                "generation": int(self._generation),
+                "resolution": float(self._grid.resolution),
+            }
+
     def set_keyframe_hook(self, hook) -> None:
         self._keyframe_hook = hook
 

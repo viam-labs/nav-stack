@@ -421,6 +421,25 @@ def test_builtin_recovery_wait_defaults():
     assert tuned.builtin.recovery_wait_duration_s == pytest.approx(3.5)
 
 
+def test_builtin_follower_snake_defaults():
+    """Defaults tuned to damp mid-path S-curve hunting on skid-steer."""
+    cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    assert cfg.builtin.lookahead_m == pytest.approx(1.1)
+    assert cfg.builtin.min_lookahead_m == pytest.approx(0.9)
+    assert cfg.builtin.max_lookahead_m == pytest.approx(1.5)
+    assert cfg.builtin.smooth_sample_spacing_m == pytest.approx(0.15)
+    # Partial override must not resurrect the old from_dict fallbacks.
+    partial = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "builtin": {"replan_period_s": 0.8},
+        }
+    )
+    assert partial.builtin.lookahead_m == pytest.approx(1.1)
+    assert partial.builtin.smooth_sample_spacing_m == pytest.approx(0.15)
+
+
 def test_nav_config_bad_nav_backend():
     with pytest.raises(ValueError, match="nav_backend"):
         NavConfig.from_dict(

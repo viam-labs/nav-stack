@@ -674,6 +674,25 @@ def test_pursuit_corrects_crosstrack_toward_path():
     assert cmd.vx > 0.12
 
 
+def test_pursuit_crosstrack_deadband_zeros_kappa():
+    """Sub-deadband lateral error must not command a turn (pose-noise floor)."""
+    from src.nav_builtin.controller import pursuit_command
+
+    cfg = FollowerConfig()
+    cfg.crosstrack_deadband_m = 0.04
+    cfg.curvature_smoothing = 1.0  # no EMA; raw κ only
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(0.0, 0.0, 0.0)
+    # |y_l| = 0.02 < deadband → κ = 0 → straight cruise.
+    cmd, rotating = pursuit_command(current, Pose2D(1.0, 0.02, 0.0), cfg=cfg)
+    assert not rotating
+    assert cmd.vx > 0.12
+    assert abs(cmd.vtheta) < 1e-9
+    # Just outside the deadband: still corrects.
+    cmd2, _ = pursuit_command(current, Pose2D(1.0, 0.05, 0.0), cfg=cfg)
+    assert cmd2.vtheta > 0.0
+
+
 def test_pursuit_rotate_to_heading_has_hysteresis():
     from src.nav_builtin.controller import pursuit_command
 
@@ -730,7 +749,7 @@ def test_pursuit_respects_skid_steer_wheel_envelope():
     cfg.motion.max_linear_mps = 0.4
     current = Pose2D(0.0, 0.0, 0.0)
     for deg in range(-58, 59, 4):
-        for L in (0.6, 0.8, 1.2):
+        for L in (0.6, 0.9, 1.2, 1.5):
             tgt = Pose2D(L * math.cos(math.radians(deg)), L * math.sin(math.radians(deg)), 0.0)
             cmd, rotating = pursuit_command(current, tgt, cfg=cfg)
             assert not rotating
@@ -1053,6 +1072,35 @@ def test_compute_path_command_drives_forward():
     assert not cmd.done
     assert cmd.vx > 0.0
     assert progress["distance_remaining_m"] > 0.0
+
+
+def test_compute_path_command_holds_rotate_into_person():
+    """Rotate-to-heading with a body in the nose collision bubble must full-stop."""
+    import numpy as np
+
+    from src.geom import conversions as conv
+    from src.nav.simple_motion import ObstacleConfig
+
+    path = Path2D(points=((0.0, 0.0), (3.0, 0.0)), goal_theta=0.0)
+    # Facing ~120° off the path → rotate-to-heading (vx=0).
+    current = Pose2D(0.0, 0.0, math.radians(120.0))
+    ranges = np.full(72, np.inf)
+    # Forward in base frame ≈ bin at angle 0.
+    angle_min = -math.pi
+    angle_increment = 2 * math.pi / 72
+    ranges[int((0.0 - angle_min) / angle_increment) % 72] = 0.15
+    scan = conv.LaserScan2D(ranges, angle_min, angle_increment, range_min=0.05)
+    cfg = FollowerConfig(
+        obstacle=ObstacleConfig(
+            stop_distance_m=0.4, slow_distance_m=1.0, spin_collision_m=0.22
+        )
+    )
+    cmd, progress = compute_path_command(
+        current, path, cfg=cfg, scan=scan, rotate_active=True
+    )
+    assert progress["obstacle"] == "hold"
+    assert cmd.vx == 0.0 and cmd.vtheta == 0.0
+    assert progress["forward_clearance_m"] == pytest.approx(0.15)
 
 
 class _FakeWorld:

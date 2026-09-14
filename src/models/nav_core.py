@@ -1220,7 +1220,7 @@ class NavServiceBase(Motion):
             prev = self._simple_nav_status.get("obstacle")
             self._simple_nav_status.update(progress)
             new_state = progress.get("obstacle")
-            if new_state != prev and new_state in ("avoid", "slow", "no_scan"):
+            if new_state != prev and new_state in ("avoid", "slow", "hold", "no_scan"):
                 clearance = progress.get("forward_clearance_m")
                 if new_state == "no_scan":
                     LOGGER.warning(

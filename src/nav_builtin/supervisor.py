@@ -47,9 +47,9 @@ class NavSupervisor:
         clearance_preference_m: float = 0.35,
         algorithm: str = "lazy_theta_star",
         replan_period_s: float = 1.0,
-        lookahead_m: float = 0.8,
-        min_lookahead_m: float = 0.6,
-        max_lookahead_m: float = 1.2,
+        lookahead_m: float = 1.1,
+        min_lookahead_m: float = 0.9,
+        max_lookahead_m: float = 1.5,
         approach_dist_m: float = 0.35,
         xy_tolerance_m: float = 0.25,
         yaw_tolerance_rad: float = 0.35,
@@ -64,7 +64,7 @@ class NavSupervisor:
         slow_distance_m: float = 1.0,
         scan_max_age_s: float = 2.0,
         smooth_path: bool = True,
-        smooth_sample_spacing_m: float = 0.10,
+        smooth_sample_spacing_m: float = 0.15,
         local_costmap_enabled: bool = True,
         local_costmap_width_m: float = 4.0,
         local_costmap_height_m: float = 4.0,
@@ -849,8 +849,10 @@ class NavSupervisor:
                         has_room = clearance is None or float(clearance) >= 0.35
                         obstacle = str(progress.get("obstacle") or "")
                         # "wait"/"slow" still mean lidar sees space; only hard
-                        # stop / missing scan should force the fail.
-                        lidar_open = obstacle not in ("stop", "no_scan") and has_room
+                        # stop / proximity hold / missing scan should force fail.
+                        lidar_open = (
+                            obstacle not in ("stop", "hold", "no_scan") and has_room
+                        )
                         # Keep following while the robot can still see open space;
                         # a mid-route localization jump often fails a few replans
                         # before the map/pose settle.

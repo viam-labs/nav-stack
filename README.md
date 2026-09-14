@@ -1,7 +1,7 @@
 # nav-stack
 
 A Viam navigation stack for mapping, localization, and obstacle-aware navigation
-on any Viam base. **Builtin SLAM + builtin nav only.**
+on any Viam base.
 The last release that still bundled Nav2/slam_toolbox is preserved at git tag
 `pre-ros-removal`.
 
@@ -556,6 +556,8 @@ Zones CRUD: `add_zone`, `get_zone`, `list_zones`, `update_zone`, `delete_zone`,
 ### Map management (SLAM service)
 
 `list_maps`, `get_active_map`, `set_active_map`, `rename_map`, `delete_map`,
+`clear_map`, `clear_obstacles` (alias `erase_obstacles`; paint free space in a
+disk — builtin SLAM; args `x`/`y` or `pose`, `radius_m`, optional `save`),
 `start_mapping`, `start_localizing`, `save_map`,
 `optimize` (alias `optimize_graph`; mapping mode — force pose-graph SPA via
 serialize/deserialize reload), `get_mode`, `get_status`
