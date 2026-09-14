@@ -14,7 +14,7 @@ from ..nav.simple_motion import (
     rear_clearance_m,
 )
 from ..ros import conversions as conv
-from .controller import FollowerConfig, compute_path_command
+from .controller import FollowerConfig, compute_path_command, update_speed_estimate
 from .local_costmap import (
     LocalCostmap,
     LocalCostmapConfig,
@@ -47,9 +47,9 @@ class NavSupervisor:
         clearance_preference_m: float = 0.35,
         algorithm: str = "lazy_theta_star",
         replan_period_s: float = 1.0,
-        lookahead_m: float = 1.0,
-        min_lookahead_m: float = 0.7,
-        max_lookahead_m: float = 1.4,
+        lookahead_m: float = 0.6,
+        min_lookahead_m: float = 0.4,
+        max_lookahead_m: float = 0.9,
         approach_dist_m: float = 0.35,
         xy_tolerance_m: float = 0.25,
         yaw_tolerance_rad: float = 0.35,
@@ -353,6 +353,7 @@ class NavSupervisor:
             failed_static_replan = 0
             local_planner_active = False
             prev_local_cmd: Optional[DriveCommand] = None
+            rotate_active = False
             vx_sign_history: list[tuple[float, int]] = []
             xy_ok_since: Optional[float] = None
             last_tick_pose: Optional[Pose2D] = None
@@ -627,7 +628,9 @@ class NavSupervisor:
                     min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
                     local_planner_active=local_planner_active,
                     prev_local_cmd=prev_local_cmd,
+                    rotate_active=rotate_active,
                 )
+                rotate_active = bool(progress.get("rotate_to_heading"))
                 local_planner_active = bool(progress.get("local_planner"))
                 if local_planner_active:
                     prev_local_cmd = cmd
@@ -1042,7 +1045,9 @@ class NavSupervisor:
                         time.sleep(poll)
                         continue
                     raise
-                self._last_cmd_vx = cmd.vx
+                # Smoothed speed for the velocity-scaled lookahead (see
+                # ``update_speed_estimate``): raw cmd feedback limit-cycles.
+                self._last_cmd_vx = update_speed_estimate(self._last_cmd_vx, cmd.vx)
                 time.sleep(poll)
 
             self._world.stop()

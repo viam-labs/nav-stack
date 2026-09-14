@@ -602,13 +602,12 @@ def test_follow_command_translates_while_gently_turning():
     current = Pose2D(0.0, 0.0, 0.0)
     path_yaw = math.atan2(0.5, 2.0)
     target = Pose2D(2.0, 0.5, path_yaw)
-    cmd = compute_follow_command(
-        current, target, cfg=cfg, crosstrack_m=0.0, path_yaw=path_yaw
-    )
+    cmd = compute_follow_command(current, target, cfg=cfg)
     assert not cmd.done
     assert cmd.vx > 0.05
-    assert cmd.vtheta != 0.0
-    assert abs(cmd.vtheta) <= cfg.max_translate_yaw_rad_s + 1e-6
+    assert cmd.vtheta > 0.0
+    # Pure pursuit: ω = v·κ with κ = 2y/L² → gentle for a far, slightly-off point.
+    assert abs(cmd.vtheta) <= 0.3
 
 
 def test_follow_command_cruises_when_aligned():
@@ -625,52 +624,99 @@ def test_follow_command_cruises_when_aligned():
     assert abs(cmd.vtheta) < 0.15
 
 
-def test_follow_command_tracks_path_tangent_not_point_chase():
-    """On-path but heading slightly off: steer from path yaw, not a short point chase."""
-    from src.nav_builtin.controller import compute_follow_command
+def test_pursuit_is_geometric_omega_scales_with_speed():
+    """ω = v·κ: halving max speed halves ω for the same lookahead point."""
+    from src.nav_builtin.controller import pursuit_command
+
+    current = Pose2D(0.0, 0.0, 0.0)
+    target = Pose2D(0.6, 0.1, 0.0)  # gentle: κ = 2·0.1/0.37 ≈ 0.54 (r ≈ 1.85 m)
+    fast = FollowerConfig()
+    fast.motion.max_linear_mps = 0.6
+    slow = FollowerConfig()
+    slow.motion.max_linear_mps = 0.3
+    cmd_f, rot_f = pursuit_command(current, target, cfg=fast)
+    cmd_s, rot_s = pursuit_command(current, target, cfg=slow)
+    assert not rot_f and not rot_s
+    assert cmd_f.vx == pytest.approx(0.6)
+    assert cmd_s.vx == pytest.approx(0.3)
+    assert cmd_f.vtheta == pytest.approx(2 * cmd_s.vtheta, rel=1e-6)
+    assert cmd_f.vtheta / cmd_f.vx == pytest.approx(cmd_s.vtheta / cmd_s.vx, rel=1e-6)
+
+
+def test_pursuit_regulates_speed_by_curvature():
+    """Tight lookahead arc → slow down (r/r_min), never below the regulated floor."""
+    from src.nav_builtin.controller import pursuit_command
 
     cfg = FollowerConfig()
     cfg.motion.max_linear_mps = 0.6
-    # Robot on the x-axis path, yawed +20°; lookahead 1 m ahead on path.
-    current = Pose2D(0.0, 0.0, math.radians(20.0))
-    target = Pose2D(1.0, 0.0, 0.0)
-    cmd = compute_follow_command(
-        current, target, cfg=cfg, final_yaw=None, crosstrack_m=0.0, path_yaw=0.0
-    )
-    assert cmd.vx > 0.2
-    # Path-tangent error is −20° → modest CW turn, not a hard chase.
-    assert cmd.vtheta < 0.0
-    assert abs(cmd.vtheta) <= 0.45
+    current = Pose2D(0.0, 0.0, 0.0)
+    # 40° bearing at L=0.5 → κ = 2 sin(40°)/0.5 ≈ 2.57 → r ≈ 0.39 m < 0.7.
+    target = Pose2D(0.5 * math.cos(math.radians(40)), 0.5 * math.sin(math.radians(40)), 0.0)
+    cmd, rotating = pursuit_command(current, target, cfg=cfg)
+    assert not rotating
+    assert cfg.regulated_min_speed_mps <= cmd.vx < 0.6 * 0.6
+    assert cmd.vtheta > 0.0
+    # Still a drivable arc for the Viam base sanitizer (not a spin).
+    assert cmd.vx >= 0.12
 
 
-def test_follow_command_corrects_crosstrack_instead_of_cutting_corner():
-    """Robot left of a straight path must turn right back onto it (not keep cutting)."""
-    from src.nav_builtin.controller import compute_follow_command
+def test_pursuit_corrects_crosstrack_toward_path():
+    """Robot left of a straight path turns right back onto it, without Stanley."""
+    from src.nav_builtin.controller import pursuit_command
 
     cfg = FollowerConfig()
     cfg.motion.max_linear_mps = 0.6
-    # Facing along +x path but 0.35 m to the left (inside a left-hand corner cut).
     current = Pose2D(0.0, 0.35, 0.0)
-    target = Pose2D(1.0, 0.0, 0.0)
-    cmd = compute_follow_command(
-        current,
-        target,
-        cfg=cfg,
-        final_yaw=None,
-        crosstrack_m=0.35,
-        path_yaw=0.0,
-    )
+    target = Pose2D(0.6, 0.0, 0.0)
+    cmd, rotating = pursuit_command(current, target, cfg=cfg)
+    assert not rotating
     assert cmd.vtheta < 0.0
-    # Off-path: do not keep full cruise speed into the obstacle.
-    on_path = compute_follow_command(
-        Pose2D(0.0, 0.0, 0.0),
-        target,
-        cfg=cfg,
-        final_yaw=None,
-        crosstrack_m=0.0,
-        path_yaw=0.0,
-    )
-    assert cmd.vx < on_path.vx
+    assert cmd.vx > 0.12
+
+
+def test_pursuit_rotate_to_heading_has_hysteresis():
+    from src.nav_builtin.controller import pursuit_command
+
+    cfg = FollowerConfig()
+    current = Pose2D(0.0, 0.0, 0.0)
+
+    def _at(deg: float) -> Pose2D:
+        return Pose2D(0.6 * math.cos(math.radians(deg)), 0.6 * math.sin(math.radians(deg)), 0.0)
+
+    # Beyond the enter threshold: rotate-to-heading.
+    far = _at(math.degrees(cfg.rotate_in_place_rad) + 15.0)
+    cmd, rotating = pursuit_command(current, far, cfg=cfg)
+    assert rotating and cmd.vx == 0.0 and cmd.vtheta > 0.0
+    assert abs(cmd.vtheta) <= cfg.rotate_vel_rad_s + 1e-9
+    # Between exit and enter: keep rotating only if we already were.
+    mid = _at(0.5 * math.degrees(cfg.rotate_in_place_rad + cfg.rotate_exit_rad))
+    cmd_stay, still = pursuit_command(current, mid, cfg=cfg, rotate_active=True)
+    assert still and cmd_stay.vx == 0.0
+    cmd_go, fresh = pursuit_command(current, mid, cfg=cfg, rotate_active=False)
+    assert not fresh and cmd_go.vx > 0.0
+    # Under the exit threshold: leave rotate-to-heading.
+    close = _at(math.degrees(cfg.rotate_exit_rad) - 10.0)
+    cmd_exit, done_rot = pursuit_command(current, close, cfg=cfg, rotate_active=True)
+    assert not done_rot and cmd_exit.vx > 0.0
+
+
+def test_keep_arc_drivable_preserves_curvature_at_crawl():
+    from src.nav_builtin.controller import DriveCommand, keep_arc_drivable
+
+    # Slow-down produced 0.05 m/s with 0.10 rad/s (r = 0.5 m). The Viam
+    # sanitizer would keep this, but flooring to 0.12 keeps the same arc.
+    out = keep_arc_drivable(DriveCommand(0.05, 0.0, 0.10, False))
+    assert out.vx == pytest.approx(0.12)
+    assert out.vtheta / out.vx == pytest.approx(2.0)
+    # Sanitizer trap: vx<0.12 with |vθ|>0.25 → would become a pure spin.
+    trap = keep_arc_drivable(DriveCommand(0.08, 0.0, 0.30, False))
+    assert trap.vx == pytest.approx(0.12)
+    assert abs(trap.vtheta) <= 0.25
+    # Already drivable / not translating: untouched.
+    ok = DriveCommand(0.3, 0.0, 0.5, False)
+    assert keep_arc_drivable(ok) == ok
+    spin = DriveCommand(0.0, 0.0, 0.5, False)
+    assert keep_arc_drivable(spin) == spin
 
 
 def test_follow_command_approach_cap_only_at_goal():

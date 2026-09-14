@@ -208,7 +208,28 @@ def test_avoidance_slows_in_band():
     out, state, clr = apply_obstacle_avoidance(cmd, scan, obs, max_angular_rad_s=0.8)
     assert state == "slow"
     assert 0.0 < out.vx < cmd.vx
-    assert out.vtheta == cmd.vtheta
+    # Curvature preserved: vθ scales with vx so the arc does not tighten.
+    assert out.vtheta / out.vx == pytest.approx(cmd.vtheta / cmd.vx)
+
+
+def test_velocity_floor_skips_angular_when_translating():
+    from src.nav.simple_motion import apply_velocity_floor
+
+    cfg = SimpleMotionConfig(
+        max_linear_mps=0.6,
+        max_angular_rad_s=1.0,
+        min_linear_mps=0.1,
+        min_angular_rad_s=0.15,
+    )
+    # Translating with a tiny correction: do not zig-zag at ±min_angular.
+    moving = apply_velocity_floor(DriveCommand(0.3, 0.0, 0.03, False), cfg)
+    assert moving.vtheta == pytest.approx(0.03)
+    # Pure rotation: floor still applies (skid-steer stiction).
+    spin = apply_velocity_floor(DriveCommand(0.0, 0.0, 0.03, False), cfg)
+    assert spin.vtheta == pytest.approx(0.15)
+    # Linear floor unchanged.
+    crawl = apply_velocity_floor(DriveCommand(0.02, 0.0, 0.0, False), cfg)
+    assert crawl.vx == pytest.approx(0.1)
 
 
 def test_avoidance_stops_and_turns_to_clearer_side():

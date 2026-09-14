@@ -24,28 +24,41 @@ from .types import Path2D, Pose2D
 
 @dataclass
 class FollowerConfig:
-    # Longer lookahead = gentler pure-pursuit arcs on skid-steer. The mugger
-    # 0.25–0.7 m RPP band made mid-path corrections too sharp (small arcs → big).
-    lookahead_m: float = 1.0
-    min_lookahead_m: float = 0.7
-    max_lookahead_m: float = 1.4
+    """Regulated Pure Pursuit (Nav2-style) for diff-drive / skid-steer.
+
+    Lookahead is velocity-scaled: ``L = clamp(v · lookahead_time_s, min, max)``;
+    ``lookahead_m`` is used when the commanded speed is unknown or ~0. Steering
+    is geometric (``κ = 2·y_l / L²``, ``ω = v·κ``) so slowing down never
+    tightens the turn, and the lookahead low-passes SLAM pose jitter.
+    """
+
+    lookahead_m: float = 0.6
+    min_lookahead_m: float = 0.4
+    max_lookahead_m: float = 0.9
+    lookahead_time_s: float = 1.5
     approach_dist_m: float = 0.35
     waypoint_tolerance_m: float = 0.15
-    # Above this bearing error, stop translating and rotate in place. Below it,
-    # keep moving while turning (needed for sparse Lazy Theta* paths).
-    # Kept tighter than 75° so we don't carve large translate+turn arcs.
-    rotate_in_place_rad: float = math.radians(55.0)
-    # Mid-path angular gain on path-tangent error (was 1.8 on point-bearing).
-    heading_gain: float = 1.0
-    # Cap |vθ| while translating so turn radius stays gentle.
-    max_translate_yaw_rad_s: float = 0.55
-    # Stanley crosstrack gain (1/m-ish via atan(k e / v)). Higher = snap back
-    # to the polyline harder so pure-pursuit does not cut inside corners.
-    crosstrack_gain: float = 1.25
-    # Start scaling linear speed down once |crosstrack| exceeds this.
-    crosstrack_slow_m: float = 0.12
+    # Rotate-to-heading: stop translating when the lookahead bearing exceeds
+    # ``rotate_in_place_rad``; keep rotating until it drops under
+    # ``rotate_exit_rad`` (hysteresis so we do not toggle spin/translate).
+    # 60° (not Nav2's 45°): with curvature-regulated speed a 90° corner is a
+    # slow tight arc, and a 45° trigger turned every corner into stop-spin-go.
+    rotate_in_place_rad: float = math.radians(60.0)
+    rotate_exit_rad: float = math.radians(25.0)
+    rotate_vel_rad_s: float = 0.6
+    # Curvature regulation: below this turn radius, scale v by r / r_min so the
+    # robot slows into corners instead of carving them at cruise.
+    regulated_min_radius_m: float = 0.7
+    regulated_min_speed_mps: float = 0.15
     motion: SimpleMotionConfig = field(default_factory=SimpleMotionConfig)
     obstacle: Optional[ObstacleConfig] = None
+
+
+# Viam wheeled bases reject wheel RPM "nearly 0". ``ViamWorldIO`` sanitizes
+# ``vx < 0.12`` with ``|vθ| > 0.25`` to a pure spin, so any translating arc we
+# emit must stay in the drivable region or the base turns it into a spin.
+_BASE_CRAWL_FLOOR_MPS = 0.12
+_BASE_CRAWL_MAX_YAW_RAD_S = 0.25
 
 
 def _path_length(path: Path2D) -> float:
@@ -197,15 +210,96 @@ def _effective_lookahead(
     speed_mps: float,
     near_goal: bool = False,
 ) -> float:
-    """Velocity-scaled lookahead — longer = gentler arcs on diff/skid bases."""
+    """Velocity-scaled lookahead (RPP): ``clamp(v · t_lookahead, lo, hi)``."""
     lo = min(cfg.min_lookahead_m, cfg.max_lookahead_m)
     hi = max(cfg.min_lookahead_m, cfg.max_lookahead_m)
     if near_goal:
         return lo
-    # Do not shrink lookahead when crawling — that pulls the pursuit target in
-    # and caps linear speed in a slow/shimmy feedback loop.
-    horizon = max(cfg.lookahead_m, abs(speed_mps) * 1.2)
-    return max(lo, min(hi, horizon))
+    if abs(speed_mps) < 0.05:
+        # Starting / after rotate-to-heading: no speed to scale from.
+        return max(lo, min(hi, cfg.lookahead_m))
+    return max(lo, min(hi, abs(speed_mps) * cfg.lookahead_time_s))
+
+
+def update_speed_estimate(prev: float, cmd_vx: float, *, alpha: float = 0.25) -> float:
+    """Smoothed forward-speed estimate for the velocity-scaled lookahead.
+
+    Nav2 scales lookahead from *measured* odometry, which the robot's inertia
+    smooths. We only have the last command; feeding it back raw creates a
+    limit cycle (slow → shorter L → less curvature → fast → longer L → ...)
+    that shows up as alternating vθ every tick through a corner. A ~0.4 s EMA
+    stands in for inertia.
+    """
+    return (1.0 - alpha) * float(prev) + alpha * max(0.0, float(cmd_vx))
+
+
+def keep_arc_drivable(cmd: DriveCommand) -> DriveCommand:
+    """Keep a translating arc inside the base sanitizer's drivable region.
+
+    Obstacle slow-down can scale ``vx`` under 0.12 m/s while ``vθ`` stays over
+    0.25 rad/s; the base then drops ``vx`` to zero and the robot spins in place
+    every few ticks (the "crazy arcs"). Preserve curvature instead: floor
+    ``vx`` at the crawl floor and rescale ``vθ`` with it, capping very tight
+    arcs at the sanitizer's yaw limit.
+    """
+    if cmd.done or cmd.vx <= 0.0 or cmd.vx >= _BASE_CRAWL_FLOOR_MPS:
+        return cmd
+    kappa = cmd.vtheta / cmd.vx
+    vx = _BASE_CRAWL_FLOOR_MPS
+    vtheta = _clamp(vx * kappa, _BASE_CRAWL_MAX_YAW_RAD_S)
+    return DriveCommand(vx, cmd.vy, vtheta, False)
+
+
+def pursuit_command(
+    current: Pose2D,
+    target: Pose2D,
+    *,
+    cfg: FollowerConfig,
+    rotate_active: bool = False,
+) -> Tuple[DriveCommand, bool]:
+    """Regulated pure pursuit toward the lookahead point ``target``.
+
+    Returns ``(cmd, rotating)`` where ``rotating`` is the rotate-to-heading
+    state to feed back next tick (hysteresis).
+    """
+    motion = cfg.motion
+    max_linear = motion.max_linear_mps
+    max_angular = motion.max_angular_rad_s
+
+    dx = target.x - current.x
+    dy = target.y - current.y
+    cth = math.cos(current.theta)
+    sth = math.sin(current.theta)
+    # Lookahead point in the robot frame.
+    x_l = cth * dx + sth * dy
+    y_l = -sth * dx + cth * dy
+    l2 = x_l * x_l + y_l * y_l
+    if l2 < 1e-6:
+        return DriveCommand(0.0, 0.0, 0.0, False), False
+    alpha = math.atan2(y_l, x_l)
+
+    enter = abs(alpha) > cfg.rotate_in_place_rad
+    stay = rotate_active and abs(alpha) > cfg.rotate_exit_rad
+    if enter or stay:
+        rot_max = min(float(cfg.rotate_vel_rad_s), max_angular)
+        rot_floor = min(rot_max, max(motion.min_angular_rad_s, 0.2))
+        w = math.copysign(max(min(abs(alpha) * 1.5, rot_max), rot_floor), alpha)
+        return DriveCommand(0.0, 0.0, w, False), True
+
+    kappa = 2.0 * y_l / l2
+    v = max_linear
+    if abs(kappa) > 1e-6:
+        radius = 1.0 / abs(kappa)
+        if radius < cfg.regulated_min_radius_m:
+            v *= radius / cfg.regulated_min_radius_m
+    v = min(max_linear, max(float(cfg.regulated_min_speed_mps), v))
+    w = v * kappa
+    if abs(w) > max_angular:
+        # Keep the arc; give up speed rather than curvature.
+        w = math.copysign(max_angular, w)
+        v = max_angular / abs(kappa)
+    v = max(v, motion.min_linear_mps)
+    return keep_arc_drivable(DriveCommand(v, 0.0, w, False)), False
 
 
 def lookahead_pose(
@@ -268,10 +362,8 @@ def compute_follow_command(
     *,
     cfg: FollowerConfig,
     final_yaw: Optional[float] = None,
-    crosstrack_m: Optional[float] = None,
-    path_yaw: Optional[float] = None,
 ) -> DriveCommand:
-    """Pure-pursuit-ish step toward ``target`` (map frame → body cmd_vel)."""
+    """One step toward ``target``: near-goal law if ``final_yaw`` else pursuit."""
     motion = cfg.motion
     dist = distance_m(current, target)
     heading_to_target = math.atan2(target.y - current.y, target.x - current.x)
@@ -294,55 +386,11 @@ def compute_follow_command(
         )
 
     # Intermediate pursuit target reached — not navigation complete.
-    if final_yaw is None and dist <= xy_tol * 0.5:
+    if dist <= xy_tol * 0.5:
         return DriveCommand(0.0, 0.0, 0.0, False)
 
-    max_linear = motion.max_linear_mps
-    max_angular = motion.max_angular_rad_s
-
-    # Mid-path: path tangent + Stanley crosstrack (not chase-lookahead).
-    # Pure point-pursuit cuts inside corners and rides under the planned
-    # robot_radius clearance even when the green plan looked fine.
-    yaw_ref = float(path_yaw) if path_yaw is not None else float(target.theta)
-    heading_err = heading_error_rad(current.theta, yaw_ref)
-    bearing_to_point = heading_error_rad(current.theta, heading_to_target)
-    ct = float(crosstrack_m) if crosstrack_m is not None else 0.0
-    # Positive crosstrack = robot left of path → turn right (negative vθ).
-    speed_ref = max(0.20, max_linear * 0.5)
-    stanley = math.atan(
-        (float(cfg.crosstrack_gain) * ct) / speed_ref
-    )
-    steer = conv.normalize_angle(heading_err - stanley)
-    along = math.cos(yaw_ref) * (target.x - current.x) + math.sin(yaw_ref) * (
-        target.y - current.y
-    )
-    face = bearing_to_point if along < 0.05 else steer
-
-    # Large heading / crosstrack error: rotate in place first.
-    if abs(face) > cfg.rotate_in_place_rad or along < 0.05:
-        return apply_velocity_floor(
-            DriveCommand(0.0, 0.0, _clamp(face * 1.5, max_angular), False),
-            motion,
-        )
-
-    linear_cmd = _clamp(dist * 0.75, max_linear)
-    if abs(steer) < math.radians(25.0) and abs(ct) < cfg.crosstrack_slow_m:
-        linear_cmd = max(max_linear * 0.55, min(max_linear, linear_cmd))
-    bearing_scale = max(0.45, 1.0 - (abs(steer) / cfg.rotate_in_place_rad) * 0.45)
-    linear_cmd *= bearing_scale
-    # Slow when off the polyline so we stop cutting deeper into the corner.
-    if abs(ct) > cfg.crosstrack_slow_m:
-        slow_span = max(0.15, 0.45 - cfg.crosstrack_slow_m)
-        ct_scale = max(
-            0.25,
-            1.0 - (abs(ct) - cfg.crosstrack_slow_m) / slow_span,
-        )
-        linear_cmd *= ct_scale
-    yaw_cap = min(max_angular, float(cfg.max_translate_yaw_rad_s))
-    angular_cmd = _clamp(steer * float(cfg.heading_gain), yaw_cap)
-    return apply_velocity_floor(
-        DriveCommand(linear_cmd, 0.0, angular_cmd, False), motion
-    )
+    cmd, _rotating = pursuit_command(current, target, cfg=cfg)
+    return apply_velocity_floor(cmd, motion)
 
 
 def compute_path_command(
@@ -359,8 +407,13 @@ def compute_path_command(
     min_cmd_vel_theta: float = 0.0,
     local_planner_active: bool = False,
     prev_local_cmd: Optional[DriveCommand] = None,
+    rotate_active: bool = False,
 ) -> Tuple[DriveCommand, dict]:
-    """One control step along ``path``."""
+    """One control step along ``path``.
+
+    ``rotate_active`` is the rotate-to-heading state from the previous tick
+    (``progress["rotate_to_heading"]``); feed it back for hysteresis.
+    """
     est_speed = cfg.motion.max_linear_mps * 0.5 if speed_mps is None else speed_mps
     goal_xy = Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
     dist_goal = distance_m(current, goal_xy)
@@ -382,7 +435,8 @@ def compute_path_command(
     bearing = heading_error_rad(
         current.theta, math.atan2(target.y - current.y, target.x - current.x)
     )
-    crosstrack, path_yaw_ref = signed_crosstrack_m(current, path)
+    crosstrack, _path_yaw = signed_crosstrack_m(current, path)
+    rotating = False
 
     local_active = False
     if (
@@ -417,14 +471,10 @@ def compute_path_command(
             )
             bearing = heading_error_rad(current.theta, path.goal_theta)
         else:
-            cmd = compute_follow_command(
-                current,
-                target,
-                cfg=cfg,
-                final_yaw=None,
-                crosstrack_m=crosstrack,
-                path_yaw=path_yaw_ref,
+            cmd, rotating = pursuit_command(
+                current, target, cfg=cfg, rotate_active=rotate_active
             )
+            cmd = apply_velocity_floor(cmd, cfg.motion)
 
     obstacle_state = "clear"
     forward_clearance = math.inf
@@ -442,7 +492,9 @@ def compute_path_command(
             cmd, scan, cfg.obstacle, max_angular_rad_s=cfg.motion.max_angular_rad_s
         )
         if not cmd.done and (cmd.vx != 0.0 or cmd.vtheta != 0.0):
-            cmd = apply_velocity_floor(cmd, cfg.motion)
+            # Slow-down scaled vx; keep the arc drivable before the floor so a
+            # 0.05 m/s crawl with 0.2 rad/s does not become a base-side spin.
+            cmd = apply_velocity_floor(keep_arc_drivable(cmd), cfg.motion)
     elif local_active:
         obstacle_state = "local_planner"
     elif (
@@ -467,6 +519,8 @@ def compute_path_command(
         "forward_clearance_m": None if math.isinf(forward_clearance) else forward_clearance,
         "bearing_error_rad": bearing,
         "crosstrack_m": crosstrack,
+        "lookahead_m": lookahead,
+        "rotate_to_heading": rotating,
         "cmd_vx_mps": cmd.vx,
         "cmd_vy_mps": cmd.vy,
         "cmd_vtheta_rad_s": cmd.vtheta,

@@ -379,11 +379,12 @@ class BuiltinNavConfig:
 
     # ``lazy_theta_star`` (default) or ``astar``.
     planner: str = BUILTIN_PLANNER_LAZY_THETA
-    # Longer pure-pursuit lookahead = gentler arcs on skid-steer. Short RPP
-    # (0.25–0.7 m) made mid-path corrections too sharp.
-    lookahead_m: float = 1.0
-    min_lookahead_m: float = 0.7
-    max_lookahead_m: float = 1.4
+    # Regulated pure pursuit lookahead: velocity-scaled (1.5 s) and clamped to
+    # [min, max]; ``lookahead_m`` is the fallback when starting from rest.
+    # Longer = smoother but cuts corners more; shorter = tighter tracking.
+    lookahead_m: float = 0.6
+    min_lookahead_m: float = 0.4
+    max_lookahead_m: float = 0.9
     replan_period_s: float = 1.0
     timeout_s: float = 300.0
     # Base.SetVelocity wait on the shared module event loop. Mapping+SLAM can
