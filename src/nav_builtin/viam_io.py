@@ -130,7 +130,11 @@ class ViamWorldIO:
         # A fire-and-forget refresh fills this cache; the control loop only reads it
         # so RealSense PCD cannot starve SetVelocity on the shared module loop.
         self._per_lidar_scan: dict[str, tuple[conv.LaserScan2D, float]] = {}
-        self._obstacles_only_period_s = 0.75
+        # Depth is async + slow; keep it fresh enough that motion compensation works.
+        self._obstacles_only_period_s = 0.40
+        # Beyond this pose shift, cached depth is dropped (avoids phantom obstacles).
+        self._obstacles_max_shift_m = 0.30
+        self._obstacles_max_shift_rad = math.radians(20.0)
         self._obstacles_refresh_inflight: Set[str] = set()
         self._last_drive: Optional[dict] = None
         self._pose_source: str = "none"
@@ -308,8 +312,15 @@ class ViamWorldIO:
             # Include obstacles_only sensors — this path is for nav avoidance /
             # local costmap, not SLAM matching.
             scan = self._read_lidar_scan_sync(lidar, max_age_s=max_age_s)
-            if scan is not None:
-                scans.append(scan)
+            if scan is None:
+                continue
+            if pose is not None and lidar.obstacles_only:
+                # Depth is rate-limited/async: re-express into the live body frame
+                # or drop when the robot has moved too far (phantom obstacles).
+                scan = self._align_obstacles_scan_to_pose(scan, pose)
+                if scan is None:
+                    continue
+            scans.append(scan)
         if not scans:
             return self._scan_cache
         merged = (
@@ -331,6 +342,66 @@ class ViamWorldIO:
         self._scan_cache_at = now
         self._scan_cache_pose = pose
         return merged
+
+    def _map_pose_now(self) -> Optional[conv.Pose2D]:
+        if self._pose_provider is not None:
+            try:
+                return self._pose_provider()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            return self.get_pose()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _stamp_capture_pose(
+        self, scan: conv.LaserScan2D, pose: Optional[conv.Pose2D]
+    ) -> conv.LaserScan2D:
+        if pose is None:
+            return scan
+        return conv.LaserScan2D(
+            ranges=scan.ranges,
+            angle_min=scan.angle_min,
+            angle_increment=scan.angle_increment,
+            range_min=scan.range_min,
+            range_max=scan.range_max,
+            sensor_pose=scan.sensor_pose,
+            capture_pose=pose,
+        )
+
+    def _align_obstacles_scan_to_pose(
+        self, scan: conv.LaserScan2D, current: conv.Pose2D
+    ) -> Optional[conv.LaserScan2D]:
+        """Move a cached depth scan into the live base_link, or drop if too stale.
+
+        Without this, async depth (~0.4–1 s old) is painted as if seen from the
+        *current* pose — walls smear into free space and the local planner weaves.
+        """
+        cap = scan.capture_pose
+        if cap is None:
+            # Unknown capture frame: safer to drop than invent obstacles.
+            return None
+        dtheta = abs(conv.normalize_angle(current.theta - cap.theta))
+        dist = math.hypot(current.x - cap.x, current.y - cap.y)
+        if dist <= 0.08 and dtheta <= math.radians(8.0):
+            return self._stamp_capture_pose(scan, current)
+        if dist > self._obstacles_max_shift_m or dtheta > self._obstacles_max_shift_rad:
+            return None
+        pts = scan.to_points()
+        if pts.size == 0:
+            return self._stamp_capture_pose(scan, current)
+        pts3 = np.column_stack([pts, np.zeros(len(pts))])
+        aligned = conv.transform_points_between_poses(pts3, cap, current)[:, :2]
+        n_bins = int(len(scan.ranges)) if len(scan.ranges) else self._scan_bins
+        rebuilt = conv.points_to_scan(
+            aligned,
+            angle_min=-math.pi,
+            angle_max=math.pi,
+            num_bins=max(n_bins, 8),
+            range_min=float(scan.range_min),
+            range_max=float(scan.range_max),
+        )
+        return self._stamp_capture_pose(rebuilt, current)
 
     def _pcd_to_scan(
         self, raw: bytes, lidar: LidarConfig
@@ -418,7 +489,10 @@ class ViamWorldIO:
                     lidar, max_age_s=max(2.0, self._obstacles_only_period_s * 2)
                 )
                 if shm_scan is not None:
-                    self._per_lidar_scan[name] = (shm_scan, time.monotonic())
+                    self._per_lidar_scan[name] = (
+                        self._stamp_capture_pose(shm_scan, self._map_pose_now()),
+                        time.monotonic(),
+                    )
                     return
                 if cam is None:
                     return
@@ -429,7 +503,10 @@ class ViamWorldIO:
                     None, lambda: self._pcd_to_scan(raw, lidar)
                 )
                 if scan is not None:
-                    self._per_lidar_scan[name] = (scan, time.monotonic())
+                    self._per_lidar_scan[name] = (
+                        self._stamp_capture_pose(scan, self._map_pose_now()),
+                        time.monotonic(),
+                    )
             except Exception as exc:  # noqa: BLE001
                 self._log(f"obstacles_only lidar {name} refresh failed: {exc}")
             finally:

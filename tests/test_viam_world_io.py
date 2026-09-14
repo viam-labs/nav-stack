@@ -386,6 +386,14 @@ async def test_obstacles_only_scan_never_blocks_on_point_cloud():
         lidars=[depth],
     )
     seeded = conv.points_to_scan(np.array([[1.0, 0.0]]), num_bins=360)
+    seeded = conv.LaserScan2D(
+        ranges=seeded.ranges,
+        angle_min=seeded.angle_min,
+        angle_increment=seeded.angle_increment,
+        range_min=seeded.range_min,
+        range_max=seeded.range_max,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
     world._per_lidar_scan["camera"] = (seeded, time.monotonic())  # noqa: SLF001
 
     t0 = time.monotonic()
@@ -393,3 +401,64 @@ async def test_obstacles_only_scan_never_blocks_on_point_cloud():
     assert time.monotonic() - t0 < 1.0
     assert scan is not None
     cam.get_point_cloud.assert_not_awaited()
+
+
+def test_align_obstacles_scan_drops_when_pose_moved_too_far():
+    """Stale depth after a large move must not paint phantom obstacles."""
+    from src.config import LidarConfig
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[
+            LidarConfig(name="camera", scan_source="point_cloud", obstacles_only=True)
+        ],
+    )
+    scan = conv.points_to_scan(np.array([[1.5, 0.0]]), num_bins=72)
+    scan = conv.LaserScan2D(
+        ranges=scan.ranges,
+        angle_min=scan.angle_min,
+        angle_increment=scan.angle_increment,
+        range_min=scan.range_min,
+        range_max=scan.range_max,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+    # Moved 0.5 m — beyond _obstacles_max_shift_m.
+    assert (
+        world._align_obstacles_scan_to_pose(scan, conv.Pose2D(0.5, 0.0, 0.0))  # noqa: SLF001
+        is None
+    )
+
+
+def test_align_obstacles_scan_motion_compensates_small_shift():
+    """Small pose change should warp depth hits into the live base_link."""
+    from src.config import LidarConfig
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[
+            LidarConfig(name="camera", scan_source="point_cloud", obstacles_only=True)
+        ],
+    )
+    # Hit 1 m ahead at capture pose.
+    scan = conv.points_to_scan(np.array([[1.0, 0.0]]), num_bins=72)
+    scan = conv.LaserScan2D(
+        ranges=scan.ranges,
+        angle_min=scan.angle_min,
+        angle_increment=scan.angle_increment,
+        range_min=scan.range_min,
+        range_max=scan.range_max,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+    # Robot moved +0.2 m in x; same hit is now 0.8 m ahead in body frame.
+    aligned = world._align_obstacles_scan_to_pose(  # noqa: SLF001
+        scan, conv.Pose2D(0.2, 0.0, 0.0)
+    )
+    assert aligned is not None
+    pts = aligned.to_points()
+    assert pts.shape[0] >= 1
+    assert abs(float(pts[0, 0]) - 0.8) < 0.08
+    assert abs(float(pts[0, 1])) < 0.08
