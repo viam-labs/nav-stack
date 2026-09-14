@@ -124,6 +124,9 @@ class ViamWorldIO:
         self._scan_cache: Optional[conv.LaserScan2D] = None
         self._scan_cache_at = 0.0
         self._scan_cache_pose: Optional[conv.Pose2D] = None
+        # Per-sensor cache so dense depth cams are not GetPointCloud'd every tick.
+        self._per_lidar_scan: dict[str, tuple[conv.LaserScan2D, float]] = {}
+        self._obstacles_only_period_s = 0.25
         self._last_drive: Optional[dict] = None
         self._pose_source: str = "none"
 
@@ -328,17 +331,22 @@ class ViamWorldIO:
         self, raw: bytes, lidar: LidarConfig
     ) -> conv.LaserScan2D:
         pts = conv.parse_pcd(raw)
-        if not lidar.points_in_base_link:
-            pts = conv.transform_lidar_mount_to_base_link(
-                pts,
-                x=lidar.x,
-                y=lidar.y,
-                z=lidar.z,
-                theta=lidar.theta,
-                pitch=lidar.pitch,
-                roll=lidar.roll,
-            )
-        pts = conv.filter_points_by_z(pts, lidar.z_min, lidar.z_max)
+        # Depth cams are dense; downsample so GetPointCloud doesn't starve SetVelocity.
+        max_pts = 4000 if lidar.obstacles_only else 0
+        pts = conv.prepare_lidar_point_cloud(
+            pts,
+            cloud_frame=lidar.cloud_frame,
+            points_in_base_link=lidar.points_in_base_link,
+            x=lidar.x,
+            y=lidar.y,
+            z=lidar.z,
+            theta=lidar.theta,
+            pitch=lidar.pitch,
+            roll=lidar.roll,
+            z_min=lidar.z_min,
+            z_max=lidar.z_max,
+            max_points=max_pts,
+        )
         return conv.points_to_scan(
             pts,
             angle_min=-math.pi,
@@ -378,10 +386,19 @@ class ViamWorldIO:
     def _read_lidar_scan_sync(
         self, lidar: LidarConfig, *, max_age_s: float
     ) -> Optional[conv.LaserScan2D]:
+        if lidar.obstacles_only:
+            cached = self._per_lidar_scan.get(lidar.name)
+            if (
+                cached is not None
+                and time.monotonic() - cached[1] < self._obstacles_only_period_s
+            ):
+                return cached[0]
         # Prefer POSIX shm (memcpy) so the 10 Hz control loop never blocks on
         # gRPC GetPointCloud — that lag was causing no_scan spin / circles.
         shm_scan = self._try_shm_scan(lidar, max_age_s=max_age_s)
         if shm_scan is not None:
+            if lidar.obstacles_only:
+                self._per_lidar_scan[lidar.name] = (shm_scan, time.monotonic())
             return shm_scan
         if lidar.shm_name and lidar.shm_required:
             return None
@@ -389,12 +406,15 @@ class ViamWorldIO:
         if cam is None:
             return None
         try:
-            return self._run(
+            scan = self._run(
                 self._read_lidar_scan_grpc(cam, lidar),
                 timeout=1.0,
             )
         except Exception:  # noqa: BLE001
             return None
+        if scan is not None and lidar.obstacles_only:
+            self._per_lidar_scan[lidar.name] = (scan, time.monotonic())
+        return scan
 
     async def _read_lidar_scan_grpc(
         self, cam, lidar: LidarConfig

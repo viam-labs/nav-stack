@@ -33,6 +33,13 @@ LIDAR_SCAN_SOURCES = {
     LIDAR_SCAN_POINT_CLOUD,
 }
 
+# Point-cloud axis convention *before* the mount transform.
+# ``sensor``: X forward, Y left, Z up (RPLIDAR / Livox / ROS body).
+# ``camera_optical``: X right, Y down, Z forward (RealSense / OpenCV / ROS optical).
+CLOUD_FRAME_SENSOR = "sensor"
+CLOUD_FRAME_CAMERA_OPTICAL = "camera_optical"
+CLOUD_FRAMES = {CLOUD_FRAME_SENSOR, CLOUD_FRAME_CAMERA_OPTICAL}
+
 
 def default_lidar_shm_name(component_name: str) -> str:
     """Match ``viam-labs:nav-stack:rplidar`` default writer name."""
@@ -219,6 +226,11 @@ class LidarConfig:
     # it is excluded from SLAM scan-matching and map updates. Use for a short-
     # range depth camera alongside a real lidar.
     obstacles_only: bool = False
+    # Axis convention of ``get_point_cloud`` *before* mount. RealSense / OpenCV
+    # depth clouds are ``camera_optical`` (Z forward); treating them as
+    # ``sensor`` (X forward) collapses depth into height and paints a blob on
+    # the robot in the local costmap.
+    cloud_frame: str = CLOUD_FRAME_SENSOR
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "LidarConfig":
@@ -230,6 +242,11 @@ class LidarConfig:
         if scan_source not in LIDAR_SCAN_SOURCES:
             raise ValueError(
                 f"lidar scan_source must be one of {sorted(LIDAR_SCAN_SOURCES)}"
+            )
+        cloud_frame = str(d.get("cloud_frame", CLOUD_FRAME_SENSOR)).strip().lower()
+        if cloud_frame not in CLOUD_FRAMES:
+            raise ValueError(
+                f"lidar cloud_frame must be one of {sorted(CLOUD_FRAMES)}"
             )
         name = d["name"]
         if "shm_name" in d:
@@ -261,6 +278,7 @@ class LidarConfig:
             shm_region_size=region,
             shm_required=bool(d.get("shm_required", False)),
             obstacles_only=bool(d.get("obstacles_only", False)),
+            cloud_frame=cloud_frame,
         )
 
 

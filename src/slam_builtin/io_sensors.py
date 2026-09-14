@@ -187,17 +187,21 @@ class BuiltinSensors:
 
     def _pcd_to_scan(self, raw: bytes, lidar: LidarConfig) -> conv.LaserScan2D:
         pts = conv.parse_pcd(raw)
-        if not lidar.points_in_base_link:
-            pts = conv.transform_lidar_mount_to_base_link(
-                pts,
-                x=lidar.x,
-                y=lidar.y,
-                z=lidar.z,
-                theta=lidar.theta,
-                pitch=lidar.pitch,
-                roll=lidar.roll,
-            )
-        pts = conv.filter_points_by_z(pts, lidar.z_min, lidar.z_max)
+        max_pts = 4000 if lidar.obstacles_only else 0
+        pts = conv.prepare_lidar_point_cloud(
+            pts,
+            cloud_frame=lidar.cloud_frame,
+            points_in_base_link=lidar.points_in_base_link,
+            x=lidar.x,
+            y=lidar.y,
+            z=lidar.z,
+            theta=lidar.theta,
+            pitch=lidar.pitch,
+            roll=lidar.roll,
+            z_min=lidar.z_min,
+            z_max=lidar.z_max,
+            max_points=max_pts,
+        )
         return conv.points_to_scan(
             pts,
             angle_min=-math.pi,

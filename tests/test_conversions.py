@@ -128,6 +128,58 @@ def test_pointcloud_to_scan_excludes_floor_for_livox_height_band():
     assert np.all(valid >= 1.4)
 
 
+def test_camera_optical_to_sensor_frame_maps_depth_to_forward():
+    # 1 m ahead in optical (Z), 0.1 m right (X), 0.2 m down (Y).
+    optical = np.array([[0.1, 0.2, 1.0]])
+    sensor = conv.camera_optical_to_sensor_frame(optical)
+    assert np.allclose(sensor[0], [1.0, -0.1, -0.2], atol=1e-9)
+
+
+def test_prepare_lidar_point_cloud_optical_does_not_blob_on_robot():
+    """Repro: treating optical Z as height paints obstacles on the camera XY."""
+    # Dense depth along optical Z (0.5–2.0 m ahead), all at optical origin XY.
+    zs = np.linspace(0.5, 2.0, 50)
+    optical = np.column_stack([np.zeros(50), np.zeros(50), zs])
+    mount = dict(x=0.29, y=-0.22, z=0.05, theta=0.0)
+    # Wrong frame: depth → height; after z_min=0.8 many points sit on camera XY.
+    wrong = conv.prepare_lidar_point_cloud(
+        optical,
+        cloud_frame="sensor",
+        z_min=0.80,
+        z_max=1.2,
+        **mount,
+    )
+    assert len(wrong) > 0
+    assert np.mean(np.hypot(wrong[:, 0], wrong[:, 1])) < 0.5
+
+    # Correct optical remap: points land ahead of the camera (~0.8–1.2 m + mount).
+    right = conv.prepare_lidar_point_cloud(
+        optical,
+        cloud_frame="camera_optical",
+        z_min=0.0,
+        z_max=2.0,
+        **mount,
+    )
+    assert len(right) == 50
+    assert np.min(right[:, 0]) >= 0.5 + mount["x"] - 1e-6
+    assert np.allclose(right[:, 2], mount["z"], atol=1e-6)
+
+
+def test_lidar_config_cloud_frame_optical():
+    from src.config import LidarConfig
+
+    cfg = LidarConfig.from_dict(
+        {
+            "name": "camera",
+            "obstacles_only": True,
+            "cloud_frame": "camera_optical",
+            "mount": {"x": 0.29, "y": -0.22, "z": 0.05},
+        }
+    )
+    assert cfg.cloud_frame == "camera_optical"
+    assert cfg.obstacles_only is True
+
+
 def test_filter_points_by_z():
     pts = np.array([[0.0, 0.0, 0.05], [0.0, 0.0, 0.5], [0.0, 0.0, 2.0]])
     kept = conv.filter_points_by_z(pts, 0.12, 1.5)

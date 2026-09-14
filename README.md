@@ -154,13 +154,20 @@ mapping). Example depth camera for avoidance only:
   "name": "depth-cam",
   "scan_source": "point_cloud",
   "obstacles_only": true,
+  "cloud_frame": "camera_optical",
+  "shm_name": "",
   "max_range": 4.0,
-  "z_min": 0.05,
+  "min_range": 0.4,
+  "z_min": 0.15,
   "z_max": 1.5,
   "mount": { "x": 0.15, "y": 0.0, "z": 0.4, "theta": 0.0 }
 }
 ```
 
+RealSense / OpenCV depth clouds use **optical** axes (Z forward). Set
+``cloud_frame: "camera_optical"`` so depth is remapped to X-forward before the
+mount and height band; without it, depth collapses into Z and paints a blob on
+the robot in the local costmap.
 **Tuning via Viam config (no YAML editing required):**
 
 | Attribute | Service | Description |
