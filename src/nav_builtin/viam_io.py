@@ -376,6 +376,11 @@ class ViamWorldIO:
 
         Without this, async depth (~0.4–1 s old) is painted as if seen from the
         *current* pose — walls smear into free space and the local planner weaves.
+
+        Important: never restamp ``capture_pose`` to ``current`` without warping
+        the ranges. A prior "small motion" shortcut did that, then ``get_scan``
+        stamped the merge as current — body-frame points stayed frozen while the
+        pose advanced, so phantoms accumulated into a black local-costmap blob.
         """
         cap = scan.capture_pose
         if cap is None:
@@ -383,10 +388,10 @@ class ViamWorldIO:
             return None
         dtheta = abs(conv.normalize_angle(current.theta - cap.theta))
         dist = math.hypot(current.x - cap.x, current.y - cap.y)
-        if dist <= 0.08 and dtheta <= math.radians(8.0):
-            return self._stamp_capture_pose(scan, current)
         if dist > self._obstacles_max_shift_m or dtheta > self._obstacles_max_shift_rad:
             return None
+        if dist < 1e-4 and dtheta < 1e-5:
+            return self._stamp_capture_pose(scan, current)
         pts = scan.to_points()
         if pts.size == 0:
             return self._stamp_capture_pose(scan, current)

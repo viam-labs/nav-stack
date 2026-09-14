@@ -462,3 +462,33 @@ def test_align_obstacles_scan_motion_compensates_small_shift():
     assert pts.shape[0] >= 1
     assert abs(float(pts[0, 0]) - 0.8) < 0.08
     assert abs(float(pts[0, 1])) < 0.08
+
+
+def test_align_obstacles_scan_small_shift_still_warps():
+    """Regression: sub-8 cm moves must warp, not restamp capture_pose only."""
+    from src.config import LidarConfig
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[
+            LidarConfig(name="camera", scan_source="point_cloud", obstacles_only=True)
+        ],
+    )
+    scan = conv.points_to_scan(np.array([[1.0, 0.0]]), num_bins=72)
+    scan = conv.LaserScan2D(
+        ranges=scan.ranges,
+        angle_min=scan.angle_min,
+        angle_increment=scan.angle_increment,
+        range_min=scan.range_min,
+        range_max=scan.range_max,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+    # 5 cm — previously took the broken early-exit that skipped the warp.
+    aligned = world._align_obstacles_scan_to_pose(  # noqa: SLF001
+        scan, conv.Pose2D(0.05, 0.0, 0.0)
+    )
+    assert aligned is not None
+    pts = aligned.to_points()
+    assert abs(float(pts[0, 0]) - 0.95) < 0.08
