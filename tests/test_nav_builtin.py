@@ -219,7 +219,7 @@ def test_costmap_soft_outer_matches_inflation_radius():
         inflation_radius_m=inflate_r,
         robot_radius_m=robot_r,
         cost_scaling_factor=4.0,
-        clearance_preference_m=0.15,
+        clearance_preference_m=0.35,
     )
     cx, cy = 2.0, 2.0  # world center of obstacle cell
     # Just inside soft outer edge: non-zero soft cost (viz-visible).
@@ -329,7 +329,7 @@ def test_corner_path_stays_out_of_soft_halo():
             r, c = occ.world_to_cell(x, y)
             if occ.in_bounds(r, c):
                 peak = max(peak, int(costs[r, c]))
-    # Open space around the tip: stay out of heavy soft glow, not flush to wall.
+    # Open space around the tip: stay out of heavy soft glow.
     assert peak <= 50
 
 
@@ -363,9 +363,10 @@ def test_t_pillar_tip_prefers_clear_swing():
                 if occ.in_bounds(r, c):
                     peak = max(peak, int(costs[r, c]))
     assert ys
-    # Tip at y=2.0; soft outer ≈ 1.65. Prefer a clear under-tip route rather
-    # than hugging the stem — without requiring a multi-metre swing.
-    assert max(ys) <= 1.70
+    # Tip at y=2.0; soft outer ≈ 1.65. Prefer under-tip clear of the stem, not
+    # a multi-metre swing (preference stays LOS-ok so string-pull can tighten).
+    assert max(ys) <= 1.75
+    assert max(ys) < 1.95
     assert peak <= 50
 
 

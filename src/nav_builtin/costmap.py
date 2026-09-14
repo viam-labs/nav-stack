@@ -185,11 +185,10 @@ def _disk_offsets(radius_cells: int) -> Tuple[np.ndarray, np.ndarray]:
 # Soft costs at/above this are shown as inflation in nav-camera / UI.
 # Lower costs are planner-only clearance preference (invisible halo).
 _VIZ_SOFT_MIN = 50
-# Mild bias past inflation — must stay below LOS soft cap so Lazy Theta* /
-# string-pull can still shortcut through the preference band (otherwise paths
-# arc hard around inflate+prefer and the robot sways on every corner).
-_PREF_COST_HI = 40
-_PREF_COST_LO = 12
+# Preference band past inflation — must stay ≤ LOS soft cap (50) so Lazy Theta*
+# / string-pull can shortcut through it (blocking LOS here forced huge plan arcs).
+_PREF_COST_HI = 48
+_PREF_COST_LO = 32
 
 
 def build_costmap(
@@ -199,7 +198,7 @@ def build_costmap(
     robot_radius_m: float = 0.0,
     occupied_threshold: int = 50,
     cost_scaling_factor: float = 4.0,
-    clearance_preference_m: float = 0.15,
+    clearance_preference_m: float = 0.35,
 ) -> np.ndarray:
     """Return (H, W) uint8 costmap.
 
@@ -210,10 +209,10 @@ def build_costmap(
 
     Soft outer radius matches configured ``inflation_radius_m`` (clamped to at
     least the footprint) — that is what UIs show. An additional low-cost
-    ``clearance_preference_m`` band past inflation mildly biases planning toward
-    open space when a cheap detour exists; it is not drawn as inflation (see
-    ``costs_to_occupancy_viz``) and remains LOS-traversable so paths do not arc
-    wildly around every corner.
+    ``clearance_preference_m`` band past inflation biases planning toward open
+    space when a detour exists; it is not drawn as inflation (see
+    ``costs_to_occupancy_viz``) and stays LOS-traversable so string-pull does
+    not have to arc outside inflate+prefer.
     """
     h, w = occ.height, occ.width
     costs = np.full((h, w), FREE, dtype=np.uint8)

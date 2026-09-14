@@ -68,8 +68,7 @@ def _cost_multiplier(cost: int) -> float:
 
     Soft cells stay traversable so narrow corridors remain solvable, but the
     multiplier must be strong enough that a modestly longer clear path beats a
-    short hug of the inflation halo when open space is available — without
-    forcing multi-metre arcs that make the follower sway around every corner.
+    short hug of the inflation halo when open space is available.
     """
     c = int(cost)
     if c <= 0:
@@ -77,8 +76,8 @@ def _cost_multiplier(cost: int) -> float:
     if c >= INSCRIBED:
         return 1e6
     t = c / float(INSCRIBED - 1)
-    # Mild linear + quadratic: preference/outer soft ~2–6×, near-inscribed ≫20×.
-    return 1.0 + 8.0 * t + 35.0 * (t * t)
+    # Linear + steep quadratic: outer soft ≈ 10–20×, near-inscribed ≫50×.
+    return 1.0 + 25.0 * t + 120.0 * (t * t)
 
 
 # Any-angle LOS / string-pull may shortcut through preference / outer soft, but
@@ -583,7 +582,7 @@ def connect_plan_start(
     inflation_radius_m: float,
     robot_radius_m: float,
     cost_scaling_factor: float = 4.0,
-    clearance_preference_m: float = 0.15,
+    clearance_preference_m: float = 0.35,
     algorithm: str = DEFAULT_PLANNER,
     xy_tolerance_m: float = 0.15,
     scan: Optional[conv.LaserScan2D] = None,
@@ -766,7 +765,7 @@ def plan_path(
     inflation_radius_m: float,
     robot_radius_m: float = 0.22,
     cost_scaling_factor: float = 4.0,
-    clearance_preference_m: float = 0.15,
+    clearance_preference_m: float = 0.35,
     algorithm: str = DEFAULT_PLANNER,
     scan: Optional[conv.LaserScan2D] = None,
     scan_pose: Optional[conv.Pose2D] = None,

@@ -111,7 +111,7 @@ def smooth_plan_path(
     inflation_radius_m: float,
     robot_radius_m: float,
     cost_scaling_factor: float,
-    clearance_preference_m: float = 0.15,
+    clearance_preference_m: float = 0.35,
     enabled: bool = True,
     sample_spacing_m: float = 0.10,
 ) -> Path2D:
