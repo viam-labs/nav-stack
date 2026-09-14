@@ -131,7 +131,7 @@ class BuiltinSlamHost:
         # No ROS bridge cmd_vel history on the builtin path.
         del vx, vy, vtheta, source
 
-    # -- BridgeNode-like (via self.node = self) ------------------------------
+    # -- Map / pose surface (self.node = self) -------------------------------
     def get_map(self) -> Optional[dict]:
         if not self._map_updates_enabled:
             return None
