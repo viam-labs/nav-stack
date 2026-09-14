@@ -20,7 +20,7 @@ class BuiltinNavigator:
         inflation_radius_m: float = 0.25,
         robot_radius_m: float = 0.22,
         cost_scaling_factor: float = 4.0,
-        clearance_preference_m: float = 0.35,
+        clearance_preference_m: float = 0.15,
         algorithm: str = "lazy_theta_star",
         replan_period_s: float = 1.0,
         lookahead_m: float = 0.6,

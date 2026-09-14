@@ -68,7 +68,8 @@ def _cost_multiplier(cost: int) -> float:
 
     Soft cells stay traversable so narrow corridors remain solvable, but the
     multiplier must be strong enough that a modestly longer clear path beats a
-    short hug of the inflation halo when open space is available.
+    short hug of the inflation halo when open space is available — without
+    forcing multi-metre arcs that make the follower sway around every corner.
     """
     c = int(cost)
     if c <= 0:
@@ -76,13 +77,14 @@ def _cost_multiplier(cost: int) -> float:
     if c >= INSCRIBED:
         return 1e6
     t = c / float(INSCRIBED - 1)
-    # Linear + steep quadratic: outer soft ≈ 10–20×, near-inscribed ≫50×.
-    return 1.0 + 25.0 * t + 120.0 * (t * t)
+    # Mild linear + quadratic: preference/outer soft ~2–6×, near-inscribed ≫20×.
+    return 1.0 + 8.0 * t + 35.0 * (t * t)
 
 
-# Any-angle LOS / string-pull may only shortcut through near-free cells.
-# Higher soft costs remain traversable via 8-connected steps (narrow gaps).
-_LOS_MAX_SOFT_COST = 30
+# Any-angle LOS / string-pull may shortcut through preference / outer soft, but
+# not through the visible soft glow (cost ≥ ~50). Narrow gaps still work via
+# 8-connected steps through higher soft cells.
+_LOS_MAX_SOFT_COST = 50
 
 
 def _cell_step_cost(costs: np.ndarray, cell: Cell, base_step: float) -> float:
@@ -581,7 +583,7 @@ def connect_plan_start(
     inflation_radius_m: float,
     robot_radius_m: float,
     cost_scaling_factor: float = 4.0,
-    clearance_preference_m: float = 0.35,
+    clearance_preference_m: float = 0.15,
     algorithm: str = DEFAULT_PLANNER,
     xy_tolerance_m: float = 0.15,
     scan: Optional[conv.LaserScan2D] = None,
@@ -764,7 +766,7 @@ def plan_path(
     inflation_radius_m: float,
     robot_radius_m: float = 0.22,
     cost_scaling_factor: float = 4.0,
-    clearance_preference_m: float = 0.35,
+    clearance_preference_m: float = 0.15,
     algorithm: str = DEFAULT_PLANNER,
     scan: Optional[conv.LaserScan2D] = None,
     scan_pose: Optional[conv.Pose2D] = None,

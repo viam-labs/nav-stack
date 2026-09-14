@@ -9,9 +9,9 @@ import numpy as np
 from .planner import line_of_sight, world_segment_traversable
 from .types import OccupancyGrid, Path2D
 
-# Reject string-pull shortcuts that graze soft inflation (planner already paid
-# to avoid this; binary LOS alone would pull flush to the inscribed edge).
-_SMOOTH_MAX_SOFT_COST = 30
+# Reject string-pull shortcuts through the visible soft glow; preference /
+# outer soft (below ~50) may still be shortened so paths don't arc hard.
+_SMOOTH_MAX_SOFT_COST = 50
 
 
 def _resample_polyline(
@@ -111,7 +111,7 @@ def smooth_plan_path(
     inflation_radius_m: float,
     robot_radius_m: float,
     cost_scaling_factor: float,
-    clearance_preference_m: float = 0.35,
+    clearance_preference_m: float = 0.15,
     enabled: bool = True,
     sample_spacing_m: float = 0.10,
 ) -> Path2D:
