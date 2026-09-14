@@ -892,6 +892,7 @@ class _FakeWorld:
         self.map_data = map_data
         self.cmds = []
         self.stopped = False
+        self.loc_hold = None
 
     def get_map(self):
         return self.map_data
@@ -902,6 +903,9 @@ class _FakeWorld:
     def get_scan(self, max_age_s: float = 2.0):
         return None
 
+    def get_localization_hold(self):
+        return self.loc_hold
+
     def set_velocity(self, vx, vy, vtheta):
         self.cmds.append((vx, vy, vtheta))
         # Nudge pose toward +x for a trivial follow.
@@ -910,6 +914,7 @@ class _FakeWorld:
 
     def stop(self):
         self.stopped = True
+        self.cmds.append((0.0, 0.0, 0.0))
 
     def set_viz_plan(self, path_xy, goal=None):
         pass
@@ -941,3 +946,45 @@ def test_builtin_navigator_cancel_sets_status():
     nav = BuiltinNavigator(world, avoid_obstacles=False)
     nav.cancel()
     assert nav.nav_status()["state"] == "canceled"
+
+
+def test_nav_holds_drive_while_localization_awaiting_confirm():
+    """Do not crawl/turn on a disputed pose while a large jump awaits confirm."""
+    import threading
+    import time
+
+    world = _FakeWorld(Pose2D(0.2, 0.2, 0.0), _empty_map(size=80))
+    world.loc_hold = {
+        "status": "awaiting_confirm",
+        "confirm_count": 1,
+        "confirm_needed": 2,
+        "jump_shift_m": 0.49,
+        "jump_shift_deg": 42.0,
+    }
+    nav = BuiltinNavigator(
+        world,
+        inflation_radius_m=0.15,
+        robot_radius_m=0.05,
+        avoid_obstacles=False,
+        xy_tolerance_m=0.1,
+        timeout_s=4.0,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+    )
+
+    def _run():
+        nav.navigate(3.0, 0.2, 0.0)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    time.sleep(0.35)
+    status = nav.nav_status()
+    assert status.get("active") is True
+    assert status.get("obstacle") == "loc_hold"
+    # No forward or turn commands while held (stops only).
+    assert all(abs(vx) < 1e-9 and abs(vth) < 1e-9 for vx, _vy, vth in world.cmds)
+    world.loc_hold = None
+    time.sleep(0.25)
+    nav.cancel()
+    t.join(timeout=2.0)
+    assert world.stopped

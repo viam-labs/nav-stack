@@ -358,6 +358,8 @@ class NavSupervisor:
             # Clearance + stall/timeout still end hopeless runs.
             static_replan_fail_limit = 5
             pose_jump_replan_m = 1.5
+            was_loc_holding = False
+            pending_loc_replan = False
 
             while time.monotonic() < deadline:
                 if self._cancel.is_set():
@@ -378,6 +380,20 @@ class NavSupervisor:
                 self._set_status(
                     pose={"x": pose.x, "y": pose.y, "theta": pose.theta}
                 )
+
+                # Large pose-jump awaiting confirm: stop until SLAM applies or
+                # rejects. Driving on the old pose while turning is how we plow.
+                loc_hold = None
+                hold_fn = getattr(self._world, "get_localization_hold", None)
+                if callable(hold_fn):
+                    try:
+                        loc_hold = hold_fn()
+                    except Exception:  # noqa: BLE001
+                        loc_hold = None
+                holding_for_localize = isinstance(loc_hold, dict)
+                if was_loc_holding and not holding_for_localize:
+                    pending_loc_replan = True
+                was_loc_holding = holding_for_localize
 
                 # Goal reached?
                 goal_pose = Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta)
@@ -414,6 +430,39 @@ class NavSupervisor:
                         return
                 else:
                     xy_ok_since = None
+
+                if holding_for_localize:
+                    # Freeze progress clocks; do not crawl/turn on a disputed pose.
+                    self._world.stop()
+                    last_progress_at = now
+                    last_progress_pose = pose
+                    last_progress_dist = dist_goal_chk
+                    last_progress_bearing = float("inf")
+                    spin_stuck_since = None
+                    self._set_status(
+                        pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
+                        progress={
+                            "obstacle": "loc_hold",
+                            "local_planner": False,
+                            "forward_clearance_m": None,
+                            "cmd_vx_mps": 0.0,
+                            "cmd_vtheta_rad_s": 0.0,
+                            "bearing_error_rad": 0.0,
+                            "distance_remaining_m": dist_goal_chk,
+                            "waypoint_index": 0,
+                            "localization_hold": {
+                                "status": loc_hold.get("status"),
+                                "confirm_count": loc_hold.get("confirm_count"),
+                                "confirm_needed": loc_hold.get("confirm_needed"),
+                                "shift_m": loc_hold.get("shift_m")
+                                or loc_hold.get("jump_shift_m"),
+                                "shift_deg": loc_hold.get("shift_deg")
+                                or loc_hold.get("jump_shift_deg"),
+                            },
+                        },
+                    )
+                    time.sleep(poll)
+                    continue
 
                 now = time.monotonic()
 
@@ -708,9 +757,9 @@ class NavSupervisor:
                 replan_due = now - last_replan >= self._replan_period
                 map_data = None
                 static_blocked = False
-                pose_jumped = False
+                pose_jumped = pending_loc_replan
                 if last_tick_pose is not None:
-                    pose_jumped = (
+                    pose_jumped = pose_jumped or (
                         distance_m(pose, last_tick_pose) >= pose_jump_replan_m
                     )
                 last_tick_pose = pose
@@ -759,6 +808,7 @@ class NavSupervisor:
                         backup_attempts = 0
                         vx_sign_history.clear()
                         spin_stuck_since = None
+                        pending_loc_replan = False
                     elif static_blocked:
                         failed_static_replan += 1
                         last_replan = now

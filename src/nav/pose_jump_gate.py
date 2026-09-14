@@ -147,3 +147,14 @@ class PoseJumpGate:
             return False
         dyaw = abs(math.degrees(conv.normalize_angle(a.theta - b.theta)))
         return dyaw <= self.agree_deg
+
+
+def should_hold_drive_for_pose_jump(check: Optional[object]) -> bool:
+    """True when a published localization/revisit check is awaiting jump confirm.
+
+    Nav must stop while a large correction is gated — continuing on the old
+    pose with forward + turn is how robots plow into nearby obstacles.
+    """
+    if not isinstance(check, dict):
+        return False
+    return str(check.get("status") or "") == "awaiting_confirm"
