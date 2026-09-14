@@ -9,8 +9,8 @@ pytest.importorskip("viam.spatialmath")
 
 from viam.proto.common import Pose
 
-from src.ros import conversions as conv
-from src.ros.external_slam import (
+from src.geom import conversions as conv
+from src.slam_client import (
     _decode_grid_cells,
     _grid_key,
     parse_get_grid,

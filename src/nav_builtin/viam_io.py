@@ -1,4 +1,4 @@
-"""Viam-backed WorldIO: SLAM + lidars + base with no ROS/rclpy."""
+"""Viam-backed WorldIO: SLAM + lidars + base."""
 from __future__ import annotations
 
 import asyncio
@@ -16,11 +16,11 @@ from ..config import (
     LIDAR_SCAN_GET_LASER_SCAN,
     LIDAR_SCAN_POINT_CLOUD,
     LidarConfig,
-    ros_twist_to_viam_set_velocity,
+    body_twist_to_viam_set_velocity,
 )
-from ..ros import conversions as conv
-from ..ros.external_slam import parse_get_grid, slam_pose_to_pose2d
-from ..ros import pcshm
+from ..geom import conversions as conv
+from ..slam_client import parse_get_grid, slam_pose_to_pose2d
+from ..shm import pcshm
 from .viz_store import NavVizStore
 from .world_io import WorldIO
 
@@ -56,7 +56,7 @@ def get_grid_response_to_map(resp: Mapping) -> Optional[dict]:
     }
 
 
-def bridge_map_to_get_grid(map_data: dict) -> dict:
+def map_dict_to_get_grid(map_data: dict) -> dict:
     """Encode a bridge-style map dict as a ``get_grid`` DoCommand payload."""
     grid = np.asarray(map_data["grid"], dtype=np.int16)
     rows, cols = int(grid.shape[0]), int(grid.shape[1])
@@ -73,7 +73,7 @@ def bridge_map_to_get_grid(map_data: dict) -> dict:
 
 
 class ViamWorldIO:
-    """WorldIO over Viam SLAM / Camera / Base resources (no ROS topics)."""
+    """WorldIO over Viam SLAM / Camera / Base resources."""
 
     def __init__(
         self,
@@ -162,7 +162,7 @@ class ViamWorldIO:
             ) from exc
 
     def last_drive(self) -> Optional[dict]:
-        """Most recent SetVelocity mapping (ROS rad/s → Viam mm/s + deg/s)."""
+        """Most recent SetVelocity mapping (body rad/s → Viam mm/s + deg/s)."""
         return dict(self._last_drive) if self._last_drive else None
 
     def pose_source(self) -> str:
@@ -216,11 +216,11 @@ class ViamWorldIO:
         ``GetPosition`` on the shared module event loop every tick (that
         starves ``Base.SetVelocity``). Order:
 
-        1. Sync ``slam.get_position_pose2d()`` when the dependency is local RosSlam.
+        1. Sync ``slam.get_position_pose2d()`` when the dependency is local SlamService.
         2. ``pose_provider`` (in-process registered SLAM service / engine).
         3. Async ``GetPosition`` only as a last resort (remote SLAM).
         """
-        # Only call sync helpers declared on the SLAM class (local RosSlam).
+        # Only call sync helpers declared on the SLAM class (local SlamService).
         # Instance MagicMock / gRPC stubs must not invent get_position_pose2d.
         if callable(getattr(type(self._slam), "get_position_pose2d", None)):
             try:
@@ -621,13 +621,13 @@ class ViamWorldIO:
 
     def set_velocity(self, vx: float, vy: float, vtheta: float) -> None:
         vx, vy, vtheta = _sanitize_base_cmd(vx, vy, vtheta)
-        lx_mm, ly_mm, ang_deg_s = ros_twist_to_viam_set_velocity(
+        lx_mm, ly_mm, ang_deg_s = body_twist_to_viam_set_velocity(
             vx, vy, vtheta, self._convention
         )
         intent = {
-            "ros_vx_mps": vx,
-            "ros_vy_mps": vy,
-            "ros_vtheta_rad_s": vtheta,
+            "body_vx_mps": vx,
+            "body_vy_mps": vy,
+            "body_vtheta_rad_s": vtheta,
             "viam_linear_x_mm_s": lx_mm,
             "viam_linear_y_mm_s": ly_mm,
             "viam_angular_z_deg_s": ang_deg_s,
@@ -659,10 +659,10 @@ class ViamWorldIO:
                     # mid-path throws the heading and the follower has to
                     # recover from a pose it never commanded.
                     vx_retry = max(vx, 0.06 + 0.32 * abs(vtheta))
-                    lx_mm_r, ly_mm_r, _ = ros_twist_to_viam_set_velocity(
+                    lx_mm_r, ly_mm_r, _ = body_twist_to_viam_set_velocity(
                         vx_retry, vy, vtheta, self._convention
                     )
-                    intent["retry"] = {"kind": "widen_arc", "ros_vx_mps": vx_retry}
+                    intent["retry"] = {"kind": "widen_arc", "body_vx_mps": vx_retry}
                     self._run(
                         self._base.set_velocity(
                             linear=Vector3(x=lx_mm_r, y=ly_mm_r, z=0.0),
@@ -703,9 +703,9 @@ class ViamWorldIO:
                 timeout=self._drive_timeout_s,
             )
             self._last_drive = {
-                "ros_vx_mps": 0.0,
-                "ros_vy_mps": 0.0,
-                "ros_vtheta_rad_s": 0.0,
+                "body_vx_mps": 0.0,
+                "body_vy_mps": 0.0,
+                "body_vtheta_rad_s": 0.0,
                 "viam_linear_x_mm_s": 0.0,
                 "viam_linear_y_mm_s": 0.0,
                 "viam_angular_z_deg_s": 0.0,
@@ -715,9 +715,9 @@ class ViamWorldIO:
             }
         except Exception as exc:  # noqa: BLE001
             self._last_drive = {
-                "ros_vx_mps": 0.0,
-                "ros_vy_mps": 0.0,
-                "ros_vtheta_rad_s": 0.0,
+                "body_vx_mps": 0.0,
+                "body_vy_mps": 0.0,
+                "body_vtheta_rad_s": 0.0,
                 "viam_linear_x_mm_s": 0.0,
                 "viam_linear_y_mm_s": 0.0,
                 "viam_angular_z_deg_s": 0.0,

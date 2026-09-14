@@ -15,9 +15,9 @@ from ..config import (
     LidarConfig,
     SlamConfig,
 )
-from ..ros import conversions as conv
-from ..ros import imushm
-from ..ros import pcshm
+from ..geom import conversions as conv
+from ..shm import imushm
+from ..shm import pcshm
 
 
 def _get_laser_scan_not_implemented(exc: BaseException) -> bool:
@@ -452,7 +452,7 @@ class BuiltinSensors:
 
         ``gyro_z_deg_s`` is always reported for diagnostics when readable.
         """
-        from ..ros.odom_source import read_typed_heading
+        from ..odom.source import read_typed_heading
 
         cfg = self._cfg
         if self._heading is None:

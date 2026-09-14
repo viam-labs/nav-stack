@@ -18,7 +18,7 @@ from ..config import (
 from ..nav.global_localize import OccupancyMap
 from ..nav.maps import MapStore
 from ..nav.pose_jump_gate import PoseJumpGate
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from . import occupancy as occ
 from . import persistence
 from . import scan_match
@@ -51,7 +51,7 @@ class BuiltinSlamEngine:
 
         self._lock = threading.RLock()
         self._grid: LogOddsGrid = occ.empty_grid(
-            resolution=cfg.slam_toolbox.resolution
+            resolution=cfg.map.resolution
         )
         self._pose = conv.Pose2D(0.0, 0.0, 0.0)
         self._last_odom_pose: Optional[conv.Pose2D] = None
@@ -74,7 +74,7 @@ class BuiltinSlamEngine:
         self._match_accepts = 0
         self._match_rejects = 0
         self._last_match_at = 0.0
-        # Mapping inserts only after movement (slam_toolbox-style) or timeout.
+        # Mapping inserts only after movement (or timeout).
         self._last_insert_pose: Optional[conv.Pose2D] = None
         self._last_insert_at = 0.0
         # Anti-oscillation: require two agreeing frames before applying a jump.
@@ -149,7 +149,7 @@ class BuiltinSlamEngine:
                 elif mode == MODE_MAPPING:
                     # Fresh mapping session.
                     self._grid = occ.empty_grid(
-                        resolution=self._cfg.slam_toolbox.resolution
+                        resolution=self._cfg.map.resolution
                     )
                     self._pose = conv.Pose2D(0.0, 0.0, 0.0)
                     self._last_odom_pose = None
@@ -175,7 +175,7 @@ class BuiltinSlamEngine:
     def reset_map(self) -> None:
         with self._lock:
             self._grid = occ.empty_grid(
-                resolution=self._cfg.slam_toolbox.resolution
+                resolution=self._cfg.map.resolution
             )
             self._pose = conv.Pose2D(0.0, 0.0, 0.0)
             self._last_odom_pose = None

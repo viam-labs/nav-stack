@@ -32,13 +32,13 @@ from viam.utils import struct_to_dict
 from ..imu.wit_protocol import ALGORITHMS, WitError, WitSample
 from ..imu.wit_serial import WitSerial
 from ..lidar.serial_ports import list_candidate_serial_ports, normalize_exclude_list
-from ..ros import imushm
+from ..shm import imushm
 
 LOGGER = getLogger(__name__)
 
 
 def _shm_name_for(component_name: str, explicit: Optional[str]) -> str:
-    from ..ros import pcshm
+    from ..shm import pcshm
 
     if explicit:
         return pcshm.normalize_name(explicit)

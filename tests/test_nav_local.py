@@ -8,7 +8,7 @@ import pytest
 
 from src.nav.simple_motion import DriveCommand, rear_clearance_m
 from src.nav_builtin.controller import FollowerConfig, compute_path_command
-from src.nav_builtin.costmap import build_costmap, occupancy_from_bridge_map
+from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
 from src.nav_builtin.local_costmap import (
     LocalCostmap,
     LocalCostmapConfig,
@@ -18,7 +18,7 @@ from src.nav_builtin.local_costmap import (
 from src.nav_builtin.local_planner import LocalPlannerConfig, compute_local_command
 from src.nav_builtin.smoother import smooth_path
 from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
-from src.ros import conversions as conv
+from src.geom import conversions as conv
 
 
 def _empty_map(size: int = 40, resolution: float = 0.05) -> dict:
@@ -47,7 +47,7 @@ def test_rear_clearance_m_ignores_forward_returns():
 
 def test_smooth_path_shortens_zigzag_astar():
     m = _empty_map(size=60, resolution=0.05)
-    occ = occupancy_from_bridge_map(m)
+    occ = occupancy_from_map_dict(m)
     costs = build_costmap(
         occ, inflation_radius_m=0.15, robot_radius_m=0.05, cost_scaling_factor=3.0
     )
@@ -136,10 +136,10 @@ def test_local_costmap_syncs_stale_scan_pose():
 
 def test_local_costmap_does_not_reinflate_global_static():
     """Global static in the local window must not get a second inflation pass."""
-    from src.nav_builtin.costmap import INSCRIBED, build_costmap, occupancy_from_bridge_map
+    from src.nav_builtin.costmap import INSCRIBED, build_costmap, occupancy_from_map_dict
 
     m = _empty_map(size=60, resolution=0.05)
-    occ = occupancy_from_bridge_map(m)
+    occ = occupancy_from_map_dict(m)
     occ.grid[30, 30] = 100
     global_costs = build_costmap(
         occ, inflation_radius_m=0.25, robot_radius_m=0.22, cost_scaling_factor=4.0

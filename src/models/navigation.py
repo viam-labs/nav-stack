@@ -1,11 +1,8 @@
 """Navigation service model: ``viam-labs:nav-stack:navigation``.
 
-Default ``nav_backend: builtin`` drives the in-module navigator over Viam APIs
-only (``ViamWorldIO`` + ``BuiltinNavHost``): SLAM ``get_grid`` / ``GetPosition``,
-lidar shm/cameras, ``Base.SetVelocity``. No RosManager, no bridge, no Nav2.
-
-Set ``nav_backend: nav2`` for legacy ROS2 Nav2 (requires ``REQUIRE_ROS=1`` at
-setup). Or use ``navigation-external`` against any ``rdk:service:slam``.
+Builtin MoveOnMap over Viam APIs only (``ViamWorldIO`` + ``BuiltinNavHost``):
+SLAM ``get_grid`` / ``GetPosition``, lidar shm/cameras, ``Base.SetVelocity``.
+No ROS / Nav2. Or use ``navigation-external`` against any ``rdk:service:slam``.
 """
 from __future__ import annotations
 
@@ -36,35 +33,12 @@ from ..runtime import (
     SlamRuntime,
     get_slam,
     get_slam_service,
-    register_bridge,
     register_nav_host,
     register_nav_viz,
-    unregister_bridge,
     unregister_nav_host,
     unregister_nav_viz,
 )
-
-# Re-exported for backwards-compatible imports (tests + any external callers
-# still do ``from src.models.navigation import _sync_mppi_model_dt`` etc.).
-from .nav_core import (  # noqa: F401
-    NavServiceBase,
-    _apply_diffdrive_controller,
-    _apply_local_costmap_size,
-    _apply_nav2_tuning,
-    _apply_overrides,
-    _apply_velocity_limits,
-    _deep_merge,
-    _find_template_section_paths,
-    _mppi_profile_snapshot,
-    _nav_status_to_plan_state,
-    _normalize_nav2_user_params,
-    _set_obstacle_sources,
-    _sync_mppi_model_dt,
-    _sync_smoother_reverse_to_mppi,
-    _tune_nav2_bt_xml,
-    _validate_nav2_params_structure,
-    _write_nav2_bt_xml,
-)
+from .nav_core import NavServiceBase, _nav_status_to_plan_state  # noqa: F401
 
 LOGGER = getLogger(__name__)
 
@@ -74,9 +48,9 @@ def _sync_slam_pose_provider(slam_service_name: str):
 
     The motion dependency is often a gRPC client stub even for same-module SLAM.
     Calling ``GetPosition`` every control tick then contends with ``SetVelocity``
-    on the shared loop — commands are computed (and were previously recorded in
-    ``last_drive`` before the call) while the base never moves. Always re-resolve
-    the registered service / runtime so SLAM reconfigure cannot leave a stale host.
+    on the shared loop — commands are computed while the base never moves. Always
+    re-resolve the registered service / runtime so SLAM reconfigure cannot leave
+    a stale host.
     """
 
     def _get():
@@ -95,9 +69,6 @@ def _sync_slam_pose_provider(slam_service_name: str):
         getter = getattr(manager, "get_pose_in_map", None)
         if callable(getter):
             return getter()
-        node = getattr(manager, "node", None)
-        if node is not None and hasattr(node, "get_pose_in_map"):
-            return node.get_pose_in_map()
         return None
 
     return _get
@@ -133,22 +104,19 @@ def _in_process_map_provider(slam_service_name: str):
         getter = getattr(manager, "get_map", None)
         if callable(getter):
             return getter()
-        node = getattr(manager, "node", None)
-        if node is not None and hasattr(node, "get_map"):
-            return node.get_map()
         return None
 
     return _get
 
 
-class RosNavigation(NavServiceBase):
+class NavigationService(NavServiceBase):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "nav-stack"), "navigation")
 
     def __init__(self, name: str):
         super().__init__(name)
         self._viz: Optional[NavVizStore] = None
         self._slam_resource = None
-        # When builtin: a SlamRuntime whose ``manager`` is BuiltinNavHost (no ROS).
+        # SlamRuntime whose ``manager`` is BuiltinNavHost.
         self._builtin_runtime: Optional[SlamRuntime] = None
 
     # -- registration --------------------------------------------------------
@@ -195,7 +163,6 @@ class RosNavigation(NavServiceBase):
 
         unregister_nav_viz(self.name)
         unregister_nav_host(self.name)
-        unregister_bridge(self.name)
         self._viz = None
         if self._builtin_runtime is not None:
             try:
@@ -204,83 +171,55 @@ class RosNavigation(NavServiceBase):
                 pass
             self._builtin_runtime = None
 
-        if cfg.uses_builtin_nav():
-            # Fully ROS-free nav surface: never touch slam_rt.manager (RosManager).
-            viz = NavVizStore()
-            self._viz = viz
-            loop = asyncio.get_event_loop()
-            world = ViamWorldIO(
-                slam=self._slam_resource,
-                base=self._base,
-                loop=loop,
-                cameras=slam_rt.cameras,
-                lidars=slam_rt.slam_cfg.lidars,
-                base_velocity_convention=slam_rt.slam_cfg.base_velocity_convention,
-                viz=viz,
-                shm_lidar=slam_rt.shm_lidar,
-                scan_max_age_s=float(
-                    getattr(slam_rt.slam_cfg, "scan_max_age_s", 2.0) or 2.0
-                ),
-                drive_timeout_s=float(getattr(cfg.builtin, "drive_timeout_s", 5.0)),
-                pose_provider=_sync_slam_pose_provider(cfg.slam_service),
-                map_provider=_in_process_map_provider(cfg.slam_service),
-                localization_hold_provider=_localization_hold_provider(
-                    cfg.slam_service
-                ),
-                scan_provider=(
-                    (lambda max_age_s, s=slam_rt.sim_sensors: s.get_scan(max_age_s))
-                    if slam_rt.sim_sensors is not None
-                    else None
-                ),
-                logger=lambda m: LOGGER.info(m),
-            )
-            navigator = make_builtin_navigator(
-                world, cfg, logger=lambda m: LOGGER.info(m)
-            )
-            host = BuiltinNavHost(navigator, world, viz, nav_cfg=cfg)
-            self._builtin_runtime = SlamRuntime(
-                host,
-                slam_rt.map_store,
-                slam_rt.slam_cfg,
-                slam_rt.localization_check,
-                cameras=slam_rt.cameras,
-                shm_lidar=slam_rt.shm_lidar,
-                sim_sensors=slam_rt.sim_sensors,
-            )
-            register_nav_viz(self.name, viz)
-            register_nav_host(self.name, host)
-            self._refresh_zone_masks()
-            LOGGER.info(
-                f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}, "
-                f"nav_backend=builtin, ROS-free ViamWorldIO)"
-            )
-            return
-
-        # Legacy Nav2 path: share the SLAM RosManager / bridge.
-        from ..ros.availability import require_rclpy
-
-        require_rclpy("nav_backend=nav2")
-        if hasattr(slam_rt.manager, "set_builtin_world"):
-            slam_rt.manager.set_builtin_world(None)
-        slam_service = cfg.slam_service
-        register_bridge(
-            self.name,
-            lambda: (
-                rt.manager.node if (rt := get_slam(slam_service)) is not None else None
+        viz = NavVizStore()
+        self._viz = viz
+        loop = asyncio.get_event_loop()
+        world = ViamWorldIO(
+            slam=self._slam_resource,
+            base=self._base,
+            loop=loop,
+            cameras=slam_rt.cameras,
+            lidars=slam_rt.slam_cfg.lidars,
+            base_velocity_convention=slam_rt.slam_cfg.base_velocity_convention,
+            viz=viz,
+            shm_lidar=slam_rt.shm_lidar,
+            scan_max_age_s=float(
+                getattr(slam_rt.slam_cfg, "scan_max_age_s", 2.0) or 2.0
             ),
+            drive_timeout_s=float(getattr(cfg.builtin, "drive_timeout_s", 5.0)),
+            pose_provider=_sync_slam_pose_provider(cfg.slam_service),
+            map_provider=_in_process_map_provider(cfg.slam_service),
+            localization_hold_provider=_localization_hold_provider(cfg.slam_service),
+            scan_provider=(
+                (lambda max_age_s, s=slam_rt.sim_sensors: s.get_scan(max_age_s))
+                if slam_rt.sim_sensors is not None
+                else None
+            ),
+            logger=lambda m: LOGGER.info(m),
         )
-        slam_rt.manager.set_nav_config(cfg)
-        params_path = self._write_nav2_params(cfg)
-        slam_rt.manager.ensure_nav2_async(cfg, params_path)
+        navigator = make_builtin_navigator(
+            world, cfg, logger=lambda m: LOGGER.info(m)
+        )
+        host = BuiltinNavHost(navigator, world, viz, nav_cfg=cfg)
+        self._builtin_runtime = SlamRuntime(
+            host,
+            slam_rt.map_store,
+            slam_rt.slam_cfg,
+            slam_rt.localization_check,
+            cameras=slam_rt.cameras,
+            shm_lidar=slam_rt.shm_lidar,
+            sim_sensors=slam_rt.sim_sensors,
+        )
+        register_nav_viz(self.name, viz)
+        register_nav_host(self.name, host)
         self._refresh_zone_masks()
         LOGGER.info(
             f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}, "
-            f"nav_backend=nav2); Nav2 starting in background"
+            f"nav_backend=builtin, ViamWorldIO)"
         )
 
     async def close(self) -> None:
         await self._cancel_simple_nav()
-        unregister_bridge(self.name)
         unregister_nav_viz(self.name)
         unregister_nav_host(self.name)
         if self._builtin_runtime is not None:
@@ -294,6 +233,6 @@ class RosNavigation(NavServiceBase):
 
 Registry.register_resource_creator(
     Motion.API,
-    RosNavigation.MODEL,
-    ResourceCreatorRegistration(RosNavigation.new, RosNavigation.validate_config),
+    NavigationService.MODEL,
+    ResourceCreatorRegistration(NavigationService.new, NavigationService.validate_config),
 )

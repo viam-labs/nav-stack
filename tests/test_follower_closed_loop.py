@@ -27,7 +27,7 @@ from src.nav_builtin.controller import (
 from src.nav_builtin.path_utils import signed_crosstrack_m
 from src.nav_builtin.types import Path2D, Pose2D
 from src.nav_builtin.viam_io import _sanitize_base_cmd
-from src.ros import conversions as conv
+from src.geom import conversions as conv
 
 
 def _densify(pts: List[Tuple[float, float]], step: float = 0.1) -> Tuple[Tuple[float, float], ...]:

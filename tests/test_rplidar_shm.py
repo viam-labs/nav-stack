@@ -10,9 +10,9 @@ import pytest
 
 from src.lidar import rplidar_protocol as proto
 from src.lidar.rplidar_serial import RPLidarSerial
-from src.ros import conversions as conv
-from src.ros import pcshm
-from src.ros.shm_lidar import ShmPointCloudClient
+from src.geom import conversions as conv
+from src.shm import pcshm
+from src.shm.lidar import ShmPointCloudClient
 
 
 def test_node_round_trip():

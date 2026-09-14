@@ -25,7 +25,7 @@ from src.nav_builtin.planner import (
     plan_path,
 )
 from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
-from src.ros import conversions as conv
+from src.geom import conversions as conv
 
 
 def _empty_map(size: int = 40, resolution: float = 0.05) -> dict:

@@ -15,7 +15,7 @@ from ..nav.simple_motion import (
     distance_m,
     heading_error_rad,
 )
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .local_costmap import LocalCostmapView
 from .local_planner import LocalPlannerConfig, compute_local_command
 from .path_utils import closest_point_on_path, signed_crosstrack_m

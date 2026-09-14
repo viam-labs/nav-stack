@@ -1,42 +1,21 @@
 from pathlib import Path
 import asyncio
 import math
-import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from src.config import MODE_LOCALIZING, MODE_MAPPING, SlamConfig
 
-# Stub ROS 2 Python deps so model tests run without a ROS install.
-for _mod in (
-    "rclpy",
-    "rclpy.node",
-    "rclpy.qos",
-    "rclpy.action",
-    "geometry_msgs",
-    "geometry_msgs.msg",
-    "nav_msgs",
-    "nav_msgs.msg",
-    "sensor_msgs",
-    "sensor_msgs.msg",
-    "std_msgs",
-    "std_msgs.msg",
-    "tf2_ros",
-    "nav2_msgs",
-    "nav2_msgs.action",
-):
-    sys.modules.setdefault(_mod, MagicMock())
-
 pytest.importorskip("viam")
 
-from src.models.slam import RosSlam
+from src.models.slam import SlamService
 from src.nav.maps import MapStore
-from src.ros import conversions as conv
+from src.geom import conversions as conv
 
 
-def test_get_status_includes_bridge_and_sensor_probe(tmp_path: Path):
-    slam = RosSlam("slam")
+def test_get_status_includes_diagnostics_and_sensor_probe(tmp_path: Path):
+    slam = SlamService("slam")
     store = MapStore(str(tmp_path))
     store.create_map("floor1")
     store.set_active_map("floor1")
@@ -56,7 +35,7 @@ def test_get_status_includes_bridge_and_sensor_probe(tmp_path: Path):
     )
     slam._manager = MagicMock()
     slam._manager.slam_diagnostics.return_value = {
-        "slam_toolbox_running": True,
+        "slam_backend": "builtin",
         "scan_publishing": True,
         "scan_valid_returns": 120,
         "odom_tf_age_s": 0.1,
@@ -70,7 +49,7 @@ def test_get_status_includes_bridge_and_sensor_probe(tmp_path: Path):
 
     result = asyncio.run(slam.do_command({"command": "get_status"}))
 
-    assert result["slam_toolbox_running"] is True
+    assert result["slam_backend"] == "builtin"
     assert result["active_map"] == "floor1"
     assert result["movement_sensor"] == "imu"
     assert result["sensor_probe"]["lidars"][0]["scan_valid_returns"] == 120
@@ -78,7 +57,7 @@ def test_get_status_includes_bridge_and_sensor_probe(tmp_path: Path):
 
 
 def test_get_status_skips_sensor_probe_when_disabled(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     store = MapStore(str(tmp_path))
     store.create_map("floor1")
     slam._map_store = store
@@ -86,7 +65,7 @@ def test_get_status_skips_sensor_probe_when_disabled(tmp_path: Path):
         {"base": "b", "lidar": "f", "mode": "mapping", "active_map": "floor1"}
     )
     slam._manager = MagicMock()
-    slam._manager.slam_diagnostics.return_value = {"slam_toolbox_running": True}
+    slam._manager.slam_diagnostics.return_value = {"slam_backend": "builtin"}
     slam._probe_sensors = AsyncMock()
 
     asyncio.run(slam.do_command({"command": "get_status", "probe_sensors": False}))
@@ -95,14 +74,14 @@ def test_get_status_skips_sensor_probe_when_disabled(tmp_path: Path):
 
 
 def test_resolve_pose_by_location_requires_active_map(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._map_store = MapStore(str(tmp_path))
     with pytest.raises(RuntimeError, match="no active map"):
         slam._resolve_pose({"location": "kitchen"})
 
 
 def test_resolve_pose_by_location_uses_active_map(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     store = MapStore(str(tmp_path))
     store.create_map("floor1")
     store.set_active_map("floor1")
@@ -120,7 +99,7 @@ def test_resolve_pose_by_location_uses_active_map(tmp_path: Path):
 
 
 def test_resolve_pose_explicit_pose():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     pose = slam._resolve_pose({"pose": {"x": 3.0, "y": 4.0, "theta": 1.0}})
     assert pose.x == 3.0
     assert pose.y == 4.0
@@ -128,12 +107,12 @@ def test_resolve_pose_explicit_pose():
 
 
 def test_delete_active_map_clears_live_slam(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     store = MapStore(str(tmp_path))
     store.create_map("floor1")
     store.set_active_map("floor1")
     slam._map_store = store
-    slam._cfg = MagicMock(mode=MODE_MAPPING, slam_toolbox=MagicMock(resolution=0.05))
+    slam._cfg = MagicMock(mode=MODE_MAPPING, map=MagicMock(resolution=0.05))
 
     node = MagicMock()
     slam._manager = MagicMock(node=node)
@@ -154,13 +133,13 @@ def test_delete_active_map_clears_live_slam(tmp_path: Path):
 
 
 def test_delete_inactive_map_does_not_restart_slam(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     store = MapStore(str(tmp_path))
     store.create_map("floor1")
     store.create_map("floor2")
     store.set_active_map("floor1")
     slam._map_store = store
-    slam._cfg = MagicMock(mode=MODE_MAPPING, slam_toolbox=MagicMock(resolution=0.05))
+    slam._cfg = MagicMock(mode=MODE_MAPPING, map=MagicMock(resolution=0.05))
 
     node = MagicMock()
     slam._manager = MagicMock(node=node)
@@ -179,11 +158,11 @@ def test_delete_inactive_map_does_not_restart_slam(tmp_path: Path):
 
 
 def test_delete_live_map_resets_when_configured_active_without_store_active(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     store = MapStore(str(tmp_path))
     store.create_map("config-map")
     slam._map_store = store
-    slam._cfg = MagicMock(mode=MODE_MAPPING, active_map="config-map", slam_toolbox=MagicMock(resolution=0.05))
+    slam._cfg = MagicMock(mode=MODE_MAPPING, active_map="config-map", map=MagicMock(resolution=0.05))
     slam._manager = MagicMock()
     slam._reset_live_slam = MagicMock()
 
@@ -199,13 +178,13 @@ def test_delete_live_map_resets_when_configured_active_without_store_active(tmp_
 
 
 def test_delete_configured_name_does_not_reset_other_active_map(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     store = MapStore(str(tmp_path))
     store.create_map("floor1")
     store.create_map("config-map")
     store.set_active_map("floor1")
     slam._map_store = store
-    slam._cfg = MagicMock(mode=MODE_MAPPING, active_map="config-map", slam_toolbox=MagicMock(resolution=0.05))
+    slam._cfg = MagicMock(mode=MODE_MAPPING, active_map="config-map", map=MagicMock(resolution=0.05))
     slam._manager = MagicMock()
     slam._reset_live_slam = MagicMock()
 
@@ -221,7 +200,7 @@ def test_delete_configured_name_does_not_reset_other_active_map(tmp_path: Path):
 
 
 def test_clear_map_resets_live_slam(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     store = MapStore(str(tmp_path))
     store.create_map("floor1")
     store.set_active_map("floor1")
@@ -236,7 +215,7 @@ def test_clear_map_resets_live_slam(tmp_path: Path):
 
 
 def test_clear_map_requires_active_map(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._map_store = MapStore(str(tmp_path))
     slam._manager = MagicMock()
     with pytest.raises(ValueError, match="no active map"):
@@ -244,7 +223,7 @@ def test_clear_map_requires_active_map(tmp_path: Path):
 
 
 def test_optimize_do_command_requires_mapping_mode(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "f", "mode": MODE_LOCALIZING, "maps_dir": str(tmp_path)}
     )
@@ -255,7 +234,7 @@ def test_optimize_do_command_requires_mapping_mode(tmp_path: Path):
 
 
 def test_optimize_do_command_calls_manager(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "f", "mode": MODE_MAPPING, "maps_dir": str(tmp_path)}
     )
@@ -276,7 +255,7 @@ def test_optimize_do_command_calls_manager(tmp_path: Path):
 
 
 def test_relocalize_uses_current_map_pose(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._map_store = MapStore(str(tmp_path))
     slam._cfg = MagicMock(mode=MODE_LOCALIZING)
     mgr = MagicMock()
@@ -297,7 +276,7 @@ def test_relocalize_uses_current_map_pose(tmp_path: Path):
 
 
 def test_set_initial_pose_refine_runs_seeded_yaw_search(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._map_store = MapStore(str(tmp_path))
     slam._cfg = MagicMock(mode=MODE_LOCALIZING)
     mgr = MagicMock()
@@ -332,7 +311,7 @@ def test_set_initial_pose_refine_runs_seeded_yaw_search(tmp_path: Path):
 
 
 def test_set_initial_pose_without_refine_skips_search(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._map_store = MapStore(str(tmp_path))
     slam._cfg = MagicMock(mode=MODE_LOCALIZING)
     mgr = MagicMock()
@@ -350,7 +329,7 @@ def test_set_initial_pose_without_refine_skips_search(tmp_path: Path):
 
 
 def test_relocalize_use_mir_pose_from_movement_sensor(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._map_store = MapStore(str(tmp_path))
     slam._cfg = MagicMock(mode=MODE_LOCALIZING)
     slam._manager = MagicMock()
@@ -377,7 +356,7 @@ def test_relocalize_use_mir_pose_from_movement_sensor(tmp_path: Path):
 
 
 def test_relocalize_requires_localizing_mode(tmp_path: Path):
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._map_store = MapStore(str(tmp_path))
     slam._cfg = MagicMock(mode=MODE_MAPPING)
     slam._manager = MagicMock()
@@ -386,7 +365,7 @@ def test_relocalize_requires_localizing_mode(tmp_path: Path):
 
 
 def test_schedule_startup_global_localize_skips_when_disabled():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._cfg = MagicMock(mode=MODE_LOCALIZING, global_localize_on_start=False)
     loop = MagicMock()
 
@@ -396,7 +375,7 @@ def test_schedule_startup_global_localize_skips_when_disabled():
 
 
 def test_run_startup_global_localize_retries_then_succeeds():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam.do_command = AsyncMock(
         side_effect=[
             RuntimeError("slam not ready"),
@@ -437,7 +416,7 @@ def test_run_startup_global_localize_retries_then_succeeds():
 
 
 def test_run_startup_global_localize_runs_refinement_pass():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam.do_command = AsyncMock(
         side_effect=[
             {
@@ -488,7 +467,7 @@ def test_run_startup_global_localize_runs_refinement_pass():
 
 
 def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam.do_command = AsyncMock(
         side_effect=[
             {
@@ -534,7 +513,7 @@ def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
 
 
 def test_startup_localize_readiness_waits_for_scan_and_map():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._manager = MagicMock()
     slam._manager.slam_running.return_value = True
     slam._read_merged_scan = AsyncMock(
@@ -552,7 +531,7 @@ def test_startup_localize_readiness_waits_for_scan_and_map():
 
 
 def test_startup_localize_readiness_times_out():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._manager = MagicMock()
     slam._manager.slam_running.return_value = False
 
@@ -564,7 +543,7 @@ def test_startup_localize_readiness_times_out():
 
 
 def test_run_startup_global_localize_skips_when_navigation_active():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._manager = MagicMock()
     slam._manager.nav_status.return_value = {"active": True}
     slam.do_command = AsyncMock()
@@ -584,7 +563,7 @@ def test_run_startup_global_localize_skips_when_navigation_active():
 def test_get_point_cloud_map_hides_stale_generation():
     import numpy as np
 
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._visible_map_generation = 2
     grid = {
         "grid": np.ones((2, 2), dtype=np.int16) * 100,
@@ -602,7 +581,7 @@ def test_get_point_cloud_map_hides_stale_generation():
 def test_get_point_cloud_map_shows_current_generation():
     import numpy as np
 
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._visible_map_generation = 2
     grid = {
         "grid": np.ones((2, 2), dtype=np.int16) * 100,
@@ -618,7 +597,7 @@ def test_get_point_cloud_map_shows_current_generation():
 
 
 def test_stop_base_zeros_velocity_without_full_stop():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._cfg = MagicMock(
         base_velocity_convention="viam",
         sensor_read_timeout_s=1.0,
@@ -646,8 +625,8 @@ def test_stop_base_zeros_velocity_without_full_stop():
     assert kwargs["angular"].z == 0.0
 
 
-def test_nav2_drive_base_sends_angular_z_to_viam_base():
-    slam = RosSlam("slam")
+def test_drive_base_sends_angular_z_to_viam_base():
+    slam = SlamService("slam")
     slam._cfg = MagicMock(
         base_velocity_convention="viam",
         sensor_read_timeout_s=1.0,
@@ -668,7 +647,7 @@ def test_nav2_drive_base_sends_angular_z_to_viam_base():
     io = slam._build_io()
     asyncio.run(io.drive_base(0.5, 0.0, -1.0))
 
-    node.record_cmd_vel.assert_called_once_with(0.5, 0.0, -1.0, source="nav2")
+    node.record_cmd_vel.assert_called_once_with(0.5, 0.0, -1.0, source="builtin")
     slam._base.set_velocity.assert_awaited_once()
     kwargs = slam._base.set_velocity.await_args.kwargs
     assert kwargs["linear"].x == 0.0
@@ -687,7 +666,7 @@ def _relocalize_slam(**cfg_overrides):
         "periodic_relocalize": True,
     }
     d.update(cfg_overrides)
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._cfg = SlamConfig.from_dict(d)
     slam._pose_jump_gate = PoseJumpGate(
         confirm_count=slam._cfg.localize_jump_confirm_count,
@@ -726,7 +705,7 @@ def test_schedule_periodic_relocalize_skips_when_disabled():
 
 
 def test_schedule_periodic_relocalize_skips_when_mapping():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "f", "mode": "mapping", "periodic_relocalize": True}
     )
@@ -744,7 +723,7 @@ def test_schedule_periodic_relocalize_starts_when_enabled():
 
 
 def test_schedule_periodic_relocalize_starts_by_default_in_localizing():
-    slam = RosSlam("slam")
+    slam = SlamService("slam")
     slam._cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "mode": "localizing"})
     slam._run_periodic_relocalize = MagicMock(return_value=None)
     loop = MagicMock()
@@ -998,7 +977,7 @@ def test_is_navigation_active_sees_registered_builtin_nav_host():
     host.nav_status.return_value = {"active": True, "state": "active"}
     register_nav_host("nav-test-active", host)
     try:
-        slam = RosSlam("slam-test-active")
+        slam = SlamService("slam-test-active")
         slam._manager = MagicMock()
         slam._manager.nav_status.return_value = {
             "active": False,

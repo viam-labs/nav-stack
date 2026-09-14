@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from src.nav import pause_keyframes
-from src.ros import conversions as conv
+from src.geom import conversions as conv
 
 
 def _wall_scan(x0=2.0, y0=-3.0, x1=2.0, y1=3.0, n=80) -> conv.LaserScan2D:

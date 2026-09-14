@@ -7,7 +7,7 @@ from typing import Callable, List, Optional
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from . import occupancy as occ
 from .types import LogOddsGrid
 

@@ -1,38 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-for _mod in (
-    "rclpy",
-    "rclpy.node",
-    "rclpy.qos",
-    "rclpy.action",
-    "geometry_msgs",
-    "geometry_msgs.msg",
-    "nav_msgs",
-    "nav_msgs.msg",
-    "sensor_msgs",
-    "sensor_msgs.msg",
-    "std_msgs",
-    "std_msgs.msg",
-    "tf2_ros",
-    "nav2_msgs",
-    "nav2_msgs.action",
-):
-    sys.modules.setdefault(_mod, MagicMock())
-
 pytest.importorskip("viam")
 
 from src.config import SlamConfig
-from src.ros import pcshm
-from src.ros.sensor_io import build_io_provider
-from src.ros.shm_lidar import ShmPointCloudClient
+from src.shm import pcshm
+from src.sensors.viam_io import build_io_provider
+from src.shm.lidar import ShmPointCloudClient
 
 _MIN_PCD = (
     b"# .PCD v0.7\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\n"
@@ -119,7 +99,7 @@ def test_auto_mode_skips_after_rplidar_not_implemented():
 
 def test_rplidar_get_laser_scan_raises_not_implemented():
     from src.models.rplidar_shm import RPLidarShm
-    from src.ros.sensor_io import get_laser_scan_not_implemented
+    from src.sensors.viam_io import get_laser_scan_not_implemented
 
     cam = RPLidarShm("lidar")
     with pytest.raises(NotImplementedError) as ei:
@@ -128,7 +108,7 @@ def test_rplidar_get_laser_scan_raises_not_implemented():
 
 
 def test_get_laser_scan_not_implemented_matches_legacy_rplidar_message():
-    from src.ros.sensor_io import get_laser_scan_not_implemented
+    from src.sensors.viam_io import get_laser_scan_not_implemented
 
     # Historical message before "not implemented" was in the text.
     assert get_laser_scan_not_implemented(

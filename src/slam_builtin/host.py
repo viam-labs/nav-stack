@@ -1,4 +1,4 @@
-"""Duck-typed RosManager stand-in for ``slam_backend: builtin``."""
+"""Duck-typed SLAM host for ``slam_backend: builtin``."""
 from __future__ import annotations
 
 import math
@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from ..config import SLAM_BACKEND_BUILTIN
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .engine import BuiltinSlamEngine
 
 
 class BuiltinSlamHost:
-    """SLAM surface used by ``RosSlam`` when there is no slam_toolbox/ROS.
+    """SLAM surface used by ``SlamService`` for builtin occupancy mapping.
 
     Implements the methods ``slam.py`` calls on ``runtime.manager`` /
     ``manager.node``. ``node`` is self (same object) so
@@ -31,7 +31,7 @@ class BuiltinSlamHost:
     def engine(self) -> BuiltinSlamEngine:
         return self._engine
 
-    # -- RosManager-like -----------------------------------------------------
+    # -- Lifecycle ------------------------------------------------------------
     def start(self, io_provider=None, loop=None) -> None:
         del io_provider, loop
         self._engine.start()
@@ -116,7 +116,9 @@ class BuiltinSlamHost:
 
     def slam_diagnostics(self) -> Dict:
         d = self._engine.diagnostics()
-        d["slam_toolbox_lifecycle"] = "n/a"
+        d["slam_backend"] = SLAM_BACKEND_BUILTIN
+        d["map_backend"] = "builtin"
+
         d["bridge"] = {"ok": True, "slam_backend": SLAM_BACKEND_BUILTIN}
         return d
 
@@ -126,10 +128,10 @@ class BuiltinSlamHost:
     def record_cmd_vel(
         self, vx: float, vy: float, vtheta: float, *, source: str = "nav"
     ) -> None:
-        # No ROS bridge cmd_vel history on the builtin path.
+        # No external cmd_vel history on the builtin path.
         del vx, vy, vtheta, source
 
-    # -- BridgeNode-like (via self.node = self) ------------------------------
+    # -- Map / pose surface (self.node = self) -------------------------------
     def get_map(self) -> Optional[dict]:
         if not self._map_updates_enabled:
             return None

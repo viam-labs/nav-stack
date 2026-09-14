@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.ros.conversions import path_length_m, path_msg_to_points
+from src.geom.conversions import path_length_m, path_msg_to_points
 
 
 def _pose(x, y, yaw=0.0):
@@ -52,9 +52,9 @@ def test_path_length_m():
 def test_plan_to_point_do_command_returns_path_without_navigate():
     pytest.importorskip("viam")
     from src.config import NavConfig
-    from src.models.navigation import RosNavigation
+    from src.models.navigation import NavigationService
 
-    nav = RosNavigation("nav")
+    nav = NavigationService("nav")
     nav._cfg = NavConfig(
         slam_service="slam",
         base="my-base",
@@ -98,9 +98,9 @@ def test_plan_to_point_do_command_returns_path_without_navigate():
 def test_execute_plan_navigates_preview_goal():
     pytest.importorskip("viam")
     from src.config import NavConfig
-    from src.models.navigation import RosNavigation
+    from src.models.navigation import NavigationService
 
-    nav = RosNavigation("nav")
+    nav = NavigationService("nav")
     nav._cfg = NavConfig(
         slam_service="slam",
         base="my-base",
@@ -137,9 +137,9 @@ def test_move_on_map_preview_extra_does_not_navigate():
     from viam.proto.common import Pose
 
     from src.config import NavConfig
-    from src.models.navigation import RosNavigation
+    from src.models.navigation import NavigationService
 
-    nav = RosNavigation("nav")
+    nav = NavigationService("nav")
     nav._cfg = NavConfig(
         slam_service="slam",
         base="my-base",

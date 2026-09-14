@@ -7,7 +7,7 @@ velocity but may omit or sparsely serialize the same fields in readings).
 
 This reader uses the portable contract: call ``get_properties()`` once to
 discover which typed getters the sensor implements, then call only those. It
-produces the same sensor-frame :class:`~..ros.conversions.OdomReading` the
+produces the same sensor-frame :class:`~..geom.conversions.OdomReading` the
 readings parser does, so the downstream mount-yaw / upside-down / heading
 corrections (see ``slam.py``) compose unchanged.
 
@@ -25,13 +25,13 @@ integrating acceleration (drifts quadratically), which is unusable as odometry.
 ``velocity_convention`` selects the sensor body frame for twist fields:
 
 * ``viam`` / ``mir``: keep Y-forward (``vy`` = forward, ``vx`` = right). Do **not**
-  apply the ROS forward→x swap.
-* ``ros``: keep X-forward (``vx`` = forward, ``vy`` = left).
+  apply the body X/Y swap.
+* ``x_forward`` / ``ros``: keep X-forward (``vx`` = forward, ``vy`` = left).
 
 When linear velocity is available but ``trust_pose`` is off, this reader
 dead-reckons an odom ``pose`` from twist (so ``has_pose`` is true for
-velocity-only wheeled sensors). Integration uses a ROS-style world frame
-(theta=0 faces +X) with convention-aware body→world kinematics.
+velocity-only wheeled sensors). Integration uses a world frame where
+theta=0 faces +X, with convention-aware body→world kinematics.
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ from typing import Any, Dict, Mapping, Optional
 from viam.components.movement_sensor import MovementSensor
 
 from ..config import BASE_VELOCITY_VIAM, BASE_VELOCITY_Y_FORWARD
-from . import conversions as conv
+from ..geom import conversions as conv
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ class TypedOdomConfig:
 
     # Use LinearVelocity as body twist when the sensor advertises it (wheel /
     # fused odometry). When true and present, the accel/lidar-odom path is
-    # bypassed (see BridgeNode ``_has_wheel_twist``).
+    # Wheel-twist deadband for near-stationary bases.
     use_linear_velocity: bool = True
     # Emit gravity-compensated body accel hints from LinearAcceleration.
     use_linear_acceleration: bool = True
@@ -134,7 +134,7 @@ class TypedMovementSensorOdom:
     def _integrate_twist_pose(
         self, vx: float, vy: float, vtheta: float, now: float
     ) -> conv.Pose2D:
-        """Integrate sensor-native twist into a ROS-world odom pose."""
+        """Integrate sensor-native twist into a world-frame odom pose."""
         if self._integ_t is None:
             self._integ_t = now
             return conv.Pose2D(self._integ_x, self._integ_y, self._integ_th)
@@ -149,7 +149,7 @@ class TypedMovementSensorOdom:
                 self._integ_x += (c * vy + s * vx) * dt
                 self._integ_y += (s * vy - c * vx) * dt
             else:
-                # ROS body: +x forward, +y left.
+                # Body: +x forward, +y left.
                 self._integ_x += (c * vx - s * vy) * dt
                 self._integ_y += (s * vx + c * vy) * dt
             self._integ_th = conv.normalize_angle(self._integ_th + vtheta * dt)
@@ -211,8 +211,8 @@ class TypedMovementSensorOdom:
             ly = float(getattr(lv, "y", 0.0) or 0.0)
             lz = float(getattr(lv, "z", 0.0) or 0.0)
             raw_lv = (lx, ly, lz)
-            # Keep sensor-native axes. ROS forward→x conversion belongs in the
-            # ROS bridge publish path, not here (builtin probe expects viam
+            # Keep sensor-native axes. Body-frame conversion belongs at the
+            # drive/publish boundary, not here (builtin probe expects viam
             # forward on vy).
             vx, vy = lx, ly
 

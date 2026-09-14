@@ -1,8 +1,8 @@
 """Occupancy + plan renderer for the ``nav-camera`` component.
 
 Turns a plain-Python snapshot (occupancy grid, plans, robot pose, goal) into a
-PNG the Viam app can stream. Deliberately **ROS-free** and side-effect-free so
-it unit-tests without a ROS install: the bridge collects the snapshot; this
+PNG the Viam app can stream. Side-effect-free so it unit-tests cleanly: the
+nav viz store collects the snapshot; this
 module only draws it.
 
 Coordinate model: occupancy grids are ``nav_msgs/OccupancyGrid``-style, row-major

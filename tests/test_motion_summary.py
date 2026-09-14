@@ -3,10 +3,10 @@ from src.nav.motion_summary import describe_cmd_vel, summarize_nav_motion
 
 def test_describe_hard_right_turn_with_forward():
     last = {
-        "ros_vx_mps": 0.4,
-        "ros_vy_mps": 0.0,
-        "ros_vtheta_rad_s": -1.0,
-        "source": "nav2",
+        "body_vx_mps": 0.4,
+        "body_vy_mps": 0.0,
+        "body_vtheta_rad_s": -1.0,
+        "source": "builtin",
         "age_s": 0.1,
     }
     phrase = describe_cmd_vel(
@@ -20,7 +20,7 @@ def test_describe_hard_right_turn_with_forward():
 
 def test_describe_spin_in_place_left():
     phrase = describe_cmd_vel(
-        {"ros_vx_mps": 0.0, "ros_vy_mps": 0.0, "ros_vtheta_rad_s": 0.5, "source": "nav2"},
+        {"body_vx_mps": 0.0, "body_vy_mps": 0.0, "body_vtheta_rad_s": 0.5, "source": "builtin"},
         max_vel_x=0.75,
         max_vel_theta=1.2,
     )
@@ -34,9 +34,9 @@ def test_summarize_idle_stopped():
             "active": False,
             "state": "idle",
             "last_cmd_vel": {
-                "ros_vx_mps": 0.0,
-                "ros_vy_mps": 0.0,
-                "ros_vtheta_rad_s": 0.0,
+                "body_vx_mps": 0.0,
+                "body_vy_mps": 0.0,
+                "body_vtheta_rad_s": 0.0,
                 "source": "stop",
                 "age_s": 2.0,
             },
@@ -47,28 +47,28 @@ def test_summarize_idle_stopped():
     assert "stopped" in out["action"]
 
 
-def test_summarize_nav2_with_distance_and_held():
+def test_summarize_builtin_with_distance_and_held():
     out = summarize_nav_motion(
         {
             "active": True,
             "state": "navigating",
             "distance_remaining": 1.25,
             "last_cmd_vel": {
-                "ros_vx_mps": 0.5,
-                "ros_vy_mps": 0.0,
-                "ros_vtheta_rad_s": -0.9,
-                "source": "nav2",
+                "body_vx_mps": 0.5,
+                "body_vy_mps": 0.0,
+                "body_vtheta_rad_s": -0.9,
+                "source": "builtin",
                 "age_s": 0.05,
             },
             "cmd_vel_history": [
                 {
-                    "ros_vx_mps": 0.5,
-                    "ros_vtheta_rad_s": 0.0,
+                    "body_vx_mps": 0.5,
+                    "body_vtheta_rad_s": 0.0,
                     "age_s": 3.1,
                 },
                 {
-                    "ros_vx_mps": 0.5,
-                    "ros_vtheta_rad_s": -0.9,
+                    "body_vx_mps": 0.5,
+                    "body_vtheta_rad_s": -0.9,
                     "age_s": 0.05,
                 },
             ],
@@ -76,7 +76,7 @@ def test_summarize_nav2_with_distance_and_held():
         max_vel_x=0.75,
         max_vel_theta=1.2,
     )
-    assert "Nav2 navigating" in out["summary"]
+    assert "builtin navigating" in out["summary"]
     assert "1.2 m remaining" in out["summary"]
     assert "hard" in out["action"] and "right" in out["action"]
     assert out["held_s"] == 3.1
@@ -91,10 +91,10 @@ def test_summarize_includes_goal_relative_and_progress():
             "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
             "goal": {"x": 2.0, "y": -2.0, "theta": 0.0, "name": "dock"},
             "last_cmd_vel": {
-                "ros_vx_mps": 0.4,
-                "ros_vy_mps": 0.0,
-                "ros_vtheta_rad_s": -0.5,
-                "source": "nav2",
+                "body_vx_mps": 0.4,
+                "body_vy_mps": 0.0,
+                "body_vtheta_rad_s": -0.5,
+                "source": "builtin",
                 "age_s": 0.1,
             },
             "cmd_vel_history": [],

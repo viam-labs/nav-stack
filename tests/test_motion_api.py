@@ -16,8 +16,8 @@ from viam.proto.service.motion import PlanState
 from viam.services.motion import Motion
 
 from src.config import NavConfig
-from src.models.navigation import RosNavigation, _nav_status_to_plan_state
-from src.ros.conversions import Pose2D, viam_pose_to_pose2d
+from src.models.navigation import NavigationService, _nav_status_to_plan_state
+from src.geom.conversions import Pose2D, viam_pose_to_pose2d
 
 
 def test_nav_status_to_plan_state_mapping():
@@ -44,13 +44,13 @@ def test_nav_status_to_plan_state_mapping():
     )
 
 
-def test_ros_navigation_registers_as_motion():
-    assert RosNavigation.API == Motion.API
-    assert issubclass(RosNavigation, Motion)
+def test_navigation_registers_as_motion():
+    assert NavigationService.API == Motion.API
+    assert issubclass(NavigationService, Motion)
 
 
-def _configured_nav(*, nav_status=None, pose=None) -> tuple[RosNavigation, MagicMock]:
-    nav = RosNavigation("nav")
+def _configured_nav(*, nav_status=None, pose=None) -> tuple[NavigationService, MagicMock]:
+    nav = NavigationService("nav")
     nav._cfg = NavConfig(
         slam_service="slam",
         base="my-base",
@@ -71,7 +71,6 @@ def _configured_nav(*, nav_status=None, pose=None) -> tuple[RosNavigation, Magic
     mgr.get_pose_in_map = MagicMock(
         return_value=pose if pose is not None else Pose2D(1.0, 2.0, 0.5)
     )
-    mgr.nav2_diagnostics = MagicMock(return_value={})
     runtime = SimpleNamespace(manager=mgr, localization_check={})
     nav._resolve_runtime = MagicMock(return_value=runtime)  # type: ignore[method-assign]
     nav._base = MagicMock()
@@ -209,7 +208,7 @@ def test_suspend_resume_move_on_map():
     assert suspended["status"] == "suspended"
     assert suspended["goal"]["x"] == pytest.approx(1.0)
     assert suspended["goal"]["y"] == pytest.approx(0.0)
-    assert suspended["goal"]["motion"] == "nav2"
+    assert suspended["goal"]["motion"] == "builtin"
     assert suspended["goal"]["reason"] == "safety"
     mgr.cancel.assert_called()
     plan = asyncio.run(nav.get_plan("my-base", execution_id=execution_id))

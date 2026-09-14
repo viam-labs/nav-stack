@@ -6,11 +6,11 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 
 class NavVizStore:
-    """Thread-safe stand-in for BridgeNode.viz_snapshot() without ROS."""
+    """Thread-safe viz snapshot for nav-camera / get_costmap."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -29,7 +29,7 @@ class NavVizStore:
         self._history_len = max(1, int(n))
 
     def enable_viz(self, history_len: int = 8) -> None:
-        """BridgeNode-compatible hook used by nav-camera / get_costmap."""
+        """Hook used by nav-camera / get_costmap."""
         self.set_history_len(history_len)
 
     def viz_snapshot(self) -> Dict:

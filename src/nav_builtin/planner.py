@@ -18,13 +18,13 @@ from .costmap import (
     mark_scan_on_occupancy,
     nearest_free_cell,
     nearest_free_pose,
-    occupancy_from_bridge_map,
+    occupancy_from_map_dict,
 )
 from .path_utils import closest_point_on_path
 from .local_costmap import LocalCostmapView
 from .local_planner import path_cost_ahead
 from .types import OccupancyGrid, Path2D, PlanResult, Pose2D
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 PLANNER_ASTAR = "astar"
 PLANNER_LAZY_THETA = "lazy_theta_star"
@@ -592,7 +592,7 @@ def connect_plan_start(
     if not result.feasible or result.path.empty:
         return result
     try:
-        occ = occupancy_from_bridge_map(map_data)
+        occ = occupancy_from_map_dict(map_data)
     except (KeyError, TypeError, ValueError) as exc:
         return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
     costs = build_costmap(
@@ -785,7 +785,7 @@ def plan_path(
     nav-camera can render (inflated costs the planner actually used).
     """
     try:
-        occ = occupancy_from_bridge_map(map_data)
+        occ = occupancy_from_map_dict(map_data)
     except (KeyError, TypeError, ValueError) as exc:
         return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
     # Paint lidar hits as occupied *cells* (small radius). build_costmap then
@@ -837,7 +837,7 @@ def path_blocked(
     """
     if path.empty:
         return True
-    occ = occupancy_from_bridge_map(map_data)
+    occ = occupancy_from_map_dict(map_data)
     costs = build_costmap(
         occ,
         inflation_radius_m=inflation_radius_m,

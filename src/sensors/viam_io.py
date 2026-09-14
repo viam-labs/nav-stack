@@ -1,19 +1,9 @@
 """Shared builder for :class:`~.io_provider.IOProvider`.
 
-Both navigation-capable models (and ROS-free ``global_localize``) feed the same
-four Viam-backed callables — lidar point reads, odometry reads, drive, and stop.
-The only difference is *how odometry is read*:
-
-* built-in SLAM and external-SLAM both prefer the portable typed
-  MovementSensor API (:class:`~.odom_source.TypedMovementSensorOdom`) when an
-  ``odom_reader`` is supplied; otherwise the ``get_readings`` parser is used.
-
-So this builder takes an optional ``odom_reader``: when provided it supplies the
-raw sample; otherwise the ``get_readings`` parser is used. Either way the same
-mount-yaw / upside-down / heading-sensor corrections are applied, so odometry
-behaves identically regardless of the read path.
-
-Importing this module must not require ``rclpy`` (builtin SLAM path).
+SLAM and navigation feed the same four Viam-backed callables — lidar reads,
+odometry, drive, and stop. When ``odom_reader`` is supplied it uses the typed
+MovementSensor API; otherwise ``get_readings`` is parsed. Mount-yaw / upside-down
+/ heading-sensor corrections apply either way.
 """
 from __future__ import annotations
 
@@ -26,12 +16,12 @@ from viam.utils import struct_to_dict
 from ..config import (
     LIDAR_SCAN_GET_LASER_SCAN,
     LIDAR_SCAN_POINT_CLOUD,
-    ros_twist_to_viam_set_velocity,
+    body_twist_to_viam_set_velocity,
 )
-from . import conversions as conv
+from ..geom import conversions as conv
+from ..shm import pcshm
+from ..shm.lidar import ShmPointCloudClient
 from .io_provider import IOProvider
-from . import pcshm
-from .shm_lidar import ShmPointCloudClient
 
 
 def get_laser_scan_not_implemented(exc: BaseException) -> bool:
@@ -219,7 +209,7 @@ def build_io_provider(
                 sample, math.radians(cfg.movement_sensor_yaw_deg)
             )
         if heading_sensor is not None:
-            from .odom_source import read_typed_heading
+            from ..odom.source import read_typed_heading
 
             heading, _source, _dbg = await read_typed_heading(heading_sensor)
             if heading is not None:
@@ -240,13 +230,12 @@ def build_io_provider(
         vy: float,
         vtheta: float,
         *,
-        record_source: Optional[str] = "nav2",
+        record_source: Optional[str] = "builtin",
     ):
-        # ``record_source=None`` skips history (caller already recorded the
-        # pre-snap Nav2 command — see BridgeNode._on_drive_timer).
+        # ``record_source=None`` skips history (caller already recorded).
         if record_cmd_vel is not None and record_source is not None:
             record_cmd_vel(vx, vy, vtheta, source=record_source)
-        lx_mm, ly_mm, ang_deg_s = ros_twist_to_viam_set_velocity(
+        lx_mm, ly_mm, ang_deg_s = body_twist_to_viam_set_velocity(
             vx, vy, vtheta, cfg.base_velocity_convention
         )
         await base.set_velocity(
@@ -256,8 +245,7 @@ def build_io_provider(
 
     async def stop_base():
         # MiR base.stop() also calls REST stop_immediately (PAUSE), which drops
-        # Manualcontrol and kills the rosbridge /cmd_vel session. Nav2 only needs
-        # zeros.
+        # Manualcontrol. Prefer SetVelocity zeros.
         if record_cmd_vel is not None:
             record_cmd_vel(0.0, 0.0, 0.0, source="stop")
         await base.set_velocity(

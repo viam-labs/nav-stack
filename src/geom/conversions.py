@@ -179,7 +179,7 @@ def map_pose_to_odom_pose(map_pose: Pose2D, map_to_odom: Pose2D) -> Pose2D:
     """Odom-frame pose that makes ``map_to_odom ∘ odom_pose == map_pose``.
 
     Used by the mapping-time revisit correction: shifting the published odom
-    pose to this value lands slam_toolbox's scan-match prior on ``map_pose``
+    pose to this value lands the scan-match prior on ``map_pose``
     without touching its map->odom estimate.
     """
     return compose_poses(invert_pose(map_to_odom), map_pose)
@@ -947,7 +947,7 @@ def forward_sector_min_range(
     """Nearest finite return within ±``half_width_rad`` of angle 0 (robot forward).
 
     Used by sensor probes: standing in front of the cart should drop this value
-    even when slam_toolbox refuses to update the occupancy map while parked.
+    even when the occupancy map is not updated while parked.
     """
     if scan.ranges.size == 0:
         return None
@@ -1139,7 +1139,7 @@ def merge_scans(
 
     Each input scan is transformed into the common (base_link) frame via its
     ``sensor_pose``, then all points are re-projected into a single 360 scan. This
-    is what feeds slam_toolbox, which only accepts a single ``/scan`` input.
+    is what feeds SLAM as a single merged scan.
     """
     if not scans:
         return LaserScan2D(np.full(num_bins, np.inf), -math.pi, 2 * math.pi / num_bins)

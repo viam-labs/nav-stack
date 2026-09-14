@@ -39,7 +39,7 @@ fi
 
 if [ ! -d "${ROOT}/.venv" ]; then
   echo "[local-sim] creating Python venv via setup.sh (ROS-free)…"
-  REQUIRE_ROS=0 "${ROOT}/setup.sh"
+  "${ROOT}/setup.sh"
 fi
 
 BIND_ADDRESS="${BIND:-:8081}"

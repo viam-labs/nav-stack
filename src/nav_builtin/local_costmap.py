@@ -1,4 +1,4 @@
-"""Rolling local costmap for builtin navigation (map frame, no ROS)."""
+"""Rolling local costmap for builtin navigation (map frame)."""
 from __future__ import annotations
 
 import math
@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .costmap import FREE, INSCRIBED, LETHAL, build_costmap, is_traversable
 from .types import OccupancyGrid
 

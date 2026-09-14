@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 # Occupancy conventions match nav-stack / ROS: -1 unknown, 0 free, 100 occupied.
 _OCCUPIED_MIN = 50
