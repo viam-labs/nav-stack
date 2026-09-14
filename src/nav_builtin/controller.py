@@ -32,10 +32,17 @@ class FollowerConfig:
     tightens the turn, and the lookahead low-passes SLAM pose jitter.
     """
 
-    lookahead_m: float = 0.6
-    min_lookahead_m: float = 0.4
-    max_lookahead_m: float = 0.9
-    lookahead_time_s: float = 1.5
+    # Pure pursuit's noise gain is ~2v(σ_xy + L·σ_yaw)/L²: SLAM jitter of
+    # 2–3 cm / 2–3° at L=0.4–0.6 m produced ±0.2 rad/s heading wag on the real
+    # robot. 0.6–1.2 m halves that at the cost of a ~0.1–0.15 m corner cut,
+    # which sits well inside the planner's clearance preference.
+    lookahead_m: float = 0.8
+    min_lookahead_m: float = 0.6
+    max_lookahead_m: float = 1.2
+    lookahead_time_s: float = 2.0
+    # Blend commanded curvature with the previous tick's (EMA weight on the
+    # new value). Smooths pose-noise-driven κ flicker without changing the arc.
+    curvature_smoothing: float = 0.6
     approach_dist_m: float = 0.35
     waypoint_tolerance_m: float = 0.15
     # Rotate-to-heading: stop translating when the lookahead bearing exceeds
@@ -50,15 +57,27 @@ class FollowerConfig:
     # robot slows into corners instead of carving them at cruise.
     regulated_min_radius_m: float = 0.7
     regulated_min_speed_mps: float = 0.15
+    # Skid-steer wheel constraint. Inner wheel speed is ``vx - |vθ|·half_track``;
+    # Viam wheeled bases reject commands whose inner wheel is "nearly 0" RPM and
+    # the retry path turns the arc into a pure spin — which is how a regulated
+    # corner arc became stop-spin-go on the robot. Arcs are kept such that
+    # ``vx - |vθ|·half_track >= wheel_min_speed`` and radius ≥ min_turn_radius.
+    # Supervisor sets half_track from robot_radius (≈0.6·r).
+    wheel_half_track_m: float = 0.27
+    wheel_min_speed_mps: float = 0.06
+    min_turn_radius_m: Optional[float] = None
     motion: SimpleMotionConfig = field(default_factory=SimpleMotionConfig)
     obstacle: Optional[ObstacleConfig] = None
 
+    def effective_min_turn_radius_m(self) -> float:
+        if self.min_turn_radius_m is not None:
+            return max(0.05, float(self.min_turn_radius_m))
+        return float(self.wheel_half_track_m) + 0.15
 
-# Viam wheeled bases reject wheel RPM "nearly 0". ``ViamWorldIO`` sanitizes
-# ``vx < 0.12`` with ``|vθ| > 0.25`` to a pure spin, so any translating arc we
-# emit must stay in the drivable region or the base turns it into a spin.
-_BASE_CRAWL_FLOOR_MPS = 0.12
-_BASE_CRAWL_MAX_YAW_RAD_S = 0.25
+
+# ``ViamWorldIO._sanitize_base_cmd`` zeroes ``vx < 0.12`` when ``|vθ| > 0.25``
+# (pure spin). Any translating arc we emit must clear that floor.
+_BASE_CRAWL_FLOOR_MPS = 0.125
 
 
 def _path_length(path: Path2D) -> float:
@@ -233,21 +252,42 @@ def update_speed_estimate(prev: float, cmd_vx: float, *, alpha: float = 0.25) ->
     return (1.0 - alpha) * float(prev) + alpha * max(0.0, float(cmd_vx))
 
 
-def keep_arc_drivable(cmd: DriveCommand) -> DriveCommand:
-    """Keep a translating arc inside the base sanitizer's drivable region.
+def drivable_min_speed(kappa: float, cfg: FollowerConfig) -> float:
+    """Slowest ``vx`` at which an arc of curvature ``kappa`` keeps the inner
+    wheel above ``wheel_min_speed`` (and clears the base sanitizer floor)."""
+    denom = 1.0 - float(cfg.wheel_half_track_m) * abs(kappa)
+    if denom <= 1e-3:
+        return math.inf
+    return max(_BASE_CRAWL_FLOOR_MPS, float(cfg.wheel_min_speed_mps) / denom)
 
-    Obstacle slow-down can scale ``vx`` under 0.12 m/s while ``vθ`` stays over
-    0.25 rad/s; the base then drops ``vx`` to zero and the robot spins in place
-    every few ticks (the "crazy arcs"). Preserve curvature instead: floor
-    ``vx`` at the crawl floor and rescale ``vθ`` with it, capping very tight
-    arcs at the sanitizer's yaw limit.
+
+def keep_arc_drivable(cmd: DriveCommand, cfg: Optional[FollowerConfig] = None) -> DriveCommand:
+    """Keep a translating arc inside the region the base will actually execute.
+
+    Obstacle slow-down scales ``vx`` toward zero; below the crawl floor the
+    sanitizer, and below the inner-wheel minimum the base itself, turn the arc
+    into a pure spin (the "crazy arcs" / stop-spin-go at corners). Preserve
+    curvature instead: cap it at the minimum turn radius, then raise ``vx`` to
+    the slowest speed that still drives that arc and rescale ``vθ`` with it.
     """
-    if cmd.done or cmd.vx <= 0.0 or cmd.vx >= _BASE_CRAWL_FLOOR_MPS:
+    if cmd.done or cmd.vx <= 0.0:
         return cmd
+    cfg = cfg if cfg is not None else FollowerConfig()
     kappa = cmd.vtheta / cmd.vx
-    vx = _BASE_CRAWL_FLOOR_MPS
-    vtheta = _clamp(vx * kappa, _BASE_CRAWL_MAX_YAW_RAD_S)
-    return DriveCommand(vx, cmd.vy, vtheta, False)
+    kappa_max = 1.0 / cfg.effective_min_turn_radius_m()
+    if abs(kappa) > kappa_max:
+        kappa = math.copysign(kappa_max, kappa)
+    vx = max(cmd.vx, drivable_min_speed(kappa, cfg))
+    vx = min(vx, cfg.motion.max_linear_mps) if cfg.motion.max_linear_mps > 0 else vx
+    if vx == cmd.vx and kappa == cmd.vtheta / cmd.vx:
+        return cmd
+    return DriveCommand(vx, cmd.vy, vx * kappa, False)
+
+
+def _prev_curvature(prev_cmd: Optional[DriveCommand]) -> Optional[float]:
+    if prev_cmd is None or prev_cmd.done or prev_cmd.vx <= 1e-3:
+        return None
+    return float(prev_cmd.vtheta) / float(prev_cmd.vx)
 
 
 def pursuit_command(
@@ -256,11 +296,13 @@ def pursuit_command(
     *,
     cfg: FollowerConfig,
     rotate_active: bool = False,
+    prev_cmd: Optional[DriveCommand] = None,
 ) -> Tuple[DriveCommand, bool]:
     """Regulated pure pursuit toward the lookahead point ``target``.
 
     Returns ``(cmd, rotating)`` where ``rotating`` is the rotate-to-heading
-    state to feed back next tick (hysteresis).
+    state to feed back next tick (hysteresis). ``prev_cmd`` (last issued
+    command) enables curvature smoothing across ticks.
     """
     motion = cfg.motion
     max_linear = motion.max_linear_mps
@@ -287,19 +329,33 @@ def pursuit_command(
         return DriveCommand(0.0, 0.0, w, False), True
 
     kappa = 2.0 * y_l / l2
+    # Smooth κ across ticks (pose noise → κ flicker), unless we just started
+    # translating (no previous arc to blend with).
+    prev_kappa = _prev_curvature(prev_cmd)
+    if prev_kappa is not None:
+        a = min(1.0, max(0.05, float(cfg.curvature_smoothing)))
+        kappa = a * kappa + (1.0 - a) * prev_kappa
+    # Skid-steer cannot drive arcs tighter than min_turn_radius while
+    # translating (inner wheel → 0 → base rejects → spin). Widen the arc; the
+    # bearing then grows and rotate-to-heading takes over if really needed.
+    kappa_max = 1.0 / cfg.effective_min_turn_radius_m()
+    if abs(kappa) > kappa_max:
+        kappa = math.copysign(kappa_max, kappa)
+
     v = max_linear
     if abs(kappa) > 1e-6:
         radius = 1.0 / abs(kappa)
         if radius < cfg.regulated_min_radius_m:
             v *= radius / cfg.regulated_min_radius_m
-    v = min(max_linear, max(float(cfg.regulated_min_speed_mps), v))
+    v = max(v, float(cfg.regulated_min_speed_mps), drivable_min_speed(kappa, cfg))
+    v = min(max_linear, v)
     w = v * kappa
     if abs(w) > max_angular:
         # Keep the arc; give up speed rather than curvature.
         w = math.copysign(max_angular, w)
         v = max_angular / abs(kappa)
     v = max(v, motion.min_linear_mps)
-    return keep_arc_drivable(DriveCommand(v, 0.0, w, False)), False
+    return keep_arc_drivable(DriveCommand(v, 0.0, w, False), cfg), False
 
 
 def lookahead_pose(
@@ -408,11 +464,13 @@ def compute_path_command(
     local_planner_active: bool = False,
     prev_local_cmd: Optional[DriveCommand] = None,
     rotate_active: bool = False,
+    prev_cmd: Optional[DriveCommand] = None,
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``.
 
     ``rotate_active`` is the rotate-to-heading state from the previous tick
     (``progress["rotate_to_heading"]``); feed it back for hysteresis.
+    ``prev_cmd`` is the last command actually issued (curvature smoothing).
     """
     est_speed = cfg.motion.max_linear_mps * 0.5 if speed_mps is None else speed_mps
     goal_xy = Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
@@ -472,7 +530,11 @@ def compute_path_command(
             bearing = heading_error_rad(current.theta, path.goal_theta)
         else:
             cmd, rotating = pursuit_command(
-                current, target, cfg=cfg, rotate_active=rotate_active
+                current,
+                target,
+                cfg=cfg,
+                rotate_active=rotate_active,
+                prev_cmd=prev_cmd,
             )
             cmd = apply_velocity_floor(cmd, cfg.motion)
 
@@ -494,7 +556,7 @@ def compute_path_command(
         if not cmd.done and (cmd.vx != 0.0 or cmd.vtheta != 0.0):
             # Slow-down scaled vx; keep the arc drivable before the floor so a
             # 0.05 m/s crawl with 0.2 rad/s does not become a base-side spin.
-            cmd = apply_velocity_floor(keep_arc_drivable(cmd), cfg.motion)
+            cmd = apply_velocity_floor(keep_arc_drivable(cmd, cfg), cfg.motion)
     elif local_active:
         obstacle_state = "local_planner"
     elif (

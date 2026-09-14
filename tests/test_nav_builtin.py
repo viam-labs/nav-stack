@@ -703,20 +703,42 @@ def test_pursuit_rotate_to_heading_has_hysteresis():
 def test_keep_arc_drivable_preserves_curvature_at_crawl():
     from src.nav_builtin.controller import DriveCommand, keep_arc_drivable
 
-    # Slow-down produced 0.05 m/s with 0.10 rad/s (r = 0.5 m). The Viam
-    # sanitizer would keep this, but flooring to 0.12 keeps the same arc.
-    out = keep_arc_drivable(DriveCommand(0.05, 0.0, 0.10, False))
-    assert out.vx == pytest.approx(0.12)
+    cfg = FollowerConfig()  # half_track 0.27, wheel_min 0.06, r_min 0.42
+    # Slow-down produced 0.05 m/s with 0.10 rad/s (r = 0.5 m). Same arc, but
+    # fast enough that the inner wheel (vx - |ω|·half_track) stays ≥ 0.06.
+    out = keep_arc_drivable(DriveCommand(0.05, 0.0, 0.10, False), cfg)
     assert out.vtheta / out.vx == pytest.approx(2.0)
-    # Sanitizer trap: vx<0.12 with |vθ|>0.25 → would become a pure spin.
-    trap = keep_arc_drivable(DriveCommand(0.08, 0.0, 0.30, False))
-    assert trap.vx == pytest.approx(0.12)
-    assert abs(trap.vtheta) <= 0.25
+    assert out.vx >= 0.125
+    assert out.vx - abs(out.vtheta) * cfg.wheel_half_track_m >= cfg.wheel_min_speed_mps - 1e-9
+    # Tighter than the min turn radius (r = 0.27 m): widen to r_min, not spin.
+    tight = keep_arc_drivable(DriveCommand(0.08, 0.0, 0.30, False), cfg)
+    assert tight.vx > 0.0
+    assert tight.vx / abs(tight.vtheta) == pytest.approx(cfg.effective_min_turn_radius_m())
+    assert tight.vx - abs(tight.vtheta) * cfg.wheel_half_track_m >= cfg.wheel_min_speed_mps - 1e-9
     # Already drivable / not translating: untouched.
-    ok = DriveCommand(0.3, 0.0, 0.5, False)
-    assert keep_arc_drivable(ok) == ok
+    ok = DriveCommand(0.3, 0.0, 0.3, False)
+    assert keep_arc_drivable(ok, cfg) == ok
     spin = DriveCommand(0.0, 0.0, 0.5, False)
-    assert keep_arc_drivable(spin) == spin
+    assert keep_arc_drivable(spin, cfg) == spin
+
+
+def test_pursuit_respects_skid_steer_wheel_envelope():
+    """No translating command may put the inner wheel under the base minimum."""
+    from src.nav_builtin.controller import pursuit_command
+
+    cfg = FollowerConfig()
+    cfg.motion.max_linear_mps = 0.4
+    current = Pose2D(0.0, 0.0, 0.0)
+    for deg in range(-58, 59, 4):
+        for L in (0.6, 0.8, 1.2):
+            tgt = Pose2D(L * math.cos(math.radians(deg)), L * math.sin(math.radians(deg)), 0.0)
+            cmd, rotating = pursuit_command(current, tgt, cfg=cfg)
+            assert not rotating
+            inner = cmd.vx - abs(cmd.vtheta) * cfg.wheel_half_track_m
+            assert inner >= cfg.wheel_min_speed_mps - 1e-9, (deg, L, cmd)
+            assert cmd.vx >= 0.125
+            if abs(cmd.vtheta) > 1e-9:
+                assert cmd.vx / abs(cmd.vtheta) >= cfg.effective_min_turn_radius_m() - 1e-9
 
 
 def test_follow_command_approach_cap_only_at_goal():

@@ -645,7 +645,6 @@ class ViamWorldIO:
             )
         except Exception as exc:  # noqa: BLE001
             # Wheeled bases reject non-zero but tiny wheel RPM ("nearly 0").
-            # Snap to a clean stop or pure spin and retry once.
             if not _is_near_zero_rpm_error(exc):
                 intent["error"] = str(exc).strip() or type(exc).__name__
                 self._last_drive = intent
@@ -654,7 +653,25 @@ class ViamWorldIO:
                 )
                 raise
             try:
-                if abs(vtheta) >= 0.15:
+                if vx > 0.0 and abs(vtheta) >= 0.08:
+                    # Translating arc whose inner wheel is ~0: widen it (more
+                    # vx, same vθ) rather than convert to a pure spin — a spin
+                    # mid-path throws the heading and the follower has to
+                    # recover from a pose it never commanded.
+                    vx_retry = max(vx, 0.06 + 0.32 * abs(vtheta))
+                    lx_mm_r, ly_mm_r, _ = ros_twist_to_viam_set_velocity(
+                        vx_retry, vy, vtheta, self._convention
+                    )
+                    intent["retry"] = {"kind": "widen_arc", "ros_vx_mps": vx_retry}
+                    self._run(
+                        self._base.set_velocity(
+                            linear=Vector3(x=lx_mm_r, y=ly_mm_r, z=0.0),
+                            angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
+                        ),
+                        timeout=self._drive_timeout_s,
+                    )
+                elif vx == 0.0 and abs(vtheta) >= 0.15:
+                    intent["retry"] = {"kind": "spin"}
                     self._run(
                         self._base.set_velocity(
                             linear=Vector3(x=0.0, y=0.0, z=0.0),
@@ -663,6 +680,7 @@ class ViamWorldIO:
                         timeout=self._drive_timeout_s,
                     )
                 else:
+                    intent["retry"] = {"kind": "stop"}
                     self.stop()
             except Exception as retry_exc:  # noqa: BLE001
                 intent["error"] = str(retry_exc).strip() or type(retry_exc).__name__

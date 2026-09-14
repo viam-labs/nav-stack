@@ -337,6 +337,41 @@ async def test_viam_world_io_last_drive_issued_only_after_set_velocity():
     assert drive["viam_linear_y_mm_s"] == pytest.approx(300.0)
 
 
+@pytest.mark.asyncio
+async def test_near_zero_rpm_retry_widens_arc_instead_of_spinning():
+    """A translating arc the base rejects (inner wheel ~0) must be retried as a
+    wider arc, not converted to a pure spin — spins mid-path throw the heading."""
+    loop = asyncio.get_event_loop()
+    base = MagicMock()
+    base.name = "tracer"
+    rpm_err = Exception("Cannot move motor at an RPM that is nearly 0")
+    base.set_velocity = AsyncMock(side_effect=[rpm_err, None])
+    world = ViamWorldIO(
+        slam=MagicMock(spec=["get_position", "do_command"]),
+        base=base,
+        loop=loop,
+        cameras={},
+        lidars=[],
+        base_velocity_convention="viam",
+    )
+    await asyncio.to_thread(world.set_velocity, 0.15, 0.0, 0.6)
+    assert base.set_velocity.await_count == 2
+    retry = base.set_velocity.await_args_list[1].kwargs
+    # Still translating (viam convention: ROS vx → linear.y), faster than asked.
+    assert retry["linear"].y > 150.0
+    assert retry["angular"].z == pytest.approx(math.degrees(0.6))
+    drive = world.last_drive()
+    assert drive["issued"] is True
+    assert drive["retry"]["kind"] == "widen_arc"
+
+    # A rejected pure spin still retries as a spin.
+    base.set_velocity = AsyncMock(side_effect=[rpm_err, None])
+    await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.3)
+    retry = base.set_velocity.await_args_list[1].kwargs
+    assert retry["linear"].y == 0.0
+    assert world.last_drive()["retry"]["kind"] == "spin"
+
+
 def test_sync_slam_pose_provider_uses_registered_service(monkeypatch):
     from src.models import navigation as nav_mod
 

@@ -379,12 +379,14 @@ class BuiltinNavConfig:
 
     # ``lazy_theta_star`` (default) or ``astar``.
     planner: str = BUILTIN_PLANNER_LAZY_THETA
-    # Regulated pure pursuit lookahead: velocity-scaled (1.5 s) and clamped to
+    # Regulated pure pursuit lookahead: velocity-scaled (2 s) and clamped to
     # [min, max]; ``lookahead_m`` is the fallback when starting from rest.
-    # Longer = smoother but cuts corners more; shorter = tighter tracking.
-    lookahead_m: float = 0.6
-    min_lookahead_m: float = 0.4
-    max_lookahead_m: float = 0.9
+    # Longer = smoother / less sensitive to SLAM pose jitter but cuts corners
+    # more; shorter = tighter tracking. Below ~0.6 m real SLAM noise (2–3 cm,
+    # 2–3°) shows up as visible heading wag on a skid-steer.
+    lookahead_m: float = 0.8
+    min_lookahead_m: float = 0.6
+    max_lookahead_m: float = 1.2
     replan_period_s: float = 1.0
     timeout_s: float = 300.0
     # Base.SetVelocity wait on the shared module event loop. Mapping+SLAM can

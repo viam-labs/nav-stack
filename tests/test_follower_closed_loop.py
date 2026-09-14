@@ -62,6 +62,23 @@ def _uniform_scan(front_range_m: float, num_bins: int = 360) -> conv.LaserScan2D
     return conv.LaserScan2D(ranges, -math.pi, 2 * math.pi / num_bins, range_min=0.05)
 
 
+@dataclass(frozen=True)
+class BaseModel:
+    """Real skid-steer / Viam base effects the ideal unicycle ignores."""
+
+    half_track_m: float = 0.28  # (vx=0.12, ω=0.25) is the empirical sanitizer edge
+    wheel_min_mps: float = 0.05  # inner wheel below this → "nearly 0 RPM" rejection
+    ang_deadband: float = 0.12  # no yaw response below this while translating
+    slip: float = 0.85  # actual ω / commanded ω while translating
+    tau_v_s: float = 0.4  # first-order actuator lags
+    tau_w_s: float = 0.25
+    pose_lag_ticks: int = 2  # SLAM pose latency in control ticks
+
+
+IDEAL = None
+HARSH = BaseModel()
+
+
 @dataclass
 class RunLog:
     crosstrack: List[float]
@@ -70,6 +87,8 @@ class RunLog:
     final: Pose2D
     reached: bool
     ticks: int
+    rejections: int = 0
+    max_heading_err: float = 0.0
 
     def sign_flips(self, deadband: float = 0.1, window: int = 5) -> int:
         """Count *sustained* vθ sign reversals (chatter / S-curve metric).
@@ -118,20 +137,26 @@ def _run(
     max_ticks: int = 1500,
     stop_dist_m: float = 0.5,
     seed: int = 0,
+    base: Optional[BaseModel] = IDEAL,
 ) -> RunLog:
     rng = random.Random(seed)
     true = start
     goal = Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta)
     queue: deque = deque([(0.0, 0.0)] * latency_ticks)
+    pose_lag = base.pose_lag_ticks if base is not None else 0
+    pose_hist: deque = deque([start] * (pose_lag + 1), maxlen=pose_lag + 1)
     rotate_active = False
     last_vx = 0.0
+    prev_cmd = None
+    v_act = w_act = 0.0
     log = RunLog([], [], [], true, False, 0)
 
     for tick in range(max_ticks):
+        lagged = pose_hist[0]
         meas = Pose2D(
-            true.x + rng.gauss(0.0, noise_xy_m),
-            true.y + rng.gauss(0.0, noise_xy_m),
-            conv.normalize_angle(true.theta + rng.gauss(0.0, noise_yaw_rad)),
+            lagged.x + rng.gauss(0.0, noise_xy_m),
+            lagged.y + rng.gauss(0.0, noise_xy_m),
+            conv.normalize_angle(lagged.theta + rng.gauss(0.0, noise_yaw_rad)),
         )
         cmd, progress = compute_path_command(
             meas,
@@ -140,12 +165,32 @@ def _run(
             scan=scan,
             speed_mps=last_vx,
             rotate_active=rotate_active,
+            prev_cmd=prev_cmd,
         )
         rotate_active = bool(progress.get("rotate_to_heading"))
         last_vx = update_speed_estimate(last_vx, cmd.vx)  # mirrors supervisor
+        prev_cmd = cmd
         vx, _vy, w = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+        if base is not None and vx > 0.0 and vx - abs(w) * base.half_track_m < base.wheel_min_mps:
+            # Base rejects "nearly 0 RPM"; ViamWorldIO retries with a wider arc.
+            log.rejections += 1
+            vx = max(vx, 0.06 + 0.32 * abs(w)) if abs(w) >= 0.08 else 0.0
+            if vx == 0.0:
+                w = 0.0
         queue.append((vx, w))
-        vx_a, w_a = queue.popleft()
+        vx_b, w_b = queue.popleft()
+        if base is None:
+            vx_a, w_a = vx_b, w_b
+        else:
+            v_act += (vx_b - v_act) * min(1.0, dt / base.tau_v_s)
+            if vx_b == 0.0:
+                w_tgt = w_b
+            elif abs(w_b) < base.ang_deadband:
+                w_tgt = 0.0
+            else:
+                w_tgt = w_b * base.slip
+            w_act += (w_tgt - w_act) * min(1.0, dt / base.tau_w_s)
+            vx_a, w_a = v_act, w_act
         # Unicycle integration (midpoint heading).
         th_mid = true.theta + 0.5 * w_a * dt
         true = Pose2D(
@@ -153,10 +198,14 @@ def _run(
             true.y + vx_a * math.sin(th_mid) * dt,
             conv.normalize_angle(true.theta + w_a * dt),
         )
-        ct, _ = signed_crosstrack_m(true, path)
+        pose_hist.append(true)
+        ct, path_yaw = signed_crosstrack_m(true, path)
         log.crosstrack.append(ct)
         log.omega.append(w_a)
         log.vx.append(vx_a)
+        if vx_a > 0.05:
+            herr = abs(conv.normalize_angle(true.theta - path_yaw))
+            log.max_heading_err = max(log.max_heading_err, herr)
         log.ticks = tick + 1
         if math.hypot(goal.x - true.x, goal.y - true.y) <= stop_dist_m:
             log.reached = True
@@ -250,3 +299,62 @@ def test_latency_two_ticks_still_stable():
     assert max(abs(c) for c in log.crosstrack) < 0.3
     assert log.sign_flips() <= 4
     assert log.spin_toggles() == 0
+
+
+# --- Real-base model: 5 Hz loop, 0.4 s pose latency, 3 cm / 3° SLAM noise,
+# actuator lag, yaw deadband + slip, and the wheeled base's inner-wheel
+# "nearly 0 RPM" rejection. This is what rc95 failed on the robot with:
+# regulated corner arcs at 0.15 m/s / 0.7 rad/s were rejected and retried as
+# pure spins → heading jumps → rotate-to-heading → stop-spin-go.
+
+_HARSH = dict(base=HARSH, dt=0.2, noise_xy_m=0.03, noise_yaw_rad=math.radians(3.0))
+
+
+def _dogleg() -> Path2D:
+    return Path2D(
+        points=_densify([(0.0, 0.0), (2.0, 0.0), (3.5, 1.2), (6.0, 1.2)]), goal_theta=0.0
+    )
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_harsh_corner_never_rejected_by_base(seed: int):
+    log = _run(_l_corner(), Pose2D(0.0, 0.0, 0.0), cfg=_robot_cfg(), seed=seed, **_HARSH)
+    assert log.reached
+    # Every translating command is inside the wheel envelope → no spin retries.
+    assert log.rejections == 0
+    assert log.spin_toggles() == 0
+    # One continuous arc: bounded cut, and heading never diverges from the path.
+    assert max(abs(c) for c in log.crosstrack) < 0.3
+    assert log.max_heading_err < math.radians(110.0)
+    assert log.sign_flips() <= 3
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_harsh_straight_keeps_heading(seed: int):
+    """SLAM noise at 5 Hz must not become heading wag: the base should see
+    almost no yaw commands, and actual heading stays within a few degrees."""
+    log = _run(_straight(), Pose2D(0.0, 0.0, math.radians(4.0)), cfg=_robot_cfg(), seed=seed, **_HARSH)
+    assert log.reached
+    assert log.rejections == 0
+    assert max(abs(c) for c in log.crosstrack) < 0.12
+    assert log.max_heading_err < math.radians(12.0)
+    assert log.sign_flips() <= 2
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_harsh_dogleg_and_slow_band(seed: int):
+    log = _run(_dogleg(), Pose2D(0.0, 0.0, 0.0), cfg=_robot_cfg(), seed=seed, **_HARSH)
+    assert log.reached and log.rejections == 0 and log.spin_toggles() == 0
+    assert max(abs(c) for c in log.crosstrack) < 0.2
+    obstacle = ObstacleConfig(enabled=True, stop_distance_m=0.5, slow_distance_m=1.0)
+    slow = _run(
+        _l_corner(),
+        Pose2D(0.0, 0.0, 0.0),
+        cfg=_robot_cfg(obstacle=obstacle),
+        scan=_uniform_scan(0.75),
+        seed=seed,
+        max_ticks=4000,
+        **_HARSH,
+    )
+    assert slow.reached and slow.rejections == 0 and slow.spin_toggles() == 0
+    assert max(abs(c) for c in slow.crosstrack) < 0.25
