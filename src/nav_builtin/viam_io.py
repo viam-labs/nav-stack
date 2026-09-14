@@ -6,7 +6,7 @@ import base64
 import math
 import struct
 import time
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence, Set
 
 import numpy as np
 from viam.proto.common import Vector3
@@ -93,6 +93,8 @@ class ViamWorldIO:
         logger=None,
         pose_provider: Optional[Callable[[], Optional[conv.Pose2D]]] = None,
         map_provider: Optional[Callable[[], Optional[dict]]] = None,
+        scan_provider: Optional[Callable[[float], Optional[conv.LaserScan2D]]] = None,
+        localization_hold_provider: Optional[Callable[[], Optional[dict]]] = None,
     ):
         self._slam = slam
         self._base = base
@@ -116,12 +118,24 @@ class ViamWorldIO:
         # origin placeholder (0,0,0) or stall — which freezes bearing_error.
         self._pose_provider = pose_provider
         self._map_provider = map_provider
+        self._scan_provider = scan_provider
+        self._localization_hold_provider = localization_hold_provider
         self._skip_get_laser_scan: set[str] = set()
         self._map_cache: Optional[dict] = None
         self._map_cache_at = 0.0
         self._scan_cache: Optional[conv.LaserScan2D] = None
         self._scan_cache_at = 0.0
         self._scan_cache_pose: Optional[conv.Pose2D] = None
+        # Obstacles-only depth cams: never await GetPointCloud on the nav tick.
+        # A fire-and-forget refresh fills this cache; the control loop only reads it
+        # so RealSense PCD cannot starve SetVelocity on the shared module loop.
+        self._per_lidar_scan: dict[str, tuple[conv.LaserScan2D, float]] = {}
+        # Depth is async + slow; keep it fresh enough that motion compensation works.
+        self._obstacles_only_period_s = 0.40
+        # Beyond this pose shift, cached depth is dropped (avoids phantom obstacles).
+        self._obstacles_max_shift_m = 0.30
+        self._obstacles_max_shift_rad = math.radians(20.0)
+        self._obstacles_refresh_inflight: Set[str] = set()
         self._last_drive: Optional[dict] = None
         self._pose_source: str = "none"
 
@@ -254,11 +268,15 @@ class ViamWorldIO:
         except Exception:  # noqa: BLE001
             return None
 
-    def get_scan(self, max_age_s: float = 2.0) -> Optional[conv.LaserScan2D]:
+    def get_scan(
+        self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True
+    ) -> Optional[conv.LaserScan2D]:
         now = time.monotonic()
         pose = self.get_pose()
+        # Merged cache includes depth; only reuse when the caller wants that.
         if (
-            self._scan_cache is not None
+            include_obstacles_only
+            and self._scan_cache is not None
             and now - self._scan_cache_at <= max_age_s
             and self._scan_cache_pose is not None
             and pose is not None
@@ -271,17 +289,46 @@ class ViamWorldIO:
             )
             if dtheta <= math.radians(12.0) and dist <= 0.12:
                 return self._scan_cache
+        if self._scan_provider is not None:
+            try:
+                provided = self._scan_provider(max_age_s)
+            except Exception:  # noqa: BLE001
+                provided = None
+            if provided is not None:
+                if pose is not None and provided.capture_pose is None:
+                    provided = conv.LaserScan2D(
+                        ranges=provided.ranges,
+                        angle_min=provided.angle_min,
+                        angle_increment=provided.angle_increment,
+                        range_min=provided.range_min,
+                        range_max=provided.range_max,
+                        sensor_pose=provided.sensor_pose,
+                        capture_pose=pose,
+                    )
+                if include_obstacles_only:
+                    self._scan_cache = provided
+                    self._scan_cache_at = now
+                    self._scan_cache_pose = pose
+                return provided
         if not self._lidars:
-            return self._scan_cache
+            return self._scan_cache if include_obstacles_only else None
         scans = []
         for lidar in self._lidars:
-            # Include obstacles_only sensors — this path is for nav avoidance /
-            # local costmap, not SLAM matching.
+            # Depth (obstacles_only) is for reactive slowing — not the rolling
+            # local costmap / DWA. Including it there caused phantom blobs and
+            # left/right chatter after the depth camera was added.
+            if lidar.obstacles_only and not include_obstacles_only:
+                continue
             scan = self._read_lidar_scan_sync(lidar, max_age_s=max_age_s)
-            if scan is not None:
-                scans.append(scan)
+            if scan is None:
+                continue
+            if pose is not None and lidar.obstacles_only:
+                scan = self._align_obstacles_scan_to_pose(scan, pose)
+                if scan is None:
+                    continue
+            scans.append(scan)
         if not scans:
-            return self._scan_cache
+            return self._scan_cache if include_obstacles_only else None
         merged = (
             scans[0]
             if len(scans) == 1
@@ -297,26 +344,97 @@ class ViamWorldIO:
                 sensor_pose=merged.sensor_pose,
                 capture_pose=pose,
             )
-        self._scan_cache = merged
-        self._scan_cache_at = now
-        self._scan_cache_pose = pose
+        if include_obstacles_only:
+            self._scan_cache = merged
+            self._scan_cache_at = now
+            self._scan_cache_pose = pose
         return merged
+
+    def _map_pose_now(self) -> Optional[conv.Pose2D]:
+        if self._pose_provider is not None:
+            try:
+                return self._pose_provider()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            return self.get_pose()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _stamp_capture_pose(
+        self, scan: conv.LaserScan2D, pose: Optional[conv.Pose2D]
+    ) -> conv.LaserScan2D:
+        if pose is None:
+            return scan
+        return conv.LaserScan2D(
+            ranges=scan.ranges,
+            angle_min=scan.angle_min,
+            angle_increment=scan.angle_increment,
+            range_min=scan.range_min,
+            range_max=scan.range_max,
+            sensor_pose=scan.sensor_pose,
+            capture_pose=pose,
+        )
+
+    def _align_obstacles_scan_to_pose(
+        self, scan: conv.LaserScan2D, current: conv.Pose2D
+    ) -> Optional[conv.LaserScan2D]:
+        """Move a cached depth scan into the live base_link, or drop if too stale.
+
+        Without this, async depth (~0.4–1 s old) is painted as if seen from the
+        *current* pose — walls smear into free space and the local planner weaves.
+
+        Important: never restamp ``capture_pose`` to ``current`` without warping
+        the ranges. A prior "small motion" shortcut did that, then ``get_scan``
+        stamped the merge as current — body-frame points stayed frozen while the
+        pose advanced, so phantoms accumulated into a black local-costmap blob.
+        """
+        cap = scan.capture_pose
+        if cap is None:
+            # Unknown capture frame: safer to drop than invent obstacles.
+            return None
+        dtheta = abs(conv.normalize_angle(current.theta - cap.theta))
+        dist = math.hypot(current.x - cap.x, current.y - cap.y)
+        if dist > self._obstacles_max_shift_m or dtheta > self._obstacles_max_shift_rad:
+            return None
+        if dist < 1e-4 and dtheta < 1e-5:
+            return self._stamp_capture_pose(scan, current)
+        pts = scan.to_points()
+        if pts.size == 0:
+            return self._stamp_capture_pose(scan, current)
+        pts3 = np.column_stack([pts, np.zeros(len(pts))])
+        aligned = conv.transform_points_between_poses(pts3, cap, current)[:, :2]
+        n_bins = int(len(scan.ranges)) if len(scan.ranges) else self._scan_bins
+        rebuilt = conv.points_to_scan(
+            aligned,
+            angle_min=-math.pi,
+            angle_max=math.pi,
+            num_bins=max(n_bins, 8),
+            range_min=float(scan.range_min),
+            range_max=float(scan.range_max),
+        )
+        return self._stamp_capture_pose(rebuilt, current)
 
     def _pcd_to_scan(
         self, raw: bytes, lidar: LidarConfig
     ) -> conv.LaserScan2D:
         pts = conv.parse_pcd(raw)
-        if not lidar.points_in_base_link:
-            pts = conv.transform_lidar_mount_to_base_link(
-                pts,
-                x=lidar.x,
-                y=lidar.y,
-                z=lidar.z,
-                theta=lidar.theta,
-                pitch=lidar.pitch,
-                roll=lidar.roll,
-            )
-        pts = conv.filter_points_by_z(pts, lidar.z_min, lidar.z_max)
+        # Depth cams are dense; downsample so GetPointCloud doesn't starve SetVelocity.
+        max_pts = 4000 if lidar.obstacles_only else 0
+        pts = conv.prepare_lidar_point_cloud(
+            pts,
+            cloud_frame=lidar.cloud_frame,
+            points_in_base_link=lidar.points_in_base_link,
+            x=lidar.x,
+            y=lidar.y,
+            z=lidar.z,
+            theta=lidar.theta,
+            pitch=lidar.pitch,
+            roll=lidar.roll,
+            z_min=lidar.z_min,
+            z_max=lidar.z_max,
+            max_points=max_pts,
+        )
         return conv.points_to_scan(
             pts,
             angle_min=-math.pi,
@@ -353,9 +471,74 @@ class ViamWorldIO:
         raw, _age = got
         return self._pcd_to_scan(raw, lidar)
 
+    def _kick_obstacles_only_refresh(self, lidar: LidarConfig) -> None:
+        """Schedule a non-blocking depth refresh on the module loop.
+
+        Nav never waits for this. While ``get_point_cloud`` is awaiting network,
+        ``SetVelocity`` can still run on the same loop. PCD parse runs in an
+        executor so CPU work does not freeze drive commands.
+        """
+        name = lidar.name
+        if name in self._obstacles_refresh_inflight:
+            return
+        cached = self._per_lidar_scan.get(name)
+        now = time.monotonic()
+        if (
+            cached is not None
+            and now - cached[1] < self._obstacles_only_period_s
+        ):
+            return
+        if self._loop.is_closed():
+            return
+        cam = self._cameras.get(name)
+        if cam is None and not lidar.shm_name:
+            return
+        self._obstacles_refresh_inflight.add(name)
+
+        async def _job() -> None:
+            try:
+                shm_scan = self._try_shm_scan(
+                    lidar, max_age_s=max(2.0, self._obstacles_only_period_s * 2)
+                )
+                if shm_scan is not None:
+                    self._per_lidar_scan[name] = (
+                        self._stamp_capture_pose(shm_scan, self._map_pose_now()),
+                        time.monotonic(),
+                    )
+                    return
+                if cam is None:
+                    return
+                data = await cam.get_point_cloud(timeout=2.0)
+                raw = data[0] if isinstance(data, tuple) else data
+                loop = asyncio.get_running_loop()
+                scan = await loop.run_in_executor(
+                    None, lambda: self._pcd_to_scan(raw, lidar)
+                )
+                if scan is not None:
+                    self._per_lidar_scan[name] = (
+                        self._stamp_capture_pose(scan, self._map_pose_now()),
+                        time.monotonic(),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"obstacles_only lidar {name} refresh failed: {exc}")
+            finally:
+                self._obstacles_refresh_inflight.discard(name)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_job(), self._loop)
+        except Exception:  # noqa: BLE001
+            self._obstacles_refresh_inflight.discard(name)
+
     def _read_lidar_scan_sync(
         self, lidar: LidarConfig, *, max_age_s: float
     ) -> Optional[conv.LaserScan2D]:
+        if lidar.obstacles_only:
+            # Cache-only on the hot path — never block the nav worker / event loop
+            # on RealSense GetPointCloud (that was starving SetVelocity → stall).
+            self._kick_obstacles_only_refresh(lidar)
+            cached = self._per_lidar_scan.get(lidar.name)
+            return cached[0] if cached is not None else None
+
         # Prefer POSIX shm (memcpy) so the 10 Hz control loop never blocks on
         # gRPC GetPointCloud — that lag was causing no_scan spin / circles.
         shm_scan = self._try_shm_scan(lidar, max_age_s=max_age_s)
@@ -462,7 +645,6 @@ class ViamWorldIO:
             )
         except Exception as exc:  # noqa: BLE001
             # Wheeled bases reject non-zero but tiny wheel RPM ("nearly 0").
-            # Snap to a clean stop or pure spin and retry once.
             if not _is_near_zero_rpm_error(exc):
                 intent["error"] = str(exc).strip() or type(exc).__name__
                 self._last_drive = intent
@@ -471,7 +653,25 @@ class ViamWorldIO:
                 )
                 raise
             try:
-                if abs(vtheta) >= 0.15:
+                if vx > 0.0 and abs(vtheta) >= 0.08:
+                    # Translating arc whose inner wheel is ~0: widen it (more
+                    # vx, same vθ) rather than convert to a pure spin — a spin
+                    # mid-path throws the heading and the follower has to
+                    # recover from a pose it never commanded.
+                    vx_retry = max(vx, 0.06 + 0.32 * abs(vtheta))
+                    lx_mm_r, ly_mm_r, _ = ros_twist_to_viam_set_velocity(
+                        vx_retry, vy, vtheta, self._convention
+                    )
+                    intent["retry"] = {"kind": "widen_arc", "ros_vx_mps": vx_retry}
+                    self._run(
+                        self._base.set_velocity(
+                            linear=Vector3(x=lx_mm_r, y=ly_mm_r, z=0.0),
+                            angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
+                        ),
+                        timeout=self._drive_timeout_s,
+                    )
+                elif vx == 0.0 and abs(vtheta) >= 0.15:
+                    intent["retry"] = {"kind": "spin"}
                     self._run(
                         self._base.set_velocity(
                             linear=Vector3(x=0.0, y=0.0, z=0.0),
@@ -480,6 +680,7 @@ class ViamWorldIO:
                         timeout=self._drive_timeout_s,
                     )
                 else:
+                    intent["retry"] = {"kind": "stop"}
                     self.stop()
             except Exception as retry_exc:  # noqa: BLE001
                 intent["error"] = str(retry_exc).strip() or type(retry_exc).__name__
@@ -543,6 +744,16 @@ class ViamWorldIO:
         if self._viz is None:
             return
         self._viz.set_local_costmap(costmap)
+
+    def get_localization_hold(self) -> Optional[dict]:
+        provider = self._localization_hold_provider
+        if provider is None:
+            return None
+        try:
+            hold = provider()
+        except Exception:  # noqa: BLE001 - never block drive on status read
+            return None
+        return hold if isinstance(hold, dict) else None
 
 
 def _sanitize_base_cmd(

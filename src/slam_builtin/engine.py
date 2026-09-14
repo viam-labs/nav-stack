@@ -17,6 +17,7 @@ from ..config import (
 )
 from ..nav.global_localize import OccupancyMap
 from ..nav.maps import MapStore
+from ..nav.pose_jump_gate import PoseJumpGate
 from ..ros import conversions as conv
 from . import occupancy as occ
 from . import persistence
@@ -93,8 +94,16 @@ class BuiltinSlamEngine:
             max_keyframes=int(cfg.builtin_mapping_keyframe_max)
         )
         self._keyframe_hook = None
+        self._pose_listeners: list = []
         self._last_odom_twist = (0.0, 0.0, 0.0)
         self._last_loop_rebuild_at = 0.0
+        self._pose_jump_gate = PoseJumpGate(
+            confirm_count=int(cfg.localize_jump_confirm_count),
+            agree_m=float(cfg.localize_jump_agree_m),
+            agree_deg=float(cfg.localize_jump_agree_deg),
+            large_m=float(cfg.localize_jump_large_m),
+            large_deg=float(cfg.localize_jump_large_deg),
+        )
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -179,6 +188,17 @@ class BuiltinSlamEngine:
     def set_keyframe_hook(self, hook) -> None:
         self._keyframe_hook = hook
 
+    def add_pose_listener(self, listener) -> None:
+        """``listener(pose: Pose2D)`` after set_pose / apply_map_pose_correction."""
+        self._pose_listeners.append(listener)
+
+    def _notify_pose_listeners(self, pose: conv.Pose2D) -> None:
+        for listener in list(self._pose_listeners):
+            try:
+                listener(pose)
+            except Exception:  # noqa: BLE001
+                pass
+
     def set_pose(self, pose: conv.Pose2D) -> None:
         with self._lock:
             self._pose = pose
@@ -189,6 +209,7 @@ class BuiltinSlamEngine:
             self._last_odom_pose = None
             self._last_odom_heading = None
             self._last_odom_time = None
+        self._notify_pose_listeners(pose)
 
     def apply_map_pose_correction(self, matched_pose: conv.Pose2D) -> dict:
         """Correct pose drift during mapping; optionally rebuild the grid."""
@@ -243,6 +264,7 @@ class BuiltinSlamEngine:
             self._last_odom_time = None
             self._last_insert_pose = matched_pose
 
+        self._notify_pose_listeners(matched_pose)
         return {
             "applied": True,
             "rebuilt": rebuilt,
@@ -365,6 +387,14 @@ class BuiltinSlamEngine:
         if scan is not None:
             self._last_scan_obj = scan
 
+        # Builtin sim: body pose in SimWorld is ground truth (raycast + kinematics).
+        # Track it directly so localize/set_pose cannot yank the body or desync
+        # scans from the estimate. Real-robot path below is unchanged.
+        world = getattr(self._sensors, "world", None)
+        if world is not None:
+            self._tick_sim_world(world, scan, odom, now, new_scan=new_scan)
+            return
+
         with self._lock:
             seed_pending = (
                 self._mode == MODE_LOCALIZING and self._seed_localize_pending
@@ -426,6 +456,73 @@ class BuiltinSlamEngine:
             else:
                 self._maybe_insert_scan(scan, now)
 
+    def _tick_sim_world(
+        self,
+        world,
+        scan,
+        odom: Optional[conv.OdomReading],
+        now: float,
+        *,
+        new_scan: bool,
+    ) -> None:
+        """SLAM pose follows SimWorld; match scores are diagnostic only."""
+        pose = world.get_pose()
+        with self._lock:
+            prev_pose, prev_at = self._last_tick_pose, self._last_tick_at
+            self._pose = pose
+            # World pose is authoritative — never wait on seed global_localize.
+            self._seed_localize_pending = False
+            self._pending_match = None
+            self._pending_count = 0
+            self._ticks += 1
+            self._last_tick_pose, self._last_tick_at = pose, now
+            if odom is not None and odom.pose is not None:
+                self._last_odom_pose = conv.Pose2D(
+                    odom.pose.x, odom.pose.y, odom.pose.theta
+                )
+                self._last_odom_heading = odom.heading_rad
+                self._last_odom_time = now
+            yaw_rate = 0.0
+            if prev_pose is not None and prev_at is not None and now > prev_at:
+                yaw_rate = abs(
+                    conv.normalize_angle(pose.theta - prev_pose.theta)
+                ) / (now - prev_at)
+            self._last_yaw_rate = yaw_rate
+            if scan is None or not new_scan:
+                return
+            occ_map = self._occupancy_for_match()
+            known = self._occ_cache_known
+            run_match = (
+                known > 0.02
+                and now - self._last_match_at >= self._match_period_s
+            )
+
+        if run_match:
+            matched, score, prior_score = scan_match.refine_pose(
+                occ_map, scan, pose
+            )
+            with self._lock:
+                self._last_match_at = now
+                self._last_match_score = score
+                self._last_prior_score = prior_score
+                # Do not apply match to pose (would fight SimWorld). Count how
+                # often the map agrees with ground truth for status.
+                if matched is not None:
+                    dist = math.hypot(matched.x - pose.x, matched.y - pose.y)
+                    dyaw = abs(conv.normalize_angle(matched.theta - pose.theta))
+                    if dist <= self._SMALL_CORRECTION_M and dyaw <= self._SMALL_CORRECTION_RAD:
+                        self._match_accepts += 1
+                    else:
+                        self._match_rejects += 1
+                else:
+                    self._match_rejects += 1
+
+        if self._mode == MODE_MAPPING:
+            if yaw_rate > self._MAX_INSERT_YAW_RATE:
+                self._insert_skips_turning += 1
+            else:
+                self._maybe_insert_scan(scan, now)
+
     # Above this yaw rate a revolution is skewed >~5 deg; keep matching but
     # do not bake the skewed scan into the map.
     _MAX_INSERT_YAW_RATE = math.radians(45.0)
@@ -467,6 +564,16 @@ class BuiltinSlamEngine:
             return False
         pose = result.pose
         with self._lock:
+            current = self._pose
+        decision = self._pose_jump_gate.evaluate(current, pose, force=False)
+        if not decision.should_apply:
+            self._log(
+                f"seed global localize awaiting confirm "
+                f"{decision.confirm_count}/{decision.confirm_needed} "
+                f"(shift={decision.shift_m:.2f} m score={score:.3f})"
+            )
+            return False
+        with self._lock:
             self._pose = pose
             self._seed_localize_pending = False
             self._last_odom_pose = None
@@ -475,10 +582,12 @@ class BuiltinSlamEngine:
             self._pending_match = None
             self._pending_count = 0
             self._last_match_score = score
+        self._notify_pose_listeners(pose)
         self._log(
             f"seed global localize applied "
             f"x={pose.x:.2f} y={pose.y:.2f} th={pose.theta:.2f} "
-            f"score={score:.3f} ray_mae={result.ray_mae_m:.3f}"
+            f"score={score:.3f} ray_mae={result.ray_mae_m:.3f} "
+            f"jump={decision.status}"
         )
         return True
 

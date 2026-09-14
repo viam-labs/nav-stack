@@ -13,6 +13,7 @@ This module (`viam-labs:nav-stack`) provides:
 | `viam-labs:nav-stack:navigation` | `rdk:service:motion` | Builtin MoveOnMap (default); optional Nav2. Named locations, zones, `go_to_*` via `DoCommand`. |
 | `viam-labs:nav-stack:navigation-external` | `rdk:service:motion` | Same Motion + DoCommand surface against **any** `rdk:service:slam`. Builtin path is fully ROS-free. |
 | `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders costmap + plan(s), pose, footprint and goal as a live camera image. |
+| `viam-labs:nav-stack:sim-base` | `rdk:component:base` | Simulated base for hardware-free mapping / nav (`SetVelocity` → raycast world). |
 | `viam-labs:nav-stack:rplidar` / `wit-imu` / `shm-pointcloud` | camera / movement_sensor | Optional sensor helpers with POSIX shm for low-latency builtin paths. |
 
 ## How it works
@@ -153,13 +154,20 @@ mapping). Example depth camera for avoidance only:
   "name": "depth-cam",
   "scan_source": "point_cloud",
   "obstacles_only": true,
+  "cloud_frame": "camera_optical",
+  "shm_name": "",
   "max_range": 4.0,
-  "z_min": 0.05,
+  "min_range": 0.4,
+  "z_min": 0.15,
   "z_max": 1.5,
   "mount": { "x": 0.15, "y": 0.0, "z": 0.4, "theta": 0.0 }
 }
 ```
 
+RealSense / OpenCV depth clouds use **optical** axes (Z forward). Set
+``cloud_frame: "camera_optical"`` so depth is remapped to X-forward before the
+mount and height band; without it, depth collapses into Z and paints a blob on
+the robot in the local costmap.
 **Tuning via Viam config (no YAML editing required):**
 
 | Attribute | Service | Description |
@@ -376,6 +384,93 @@ Use `viam-labs:nav-stack:navigation-external` to drive Nav2 from **any** `rdk:se
 ```
 
 Optional attributes: `trust_movement_sensor_pose` (default `false`), `snap_heading` (default `false`), plus the same bridge/odometry tuning fields as the SLAM service and the same `nav2` block as `navigation`. The built-in `navigation` model is unchanged; use it when you map with `nav-stack:slam`.
+
+### Builtin simulation (no hardware)
+
+Bring up slam + navigation against a raycast floorplan so you can **map**, **localize**, **plan/execute** paths (including from nav-stack-ui), and **repeat** the same path after a pose reset — without real lidars or a wheeled base.
+
+Architecture:
+
+- `viam-labs:nav-stack:sim-base` — real Viam Base; `SetVelocity` / teleop update a shared `SimWorld`
+- SLAM `sim.enabled` — in-process `SimSensors` (raycast lidar + integrated odom); no Camera deps
+- Real `slam` / `navigation` / optional `nav-camera` APIs unchanged for the UI
+
+Example fragment (configure `sim-base` **before** slam so the world exists; slam may also create it):
+
+```json
+{
+  "components": [
+    {
+      "name": "sim-base",
+      "api": "rdk:component:base",
+      "model": "viam-labs:nav-stack:sim-base",
+      "attributes": {
+        "world_name": "default",
+        "seed_x": 1.0,
+        "seed_y": 1.0,
+        "seed_theta": 0.0
+      }
+    }
+  ],
+  "services": [
+    {
+      "name": "slam",
+      "api": "rdk:service:slam",
+      "model": "viam-labs:nav-stack:slam",
+      "attributes": {
+        "base": "sim-base",
+        "slam_backend": "builtin",
+        "mode": "mapping",
+        "sim": {
+          "enabled": true,
+          "world_name": "default",
+          "seed_x": 1.0,
+          "seed_y": 1.0
+        }
+      }
+    },
+    {
+      "name": "nav",
+      "api": "rdk:service:motion",
+      "model": "viam-labs:nav-stack:navigation",
+      "attributes": {
+        "slam_service": "slam",
+        "base": "sim-base",
+        "nav_backend": "builtin"
+      }
+    }
+  ]
+}
+```
+
+Notes:
+
+- Default world is a built-in L-corridor; set `sim.map_path` / `map_path` on sim-base to a `.npy` grid (+ optional sibling `.json` with `resolution`, `origin_x`, `origin_y`).
+- Lidars and movement sensors are omitted when `sim.enabled` is true.
+- Reset pose for repeatable runs: `sim-base` DoCommand `{"command": "reset"}` (optional `x` / `y` / `theta`).
+
+**Local bring-up (viam-server):**
+
+```bash
+./scripts/run_local_sim.sh          # creates venv if needed, serves on :8081 (--no-tls)
+# BIND=:8082 ./scripts/run_local_sim.sh
+# ./scripts/run_local_sim.sh --print   # write resolved config only
+```
+
+Uses [`sample_configs/local_sim.json`](sample_configs/local_sim.json) (rewrites `executable_path` + `maps_dir` to absolute paths). Resources: `sim-base`, `slam`, `nav`, `nav-view`.
+
+**Point nav-stack-ui at it** (fully local, no cloud/API keys):
+
+```bash
+# in nav-stack-ui/.env
+VITE_HOST=http://localhost:8081
+VITE_CAMERA_NAME=nav-view
+VITE_SLAM_SERVICE=slam
+VITE_NAV_SERVICE=nav
+VITE_BASE_NAME=sim-base
+```
+
+Then `npm run dev` in nav-stack-ui. Teleop `sim-base` to map, navigate with `nav`, reset with DoCommand `{"command":"reset"}` on `sim-base`.
 
 ### Visualizing what nav is planning (nav-camera)
 

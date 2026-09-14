@@ -290,8 +290,21 @@ def summarize_nav_motion(
 ) -> dict:
     """Build a plain-English motion summary from a nav ``get_status`` dict."""
     last = dict(status.get("last_cmd_vel") or {})
+    # Builtin nav publishes live follower cmds as top-level progress fields
+    # (cmd_vx_mps / cmd_vtheta_rad_s) without the ROS cmd_vel history recorder.
+    if not last and (
+        status.get("cmd_vx_mps") is not None
+        or status.get("cmd_vtheta_rad_s") is not None
+    ):
+        last = {
+            "ros_vx_mps": float(status.get("cmd_vx_mps") or 0.0),
+            "ros_vy_mps": 0.0,
+            "ros_vtheta_rad_s": float(status.get("cmd_vtheta_rad_s") or 0.0),
+            "source": "builtin",
+            "age_s": 0.0,
+        }
     history = list(status.get("cmd_vel_history") or [])
-    held = _held_seconds(history, last)
+    held = _held_seconds(history, last) if history else None
     action = describe_cmd_vel(
         last, max_vel_x=max_vel_x, max_vel_theta=max_vel_theta, held_s=held
     )
@@ -306,6 +319,8 @@ def summarize_nav_motion(
         motion = "nav2"
 
     dist = status.get("distance_remaining")
+    if dist is None:
+        dist = status.get("distance_remaining_m")
     if dist is None:
         dist = simple.get("distance_remaining_m")
     recoveries = status.get("number_of_recoveries")
@@ -328,6 +343,8 @@ def summarize_nav_motion(
             context_bits.append("idle")
     elif motion == "simple":
         context_bits.append("simple go_to in progress")
+    elif motion == "builtin":
+        context_bits.append("builtin navigating")
     elif active:
         context_bits.append("Nav2 navigating")
     else:

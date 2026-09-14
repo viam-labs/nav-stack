@@ -33,6 +33,13 @@ LIDAR_SCAN_SOURCES = {
     LIDAR_SCAN_POINT_CLOUD,
 }
 
+# Point-cloud axis convention *before* the mount transform.
+# ``sensor``: X forward, Y left, Z up (RPLIDAR / Livox / ROS body).
+# ``camera_optical``: X right, Y down, Z forward (RealSense / OpenCV / ROS optical).
+CLOUD_FRAME_SENSOR = "sensor"
+CLOUD_FRAME_CAMERA_OPTICAL = "camera_optical"
+CLOUD_FRAMES = {CLOUD_FRAME_SENSOR, CLOUD_FRAME_CAMERA_OPTICAL}
+
 
 def default_lidar_shm_name(component_name: str) -> str:
     """Match ``viam-labs:nav-stack:rplidar`` default writer name."""
@@ -114,6 +121,70 @@ def sensor_twist_to_ros_body(
     return float(vx), float(vy)
 
 
+def viam_set_velocity_to_ros_twist(
+    linear_x_mm_s: float,
+    linear_y_mm_s: float,
+    angular_z_deg_s: float,
+    convention: str = BASE_VELOCITY_VIAM,
+) -> tuple[float, float, float]:
+    """Inverse of ``ros_twist_to_viam_set_velocity`` (mm/s + deg/s → ROS m/s + rad/s)."""
+    import math
+
+    lx = float(linear_x_mm_s) / 1000.0
+    ly = float(linear_y_mm_s) / 1000.0
+    if convention in BASE_VELOCITY_Y_FORWARD:
+        # Forward was packed on Viam linear.y; lateral on linear.x.
+        vx_mps, vy_mps = ly, lx
+    else:
+        vx_mps, vy_mps = lx, ly
+    return vx_mps, vy_mps, math.radians(float(angular_z_deg_s))
+
+
+@dataclass
+class SimConfig:
+    """Builtin simulation (raycast world + ``sim-base``), nested under slam ``sim``."""
+
+    enabled: bool = False
+    # Shared registry key so ``sim-base`` and SLAM ``SimSensors`` find one world.
+    world_name: str = "default"
+    # Optional ``.npy`` (+ sibling ``.json`` meta). Empty → built-in L-corridor.
+    map_path: Optional[str] = None
+    seed_x: float = 1.0
+    seed_y: float = 1.0
+    seed_theta: float = 0.0
+    scan_bins: int = 360
+    range_min: float = 0.05
+    range_max: float = 20.0
+    # Velocity convention for decoding Base.SetVelocity into SimWorld (match slam).
+    base_velocity_convention: str = BASE_VELOCITY_VIAM
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "SimConfig":
+        if not d:
+            return cls()
+        convention = d.get("base_velocity_convention", BASE_VELOCITY_VIAM)
+        if convention not in BASE_VELOCITY_CONVENTIONS:
+            raise ValueError(
+                f"sim.base_velocity_convention must be one of "
+                f"{sorted(BASE_VELOCITY_CONVENTIONS)}"
+            )
+        if convention == BASE_VELOCITY_MIR:
+            convention = BASE_VELOCITY_VIAM
+        map_path = d.get("map_path")
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            world_name=str(d.get("world_name", "default") or "default"),
+            map_path=str(map_path).strip() or None if map_path else None,
+            seed_x=float(d.get("seed_x", 1.0)),
+            seed_y=float(d.get("seed_y", 1.0)),
+            seed_theta=float(d.get("seed_theta", 0.0)),
+            scan_bins=int(d.get("scan_bins", 360)),
+            range_min=float(d.get("range_min", 0.05)),
+            range_max=float(d.get("range_max", 20.0)),
+            base_velocity_convention=str(convention),
+        )
+
+
 @dataclass
 class LidarConfig:
     """A single lidar and its mount transform (base_link -> laser_N)."""
@@ -155,6 +226,11 @@ class LidarConfig:
     # it is excluded from SLAM scan-matching and map updates. Use for a short-
     # range depth camera alongside a real lidar.
     obstacles_only: bool = False
+    # Axis convention of ``get_point_cloud`` *before* mount. RealSense / OpenCV
+    # depth clouds are ``camera_optical`` (Z forward); treating them as
+    # ``sensor`` (X forward) collapses depth into height and paints a blob on
+    # the robot in the local costmap.
+    cloud_frame: str = CLOUD_FRAME_SENSOR
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "LidarConfig":
@@ -166,6 +242,11 @@ class LidarConfig:
         if scan_source not in LIDAR_SCAN_SOURCES:
             raise ValueError(
                 f"lidar scan_source must be one of {sorted(LIDAR_SCAN_SOURCES)}"
+            )
+        cloud_frame = str(d.get("cloud_frame", CLOUD_FRAME_SENSOR)).strip().lower()
+        if cloud_frame not in CLOUD_FRAMES:
+            raise ValueError(
+                f"lidar cloud_frame must be one of {sorted(CLOUD_FRAMES)}"
             )
         name = d["name"]
         if "shm_name" in d:
@@ -197,6 +278,7 @@ class LidarConfig:
             shm_region_size=region,
             shm_required=bool(d.get("shm_required", False)),
             obstacles_only=bool(d.get("obstacles_only", False)),
+            cloud_frame=cloud_frame,
         )
 
 
@@ -297,11 +379,14 @@ class BuiltinNavConfig:
 
     # ``lazy_theta_star`` (default) or ``astar``.
     planner: str = BUILTIN_PLANNER_LAZY_THETA
-    # Pure-pursuit lookahead (mugger-dds RPP uses 0.25–0.7 m velocity-scaled;
-    # 1.0 m was Nav2-cart-ish and cut corners / overshot on diff-drive).
-    lookahead_m: float = 0.6
-    min_lookahead_m: float = 0.25
-    max_lookahead_m: float = 0.7
+    # Regulated pure pursuit lookahead: velocity-scaled (2 s) and clamped to
+    # [min, max]; ``lookahead_m`` is the fallback when starting from rest.
+    # Longer = smoother / less sensitive to SLAM pose jitter but cuts corners
+    # more; shorter = tighter tracking. Below ~0.6 m real SLAM noise (2–3 cm,
+    # 2–3°) shows up as visible heading wag on a skid-steer.
+    lookahead_m: float = 0.8
+    min_lookahead_m: float = 0.6
+    max_lookahead_m: float = 1.2
     replan_period_s: float = 1.0
     timeout_s: float = 300.0
     # Base.SetVelocity wait on the shared module event loop. Mapping+SLAM can
@@ -310,11 +395,13 @@ class BuiltinNavConfig:
     # Consecutive SetVelocity timeouts before aborting the goal.
     drive_timeout_streak: int = 20
     cost_scaling_factor: float = 4.0
+    # Extra planning clearance past inflation_radius (not drawn as soft inflation).
+    clearance_preference_m: float = 0.35
     xy_goal_tolerance: float = 0.25  # meters
     yaw_goal_tolerance: float = 0.35  # radians (~20 deg; mugger uses 0.6)
     # After XY is inside tolerance, accept the goal if final yaw still has not
     # settled (noisy heading / goal θ far from approach). 0 disables.
-    yaw_align_timeout_s: float = 6.0
+    yaw_align_timeout_s: float = 4.0
     # Final approach: cap linear speed within this distance of the goal.
     approach_dist_m: float = 0.35
     # Post-process global plans (shortcut + resample) before following.
@@ -352,17 +439,18 @@ class BuiltinNavConfig:
             return cls()
         return cls(
             planner=normalize_builtin_planner(d.get("planner", BUILTIN_PLANNER_LAZY_THETA)),
-            lookahead_m=float(d.get("lookahead_m", 0.6)),
-            min_lookahead_m=float(d.get("min_lookahead_m", 0.25)),
-            max_lookahead_m=float(d.get("max_lookahead_m", 0.7)),
+            lookahead_m=float(d.get("lookahead_m", 1.0)),
+            min_lookahead_m=float(d.get("min_lookahead_m", 0.7)),
+            max_lookahead_m=float(d.get("max_lookahead_m", 1.4)),
             replan_period_s=float(d.get("replan_period_s", 1.0)),
             timeout_s=float(d.get("timeout_s", 300.0)),
             drive_timeout_s=float(d.get("drive_timeout_s", 5.0)),
             drive_timeout_streak=int(d.get("drive_timeout_streak", 20)),
             cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),
+            clearance_preference_m=float(d.get("clearance_preference_m", 0.35)),
             xy_goal_tolerance=float(d.get("xy_goal_tolerance", 0.25)),
             yaw_goal_tolerance=float(d.get("yaw_goal_tolerance", 0.35)),
-            yaw_align_timeout_s=float(d.get("yaw_align_timeout_s", 6.0)),
+            yaw_align_timeout_s=float(d.get("yaw_align_timeout_s", 4.0)),
             approach_dist_m=float(d.get("approach_dist_m", 0.35)),
             smooth_path=bool(d.get("smooth_path", True)),
             smooth_sample_spacing_m=float(d.get("smooth_sample_spacing_m", 0.10)),
@@ -674,6 +762,14 @@ class SlamConfig:
     periodic_relocalize_recovery_min_score: float = 0.45
     periodic_relocalize_min_shift_m: float = 0.2
     periodic_relocalize_min_shift_deg: float = 10.0
+    # Large automatic pose jumps (periodic relocalize, mapping revisit, seed /
+    # startup localize) must agree across N matches before apply. Manual
+    # ``relocalize`` and ``apply: true`` bypass this gate.
+    localize_jump_confirm_count: int = 2
+    localize_jump_agree_m: float = 0.4
+    localize_jump_agree_deg: float = 15.0
+    localize_jump_large_m: float = 0.75
+    localize_jump_large_deg: float = 25.0
     # When Nav2 reports this many recoveries on the active goal, skip the cheap
     # local match and run full-map global_localize immediately.
     periodic_relocalize_nav_recoveries_threshold: int = 2
@@ -687,12 +783,25 @@ class SlamConfig:
             "auto_full_map_fallback": True,
         }
     )
+    # Builtin simulation: raycast floorplan + in-process SimSensors (see ``sim``).
+    sim: SimConfig = field(default_factory=SimConfig)
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "SlamConfig":
+        sim = SimConfig.from_dict(d.get("sim", {}) or {})
         lidars_raw = d.get("lidars") or ([d["lidar"]] if d.get("lidar") else [])
         if not lidars_raw:
-            raise ValueError("at least one lidar is required ('lidars' or 'lidar')")
+            if sim.enabled:
+                # Placeholder lidar config for scan_bins/range; not a Viam Camera dep.
+                lidars_raw = [
+                    {
+                        "name": "sim-lidar",
+                        "min_range": sim.range_min,
+                        "max_range": sim.range_max,
+                    }
+                ]
+            else:
+                raise ValueError("at least one lidar is required ('lidars' or 'lidar')")
         lidars = [LidarConfig.from_dict(x) for x in lidars_raw]
         slam_lidars = [lidar for lidar in lidars if not lidar.obstacles_only]
         if not slam_lidars:
@@ -711,6 +820,11 @@ class SlamConfig:
                 f"slam_backend must be one of {sorted(SLAM_BACKENDS)}, "
                 f"got {slam_backend!r}"
             )
+        if sim.enabled and slam_backend != SLAM_BACKEND_BUILTIN:
+            raise ValueError(
+                "sim.enabled requires slam_backend=builtin "
+                f"(got {slam_backend!r})"
+            )
         convention = d.get("base_velocity_convention", BASE_VELOCITY_VIAM)
         if convention not in BASE_VELOCITY_CONVENTIONS:
             raise ValueError(
@@ -719,6 +833,20 @@ class SlamConfig:
         # Normalize legacy ``mir`` to the canonical Y-forward name.
         if convention == BASE_VELOCITY_MIR:
             convention = BASE_VELOCITY_VIAM
+        # Prefer slam-level convention for the sim world when not overridden in sim{}.
+        if "base_velocity_convention" not in (d.get("sim") or {}):
+            sim = SimConfig(
+                enabled=sim.enabled,
+                world_name=sim.world_name,
+                map_path=sim.map_path,
+                seed_x=sim.seed_x,
+                seed_y=sim.seed_y,
+                seed_theta=sim.seed_theta,
+                scan_bins=sim.scan_bins,
+                range_min=sim.range_min,
+                range_max=sim.range_max,
+                base_velocity_convention=convention,
+            )
         frames_d = d.get("frames", {}) or {}
         # Point-cloud SLAM defaults follow mapping sensors only — an
         # obstacles_only depth cam must not flip Livox-style tuning on/off.
@@ -993,7 +1121,11 @@ class SlamConfig:
             base_velocity_convention=convention,
             slam_toolbox=SlamToolboxConfig.from_dict(stb_raw),
             slam_params=slam_params_raw,
-            global_localize_on_start=bool(d.get("global_localize_on_start", True)),
+            # Sim seeds SLAM pose from sim.seed_*; startup global_localize is
+            # optional and off by default (avoids fighting the ground-truth seed).
+            global_localize_on_start=bool(
+                d.get("global_localize_on_start", not sim.enabled)
+            ),
             global_localize_on_start_delay_s=float(
                 d.get("global_localize_on_start_delay_s", 4.0)
             ),
@@ -1074,6 +1206,11 @@ class SlamConfig:
             periodic_relocalize_min_shift_deg=float(
                 d.get("periodic_relocalize_min_shift_deg", 10.0)
             ),
+            localize_jump_confirm_count=int(d.get("localize_jump_confirm_count", 2)),
+            localize_jump_agree_m=float(d.get("localize_jump_agree_m", 0.4)),
+            localize_jump_agree_deg=float(d.get("localize_jump_agree_deg", 15.0)),
+            localize_jump_large_m=float(d.get("localize_jump_large_m", 0.75)),
+            localize_jump_large_deg=float(d.get("localize_jump_large_deg", 25.0)),
             periodic_relocalize_nav_recoveries_threshold=int(
                 d.get("periodic_relocalize_nav_recoveries_threshold", 2)
             ),
@@ -1098,15 +1235,23 @@ class SlamConfig:
                 "search_radius_m": 3.0,
                 "auto_full_map_fallback": True,
             },
+            sim=sim,
         )
 
     def required_dependencies(self) -> List[str]:
+        if self.sim.enabled:
+            # Lidars / movement sensors are in-process SimSensors; only Base
+            # (typically viam-labs:nav-stack:sim-base) is a Viam dependency.
+            return [self.base]
         deps = [self.base, *[lidar.name for lidar in self.lidars]]
         if self.movement_sensor:
             deps.append(self.movement_sensor)
         if self.heading_sensor:
             deps.append(self.heading_sensor)
         return deps
+
+    def uses_sim(self) -> bool:
+        return bool(self.sim.enabled)
 
     def slam_lidars(self) -> List[LidarConfig]:
         """Lidars used for SLAM matching/mapping (excludes ``obstacles_only``)."""

@@ -20,7 +20,9 @@ class WorldIO(Protocol):
     def get_pose(self) -> Optional[conv.Pose2D]:
         ...
 
-    def get_scan(self, max_age_s: float = 2.0) -> Optional[conv.LaserScan2D]:
+    def get_scan(
+        self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True
+    ) -> Optional[conv.LaserScan2D]:
         ...
 
     def set_velocity(self, vx: float, vy: float, vtheta: float) -> None:
@@ -44,4 +46,8 @@ class WorldIO(Protocol):
 
     def set_viz_local_costmap(self, costmap: dict) -> None:
         """Optional rolling local costmap for operator UIs; default no-op."""
+        return None
+
+    def get_localization_hold(self) -> Optional[dict]:
+        """If non-None, nav must stop (large pose jump awaiting confirm)."""
         return None

@@ -221,3 +221,6 @@ __marimo__/
 
 module.tar.gz
 scripts/watch_describe_motion.py
+# Local sim bring-up artifacts
+sample_configs/.local_sim.generated.json
+.local/

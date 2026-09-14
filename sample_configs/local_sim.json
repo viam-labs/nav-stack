@@ -1,0 +1,73 @@
+{
+  "_comment": "Local builtin-sim machine config. Prefer scripts/run_local_sim.sh which rewrites executable_path + maps_dir to absolute paths and starts viam-server.",
+  "network": {
+    "bind_address": ":8081"
+  },
+  "modules": [
+    {
+      "type": "local",
+      "name": "nav-stack-local",
+      "executable_path": "./run.sh"
+    }
+  ],
+  "components": [
+    {
+      "name": "sim-base",
+      "api": "rdk:component:base",
+      "model": "viam-labs:nav-stack:sim-base",
+      "attributes": {
+        "world_name": "default",
+        "seed_x": 1.0,
+        "seed_y": 1.5,
+        "seed_theta": 0.0,
+        "scan_bins": 360,
+        "base_velocity_convention": "viam"
+      }
+    },
+    {
+      "name": "nav-view",
+      "api": "rdk:component:camera",
+      "model": "viam-labs:nav-stack:nav-camera",
+      "attributes": {
+        "navigation": "nav"
+      }
+    }
+  ],
+  "services": [
+    {
+      "name": "slam",
+      "api": "rdk:service:slam",
+      "model": "viam-labs:nav-stack:slam",
+      "attributes": {
+        "base": "sim-base",
+        "slam_backend": "builtin",
+        "mode": "mapping",
+        "maps_dir": "./.local/sim-maps",
+        "active_map": "sim-lab",
+        "base_velocity_convention": "viam",
+        "sim": {
+          "enabled": true,
+          "world_name": "default",
+          "seed_x": 1.0,
+          "seed_y": 1.5,
+          "seed_theta": 0.0
+        }
+      }
+    },
+    {
+      "name": "nav",
+      "api": "rdk:service:motion",
+      "model": "viam-labs:nav-stack:navigation",
+      "attributes": {
+        "slam_service": "slam",
+        "base": "sim-base",
+        "nav_backend": "builtin",
+        "kinematics": "differential",
+        "robot_radius": 0.22,
+        "max_vel_x": 0.4,
+        "max_vel_theta": 1.0,
+        "inflation_radius": 0.35
+      }
+    }
+  ]
+}

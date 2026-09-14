@@ -14,7 +14,7 @@ from ..nav.simple_motion import (
     rear_clearance_m,
 )
 from ..ros import conversions as conv
-from .controller import FollowerConfig, compute_path_command
+from .controller import FollowerConfig, compute_path_command, update_speed_estimate
 from .local_costmap import (
     LocalCostmap,
     LocalCostmapConfig,
@@ -44,11 +44,12 @@ class NavSupervisor:
         inflation_radius_m: float = 0.25,
         robot_radius_m: float = 0.22,
         cost_scaling_factor: float = 4.0,
+        clearance_preference_m: float = 0.35,
         algorithm: str = "lazy_theta_star",
         replan_period_s: float = 1.0,
-        lookahead_m: float = 0.6,
-        min_lookahead_m: float = 0.25,
-        max_lookahead_m: float = 0.7,
+        lookahead_m: float = 0.8,
+        min_lookahead_m: float = 0.6,
+        max_lookahead_m: float = 1.2,
         approach_dist_m: float = 0.35,
         xy_tolerance_m: float = 0.25,
         yaw_tolerance_rad: float = 0.35,
@@ -84,12 +85,13 @@ class NavSupervisor:
         replan_local_blocked_time_s: float = 0.3,
         replan_local_min_period_s: float = 0.5,
         drive_timeout_streak: int = 20,
-        yaw_align_timeout_s: float = 6.0,
+        yaw_align_timeout_s: float = 4.0,
     ):
         self._world = world
         self._inflation = inflation_radius_m
         self._robot_radius = robot_radius_m
         self._cost_scaling = cost_scaling_factor
+        self._clearance_preference_m = max(0.0, float(clearance_preference_m))
         self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
         self._algorithm = algorithm
         self._replan_period = replan_period_s
@@ -150,6 +152,9 @@ class NavSupervisor:
             max_lookahead_m=max_lookahead_m,
             approach_dist_m=approach_dist_m,
             waypoint_tolerance_m=max(0.1, xy_tolerance_m),
+            # Skid-steer track ≈ 1.2·robot_radius; keeps translating arcs
+            # above the base's inner-wheel "nearly 0 RPM" rejection.
+            wheel_half_track_m=max(0.08, 0.6 * float(robot_radius_m)),
             motion=SimpleMotionConfig(
                 poll_interval_s=poll_interval_s,
                 xy_tolerance_m=xy_tolerance_m,
@@ -163,8 +168,13 @@ class NavSupervisor:
             ),
             obstacle=ObstacleConfig(
                 enabled=avoid_obstacles,
-                stop_distance_m=stop_distance_m,
-                slow_distance_m=slow_distance_m,
+                # Lidar stop must respect the footprint; default 0.4 < a 0.45 m
+                # robot_radius lets execution crawl closer than the costmap shows.
+                stop_distance_m=max(float(stop_distance_m), float(robot_radius_m) + 0.05),
+                slow_distance_m=max(
+                    float(slow_distance_m),
+                    max(float(stop_distance_m), float(robot_radius_m) + 0.05) + 0.35,
+                ),
                 max_age_s=scan_max_age_s,
             )
             if avoid_obstacles
@@ -224,12 +234,13 @@ class NavSupervisor:
             inflation_radius_m=self._inflation,
             robot_radius_m=self._robot_radius,
             cost_scaling_factor=self._cost_scaling,
+            clearance_preference_m=self._clearance_preference_m,
             algorithm=self._algorithm,
             scan=scan,
             scan_pose=pose if scan is not None else None,
             blocked_path=blocked_path,
             blocked_path_pose=blocked_path_pose,
-            dynamic_obstacle_radius_m=max(self._inflation + 0.1, 0.35),
+            dynamic_obstacle_radius_m=max(0.05, min(self._robot_radius, 0.12)),
         )
         if result.feasible:
             result = connect_plan_start(
@@ -239,6 +250,7 @@ class NavSupervisor:
                 inflation_radius_m=self._inflation,
                 robot_radius_m=self._robot_radius,
                 cost_scaling_factor=self._cost_scaling,
+                clearance_preference_m=self._clearance_preference_m,
                 algorithm=self._algorithm,
                 xy_tolerance_m=self._follower.motion.xy_tolerance_m,
                 scan=scan,
@@ -250,6 +262,7 @@ class NavSupervisor:
                 inflation_radius_m=self._inflation,
                 robot_radius_m=self._robot_radius,
                 cost_scaling_factor=self._cost_scaling,
+                clearance_preference_m=self._clearance_preference_m,
                 enabled=True,
                 sample_spacing_m=self._smooth_spacing,
             )
@@ -330,6 +343,7 @@ class NavSupervisor:
             last_progress_pose: Optional[Pose2D] = None
             last_progress_at = time.monotonic()
             last_progress_dist = float("inf")
+            last_progress_bearing = float("inf")
             spin_stuck_since: Optional[float] = None
             backup_active = False
             backup_start: Optional[Pose2D] = None
@@ -341,6 +355,9 @@ class NavSupervisor:
             failed_replan_while_blocked = 0
             failed_static_replan = 0
             local_planner_active = False
+            prev_local_cmd: Optional[DriveCommand] = None
+            prev_cmd: Optional[DriveCommand] = None
+            rotate_active = False
             vx_sign_history: list[tuple[float, int]] = []
             xy_ok_since: Optional[float] = None
             last_tick_pose: Optional[Pose2D] = None
@@ -352,6 +369,8 @@ class NavSupervisor:
             # Clearance + stall/timeout still end hopeless runs.
             static_replan_fail_limit = 5
             pose_jump_replan_m = 1.5
+            was_loc_holding = False
+            pending_loc_replan = False
 
             while time.monotonic() < deadline:
                 if self._cancel.is_set():
@@ -373,11 +392,25 @@ class NavSupervisor:
                     pose={"x": pose.x, "y": pose.y, "theta": pose.theta}
                 )
 
+                # Large pose-jump awaiting confirm: stop until SLAM applies or
+                # rejects. Driving on the old pose while turning is how we plow.
+                loc_hold = None
+                hold_fn = getattr(self._world, "get_localization_hold", None)
+                if callable(hold_fn):
+                    try:
+                        loc_hold = hold_fn()
+                    except Exception:  # noqa: BLE001
+                        loc_hold = None
+                holding_for_localize = isinstance(loc_hold, dict)
+                if was_loc_holding and not holding_for_localize:
+                    pending_loc_replan = True
+                was_loc_holding = holding_for_localize
+
                 # Goal reached?
                 goal_pose = Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta)
-                xy_ok = (
-                    distance_m(pose, goal_pose) <= self._follower.motion.xy_tolerance_m
-                )
+                dist_goal_chk = distance_m(pose, goal_pose)
+                xy_tol = self._follower.motion.xy_tolerance_m
+                xy_ok = dist_goal_chk <= xy_tol
                 yaw_ok = (
                     abs(conv.normalize_angle(pose.theta - goal_pose.theta))
                     <= self._follower.motion.yaw_tolerance_rad
@@ -387,6 +420,9 @@ class NavSupervisor:
                     self._world.stop()
                     self._set_status(state="succeeded", active=False, error_msg="")
                     return
+                # Start the yaw give-up clock once inside XY acceptance — not only
+                # after the ~3 cm settle — so end-wiggle cannot run forever while
+                # oscillating just outside settle.
                 if xy_ok:
                     if xy_ok_since is None:
                         xy_ok_since = now
@@ -394,8 +430,7 @@ class NavSupervisor:
                         self._yaw_align_timeout_s > 0.0
                         and now - xy_ok_since >= self._yaw_align_timeout_s
                     ):
-                        # On the spot but final yaw won't settle (noisy heading
-                        # prior, or goal θ far from approach). Accept XY.
+                        # Close enough in XY; final yaw will not lock cleanly.
                         self._world.stop()
                         self._set_status(
                             state="succeeded",
@@ -405,6 +440,39 @@ class NavSupervisor:
                         return
                 else:
                     xy_ok_since = None
+
+                if holding_for_localize:
+                    # Freeze progress clocks; do not crawl/turn on a disputed pose.
+                    self._world.stop()
+                    last_progress_at = now
+                    last_progress_pose = pose
+                    last_progress_dist = dist_goal_chk
+                    last_progress_bearing = float("inf")
+                    spin_stuck_since = None
+                    self._set_status(
+                        pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
+                        progress={
+                            "obstacle": "loc_hold",
+                            "local_planner": False,
+                            "forward_clearance_m": None,
+                            "cmd_vx_mps": 0.0,
+                            "cmd_vtheta_rad_s": 0.0,
+                            "bearing_error_rad": 0.0,
+                            "distance_remaining_m": dist_goal_chk,
+                            "waypoint_index": 0,
+                            "localization_hold": {
+                                "status": loc_hold.get("status"),
+                                "confirm_count": loc_hold.get("confirm_count"),
+                                "confirm_needed": loc_hold.get("confirm_needed"),
+                                "shift_m": loc_hold.get("shift_m")
+                                or loc_hold.get("jump_shift_m"),
+                                "shift_deg": loc_hold.get("shift_deg")
+                                or loc_hold.get("jump_shift_deg"),
+                            },
+                        },
+                    )
+                    time.sleep(poll)
+                    continue
 
                 now = time.monotonic()
 
@@ -417,6 +485,7 @@ class NavSupervisor:
                     or self._local_costmap is not None
                 ):
                     try:
+                        # Full merge (incl. depth) for reactive cone slowing.
                         scan = self._world.get_scan(self._scan_max_age)
                     except TimeoutError:
                         scan = None
@@ -426,14 +495,28 @@ class NavSupervisor:
                     now - self._local_view_at >= self._local_update_period_s
                     or local_view is None
                 ):
-                    costmap_scan = scan
-                    if costmap_scan is None and self._local_scan_max_age_s > 0:
+                    # Lidar-only for the rolling local costmap / DWA. Depth is
+                    # noisy+laggy and was flipping left/right detours every tick.
+                    costmap_scan = None
+                    try:
+                        costmap_scan = self._world.get_scan(
+                            self._local_scan_max_age_s
+                            if self._local_scan_max_age_s > 0
+                            else self._scan_max_age,
+                            include_obstacles_only=False,
+                        )
+                    except TypeError:
+                        # Older WorldIO stubs without the kwarg.
                         try:
                             costmap_scan = self._world.get_scan(
                                 self._local_scan_max_age_s
+                                if self._local_scan_max_age_s > 0
+                                else self._scan_max_age
                             )
                         except TimeoutError:
                             costmap_scan = None
+                    except TimeoutError:
+                        costmap_scan = None
                     if (
                         costmap_scan is not None
                         and costmap_scan.capture_pose is None
@@ -463,6 +546,7 @@ class NavSupervisor:
                                 inflation_radius_m=self._inflation,
                                 robot_radius_m=self._robot_radius,
                                 cost_scaling_factor=self._cost_scaling,
+                                clearance_preference_m=self._clearance_preference_m,
                             )
                             self._global_cache_at = now
                     local_view = self._local_costmap.update(
@@ -547,8 +631,16 @@ class NavSupervisor:
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
                     min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
                     local_planner_active=local_planner_active,
+                    prev_local_cmd=prev_local_cmd,
+                    rotate_active=rotate_active,
+                    prev_cmd=prev_cmd,
                 )
+                rotate_active = bool(progress.get("rotate_to_heading"))
                 local_planner_active = bool(progress.get("local_planner"))
+                if local_planner_active:
+                    prev_local_cmd = cmd
+                else:
+                    prev_local_cmd = None
 
                 if waiting_for_clear:
                     # Stop and let the blocker move; don't trip stall timeout.
@@ -566,6 +658,7 @@ class NavSupervisor:
                         pose,
                         Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta),
                     ) if path.points else last_progress_dist
+                    last_progress_bearing = float("inf")
 
                 allow_backup = (
                     self._backup_enabled
@@ -697,9 +790,9 @@ class NavSupervisor:
                 replan_due = now - last_replan >= self._replan_period
                 map_data = None
                 static_blocked = False
-                pose_jumped = False
+                pose_jumped = pending_loc_replan
                 if last_tick_pose is not None:
-                    pose_jumped = (
+                    pose_jumped = pose_jumped or (
                         distance_m(pose, last_tick_pose) >= pose_jump_replan_m
                     )
                 last_tick_pose = pose
@@ -748,18 +841,22 @@ class NavSupervisor:
                         backup_attempts = 0
                         vx_sign_history.clear()
                         spin_stuck_since = None
+                        pending_loc_replan = False
                     elif static_blocked:
                         failed_static_replan += 1
                         last_replan = now
-                        lidar_clear = progress.get("obstacle") == "clear"
                         clearance = progress.get("forward_clearance_m")
                         has_room = clearance is None or float(clearance) >= 0.35
+                        obstacle = str(progress.get("obstacle") or "")
+                        # "wait"/"slow" still mean lidar sees space; only hard
+                        # stop / missing scan should force the fail.
+                        lidar_open = obstacle not in ("stop", "no_scan") and has_room
                         # Keep following while the robot can still see open space;
                         # a mid-route localization jump often fails a few replans
                         # before the map/pose settle.
                         if (
                             failed_static_replan >= static_replan_fail_limit
-                            and not (lidar_clear and has_room)
+                            and not lidar_open
                         ):
                             self._world.stop()
                             self._set_status(
@@ -810,8 +907,9 @@ class NavSupervisor:
                         return
 
                 # Stall detection.
-                # Pure spin (vx≈0) must not reset the stall timer — otherwise a
-                # stuck local-planner / rotate-in-place loop never replans.
+                # Pure spin with no bearing improvement must not reset the timer
+                # forever (stuck local-planner / RIP loops need to replan). But
+                # intentional align spins that shrink |bearing| are real progress.
                 goal_pose_stall = Pose2D(
                     path.points[-1][0], path.points[-1][1], path.goal_theta
                 )
@@ -824,14 +922,32 @@ class NavSupervisor:
                 stall_limit_s = self._follower.motion.stall_timeout_s * (
                     2.0 if near_goal_stall else 1.0
                 )
-                if last_progress_pose is None:
+                bearing_err = abs(float(progress.get("bearing_error_rad", 0.0)))
+                spinning = (
+                    abs(float(cmd.vtheta)) >= 0.08
+                    and abs(float(cmd.vx)) < translating_floor
+                )
+
+                def _mark_progress() -> None:
+                    nonlocal last_progress_pose, last_progress_at
+                    nonlocal last_progress_dist, last_progress_bearing
                     last_progress_pose = pose
                     last_progress_at = now
                     last_progress_dist = dist_goal
+                    last_progress_bearing = bearing_err
+
+                if last_progress_pose is None:
+                    _mark_progress()
                 else:
                     moved = distance_m(pose, last_progress_pose)
                     closing = dist_goal < last_progress_dist - 0.01
                     translating = abs(float(cmd.vx)) >= translating_floor
+                    bearing_improved = bearing_err < last_progress_bearing - math.radians(
+                        3.0
+                    )
+                    turned = abs(
+                        conv.normalize_angle(pose.theta - last_progress_pose.theta)
+                    )
                     if closing or (
                         moved >= self._follower.motion.stall_progress_m
                         and (
@@ -839,17 +955,10 @@ class NavSupervisor:
                             or moved >= self._follower.motion.stall_progress_m * 2
                         )
                     ):
-                        last_progress_pose = pose
-                        last_progress_at = now
-                        last_progress_dist = dist_goal
+                        _mark_progress()
                     elif translating:
-                        turned = abs(
-                            conv.normalize_angle(pose.theta - last_progress_pose.theta)
-                        )
                         if turned >= self._follower.motion.stall_progress_rad:
-                            last_progress_pose = pose
-                            last_progress_at = now
-                            last_progress_dist = dist_goal
+                            _mark_progress()
                         elif now - last_progress_at >= stall_limit_s:
                             new_path = self._try_replan(
                                 goal,
@@ -862,6 +971,7 @@ class NavSupervisor:
                                 path = new_path
                                 last_progress_at = now
                                 last_progress_dist = dist_goal
+                                last_progress_bearing = bearing_err
                                 last_replan = now
                                 local_blocked_since = None
                                 backup_attempts = 0
@@ -873,6 +983,11 @@ class NavSupervisor:
                                     error_msg="navigation stalled",
                                 )
                                 return
+                    elif spinning and (
+                        turned >= self._follower.motion.stall_progress_rad
+                        or bearing_improved
+                    ):
+                        _mark_progress()
                     elif now - last_progress_at >= stall_limit_s:
                         new_path = self._try_replan(
                             goal,
@@ -885,6 +1000,7 @@ class NavSupervisor:
                             path = new_path
                             last_progress_at = now
                             last_progress_dist = dist_goal
+                            last_progress_bearing = bearing_err
                             last_replan = now
                             local_blocked_since = None
                             backup_attempts = 0
@@ -934,7 +1050,10 @@ class NavSupervisor:
                         time.sleep(poll)
                         continue
                     raise
-                self._last_cmd_vx = cmd.vx
+                # Smoothed speed for the velocity-scaled lookahead (see
+                # ``update_speed_estimate``): raw cmd feedback limit-cycles.
+                self._last_cmd_vx = update_speed_estimate(self._last_cmd_vx, cmd.vx)
+                prev_cmd = cmd
                 time.sleep(poll)
 
             self._world.stop()

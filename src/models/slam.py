@@ -43,6 +43,7 @@ from ..nav.global_localize import (
 )
 from ..nav import pause_keyframes, slice_match
 from ..nav.maps import MapStore, validate_map_name
+from ..nav.pose_jump_gate import JumpDecision, PoseJumpGate
 from ..ros import conversions as conv
 from ..ros.shm_lidar import ShmPointCloudClient
 from ..runtime import (
@@ -91,6 +92,7 @@ class RosSlam(SLAM):
         # Lidars that don't implement get_laser_scan (auto mode); skip re-probing.
         self._skip_get_laser_scan: set[str] = set()
         self._shm_lidar = ShmPointCloudClient(logger=LOGGER)
+        self._pose_jump_gate = PoseJumpGate()
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -119,30 +121,46 @@ class RosSlam(SLAM):
         attrs = struct_to_dict(config.attributes)
         cfg = SlamConfig.from_dict(attrs)
         self._cfg = cfg
+        self._pose_jump_gate = PoseJumpGate(
+            confirm_count=cfg.localize_jump_confirm_count,
+            agree_m=cfg.localize_jump_agree_m,
+            agree_deg=cfg.localize_jump_agree_deg,
+            large_m=cfg.localize_jump_large_m,
+            large_deg=cfg.localize_jump_large_deg,
+        )
 
         self._base = cast(Base, dependencies[Base.get_resource_name(cfg.base)])
-        self._cameras = {
-            lidar.name: cast(
-                Camera, dependencies[Camera.get_resource_name(lidar.name)]
+        if cfg.uses_sim():
+            self._cameras = {}
+            self._movement_sensor = None
+            self._heading_sensor = None
+        else:
+            self._cameras = {
+                lidar.name: cast(
+                    Camera, dependencies[Camera.get_resource_name(lidar.name)]
+                )
+                for lidar in cfg.lidars
+            }
+            self._movement_sensor = (
+                cast(
+                    MovementSensor,
+                    dependencies[
+                        MovementSensor.get_resource_name(cfg.movement_sensor)
+                    ],
+                )
+                if cfg.movement_sensor
+                else None
             )
-            for lidar in cfg.lidars
-        }
-        self._movement_sensor = (
-            cast(
-                MovementSensor,
-                dependencies[MovementSensor.get_resource_name(cfg.movement_sensor)],
+            self._heading_sensor = (
+                cast(
+                    MovementSensor,
+                    dependencies[
+                        MovementSensor.get_resource_name(cfg.heading_sensor)
+                    ],
+                )
+                if cfg.heading_sensor
+                else None
             )
-            if cfg.movement_sensor
-            else None
-        )
-        self._heading_sensor = (
-            cast(
-                MovementSensor,
-                dependencies[MovementSensor.get_resource_name(cfg.heading_sensor)],
-            )
-            if cfg.heading_sensor
-            else None
-        )
 
         self._map_store = MapStore(cfg.maps_dir)
         active = cfg.active_map or self._map_store.get_active_map_name() or "default"
@@ -155,28 +173,44 @@ class RosSlam(SLAM):
         self._engine = None
 
         loop = asyncio.get_event_loop()
+        sim_sensors = None
         if cfg.uses_builtin_slam():
-            odom_reader = self._make_typed_odom_reader()
-            sensors = BuiltinSensors(
-                cfg=cfg,
-                cameras=self._cameras,
-                movement_sensor=self._movement_sensor,
-                heading_sensor=self._heading_sensor,
-                shm_lidar=self._shm_lidar,
-                loop=loop,
-                logger=LOGGER.info,
-                skip_get_laser_scan=self._skip_get_laser_scan,
-                scan_max_age_s=float(cfg.scan_max_age_s or 2.0),
-                odom_reader=odom_reader,
-            )
+            if cfg.uses_sim():
+                from ..sim import SimSensors, ensure_sim_world_from_slam_cfg
+
+                world = ensure_sim_world_from_slam_cfg(cfg)
+                sensors = SimSensors(world)
+                sim_sensors = sensors
+            else:
+                odom_reader = self._make_typed_odom_reader()
+                sensors = BuiltinSensors(
+                    cfg=cfg,
+                    cameras=self._cameras,
+                    movement_sensor=self._movement_sensor,
+                    heading_sensor=self._heading_sensor,
+                    shm_lidar=self._shm_lidar,
+                    loop=loop,
+                    logger=LOGGER.info,
+                    skip_get_laser_scan=self._skip_get_laser_scan,
+                    scan_max_age_s=float(cfg.scan_max_age_s or 2.0),
+                    odom_reader=odom_reader,
+                )
             self._engine = BuiltinSlamEngine(
                 cfg, sensors, self._map_store, logger=LOGGER.info
             )
+            if cfg.uses_sim():
+                # SimWorld is ground truth: SLAM pose tracks the body each tick.
+                # Do not teleport the body when localize jumps the estimate —
+                # that caused OOB freezes and big visible jumps.
+                seed = conv.Pose2D(
+                    cfg.sim.seed_x, cfg.sim.seed_y, cfg.sim.seed_theta
+                )
+                self._engine.set_pose(seed)
             self._manager = BuiltinSlamHost(self._engine)
             self._manager.start()
             self._start_mode(cfg.mode)
             self._wire_still_keyframe_hook()
-            backend = "builtin"
+            backend = "builtin+sim" if cfg.uses_sim() else "builtin"
         else:
             from ..ros.availability import require_rclpy
             from ..ros.manager import RosManager
@@ -205,6 +239,7 @@ class RosSlam(SLAM):
                 self._last_relocalize_check,
                 cameras=self._cameras,
                 shm_lidar=self._shm_lidar,
+                sim_sensors=sim_sensors,
             ),
         )
         register_slam_service(self.name, self)
@@ -746,6 +781,23 @@ class RosSlam(SLAM):
                 return self._publish_revisit_check(out)
 
         if should_apply:
+            decision = self._confirm_pose_jump(
+                current, result.pose, force=apply_override is True
+            )
+            out.update(self._jump_decision_dict(decision))
+            if not decision.should_apply:
+                out["status"] = "awaiting_confirm"
+                out["corrected"] = False
+                LOGGER.info(
+                    "mapping revisit: large jump %.2f m / %.1f deg awaiting "
+                    "confirm %d/%d (score=%.2f)",
+                    decision.shift_m,
+                    decision.shift_deg,
+                    decision.confirm_count,
+                    decision.confirm_needed,
+                    score,
+                )
+                return self._publish_revisit_check(out)
             applied = await asyncio.to_thread(
                 mgr.apply_map_pose_correction, result.pose
             )
@@ -755,15 +807,18 @@ class RosSlam(SLAM):
                 out["corrected"] = True
                 LOGGER.info(
                     "mapping revisit: odom shifted to rejoin map via %s "
-                    "(shift=%.2f m, %.1f deg, score=%.2f, ray_mae=%s)",
+                    "(shift=%.2f m, %.1f deg, score=%.2f, ray_mae=%s, jump=%s)",
                     match_mode,
                     shift_m,
                     shift_deg,
                     score,
                     ray_mae,
+                    decision.status,
                 )
             else:
                 out["status"] = "correction_failed"
+        else:
+            self._pose_jump_gate.clear()
 
         # Grow the slice library from confirmed in-place / corrected poses as a
         # backup to the still-publish keyframe path (no-ops when already dense).
@@ -816,6 +871,36 @@ class RosSlam(SLAM):
             except Exception as exc:  # noqa: BLE001 - watchdog must survive hiccups
                 LOGGER.warning("periodic relocalize cycle failed: %s", exc)
                 self._publish_relocalize_check({"status": "error", "error": str(exc)})
+
+    def _pose_from_mapping(self, pose: Mapping) -> conv.Pose2D:
+        return conv.Pose2D(
+            float(pose.get("x", 0.0)),
+            float(pose.get("y", 0.0)),
+            float(pose.get("theta", 0.0)),
+        )
+
+    def _confirm_pose_jump(
+        self,
+        current: Optional[conv.Pose2D],
+        candidate: conv.Pose2D,
+        *,
+        force: bool = False,
+    ) -> JumpDecision:
+        """Shared gate for automatic large map jumps (manual / force bypasses)."""
+        if current is None:
+            current = conv.Pose2D(0.0, 0.0, 0.0)
+        return self._pose_jump_gate.evaluate(current, candidate, force=force)
+
+    def _jump_decision_dict(self, decision: JumpDecision) -> dict:
+        return {
+            "jump_status": decision.status,
+            "large_jump": decision.large_jump,
+            "confirm_count": decision.confirm_count,
+            "confirm_needed": decision.confirm_needed,
+            "jump_shift_m": round(decision.shift_m, 3),
+            "jump_shift_deg": round(decision.shift_deg, 2),
+            **self._pose_jump_gate.snapshot(),
+        }
 
     def _publish_relocalize_check(self, result: Mapping[str, ValueTypes]) -> dict:
         self._last_relocalize_check.clear()
@@ -984,6 +1069,24 @@ class RosSlam(SLAM):
             return self._publish_relocalize_check(result)
 
         if should_apply and isinstance(matched_pose, Mapping):
+            candidate = self._pose_from_mapping(matched_pose)
+            decision = self._confirm_pose_jump(
+                current, candidate, force=apply_override is True
+            )
+            result.update(self._jump_decision_dict(decision))
+            if not decision.should_apply:
+                result["status"] = "awaiting_confirm"
+                result["corrected"] = False
+                LOGGER.info(
+                    "periodic relocalize: large jump %.2f m / %.1f deg awaiting "
+                    "confirm %d/%d (score=%.2f)",
+                    decision.shift_m,
+                    decision.shift_deg,
+                    decision.confirm_count,
+                    decision.confirm_needed,
+                    score,
+                )
+                return self._publish_relocalize_check(result)
             await self.do_command(
                 {
                     "command": "relocalize",
@@ -1000,7 +1103,7 @@ class RosSlam(SLAM):
             result["corrected"] = True
             LOGGER.info(
                 "periodic relocalize: corrected via %s (shift=%.2f m, %.1f deg, "
-                "score=%.2f, ray_mae=%s, recovery=%s, nav_recoveries=%d)",
+                "score=%.2f, ray_mae=%s, recovery=%s, nav_recoveries=%d, jump=%s)",
                 match_mode,
                 0.0 if math.isinf(shift_m) else shift_m,
                 0.0 if math.isinf(shift_deg) else shift_deg,
@@ -1008,8 +1111,11 @@ class RosSlam(SLAM):
                 ray_mae,
                 recovery_apply and not good_match,
                 nav_recoveries,
+                decision.status,
             )
         else:
+            if not should_apply:
+                self._pose_jump_gate.clear()
             LOGGER.debug(
                 "periodic relocalize: pose ok (%s shift=%.2f m score=%.2f)",
                 match_mode,
@@ -1196,6 +1302,46 @@ class RosSlam(SLAM):
         command.update(dict(options))
         command["apply"] = False
         best_result: Optional[Mapping[str, ValueTypes]] = None
+        applied = False
+
+        async def _observe_startup_pose(pose_map: object) -> bool:
+            """Feed one match into the jump gate; apply when confirmed."""
+            if not isinstance(pose_map, Mapping):
+                return False
+            mgr = self._manager
+            current = mgr.get_pose_in_map() if mgr is not None else None
+            candidate = self._pose_from_mapping(pose_map)
+            decision = self._confirm_pose_jump(current, candidate, force=False)
+            if not decision.should_apply:
+                LOGGER.info(
+                    "startup global_localize: large jump %.2f m awaiting "
+                    "confirm %d/%d",
+                    decision.shift_m,
+                    decision.confirm_count,
+                    decision.confirm_needed,
+                )
+                return False
+            await self.do_command(
+                {
+                    "command": "relocalize",
+                    "pose": {
+                        "x": float(pose_map.get("x", 0.0)),
+                        "y": float(pose_map.get("y", 0.0)),
+                        "theta": float(pose_map.get("theta", 0.0)),
+                    },
+                    "position_variance_m2": 0.25,
+                    "yaw_variance_rad2": 0.06853891945200942,
+                }
+            )
+            LOGGER.info(
+                "startup global_localize applied (%.2f, %.2f, %.2f) jump=%s",
+                candidate.x,
+                candidate.y,
+                candidate.theta,
+                decision.status,
+            )
+            return True
+
         for attempt in range(1, max_attempts + 1):
             try:
                 result = await self.do_command(command)
@@ -1206,7 +1352,9 @@ class RosSlam(SLAM):
                     result.get("score"),
                     result.get("ray_mae_m"),
                 )
-                if run_refine_pass:
+                if await _observe_startup_pose(result.get("pose")):
+                    applied = True
+                if run_refine_pass and not applied:
                     passes = max(0, int(refine_max_passes))
                     for refine_pass in range(1, passes + 1):
                         if self._is_navigation_active():
@@ -1252,21 +1400,20 @@ class RosSlam(SLAM):
                             refine_result.get("score"),
                             refine_result.get("ray_mae_m"),
                         )
+                        if await _observe_startup_pose(best_result.get("pose")):
+                            applied = True
+                            break
 
-                best_pose = best_result.get("pose") if best_result is not None else None
-                if isinstance(best_pose, Mapping):
-                    await self.do_command(
-                        {
-                            "command": "relocalize",
-                            "pose": {
-                                "x": float(best_pose.get("x", 0.0)),
-                                "y": float(best_pose.get("y", 0.0)),
-                                "theta": float(best_pose.get("theta", 0.0)),
-                            },
-                            "position_variance_m2": 0.25,
-                            "yaw_variance_rad2": 0.06853891945200942,
-                        }
+                if not applied:
+                    if attempt < max_attempts:
+                        await asyncio.sleep(max(retry_delay_s, 0.0))
+                        continue
+                    LOGGER.warning(
+                        "startup global_localize: large jump never confirmed; "
+                        "not applying"
                     )
+                    return
+
                 if run_post_apply_refine and best_result is not None:
                     if post_apply_refine_delay_s > 0.0:
                         await asyncio.sleep(post_apply_refine_delay_s)
@@ -1454,9 +1601,14 @@ class RosSlam(SLAM):
                 "obstacles_only": bool(lidar.obstacles_only),
             }
             try:
-                scan = await asyncio.to_thread(
-                    sensors._read_lidar_scan_sync, lidar, max_age_s=2.0  # noqa: SLF001
-                )
+                # SimSensors has get_scan only (no Viam Camera / _read_lidar_scan_sync).
+                read_sync = getattr(sensors, "_read_lidar_scan_sync", None)
+                if read_sync is not None:
+                    scan = await asyncio.to_thread(
+                        read_sync, lidar, max_age_s=2.0
+                    )
+                else:
+                    scan = await asyncio.to_thread(sensors.get_scan, 2.0)
                 if scan is None:
                     entry["scan_valid_returns"] = 0
                 else:
@@ -1962,6 +2114,17 @@ class RosSlam(SLAM):
         base_link); pure 2D scans contribute to the merged scan but not bands.
         """
         assert self._cfg is not None
+        # Sim has no Viam lidar Camera; placeholder name ``sim-lidar`` is not in
+        # ``self._cameras``. Use in-process SimSensors raycast instead.
+        if self._cfg.uses_sim() and self._engine is not None:
+            sensors = self._engine._sensors  # noqa: SLF001
+            scan = await asyncio.to_thread(sensors.get_scan, 2.0)
+            if scan is None or not conv.scan_has_returns(scan):
+                raise RuntimeError("no lidar returns available for global_localize")
+            empty_bands: List[np.ndarray] = (
+                [np.empty((0, 2)) for _ in bands] if bands else []
+            )
+            return scan, empty_bands
         io = self._build_io()
         scans: List[conv.LaserScan2D] = []
         band_points: List[np.ndarray] = (

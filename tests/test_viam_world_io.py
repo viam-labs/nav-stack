@@ -337,6 +337,41 @@ async def test_viam_world_io_last_drive_issued_only_after_set_velocity():
     assert drive["viam_linear_y_mm_s"] == pytest.approx(300.0)
 
 
+@pytest.mark.asyncio
+async def test_near_zero_rpm_retry_widens_arc_instead_of_spinning():
+    """A translating arc the base rejects (inner wheel ~0) must be retried as a
+    wider arc, not converted to a pure spin — spins mid-path throw the heading."""
+    loop = asyncio.get_event_loop()
+    base = MagicMock()
+    base.name = "tracer"
+    rpm_err = Exception("Cannot move motor at an RPM that is nearly 0")
+    base.set_velocity = AsyncMock(side_effect=[rpm_err, None])
+    world = ViamWorldIO(
+        slam=MagicMock(spec=["get_position", "do_command"]),
+        base=base,
+        loop=loop,
+        cameras={},
+        lidars=[],
+        base_velocity_convention="viam",
+    )
+    await asyncio.to_thread(world.set_velocity, 0.15, 0.0, 0.6)
+    assert base.set_velocity.await_count == 2
+    retry = base.set_velocity.await_args_list[1].kwargs
+    # Still translating (viam convention: ROS vx → linear.y), faster than asked.
+    assert retry["linear"].y > 150.0
+    assert retry["angular"].z == pytest.approx(math.degrees(0.6))
+    drive = world.last_drive()
+    assert drive["issued"] is True
+    assert drive["retry"]["kind"] == "widen_arc"
+
+    # A rejected pure spin still retries as a spin.
+    base.set_velocity = AsyncMock(side_effect=[rpm_err, None])
+    await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.3)
+    retry = base.set_velocity.await_args_list[1].kwargs
+    assert retry["linear"].y == 0.0
+    assert world.last_drive()["retry"]["kind"] == "spin"
+
+
 def test_sync_slam_pose_provider_uses_registered_service(monkeypatch):
     from src.models import navigation as nav_mod
 
@@ -348,3 +383,194 @@ def test_sync_slam_pose_provider_uses_registered_service(monkeypatch):
     monkeypatch.setattr(nav_mod, "get_slam", lambda _n: None)
     provider = nav_mod._sync_slam_pose_provider("slam")
     assert provider() == conv.Pose2D(1.25, -0.5, 0.3)
+
+
+@pytest.mark.asyncio
+async def test_obstacles_only_scan_never_blocks_on_point_cloud():
+    """Hot-path get_scan must return cache without waiting on RealSense PCD."""
+    import time
+
+    from src.config import LidarConfig
+
+    loop = asyncio.get_running_loop()
+
+    async def _hang(*_a, **_k):
+        await asyncio.sleep(3600.0)
+
+    cam = MagicMock()
+    cam.get_point_cloud = AsyncMock(side_effect=_hang)
+    slam = MagicMock(spec=["get_position", "do_command"])
+    slam.get_position = AsyncMock(
+        return_value=SimpleNamespace(
+            x=0.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0
+        )
+    )
+    # Fresh enough that kick skips scheduling a refresh.
+    depth = LidarConfig(
+        name="camera",
+        scan_source="point_cloud",
+        obstacles_only=True,
+        cloud_frame="camera_optical",
+        shm_name=None,
+    )
+    world = ViamWorldIO(
+        slam=slam,
+        base=MagicMock(),
+        loop=loop,
+        cameras={"camera": cam},
+        lidars=[depth],
+    )
+    seeded = conv.points_to_scan(np.array([[1.0, 0.0]]), num_bins=360)
+    seeded = conv.LaserScan2D(
+        ranges=seeded.ranges,
+        angle_min=seeded.angle_min,
+        angle_increment=seeded.angle_increment,
+        range_min=seeded.range_min,
+        range_max=seeded.range_max,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+    world._per_lidar_scan["camera"] = (seeded, time.monotonic())  # noqa: SLF001
+
+    t0 = time.monotonic()
+    scan = await asyncio.to_thread(world.get_scan, 2.0)
+    assert time.monotonic() - t0 < 1.0
+    assert scan is not None
+    cam.get_point_cloud.assert_not_awaited()
+
+
+def test_align_obstacles_scan_drops_when_pose_moved_too_far():
+    """Stale depth after a large move must not paint phantom obstacles."""
+    from src.config import LidarConfig
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[
+            LidarConfig(name="camera", scan_source="point_cloud", obstacles_only=True)
+        ],
+    )
+    scan = conv.points_to_scan(np.array([[1.5, 0.0]]), num_bins=72)
+    scan = conv.LaserScan2D(
+        ranges=scan.ranges,
+        angle_min=scan.angle_min,
+        angle_increment=scan.angle_increment,
+        range_min=scan.range_min,
+        range_max=scan.range_max,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+    # Moved 0.5 m — beyond _obstacles_max_shift_m.
+    assert (
+        world._align_obstacles_scan_to_pose(scan, conv.Pose2D(0.5, 0.0, 0.0))  # noqa: SLF001
+        is None
+    )
+
+
+def test_align_obstacles_scan_motion_compensates_small_shift():
+    """Small pose change should warp depth hits into the live base_link."""
+    from src.config import LidarConfig
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[
+            LidarConfig(name="camera", scan_source="point_cloud", obstacles_only=True)
+        ],
+    )
+    # Hit 1 m ahead at capture pose.
+    scan = conv.points_to_scan(np.array([[1.0, 0.0]]), num_bins=72)
+    scan = conv.LaserScan2D(
+        ranges=scan.ranges,
+        angle_min=scan.angle_min,
+        angle_increment=scan.angle_increment,
+        range_min=scan.range_min,
+        range_max=scan.range_max,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+    # Robot moved +0.2 m in x; same hit is now 0.8 m ahead in body frame.
+    aligned = world._align_obstacles_scan_to_pose(  # noqa: SLF001
+        scan, conv.Pose2D(0.2, 0.0, 0.0)
+    )
+    assert aligned is not None
+    pts = aligned.to_points()
+    assert pts.shape[0] >= 1
+    assert abs(float(pts[0, 0]) - 0.8) < 0.08
+    assert abs(float(pts[0, 1])) < 0.08
+
+
+def test_align_obstacles_scan_small_shift_still_warps():
+    """Regression: sub-8 cm moves must warp, not restamp capture_pose only."""
+    from src.config import LidarConfig
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[
+            LidarConfig(name="camera", scan_source="point_cloud", obstacles_only=True)
+        ],
+    )
+    scan = conv.points_to_scan(np.array([[1.0, 0.0]]), num_bins=72)
+    scan = conv.LaserScan2D(
+        ranges=scan.ranges,
+        angle_min=scan.angle_min,
+        angle_increment=scan.angle_increment,
+        range_min=scan.range_min,
+        range_max=scan.range_max,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+    # 5 cm — previously took the broken early-exit that skipped the warp.
+    aligned = world._align_obstacles_scan_to_pose(  # noqa: SLF001
+        scan, conv.Pose2D(0.05, 0.0, 0.0)
+    )
+    assert aligned is not None
+    pts = aligned.to_points()
+    assert abs(float(pts[0, 0]) - 0.95) < 0.08
+
+
+def test_get_scan_can_exclude_obstacles_only_lidars():
+    """Local costmap path must not merge depth into the rolling window."""
+    from src.config import LidarConfig
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[
+            LidarConfig(name="lidar", scan_source="get_laser_scan"),
+            LidarConfig(
+                name="camera", scan_source="point_cloud", obstacles_only=True
+            ),
+        ],
+    )
+    lidar_scan = conv.LaserScan2D(
+        ranges=np.full(8, 2.0),
+        angle_min=-math.pi,
+        angle_increment=math.pi / 4,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    depth_scan = conv.LaserScan2D(
+        ranges=np.full(8, 0.4),
+        angle_min=-math.pi,
+        angle_increment=math.pi / 4,
+        range_min=0.05,
+        range_max=10.0,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+
+    def _read(lidar, max_age_s=2.0):
+        if lidar.name == "lidar":
+            return lidar_scan
+        return depth_scan
+
+    world.get_pose = MagicMock(return_value=conv.Pose2D(0.0, 0.0, 0.0))
+    world._read_lidar_scan_sync = MagicMock(side_effect=_read)  # noqa: SLF001
+
+    full = world.get_scan(2.0, include_obstacles_only=True)
+    lidar_only = world.get_scan(2.0, include_obstacles_only=False)
+    assert full is not None and lidar_only is not None
+    # Full merge sees the near depth hit; lidar-only keeps the far beam.
+    assert float(np.nanmin(full.ranges)) < 0.5
+    assert float(np.nanmin(lidar_only.ranges)) > 1.5

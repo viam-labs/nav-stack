@@ -6,8 +6,12 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 
-from .planner import line_of_sight
+from .planner import line_of_sight, world_segment_traversable
 from .types import OccupancyGrid, Path2D
+
+# Reject string-pull shortcuts through preference / soft inflation so the
+# smoothed path keeps the clear-space bias Lazy Theta* paid for.
+_SMOOTH_MAX_SOFT_COST = 30
 
 
 def _resample_polyline(
@@ -49,6 +53,7 @@ def _shortcut_smooth(
     out = [pts[0]]
     i = 0
     n = len(pts)
+    sample_step = max(0.05, float(occ.resolution) * 0.5)
     while i < n - 1:
         best_j = i + 1
         r0, c0 = occ.world_to_cell(pts[i][0], pts[i][1])
@@ -60,9 +65,22 @@ def _shortcut_smooth(
             r1, c1 = occ.world_to_cell(pts[j][0], pts[j][1])
             if not occ.in_bounds(r1, c1):
                 continue
-            if line_of_sight(costs, (r0, c0), (r1, c1)):
-                best_j = j
-                break
+            if not line_of_sight(costs, (r0, c0), (r1, c1)):
+                continue
+            # Cell LOS can still clip the inflation halo in world space.
+            if not world_segment_traversable(
+                costs,
+                occ,
+                pts[i][0],
+                pts[i][1],
+                pts[j][0],
+                pts[j][1],
+                sample_step_m=sample_step,
+                max_cost=_SMOOTH_MAX_SOFT_COST,
+            ):
+                continue
+            best_j = j
+            break
         out.append(pts[best_j])
         i = best_j
     return out
@@ -93,6 +111,7 @@ def smooth_plan_path(
     inflation_radius_m: float,
     robot_radius_m: float,
     cost_scaling_factor: float,
+    clearance_preference_m: float = 0.35,
     enabled: bool = True,
     sample_spacing_m: float = 0.10,
 ) -> Path2D:
@@ -107,6 +126,7 @@ def smooth_plan_path(
         inflation_radius_m=inflation_radius_m,
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
+        clearance_preference_m=clearance_preference_m,
     )
     return smooth_path(
         path,

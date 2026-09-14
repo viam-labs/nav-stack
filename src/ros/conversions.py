@@ -1157,6 +1157,70 @@ def merge_scans(
     )
 
 
+def camera_optical_to_sensor_frame(points: np.ndarray) -> np.ndarray:
+    """Map camera optical coordinates into the lidar/sensor body frame.
+
+    Optical (RealSense / OpenCV / ROS ``_optical_frame``):
+      X right, Y down, Z forward (into the scene).
+
+    Sensor / ``base_link``-style body axes used by mount + z filtering:
+      X forward, Y left, Z up.
+
+    Without this remap, depth (optical Z) is treated as height, so a wall of
+    points collapses onto the camera XY and paints a lethal blob on the robot.
+    """
+    points = np.asarray(points, dtype=float)
+    if points.size == 0:
+        return np.empty((0, 3))
+    if points.shape[1] == 2:
+        points = np.column_stack([points[:, 0], points[:, 1], np.zeros(len(points))])
+    out = np.empty((len(points), 3), dtype=float)
+    out[:, 0] = points[:, 2]
+    out[:, 1] = -points[:, 0]
+    out[:, 2] = -points[:, 1]
+    return out
+
+
+def downsample_points(points: np.ndarray, *, max_points: int = 4000) -> np.ndarray:
+    """Uniform stride downsample for heavy depth clouds (nav tick budget)."""
+    points = np.asarray(points, dtype=float)
+    if points.size == 0 or max_points <= 0 or len(points) <= max_points:
+        return points
+    step = int(math.ceil(len(points) / float(max_points)))
+    return points[:: max(1, step)]
+
+
+def prepare_lidar_point_cloud(
+    points: np.ndarray,
+    *,
+    cloud_frame: str = "sensor",
+    points_in_base_link: bool = False,
+    x: float = 0.0,
+    y: float = 0.0,
+    z: float = 0.0,
+    theta: float = 0.0,
+    pitch: float = 0.0,
+    roll: float = 0.0,
+    z_min: float = -0.2,
+    z_max: float = 2.0,
+    max_points: int = 0,
+) -> np.ndarray:
+    """Optical remap → mount → height band (returns base_link XYZ)."""
+    pts = np.asarray(points, dtype=float)
+    if max_points > 0:
+        pts = downsample_points(pts, max_points=max_points)
+    if pts.size == 0:
+        return np.empty((0, 3))
+    if points_in_base_link:
+        return filter_points_by_z(pts, z_min, z_max)
+    if cloud_frame == "camera_optical":
+        pts = camera_optical_to_sensor_frame(pts)
+    pts = transform_lidar_mount_to_base_link(
+        pts, x=x, y=y, z=z, theta=theta, pitch=pitch, roll=roll
+    )
+    return filter_points_by_z(pts, z_min, z_max)
+
+
 def filter_points_by_z(
     points: np.ndarray, z_min: float, z_max: float
 ) -> np.ndarray:

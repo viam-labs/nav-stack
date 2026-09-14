@@ -28,6 +28,8 @@ class LocalPlannerConfig:
     max_vel_x_reverse_m: float = 0.15
     reverse_speed_weight: float = 0.85
     spin_penalty: float = 1.0  # prefer translate (incl. reverse) over rotate-only
+    # Prefer continuity with the previous DWA command so vθ doesn't flip each tick.
+    continuity_weight: float = 0.35
     vx_samples: int = 5
     vtheta_samples: int = 5
     sim_time_s: float = 1.2
@@ -143,6 +145,7 @@ def compute_local_command(
     min_cmd_vel_x: float = 0.0,
     min_cmd_vel_theta: float = 0.0,
     local_planner_active: bool = False,
+    prev_cmd: Optional[DriveCommand] = None,
 ) -> Optional[DriveCommand]:
     """Sample (vx, vtheta) rollouts; return best safe command or None if not needed."""
     if not should_use_local_planner(
@@ -163,6 +166,8 @@ def compute_local_command(
     best: Optional[Tuple[float, float, float]] = None
     n_vx = max(3, int(cfg.vx_samples))
     n_vt = max(3, int(cfg.vtheta_samples))
+    prev_vx = float(prev_cmd.vx) if prev_cmd is not None else None
+    prev_vt = float(prev_cmd.vtheta) if prev_cmd is not None else None
 
     for i in range(n_vx):
         if n_vx == 1:
@@ -222,6 +227,17 @@ def compute_local_command(
             )
             if abs(vx) < 1e-3 and abs(vtheta) > 1e-3 and path_blocked_ahead:
                 score -= cfg.spin_penalty
+            if prev_vx is not None and prev_vt is not None and max_vel_x > 1e-6:
+                # Stick to the last DWA choice so noisy costmaps don't chatter.
+                dvx = abs(vx - prev_vx) / max(max_vel_x, 1e-3)
+                dvt = abs(vtheta - prev_vt) / max(max_vel_theta, 1e-3)
+                score -= cfg.continuity_weight * (dvx + dvt)
+                if (
+                    abs(prev_vt) > 0.05
+                    and abs(vtheta) > 0.05
+                    and (prev_vt > 0) != (vtheta > 0)
+                ):
+                    score -= cfg.continuity_weight * 1.5
             if best is None or score > best[2]:
                 best = (vx, vtheta, score)
 

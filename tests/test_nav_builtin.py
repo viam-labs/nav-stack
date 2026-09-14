@@ -8,6 +8,8 @@ import pytest
 
 from src.nav_builtin.controller import FollowerConfig, compute_path_command, lookahead_pose
 from src.nav_builtin.costmap import (
+    FREE,
+    INSCRIBED,
     LETHAL,
     build_costmap,
     footprint_traversable,
@@ -199,6 +201,43 @@ def test_costmap_viz_dict_shows_inflation_gradient():
     assert d["resolution"] == 0.05
 
 
+def test_costmap_soft_outer_matches_inflation_radius():
+    """Soft halo ends at inflation_radius; preference past that is planner-only."""
+    from src.nav_builtin.costmap import costs_to_occupancy_viz
+
+    occ = OccupancyGrid(
+        grid=np.zeros((81, 81), dtype=np.int16),
+        resolution=0.05,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    occ.grid[40, 40] = 100
+    robot_r = 0.22
+    inflate_r = 0.35
+    costs = build_costmap(
+        occ,
+        inflation_radius_m=inflate_r,
+        robot_radius_m=robot_r,
+        cost_scaling_factor=4.0,
+        clearance_preference_m=0.35,
+    )
+    cx, cy = 2.0, 2.0  # world center of obstacle cell
+    # Just inside soft outer edge: non-zero soft cost (viz-visible).
+    r_in, c_in = occ.world_to_cell(cx + inflate_r - 0.03, cy)
+    assert int(costs[r_in, c_in]) >= 50
+    # Just outside configured inflation: preference cost, not drawn as soft.
+    r_out, c_out = occ.world_to_cell(cx + inflate_r + 0.08, cy)
+    assert 0 < int(costs[r_out, c_out]) < 50
+    viz = costs_to_occupancy_viz(costs)
+    assert int(viz[r_out, c_out]) == 0
+    # Inside footprint: inscribed.
+    r_hard, c_hard = occ.world_to_cell(cx + robot_r * 0.5, cy)
+    assert int(costs[r_hard, c_hard]) == INSCRIBED
+    # Past preference band: free.
+    r_far, c_far = occ.world_to_cell(cx + inflate_r + 0.45, cy)
+    assert int(costs[r_far, c_far]) == FREE
+
+
 def test_plan_respects_inflation_radius():
     """Lazy Theta* must not shortcut through the soft inflation halo."""
     grid = np.zeros((40, 40), dtype=np.int16)
@@ -212,7 +251,8 @@ def test_plan_respects_inflation_radius():
     costs = build_costmap(
         occ, inflation_radius_m=0.35, robot_radius_m=0.05, cost_scaling_factor=3.0
     )
-    # With the fix, 0.35 m halo is inscribed — path cannot pass through x≈2, y≈2.
+    # Soft halo out to inflation_radius; path may graze soft costs but must
+    # stay traversable (outside inscribed/lethal).
     result = plan_on_costmap(
         occ, costs, start, goal, algorithm="lazy_theta_star"
     )
@@ -220,6 +260,113 @@ def test_plan_respects_inflation_radius():
     for x, y in result.path.points:
         r, c = occ.world_to_cell(x, y)
         assert is_traversable(int(costs[r, c]))
+
+
+def test_planner_prefers_clear_lane_over_inflation_hug():
+    """When a clear detour exists, do not hug the soft inflation of a wall."""
+    import numpy as np
+
+    grid = np.zeros((100, 140), dtype=np.int16)
+    grid[0:28, 25:115] = 100  # solid block for y in [0, 1.4)
+    occ = OccupancyGrid(grid=grid, resolution=0.05, origin_x=0.0, origin_y=0.0)
+    costs = build_costmap(
+        occ, inflation_radius_m=0.40, robot_radius_m=0.22, cost_scaling_factor=4.0
+    )
+    start = Pose2D(0.6, 1.55, 0.0)
+    goal = Pose2D(6.4, 1.55, 0.0)
+    result = plan_on_costmap(
+        occ, costs, start, goal, algorithm="lazy_theta_star", robot_radius_m=0.22
+    )
+    assert result.feasible
+    # Sample the polyline across the wall span — must climb into free space
+    # (~y≥1.8) rather than ride the inscribed/soft edge at y≈1.55.
+    ys: list[float] = []
+    peak_cost = 0
+    pts = result.path.points
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i][0], pts[i][1]
+        x1, y1 = pts[i + 1][0], pts[i + 1][1]
+        for t in np.linspace(0.0, 1.0, 60):
+            x = x0 + t * (x1 - x0)
+            y = y0 + t * (y1 - y0)
+            if 1.5 < x < 5.5:
+                ys.append(y)
+                r, c = occ.world_to_cell(x, y)
+                peak_cost = max(peak_cost, int(costs[r, c]))
+    assert ys
+    assert min(ys) >= 1.65
+    # Mid-route should stay out of preference / soft (LOS soft cap 30).
+    assert peak_cost <= 30
+
+
+def test_corner_path_stays_out_of_soft_halo():
+    """Repro: round a pillar tip in clear space, not through the soft glow."""
+    import numpy as np
+
+    from src.nav_builtin.smoother import smooth_path
+
+    grid = np.zeros((80, 80), dtype=np.int16)
+    grid[20:55, 35:50] = 100  # vertical bar
+    occ = OccupancyGrid(grid=grid, resolution=0.05, origin_x=0.0, origin_y=0.0)
+    costs = build_costmap(
+        occ, inflation_radius_m=0.35, robot_radius_m=0.22, cost_scaling_factor=4.0
+    )
+    start = Pose2D(1.0, 2.5, 0.0)
+    goal = Pose2D(3.2, 1.0, 0.0)
+    result = plan_on_costmap(
+        occ, costs, start, goal, algorithm="lazy_theta_star", robot_radius_m=0.22
+    )
+    assert result.feasible
+    path = smooth_path(result.path, costs, occ, enabled=True, sample_spacing_m=0.10)
+    peak = 0
+    pts = path.points
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i][0], pts[i][1]
+        x1, y1 = pts[i + 1][0], pts[i + 1][1]
+        for t in np.linspace(0.0, 1.0, 40):
+            x = x0 + t * (x1 - x0)
+            y = y0 + t * (y1 - y0)
+            r, c = occ.world_to_cell(x, y)
+            if occ.in_bounds(r, c):
+                peak = max(peak, int(costs[r, c]))
+    # Open space around the tip: stay in free / near-free, not soft glow.
+    assert peak <= 5
+
+
+def test_t_pillar_tip_prefers_clear_swing():
+    """Screenshot-like stem tip: only under-tip route; stay outside soft glow."""
+    grid = np.zeros((120, 100), dtype=np.int16)
+    # Stem from y=2.0 up to map top so the only detour is under the tip.
+    grid[40:120, 48:55] = 100
+    occ = OccupancyGrid(grid=grid, resolution=0.05, origin_x=0.0, origin_y=0.0)
+    costs = build_costmap(
+        occ, inflation_radius_m=0.35, robot_radius_m=0.22, cost_scaling_factor=4.0
+    )
+    start = Pose2D(3.6, 2.4, 0.0)
+    goal = Pose2D(1.4, 2.4, 0.0)
+    result = plan_on_costmap(
+        occ, costs, start, goal, algorithm="lazy_theta_star", robot_radius_m=0.22
+    )
+    assert result.feasible
+    ys: list[float] = []
+    peak = 0
+    pts = result.path.points
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i][0], pts[i][1]
+        x1, y1 = pts[i + 1][0], pts[i + 1][1]
+        for t in np.linspace(0.0, 1.0, 50):
+            x = x0 + t * (x1 - x0)
+            y = y0 + t * (y1 - y0)
+            if 2.2 < x < 2.9:
+                ys.append(y)
+                r, c = occ.world_to_cell(x, y)
+                if occ.in_bounds(r, c):
+                    peak = max(peak, int(costs[r, c]))
+    assert ys
+    # Tip at y=2.0; soft outer ≈ 1.65; preference outer ≈ 1.30. Prefer clear
+    # swing outside the visible glow (and ideally past preference).
+    assert max(ys) <= 1.40
+    assert peak <= 5
 
 
 def test_plan_straight_line_on_empty_map():
@@ -255,9 +402,7 @@ def test_lazy_theta_star_shorter_or_smoother_than_astar():
         algorithm="lazy_theta_star",
     )
     assert astar.feasible and theta.feasible
-    # Any-angle should use fewer waypoints than grid A* on open space.
-    assert len(theta.path.points) <= len(astar.path.points)
-    # And path length should be no worse than A* (within tiny float slack).
+
     def _len(path):
         pts = path.points
         return sum(
@@ -265,8 +410,14 @@ def test_lazy_theta_star_shorter_or_smoother_than_astar():
             for i in range(1, len(pts))
         )
 
+    # World densify may add waypoints for collision safety; length still matters.
     assert _len(theta.path) <= _len(astar.path) + 1e-6
-
+    assert (
+        path_blocked(
+            m, theta.path, inflation_radius_m=0.15, robot_radius_m=0.05, from_pose=start
+        )
+        is False
+    )
 
 def test_lazy_theta_star_detours_around_wall():
     m = _wall_map()
@@ -364,6 +515,64 @@ def test_path_blocked_horizon_ignores_far_obstacle():
     ) is True
 
 
+def test_lazy_theta_plan_survives_path_blocked_on_corridor():
+    """Planned world polyline must not immediately fail static path_blocked."""
+    from src.sim.world import make_builtin_corridor
+
+    sm = make_builtin_corridor()
+    m = {
+        "grid": sm.grid.copy(),
+        "resolution": sm.resolution,
+        "origin_x": sm.origin_x,
+        "origin_y": sm.origin_y,
+    }
+    start = Pose2D(5.69, 1.63, -3.1)
+    goal = Pose2D(1.77, 2.34, -0.13)
+    result = plan_path(
+        m, start, goal, inflation_radius_m=0.35, robot_radius_m=0.22
+    )
+    assert result.feasible
+    assert (
+        path_blocked(
+            m,
+            result.path,
+            inflation_radius_m=0.35,
+            robot_radius_m=0.22,
+            from_pose=start,
+            ahead_m=4.0,
+        )
+        is False
+    )
+
+
+def test_plan_with_scan_does_not_seal_mapped_corridor():
+    """Lidar hits on already-mapped walls must not double-inflate the gap shut."""
+    from src.sim.world import SimWorld, make_builtin_corridor
+
+    sm = make_builtin_corridor()
+    m = {
+        "grid": sm.grid.copy(),
+        "resolution": sm.resolution,
+        "origin_x": sm.origin_x,
+        "origin_y": sm.origin_y,
+    }
+    start = Pose2D(5.69, 1.63, -3.1)
+    goal = Pose2D(1.77, 2.34, -0.13)
+    world = SimWorld(sm, seed_pose=conv.Pose2D(start.x, start.y, start.theta))
+    scan = world.get_scan()
+    result = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.35,
+        robot_radius_m=0.22,
+        scan=scan,
+        scan_pose=start,
+        dynamic_obstacle_radius_m=0.45,
+    )
+    assert result.feasible
+
+
 def test_lookahead_advances_along_path():
     path = Path2D(points=((0.0, 0.0), (1.0, 0.0), (2.0, 0.0)), goal_theta=0.0)
     pose = Pose2D(0.0, 0.0, 0.0)
@@ -391,11 +600,14 @@ def test_follow_command_translates_while_gently_turning():
 
     cfg = FollowerConfig()
     current = Pose2D(0.0, 0.0, 0.0)
-    target = Pose2D(2.0, 0.5, 0.0)  # ~14 deg bearing — should still drive
+    path_yaw = math.atan2(0.5, 2.0)
+    target = Pose2D(2.0, 0.5, path_yaw)
     cmd = compute_follow_command(current, target, cfg=cfg)
     assert not cmd.done
     assert cmd.vx > 0.05
-    assert cmd.vtheta != 0.0
+    assert cmd.vtheta > 0.0
+    # Pure pursuit: ω = v·κ with κ = 2y/L² → gentle for a far, slightly-off point.
+    assert abs(cmd.vtheta) <= 0.3
 
 
 def test_follow_command_cruises_when_aligned():
@@ -403,11 +615,130 @@ def test_follow_command_cruises_when_aligned():
 
     cfg = FollowerConfig()
     cfg.motion.max_linear_mps = 0.6
-    current = Pose2D(0.0, 0.0, -2.29)
-    target = Pose2D(-0.38, -2.96, 0.0)  # ~0.04 rad bearing, ~1 m ahead
+    path_yaw = math.atan2(-2.96, -0.38)
+    current = Pose2D(0.0, 0.0, path_yaw)
+    target = Pose2D(-0.38, -2.96, path_yaw)
     cmd = compute_follow_command(current, target, cfg=cfg, final_yaw=None)
     assert not cmd.done
     assert cmd.vx >= 0.33
+    assert abs(cmd.vtheta) < 0.15
+
+
+def test_pursuit_is_geometric_omega_scales_with_speed():
+    """ω = v·κ: halving max speed halves ω for the same lookahead point."""
+    from src.nav_builtin.controller import pursuit_command
+
+    current = Pose2D(0.0, 0.0, 0.0)
+    target = Pose2D(0.6, 0.1, 0.0)  # gentle: κ = 2·0.1/0.37 ≈ 0.54 (r ≈ 1.85 m)
+    fast = FollowerConfig()
+    fast.motion.max_linear_mps = 0.6
+    slow = FollowerConfig()
+    slow.motion.max_linear_mps = 0.3
+    cmd_f, rot_f = pursuit_command(current, target, cfg=fast)
+    cmd_s, rot_s = pursuit_command(current, target, cfg=slow)
+    assert not rot_f and not rot_s
+    assert cmd_f.vx == pytest.approx(0.6)
+    assert cmd_s.vx == pytest.approx(0.3)
+    assert cmd_f.vtheta == pytest.approx(2 * cmd_s.vtheta, rel=1e-6)
+    assert cmd_f.vtheta / cmd_f.vx == pytest.approx(cmd_s.vtheta / cmd_s.vx, rel=1e-6)
+
+
+def test_pursuit_regulates_speed_by_curvature():
+    """Tight lookahead arc → slow down (r/r_min), never below the regulated floor."""
+    from src.nav_builtin.controller import pursuit_command
+
+    cfg = FollowerConfig()
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(0.0, 0.0, 0.0)
+    # 40° bearing at L=0.5 → κ = 2 sin(40°)/0.5 ≈ 2.57 → r ≈ 0.39 m < 0.7.
+    target = Pose2D(0.5 * math.cos(math.radians(40)), 0.5 * math.sin(math.radians(40)), 0.0)
+    cmd, rotating = pursuit_command(current, target, cfg=cfg)
+    assert not rotating
+    assert cfg.regulated_min_speed_mps <= cmd.vx < 0.6 * 0.6
+    assert cmd.vtheta > 0.0
+    # Still a drivable arc for the Viam base sanitizer (not a spin).
+    assert cmd.vx >= 0.12
+
+
+def test_pursuit_corrects_crosstrack_toward_path():
+    """Robot left of a straight path turns right back onto it, without Stanley."""
+    from src.nav_builtin.controller import pursuit_command
+
+    cfg = FollowerConfig()
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(0.0, 0.35, 0.0)
+    target = Pose2D(0.6, 0.0, 0.0)
+    cmd, rotating = pursuit_command(current, target, cfg=cfg)
+    assert not rotating
+    assert cmd.vtheta < 0.0
+    assert cmd.vx > 0.12
+
+
+def test_pursuit_rotate_to_heading_has_hysteresis():
+    from src.nav_builtin.controller import pursuit_command
+
+    cfg = FollowerConfig()
+    current = Pose2D(0.0, 0.0, 0.0)
+
+    def _at(deg: float) -> Pose2D:
+        return Pose2D(0.6 * math.cos(math.radians(deg)), 0.6 * math.sin(math.radians(deg)), 0.0)
+
+    # Beyond the enter threshold: rotate-to-heading.
+    far = _at(math.degrees(cfg.rotate_in_place_rad) + 15.0)
+    cmd, rotating = pursuit_command(current, far, cfg=cfg)
+    assert rotating and cmd.vx == 0.0 and cmd.vtheta > 0.0
+    assert abs(cmd.vtheta) <= cfg.rotate_vel_rad_s + 1e-9
+    # Between exit and enter: keep rotating only if we already were.
+    mid = _at(0.5 * math.degrees(cfg.rotate_in_place_rad + cfg.rotate_exit_rad))
+    cmd_stay, still = pursuit_command(current, mid, cfg=cfg, rotate_active=True)
+    assert still and cmd_stay.vx == 0.0
+    cmd_go, fresh = pursuit_command(current, mid, cfg=cfg, rotate_active=False)
+    assert not fresh and cmd_go.vx > 0.0
+    # Under the exit threshold: leave rotate-to-heading.
+    close = _at(math.degrees(cfg.rotate_exit_rad) - 10.0)
+    cmd_exit, done_rot = pursuit_command(current, close, cfg=cfg, rotate_active=True)
+    assert not done_rot and cmd_exit.vx > 0.0
+
+
+def test_keep_arc_drivable_preserves_curvature_at_crawl():
+    from src.nav_builtin.controller import DriveCommand, keep_arc_drivable
+
+    cfg = FollowerConfig()  # half_track 0.27, wheel_min 0.06, r_min 0.42
+    # Slow-down produced 0.05 m/s with 0.10 rad/s (r = 0.5 m). Same arc, but
+    # fast enough that the inner wheel (vx - |ω|·half_track) stays ≥ 0.06.
+    out = keep_arc_drivable(DriveCommand(0.05, 0.0, 0.10, False), cfg)
+    assert out.vtheta / out.vx == pytest.approx(2.0)
+    assert out.vx >= 0.125
+    assert out.vx - abs(out.vtheta) * cfg.wheel_half_track_m >= cfg.wheel_min_speed_mps - 1e-9
+    # Tighter than the min turn radius (r = 0.27 m): widen to r_min, not spin.
+    tight = keep_arc_drivable(DriveCommand(0.08, 0.0, 0.30, False), cfg)
+    assert tight.vx > 0.0
+    assert tight.vx / abs(tight.vtheta) == pytest.approx(cfg.effective_min_turn_radius_m())
+    assert tight.vx - abs(tight.vtheta) * cfg.wheel_half_track_m >= cfg.wheel_min_speed_mps - 1e-9
+    # Already drivable / not translating: untouched.
+    ok = DriveCommand(0.3, 0.0, 0.3, False)
+    assert keep_arc_drivable(ok, cfg) == ok
+    spin = DriveCommand(0.0, 0.0, 0.5, False)
+    assert keep_arc_drivable(spin, cfg) == spin
+
+
+def test_pursuit_respects_skid_steer_wheel_envelope():
+    """No translating command may put the inner wheel under the base minimum."""
+    from src.nav_builtin.controller import pursuit_command
+
+    cfg = FollowerConfig()
+    cfg.motion.max_linear_mps = 0.4
+    current = Pose2D(0.0, 0.0, 0.0)
+    for deg in range(-58, 59, 4):
+        for L in (0.6, 0.8, 1.2):
+            tgt = Pose2D(L * math.cos(math.radians(deg)), L * math.sin(math.radians(deg)), 0.0)
+            cmd, rotating = pursuit_command(current, tgt, cfg=cfg)
+            assert not rotating
+            inner = cmd.vx - abs(cmd.vtheta) * cfg.wheel_half_track_m
+            assert inner >= cfg.wheel_min_speed_mps - 1e-9, (deg, L, cmd)
+            assert cmd.vx >= 0.125
+            if abs(cmd.vtheta) > 1e-9:
+                assert cmd.vx / abs(cmd.vtheta) >= cfg.effective_min_turn_radius_m() - 1e-9
 
 
 def test_follow_command_approach_cap_only_at_goal():
@@ -435,7 +766,7 @@ def test_follow_command_rotate_in_place_when_goal_behind():
 
 
 def test_follow_command_no_sign_flip_across_xy_tolerance():
-    """XY jitter across xy_tol must not reverse saturated turn direction."""
+    """XY jitter across settle must not reverse saturated turn direction."""
     from src.nav_builtin.controller import compute_follow_command
 
     cfg = FollowerConfig()
@@ -444,7 +775,8 @@ def test_follow_command_no_sign_flip_across_xy_tolerance():
     cfg.motion.yaw_tolerance_rad = 0.35
     goal = Pose2D(0.0, 0.0, 0.0)
     # Facing ~57°, need to turn CW (negative) to final yaw 0.
-    inside = Pose2D(0.10, 0.0, 1.0)
+    # Inside settle (~3 cm): pure spin for final yaw.
+    inside = Pose2D(0.02, 0.0, 1.0)
     # Slight overshoot past the goal — old law RIP'd CCW on ±π bearing.
     outside = Pose2D(-0.30, 0.0, 1.0)
     cmd_in = compute_follow_command(inside, goal, cfg=cfg, final_yaw=0.0)
@@ -494,6 +826,52 @@ def test_follow_command_just_outside_2x_tol_no_full_spin():
         assert abs(cmd.vtheta) <= 0.25 + 1e-6
 
 
+def test_follow_command_dock_end_no_point_facing_rip():
+    """Repro: ~9 cm out, ~57° off dock yaw — don't RIP to face the point.
+
+    Status dump: spinning |vθ|=0.4 with vx=0 while hunting point bearing,
+    then crawl, then final-yaw the other way — endless end swing.
+    """
+    from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(-0.972, 1.663, -0.844)
+    goal = Pose2D(-1.051, 1.622, 0.042)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    # Prefer final-yaw handoff (close enough) or soft crawl — never long
+    # in-place spin solely to face the XY point.
+    if cmd.vx == 0.0:
+        # Final yaw spin: error is toward +0.042 from -0.844 → positive vθ.
+        yaw_err = conv.normalize_angle(goal.theta - current.theta)
+        assert cmd.vtheta * yaw_err > 0.0
+    else:
+        sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+        assert abs(sx) >= 0.05 - 1e-6
+        assert abs(st) <= 0.25 + 1e-6
+
+
+def test_follow_command_inside_tol_soft_close_no_rip():
+    """Inside XY tol with mid bearing: crawl, do not pure-spin to face point."""
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    # ~0.18 m out (beyond final-yaw handoff), final yaw still off, bearing ~56°.
+    current = Pose2D(0.0, 0.0, 0.0)
+    goal = Pose2D(0.10, 0.15, 0.8)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    assert abs(cmd.vx) > 1e-6
+    assert abs(cmd.vtheta) <= 0.22 + 1e-6
+
+
 def test_follow_command_end_approach_no_tiny_reverse_yaw_hunt():
     """Repro: 0.29 m out, goal behind heading — don't emit vx=-0.06 + vθ=0.28."""
     from src.nav_builtin.controller import compute_follow_command
@@ -513,19 +891,125 @@ def test_follow_command_end_approach_no_tiny_reverse_yaw_hunt():
     assert abs(sx) >= 0.12 - 1e-6 or (abs(sx) < 1e-9 and abs(st) >= 0.08)
 
 
-def test_follow_command_large_yaw_spins_before_crawl():
-    """Status repro: ~140° final yaw at 0.3 m must not translate while spinning."""
+def test_follow_command_half_metre_final_yaw_closes_xy():
+    """Repro: ~0.5 m out with ~35° final yaw must not pure-spin (stall)."""
+    from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    # Matches status dump: goal south of robot, final yaw differs ~35°.
+    current = Pose2D(2.513, 2.105, 2.45)
+    goal = Pose2D(2.498, 1.610, 1.835)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+    # Old bug: spin for final yaw (|vθ|≈0.4, vx=0) while still 0.5 m out.
+    assert abs(sx) >= 0.12 - 1e-6 or (abs(sx) < 1e-9 and abs(st) >= 0.08)
+    assert not (cmd.vx == 0.0 and abs(cmd.vtheta) >= 0.30)
+
+
+def test_follow_command_large_yaw_outside_tol_closes_xy():
+    """~140° final yaw at 0.3 m: close XY first; do not spin for goal θ yet."""
+    from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(2.52, 1.40, 1.08)
+    goal = Pose2D(2.79, 1.56, -2.76)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+    # Must make XY progress (or face the point), not pure-spin for final yaw.
+    assert abs(sx) >= 0.12 - 1e-6 or (abs(sx) < 1e-9 and abs(st) >= 0.08)
+
+
+def test_follow_command_edge_of_xy_tol_still_closes():
+    """Inside xy_tol (~0.22 m) but outside settle: soft-close, don't yaw-spin."""
+    import math
+
+    from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    goal = Pose2D(5.663, 4.573, 0.10)
+    # Already facing the goal point; final yaw still far off.
+    heading = math.atan2(goal.y - 4.402, goal.x - 5.826)
+    current = Pose2D(5.826, 4.402, heading)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+    assert abs(sx) >= 0.05 - 1e-6
+    # Must not be final-yaw-only spin at the outer edge of the ball.
+    assert abs(cmd.vx) > 0.0
+    assert abs(cmd.vtheta) < 0.25
+
+
+def test_follow_command_large_yaw_inside_settle_spins():
+    """Inside settle radius (~3 cm) with large final yaw: pure spin only."""
     from src.nav_builtin.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
     cfg.motion.yaw_tolerance_rad = 0.35
-    current = Pose2D(2.52, 1.40, 1.08)
+    current = Pose2D(2.775, 1.550, 1.08)
     goal = Pose2D(2.79, 1.56, -2.76)
     cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
     assert cmd.vx == 0.0
     assert abs(cmd.vtheta) > 0.0
     assert abs(cmd.vtheta) <= 0.40 + 1e-6
+
+
+def test_follow_command_near_settle_large_yaw_spins():
+    """Repro: ~4 cm out with ~134° final yaw must spin, not soft-crawl forever."""
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    # Status dump: dist≈0.044, yaw_err≈-2.35
+    current = Pose2D(4.962, 2.218, 2.538)
+    goal = Pose2D(4.928, 2.247, 0.191)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    assert cmd.vx == 0.0
+    assert abs(cmd.vtheta) >= 0.10
+    assert abs(cmd.vtheta) <= 0.40 + 1e-6
+
+
+def test_follow_command_nine_cm_out_hands_off_to_final_yaw():
+    """~9 cm out with final yaw still wrong: spin for θ, not soft-crawl forever."""
+    import math
+
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    goal = Pose2D(4.349, 0.863, 0.624)
+    current_xy = (4.272, 0.912)
+    heading = math.atan2(goal.y - current_xy[1], goal.x - current_xy[0])
+    current = Pose2D(current_xy[0], current_xy[1], heading)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    # Close enough for final-yaw handoff — pure spin toward goal θ.
+    assert cmd.vx == 0.0
+    yaw_err = conv.normalize_angle(goal.theta - current.theta)
+    assert abs(yaw_err) > cfg.motion.yaw_tolerance_rad
+    assert cmd.vtheta * yaw_err > 0.0
 
 
 def test_follow_command_large_yaw_far_out_closes_xy_first():
@@ -577,6 +1061,7 @@ class _FakeWorld:
         self.map_data = map_data
         self.cmds = []
         self.stopped = False
+        self.loc_hold = None
 
     def get_map(self):
         return self.map_data
@@ -584,8 +1069,11 @@ class _FakeWorld:
     def get_pose(self):
         return self.pose
 
-    def get_scan(self, max_age_s: float = 2.0):
+    def get_scan(self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True):
         return None
+
+    def get_localization_hold(self):
+        return self.loc_hold
 
     def set_velocity(self, vx, vy, vtheta):
         self.cmds.append((vx, vy, vtheta))
@@ -595,6 +1083,7 @@ class _FakeWorld:
 
     def stop(self):
         self.stopped = True
+        self.cmds.append((0.0, 0.0, 0.0))
 
     def set_viz_plan(self, path_xy, goal=None):
         pass
@@ -626,3 +1115,45 @@ def test_builtin_navigator_cancel_sets_status():
     nav = BuiltinNavigator(world, avoid_obstacles=False)
     nav.cancel()
     assert nav.nav_status()["state"] == "canceled"
+
+
+def test_nav_holds_drive_while_localization_awaiting_confirm():
+    """Do not crawl/turn on a disputed pose while a large jump awaits confirm."""
+    import threading
+    import time
+
+    world = _FakeWorld(Pose2D(0.2, 0.2, 0.0), _empty_map(size=80))
+    world.loc_hold = {
+        "status": "awaiting_confirm",
+        "confirm_count": 1,
+        "confirm_needed": 2,
+        "jump_shift_m": 0.49,
+        "jump_shift_deg": 42.0,
+    }
+    nav = BuiltinNavigator(
+        world,
+        inflation_radius_m=0.15,
+        robot_radius_m=0.05,
+        avoid_obstacles=False,
+        xy_tolerance_m=0.1,
+        timeout_s=4.0,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+    )
+
+    def _run():
+        nav.navigate(3.0, 0.2, 0.0)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    time.sleep(0.35)
+    status = nav.nav_status()
+    assert status.get("active") is True
+    assert status.get("obstacle") == "loc_hold"
+    # No forward or turn commands while held (stops only).
+    assert all(abs(vx) < 1e-9 and abs(vth) < 1e-9 for vx, _vy, vth in world.cmds)
+    world.loc_hold = None
+    time.sleep(0.25)
+    nav.cancel()
+    t.join(timeout=2.0)
+    assert world.stopped

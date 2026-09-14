@@ -103,6 +103,25 @@ def _sync_slam_pose_provider(slam_service_name: str):
     return _get
 
 
+def _localization_hold_provider(slam_service_name: str):
+    """Stop nav while SLAM is awaiting confirm on a large pose jump."""
+    from ..nav.pose_jump_gate import should_hold_drive_for_pose_jump
+
+    def _get():
+        svc = get_slam_service(slam_service_name)
+        if svc is not None:
+            for attr in ("_last_relocalize_check", "_last_revisit_check"):
+                check = getattr(svc, attr, None)
+                if should_hold_drive_for_pose_jump(check):
+                    return dict(check)
+        rt = get_slam(slam_service_name)
+        if rt is not None and should_hold_drive_for_pose_jump(rt.localization_check):
+            return dict(rt.localization_check)
+        return None
+
+    return _get
+
+
 def _in_process_map_provider(slam_service_name: str):
     """Sync occupancy dict from the current SLAM host (re-resolves each call)."""
 
@@ -205,6 +224,14 @@ class RosNavigation(NavServiceBase):
                 drive_timeout_s=float(getattr(cfg.builtin, "drive_timeout_s", 5.0)),
                 pose_provider=_sync_slam_pose_provider(cfg.slam_service),
                 map_provider=_in_process_map_provider(cfg.slam_service),
+                localization_hold_provider=_localization_hold_provider(
+                    cfg.slam_service
+                ),
+                scan_provider=(
+                    (lambda max_age_s, s=slam_rt.sim_sensors: s.get_scan(max_age_s))
+                    if slam_rt.sim_sensors is not None
+                    else None
+                ),
                 logger=lambda m: LOGGER.info(m),
             )
             navigator = make_builtin_navigator(
@@ -218,6 +245,7 @@ class RosNavigation(NavServiceBase):
                 slam_rt.localization_check,
                 cameras=slam_rt.cameras,
                 shm_lidar=slam_rt.shm_lidar,
+                sim_sensors=slam_rt.sim_sensors,
             )
             register_nav_viz(self.name, viz)
             register_nav_host(self.name, host)

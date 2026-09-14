@@ -26,6 +26,7 @@ class SlamRuntime:
         *,
         cameras: Optional[dict] = None,
         shm_lidar: Optional[object] = None,
+        sim_sensors: Optional[object] = None,
     ):
         self.manager = manager
         self.map_store = map_store
@@ -37,6 +38,8 @@ class SlamRuntime:
         self.cameras = dict(cameras or {})
         # Shared POSIX-shm PCD client (bridge + builtin nav).
         self.shm_lidar = shm_lidar
+        # Optional SimSensors when ``sim.enabled`` (nav obstacle scans).
+        self.sim_sensors = sim_sensors
 
 
 _REGISTRY: Dict[str, SlamRuntime] = {}

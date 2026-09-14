@@ -6,7 +6,7 @@ import math
 import numpy as np
 import pytest
 
-from src.nav.simple_motion import rear_clearance_m
+from src.nav.simple_motion import DriveCommand, rear_clearance_m
 from src.nav_builtin.controller import FollowerConfig, compute_path_command
 from src.nav_builtin.costmap import build_costmap, occupancy_from_bridge_map
 from src.nav_builtin.local_costmap import (
@@ -345,7 +345,7 @@ def test_compute_path_command_defers_local_planner_when_misaligned():
         robot_radius_m=0.08,
     )
     assert progress.get("local_planner") is False
-    assert abs(progress["bearing_error_rad"]) > math.radians(75.0)
+    assert abs(progress["bearing_error_rad"]) > math.radians(55.0)
     assert cmd.vx == 0.0
     assert abs(cmd.vtheta) > 0.05
 
@@ -397,3 +397,52 @@ def test_footprint_collides_outside_map():
 
     view = LocalCostmapView(costs=costs, occ=occ, origin_x=0.0, origin_y=0.0)
     assert footprint_collides(view, -1.0, 0.5, robot_radius_m=0.05) is True
+
+
+def test_local_planner_continuity_prefers_previous_turn_sign():
+    """Noisy soft costs should not flip vθ sign every tick when prev_cmd is set."""
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=3.0,
+            height_m=3.0,
+            resolution=0.05,
+            inflation_radius_m=0.2,
+            robot_radius_m=0.1,
+            use_global_static=False,
+            scan_inflation_radius_m=0.1,
+        )
+    )
+    pose = Pose2D(1.0, 1.5, 0.0)
+    # Soft side obstacle: enough to wake DWA, not lethal in footprint.
+    n = 48
+    ranges = np.full(n, 3.0)
+    ranges[n // 4] = 0.55  # ~+45°
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(pose, scan)
+    path = Path2D(points=((1.0, 1.5), (2.5, 1.5)), goal_theta=0.0)
+    cfg = LocalPlannerConfig(
+        enabled=True,
+        activate_cost_threshold=1,
+        continuity_weight=0.8,
+        sim_time_s=1.0,
+    )
+    prev = DriveCommand(0.25, 0.0, 0.6, False)
+    cmd = compute_local_command(
+        pose,
+        path,
+        view,
+        cfg=cfg,
+        max_vel_x=0.4,
+        max_vel_theta=1.0,
+        robot_radius_m=0.1,
+        local_planner_active=True,
+        prev_cmd=prev,
+    )
+    assert cmd is not None
+    assert cmd.vtheta >= 0.0 or abs(cmd.vtheta) < 0.05

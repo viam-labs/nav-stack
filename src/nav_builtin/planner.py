@@ -63,12 +63,55 @@ def _heuristic(a: Cell, b: Cell) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
-def _cell_step_cost(costs: np.ndarray, cell: Cell, base_step: float) -> float:
-    c = int(costs[cell])
+def _cost_multiplier(cost: int) -> float:
+    """Traversal multiplier for soft inflation (1 = free, ≫1 near obstacles).
+
+    Soft cells stay traversable so narrow corridors remain solvable, but the
+    multiplier must be strong enough that a modestly longer clear path beats a
+    short hug of the inflation halo when open space is available.
+    """
+    c = int(cost)
+    if c <= 0:
+        return 1.0
     if c >= INSCRIBED:
-        return base_step
-    penalty = 1.0 + (c / float(INSCRIBED)) * 0.5
-    return base_step * penalty
+        return 1e6
+    t = c / float(INSCRIBED - 1)
+    # Linear + steep quadratic: outer soft ≈ 10–20×, near-inscribed ≫50×.
+    return 1.0 + 25.0 * t + 120.0 * (t * t)
+
+
+# Any-angle LOS / string-pull may only shortcut through near-free cells.
+# Preference costs (32–48) and the visible soft glow fail LOS so paths stay in
+# clear space when a detour exists. Narrow gaps remain traversable via
+# 8-connected steps through higher soft cells.
+_LOS_MAX_SOFT_COST = 30
+
+
+def _cell_step_cost(costs: np.ndarray, cell: Cell, base_step: float) -> float:
+    return base_step * _cost_multiplier(int(costs[cell]))
+
+
+def _segment_traversal_cost(costs: np.ndarray, a: Cell, b: Cell) -> float:
+    """Bresenham path length with per-cell soft-inflation multipliers.
+
+    Integrates step×multiplier (not Euclidean×peak) so Lazy Theta* pays for
+    every soft cell the way A* does, and still heavily penalizes halo clips.
+    """
+    cells = bresenham_cells(a, b)
+    if len(cells) <= 1:
+        return 0.0
+    total = 0.0
+    peak = 1.0
+    for i in range(1, len(cells)):
+        y0, x0 = cells[i - 1]
+        y1, x1 = cells[i]
+        step = math.hypot(y1 - y0, x1 - x0)
+        mult = _cost_multiplier(int(costs[cells[i]]))
+        peak = max(peak, mult)
+        total += step * mult
+    # Peak floor: a long mostly-free chord that nicks soft still pays.
+    euclid = math.hypot(b[0] - a[0], b[1] - a[1])
+    return max(total, euclid * peak)
 
 
 def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
@@ -76,6 +119,8 @@ def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
 
     Also rejects diagonal corner-cuts: when the line steps diagonally, both
     flanking orthogonal cells must be free (same rule as grid Theta*).
+    Soft-inflation cells above ``_LOS_MAX_SOFT_COST`` also fail LOS so
+    any-angle shortcuts stay in clear space when a clear detour exists.
     """
     y0, x0 = a
     y1, x1 = b
@@ -88,7 +133,12 @@ def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
     h, w = costs.shape
 
     while True:
-        if not (0 <= y < h and 0 <= x < w) or not is_traversable(int(costs[y, x])):
+        if not (0 <= y < h and 0 <= x < w):
+            return False
+        cell_cost = int(costs[y, x])
+        if not is_traversable(cell_cost):
+            return False
+        if cell_cost > _LOS_MAX_SOFT_COST:
             return False
         if (y, x) == (y1, x1):
             return True
@@ -109,14 +159,144 @@ def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
                 0 <= y - sy < h
                 and 0 <= x < w
                 and is_traversable(int(costs[y - sy, x]))
+                and int(costs[y - sy, x]) <= _LOS_MAX_SOFT_COST
             ):
                 return False
             if not (
                 0 <= y < h
                 and 0 <= x - sx < w
                 and is_traversable(int(costs[y, x - sx]))
+                and int(costs[y, x - sx]) <= _LOS_MAX_SOFT_COST
             ):
                 return False
+
+
+def bresenham_cells(a: Cell, b: Cell) -> List[Cell]:
+    """Inclusive Bresenham cell chain from ``a`` to ``b`` (no corner checks)."""
+    y0, x0 = a
+    y1, x1 = b
+    dy = abs(y1 - y0)
+    dx = abs(x1 - x0)
+    sy = 1 if y1 >= y0 else -1
+    sx = 1 if x1 >= x0 else -1
+    err = dx - dy
+    y, x = y0, x0
+    out: List[Cell] = []
+    while True:
+        out.append((y, x))
+        if (y, x) == (y1, x1):
+            return out
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x += sx
+        if e2 < dx:
+            err += dx
+            y += sy
+
+
+def world_segment_traversable(
+    costs: np.ndarray,
+    occ: OccupancyGrid,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    *,
+    sample_step_m: float = 0.05,
+    max_cost: Optional[int] = None,
+) -> bool:
+    """True when the Euclidean segment stays in traversable costmap cells.
+
+    When ``max_cost`` is set, cells above that soft cost also fail (used by
+    string-pull so shortcuts stay in clear space).
+    """
+    seg = math.hypot(x1 - x0, y1 - y0)
+    step = max(1e-3, float(sample_step_m))
+    if seg < 1e-9:
+        row, col = occ.world_to_cell(x0, y0)
+        if not (occ.in_bounds(row, col) and is_traversable(int(costs[row, col]))):
+            return False
+        if max_cost is not None and int(costs[row, col]) > max_cost:
+            return False
+        return True
+    n = max(1, int(math.ceil(seg / step)))
+    for k in range(n + 1):
+        t = k / n
+        x = x0 + t * (x1 - x0)
+        y = y0 + t * (y1 - y0)
+        row, col = occ.world_to_cell(x, y)
+        if not occ.in_bounds(row, col) or not is_traversable(int(costs[row, col])):
+            return False
+        if max_cost is not None and int(costs[row, col]) > max_cost:
+            return False
+    return True
+
+
+def _cells_8_adjacent(a: Cell, b: Cell) -> bool:
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1])) <= 1 and a != b
+
+
+def _repair_cell_path(costs: np.ndarray, cells: List[Cell]) -> List[Cell]:
+    """Ensure consecutive path cells are LOS-connected (Lazy Theta can emit gaps).
+
+    Invalid parent jumps are bridged with A* so the polyline of cell centers
+    does not cut through the inflation halo.
+    """
+    if len(cells) < 2:
+        return cells
+    out: List[Cell] = [cells[0]]
+    for nxt in cells[1:]:
+        prev = out[-1]
+        if prev == nxt:
+            continue
+        if _cells_8_adjacent(prev, nxt) and is_traversable(int(costs[nxt])):
+            out.append(nxt)
+            continue
+        if line_of_sight(costs, prev, nxt):
+            chain = bresenham_cells(prev, nxt)
+            # Only accept Bresenham fill when every cell is free (LOS should
+            # guarantee this; still guard against corner-cut mismatches).
+            if all(is_traversable(int(costs[c])) for c in chain):
+                out.extend(chain[1:])
+                continue
+        bridge = _astar(costs, prev, nxt)
+        if bridge is None or len(bridge) < 2:
+            # Last resort: keep the waypoint so planning still returns something.
+            out.append(nxt)
+        else:
+            out.extend(bridge[1:])
+    return out
+
+
+def _densify_world_path(
+    costs: np.ndarray,
+    occ: OccupancyGrid,
+    points: List[Tuple[float, float]],
+    *,
+    sample_step_m: float,
+) -> List[Tuple[float, float]]:
+    """Insert cell-center waypoints when a world chord clips non-traversable cells."""
+    if len(points) < 2:
+        return points
+    out: List[Tuple[float, float]] = [points[0]]
+    for nxt in points[1:]:
+        prev = out[-1]
+        if world_segment_traversable(
+            costs, occ, prev[0], prev[1], nxt[0], nxt[1], sample_step_m=sample_step_m
+        ):
+            out.append(nxt)
+            continue
+        ca = occ.world_to_cell(prev[0], prev[1])
+        cb = occ.world_to_cell(nxt[0], nxt[1])
+        bridge = _astar(costs, ca, cb)
+        if bridge is None or len(bridge) < 2:
+            out.append(nxt)
+            continue
+        for cell in bridge[1:-1]:
+            out.append(occ.cell_to_world(cell[0], cell[1]))
+        out.append(nxt)
+    return out
 
 
 def _reconstruct(came_from: dict, goal: Cell) -> List[Cell]:
@@ -211,22 +391,38 @@ def _lazy_theta_star(
                 continue
             if not line_of_sight(costs, n, s):
                 continue
-            # Euclidean parent→s (n is an 8-neighbor, but keep any-angle form).
-            cand = g_score[n] + math.hypot(sy - ny, sx - nx)
+            # Euclidean parent→s weighted by soft inflation along the chord.
+            cand = g_score[n] + _segment_traversal_cost(costs, n, s)
             if cand < best_g:
                 best_g = cand
                 best_p = n
         if best_p is None:
-            # Should be rare; keep existing parent and g (A*-like local edge).
-            return
+            # No LOS parent among closed cells: fall back to an 8-connected
+            # closed neighbor (A*-style edge). Leaving the invalid lazy parent
+            # produces chords that cut the inflation halo and fail path_blocked.
+            for dy, dx, step in _NEIGHBORS:
+                ny, nx = sy + dy, sx + dx
+                n = (ny, nx)
+                if n not in closed:
+                    continue
+                if not (0 <= ny < h and 0 <= nx < w):
+                    continue
+                if not is_traversable(int(costs[n])):
+                    continue
+                cand = g_score[n] + _cell_step_cost(costs, s, step)
+                if cand < best_g:
+                    best_g = cand
+                    best_p = n
+            if best_p is None:
+                return
         parent[s] = best_p
         g_score[s] = best_g
 
     def _compute_cost(s: Cell, sp: Cell) -> None:
         """Lazy update: assume LOS from parent(s) to ``sp`` (Path 2)."""
         ps = parent[s]
-        # Euclidean any-angle cost from assumed parent.
-        tentative = g_score[ps] + math.hypot(sp[0] - ps[0], sp[1] - ps[1])
+        # Any-angle length × inflation along the assumed parent chord.
+        tentative = g_score[ps] + _segment_traversal_cost(costs, ps, sp)
         if tentative < g_score.get(sp, math.inf):
             parent[sp] = ps
             g_score[sp] = tentative
@@ -387,6 +583,7 @@ def connect_plan_start(
     inflation_radius_m: float,
     robot_radius_m: float,
     cost_scaling_factor: float = 4.0,
+    clearance_preference_m: float = 0.35,
     algorithm: str = DEFAULT_PLANNER,
     xy_tolerance_m: float = 0.15,
     scan: Optional[conv.LaserScan2D] = None,
@@ -403,6 +600,7 @@ def connect_plan_start(
         inflation_radius_m=inflation_radius_m,
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
+        clearance_preference_m=clearance_preference_m,
     )
     sx, sy = result.path.points[0]
     at_start = math.hypot(pose.x - sx, pose.y - sy) <= xy_tolerance_m
@@ -417,6 +615,7 @@ def connect_plan_start(
         inflation_radius_m=inflation_radius_m,
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
+        clearance_preference_m=clearance_preference_m,
         algorithm=algorithm,
         scan=scan,
         scan_pose=pose if scan is not None else None,
@@ -534,19 +733,27 @@ def plan_on_costmap(
             planning_time_s=time.perf_counter() - t0,
         )
 
+    # Lazy Theta* can emit parent jumps without LOS; repair then densify so the
+    # world polyline matches what path_blocked / the follower will sample.
+    cells = _repair_cell_path(costs, cells)
     cells = _simplify(cells)
-    world = tuple(occ.cell_to_world(r, c) for r, c in cells)
+    world_list = [occ.cell_to_world(r, c) for r, c in cells]
     # Keep endpoints on snapped free cells so exact poses don't pull the path
     # through the inflation halo.
-    if world and start_xy is not None and goal_xy is not None:
-        if len(world) >= 2:
-            world = (start_xy,) + world[1:-1] + (goal_xy,)
+    if world_list and start_xy is not None and goal_xy is not None:
+        if len(world_list) >= 2:
+            world_list[0] = start_xy
+            world_list[-1] = goal_xy
         else:
-            world = (start_xy, goal_xy)
+            world_list = [start_xy, goal_xy]
+    sample_step = max(0.05, float(occ.resolution) * 0.5)
+    world_list = _densify_world_path(
+        costs, occ, world_list, sample_step_m=sample_step
+    )
 
     return PlanResult(
         feasible=True,
-        path=Path2D(points=world, goal_theta=goal.theta),
+        path=Path2D(points=tuple(world_list), goal_theta=goal.theta),
         planning_time_s=time.perf_counter() - t0,
     )
 
@@ -559,6 +766,7 @@ def plan_path(
     inflation_radius_m: float,
     robot_radius_m: float = 0.22,
     cost_scaling_factor: float = 4.0,
+    clearance_preference_m: float = 0.35,
     algorithm: str = DEFAULT_PLANNER,
     scan: Optional[conv.LaserScan2D] = None,
     scan_pose: Optional[conv.Pose2D] = None,
@@ -580,23 +788,28 @@ def plan_path(
         occ = occupancy_from_bridge_map(map_data)
     except (KeyError, TypeError, ValueError) as exc:
         return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
-    obs_r = max(float(dynamic_obstacle_radius_m), float(inflation_radius_m))
+    # Paint lidar hits as occupied *cells* (small radius). build_costmap then
+    # applies inflation once. Using inflation_radius here double-inflates walls
+    # already on the map and can seal narrow corridors.
     if scan is not None and scan_pose is not None:
+        hit_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
         occ = mark_scan_on_occupancy(
-            occ, scan_pose, scan, obstacle_radius_m=obs_r
+            occ, scan_pose, scan, obstacle_radius_m=hit_r
         )
     if blocked_path is not None and blocked_path_pose is not None:
+        block_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
         occ = mark_path_ahead_on_occupancy(
             occ,
             blocked_path,
             blocked_path_pose,
-            radius_m=obs_r,
+            radius_m=block_r,
         )
     costs = build_costmap(
         occ,
         inflation_radius_m=inflation_radius_m,
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
+        clearance_preference_m=clearance_preference_m,
     )
     result = plan_on_costmap(
         occ, costs, start, goal, algorithm=algorithm, robot_radius_m=robot_radius_m
@@ -646,6 +859,7 @@ def path_blocked(
         else:
             start_t = max(0.0, min(1.0, ((cx - x0) * dx + (cy - y0) * dy) / seg2))
 
+    step = max(1e-3, float(sample_step_m))
     for i in range(start_seg, len(pts) - 1):
         if remaining_budget <= 0.0:
             break
@@ -657,15 +871,15 @@ def path_blocked(
         if usable < 1e-9:
             continue
         check_len = min(usable, remaining_budget)
-        n = max(1, int(math.ceil(check_len / sample_step_m)))
-        for k in range(n + 1):
-            frac = check_len / seg if seg > 1e-9 else 0.0
-            t = t0 + (k / n) * frac
-            t = max(0.0, min(1.0, t))
-            x = x0 + t * (x1 - x0)
-            y = y0 + t * (y1 - y0)
-            r, c = occ.world_to_cell(x, y)
-            if not occ.in_bounds(r, c) or not is_traversable(int(costs[r, c])):
-                return True
+        # Sample the checked sub-segment (from t0 along usable).
+        x_a = x0 + t0 * (x1 - x0)
+        y_a = y0 + t0 * (y1 - y0)
+        frac = check_len / seg if seg > 1e-9 else 0.0
+        x_b = x0 + (t0 + frac) * (x1 - x0)
+        y_b = y0 + (t0 + frac) * (y1 - y0)
+        if not world_segment_traversable(
+            costs, occ, x_a, y_a, x_b, y_b, sample_step_m=step
+        ):
+            return True
         remaining_budget -= check_len
     return False

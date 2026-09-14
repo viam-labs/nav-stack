@@ -40,7 +40,9 @@ class BridgeWorldIO:
             return None
         return node.get_pose_in_map()
 
-    def get_scan(self, max_age_s: float = 2.0) -> Optional[conv.LaserScan2D]:
+    def get_scan(
+        self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True
+    ) -> Optional[conv.LaserScan2D]:
         node = self._get_node()
         if node is None:
             return None

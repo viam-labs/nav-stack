@@ -24,6 +24,9 @@ class LocalCostmapConfig:
     use_global_static: bool = True
     # Subsample dense lidar beams when marking (keeps update cheap).
     max_scan_beams: int = 180
+    # Live scan inflation is tighter than the global soft ring so sparse /
+    # jittery hits don't paint a wide soft field that flips DWA left/right.
+    scan_inflation_radius_m: Optional[float] = None
 
 
 @dataclass
@@ -156,9 +159,14 @@ class LocalCostmap:
             origin_x=self._origin_x,
             origin_y=self._origin_y,
         )
+        scan_inflation = (
+            float(self._cfg.scan_inflation_radius_m)
+            if self._cfg.scan_inflation_radius_m is not None
+            else float(self._cfg.robot_radius_m)
+        )
         scan_costs = build_costmap(
             scan_occ,
-            inflation_radius_m=self._cfg.inflation_radius_m,
+            inflation_radius_m=scan_inflation,
             robot_radius_m=self._cfg.robot_radius_m,
             cost_scaling_factor=self._cfg.cost_scaling_factor,
         )

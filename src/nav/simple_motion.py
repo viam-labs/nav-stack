@@ -140,7 +140,14 @@ def apply_obstacle_avoidance(
     if forward > obs.stop_distance_m:
         span = max(obs.slow_distance_m - obs.stop_distance_m, 1e-6)
         scale = (forward - obs.stop_distance_m) / span
-        return DriveCommand(cmd.vx * scale, 0.0, cmd.vtheta, False), "slow", forward
+        # Scale vθ with vx so the turn *radius* is preserved. Scaling vx alone
+        # tightens the arc as the robot slows (κ = vθ/vx), which is exactly the
+        # sharp swerve-near-walls behaviour a slow-down is supposed to prevent.
+        return (
+            DriveCommand(cmd.vx * scale, 0.0, cmd.vtheta * scale, False),
+            "slow",
+            forward,
+        )
 
     # Too close to keep going: stop forward motion and rotate toward whichever
     # side has more room. +vtheta (CCW) turns left (+y / positive bearings).
@@ -179,13 +186,20 @@ class DriveCommand:
 
 
 def apply_velocity_floor(cmd: DriveCommand, cfg: SimpleMotionConfig) -> DriveCommand:
-    """Bump nonzero vx / vtheta up to the configured minimums (stiction floor)."""
+    """Bump nonzero vx / vtheta up to the configured minimums (stiction floor).
+
+    The angular floor only applies to pure rotation (``vx == 0``): that is the
+    case where a skid-steer stalls below ``min_angular``. While translating,
+    a small vθ is just a slightly-differential wheel speed, and flooring it
+    turns every tiny heading correction into a ±min_angular zig-zag.
+    """
     if cmd.done:
         return cmd
+    ang_floor = cfg.min_angular_rad_s if cmd.vx == 0.0 else 0.0
     return DriveCommand(
         _apply_min_speed(cmd.vx, cfg.min_linear_mps, cfg.max_linear_mps),
         cmd.vy,
-        _apply_min_speed(cmd.vtheta, cfg.min_angular_rad_s, cfg.max_angular_rad_s),
+        _apply_min_speed(cmd.vtheta, ang_floor, cfg.max_angular_rad_s),
         False,
     )
 

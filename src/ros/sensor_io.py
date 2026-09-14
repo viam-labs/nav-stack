@@ -98,15 +98,20 @@ def build_io_provider(
             raw: bytes, *, age_s: Optional[float] = None
         ) -> conv.LidarPoints:
             pts = conv.parse_pcd(raw)
-            if lidar_cfg is not None and not lidar_cfg.points_in_base_link:
-                base_pts = conv.transform_lidar_mount_to_base_link(
+            if lidar_cfg is not None:
+                base_pts = conv.prepare_lidar_point_cloud(
                     pts,
+                    cloud_frame=lidar_cfg.cloud_frame,
+                    points_in_base_link=lidar_cfg.points_in_base_link,
                     x=lidar_cfg.x,
                     y=lidar_cfg.y,
                     z=lidar_cfg.z,
                     theta=lidar_cfg.theta,
                     pitch=lidar_cfg.pitch,
                     roll=lidar_cfg.roll,
+                    z_min=lidar_cfg.z_min,
+                    z_max=lidar_cfg.z_max,
+                    max_points=4000 if lidar_cfg.obstacles_only else 0,
                 )
             else:
                 base_pts = pts

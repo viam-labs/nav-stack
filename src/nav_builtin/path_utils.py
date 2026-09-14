@@ -46,3 +46,21 @@ def closest_point_on_path(
             best_along = along + t * seg_len
         along += seg_len
     return best_xy[0], best_xy[1], best_seg, best_along
+
+
+def signed_crosstrack_m(current: Pose2D, path: Path2D) -> Tuple[float, float]:
+    """Return ``(crosstrack_m, path_yaw)`` at the closest path point.
+
+    Positive crosstrack means the robot is to the **left** of the path
+    direction of travel.
+    """
+    pts = path.points
+    if len(pts) < 2:
+        return 0.0, float(current.theta)
+    px, py, seg_i, _along = closest_point_on_path(current, path)
+    i = min(max(0, seg_i), len(pts) - 2)
+    path_yaw = math.atan2(pts[i + 1][1] - pts[i][1], pts[i + 1][0] - pts[i][0])
+    ex = current.x - px
+    ey = current.y - py
+    crosstrack = math.cos(path_yaw) * ey - math.sin(path_yaw) * ex
+    return float(crosstrack), float(path_yaw)
