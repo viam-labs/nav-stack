@@ -24,6 +24,7 @@ def make_builtin_navigator(
         inflation_radius_m=nav_cfg.inflation_radius,
         robot_radius_m=nav_cfg.robot_radius,
         cost_scaling_factor=bcfg.cost_scaling_factor,
+        clearance_preference_m=bcfg.clearance_preference_m,
         algorithm=bcfg.planner,
         replan_period_s=bcfg.replan_period_s,
         lookahead_m=bcfg.lookahead_m,

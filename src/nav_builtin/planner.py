@@ -63,12 +63,53 @@ def _heuristic(a: Cell, b: Cell) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
-def _cell_step_cost(costs: np.ndarray, cell: Cell, base_step: float) -> float:
-    c = int(costs[cell])
+def _cost_multiplier(cost: int) -> float:
+    """Traversal multiplier for soft inflation (1 = free, ≫1 near obstacles).
+
+    Soft cells stay traversable so narrow corridors remain solvable, but the
+    multiplier must be strong enough that a modestly longer clear path beats a
+    short hug of the inflation halo when open space is available.
+    """
+    c = int(cost)
+    if c <= 0:
+        return 1.0
     if c >= INSCRIBED:
-        return base_step
-    penalty = 1.0 + (c / float(INSCRIBED)) * 0.5
-    return base_step * penalty
+        return 1e6
+    t = c / float(INSCRIBED - 1)
+    # Linear + steep quadratic: outer soft ≈ 10–20×, near-inscribed ≫50×.
+    return 1.0 + 25.0 * t + 120.0 * (t * t)
+
+
+# Any-angle LOS / string-pull may only shortcut through near-free cells.
+# Higher soft costs remain traversable via 8-connected steps (narrow gaps).
+_LOS_MAX_SOFT_COST = 30
+
+
+def _cell_step_cost(costs: np.ndarray, cell: Cell, base_step: float) -> float:
+    return base_step * _cost_multiplier(int(costs[cell]))
+
+
+def _segment_traversal_cost(costs: np.ndarray, a: Cell, b: Cell) -> float:
+    """Bresenham path length with per-cell soft-inflation multipliers.
+
+    Integrates step×multiplier (not Euclidean×peak) so Lazy Theta* pays for
+    every soft cell the way A* does, and still heavily penalizes halo clips.
+    """
+    cells = bresenham_cells(a, b)
+    if len(cells) <= 1:
+        return 0.0
+    total = 0.0
+    peak = 1.0
+    for i in range(1, len(cells)):
+        y0, x0 = cells[i - 1]
+        y1, x1 = cells[i]
+        step = math.hypot(y1 - y0, x1 - x0)
+        mult = _cost_multiplier(int(costs[cells[i]]))
+        peak = max(peak, mult)
+        total += step * mult
+    # Peak floor: a long mostly-free chord that nicks soft still pays.
+    euclid = math.hypot(b[0] - a[0], b[1] - a[1])
+    return max(total, euclid * peak)
 
 
 def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
@@ -76,6 +117,8 @@ def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
 
     Also rejects diagonal corner-cuts: when the line steps diagonally, both
     flanking orthogonal cells must be free (same rule as grid Theta*).
+    Soft-inflation cells above ``_LOS_MAX_SOFT_COST`` also fail LOS so
+    any-angle shortcuts stay in clear space when a clear detour exists.
     """
     y0, x0 = a
     y1, x1 = b
@@ -88,7 +131,12 @@ def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
     h, w = costs.shape
 
     while True:
-        if not (0 <= y < h and 0 <= x < w) or not is_traversable(int(costs[y, x])):
+        if not (0 <= y < h and 0 <= x < w):
+            return False
+        cell_cost = int(costs[y, x])
+        if not is_traversable(cell_cost):
+            return False
+        if cell_cost > _LOS_MAX_SOFT_COST:
             return False
         if (y, x) == (y1, x1):
             return True
@@ -109,12 +157,14 @@ def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
                 0 <= y - sy < h
                 and 0 <= x < w
                 and is_traversable(int(costs[y - sy, x]))
+                and int(costs[y - sy, x]) <= _LOS_MAX_SOFT_COST
             ):
                 return False
             if not (
                 0 <= y < h
                 and 0 <= x - sx < w
                 and is_traversable(int(costs[y, x - sx]))
+                and int(costs[y, x - sx]) <= _LOS_MAX_SOFT_COST
             ):
                 return False
 
@@ -152,13 +202,22 @@ def world_segment_traversable(
     y1: float,
     *,
     sample_step_m: float = 0.05,
+    max_cost: Optional[int] = None,
 ) -> bool:
-    """True when the Euclidean segment stays in traversable costmap cells."""
+    """True when the Euclidean segment stays in traversable costmap cells.
+
+    When ``max_cost`` is set, cells above that soft cost also fail (used by
+    string-pull so shortcuts stay in clear space).
+    """
     seg = math.hypot(x1 - x0, y1 - y0)
     step = max(1e-3, float(sample_step_m))
     if seg < 1e-9:
         row, col = occ.world_to_cell(x0, y0)
-        return occ.in_bounds(row, col) and is_traversable(int(costs[row, col]))
+        if not (occ.in_bounds(row, col) and is_traversable(int(costs[row, col]))):
+            return False
+        if max_cost is not None and int(costs[row, col]) > max_cost:
+            return False
+        return True
     n = max(1, int(math.ceil(seg / step)))
     for k in range(n + 1):
         t = k / n
@@ -166,6 +225,8 @@ def world_segment_traversable(
         y = y0 + t * (y1 - y0)
         row, col = occ.world_to_cell(x, y)
         if not occ.in_bounds(row, col) or not is_traversable(int(costs[row, col])):
+            return False
+        if max_cost is not None and int(costs[row, col]) > max_cost:
             return False
     return True
 
@@ -328,8 +389,8 @@ def _lazy_theta_star(
                 continue
             if not line_of_sight(costs, n, s):
                 continue
-            # Euclidean parent→s (n is an 8-neighbor, but keep any-angle form).
-            cand = g_score[n] + math.hypot(sy - ny, sx - nx)
+            # Euclidean parent→s weighted by soft inflation along the chord.
+            cand = g_score[n] + _segment_traversal_cost(costs, n, s)
             if cand < best_g:
                 best_g = cand
                 best_p = n
@@ -346,7 +407,7 @@ def _lazy_theta_star(
                     continue
                 if not is_traversable(int(costs[n])):
                     continue
-                cand = g_score[n] + step
+                cand = g_score[n] + _cell_step_cost(costs, s, step)
                 if cand < best_g:
                     best_g = cand
                     best_p = n
@@ -358,8 +419,8 @@ def _lazy_theta_star(
     def _compute_cost(s: Cell, sp: Cell) -> None:
         """Lazy update: assume LOS from parent(s) to ``sp`` (Path 2)."""
         ps = parent[s]
-        # Euclidean any-angle cost from assumed parent.
-        tentative = g_score[ps] + math.hypot(sp[0] - ps[0], sp[1] - ps[1])
+        # Any-angle length × inflation along the assumed parent chord.
+        tentative = g_score[ps] + _segment_traversal_cost(costs, ps, sp)
         if tentative < g_score.get(sp, math.inf):
             parent[sp] = ps
             g_score[sp] = tentative
@@ -520,6 +581,7 @@ def connect_plan_start(
     inflation_radius_m: float,
     robot_radius_m: float,
     cost_scaling_factor: float = 4.0,
+    clearance_preference_m: float = 0.35,
     algorithm: str = DEFAULT_PLANNER,
     xy_tolerance_m: float = 0.15,
     scan: Optional[conv.LaserScan2D] = None,
@@ -536,6 +598,7 @@ def connect_plan_start(
         inflation_radius_m=inflation_radius_m,
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
+        clearance_preference_m=clearance_preference_m,
     )
     sx, sy = result.path.points[0]
     at_start = math.hypot(pose.x - sx, pose.y - sy) <= xy_tolerance_m
@@ -550,6 +613,7 @@ def connect_plan_start(
         inflation_radius_m=inflation_radius_m,
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
+        clearance_preference_m=clearance_preference_m,
         algorithm=algorithm,
         scan=scan,
         scan_pose=pose if scan is not None else None,
@@ -700,6 +764,7 @@ def plan_path(
     inflation_radius_m: float,
     robot_radius_m: float = 0.22,
     cost_scaling_factor: float = 4.0,
+    clearance_preference_m: float = 0.35,
     algorithm: str = DEFAULT_PLANNER,
     scan: Optional[conv.LaserScan2D] = None,
     scan_pose: Optional[conv.Pose2D] = None,
@@ -742,6 +807,7 @@ def plan_path(
         inflation_radius_m=inflation_radius_m,
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
+        clearance_preference_m=clearance_preference_m,
     )
     result = plan_on_costmap(
         occ, costs, start, goal, algorithm=algorithm, robot_radius_m=robot_radius_m

@@ -392,6 +392,8 @@ class BuiltinNavConfig:
     # Consecutive SetVelocity timeouts before aborting the goal.
     drive_timeout_streak: int = 20
     cost_scaling_factor: float = 4.0
+    # Extra planning clearance past inflation_radius (not drawn as soft inflation).
+    clearance_preference_m: float = 0.35
     xy_goal_tolerance: float = 0.25  # meters
     yaw_goal_tolerance: float = 0.35  # radians (~20 deg; mugger uses 0.6)
     # After XY is inside tolerance, accept the goal if final yaw still has not
@@ -442,6 +444,7 @@ class BuiltinNavConfig:
             drive_timeout_s=float(d.get("drive_timeout_s", 5.0)),
             drive_timeout_streak=int(d.get("drive_timeout_streak", 20)),
             cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),
+            clearance_preference_m=float(d.get("clearance_preference_m", 0.35)),
             xy_goal_tolerance=float(d.get("xy_goal_tolerance", 0.25)),
             yaw_goal_tolerance=float(d.get("yaw_goal_tolerance", 0.35)),
             yaw_align_timeout_s=float(d.get("yaw_align_timeout_s", 6.0)),

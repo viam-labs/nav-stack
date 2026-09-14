@@ -44,6 +44,7 @@ class NavSupervisor:
         inflation_radius_m: float = 0.25,
         robot_radius_m: float = 0.22,
         cost_scaling_factor: float = 4.0,
+        clearance_preference_m: float = 0.35,
         algorithm: str = "lazy_theta_star",
         replan_period_s: float = 1.0,
         lookahead_m: float = 0.6,
@@ -90,6 +91,7 @@ class NavSupervisor:
         self._inflation = inflation_radius_m
         self._robot_radius = robot_radius_m
         self._cost_scaling = cost_scaling_factor
+        self._clearance_preference_m = max(0.0, float(clearance_preference_m))
         self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
         self._algorithm = algorithm
         self._replan_period = replan_period_s
@@ -224,6 +226,7 @@ class NavSupervisor:
             inflation_radius_m=self._inflation,
             robot_radius_m=self._robot_radius,
             cost_scaling_factor=self._cost_scaling,
+            clearance_preference_m=self._clearance_preference_m,
             algorithm=self._algorithm,
             scan=scan,
             scan_pose=pose if scan is not None else None,
@@ -239,6 +242,7 @@ class NavSupervisor:
                 inflation_radius_m=self._inflation,
                 robot_radius_m=self._robot_radius,
                 cost_scaling_factor=self._cost_scaling,
+                clearance_preference_m=self._clearance_preference_m,
                 algorithm=self._algorithm,
                 xy_tolerance_m=self._follower.motion.xy_tolerance_m,
                 scan=scan,
@@ -250,6 +254,7 @@ class NavSupervisor:
                 inflation_radius_m=self._inflation,
                 robot_radius_m=self._robot_radius,
                 cost_scaling_factor=self._cost_scaling,
+                clearance_preference_m=self._clearance_preference_m,
                 enabled=True,
                 sample_spacing_m=self._smooth_spacing,
             )
@@ -467,6 +472,7 @@ class NavSupervisor:
                                 inflation_radius_m=self._inflation,
                                 robot_radius_m=self._robot_radius,
                                 cost_scaling_factor=self._cost_scaling,
+                                clearance_preference_m=self._clearance_preference_m,
                             )
                             self._global_cache_at = now
                     local_view = self._local_costmap.update(

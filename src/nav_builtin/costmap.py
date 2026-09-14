@@ -182,6 +182,14 @@ def _disk_offsets(radius_cells: int) -> Tuple[np.ndarray, np.ndarray]:
     return np.asarray(ys, dtype=np.int32), np.asarray(xs, dtype=np.int32)
 
 
+# Soft costs at/above this are shown as inflation in nav-camera / UI.
+# Lower costs are planner-only clearance preference (invisible halo).
+_VIZ_SOFT_MIN = 50
+# Preference band just outside inflation_radius (all > planner LOS soft cap).
+_PREF_COST_HI = 48
+_PREF_COST_LO = 32
+
+
 def build_costmap(
     occ: OccupancyGrid,
     *,
@@ -189,13 +197,20 @@ def build_costmap(
     robot_radius_m: float = 0.0,
     occupied_threshold: int = 50,
     cost_scaling_factor: float = 4.0,
+    clearance_preference_m: float = 0.35,
 ) -> np.ndarray:
     """Return (H, W) uint8 costmap.
 
-    Occupied / unknown cells become lethal. Cells within
-    ``max(inflation_radius_m, robot_radius_m)`` of a lethal cell are marked
-    inscribed (non-traversable for global planning). ``robot_radius_m`` is
-    still used for footprint collision checks in the local planner.
+    Occupied / unknown cells become lethal. Cells within ``robot_radius_m`` of
+    a lethal cell are inscribed (non-traversable). Between that and
+    ``max(inflation_radius_m, robot_radius_m)`` soft costs decay with clearance
+    past the inscribed radius (Nav2-style).
+
+    Soft outer radius matches configured ``inflation_radius_m`` (clamped to at
+    least the footprint) — that is what UIs show. An additional low-cost
+    ``clearance_preference_m`` band past inflation biases planning toward open
+    space when a detour exists; it is not drawn as inflation (see
+    ``costs_to_occupancy_viz``).
     """
     h, w = occ.height, occ.width
     costs = np.full((h, w), FREE, dtype=np.uint8)
@@ -206,15 +221,21 @@ def build_costmap(
     costs[raw < 0] = UNKNOWN  # unknown stays unknown; planner treats as lethal
 
     res = max(float(occ.resolution), 1e-6)
-    # Full inflation radius is hard-blocked for planning (Lazy Theta* treats
-    # soft costs as free and would shortcut through a partial halo).
-    clearance_m = max(float(inflation_radius_m), float(robot_radius_m))
-    inscribed_cells = max(0, int(math.ceil(clearance_m / res)))
+    # Hard block = footprint only. Soft halo = configured inflation radius.
+    inscribed_m = max(0.0, float(robot_radius_m))
+    inflate_m = max(float(inflation_radius_m), inscribed_m)
+    prefer_m = max(0.0, float(clearance_preference_m))
+    prefer_outer_m = inflate_m + prefer_m
+    inscribed_cells = max(0, int(math.ceil(inscribed_m / res)))
     inflate_cells = max(
         inscribed_cells,
-        max(0, int(math.ceil(float(inflation_radius_m) / res))),
+        max(0, int(math.ceil(inflate_m / res))),
     )
-    if inscribed_cells == 0 and inflate_cells == 0:
+    prefer_cells = max(
+        inflate_cells,
+        max(0, int(math.ceil(prefer_outer_m / res))),
+    )
+    if inscribed_cells == 0 and inflate_cells == 0 and prefer_cells == 0:
         return costs
 
     # Seed from occupied (not unknown-only) so unknown voids don't inflate.
@@ -228,7 +249,7 @@ def build_costmap(
     seed_y, seed_x = np.nonzero(seed)
     dist[seed_y, seed_x] = 0
 
-    max_r = max(inflate_cells, inscribed_cells)
+    max_r = max(prefer_cells, inflate_cells, inscribed_cells)
     for r in range(1, max_r + 1):
         dys, dxs = _disk_offsets(r)
         # Only paint the ring at exactly this radius for speed.
@@ -251,17 +272,34 @@ def build_costmap(
 
     # Apply inflation costs on free cells (vectorized).
     free = costs == FREE
-    within = free & (dist <= inflate_cells)
-    if within.any():
-        inscribed = within & (dist <= inscribed_cells)
+    within_soft = free & (dist <= inflate_cells)
+    if within_soft.any():
+        inscribed = within_soft & (dist <= inscribed_cells)
         costs[inscribed] = INSCRIBED
-        soft = within & ~inscribed
+        soft = within_soft & ~inscribed
         if soft.any():
             dist_m = dist[soft].astype(np.float64) * res
+            # Nav2-style: decay with clearance past the inscribed radius so the
+            # outer soft edge stays meaningful and paths prefer open space.
+            clearance_m = np.maximum(0.0, dist_m - inscribed_m)
             soft_costs = np.rint(
-                INSCRIBED * np.exp(-cost_scaling_factor * dist_m)
+                (INSCRIBED - 1) * np.exp(-cost_scaling_factor * clearance_m)
             ).astype(np.int32)
             costs[soft] = np.clip(soft_costs, 1, INSCRIBED - 1).astype(np.uint8)
+
+    # Planner-only preference past inflation (not shown in costmap viz).
+    if prefer_m > 1e-6 and prefer_cells > inflate_cells:
+        prefer = free & (dist > inflate_cells) & (dist <= prefer_cells)
+        if prefer.any():
+            dist_m = dist[prefer].astype(np.float64) * res
+            # 0 at inflation edge → 1 at preference outer.
+            frac = np.clip((dist_m - inflate_m) / prefer_m, 0.0, 1.0)
+            pref_costs = np.rint(
+                _PREF_COST_HI - (_PREF_COST_HI - _PREF_COST_LO) * frac
+            ).astype(np.int32)
+            costs[prefer] = np.clip(
+                pref_costs, _PREF_COST_LO, _PREF_COST_HI
+            ).astype(np.uint8)
 
     return costs
 
@@ -281,6 +319,9 @@ def costs_to_occupancy_viz(costs: np.ndarray) -> np.ndarray:
 
     Nav2 / nav_view colouring expects: -1 unknown, 0 free, 1..98 inflation,
     99 inscribed, 100 lethal.
+
+    Planner-only clearance preference costs (below ``_VIZ_SOFT_MIN``) render as
+    free so the UI inflation ring matches ``inflation_radius``.
     """
     c = np.asarray(costs)
     out = np.zeros(c.shape, dtype=np.int16)
@@ -288,9 +329,9 @@ def costs_to_occupancy_viz(costs: np.ndarray) -> np.ndarray:
     out[c == UNKNOWN] = -1
     out[c == LETHAL] = 100
     out[c == INSCRIBED] = 99
-    mid = (c > FREE) & (c < INSCRIBED)
+    mid = (c >= _VIZ_SOFT_MIN) & (c < INSCRIBED)
     if mid.any():
-        # Map 1..252 → 1..98.
+        # Map viz soft → 1..98.
         scaled = np.clip(
             np.rint(c[mid].astype(np.float32) * (98.0 / float(INSCRIBED - 1))),
             1,

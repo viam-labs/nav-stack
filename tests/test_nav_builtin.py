@@ -8,6 +8,8 @@ import pytest
 
 from src.nav_builtin.controller import FollowerConfig, compute_path_command, lookahead_pose
 from src.nav_builtin.costmap import (
+    FREE,
+    INSCRIBED,
     LETHAL,
     build_costmap,
     footprint_traversable,
@@ -199,6 +201,43 @@ def test_costmap_viz_dict_shows_inflation_gradient():
     assert d["resolution"] == 0.05
 
 
+def test_costmap_soft_outer_matches_inflation_radius():
+    """Soft halo ends at inflation_radius; preference past that is planner-only."""
+    from src.nav_builtin.costmap import costs_to_occupancy_viz
+
+    occ = OccupancyGrid(
+        grid=np.zeros((81, 81), dtype=np.int16),
+        resolution=0.05,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    occ.grid[40, 40] = 100
+    robot_r = 0.22
+    inflate_r = 0.35
+    costs = build_costmap(
+        occ,
+        inflation_radius_m=inflate_r,
+        robot_radius_m=robot_r,
+        cost_scaling_factor=4.0,
+        clearance_preference_m=0.35,
+    )
+    cx, cy = 2.0, 2.0  # world center of obstacle cell
+    # Just inside soft outer edge: non-zero soft cost (viz-visible).
+    r_in, c_in = occ.world_to_cell(cx + inflate_r - 0.03, cy)
+    assert int(costs[r_in, c_in]) >= 50
+    # Just outside configured inflation: preference cost, not drawn as soft.
+    r_out, c_out = occ.world_to_cell(cx + inflate_r + 0.08, cy)
+    assert 0 < int(costs[r_out, c_out]) < 50
+    viz = costs_to_occupancy_viz(costs)
+    assert int(viz[r_out, c_out]) == 0
+    # Inside footprint: inscribed.
+    r_hard, c_hard = occ.world_to_cell(cx + robot_r * 0.5, cy)
+    assert int(costs[r_hard, c_hard]) == INSCRIBED
+    # Past preference band: free.
+    r_far, c_far = occ.world_to_cell(cx + inflate_r + 0.45, cy)
+    assert int(costs[r_far, c_far]) == FREE
+
+
 def test_plan_respects_inflation_radius():
     """Lazy Theta* must not shortcut through the soft inflation halo."""
     grid = np.zeros((40, 40), dtype=np.int16)
@@ -212,7 +251,8 @@ def test_plan_respects_inflation_radius():
     costs = build_costmap(
         occ, inflation_radius_m=0.35, robot_radius_m=0.05, cost_scaling_factor=3.0
     )
-    # With the fix, 0.35 m halo is inscribed — path cannot pass through x≈2, y≈2.
+    # Soft halo out to inflation_radius; path may graze soft costs but must
+    # stay traversable (outside inscribed/lethal).
     result = plan_on_costmap(
         occ, costs, start, goal, algorithm="lazy_theta_star"
     )
@@ -220,6 +260,113 @@ def test_plan_respects_inflation_radius():
     for x, y in result.path.points:
         r, c = occ.world_to_cell(x, y)
         assert is_traversable(int(costs[r, c]))
+
+
+def test_planner_prefers_clear_lane_over_inflation_hug():
+    """When a clear detour exists, do not hug the soft inflation of a wall."""
+    import numpy as np
+
+    grid = np.zeros((100, 140), dtype=np.int16)
+    grid[0:28, 25:115] = 100  # solid block for y in [0, 1.4)
+    occ = OccupancyGrid(grid=grid, resolution=0.05, origin_x=0.0, origin_y=0.0)
+    costs = build_costmap(
+        occ, inflation_radius_m=0.40, robot_radius_m=0.22, cost_scaling_factor=4.0
+    )
+    start = Pose2D(0.6, 1.55, 0.0)
+    goal = Pose2D(6.4, 1.55, 0.0)
+    result = plan_on_costmap(
+        occ, costs, start, goal, algorithm="lazy_theta_star", robot_radius_m=0.22
+    )
+    assert result.feasible
+    # Sample the polyline across the wall span — must climb into free space
+    # (~y≥1.8) rather than ride the inscribed/soft edge at y≈1.55.
+    ys: list[float] = []
+    peak_cost = 0
+    pts = result.path.points
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i][0], pts[i][1]
+        x1, y1 = pts[i + 1][0], pts[i + 1][1]
+        for t in np.linspace(0.0, 1.0, 60):
+            x = x0 + t * (x1 - x0)
+            y = y0 + t * (y1 - y0)
+            if 1.5 < x < 5.5:
+                ys.append(y)
+                r, c = occ.world_to_cell(x, y)
+                peak_cost = max(peak_cost, int(costs[r, c]))
+    assert ys
+    assert min(ys) >= 1.65
+    # Mid-route should stay out of meaningful soft inflation.
+    assert peak_cost <= 30
+
+
+def test_corner_path_stays_out_of_soft_halo():
+    """Repro: round a pillar tip in clear space, not through the soft glow."""
+    import numpy as np
+
+    from src.nav_builtin.smoother import smooth_path
+
+    grid = np.zeros((80, 80), dtype=np.int16)
+    grid[20:55, 35:50] = 100  # vertical bar
+    occ = OccupancyGrid(grid=grid, resolution=0.05, origin_x=0.0, origin_y=0.0)
+    costs = build_costmap(
+        occ, inflation_radius_m=0.35, robot_radius_m=0.22, cost_scaling_factor=4.0
+    )
+    start = Pose2D(1.0, 2.5, 0.0)
+    goal = Pose2D(3.2, 1.0, 0.0)
+    result = plan_on_costmap(
+        occ, costs, start, goal, algorithm="lazy_theta_star", robot_radius_m=0.22
+    )
+    assert result.feasible
+    path = smooth_path(result.path, costs, occ, enabled=True, sample_spacing_m=0.10)
+    peak = 0
+    pts = path.points
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i][0], pts[i][1]
+        x1, y1 = pts[i + 1][0], pts[i + 1][1]
+        for t in np.linspace(0.0, 1.0, 40):
+            x = x0 + t * (x1 - x0)
+            y = y0 + t * (y1 - y0)
+            r, c = occ.world_to_cell(x, y)
+            if occ.in_bounds(r, c):
+                peak = max(peak, int(costs[r, c]))
+    # Open space around the tip: stay in free / near-free, not soft glow.
+    assert peak <= 5
+
+
+def test_t_pillar_tip_prefers_clear_swing():
+    """Screenshot-like stem tip: only under-tip route; stay outside soft glow."""
+    grid = np.zeros((120, 100), dtype=np.int16)
+    # Stem from y=2.0 up to map top so the only detour is under the tip.
+    grid[40:120, 48:55] = 100
+    occ = OccupancyGrid(grid=grid, resolution=0.05, origin_x=0.0, origin_y=0.0)
+    costs = build_costmap(
+        occ, inflation_radius_m=0.35, robot_radius_m=0.22, cost_scaling_factor=4.0
+    )
+    start = Pose2D(3.6, 2.4, 0.0)
+    goal = Pose2D(1.4, 2.4, 0.0)
+    result = plan_on_costmap(
+        occ, costs, start, goal, algorithm="lazy_theta_star", robot_radius_m=0.22
+    )
+    assert result.feasible
+    ys: list[float] = []
+    peak = 0
+    pts = result.path.points
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i][0], pts[i][1]
+        x1, y1 = pts[i + 1][0], pts[i + 1][1]
+        for t in np.linspace(0.0, 1.0, 50):
+            x = x0 + t * (x1 - x0)
+            y = y0 + t * (y1 - y0)
+            if 2.2 < x < 2.9:
+                ys.append(y)
+                r, c = occ.world_to_cell(x, y)
+                if occ.in_bounds(r, c):
+                    peak = max(peak, int(costs[r, c]))
+    assert ys
+    # Tip at y=2.0; soft outer ≈ 1.65; preference outer ≈ 1.30. Prefer clear
+    # swing outside the visible glow (and ideally past preference).
+    assert max(ys) <= 1.40
+    assert peak <= 5
 
 
 def test_plan_straight_line_on_empty_map():
