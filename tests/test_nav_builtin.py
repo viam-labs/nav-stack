@@ -600,11 +600,13 @@ def test_follow_command_translates_while_gently_turning():
 
     cfg = FollowerConfig()
     current = Pose2D(0.0, 0.0, 0.0)
-    target = Pose2D(2.0, 0.5, 0.0)  # ~14 deg bearing — should still drive
+    # Path runs +x; lookahead slightly left — light steer, still drive.
+    target = Pose2D(2.0, 0.5, 0.0)
     cmd = compute_follow_command(current, target, cfg=cfg)
     assert not cmd.done
     assert cmd.vx > 0.05
     assert cmd.vtheta != 0.0
+    assert abs(cmd.vtheta) <= cfg.max_translate_yaw_rad_s + 1e-6
 
 
 def test_follow_command_cruises_when_aligned():
@@ -612,11 +614,29 @@ def test_follow_command_cruises_when_aligned():
 
     cfg = FollowerConfig()
     cfg.motion.max_linear_mps = 0.6
-    current = Pose2D(0.0, 0.0, -2.29)
-    target = Pose2D(-0.38, -2.96, 0.0)  # ~0.04 rad bearing, ~1 m ahead
+    path_yaw = math.atan2(-2.96, -0.38)
+    current = Pose2D(0.0, 0.0, path_yaw)
+    target = Pose2D(-0.38, -2.96, path_yaw)
     cmd = compute_follow_command(current, target, cfg=cfg, final_yaw=None)
     assert not cmd.done
     assert cmd.vx >= 0.33
+    assert abs(cmd.vtheta) < 0.15
+
+
+def test_follow_command_tracks_path_tangent_not_point_chase():
+    """On-path but heading slightly off: steer from path yaw, not a short point chase."""
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.max_linear_mps = 0.6
+    # Robot on the x-axis path, yawed +20°; lookahead 1 m ahead on path.
+    current = Pose2D(0.0, 0.0, math.radians(20.0))
+    target = Pose2D(1.0, 0.0, 0.0)
+    cmd = compute_follow_command(current, target, cfg=cfg, final_yaw=None)
+    assert cmd.vx > 0.2
+    # Path-tangent error is −20° → modest CW turn, not a hard chase.
+    assert cmd.vtheta < 0.0
+    assert abs(cmd.vtheta) <= 0.45
 
 
 def test_follow_command_approach_cap_only_at_goal():

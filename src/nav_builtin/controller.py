@@ -24,14 +24,21 @@ from .types import Path2D, Pose2D
 
 @dataclass
 class FollowerConfig:
-    lookahead_m: float = 0.6
-    min_lookahead_m: float = 0.25
-    max_lookahead_m: float = 0.7
+    # Longer lookahead = gentler pure-pursuit arcs on skid-steer. The mugger
+    # 0.25–0.7 m RPP band made mid-path corrections too sharp (small arcs → big).
+    lookahead_m: float = 1.0
+    min_lookahead_m: float = 0.7
+    max_lookahead_m: float = 1.4
     approach_dist_m: float = 0.35
     waypoint_tolerance_m: float = 0.15
     # Above this bearing error, stop translating and rotate in place. Below it,
     # keep moving while turning (needed for sparse Lazy Theta* paths).
-    rotate_in_place_rad: float = math.radians(75.0)
+    # Kept tighter than 75° so we don't carve large translate+turn arcs.
+    rotate_in_place_rad: float = math.radians(55.0)
+    # Mid-path angular gain on path-tangent error (was 1.8 on point-bearing).
+    heading_gain: float = 1.0
+    # Cap |vθ| while translating so turn radius stays gentle.
+    max_translate_yaw_rad_s: float = 0.55
     motion: SimpleMotionConfig = field(default_factory=SimpleMotionConfig)
     obstacle: Optional[ObstacleConfig] = None
 
@@ -185,7 +192,7 @@ def _effective_lookahead(
     speed_mps: float,
     near_goal: bool = False,
 ) -> float:
-    """Velocity-scaled lookahead (mugger-dds RPP: 0.25–0.7 m at ~1 s horizon)."""
+    """Velocity-scaled lookahead — longer = gentler arcs on diff/skid bases."""
     lo = min(cfg.min_lookahead_m, cfg.max_lookahead_m)
     hi = max(cfg.min_lookahead_m, cfg.max_lookahead_m)
     if near_goal:
@@ -286,23 +293,37 @@ def compute_follow_command(
     max_linear = motion.max_linear_mps
     max_angular = motion.max_angular_rad_s
 
+    # Mid-path: track the path tangent (target.theta from lookahead), not chase
+    # the lookahead point. Point-bearing + short lookahead carved large arcs.
+    path_yaw = float(target.theta)
+    heading_err = heading_error_rad(current.theta, path_yaw)
+    bearing_to_point = heading_error_rad(current.theta, heading_to_target)
+    # Light pull onto the path when laterally offset (blend toward point).
+    point_pull = conv.normalize_angle(bearing_to_point - heading_err)
+    steer = heading_err + 0.25 * point_pull
+    # Lookahead behind / badly misaligned: face it in place (don't reverse-arc).
+    along = math.cos(path_yaw) * (target.x - current.x) + math.sin(path_yaw) * (
+        target.y - current.y
+    )
+    face = bearing_to_point if along < 0.05 else steer
+
     # Large heading error: rotate in place first so skid-steers don't carve
-    # circles. Threshold is intentionally wide so sparse any-angle paths still
-    # translate while gently correcting.
-    if abs(bearing) > cfg.rotate_in_place_rad:
+    # circles.
+    if abs(face) > cfg.rotate_in_place_rad or along < 0.05:
         return apply_velocity_floor(
-            DriveCommand(0.0, 0.0, _clamp(bearing * 1.5, max_angular), False),
+            DriveCommand(0.0, 0.0, _clamp(face * 1.5, max_angular), False),
             motion,
         )
 
     linear_cmd = _clamp(dist * 0.75, max_linear)
-    if abs(bearing) < math.radians(25.0):
-        # On-path cruise: don't crawl when bearing is good.
+    if abs(steer) < math.radians(25.0):
+        # On-path cruise: don't crawl when heading is good.
         linear_cmd = max(max_linear * 0.55, min(max_linear, linear_cmd))
-    # Scale linear with bearing so we don't plow sideways (less aggressive).
-    bearing_scale = max(0.45, 1.0 - (abs(bearing) / cfg.rotate_in_place_rad) * 0.45)
+    # Scale linear with heading error so we don't plow sideways.
+    bearing_scale = max(0.45, 1.0 - (abs(steer) / cfg.rotate_in_place_rad) * 0.45)
     linear_cmd *= bearing_scale
-    angular_cmd = _clamp(bearing * 1.8, max_angular)
+    yaw_cap = min(max_angular, float(cfg.max_translate_yaw_rad_s))
+    angular_cmd = _clamp(steer * float(cfg.heading_gain), yaw_cap)
     return apply_velocity_floor(
         DriveCommand(linear_cmd, 0.0, angular_cmd, False), motion
     )

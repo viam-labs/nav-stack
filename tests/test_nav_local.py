@@ -345,7 +345,7 @@ def test_compute_path_command_defers_local_planner_when_misaligned():
         robot_radius_m=0.08,
     )
     assert progress.get("local_planner") is False
-    assert abs(progress["bearing_error_rad"]) > math.radians(75.0)
+    assert abs(progress["bearing_error_rad"]) > math.radians(55.0)
     assert cmd.vx == 0.0
     assert abs(cmd.vtheta) > 0.05
 

@@ -379,11 +379,11 @@ class BuiltinNavConfig:
 
     # ``lazy_theta_star`` (default) or ``astar``.
     planner: str = BUILTIN_PLANNER_LAZY_THETA
-    # Pure-pursuit lookahead (mugger-dds RPP uses 0.25–0.7 m velocity-scaled;
-    # 1.0 m was Nav2-cart-ish and cut corners / overshot on diff-drive).
-    lookahead_m: float = 0.6
-    min_lookahead_m: float = 0.25
-    max_lookahead_m: float = 0.7
+    # Longer pure-pursuit lookahead = gentler arcs on skid-steer. Short RPP
+    # (0.25–0.7 m) made mid-path corrections too sharp.
+    lookahead_m: float = 1.0
+    min_lookahead_m: float = 0.7
+    max_lookahead_m: float = 1.4
     replan_period_s: float = 1.0
     timeout_s: float = 300.0
     # Base.SetVelocity wait on the shared module event loop. Mapping+SLAM can
@@ -436,9 +436,9 @@ class BuiltinNavConfig:
             return cls()
         return cls(
             planner=normalize_builtin_planner(d.get("planner", BUILTIN_PLANNER_LAZY_THETA)),
-            lookahead_m=float(d.get("lookahead_m", 0.6)),
-            min_lookahead_m=float(d.get("min_lookahead_m", 0.25)),
-            max_lookahead_m=float(d.get("max_lookahead_m", 0.7)),
+            lookahead_m=float(d.get("lookahead_m", 1.0)),
+            min_lookahead_m=float(d.get("min_lookahead_m", 0.7)),
+            max_lookahead_m=float(d.get("max_lookahead_m", 1.4)),
             replan_period_s=float(d.get("replan_period_s", 1.0)),
             timeout_s=float(d.get("timeout_s", 300.0)),
             drive_timeout_s=float(d.get("drive_timeout_s", 5.0)),

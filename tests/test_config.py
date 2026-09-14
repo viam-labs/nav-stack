@@ -407,7 +407,7 @@ def test_nav_config_nav_backend_nav2():
         {"slam_service": "slam", "base": "b", "nav_backend": "nav2"}
     )
     assert cfg.uses_nav2() is True
-    assert cfg.builtin.lookahead_m == 0.6
+    assert cfg.builtin.lookahead_m == 1.0
 
 
 def test_builtin_recovery_wait_defaults_match_nav2_tune():
