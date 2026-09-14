@@ -64,18 +64,25 @@ def _near_goal_command(
 
     Keep closing XY until a few centimetres from the point, then pure-spin for
     final yaw. Supervisor may still accept XY-only after a yaw align timeout
-    once settled. We do not stop translating at the outer ``xy_tolerance`` ball
-    — that left ~0.1–0.25 m residuals while hunting heading.
+    once inside the acceptance ball. We do not stop translating at the outer
+    ``xy_tolerance`` ball — that left ~0.1–0.25 m residuals while hunting heading.
 
     Translating cmds must survive ``ViamWorldIO`` base sanitizer: it zeros
     ``|vx| < 0.12`` when ``|vθ| > 0.25`` (and ``|vx| < 0.05`` always). Tiny
     reverse crawls with yaw hunt therefore become pure spin — end wiggle
     with no XY progress.
+
+    Inside ``xy_tolerance``, never pure-spin to face the *point* (that flip-flops
+    with final-yaw spin). Soft-crawl or, when already close enough, spin for
+    goal θ only.
     """
     xy_tol = motion.xy_tolerance_m
     yaw_tol = motion.yaw_tolerance_rad
     # Nail the point before hunting goal θ (acceptance ball stays xy_tol).
     xy_settle_m = xy_settle_radius_m(xy_tol)
+    # Once inside acceptance, prefer final yaw over point-facing RIP so we do
+    # not oscillate: face-point → crawl → overshoot → final-yaw → drift → repeat.
+    final_yaw_hand_off_m = max(0.12, min(xy_tol * 0.5, 0.15))
     yaw_cap = min(0.40, motion.max_angular_rad_s)
     # Keep |vθ| under the sanitizer's 0.25 cut when also translating.
     translate_yaw_cap = min(yaw_cap, 0.22)
@@ -90,7 +97,11 @@ def _near_goal_command(
         return DriveCommand(0.0, 0.0, vtheta, False)
 
     def _close_xy(*, soft: bool = False) -> DriveCommand:
-        """Face the goal point (or reverse) and close distance."""
+        """Close distance to the goal point without pure-spin face-the-point RIP.
+
+        Soft mode never stops to rotate in place: that was the end-of-path
+        swing (spin to point bearing, crawl, then spin the other way for θ).
+        """
         floor = soft_floor if soft else crawl_floor
         # Soft: scale speed with remaining gap so a 6 cm approach doesn't
         # blast through the settle radius at 0.12 m/s.
@@ -103,7 +114,12 @@ def _near_goal_command(
                 max_crawl, max(floor, motion.max_linear_mps * (0.20 if soft else 0.25))
             )
             rev_bearing = conv.normalize_angle(bearing + math.pi)
-            vth = 0.0 if soft else _clamp(rev_bearing * 1.2, translate_yaw_cap)
+            # Soft: reverse with almost no yaw so sanitizer keeps vx.
+            vth = (
+                _clamp(rev_bearing * 0.6, 0.15)
+                if soft
+                else _clamp(rev_bearing * 1.2, translate_yaw_cap)
+            )
             return apply_velocity_floor(
                 DriveCommand(
                     -max(floor, min(crawl, dist * 0.8)),
@@ -113,8 +129,8 @@ def _near_goal_command(
                 ),
                 motion,
             )
-        if abs(bearing) > math.radians(45.0):
-            # Face the point first — don't mix tiny vx with large vθ.
+        if abs(bearing) > math.radians(45.0) and not soft:
+            # Outside acceptance: face the point first.
             return apply_velocity_floor(
                 DriveCommand(0.0, 0.0, _clamp(bearing * 1.5, yaw_cap), False),
                 motion,
@@ -124,8 +140,14 @@ def _near_goal_command(
         )
         vx = max(floor, min(crawl, dist * (1.2 if soft else 0.8)))
         vth = _clamp(bearing * (1.0 if soft else 1.5), translate_yaw_cap)
-        if soft and abs(bearing) < math.radians(25.0):
-            # Keep |vθ| low so soft |vx| survives the sanitizer.
+        if soft:
+            # Keep |vθ| low so soft |vx| survives the sanitizer — even with
+            # large bearing (crawl while turning instead of RIP).
+            vth = _clamp(bearing * 0.7, 0.15)
+            if abs(bearing) > math.radians(60.0):
+                # Prefer slow reverse/forward over a long in-place swing.
+                vx = max(floor, min(vx, 0.08))
+        elif abs(bearing) < math.radians(25.0):
             vth = _clamp(bearing * 0.8, 0.15)
         return apply_velocity_floor(
             DriveCommand(vx, 0.0, vth, False),
@@ -136,11 +158,10 @@ def _near_goal_command(
     if dist <= xy_settle_m:
         return _spin_yaw()
 
-    # Inside acceptance ball but not settled: soft-close XY (ignore final yaw),
-    # unless we're already a few cm out and heading is still wrong — further soft
-    # crawl often dies under obstacle:slow + sanitizer, so never hand off to yaw.
+    # Inside acceptance ball: soft-close XY, or hand off to final yaw once
+    # close enough that another face-point spin would start the end wiggle.
     if dist <= xy_tol:
-        if abs(yaw_err) > yaw_tol and dist <= max(0.06, xy_settle_m * 2.0):
+        if abs(yaw_err) > yaw_tol and dist <= final_yaw_hand_off_m:
             return _spin_yaw()
         return _close_xy(soft=True)
 

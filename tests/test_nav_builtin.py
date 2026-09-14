@@ -704,6 +704,52 @@ def test_follow_command_just_outside_2x_tol_no_full_spin():
         assert abs(cmd.vtheta) <= 0.25 + 1e-6
 
 
+def test_follow_command_dock_end_no_point_facing_rip():
+    """Repro: ~9 cm out, ~57° off dock yaw — don't RIP to face the point.
+
+    Status dump: spinning |vθ|=0.4 with vx=0 while hunting point bearing,
+    then crawl, then final-yaw the other way — endless end swing.
+    """
+    from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(-0.972, 1.663, -0.844)
+    goal = Pose2D(-1.051, 1.622, 0.042)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    # Prefer final-yaw handoff (close enough) or soft crawl — never long
+    # in-place spin solely to face the XY point.
+    if cmd.vx == 0.0:
+        # Final yaw spin: error is toward +0.042 from -0.844 → positive vθ.
+        yaw_err = conv.normalize_angle(goal.theta - current.theta)
+        assert cmd.vtheta * yaw_err > 0.0
+    else:
+        sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+        assert abs(sx) >= 0.05 - 1e-6
+        assert abs(st) <= 0.25 + 1e-6
+
+
+def test_follow_command_inside_tol_soft_close_no_rip():
+    """Inside XY tol with mid bearing: crawl, do not pure-spin to face point."""
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    # ~0.18 m out (beyond final-yaw handoff), final yaw still off, bearing ~56°.
+    current = Pose2D(0.0, 0.0, 0.0)
+    goal = Pose2D(0.10, 0.15, 0.8)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    assert abs(cmd.vx) > 1e-6
+    assert abs(cmd.vtheta) <= 0.22 + 1e-6
+
+
 def test_follow_command_end_approach_no_tiny_reverse_yaw_hunt():
     """Repro: 0.29 m out, goal behind heading — don't emit vx=-0.06 + vθ=0.28."""
     from src.nav_builtin.controller import compute_follow_command
@@ -820,12 +866,11 @@ def test_follow_command_near_settle_large_yaw_spins():
     assert abs(cmd.vtheta) <= 0.40 + 1e-6
 
 
-def test_follow_command_nine_cm_out_still_soft_closes():
-    """Repro: ~9 cm residual must keep soft-closing, not yaw-timeout at 0.10."""
+def test_follow_command_nine_cm_out_hands_off_to_final_yaw():
+    """~9 cm out with final yaw still wrong: spin for θ, not soft-crawl forever."""
     import math
 
     from src.nav_builtin.controller import compute_follow_command
-    from src.nav_builtin.viam_io import _sanitize_base_cmd
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -838,9 +883,11 @@ def test_follow_command_nine_cm_out_still_soft_closes():
     current = Pose2D(current_xy[0], current_xy[1], heading)
     cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
     assert not cmd.done
-    sx, _, _ = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
-    assert abs(sx) >= 0.05 - 1e-6
-    assert abs(cmd.vx) > 0.0
+    # Close enough for final-yaw handoff — pure spin toward goal θ.
+    assert cmd.vx == 0.0
+    yaw_err = conv.normalize_angle(goal.theta - current.theta)
+    assert abs(yaw_err) > cfg.motion.yaw_tolerance_rad
+    assert cmd.vtheta * yaw_err > 0.0
 
 
 def test_follow_command_large_yaw_far_out_closes_xy_first():

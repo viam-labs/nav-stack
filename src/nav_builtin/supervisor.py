@@ -14,7 +14,7 @@ from ..nav.simple_motion import (
     rear_clearance_m,
 )
 from ..ros import conversions as conv
-from .controller import FollowerConfig, compute_path_command, xy_settle_radius_m
+from .controller import FollowerConfig, compute_path_command
 from .local_costmap import (
     LocalCostmap,
     LocalCostmapConfig,
@@ -85,7 +85,7 @@ class NavSupervisor:
         replan_local_blocked_time_s: float = 0.3,
         replan_local_min_period_s: float = 0.5,
         drive_timeout_streak: int = 20,
-        yaw_align_timeout_s: float = 6.0,
+        yaw_align_timeout_s: float = 4.0,
     ):
         self._world = world
         self._inflation = inflation_radius_m
@@ -399,9 +399,7 @@ class NavSupervisor:
                 goal_pose = Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta)
                 dist_goal_chk = distance_m(pose, goal_pose)
                 xy_tol = self._follower.motion.xy_tolerance_m
-                xy_settle = xy_settle_radius_m(xy_tol)
                 xy_ok = dist_goal_chk <= xy_tol
-                xy_settled = dist_goal_chk <= xy_settle
                 yaw_ok = (
                     abs(conv.normalize_angle(pose.theta - goal_pose.theta))
                     <= self._follower.motion.yaw_tolerance_rad
@@ -411,16 +409,17 @@ class NavSupervisor:
                     self._world.stop()
                     self._set_status(state="succeeded", active=False, error_msg="")
                     return
-                # Only start the yaw give-up clock once XY is nailed (settled).
-                # Otherwise we accept ~0.24 m residuals while still soft-closing.
-                if xy_settled:
+                # Start the yaw give-up clock once inside XY acceptance — not only
+                # after the ~3 cm settle — so end-wiggle cannot run forever while
+                # oscillating just outside settle.
+                if xy_ok:
                     if xy_ok_since is None:
                         xy_ok_since = now
                     elif (
                         self._yaw_align_timeout_s > 0.0
                         and now - xy_ok_since >= self._yaw_align_timeout_s
                     ):
-                        # Settled on the point but final yaw won't lock. Accept XY.
+                        # Close enough in XY; final yaw will not lock cleanly.
                         self._world.stop()
                         self._set_status(
                             state="succeeded",
