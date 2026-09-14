@@ -114,20 +114,47 @@ def apply_obstacle_avoidance(
     *,
     max_angular_rad_s: float,
 ) -> tuple["DriveCommand", str, float]:
-    """Adjust a forward drive command for obstacles seen in ``scan``.
+    """Adjust a drive command for obstacles seen in ``scan``.
 
     Returns ``(command, state, forward_clearance_m)`` where state is one of
-    ``clear`` / ``slow`` / ``avoid`` / ``no_scan``. Only forward motion
-    (``vx > 0``) is affected; in-place rotation (final-heading, or an active
-    avoid turn) passes through so the robot can still spin to safety.
+    ``clear`` / ``slow`` / ``avoid`` / ``hold`` / ``no_scan``.
+
+    Forward motion (``vx > 0``): slow inside ``slow_distance``, and at
+    ``stop_distance`` stop translating and turn toward the clearer side
+    (``avoid``).
+
+    In-place rotation / reverse (``vx <= 0``): do **not** drive into a person
+    while spinning. If the front stop bubble (or the flank we are turning
+    into) is occupied, full stop (``hold``). Clear-space spins (final yaw,
+    rotate-to-heading in open space) still pass through.
 
     When avoidance is enabled but ``scan`` is None (no fresh data), forward
     motion is suppressed as a fail-safe — driving blind defeats the purpose of
-    the feature and is how the robot ends up nosing into obstacles it "can't
-    see". Rotation is preserved so the robot can still finish a final heading.
+    the feature. Rotation is preserved when translating so a final heading can
+    still finish; a pure spin with no scan is left alone (same as clear space).
     """
-    if not obs.enabled or cmd.done or cmd.vx <= 0.0:
+    if not obs.enabled or cmd.done:
         return cmd, "clear", math.inf
+
+    if cmd.vx <= 0.0:
+        if scan is None:
+            return cmd, "clear", math.inf
+        half = obs.front_cone_half_rad
+        forward = cone_min_range(scan, -half, half)
+        stop = float(obs.stop_distance_m)
+        if forward <= stop:
+            # Person / wall dead ahead during rotate-to-heading: freeze.
+            return DriveCommand(0.0, 0.0, 0.0, False), "hold", forward
+        if abs(cmd.vtheta) > 1e-6:
+            # Don't swing the bumper into a near hit on the turn side.
+            if cmd.vtheta > 0.0:
+                flank = cone_min_range(scan, 0.0, obs.side_cone_rad)
+            else:
+                flank = cone_min_range(scan, -obs.side_cone_rad, 0.0)
+            if flank <= stop:
+                clr = forward if math.isfinite(forward) else flank
+                return DriveCommand(0.0, 0.0, 0.0, False), "hold", clr
+        return cmd, "clear", forward
 
     if scan is None:
         return DriveCommand(0.0, 0.0, cmd.vtheta, False), "no_scan", math.inf

@@ -849,8 +849,10 @@ class NavSupervisor:
                         has_room = clearance is None or float(clearance) >= 0.35
                         obstacle = str(progress.get("obstacle") or "")
                         # "wait"/"slow" still mean lidar sees space; only hard
-                        # stop / missing scan should force the fail.
-                        lidar_open = obstacle not in ("stop", "no_scan") and has_room
+                        # stop / proximity hold / missing scan should force fail.
+                        lidar_open = (
+                            obstacle not in ("stop", "hold", "no_scan") and has_room
+                        )
                         # Keep following while the robot can still see open space;
                         # a mid-route localization jump often fails a few replans
                         # before the map/pose settle.
