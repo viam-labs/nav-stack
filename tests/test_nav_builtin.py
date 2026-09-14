@@ -600,9 +600,11 @@ def test_follow_command_translates_while_gently_turning():
 
     cfg = FollowerConfig()
     current = Pose2D(0.0, 0.0, 0.0)
-    # Path runs +x; lookahead slightly left — light steer, still drive.
-    target = Pose2D(2.0, 0.5, 0.0)
-    cmd = compute_follow_command(current, target, cfg=cfg)
+    path_yaw = math.atan2(0.5, 2.0)
+    target = Pose2D(2.0, 0.5, path_yaw)
+    cmd = compute_follow_command(
+        current, target, cfg=cfg, crosstrack_m=0.0, path_yaw=path_yaw
+    )
     assert not cmd.done
     assert cmd.vx > 0.05
     assert cmd.vtheta != 0.0
@@ -632,11 +634,43 @@ def test_follow_command_tracks_path_tangent_not_point_chase():
     # Robot on the x-axis path, yawed +20°; lookahead 1 m ahead on path.
     current = Pose2D(0.0, 0.0, math.radians(20.0))
     target = Pose2D(1.0, 0.0, 0.0)
-    cmd = compute_follow_command(current, target, cfg=cfg, final_yaw=None)
+    cmd = compute_follow_command(
+        current, target, cfg=cfg, final_yaw=None, crosstrack_m=0.0, path_yaw=0.0
+    )
     assert cmd.vx > 0.2
     # Path-tangent error is −20° → modest CW turn, not a hard chase.
     assert cmd.vtheta < 0.0
     assert abs(cmd.vtheta) <= 0.45
+
+
+def test_follow_command_corrects_crosstrack_instead_of_cutting_corner():
+    """Robot left of a straight path must turn right back onto it (not keep cutting)."""
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.max_linear_mps = 0.6
+    # Facing along +x path but 0.35 m to the left (inside a left-hand corner cut).
+    current = Pose2D(0.0, 0.35, 0.0)
+    target = Pose2D(1.0, 0.0, 0.0)
+    cmd = compute_follow_command(
+        current,
+        target,
+        cfg=cfg,
+        final_yaw=None,
+        crosstrack_m=0.35,
+        path_yaw=0.0,
+    )
+    assert cmd.vtheta < 0.0
+    # Off-path: do not keep full cruise speed into the obstacle.
+    on_path = compute_follow_command(
+        Pose2D(0.0, 0.0, 0.0),
+        target,
+        cfg=cfg,
+        final_yaw=None,
+        crosstrack_m=0.0,
+        path_yaw=0.0,
+    )
+    assert cmd.vx < on_path.vx
 
 
 def test_follow_command_approach_cap_only_at_goal():

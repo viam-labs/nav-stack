@@ -18,7 +18,7 @@ from ..nav.simple_motion import (
 from ..ros import conversions as conv
 from .local_costmap import LocalCostmapView
 from .local_planner import LocalPlannerConfig, compute_local_command
-from .path_utils import closest_point_on_path
+from .path_utils import closest_point_on_path, signed_crosstrack_m
 from .types import Path2D, Pose2D
 
 
@@ -39,6 +39,11 @@ class FollowerConfig:
     heading_gain: float = 1.0
     # Cap |vθ| while translating so turn radius stays gentle.
     max_translate_yaw_rad_s: float = 0.55
+    # Stanley crosstrack gain (1/m-ish via atan(k e / v)). Higher = snap back
+    # to the polyline harder so pure-pursuit does not cut inside corners.
+    crosstrack_gain: float = 1.25
+    # Start scaling linear speed down once |crosstrack| exceeds this.
+    crosstrack_slow_m: float = 0.12
     motion: SimpleMotionConfig = field(default_factory=SimpleMotionConfig)
     obstacle: Optional[ObstacleConfig] = None
 
@@ -263,6 +268,8 @@ def compute_follow_command(
     *,
     cfg: FollowerConfig,
     final_yaw: Optional[float] = None,
+    crosstrack_m: Optional[float] = None,
+    path_yaw: Optional[float] = None,
 ) -> DriveCommand:
     """Pure-pursuit-ish step toward ``target`` (map frame → body cmd_vel)."""
     motion = cfg.motion
@@ -293,22 +300,25 @@ def compute_follow_command(
     max_linear = motion.max_linear_mps
     max_angular = motion.max_angular_rad_s
 
-    # Mid-path: track the path tangent (target.theta from lookahead), not chase
-    # the lookahead point. Point-bearing + short lookahead carved large arcs.
-    path_yaw = float(target.theta)
-    heading_err = heading_error_rad(current.theta, path_yaw)
+    # Mid-path: path tangent + Stanley crosstrack (not chase-lookahead).
+    # Pure point-pursuit cuts inside corners and rides under the planned
+    # robot_radius clearance even when the green plan looked fine.
+    yaw_ref = float(path_yaw) if path_yaw is not None else float(target.theta)
+    heading_err = heading_error_rad(current.theta, yaw_ref)
     bearing_to_point = heading_error_rad(current.theta, heading_to_target)
-    # Light pull onto the path when laterally offset (blend toward point).
-    point_pull = conv.normalize_angle(bearing_to_point - heading_err)
-    steer = heading_err + 0.25 * point_pull
-    # Lookahead behind / badly misaligned: face it in place (don't reverse-arc).
-    along = math.cos(path_yaw) * (target.x - current.x) + math.sin(path_yaw) * (
+    ct = float(crosstrack_m) if crosstrack_m is not None else 0.0
+    # Positive crosstrack = robot left of path → turn right (negative vθ).
+    speed_ref = max(0.20, max_linear * 0.5)
+    stanley = math.atan(
+        (float(cfg.crosstrack_gain) * ct) / speed_ref
+    )
+    steer = conv.normalize_angle(heading_err - stanley)
+    along = math.cos(yaw_ref) * (target.x - current.x) + math.sin(yaw_ref) * (
         target.y - current.y
     )
     face = bearing_to_point if along < 0.05 else steer
 
-    # Large heading error: rotate in place first so skid-steers don't carve
-    # circles.
+    # Large heading / crosstrack error: rotate in place first.
     if abs(face) > cfg.rotate_in_place_rad or along < 0.05:
         return apply_velocity_floor(
             DriveCommand(0.0, 0.0, _clamp(face * 1.5, max_angular), False),
@@ -316,12 +326,18 @@ def compute_follow_command(
         )
 
     linear_cmd = _clamp(dist * 0.75, max_linear)
-    if abs(steer) < math.radians(25.0):
-        # On-path cruise: don't crawl when heading is good.
+    if abs(steer) < math.radians(25.0) and abs(ct) < cfg.crosstrack_slow_m:
         linear_cmd = max(max_linear * 0.55, min(max_linear, linear_cmd))
-    # Scale linear with heading error so we don't plow sideways.
     bearing_scale = max(0.45, 1.0 - (abs(steer) / cfg.rotate_in_place_rad) * 0.45)
     linear_cmd *= bearing_scale
+    # Slow when off the polyline so we stop cutting deeper into the corner.
+    if abs(ct) > cfg.crosstrack_slow_m:
+        slow_span = max(0.15, 0.45 - cfg.crosstrack_slow_m)
+        ct_scale = max(
+            0.25,
+            1.0 - (abs(ct) - cfg.crosstrack_slow_m) / slow_span,
+        )
+        linear_cmd *= ct_scale
     yaw_cap = min(max_angular, float(cfg.max_translate_yaw_rad_s))
     angular_cmd = _clamp(steer * float(cfg.heading_gain), yaw_cap)
     return apply_velocity_floor(
@@ -366,6 +382,7 @@ def compute_path_command(
     bearing = heading_error_rad(
         current.theta, math.atan2(target.y - current.y, target.x - current.x)
     )
+    crosstrack, path_yaw_ref = signed_crosstrack_m(current, path)
 
     local_active = False
     if (
@@ -400,7 +417,14 @@ def compute_path_command(
             )
             bearing = heading_error_rad(current.theta, path.goal_theta)
         else:
-            cmd = compute_follow_command(current, target, cfg=cfg, final_yaw=None)
+            cmd = compute_follow_command(
+                current,
+                target,
+                cfg=cfg,
+                final_yaw=None,
+                crosstrack_m=crosstrack,
+                path_yaw=path_yaw_ref,
+            )
 
     obstacle_state = "clear"
     forward_clearance = math.inf
@@ -442,6 +466,7 @@ def compute_path_command(
         "obstacle": obstacle_state,
         "forward_clearance_m": None if math.isinf(forward_clearance) else forward_clearance,
         "bearing_error_rad": bearing,
+        "crosstrack_m": crosstrack,
         "cmd_vx_mps": cmd.vx,
         "cmd_vy_mps": cmd.vy,
         "cmd_vtheta_rad_s": cmd.vtheta,

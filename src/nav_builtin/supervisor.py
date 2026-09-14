@@ -165,8 +165,13 @@ class NavSupervisor:
             ),
             obstacle=ObstacleConfig(
                 enabled=avoid_obstacles,
-                stop_distance_m=stop_distance_m,
-                slow_distance_m=slow_distance_m,
+                # Lidar stop must respect the footprint; default 0.4 < a 0.45 m
+                # robot_radius lets execution crawl closer than the costmap shows.
+                stop_distance_m=max(float(stop_distance_m), float(robot_radius_m) + 0.05),
+                slow_distance_m=max(
+                    float(slow_distance_m),
+                    max(float(stop_distance_m), float(robot_radius_m) + 0.05) + 0.35,
+                ),
                 max_age_s=scan_max_age_s,
             )
             if avoid_obstacles
