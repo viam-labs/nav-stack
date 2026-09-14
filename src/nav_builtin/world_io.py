@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional, Protocol, runtime_checkable
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 
 @runtime_checkable

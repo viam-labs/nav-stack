@@ -24,9 +24,9 @@ from ..config import (
     BASE_VELOCITY_MIR,
     BASE_VELOCITY_VIAM,
     BASE_VELOCITY_Y_FORWARD,
-    viam_set_velocity_to_ros_twist,
+    viam_set_velocity_to_body_twist,
 )
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from ..sim import (
     SimWorld,
     get_sim_world,
@@ -137,7 +137,7 @@ class SimBase(Base):
         **kwargs,
     ) -> None:
         del extra, timeout, kwargs
-        vx, vy, vtheta = viam_set_velocity_to_ros_twist(
+        vx, vy, vtheta = viam_set_velocity_to_body_twist(
             linear.x, linear.y, angular.z, self._convention
         )
         self._require_world().set_velocity_ros(vx, vy, vtheta)

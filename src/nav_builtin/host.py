@@ -6,7 +6,7 @@ from typing import Dict, Optional
 import numpy as np
 
 from ..config import NAV_BACKEND_BUILTIN, NavConfig
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .navigator import BuiltinNavigator
 from .viz_store import NavVizStore
 from .world_io import WorldIO

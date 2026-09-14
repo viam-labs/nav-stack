@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Entrypoint for the nav-stack module. Activates the Python venv and starts the
-# module server (builtin SLAM + nav only; no ROS).
+# module server (builtin SLAM + nav only).
 set -euo pipefail
 
 cd "$(dirname "$0")"

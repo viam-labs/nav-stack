@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .types import OccupancyGrid
 
 # Cost layers (uint8): 0 free … 253 inscribed, 254 lethal, 255 unknown.
@@ -156,7 +156,7 @@ def mark_path_ahead_on_occupancy(
     return mark_points_on_occupancy(occ, arr, radius_m=radius_m)
 
 
-def occupancy_from_bridge_map(map_data: dict) -> OccupancyGrid:
+def occupancy_from_map_dict(map_data: dict) -> OccupancyGrid:
     """Build OccupancyGrid from a get_map-style dict (grid + origin + resolution)."""
     grid = np.asarray(map_data["grid"], dtype=np.int16)
     if grid.ndim != 2:

@@ -37,14 +37,14 @@ from ..nav.global_localize import (
     GlobalLocalizeResult,
     choose_yaw_or_flip,
     global_localize_scan,
-    load_occupancy_from_bridge_map,
+    load_occupancy_from_map_dict,
     load_occupancy_from_map_dir,
 )
 from ..nav import pause_keyframes, slice_match
 from ..nav.maps import MapStore, validate_map_name
 from ..nav.pose_jump_gate import JumpDecision, PoseJumpGate
-from ..ros import conversions as conv
-from ..ros.shm_lidar import ShmPointCloudClient
+from ..geom import conversions as conv
+from ..shm.lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
     any_navigation_active,
@@ -64,7 +64,7 @@ RELOCALIZE_POSITION_VARIANCE_M2 = 4.0
 RELOCALIZE_YAW_VARIANCE_RAD2 = (math.pi / 4) ** 2
 
 
-class RosSlam(SLAM):
+class SlamService(SLAM):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "nav-stack"), "slam")
 
     def __init__(self, name: str):
@@ -163,7 +163,7 @@ class RosSlam(SLAM):
 
         self._map_store = MapStore(cfg.maps_dir)
         active = cfg.active_map or self._map_store.get_active_map_name() or "default"
-        self._map_store.get_or_create_map(active, resolution=cfg.slam_toolbox.resolution)
+        self._map_store.get_or_create_map(active, resolution=cfg.map.resolution)
         self._map_store.set_active_map(active)
 
         if self._manager is not None:
@@ -282,7 +282,7 @@ class RosSlam(SLAM):
     async def _run_mapping_revisit(self, *, interval_s: float) -> None:
         """Mapping-time revisit watchdog (anti duplicate-corridor).
 
-        slam_toolbox only loop-closes when the drifted return pose is inside its
+        Loop-closure only fires when the drifted return pose is inside its
         loop search radius; after a long excursion on IMU-only odom it often is
         not, so a revisited corridor gets mapped as a second copy. This task
         periodically matches the live scan against the live map — near the
@@ -370,7 +370,7 @@ class RosSlam(SLAM):
         band_points: List[np.ndarray],
         pose: conv.Pose2D,
     ) -> None:
-        """Bridge callback: record pause 2D+slice keyframe (ROS thread)."""
+        """Callback: record pause 2D+slice keyframe."""
         cfg = self._cfg
         if cfg is None or not cfg.mapping_revisit_keyframes:
             return
@@ -836,7 +836,7 @@ class RosSlam(SLAM):
     async def _run_periodic_relocalize(self, *, interval_s: float) -> None:
         """Background drift watchdog: periodically re-localize when pose drifts.
 
-        slam_toolbox tracks pose per-scan but has no automatic global correction;
+        Per-scan pose tracking has no automatic global correction;
         on long runs (or after CPU-starved navigation) the map->odom estimate can
         slide with no recovery. Uses a cheap local match each cycle, escalating
         to full-map global_localize (like a manual command) when the local match
@@ -1212,7 +1212,7 @@ class RosSlam(SLAM):
         """Hold the startup auto-localize until scan matching can actually work.
 
         A fixed post-reconfigure delay fires while MiR rosbridge sessions are
-        still connecting and slam_toolbox is still loading the posegraph; the
+        still connecting and the map is still loading; the
         retry attempts then burn out and the robot stays mislocalized until a
         manual global_localize. Ready = slam process up, a merged scan with
         returns readable, and an occupancy map loadable.
@@ -1270,7 +1270,7 @@ class RosSlam(SLAM):
             LOGGER.info("startup global_localize skipped: navigation already active")
             return
         await self._wait_for_startup_localize_ready(timeout_s=readiness_timeout_s)
-        # Extra settle time after readiness so slam_toolbox has processed a few
+        # Extra settle time after readiness so SLAM has processed a few
         # scans against the loaded posegraph before we sample one for matching.
         if delay_s > 0.0:
             await asyncio.sleep(delay_s)
@@ -1439,7 +1439,7 @@ class RosSlam(SLAM):
         """Portable GetLinearVelocity / GetAngularVelocity reader for wheel odom."""
         if self._movement_sensor is None:
             return None
-        from ..ros.odom_source import TypedMovementSensorOdom, TypedOdomConfig
+        from ..odom.source import TypedMovementSensorOdom, TypedOdomConfig
 
         assert self._cfg is not None
         return TypedMovementSensorOdom(
@@ -1451,7 +1451,7 @@ class RosSlam(SLAM):
         )
 
     def _build_io(self):
-        from ..ros.sensor_io import build_io_provider
+        from ..sensors.viam_io import build_io_provider
 
         assert self._cfg is not None
         # Prefer typed MovementSensor getters (GetLinearVelocity / AngularVelocity)
@@ -1523,7 +1523,7 @@ class RosSlam(SLAM):
                     )
                     # Nearest return within ±15° of robot forward — standing in
                     # front of the cart should drop this even when the occupancy
-                    # map stays frozen (slam_toolbox only adds scans after travel).
+                    # map stays frozen (scans are only added after travel).
                     forward = conv.forward_sector_min_range(
                         scan, half_width_rad=math.radians(15.0)
                     )
@@ -1661,7 +1661,7 @@ class RosSlam(SLAM):
         self._reset_slice_library()
 
     def _reset_live_slam(self, mode: str) -> None:
-        """Reset slam_toolbox in place when possible; full restart as fallback."""
+        """Reset SLAM in place when possible; full restart as fallback."""
         assert self._manager is not None
         mgr = self._manager
         if mode == MODE_MAPPING and mgr.slam_running() and mgr.reset_slam_map():
@@ -1807,9 +1807,9 @@ class RosSlam(SLAM):
             map_data = await asyncio.to_thread(_grid)
             if map_data is None or map_data.get("grid") is None:
                 return {"available": False, "reason": "no_map"}
-            from ..nav_builtin.viam_io import bridge_map_to_get_grid
+            from ..nav_builtin.viam_io import map_dict_to_get_grid
 
-            return bridge_map_to_get_grid(map_data)
+            return map_dict_to_get_grid(map_data)
 
         if cmd == "get_status":
             probe_sensors = command.get("probe_sensors", True)
@@ -1912,7 +1912,7 @@ class RosSlam(SLAM):
             return {"status": "saved", "map": handle.name}
 
         if cmd in ("optimize", "optimize_graph"):
-            # Force SPA: slam_toolbox has no bare CorrectPoses service, so we
+            # Force SPA: there is no bare CorrectPoses service, so we
             # serialize + deserialize the live graph (loader calls Compute()).
             if self._cfg is not None and self._cfg.mode != MODE_MAPPING:
                 raise ValueError(
@@ -1929,7 +1929,7 @@ class RosSlam(SLAM):
             pose = self._resolve_pose(command)
             await asyncio.to_thread(mgr.set_initial_pose, pose)
             # ``refine: true`` runs a seeded scan match around the given XY with
-            # a full yaw sweep — slam_toolbox itself only searches ~±30° of
+            # a full yaw sweep — the matcher itself only searches ~±30° of
             # heading, so a seed with roughly-right XY but wrong theta can never
             # self-correct without this.
             if command.get("refine"):
@@ -2045,7 +2045,7 @@ class RosSlam(SLAM):
                 store.delete_map(name)
                 if was_live:
                     resolution = (
-                        self._cfg.slam_toolbox.resolution if self._cfg else 0.05
+                        self._cfg.map.resolution if self._cfg else 0.05
                     )
                     store.get_or_create_map(name, resolution=resolution)
                     store.set_active_map(name)
@@ -2160,7 +2160,7 @@ class RosSlam(SLAM):
         merged = conv.merge_scans(
             scans,
             num_bins=self._cfg.scan_bins,
-            range_max=self._cfg.slam_toolbox.max_laser_range,
+            range_max=self._cfg.map.max_laser_range,
         )
         return merged, band_points
 
@@ -2178,7 +2178,7 @@ class RosSlam(SLAM):
         if source in {"auto", "live"} and node is not None:
             live = node.get_map()
             if live is not None:
-                return load_occupancy_from_bridge_map(live), "live"
+                return load_occupancy_from_map_dict(live), "live"
             if source == "live":
                 raise RuntimeError("requested live map_source but /map is unavailable")
 
@@ -2192,7 +2192,7 @@ class RosSlam(SLAM):
             raise RuntimeError(
                 "no occupancy map available; save the map or wait for mapping to produce a grid"
             )
-        return load_occupancy_from_bridge_map(live), "live"
+        return load_occupancy_from_map_dict(live), "live"
 
     async def _global_localize(
         self, command: Mapping[str, ValueTypes]
@@ -2355,6 +2355,6 @@ class RosSlam(SLAM):
 
 Registry.register_resource_creator(
     SLAM.API,
-    RosSlam.MODEL,
-    ResourceCreatorRegistration(RosSlam.new, RosSlam.validate_config),
+    SlamService.MODEL,
+    ResourceCreatorRegistration(SlamService.new, SlamService.validate_config),
 )

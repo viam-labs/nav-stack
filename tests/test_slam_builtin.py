@@ -12,8 +12,8 @@ from src.config import (
     SlamConfig,
 )
 from src.nav.maps import MapStore
-from src.nav_builtin.viam_io import bridge_map_to_get_grid, get_grid_response_to_map
-from src.ros import conversions as conv
+from src.nav_builtin.viam_io import map_dict_to_get_grid, get_grid_response_to_map
+from src.geom import conversions as conv
 from src.slam_builtin import occupancy as occ
 from src.slam_builtin import persistence
 from src.slam_builtin import scan_match
@@ -25,14 +25,13 @@ def test_slam_backend_default_is_builtin():
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
     assert cfg.slam_backend == SLAM_BACKEND_BUILTIN
     assert cfg.uses_builtin_slam()
-    assert not cfg.uses_slam_toolbox()
     assert cfg.mapping_revisit_check is True
     assert cfg.mapping_revisit_while_moving is True
     assert cfg.builtin_rebuild_map_on_revisit is True
 
 
 def test_slam_backend_toolbox_and_invalid():
-    with pytest.raises(ValueError, match="pre-ros-removal|slam_toolbox"):
+    with pytest.raises(ValueError, match="pre-ros-removal|slam_toolbox|no longer supported"):
         SlamConfig.from_dict(
             {"base": "b", "lidar": "front", "slam_backend": "slam_toolbox"}
         )
@@ -103,7 +102,7 @@ def test_get_grid_roundtrip_encoding():
         "origin_x": -1.0,
         "origin_y": -2.0,
     }
-    payload = bridge_map_to_get_grid(map_data)
+    payload = map_dict_to_get_grid(map_data)
     back = get_grid_response_to_map(payload)
     assert back is not None
     assert back["resolution"] == pytest.approx(0.05)
@@ -757,7 +756,7 @@ def test_builtin_sensors_get_scan_skips_obstacles_only(monkeypatch):
 def test_apply_heading_from_shm_skips_grpc():
     import asyncio
 
-    from src.ros import imushm
+    from src.shm import imushm
     from src.slam_builtin.io_sensors import BuiltinSensors
 
     class _HeadingBoom:

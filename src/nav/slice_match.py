@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 
 @dataclass(frozen=True)

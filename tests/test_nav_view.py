@@ -1,11 +1,11 @@
-"""Tests for the ROS-free nav-camera renderer (src/ros/nav_view.py)."""
+"""Tests for the nav-camera renderer (src/viz/nav_view.py)."""
 import io
 
 import numpy as np
 import pytest
 from PIL import Image
 
-from src.ros.nav_view import (
+from src.viz.nav_view import (
     NavViewOptions,
     _build_frame,
     _colorize,

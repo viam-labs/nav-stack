@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 
 @dataclass(frozen=True)

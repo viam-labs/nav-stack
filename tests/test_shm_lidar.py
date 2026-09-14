@@ -9,9 +9,9 @@ import pytest
 pytest.importorskip("viam")
 
 from src.config import SlamConfig
-from src.ros import pcshm
-from src.ros.sensor_io import build_io_provider
-from src.ros.shm_lidar import ShmPointCloudClient
+from src.shm import pcshm
+from src.sensors.viam_io import build_io_provider
+from src.shm.lidar import ShmPointCloudClient
 
 _MIN_PCD = (
     b"# .PCD v0.7\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\n"

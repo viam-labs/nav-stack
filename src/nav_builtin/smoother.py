@@ -118,9 +118,9 @@ def smooth_plan_path(
     """Convenience wrapper: build costmap from map dict then smooth."""
     if not enabled:
         return path
-    from .costmap import build_costmap, occupancy_from_bridge_map
+    from .costmap import build_costmap, occupancy_from_map_dict
 
-    occ = occupancy_from_bridge_map(map_data)
+    occ = occupancy_from_map_dict(map_data)
     costs = build_costmap(
         occ,
         inflation_radius_m=inflation_radius_m,

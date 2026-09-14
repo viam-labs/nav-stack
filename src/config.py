@@ -1,6 +1,6 @@
 """Typed configuration objects parsed from Viam component attributes.
 
-Keeping these as plain dataclasses (no Viam or ROS imports) makes the parsing
+Keeping these as plain dataclasses (no Viam SDK imports) makes the parsing
 logic easy to unit-test and shareable between the models and the runtime layer.
 """
 from __future__ import annotations
@@ -17,11 +17,18 @@ MODE_LOCALIZING = "localizing"
 SLAM_MODES = {MODE_MAPPING, MODE_LOCALIZING}
 
 BASE_VELOCITY_VIAM = "viam"
-BASE_VELOCITY_ROS = "ros"
-# Legacy alias for ``viam`` (Y-forward); accepted in config, normalized to ``viam``.
-BASE_VELOCITY_MIR = "mir"
-BASE_VELOCITY_CONVENTIONS = {BASE_VELOCITY_VIAM, BASE_VELOCITY_ROS, BASE_VELOCITY_MIR}
-# Conventions that put ROS forward (vx) on Viam ``linear.y``.
+# Body frame with +X forward, +Y left (same as classic ROS cmd_vel).
+BASE_VELOCITY_X_FORWARD = "x_forward"
+# Legacy aliases accepted in config.
+BASE_VELOCITY_ROS = "ros"  # alias of x_forward
+BASE_VELOCITY_MIR = "mir"  # alias of viam (Y-forward)
+BASE_VELOCITY_CONVENTIONS = {
+    BASE_VELOCITY_VIAM,
+    BASE_VELOCITY_X_FORWARD,
+    BASE_VELOCITY_ROS,
+    BASE_VELOCITY_MIR,
+}
+# Conventions that put body forward (vx) on Viam ``linear.y``.
 BASE_VELOCITY_Y_FORWARD = {BASE_VELOCITY_VIAM, BASE_VELOCITY_MIR}
 
 LIDAR_SCAN_AUTO = "auto"
@@ -34,8 +41,8 @@ LIDAR_SCAN_SOURCES = {
 }
 
 # Point-cloud axis convention *before* the mount transform.
-# ``sensor``: X forward, Y left, Z up (RPLIDAR / Livox / ROS body).
-# ``camera_optical``: X right, Y down, Z forward (RealSense / OpenCV / ROS optical).
+# ``sensor``: X forward, Y left, Z up (RPLIDAR / Livox body).
+# ``camera_optical``: X right, Y down, Z forward (RealSense / OpenCV optical).
 CLOUD_FRAME_SENSOR = "sensor"
 CLOUD_FRAME_CAMERA_OPTICAL = "camera_optical"
 CLOUD_FRAMES = {CLOUD_FRAME_SENSOR, CLOUD_FRAME_CAMERA_OPTICAL}
@@ -63,27 +70,27 @@ IMU_ODOM_NONE = "none"
 IMU_ODOM_MODES = {IMU_ODOM_COAST, IMU_ODOM_ACCEL_ONLY, IMU_ODOM_NONE}
 
 
-def ros_cmd_vel_to_viam_linear_mm_s(
+def body_linear_to_viam_mm_s(
     vx_mps: float,
     vy_mps: float,
     convention: str = BASE_VELOCITY_VIAM,
 ) -> tuple[float, float]:
-    """Convert ROS body-frame linear speeds (m/s) to Viam base ``SetVelocity`` mm/s.
+    """Convert body-frame linear speeds (m/s) to Viam base ``SetVelocity`` mm/s.
 
-    Default ``viam`` convention (also ``mir``): Viam ``linear.y`` = ROS forward
-    (``vx``), Viam ``linear.x`` = ROS lateral (``vy``). Matches ``rdk:builtin:wheeled``
+    Default ``viam`` convention (also ``mir``): Viam ``linear.y`` = body forward
+    (``vx``), Viam ``linear.x`` = body lateral (``vy``). Matches ``rdk:builtin:wheeled``
     and MiR bases, which only drive on Y.
 
-    ``ros`` convention: Viam ``linear.x`` = ROS forward, ``linear.y`` = lateral —
-    for bases that actually consume X as forward.
+    ``x_forward`` / ``ros``: Viam ``linear.x`` = body forward, ``linear.y`` = lateral —
+    for bases that consume X as forward.
     """
     if convention in BASE_VELOCITY_Y_FORWARD:
         vx_mps, vy_mps = vy_mps, vx_mps
     return vx_mps * 1000.0, vy_mps * 1000.0
 
 
-def ros_vtheta_to_viam_angular_deg_s(vtheta_rad_s: float) -> float:
-    """Convert ROS/nav angular rate (rad/s) to Viam ``Base.SetVelocity`` deg/s.
+def body_vtheta_to_viam_angular_deg_s(vtheta_rad_s: float) -> float:
+    """Convert body angular rate (rad/s) to Viam ``Base.SetVelocity`` deg/s.
 
     Viam's protobuf / Python SDK document ``angular.z`` as degrees per second.
     Controllers and builtin nav keep rad/s internally
@@ -95,39 +102,39 @@ def ros_vtheta_to_viam_angular_deg_s(vtheta_rad_s: float) -> float:
     return math.degrees(float(vtheta_rad_s))
 
 
-def ros_twist_to_viam_set_velocity(
+def body_twist_to_viam_set_velocity(
     vx_mps: float,
     vy_mps: float,
     vtheta_rad_s: float,
     convention: str = BASE_VELOCITY_VIAM,
 ) -> tuple[float, float, float]:
-    """ROS body twist → Viam SetVelocity ``(linear.x_mm_s, linear.y_mm_s, angular.z_deg_s)``."""
-    lx, ly = ros_cmd_vel_to_viam_linear_mm_s(vx_mps, vy_mps, convention)
-    return lx, ly, ros_vtheta_to_viam_angular_deg_s(vtheta_rad_s)
+    """Body twist → Viam SetVelocity ``(linear.x_mm_s, linear.y_mm_s, angular.z_deg_s)``."""
+    lx, ly = body_linear_to_viam_mm_s(vx_mps, vy_mps, convention)
+    return lx, ly, body_vtheta_to_viam_angular_deg_s(vtheta_rad_s)
 
 
-def sensor_twist_to_ros_body(
+def sensor_twist_to_body(
     vx: float,
     vy: float,
     convention: str = BASE_VELOCITY_VIAM,
 ) -> tuple[float, float]:
-    """Map sensor-native body linear twist to ROS body (x forward, y left).
+    """Map sensor-native body linear twist to nav body (x forward, y left).
 
-    ``viam`` / ``mir``: sensor +y is forward, +x is right → ROS ``(vy, -vx)``.
-    ``ros``: already X-forward / Y-left — pass through.
+    ``viam`` / ``mir``: sensor +y is forward, +x is right → body ``(vy, -vx)``.
+    ``x_forward`` / ``ros``: already X-forward / Y-left — pass through.
     """
     if convention in BASE_VELOCITY_Y_FORWARD:
         return float(vy), -float(vx)
     return float(vx), float(vy)
 
 
-def viam_set_velocity_to_ros_twist(
+def viam_set_velocity_to_body_twist(
     linear_x_mm_s: float,
     linear_y_mm_s: float,
     angular_z_deg_s: float,
     convention: str = BASE_VELOCITY_VIAM,
 ) -> tuple[float, float, float]:
-    """Inverse of ``ros_twist_to_viam_set_velocity`` (mm/s + deg/s → ROS m/s + rad/s)."""
+    """Inverse of ``body_twist_to_viam_set_velocity`` (mm/s + deg/s → body m/s + rad/s)."""
     import math
 
     lx = float(linear_x_mm_s) / 1000.0
@@ -170,6 +177,8 @@ class SimConfig:
             )
         if convention == BASE_VELOCITY_MIR:
             convention = BASE_VELOCITY_VIAM
+        if convention == BASE_VELOCITY_ROS:
+            convention = BASE_VELOCITY_X_FORWARD
         map_path = d.get("map_path")
         return cls(
             enabled=bool(d.get("enabled", False)),
@@ -283,64 +292,40 @@ class LidarConfig:
 
 
 @dataclass
-class SlamToolboxConfig:
-    """Shared map / scan settings used by builtin SLAM.
+class MapSettings:
+    """Map / scan settings used by builtin SLAM (resolution, range, travel gates).
 
-    Historically named for slam_toolbox; kept under the ``slam_toolbox`` attribute
-    block so existing configs keep working. Builtin engine reads ``resolution``,
-    ``max_laser_range``, and travel gates from here.
+    Config attribute is ``map``. The legacy attribute name ``slam_toolbox`` is
+    still accepted in ``from_dict`` for existing machine configs.
     """
 
     resolution: float = 0.05  # meters/cell
-    transform_publish_period: float = 0.05  # seconds
-    map_update_interval: float = 1.0  # seconds
     minimum_travel_distance: float = 0.3  # meters before adding a new scan
     minimum_travel_heading: float = 0.3  # radians before adding a new scan
     max_laser_range: float = 25.0  # meters
-    scan_topic: str = "/scan"
-    use_map_saver: bool = True
-
-    def to_ros_dict(self) -> dict:
-        return {
-            "resolution": self.resolution,
-            "transform_publish_period": self.transform_publish_period,
-            "map_update_interval": self.map_update_interval,
-            "minimum_travel_distance": self.minimum_travel_distance,
-            "minimum_travel_heading": self.minimum_travel_heading,
-            "max_laser_range": self.max_laser_range,
-            "scan_topic": self.scan_topic,
-            "use_map_saver": self.use_map_saver,
-        }
 
     @classmethod
-    def from_dict(cls, d: Mapping) -> "SlamToolboxConfig":
+    def from_dict(cls, d: Mapping) -> "MapSettings":
         if not d:
             return cls()
         return cls(
             resolution=float(d.get("resolution", 0.05)),
-            transform_publish_period=float(d.get("transform_publish_period", 0.05)),
-            map_update_interval=float(d.get("map_update_interval", 1.0)),
             minimum_travel_distance=float(d.get("minimum_travel_distance", 0.3)),
             minimum_travel_heading=float(d.get("minimum_travel_heading", 0.3)),
             max_laser_range=float(d.get("max_laser_range", 25.0)),
-            scan_topic=str(d.get("scan_topic", "/scan")),
-            use_map_saver=bool(d.get("use_map_saver", True)),
         )
 
 
 NAV_BACKEND_BUILTIN = "builtin"
-# Rejected at parse time (historical aliases).
-NAV_BACKEND_NAV2 = "nav2"
 NAV_BACKENDS = frozenset({NAV_BACKEND_BUILTIN})
 
 SLAM_BACKEND_BUILTIN = "builtin"
-# Rejected at parse time (historical aliases).
-SLAM_BACKEND_TOOLBOX = "slam_toolbox"
 SLAM_BACKENDS = frozenset({SLAM_BACKEND_BUILTIN})
 
-_ROS_REMOVED_HINT = (
-    "ROS/Nav2/slam_toolbox product paths were removed; use slam_backend/nav_backend "
-    "'builtin' only. For the last ROS release, check out git tag pre-ros-removal."
+_REMOVED_BACKEND_HINT = (
+    "Legacy backends were removed; use slam_backend/nav_backend "
+    "'builtin' only. For the last ROS-based release, check out git tag "
+    "pre-ros-removal."
 )
 
 BUILTIN_PLANNER_ASTAR = "astar"
@@ -422,7 +407,7 @@ class BuiltinNavConfig:
     local_planner_sim_time_s: float = 1.5
     local_planner_activate_cost: int = 200
     local_planner_max_vel_x_reverse_m: float = 0.15
-    # Nav2-style backup when local planner spins in place with clear rear space.
+    # Backup when local planner spins in place with clear rear space.
     backup_enabled: bool = True
     backup_stuck_time_s: float = 3.0
     backup_dist_m: float = 0.30
@@ -430,8 +415,8 @@ class BuiltinNavConfig:
     backup_rear_clear_m: float = 0.45
     backup_max_attempts: int = 1
     backup_cooldown_s: float = 4.0
-    # Nav2 Wait analogue: stop and wait for a dynamic blocker to clear before
-    # the first local replan (people crossing). Matches nav2.recovery_wait_duration.
+    # Wait: stop and wait for a dynamic blocker to clear before
+    # the first local replan (people crossing).
     recovery_wait_duration_s: float = 2.0
     # Legacy grace before local replan; effective wait is
     # max(recovery_wait_duration_s, replan_local_blocked_time_s).
@@ -545,7 +530,7 @@ class SlamConfig:
     external_transform_timeout_s: float = 0.2
     scan_bins: int = 720
     # Merge recent point-cloud frames before /scan projection. Livox Mid-360 and
-    # similar non-repetitive 3D lidars need this for stable slam_toolbox input.
+    # similar non-repetitive 3D lidars need this for stable SLAM input.
     scan_accumulation_s: float = 0.0
     # How IMU dead-reckons forward velocity when wheel encoders are absent.
     # ``accel_only`` integrates only on clear forward accel (Livox carts);
@@ -558,7 +543,7 @@ class SlamConfig:
     lidar_odom_range_flow_only: bool = False
     # Stop-and-go mapping bias: only publish /scan after the robot has been
     # still for ``map_when_still_dwell_s``, once per stop. For IMU + Livox carts
-    # this yields dense scans and lets slam_toolbox match between pauses.
+    # this yields dense scans and lets SLAM match between pauses.
     # Leave false for MiR / wheel-odom robots (continuous mapping).
     map_when_still: bool = False
     map_when_still_dwell_s: float = 1.0
@@ -579,7 +564,7 @@ class SlamConfig:
     wall_yaw_blend: float = 0.5
     # Mapping-time revisit check: periodically match the live scan against the
     # live map near the current pose and, on a strong match that disagrees with
-    # odom, shift the odom TF so slam_toolbox links back to the original area
+    # odom, shift the odom TF so localization links back to the original area
     # instead of mapping a duplicate corridor. Tiered search: local radius
     # first, wider radius on weak match, full map only as a last resort with a
     # stricter score gate. Default on with map_when_still + point-cloud lidars.
@@ -633,18 +618,18 @@ class SlamConfig:
     mapping_revisit_max_yaw_rate_rad_s: float = 0.35
     # Safety cutoff for the SLAM/publish scan path: if mir-base reports a scan
     # cache age (get_laser_scan ``age_s``) above this, the bridge skips publishing
-    # it rather than feeding SLAM/Nav2 a misregistered scan. Accurate age-based
+    # it rather than feeding SLAM a misregistered scan. Accurate age-based
     # stamping handles normal latency; this only guards genuinely stale data.
     scan_max_age_s: float = 2.0
-    # How ROS /cmd_vel (vx forward, vy lateral) maps to the Viam base SetVelocity axes.
+    # How body twist (vx forward, vy lateral) maps to the Viam base SetVelocity axes.
     base_velocity_convention: str = BASE_VELOCITY_VIAM
-    slam_toolbox: SlamToolboxConfig = field(default_factory=SlamToolboxConfig)
+    map: MapSettings = field(default_factory=MapSettings)
     slam_params: Mapping = field(default_factory=dict)
     # Automatically run global_localize shortly after starting in localizing mode.
     global_localize_on_start: bool = True
     global_localize_on_start_delay_s: float = 4.0
     # Max time to wait for slam + scans + map to become usable before the
-    # startup auto-localize runs (rosbridge sessions can take tens of seconds).
+    # startup auto-localize runs (slow networks can take tens of seconds).
     global_localize_on_start_readiness_timeout_s: float = 90.0
     global_localize_on_start_options: Mapping = field(
         default_factory=lambda: {
@@ -746,9 +731,9 @@ class SlamConfig:
         slam_backend = str(
             d.get("slam_backend", SLAM_BACKEND_BUILTIN) or SLAM_BACKEND_BUILTIN
         )
-        if slam_backend == SLAM_BACKEND_TOOLBOX:
+        if slam_backend in ("slam_toolbox", "toolbox"):
             raise ValueError(
-                f"slam_backend={slam_backend!r} is no longer supported. {_ROS_REMOVED_HINT}"
+                f"slam_backend={slam_backend!r} is no longer supported. {_REMOVED_BACKEND_HINT}"
             )
         if slam_backend not in SLAM_BACKENDS:
             raise ValueError(
@@ -767,6 +752,8 @@ class SlamConfig:
         # Normalize legacy ``mir`` to the canonical Y-forward name.
         if convention == BASE_VELOCITY_MIR:
             convention = BASE_VELOCITY_VIAM
+        if convention == BASE_VELOCITY_ROS:
+            convention = BASE_VELOCITY_X_FORWARD
         # Prefer slam-level convention for the sim world when not overridden in sim{}.
         if "base_velocity_convention" not in (d.get("sim") or {}):
             sim = SimConfig(
@@ -800,12 +787,13 @@ class SlamConfig:
         heading_only_odom = bool(d.get("heading_only_odom", False))
         if heading_only_odom:
             imu_odom_mode = IMU_ODOM_NONE
-        stb_raw = dict(d.get("slam_toolbox", {}) or {})
+        # Prefer ``map``; accept legacy ``slam_toolbox`` block from older configs.
+        stb_raw = dict(d.get("map") or d.get("slam_toolbox") or {})
         slam_params_raw = dict(d.get("slam_params", {}) or {})
         if all_point_cloud:
             max_lidar_range = max(lidar.max_range for lidar in slam_lidars)
             # Real travel gates matter for Livox: with minimum_travel_* at 0,
-            # slam_toolbox scan-matches every noisy non-repetitive frame while
+            # SLAM would otherwise scan-match every noisy non-repetitive frame while
             # parked and imprints walls at slightly different poses each time.
             stb_raw.setdefault("minimum_travel_distance", 0.15)
             stb_raw.setdefault("minimum_travel_heading", 0.12)
@@ -823,9 +811,9 @@ class SlamConfig:
         map_when_still = bool(d.get("map_when_still", False))
         if map_when_still and all_point_cloud:
             # Scans arrive only at stops; the bridge already rate-limits.
-            # slam_toolbox ALWAYS uses odom→base TF as the scan-match prior —
+            # Builtin SLAM uses odom as the scan-match prior —
             # ``use_odometry`` / ``use_tf_scan_transformation`` are NOT real
-            # slam_toolbox params (no-ops). Widen the *real* correlative angular
+            # Legacy toolbox params were no-ops here. Widen the correlative angular
             # search: default coarse_search_angle_offset is only ~±20°, so a
             # 45–180° pivot between pauses imprints rotated ghost walls.
             user_sp = dict(d.get("slam_params", {}) or {})
@@ -1053,7 +1041,7 @@ class SlamConfig:
             ),
             scan_max_age_s=float(d.get("scan_max_age_s", 2.0)),
             base_velocity_convention=convention,
-            slam_toolbox=SlamToolboxConfig.from_dict(stb_raw),
+            map=MapSettings.from_dict(stb_raw),
             slam_params=slam_params_raw,
             # Sim seeds SLAM pose from sim.seed_*; startup global_localize is
             # optional and off by default (avoids fighting the ground-truth seed).
@@ -1194,8 +1182,6 @@ class SlamConfig:
     def uses_builtin_slam(self) -> bool:
         return self.slam_backend == SLAM_BACKEND_BUILTIN
 
-    def uses_slam_toolbox(self) -> bool:
-        return False
 
 
 @dataclass
@@ -1231,9 +1217,9 @@ class NavConfig:
         if kinematics not in KINEMATICS:
             raise ValueError(f"kinematics must be one of {sorted(KINEMATICS)}")
         backend = str(d.get("nav_backend", NAV_BACKEND_BUILTIN) or NAV_BACKEND_BUILTIN)
-        if backend == NAV_BACKEND_NAV2:
+        if backend in ("nav2", "ros"):
             raise ValueError(
-                f"nav_backend={backend!r} is no longer supported. {_ROS_REMOVED_HINT}"
+                f"nav_backend={backend!r} is no longer supported. {_REMOVED_BACKEND_HINT}"
             )
         if backend not in NAV_BACKENDS:
             raise ValueError(
@@ -1268,9 +1254,6 @@ class NavConfig:
 
     def uses_builtin_nav(self) -> bool:
         return True
-
-    def uses_nav2(self) -> bool:
-        return False
 
     def required_dependencies(self) -> List[str]:
         return [self.slam_service, self.base]

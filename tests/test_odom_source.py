@@ -9,7 +9,7 @@ pytest.importorskip("viam.spatialmath")
 from viam.proto.common import GeoPoint, Orientation, Vector3
 from viam.components.movement_sensor import MovementSensor
 
-from src.ros.odom_source import (
+from src.odom.source import (
     TypedMovementSensorOdom,
     TypedOdomConfig,
     read_typed_heading,
@@ -265,7 +265,7 @@ def test_read_typed_heading_prefers_native_euler_like_wit_motion():
 
 
 def test_planar_ov_theta_is_yaw_not_axis_atan2():
-    from src.ros import conversions as conv
+    from src.geom import conversions as conv
 
     # 90° about +Z must yield yaw=90°, even with slight axis tilt noise.
     r, p, y = conv.orientation_vector_to_rpy(0.02, -0.01, 0.999, 90.0, theta_unit="deg")

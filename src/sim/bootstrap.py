@@ -1,7 +1,7 @@
 """Create / reuse SimWorld from SlamConfig.sim."""
 from __future__ import annotations
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .registry import get_sim_world, register_sim_world
 from .world import SimWorld, load_sim_map, make_builtin_corridor
 

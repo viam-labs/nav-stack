@@ -5,7 +5,7 @@ and builtin SLAM host; the navigation model (which ``depends_on`` the SLAM
 service) looks the shared runtime up by the SLAM service's resource name.
 
 Builtin nav registers a ``NavVizStore`` so nav-camera / get_costmap can render
-without a ROS bridge.
+via the in-process nav viz store.
 """
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def get_slam(name: str) -> Optional[SlamRuntime]:
         return _REGISTRY.get(name)
 
 
-# The live SLAM *service object* (RosSlam), keyed by resource name. Builtin nav
+# The live SLAM *service object* (SlamService), keyed by resource name. Builtin nav
 # uses this for sync ``get_position_pose2d`` when the motion dependency is a
 # gRPC client stub — async GetPosition every control tick starves Base.SetVelocity
 # on the shared module event loop.

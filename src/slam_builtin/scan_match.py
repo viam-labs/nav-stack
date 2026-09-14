@@ -12,7 +12,7 @@ from ..nav.global_localize import (
     _score_pose,
     scan_endpoints_base_link,
 )
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 
 def occupancy_map_from_int16(

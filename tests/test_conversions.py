@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from src.ros import conversions as conv
+from src.geom import conversions as conv
 
 
 def test_unit_conversions():
@@ -111,7 +111,7 @@ def test_pointcloud_to_scan_filters_height():
 
 def test_pointcloud_to_scan_excludes_floor_for_livox_height_band():
     # Floor hits in base_link sit near z=0; a 3D lidar height band should drop
-    # them so slam_toolbox does not see a floor arc.
+    # them so SLAM does not see a floor arc.
     pts = np.array(
         [
             [3.0, 0.0, 0.02],

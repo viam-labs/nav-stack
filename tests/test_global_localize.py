@@ -10,7 +10,7 @@ from src.nav.global_localize import (
     load_occupancy_from_map_dir,
     pgm_to_occupancy_grid,
 )
-from src.ros import conversions as conv
+from src.geom import conversions as conv
 
 
 def _asymmetric_map() -> OccupancyMap:

@@ -27,8 +27,8 @@ from viam.utils import struct_to_dict
 from ..lidar.rplidar_protocol import RPLidarError, model_name, scan_to_xyz_m
 from ..lidar.rplidar_serial import RPLidarSerial
 from ..lidar.serial_ports import list_candidate_serial_ports, normalize_exclude_list
-from ..ros import conversions as conv
-from ..ros import pcshm
+from ..geom import conversions as conv
+from ..shm import pcshm
 
 LOGGER = getLogger(__name__)
 

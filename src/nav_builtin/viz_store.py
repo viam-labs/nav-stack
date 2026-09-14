@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 
 class NavVizStore:

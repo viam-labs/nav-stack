@@ -109,7 +109,7 @@ def _in_process_map_provider(slam_service_name: str):
     return _get
 
 
-class RosNavigation(NavServiceBase):
+class NavigationService(NavServiceBase):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "nav-stack"), "navigation")
 
     def __init__(self, name: str):
@@ -233,6 +233,6 @@ class RosNavigation(NavServiceBase):
 
 Registry.register_resource_creator(
     Motion.API,
-    RosNavigation.MODEL,
-    ResourceCreatorRegistration(RosNavigation.new, RosNavigation.validate_config),
+    NavigationService.MODEL,
+    ResourceCreatorRegistration(NavigationService.new, NavigationService.validate_config),
 )

@@ -30,7 +30,7 @@ from viam.resource.types import Model, ModelFamily
 from viam.utils import struct_to_dict
 
 from ..config import NavCameraConfig
-from ..ros.nav_view import (
+from ..viz.nav_view import (
     NavViewOptions,
     legend_text,
     placeholder_png,

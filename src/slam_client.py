@@ -1,13 +1,13 @@
 """Pure helpers for consuming a Viam SLAM ``get_grid`` / pose response.
 
-Used by builtin nav (``ViamWorldIO``) and tests. No rclpy / ROS publishers.
+Used by builtin nav (``ViamWorldIO``) and tests.
 """
 from __future__ import annotations
 
 import base64
 import struct
 
-from . import conversions as conv
+from .geom import conversions as conv
 
 
 def slam_pose_to_pose2d(pose) -> conv.Pose2D:

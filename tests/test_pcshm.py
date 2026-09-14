@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.ros import pcshm
+from src.shm import pcshm
 
 
 def test_pcshm_round_trip():

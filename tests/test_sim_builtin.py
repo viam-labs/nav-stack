@@ -11,12 +11,12 @@ from viam.components.base import Vector3
 
 from src.config import (
     SlamConfig,
-    ros_twist_to_viam_set_velocity,
-    viam_set_velocity_to_ros_twist,
+    body_twist_to_viam_set_velocity,
+    viam_set_velocity_to_body_twist,
 )
 from src.models.sim_base import SimBase
 from src.nav.maps import MapStore
-from src.ros import conversions as conv
+from src.geom import conversions as conv
 from src.sim import (
     SimSensors,
     SimWorld,
@@ -29,8 +29,8 @@ from src.slam_builtin import BuiltinSlamEngine, BuiltinSlamHost
 
 
 def test_viam_velocity_roundtrip_viam_convention():
-    lx, ly, ang = ros_twist_to_viam_set_velocity(0.4, 0.0, 0.5, "viam")
-    vx, vy, vtheta = viam_set_velocity_to_ros_twist(lx, ly, ang, "viam")
+    lx, ly, ang = body_twist_to_viam_set_velocity(0.4, 0.0, 0.5, "viam")
+    vx, vy, vtheta = viam_set_velocity_to_body_twist(lx, ly, ang, "viam")
     assert vx == pytest.approx(0.4, abs=1e-9)
     assert vy == pytest.approx(0.0, abs=1e-9)
     assert vtheta == pytest.approx(0.5, abs=1e-9)
@@ -149,7 +149,7 @@ def test_sim_slam_pose_tracks_world_not_teleport(tmp_path: Path):
 
 
 def test_sim_config_requires_builtin_backend():
-    with pytest.raises(ValueError, match="slam_toolbox|slam_backend=builtin|pre-ros-removal"):
+    with pytest.raises(ValueError, match="slam_toolbox|no longer supported|pre-ros-removal"):
         SlamConfig.from_dict(
             {
                 "base": "sim-base",

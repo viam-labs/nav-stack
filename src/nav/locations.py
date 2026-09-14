@@ -1,6 +1,6 @@
 """Named-locations store (CRUD), scoped to a single map.
 
-A location is a named pose in the map frame, stored in meters/radians (ROS
+A location is a named pose in the map frame, stored in meters/radians (
 convention) in the map's ``locations.json``.
 """
 from __future__ import annotations

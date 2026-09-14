@@ -13,7 +13,7 @@ from ..nav.simple_motion import (
     distance_m,
     rear_clearance_m,
 )
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .controller import FollowerConfig, compute_path_command, update_speed_estimate
 from .local_costmap import (
     LocalCostmap,
@@ -538,9 +538,9 @@ class NavSupervisor:
                         except TimeoutError:
                             map_data = None
                         if map_data is not None:
-                            from .costmap import build_costmap, occupancy_from_bridge_map
+                            from .costmap import build_costmap, occupancy_from_map_dict
 
-                            self._global_occ_cache = occupancy_from_bridge_map(map_data)
+                            self._global_occ_cache = occupancy_from_map_dict(map_data)
                             self._global_costs_cache = build_costmap(
                                 self._global_occ_cache,
                                 inflation_radius_m=self._inflation,

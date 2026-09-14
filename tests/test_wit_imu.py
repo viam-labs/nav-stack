@@ -16,7 +16,7 @@ from src.imu.wit_protocol import (
     config_commands,
     scale_le_u16,
 )
-from src.ros import imushm
+from src.shm import imushm
 
 
 def _frame(typ: int, values_le: bytes) -> bytes:

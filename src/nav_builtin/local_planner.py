@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from ..nav.simple_motion import DriveCommand, apply_velocity_floor
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .path_utils import closest_point_on_path
 from .costmap import INSCRIBED
 from .local_costmap import LocalCostmapView, footprint_collides, max_cost_along_segment
@@ -24,7 +24,7 @@ class LocalPlannerConfig:
     goal_weight: float = 1.0
     speed_weight: float = 0.5
     obstacle_weight: float = 3.0
-    # Reverse samples (Nav2 caps ~0.15 m/s) so DWA can back out of nose-first blocks.
+    # Reverse samples (~0.15 m/s) so DWA can back out of nose-first blocks.
     max_vel_x_reverse_m: float = 0.15
     reverse_speed_weight: float = 0.85
     spin_penalty: float = 1.0  # prefer translate (incl. reverse) over rotate-only

@@ -28,7 +28,7 @@ from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
 from viam.utils import struct_to_dict
 
-from ..ros import pcshm
+from ..shm import pcshm
 
 LOGGER = getLogger(__name__)
 

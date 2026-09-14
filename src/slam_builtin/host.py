@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from ..config import SLAM_BACKEND_BUILTIN
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .engine import BuiltinSlamEngine
 
 
 class BuiltinSlamHost:
-    """SLAM surface used by ``RosSlam`` for builtin occupancy mapping.
+    """SLAM surface used by ``SlamService`` for builtin occupancy mapping.
 
     Implements the methods ``slam.py`` calls on ``runtime.manager`` /
     ``manager.node``. ``node`` is self (same object) so
@@ -117,7 +117,7 @@ class BuiltinSlamHost:
     def slam_diagnostics(self) -> Dict:
         d = self._engine.diagnostics()
         d["slam_backend"] = SLAM_BACKEND_BUILTIN
-        d["slam_toolbox_lifecycle"] = "n/a"  # legacy key; always n/a for builtin
+        d["map_backend"] = "builtin"
 
         d["bridge"] = {"ok": True, "slam_backend": SLAM_BACKEND_BUILTIN}
         return d
@@ -128,7 +128,7 @@ class BuiltinSlamHost:
     def record_cmd_vel(
         self, vx: float, vy: float, vtheta: float, *, source: str = "nav"
     ) -> None:
-        # No ROS bridge cmd_vel history on the builtin path.
+        # No external cmd_vel history on the builtin path.
         del vx, vy, vtheta, source
 
     # -- Map / pose surface (self.node = self) -------------------------------

@@ -151,8 +151,8 @@ def describe_goal_progress(
     if body is None:
         return None
     dist, bearing, _forward, _left = body
-    vx = float(last.get("ros_vx_mps", 0.0) or 0.0)
-    vth = float(last.get("ros_vtheta_rad_s", 0.0) or 0.0)
+    vx = float(last.get("body_vx_mps", last.get("ros_vx_mps", 0.0)) or 0.0)
+    vth = float(last.get("body_vtheta_rad_s", last.get("ros_vtheta_rad_s", 0.0)) or 0.0)
     moving = abs(vx) >= 0.02 or abs(vth) >= 0.05
     if not moving:
         if dist < 0.3:
@@ -214,10 +214,10 @@ def describe_cmd_vel(
     max_vel_theta: float = 1.2,
     held_s: Optional[float] = None,
 ) -> str:
-    """Describe a single ROS body-frame cmd_vel sample."""
-    vx = float(last.get("ros_vx_mps", 0.0) or 0.0)
-    vy = float(last.get("ros_vy_mps", 0.0) or 0.0)
-    vth = float(last.get("ros_vtheta_rad_s", 0.0) or 0.0)
+    """Describe a single body-frame velocity command sample."""
+    vx = float(last.get("body_vx_mps", last.get("ros_vx_mps", 0.0)) or 0.0)
+    vy = float(last.get("body_vy_mps", 0.0) or 0.0)
+    vth = float(last.get("body_vtheta_rad_s", last.get("ros_vtheta_rad_s", 0.0)) or 0.0)
     source = last.get("source") or "unknown"
 
     if abs(vx) < 0.02 and abs(vy) < 0.02 and abs(vth) < 0.05:
@@ -230,7 +230,7 @@ def describe_cmd_vel(
         return base
 
     parts: list[str] = []
-    # Prefer describing forward/back (ROS +x); mention lateral only if present.
+    # Prefer describing forward/back (+x); mention lateral only if present.
     if abs(vx) >= 0.02:
         direction = "forward" if vx > 0 else "backward"
         parts.append(f"driving {direction} {_speed_word(abs(vx), max_vel_x)}")
@@ -239,7 +239,7 @@ def describe_cmd_vel(
         parts.append(f"strafing {side} {_speed_word(abs(vy), max_vel_x)}")
 
     if abs(vth) >= 0.05:
-        # ROS +z / CCW is left for a robot facing +x.
+        # +z / CCW is left for a robot facing +x.
         turn = "left" if vth > 0 else "right"
         intensity = _turn_word(abs(vth), max_vel_theta)
         if parts:
@@ -291,15 +291,15 @@ def summarize_nav_motion(
     """Build a plain-English motion summary from a nav ``get_status`` dict."""
     last = dict(status.get("last_cmd_vel") or {})
     # Builtin nav publishes live follower cmds as top-level progress fields
-    # (cmd_vx_mps / cmd_vtheta_rad_s) without the ROS cmd_vel history recorder.
+    # (cmd_vx_mps / cmd_vtheta_rad_s) without a cmd_vel history recorder.
     if not last and (
         status.get("cmd_vx_mps") is not None
         or status.get("cmd_vtheta_rad_s") is not None
     ):
         last = {
-            "ros_vx_mps": float(status.get("cmd_vx_mps") or 0.0),
-            "ros_vy_mps": 0.0,
-            "ros_vtheta_rad_s": float(status.get("cmd_vtheta_rad_s") or 0.0),
+            "body_vx_mps": float(status.get("cmd_vx_mps") or 0.0),
+            "body_vy_mps": 0.0,
+            "body_vtheta_rad_s": float(status.get("cmd_vtheta_rad_s") or 0.0),
             "source": "builtin",
             "age_s": 0.0,
         }

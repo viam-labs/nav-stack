@@ -1,16 +1,12 @@
-"""ROS-free adapter the bridge (and builtin scan readers) use to talk to Viam.
-
-Kept out of ``bridge.py`` so ``build_io_provider`` / ``global_localize`` can run
-when ``rclpy`` is not installed (``slam_backend: builtin``).
-"""
+"""Adapter SLAM / nav use to talk to Viam components without SDK coupling."""
 from __future__ import annotations
 
 
 class IOProvider:
     """Adapter the bridge uses to talk to Viam components.
 
-    The navigation/SLAM models supply concrete async callables; the bridge stays
-    free of any Viam SDK imports.
+    The navigation/SLAM models supply concrete async callables so sensor IO stays
+    free of Viam SDK imports at this layer.
     """
 
     def __init__(self, read_lidar_points, read_odometry, drive_base, stop_base):

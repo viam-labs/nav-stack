@@ -13,7 +13,7 @@ from typing import Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 
 @dataclass(frozen=True)
@@ -67,7 +67,7 @@ class _ScoredPose:
     endpoint_eval: _PoseScore
 
 
-def load_occupancy_from_bridge_map(map_data: Mapping) -> OccupancyMap:
+def load_occupancy_from_map_dict(map_data: Mapping) -> OccupancyMap:
     """Build an ``OccupancyMap`` from bridge ``get_map()`` output."""
     grid = np.asarray(map_data["grid"], dtype=np.int16)
     if grid.ndim != 2:

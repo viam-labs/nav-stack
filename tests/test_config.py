@@ -7,10 +7,10 @@ from src.config import (
     ExternalNavConfig,
     NavConfig,
     SlamConfig,
-    ros_cmd_vel_to_viam_linear_mm_s,
-    ros_twist_to_viam_set_velocity,
-    ros_vtheta_to_viam_angular_deg_s,
-    sensor_twist_to_ros_body,
+    body_linear_to_viam_mm_s,
+    body_twist_to_viam_set_velocity,
+    body_vtheta_to_viam_angular_deg_s,
+    sensor_twist_to_body,
 )
 
 
@@ -40,8 +40,8 @@ def test_slam_config_lidar_scan_source():
     assert cfg.imu_odom_mode == "accel_only"
     assert cfg.lidar_odom_enabled is True
     assert cfg.lidar_odom_range_flow_only is True
-    assert cfg.slam_toolbox.minimum_travel_distance == pytest.approx(0.15)
-    assert cfg.slam_toolbox.minimum_travel_heading == pytest.approx(0.12)
+    assert cfg.map.minimum_travel_distance == pytest.approx(0.15)
+    assert cfg.map.minimum_travel_heading == pytest.approx(0.12)
     assert cfg.slam_params.get("minimum_time_interval") == pytest.approx(0.3)
     assert cfg.slam_params.get("correlation_search_space_dimension") == pytest.approx(0.6)
     with pytest.raises(ValueError, match="scan_source"):
@@ -137,8 +137,8 @@ def test_slam_config_map_when_still_livox_defaults():
     assert cfg.map_when_still is True
     assert cfg.scan_accumulation_s == pytest.approx(1.0)
     assert cfg.map_when_still_dwell_s == pytest.approx(1.0)
-    assert cfg.slam_toolbox.minimum_travel_distance == pytest.approx(0.0)
-    # Real slam_toolbox matcher knobs (use_odometry / use_tf_* are not real params).
+    assert cfg.map.minimum_travel_distance == pytest.approx(0.0)
+    # MapSettings travel gates for dense lidars.
     assert cfg.slam_params.get("correlation_search_space_dimension") == pytest.approx(
         1.0
     )
@@ -191,15 +191,15 @@ def test_slam_config_map_when_still_overrides_user_travel_gates():
             "base": "b",
             "lidar": {"name": "livox", "scan_source": "point_cloud"},
             "map_when_still": True,
-            "slam_toolbox": {
+            "map": {
                 "resolution": 0.05,
                 "minimum_travel_distance": 0.15,
                 "minimum_travel_heading": 0.15,
             },
         }
     )
-    assert cfg.slam_toolbox.minimum_travel_distance == pytest.approx(0.0)
-    assert cfg.slam_toolbox.minimum_travel_heading == pytest.approx(0.0)
+    assert cfg.map.minimum_travel_distance == pytest.approx(0.0)
+    assert cfg.map.minimum_travel_heading == pytest.approx(0.0)
 
 
 def test_slam_config_map_when_still_default_off_for_mir_style():
@@ -399,11 +399,10 @@ def test_nav_config_defaults_and_deps():
     assert cfg.required_dependencies() == ["slam", "b"]
     assert cfg.nav_backend == "builtin"
     assert cfg.uses_builtin_nav() is True
-    assert cfg.uses_nav2() is False
 
 
 def test_nav_config_nav_backend_nav2_rejected():
-    with pytest.raises(ValueError, match="pre-ros-removal|nav2"):
+    with pytest.raises(ValueError, match="pre-ros-removal|nav2|no longer supported"):
         NavConfig.from_dict(
             {"slam_service": "slam", "base": "b", "nav_backend": "nav2"}
         )
@@ -442,13 +441,13 @@ def test_nav_config_bad_kinematics():
         NavConfig.from_dict({"slam_service": "s", "base": "b", "kinematics": "legs"})
 
 
-def test_slam_toolbox_config_from_attributes():
+def test_map_settings_from_attributes():
     cfg = SlamConfig.from_dict(
         {
             "base": "b",
             "lidar": "f",
             "mode": "localizing",
-            "slam_toolbox": {
+            "map": {
                 "resolution": 0.1,
                 "max_laser_range": 30.0,
                 "minimum_travel_distance": 0.5,
@@ -456,25 +455,35 @@ def test_slam_toolbox_config_from_attributes():
         }
     )
     assert cfg.mode == "localizing"
-    assert cfg.slam_toolbox.resolution == 0.1
-    assert cfg.slam_toolbox.max_laser_range == 30.0
-    assert cfg.slam_toolbox.minimum_travel_distance == 0.5
+    assert cfg.map.resolution == 0.1
+    assert cfg.map.max_laser_range == 30.0
+    assert cfg.map.minimum_travel_distance == 0.5
 
 
 def test_base_velocity_convention_viam_default():
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "f"})
     assert cfg.base_velocity_convention == "viam"
-    lx, ly = ros_cmd_vel_to_viam_linear_mm_s(0.5, -0.1, cfg.base_velocity_convention)
+    lx, ly = body_linear_to_viam_mm_s(0.5, -0.1, cfg.base_velocity_convention)
     assert lx == pytest.approx(-100.0)
     assert ly == pytest.approx(500.0)
 
 
-def test_base_velocity_convention_ros_uses_x_forward():
+def test_base_velocity_convention_ros_alias_normalizes_to_x_forward():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "f", "base_velocity_convention": "ros"}
     )
-    assert cfg.base_velocity_convention == "ros"
-    lx, ly = ros_cmd_vel_to_viam_linear_mm_s(0.5, -0.1, cfg.base_velocity_convention)
+    assert cfg.base_velocity_convention == "x_forward"
+    lx, ly = body_linear_to_viam_mm_s(0.5, -0.1, cfg.base_velocity_convention)
+    assert lx == pytest.approx(500.0)
+    assert ly == pytest.approx(-100.0)
+
+
+def test_base_velocity_convention_x_forward():
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "base_velocity_convention": "x_forward"}
+    )
+    assert cfg.base_velocity_convention == "x_forward"
+    lx, ly = body_linear_to_viam_mm_s(0.5, -0.1, cfg.base_velocity_convention)
     assert lx == pytest.approx(500.0)
     assert ly == pytest.approx(-100.0)
 
@@ -484,27 +493,27 @@ def test_base_velocity_convention_mir_alias_normalizes_to_viam():
         {"base": "b", "lidar": "f", "base_velocity_convention": "mir"}
     )
     assert cfg.base_velocity_convention == "viam"
-    lx, ly = ros_cmd_vel_to_viam_linear_mm_s(0.5, -0.1, cfg.base_velocity_convention)
+    lx, ly = body_linear_to_viam_mm_s(0.5, -0.1, cfg.base_velocity_convention)
     assert lx == pytest.approx(-100.0)
     assert ly == pytest.approx(500.0)
 
 
 
-def test_ros_vtheta_to_viam_angular_is_degrees():
+def test_body_vtheta_to_viam_angular_is_degrees():
     import math
     # -1 rad/s must become ~-57.3 deg/s at Base.SetVelocity (Viam API).
-    assert ros_vtheta_to_viam_angular_deg_s(-1.0) == pytest.approx(-math.degrees(1.0))
-    lx, ly, az = ros_twist_to_viam_set_velocity(0.5, 0.0, -1.0, "viam")
-    assert lx == pytest.approx(0.0)  # Y-forward: ROS vx -> linear.y
+    assert body_vtheta_to_viam_angular_deg_s(-1.0) == pytest.approx(-math.degrees(1.0))
+    lx, ly, az = body_twist_to_viam_set_velocity(0.5, 0.0, -1.0, "viam")
+    assert lx == pytest.approx(0.0)  # Y-forward: body vx -> linear.y
     assert ly == pytest.approx(500.0)
     assert az == pytest.approx(-math.degrees(1.0))
 
-def test_sensor_twist_to_ros_body_viam_y_forward():
+def test_sensor_twist_to_body_viam_y_forward():
     # Sensor: forward on y=0.019, no lateral → ROS forward on vx.
-    ros_vx, ros_vy = sensor_twist_to_ros_body(0.0, 0.019, "viam")
+    ros_vx, ros_vy = sensor_twist_to_body(0.0, 0.019, "viam")
     assert ros_vx == pytest.approx(0.019)
     assert ros_vy == pytest.approx(0.0)
-    ros_vx, ros_vy = sensor_twist_to_ros_body(0.5, -0.1, "ros")
+    ros_vx, ros_vy = sensor_twist_to_body(0.5, -0.1, "ros")
     assert ros_vx == pytest.approx(0.5)
     assert ros_vy == pytest.approx(-0.1)
 

@@ -1,4 +1,4 @@
-"""Shared types for the ROS-free builtin navigator."""
+"""Shared types for the builtin navigator."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -6,7 +6,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 # Re-export for callers that stay inside nav_builtin.
 Pose2D = conv.Pose2D
@@ -14,7 +14,7 @@ Pose2D = conv.Pose2D
 
 @dataclass(frozen=True)
 class OccupancyGrid:
-    """Nav2-style occupancy grid (row-major, height x width).
+    """Occupancy grid (row-major, height x width).
 
     Cells: -1 unknown, 0 free, 1..100 occupied (100 = lethal).
     """

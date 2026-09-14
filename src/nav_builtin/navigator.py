@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 from typing import Dict, Optional
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .supervisor import NavSupervisor
 from .types import Pose2D
 from .world_io import WorldIO

@@ -35,7 +35,7 @@ from ..nav_builtin import (
     ViamWorldIO,
     make_builtin_navigator,
 )
-from ..ros.shm_lidar import ShmPointCloudClient
+from ..shm.lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
     register_nav_host,
@@ -48,7 +48,7 @@ from .nav_core import NavServiceBase
 LOGGER = getLogger(__name__)
 
 
-class RosNavigationExternal(NavServiceBase):
+class ExternalNavigationService(NavServiceBase):
     MODEL: ClassVar[Model] = Model(
         ModelFamily("viam-labs", "nav-stack"), "navigation-external"
     )
@@ -173,8 +173,8 @@ class RosNavigationExternal(NavServiceBase):
 
 Registry.register_resource_creator(
     Motion.API,
-    RosNavigationExternal.MODEL,
+    ExternalNavigationService.MODEL,
     ResourceCreatorRegistration(
-        RosNavigationExternal.new, RosNavigationExternal.validate_config
+        ExternalNavigationService.new, ExternalNavigationService.validate_config
     ),
 )

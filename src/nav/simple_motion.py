@@ -12,7 +12,7 @@ from typing import Awaitable, Callable, Optional
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 
 class SimpleMotionError(Exception):

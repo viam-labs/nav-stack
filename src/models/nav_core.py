@@ -46,7 +46,7 @@ from viam.proto.service.motion import (
 from viam.services.motion import Motion
 from viam.utils import ValueTypes
 
-from ..config import NavConfig, ros_twist_to_viam_set_velocity
+from ..config import NavConfig, body_twist_to_viam_set_velocity
 from ..nav import zones as zones_mod
 from ..nav.locations import LocationStore
 from ..nav.maps import MapHandle
@@ -59,7 +59,7 @@ from ..nav.simple_motion import (
     drive_to_pose,
 )
 from ..nav.zones import ZoneStore
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 
 LOGGER = getLogger(__name__)
 
@@ -785,10 +785,10 @@ class NavServiceBase(Motion):
                         from ..nav_builtin.costmap import (
                             build_costmap,
                             costmap_viz_dict,
-                            occupancy_from_bridge_map,
+                            occupancy_from_map_dict,
                         )
 
-                        occ = occupancy_from_bridge_map(mp)
+                        occ = occupancy_from_map_dict(mp)
                         costs = build_costmap(
                             occ,
                             inflation_radius_m=cfg.inflation_radius,
@@ -1091,23 +1091,23 @@ class NavServiceBase(Motion):
     async def _test_drive(
         self, command: Mapping[str, ValueTypes]
     ) -> Mapping[str, ValueTypes]:
-        """Send one ROS-body cmd through the drive path, then stop."""
+        """Send one body-frame cmd through the drive path, then stop."""
         runtime = self._require_runtime()
         node = getattr(runtime.manager, "node", None)
         io = node._io if node is not None else None
 
-        vx = float(command.get("vx", command.get("ros_vx_mps", 0.0)))
-        vy = float(command.get("vy", command.get("ros_vy_mps", 0.0)))
-        vtheta = float(command.get("vtheta", command.get("ros_vtheta_rad_s", 0.0)))
+        vx = float(command.get("vx", command.get("body_vx_mps", command.get("ros_vx_mps", 0.0))))
+        vy = float(command.get("vy", command.get("body_vy_mps", 0.0)))
+        vtheta = float(command.get("vtheta", command.get("body_vtheta_rad_s", 0.0)))
         if (
             "angular_z_deg_s" in command
             and "vtheta" not in command
-            and "ros_vtheta_rad_s" not in command
+            and "body_vtheta_rad_s" not in command
         ):
             vtheta = math.radians(float(command["angular_z_deg_s"]))
         duration_s = max(0.1, min(float(command.get("duration_s", 1.5)), 5.0))
 
-        lx, ly, ang_deg_s = ros_twist_to_viam_set_velocity(
+        lx, ly, ang_deg_s = body_twist_to_viam_set_velocity(
             vx, vy, vtheta, runtime.slam_cfg.base_velocity_convention
         )
         if io is not None:
@@ -1115,7 +1115,7 @@ class NavServiceBase(Motion):
             await asyncio.sleep(duration_s)
             await io.stop_base()
         else:
-            # ROS-free builtin: drive the Viam base directly.
+            # Drive the Viam base directly.
             base = self._base
             if base is None:
                 raise RuntimeError("base unavailable")
@@ -1131,9 +1131,9 @@ class NavServiceBase(Motion):
         return {
             "status": "ok",
             "sent": {
-                "ros_vx_mps": vx,
-                "ros_vy_mps": vy,
-                "ros_vtheta_rad_s": vtheta,
+                "body_vx_mps": vx,
+                "body_vy_mps": vy,
+                "body_vtheta_rad_s": vtheta,
                 "viam_linear_x_mm_s": lx,
                 "viam_linear_y_mm_s": ly,
                 "viam_angular_z_deg_s": ang_deg_s,
@@ -1143,7 +1143,7 @@ class NavServiceBase(Motion):
 
     async def _plan_preview(self, command: Mapping, mgr) -> dict:
         """Run path planning and cache the result for execute_plan."""
-        from ..ros import conversions as conv
+        from ..geom import conversions as conv
 
         x = float(command["x"])
         y = float(command["y"])
@@ -1186,7 +1186,7 @@ class NavServiceBase(Motion):
         # previous simple-nav run (see _start_simple_go).
         await asyncio.to_thread(runtime.manager.cancel)
 
-        from ..ros import conversions as conv
+        from ..geom import conversions as conv
 
         goal = conv.Pose2D(x, y, theta)
         motion_cfg = config_from_nav(
@@ -1210,7 +1210,7 @@ class NavServiceBase(Motion):
             node = getattr(runtime.manager, "node", None)
             if node is not None:
                 node.record_cmd_vel(vx, vy, vtheta, source="simple")
-            lx, ly, ang_deg_s = ros_twist_to_viam_set_velocity(vx, vy, vtheta, convention)
+            lx, ly, ang_deg_s = body_twist_to_viam_set_velocity(vx, vy, vtheta, convention)
             await base.set_velocity(
                 linear=Vector3(x=lx, y=ly, z=0),
                 angular=Vector3(x=0, y=0, z=ang_deg_s),

@@ -1,6 +1,6 @@
 """Pause keyframes for mapping-time revisit matching.
 
-With ``map_when_still``, slam_toolbox only sees stop scans. Returning to a
+With ``map_when_still``, SLAM only inserts scans while stopped. Returning to a
 previously mapped area often means a *different* stop pose/angle than before,
 so a thin occupancy silhouette can score poorly. Each accepted still publish
 stores a compact keyframe — primary-band 2D endpoints plus multi-height slice
@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..ros import conversions as conv
+from ..geom import conversions as conv
 from .global_localize import scan_endpoints_base_link
 
 

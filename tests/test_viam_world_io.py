@@ -11,11 +11,11 @@ import pytest
 
 from src.nav_builtin.viam_io import (
     ViamWorldIO,
-    bridge_map_to_get_grid,
+    map_dict_to_get_grid,
     get_grid_response_to_map,
 )
 from src.nav_builtin.viz_store import NavVizStore
-from src.ros import conversions as conv
+from src.geom import conversions as conv
 
 
 def test_bridge_map_get_grid_roundtrip():
@@ -26,7 +26,7 @@ def test_bridge_map_get_grid_roundtrip():
         "origin_x": -1.0,
         "origin_y": -2.0,
     }
-    payload = bridge_map_to_get_grid(mp)
+    payload = map_dict_to_get_grid(mp)
     assert payload["rows"] == 2
     assert payload["cols"] == 2
     assert payload["cellSize"] == pytest.approx(0.05)
@@ -42,7 +42,7 @@ async def test_viam_world_io_map_pose_drive():
     loop = asyncio.get_event_loop()
     grid = np.zeros((4, 4), dtype=np.int16)
     grid[1, 1] = 100
-    payload = bridge_map_to_get_grid(
+    payload = map_dict_to_get_grid(
         {
             "grid": grid,
             "resolution": 0.1,
@@ -92,7 +92,7 @@ async def test_viam_world_io_map_pose_drive():
     drive = world.last_drive()
     assert drive is not None
     assert drive["issued"] is True
-    assert drive["ros_vtheta_rad_s"] == pytest.approx(-1.0)
+    assert drive["body_vtheta_rad_s"] == pytest.approx(-1.0)
     assert drive["viam_angular_z_deg_s"] == pytest.approx(-math.degrees(1.0))
 
 
@@ -156,8 +156,8 @@ def test_viam_world_io_prefers_shm_scan():
     import time as _time
 
     from src.config import LidarConfig
-    from src.ros import pcshm
-    from src.ros.shm_lidar import ShmPointCloudClient
+    from src.shm import pcshm
+    from src.shm.lidar import ShmPointCloudClient
 
     min_pcd = (
         b"# .PCD v0.7\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\n"

@@ -16,8 +16,8 @@ from viam.proto.service.motion import PlanState
 from viam.services.motion import Motion
 
 from src.config import NavConfig
-from src.models.navigation import RosNavigation, _nav_status_to_plan_state
-from src.ros.conversions import Pose2D, viam_pose_to_pose2d
+from src.models.navigation import NavigationService, _nav_status_to_plan_state
+from src.geom.conversions import Pose2D, viam_pose_to_pose2d
 
 
 def test_nav_status_to_plan_state_mapping():
@@ -44,13 +44,13 @@ def test_nav_status_to_plan_state_mapping():
     )
 
 
-def test_ros_navigation_registers_as_motion():
-    assert RosNavigation.API == Motion.API
-    assert issubclass(RosNavigation, Motion)
+def test_navigation_registers_as_motion():
+    assert NavigationService.API == Motion.API
+    assert issubclass(NavigationService, Motion)
 
 
-def _configured_nav(*, nav_status=None, pose=None) -> tuple[RosNavigation, MagicMock]:
-    nav = RosNavigation("nav")
+def _configured_nav(*, nav_status=None, pose=None) -> tuple[NavigationService, MagicMock]:
+    nav = NavigationService("nav")
     nav._cfg = NavConfig(
         slam_service="slam",
         base="my-base",

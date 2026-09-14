@@ -1,8 +1,9 @@
 # nav-stack
 
 A Viam navigation stack for mapping, localization, and obstacle-aware navigation
-on any Viam base. **Builtin SLAM + builtin nav only** (no ROS).
-The last ROS-based release is preserved at git tag `pre-ros-removal`.
+on any Viam base. **Builtin SLAM + builtin nav only.**
+The last release that still bundled Nav2/slam_toolbox is preserved at git tag
+`pre-ros-removal`.
 
 This module (`viam-labs:nav-stack`) provides:
 
@@ -18,7 +19,8 @@ This module (`viam-labs:nav-stack`) provides:
 ## How it works
 
 SLAM and navigation run in-process over Viam APIs (lidar point clouds / shm,
-movement sensor, `Base.SetVelocity`). No ROS install required.
+movement sensor, `Base.SetVelocity`). No external navigation stack install is
+required.
 
 ```mermaid
 flowchart LR

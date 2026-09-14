@@ -6,8 +6,8 @@ Layout on disk::
         state.json                 # { "active_map": "<name>" }
         <map_name>/
             metadata.json          # name, timestamps, resolution, frame
-            map.posegraph          # slam_toolbox serialized pose-graph (written by ROS)
-            map.data               # slam_toolbox serialized data (written by ROS)
+            map.posegraph          # optional legacy pose-graph file
+            map.data               # optional legacy data file
             map.yaml / map.pgm     # occupancy grid (optional, for export)
             locations.json         # named locations (scoped to this map)
             zones.json             # keepout / speed_limit zones (scoped to this map)
@@ -59,7 +59,7 @@ class MapHandle:
 
     @property
     def posegraph_path(self) -> Path:
-        # slam_toolbox serialization writes <stem>.posegraph and <stem>.data.
+        # Legacy serialization may write <stem>.posegraph and <stem>.data.
         return self.root / "map.posegraph"
 
     @property
@@ -96,7 +96,7 @@ class MapHandle:
         return self.has_serialized_map() or self.has_occupancy_map()
 
     def clear_serialized_data(self) -> None:
-        """Remove slam_toolbox serialization and exported occupancy grid files."""
+        """Remove map serialization and exported occupancy grid files."""
         for path in (
             self.posegraph_path,
             Path(str(self.serialization_stem) + ".data"),
