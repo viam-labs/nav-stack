@@ -2032,6 +2032,51 @@ class SlamService(SLAM):
             finally:
                 self._end_map_reset()
             return {"status": "cleared", "map": handle.name, "mode": MODE_MAPPING}
+        if cmd in ("clear_obstacles", "erase_obstacles"):
+            # Paint free space into the live occupancy grid (builtin SLAM).
+            x = command.get("x")
+            y = command.get("y")
+            if x is None or y is None:
+                pose = command.get("pose")
+                if isinstance(pose, Mapping):
+                    x = pose.get("x")
+                    y = pose.get("y")
+            if x is None or y is None:
+                raise ValueError("clear_obstacles requires x,y (or pose.x/pose.y)")
+            radius = command.get("radius_m", command.get("radius", 0.35))
+            try:
+                x_m = float(x)
+                y_m = float(y)
+                radius_m = float(radius)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("x, y, radius_m must be numbers") from exc
+            if radius_m <= 0:
+                raise ValueError("radius_m must be > 0")
+
+            def _erase():
+                clear_fn = getattr(mgr, "clear_obstacles", None)
+                if clear_fn is None and getattr(mgr, "node", None) is not None:
+                    clear_fn = getattr(mgr.node, "clear_obstacles", None)
+                if clear_fn is None:
+                    raise RuntimeError(
+                        "clear_obstacles requires slam_backend=builtin "
+                        "(no live occupancy editor on this SLAM host)"
+                    )
+                return clear_fn(x_m, y_m, radius_m)
+
+            result = await asyncio.to_thread(_erase)
+            save = command.get("save", False)
+            out = dict(result) if isinstance(result, Mapping) else {"result": result}
+            out["status"] = "ok"
+            out["map"] = store.get_active_map_name()
+            out["saved"] = False
+            if save:
+                handle = store.active_handle()
+                if not handle:
+                    raise ValueError("no active map")
+                await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
+                out["saved"] = True
+            return out
         if cmd == "delete_map":
             name = validate_map_name(
                 str(command.get("map") or store.get_active_map_name() or "")

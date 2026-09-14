@@ -53,6 +53,9 @@ class BuiltinSlamHost:
         self._engine.reset_map()
         return True
 
+    def clear_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
+        return self._engine.clear_obstacles(x_m, y_m, radius_m)
+
     def save_map(self, map_stem: Path) -> None:
         self._engine.save_map(Path(map_stem).parent)
 
