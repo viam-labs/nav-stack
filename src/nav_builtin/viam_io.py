@@ -6,7 +6,7 @@ import base64
 import math
 import struct
 import time
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence, Set
 
 import numpy as np
 from viam.proto.common import Vector3
@@ -124,9 +124,12 @@ class ViamWorldIO:
         self._scan_cache: Optional[conv.LaserScan2D] = None
         self._scan_cache_at = 0.0
         self._scan_cache_pose: Optional[conv.Pose2D] = None
-        # Per-sensor cache so dense depth cams are not GetPointCloud'd every tick.
+        # Obstacles-only depth cams: never await GetPointCloud on the nav tick.
+        # A fire-and-forget refresh fills this cache; the control loop only reads it
+        # so RealSense PCD cannot starve SetVelocity on the shared module loop.
         self._per_lidar_scan: dict[str, tuple[conv.LaserScan2D, float]] = {}
-        self._obstacles_only_period_s = 0.25
+        self._obstacles_only_period_s = 0.75
+        self._obstacles_refresh_inflight: Set[str] = set()
         self._last_drive: Optional[dict] = None
         self._pose_source: str = "none"
 
@@ -383,22 +386,72 @@ class ViamWorldIO:
         raw, _age = got
         return self._pcd_to_scan(raw, lidar)
 
+    def _kick_obstacles_only_refresh(self, lidar: LidarConfig) -> None:
+        """Schedule a non-blocking depth refresh on the module loop.
+
+        Nav never waits for this. While ``get_point_cloud`` is awaiting network,
+        ``SetVelocity`` can still run on the same loop. PCD parse runs in an
+        executor so CPU work does not freeze drive commands.
+        """
+        name = lidar.name
+        if name in self._obstacles_refresh_inflight:
+            return
+        cached = self._per_lidar_scan.get(name)
+        now = time.monotonic()
+        if (
+            cached is not None
+            and now - cached[1] < self._obstacles_only_period_s
+        ):
+            return
+        if self._loop.is_closed():
+            return
+        cam = self._cameras.get(name)
+        if cam is None and not lidar.shm_name:
+            return
+        self._obstacles_refresh_inflight.add(name)
+
+        async def _job() -> None:
+            try:
+                shm_scan = self._try_shm_scan(
+                    lidar, max_age_s=max(2.0, self._obstacles_only_period_s * 2)
+                )
+                if shm_scan is not None:
+                    self._per_lidar_scan[name] = (shm_scan, time.monotonic())
+                    return
+                if cam is None:
+                    return
+                data = await cam.get_point_cloud(timeout=2.0)
+                raw = data[0] if isinstance(data, tuple) else data
+                loop = asyncio.get_running_loop()
+                scan = await loop.run_in_executor(
+                    None, lambda: self._pcd_to_scan(raw, lidar)
+                )
+                if scan is not None:
+                    self._per_lidar_scan[name] = (scan, time.monotonic())
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"obstacles_only lidar {name} refresh failed: {exc}")
+            finally:
+                self._obstacles_refresh_inflight.discard(name)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_job(), self._loop)
+        except Exception:  # noqa: BLE001
+            self._obstacles_refresh_inflight.discard(name)
+
     def _read_lidar_scan_sync(
         self, lidar: LidarConfig, *, max_age_s: float
     ) -> Optional[conv.LaserScan2D]:
         if lidar.obstacles_only:
+            # Cache-only on the hot path — never block the nav worker / event loop
+            # on RealSense GetPointCloud (that was starving SetVelocity → stall).
+            self._kick_obstacles_only_refresh(lidar)
             cached = self._per_lidar_scan.get(lidar.name)
-            if (
-                cached is not None
-                and time.monotonic() - cached[1] < self._obstacles_only_period_s
-            ):
-                return cached[0]
+            return cached[0] if cached is not None else None
+
         # Prefer POSIX shm (memcpy) so the 10 Hz control loop never blocks on
         # gRPC GetPointCloud — that lag was causing no_scan spin / circles.
         shm_scan = self._try_shm_scan(lidar, max_age_s=max_age_s)
         if shm_scan is not None:
-            if lidar.obstacles_only:
-                self._per_lidar_scan[lidar.name] = (shm_scan, time.monotonic())
             return shm_scan
         if lidar.shm_name and lidar.shm_required:
             return None
@@ -406,15 +459,12 @@ class ViamWorldIO:
         if cam is None:
             return None
         try:
-            scan = self._run(
+            return self._run(
                 self._read_lidar_scan_grpc(cam, lidar),
                 timeout=1.0,
             )
         except Exception:  # noqa: BLE001
             return None
-        if scan is not None and lidar.obstacles_only:
-            self._per_lidar_scan[lidar.name] = (scan, time.monotonic())
-        return scan
 
     async def _read_lidar_scan_grpc(
         self, cam, lidar: LidarConfig

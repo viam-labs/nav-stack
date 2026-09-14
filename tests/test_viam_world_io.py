@@ -348,3 +348,48 @@ def test_sync_slam_pose_provider_uses_registered_service(monkeypatch):
     monkeypatch.setattr(nav_mod, "get_slam", lambda _n: None)
     provider = nav_mod._sync_slam_pose_provider("slam")
     assert provider() == conv.Pose2D(1.25, -0.5, 0.3)
+
+
+@pytest.mark.asyncio
+async def test_obstacles_only_scan_never_blocks_on_point_cloud():
+    """Hot-path get_scan must return cache without waiting on RealSense PCD."""
+    import time
+
+    from src.config import LidarConfig
+
+    loop = asyncio.get_running_loop()
+
+    async def _hang(*_a, **_k):
+        await asyncio.sleep(3600.0)
+
+    cam = MagicMock()
+    cam.get_point_cloud = AsyncMock(side_effect=_hang)
+    slam = MagicMock(spec=["get_position", "do_command"])
+    slam.get_position = AsyncMock(
+        return_value=SimpleNamespace(
+            x=0.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0
+        )
+    )
+    # Fresh enough that kick skips scheduling a refresh.
+    depth = LidarConfig(
+        name="camera",
+        scan_source="point_cloud",
+        obstacles_only=True,
+        cloud_frame="camera_optical",
+        shm_name=None,
+    )
+    world = ViamWorldIO(
+        slam=slam,
+        base=MagicMock(),
+        loop=loop,
+        cameras={"camera": cam},
+        lidars=[depth],
+    )
+    seeded = conv.points_to_scan(np.array([[1.0, 0.0]]), num_bins=360)
+    world._per_lidar_scan["camera"] = (seeded, time.monotonic())  # noqa: SLF001
+
+    t0 = time.monotonic()
+    scan = await asyncio.to_thread(world.get_scan, 2.0)
+    assert time.monotonic() - t0 < 1.0
+    assert scan is not None
+    cam.get_point_cloud.assert_not_awaited()
