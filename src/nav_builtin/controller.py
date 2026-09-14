@@ -11,6 +11,7 @@ from ..nav.simple_motion import (
     SimpleMotionConfig,
     apply_obstacle_avoidance,
     apply_velocity_floor,
+    cone_min_range,
     distance_m,
     heading_error_rad,
 )
@@ -61,8 +62,10 @@ def _near_goal_command(
     next tick (back inside the ball) flips to final-yaw with the opposite
     sign — classic goal-swing.
 
-    Close XY first while still away from the goal point. Only pure-spin for
-    final yaw once inside ~2× ``xy_tolerance``.
+    Keep closing XY until a few centimetres from the point, then pure-spin for
+    final yaw. Supervisor may still accept XY-only after a yaw align timeout
+    once settled. We do not stop translating at the outer ``xy_tolerance`` ball
+    — that left ~0.1–0.25 m residuals while hunting heading.
 
     Translating cmds must survive ``ViamWorldIO`` base sanitizer: it zeros
     ``|vx| < 0.12`` when ``|vθ| > 0.25`` (and ``|vx| < 0.05`` always). Tiny
@@ -71,13 +74,14 @@ def _near_goal_command(
     """
     xy_tol = motion.xy_tolerance_m
     yaw_tol = motion.yaw_tolerance_rad
+    # Nail the point before hunting goal θ (acceptance ball stays xy_tol).
+    xy_settle_m = xy_settle_radius_m(xy_tol)
     yaw_cap = min(0.40, motion.max_angular_rad_s)
     # Keep |vθ| under the sanitizer's 0.25 cut when also translating.
     translate_yaw_cap = min(yaw_cap, 0.22)
-    spin_first_rad = max(yaw_tol * 1.5, math.radians(35.0))
-    yaw_settle_m = max(xy_tol * 2.0, 0.40)
     # Floor above sanitizer lin_eps (0.05) and the tiny+turn kill (0.12).
     crawl_floor = 0.12
+    soft_floor = 0.05  # lin_eps; pair with small vθ so soft crawl survives
 
     def _spin_yaw() -> DriveCommand:
         vtheta = _clamp(yaw_err * 0.85, yaw_cap)
@@ -85,17 +89,26 @@ def _near_goal_command(
             vtheta = math.copysign(0.10, yaw_err)
         return DriveCommand(0.0, 0.0, vtheta, False)
 
-    def _close_xy() -> DriveCommand:
+    def _close_xy(*, soft: bool = False) -> DriveCommand:
         """Face the goal point (or reverse) and close distance."""
+        floor = soft_floor if soft else crawl_floor
+        # Soft: scale speed with remaining gap so a 6 cm approach doesn't
+        # blast through the settle radius at 0.12 m/s.
+        if soft:
+            max_crawl = min(0.10, max(floor, dist * 1.2))
+        else:
+            max_crawl = 0.18
         if abs(bearing) > math.radians(100.0):
-            # Goal behind: reverse with sanitizer-safe |vx| and small vθ.
-            crawl = min(0.16, max(crawl_floor, motion.max_linear_mps * 0.25))
+            crawl = min(
+                max_crawl, max(floor, motion.max_linear_mps * (0.20 if soft else 0.25))
+            )
             rev_bearing = conv.normalize_angle(bearing + math.pi)
+            vth = 0.0 if soft else _clamp(rev_bearing * 1.2, translate_yaw_cap)
             return apply_velocity_floor(
                 DriveCommand(
-                    -max(crawl_floor, min(crawl, dist * 0.8)),
+                    -max(floor, min(crawl, dist * 0.8)),
                     0.0,
-                    _clamp(rev_bearing * 1.2, translate_yaw_cap),
+                    vth,
                     False,
                 ),
                 motion,
@@ -106,42 +119,43 @@ def _near_goal_command(
                 DriveCommand(0.0, 0.0, _clamp(bearing * 1.5, yaw_cap), False),
                 motion,
             )
-        crawl = min(0.18, max(crawl_floor, motion.max_linear_mps * 0.30))
-        vx = max(crawl_floor, min(crawl, dist * 0.8))
+        crawl = min(
+            max_crawl, max(floor, motion.max_linear_mps * (0.20 if soft else 0.30))
+        )
+        vx = max(floor, min(crawl, dist * (1.2 if soft else 0.8)))
+        vth = _clamp(bearing * (1.0 if soft else 1.5), translate_yaw_cap)
+        if soft and abs(bearing) < math.radians(25.0):
+            # Keep |vθ| low so soft |vx| survives the sanitizer.
+            vth = _clamp(bearing * 0.8, 0.15)
         return apply_velocity_floor(
-            DriveCommand(vx, 0.0, _clamp(bearing * 1.5, translate_yaw_cap), False),
+            DriveCommand(vx, 0.0, vth, False),
             motion,
         )
 
-    # On the spot: only final yaw remains.
+    # Tight on the point: only final yaw remains.
+    if dist <= xy_settle_m:
+        return _spin_yaw()
+
+    # Inside acceptance ball but not settled: soft-close XY (ignore final yaw),
+    # unless we're already a few cm out and heading is still wrong — further soft
+    # crawl often dies under obstacle:slow + sanitizer, so never hand off to yaw.
     if dist <= xy_tol:
-        return _spin_yaw()
+        if abs(yaw_err) > yaw_tol and dist <= max(0.06, xy_settle_m * 2.0):
+            return _spin_yaw()
+        return _close_xy(soft=True)
 
-    # Still metres out: ignore final yaw and close XY.
-    if dist > yaw_settle_m:
-        return _close_xy()
+    # Still outside XY tolerance: ignore final yaw and close on the point.
+    return _close_xy(soft=False)
 
-    # Near the XY ball with a large final-yaw error: spin before crawling.
-    if abs(yaw_err) > spin_first_rad:
-        return _spin_yaw()
 
-    # Final yaw already good — close remaining XY facing the goal point.
-    if abs(yaw_err) <= yaw_tol:
-        return _close_xy()
+def xy_settle_radius_m(xy_tolerance_m: float) -> float:
+    """Radius at which near-goal stops translating and spins for final yaw.
 
-    # Partial yaw error: never reverse+hunt final yaw (that fights itself and
-    # gets vx stripped by the sanitizer). Face the goal point, then crawl.
-    if abs(bearing) > math.radians(60.0):
-        return apply_velocity_floor(
-            DriveCommand(0.0, 0.0, _clamp(bearing * 1.5, yaw_cap), False),
-            motion,
-        )
-    crawl = min(0.16, max(crawl_floor, motion.max_linear_mps * 0.25))
-    vx = max(crawl_floor, min(crawl, dist * 0.7))
-    return apply_velocity_floor(
-        DriveCommand(vx, 0.0, _clamp(yaw_err * 0.7, translate_yaw_cap), False),
-        motion,
-    )
+    Kept small so we park on the point when possible. Below ~3 cm, soft crawl
+    (sanitizer lin_eps 0.05 m/s) mostly overshoots, so we spin instead.
+    """
+    del xy_tolerance_m  # acceptance ball is separate; settle is physical
+    return 0.03
 
 
 def _effective_lookahead(
@@ -346,11 +360,16 @@ def compute_path_command(
 
     obstacle_state = "clear"
     forward_clearance = math.inf
-    if (
+    # Inside the XY acceptance ball, reactive slow/stop fights the soft crawl
+    # (scales vx under sanitizer lin_eps) and blocks the yaw handoff. Clearance
+    # is still reported when we have a scan; we just don't reshape the cmd.
+    apply_obstacle = (
         not local_active
         and cfg.obstacle is not None
         and cfg.obstacle.enabled
-    ):
+        and dist_goal > cfg.motion.xy_tolerance_m
+    )
+    if apply_obstacle:
         cmd, obstacle_state, forward_clearance = apply_obstacle_avoidance(
             cmd, scan, cfg.obstacle, max_angular_rad_s=cfg.motion.max_angular_rad_s
         )
@@ -358,6 +377,15 @@ def compute_path_command(
             cmd = apply_velocity_floor(cmd, cfg.motion)
     elif local_active:
         obstacle_state = "local_planner"
+    elif (
+        cfg.obstacle is not None
+        and cfg.obstacle.enabled
+        and dist_goal <= cfg.motion.xy_tolerance_m
+        and scan is not None
+    ):
+        half = cfg.obstacle.front_cone_half_rad
+        forward_clearance = cone_min_range(scan, -half, half)
+        obstacle_state = "clear"
 
     progress = {
         "waypoint_index": idx,

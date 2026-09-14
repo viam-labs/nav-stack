@@ -93,6 +93,7 @@ class ViamWorldIO:
         logger=None,
         pose_provider: Optional[Callable[[], Optional[conv.Pose2D]]] = None,
         map_provider: Optional[Callable[[], Optional[dict]]] = None,
+        scan_provider: Optional[Callable[[float], Optional[conv.LaserScan2D]]] = None,
     ):
         self._slam = slam
         self._base = base
@@ -116,6 +117,7 @@ class ViamWorldIO:
         # origin placeholder (0,0,0) or stall — which freezes bearing_error.
         self._pose_provider = pose_provider
         self._map_provider = map_provider
+        self._scan_provider = scan_provider
         self._skip_get_laser_scan: set[str] = set()
         self._map_cache: Optional[dict] = None
         self._map_cache_at = 0.0
@@ -271,6 +273,26 @@ class ViamWorldIO:
             )
             if dtheta <= math.radians(12.0) and dist <= 0.12:
                 return self._scan_cache
+        if self._scan_provider is not None:
+            try:
+                provided = self._scan_provider(max_age_s)
+            except Exception:  # noqa: BLE001
+                provided = None
+            if provided is not None:
+                if pose is not None and provided.capture_pose is None:
+                    provided = conv.LaserScan2D(
+                        ranges=provided.ranges,
+                        angle_min=provided.angle_min,
+                        angle_increment=provided.angle_increment,
+                        range_min=provided.range_min,
+                        range_max=provided.range_max,
+                        sensor_pose=provided.sensor_pose,
+                        capture_pose=pose,
+                    )
+                self._scan_cache = provided
+                self._scan_cache_at = now
+                self._scan_cache_pose = pose
+                return provided
         if not self._lidars:
             return self._scan_cache
         scans = []

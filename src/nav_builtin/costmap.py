@@ -80,12 +80,31 @@ def mark_scan_on_occupancy(
     pose: conv.Pose2D,
     scan: conv.LaserScan2D,
     *,
-    obstacle_radius_m: float = 0.35,
+    obstacle_radius_m: float = 0.05,
+    occupied_threshold: int = 50,
 ) -> OccupancyGrid:
-    """Copy ``occ`` with inflated live scan hits (for dynamic replanning)."""
+    """Copy ``occ`` with live scan hits marked occupied (for dynamic replanning).
+
+    Hits that already land on mapped occupied cells are skipped so static walls
+    are not painted again before ``build_costmap`` inflation (which would seal
+    narrow gaps). ``obstacle_radius_m`` is hit thickness only — inflation is
+    applied separately by ``build_costmap``.
+    """
     hits = scan_world_points(pose, scan)
+    if hits.size == 0:
+        return occ
+    novel = []
+    for wx, wy in hits:
+        row, col = occ.world_to_cell(float(wx), float(wy))
+        if not occ.in_bounds(row, col):
+            continue
+        if int(occ.grid[row, col]) >= occupied_threshold:
+            continue
+        novel.append((float(wx), float(wy)))
+    if not novel:
+        return occ
     return mark_points_on_occupancy(
-        occ, hits, radius_m=obstacle_radius_m
+        occ, np.asarray(novel, dtype=np.float64), radius_m=obstacle_radius_m
     )
 
 

@@ -6,7 +6,7 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 
-from .planner import line_of_sight
+from .planner import line_of_sight, world_segment_traversable
 from .types import OccupancyGrid, Path2D
 
 
@@ -49,6 +49,7 @@ def _shortcut_smooth(
     out = [pts[0]]
     i = 0
     n = len(pts)
+    sample_step = max(0.05, float(occ.resolution) * 0.5)
     while i < n - 1:
         best_j = i + 1
         r0, c0 = occ.world_to_cell(pts[i][0], pts[i][1])
@@ -60,9 +61,21 @@ def _shortcut_smooth(
             r1, c1 = occ.world_to_cell(pts[j][0], pts[j][1])
             if not occ.in_bounds(r1, c1):
                 continue
-            if line_of_sight(costs, (r0, c0), (r1, c1)):
-                best_j = j
-                break
+            if not line_of_sight(costs, (r0, c0), (r1, c1)):
+                continue
+            # Cell LOS can still clip the inflation halo in world space.
+            if not world_segment_traversable(
+                costs,
+                occ,
+                pts[i][0],
+                pts[i][1],
+                pts[j][0],
+                pts[j][1],
+                sample_step_m=sample_step,
+            ):
+                continue
+            best_j = j
+            break
         out.append(pts[best_j])
         i = best_j
     return out

@@ -255,9 +255,7 @@ def test_lazy_theta_star_shorter_or_smoother_than_astar():
         algorithm="lazy_theta_star",
     )
     assert astar.feasible and theta.feasible
-    # Any-angle should use fewer waypoints than grid A* on open space.
-    assert len(theta.path.points) <= len(astar.path.points)
-    # And path length should be no worse than A* (within tiny float slack).
+
     def _len(path):
         pts = path.points
         return sum(
@@ -265,8 +263,14 @@ def test_lazy_theta_star_shorter_or_smoother_than_astar():
             for i in range(1, len(pts))
         )
 
+    # World densify may add waypoints for collision safety; length still matters.
     assert _len(theta.path) <= _len(astar.path) + 1e-6
-
+    assert (
+        path_blocked(
+            m, theta.path, inflation_radius_m=0.15, robot_radius_m=0.05, from_pose=start
+        )
+        is False
+    )
 
 def test_lazy_theta_star_detours_around_wall():
     m = _wall_map()
@@ -364,6 +368,64 @@ def test_path_blocked_horizon_ignores_far_obstacle():
     ) is True
 
 
+def test_lazy_theta_plan_survives_path_blocked_on_corridor():
+    """Planned world polyline must not immediately fail static path_blocked."""
+    from src.sim.world import make_builtin_corridor
+
+    sm = make_builtin_corridor()
+    m = {
+        "grid": sm.grid.copy(),
+        "resolution": sm.resolution,
+        "origin_x": sm.origin_x,
+        "origin_y": sm.origin_y,
+    }
+    start = Pose2D(5.69, 1.63, -3.1)
+    goal = Pose2D(1.77, 2.34, -0.13)
+    result = plan_path(
+        m, start, goal, inflation_radius_m=0.35, robot_radius_m=0.22
+    )
+    assert result.feasible
+    assert (
+        path_blocked(
+            m,
+            result.path,
+            inflation_radius_m=0.35,
+            robot_radius_m=0.22,
+            from_pose=start,
+            ahead_m=4.0,
+        )
+        is False
+    )
+
+
+def test_plan_with_scan_does_not_seal_mapped_corridor():
+    """Lidar hits on already-mapped walls must not double-inflate the gap shut."""
+    from src.sim.world import SimWorld, make_builtin_corridor
+
+    sm = make_builtin_corridor()
+    m = {
+        "grid": sm.grid.copy(),
+        "resolution": sm.resolution,
+        "origin_x": sm.origin_x,
+        "origin_y": sm.origin_y,
+    }
+    start = Pose2D(5.69, 1.63, -3.1)
+    goal = Pose2D(1.77, 2.34, -0.13)
+    world = SimWorld(sm, seed_pose=conv.Pose2D(start.x, start.y, start.theta))
+    scan = world.get_scan()
+    result = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.35,
+        robot_radius_m=0.22,
+        scan=scan,
+        scan_pose=start,
+        dynamic_obstacle_radius_m=0.45,
+    )
+    assert result.feasible
+
+
 def test_lookahead_advances_along_path():
     path = Path2D(points=((0.0, 0.0), (1.0, 0.0), (2.0, 0.0)), goal_theta=0.0)
     pose = Pose2D(0.0, 0.0, 0.0)
@@ -435,7 +497,7 @@ def test_follow_command_rotate_in_place_when_goal_behind():
 
 
 def test_follow_command_no_sign_flip_across_xy_tolerance():
-    """XY jitter across xy_tol must not reverse saturated turn direction."""
+    """XY jitter across settle must not reverse saturated turn direction."""
     from src.nav_builtin.controller import compute_follow_command
 
     cfg = FollowerConfig()
@@ -444,7 +506,8 @@ def test_follow_command_no_sign_flip_across_xy_tolerance():
     cfg.motion.yaw_tolerance_rad = 0.35
     goal = Pose2D(0.0, 0.0, 0.0)
     # Facing ~57°, need to turn CW (negative) to final yaw 0.
-    inside = Pose2D(0.10, 0.0, 1.0)
+    # Inside settle (~3 cm): pure spin for final yaw.
+    inside = Pose2D(0.02, 0.0, 1.0)
     # Slight overshoot past the goal — old law RIP'd CCW on ±π bearing.
     outside = Pose2D(-0.30, 0.0, 1.0)
     cmd_in = compute_follow_command(inside, goal, cfg=cfg, final_yaw=0.0)
@@ -513,19 +576,124 @@ def test_follow_command_end_approach_no_tiny_reverse_yaw_hunt():
     assert abs(sx) >= 0.12 - 1e-6 or (abs(sx) < 1e-9 and abs(st) >= 0.08)
 
 
-def test_follow_command_large_yaw_spins_before_crawl():
-    """Status repro: ~140° final yaw at 0.3 m must not translate while spinning."""
+def test_follow_command_half_metre_final_yaw_closes_xy():
+    """Repro: ~0.5 m out with ~35° final yaw must not pure-spin (stall)."""
+    from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    # Matches status dump: goal south of robot, final yaw differs ~35°.
+    current = Pose2D(2.513, 2.105, 2.45)
+    goal = Pose2D(2.498, 1.610, 1.835)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+    # Old bug: spin for final yaw (|vθ|≈0.4, vx=0) while still 0.5 m out.
+    assert abs(sx) >= 0.12 - 1e-6 or (abs(sx) < 1e-9 and abs(st) >= 0.08)
+    assert not (cmd.vx == 0.0 and abs(cmd.vtheta) >= 0.30)
+
+
+def test_follow_command_large_yaw_outside_tol_closes_xy():
+    """~140° final yaw at 0.3 m: close XY first; do not spin for goal θ yet."""
+    from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    current = Pose2D(2.52, 1.40, 1.08)
+    goal = Pose2D(2.79, 1.56, -2.76)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+    # Must make XY progress (or face the point), not pure-spin for final yaw.
+    assert abs(sx) >= 0.12 - 1e-6 or (abs(sx) < 1e-9 and abs(st) >= 0.08)
+
+
+def test_follow_command_edge_of_xy_tol_still_closes():
+    """Inside xy_tol (~0.22 m) but outside settle: soft-close, don't yaw-spin."""
+    import math
+
+    from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    goal = Pose2D(5.663, 4.573, 0.10)
+    # Already facing the goal point; final yaw still far off.
+    heading = math.atan2(goal.y - 4.402, goal.x - 5.826)
+    current = Pose2D(5.826, 4.402, heading)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+    assert abs(sx) >= 0.05 - 1e-6
+    # Must not be final-yaw-only spin at the outer edge of the ball.
+    assert abs(cmd.vx) > 0.0
+    assert abs(cmd.vtheta) < 0.25
+
+
+def test_follow_command_large_yaw_inside_settle_spins():
+    """Inside settle radius (~3 cm) with large final yaw: pure spin only."""
     from src.nav_builtin.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
     cfg.motion.yaw_tolerance_rad = 0.35
-    current = Pose2D(2.52, 1.40, 1.08)
+    current = Pose2D(2.775, 1.550, 1.08)
     goal = Pose2D(2.79, 1.56, -2.76)
     cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
     assert cmd.vx == 0.0
     assert abs(cmd.vtheta) > 0.0
     assert abs(cmd.vtheta) <= 0.40 + 1e-6
+
+
+def test_follow_command_near_settle_large_yaw_spins():
+    """Repro: ~4 cm out with ~134° final yaw must spin, not soft-crawl forever."""
+    from src.nav_builtin.controller import compute_follow_command
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    # Status dump: dist≈0.044, yaw_err≈-2.35
+    current = Pose2D(4.962, 2.218, 2.538)
+    goal = Pose2D(4.928, 2.247, 0.191)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    assert cmd.vx == 0.0
+    assert abs(cmd.vtheta) >= 0.10
+    assert abs(cmd.vtheta) <= 0.40 + 1e-6
+
+
+def test_follow_command_nine_cm_out_still_soft_closes():
+    """Repro: ~9 cm residual must keep soft-closing, not yaw-timeout at 0.10."""
+    import math
+
+    from src.nav_builtin.controller import compute_follow_command
+    from src.nav_builtin.viam_io import _sanitize_base_cmd
+
+    cfg = FollowerConfig()
+    cfg.motion.xy_tolerance_m = 0.25
+    cfg.motion.yaw_tolerance_rad = 0.35
+    cfg.motion.max_angular_rad_s = 1.0
+    cfg.motion.max_linear_mps = 0.6
+    goal = Pose2D(4.349, 0.863, 0.624)
+    current_xy = (4.272, 0.912)
+    heading = math.atan2(goal.y - current_xy[1], goal.x - current_xy[0])
+    current = Pose2D(current_xy[0], current_xy[1], heading)
+    cmd = compute_follow_command(current, goal, cfg=cfg, final_yaw=goal.theta)
+    assert not cmd.done
+    sx, _, _ = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
+    assert abs(sx) >= 0.05 - 1e-6
+    assert abs(cmd.vx) > 0.0
 
 
 def test_follow_command_large_yaw_far_out_closes_xy_first():

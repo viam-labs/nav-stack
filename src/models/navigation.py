@@ -205,6 +205,11 @@ class RosNavigation(NavServiceBase):
                 drive_timeout_s=float(getattr(cfg.builtin, "drive_timeout_s", 5.0)),
                 pose_provider=_sync_slam_pose_provider(cfg.slam_service),
                 map_provider=_in_process_map_provider(cfg.slam_service),
+                scan_provider=(
+                    (lambda max_age_s, s=slam_rt.sim_sensors: s.get_scan(max_age_s))
+                    if slam_rt.sim_sensors is not None
+                    else None
+                ),
                 logger=lambda m: LOGGER.info(m),
             )
             navigator = make_builtin_navigator(
@@ -218,6 +223,7 @@ class RosNavigation(NavServiceBase):
                 slam_rt.localization_check,
                 cameras=slam_rt.cameras,
                 shm_lidar=slam_rt.shm_lidar,
+                sim_sensors=slam_rt.sim_sensors,
             )
             register_nav_viz(self.name, viz)
             register_nav_host(self.name, host)

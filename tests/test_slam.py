@@ -406,6 +406,12 @@ def test_run_startup_global_localize_retries_then_succeeds():
                 "ray_mae_m": 0.4,
                 "pose": {"x": 1.0, "y": 2.0, "theta": 0.3},
             },
+            {
+                "status": "matched",
+                "score": 0.72,
+                "ray_mae_m": 0.38,
+                "pose": {"x": 1.05, "y": 2.02, "theta": 0.31},
+            },
             {"status": "relocalizing"},
         ]
     )
@@ -414,23 +420,20 @@ def test_run_startup_global_localize_retries_then_succeeds():
         slam._run_startup_global_localize(
             {"full_map": True},
             delay_s=0.0,
-            max_attempts=2,
+            max_attempts=3,
             retry_delay_s=0.0,
             run_post_apply_refine=False,
         )
     )
 
-    assert slam.do_command.await_count == 3
-    first_cmd = slam.do_command.await_args_list[0].args[0]
-    second_cmd = slam.do_command.await_args_list[1].args[0]
-    third_cmd = slam.do_command.await_args_list[2].args[0]
-    assert first_cmd["command"] == "global_localize"
-    assert first_cmd["apply"] is False
-    assert first_cmd["full_map"] is True
-    assert second_cmd["command"] == "global_localize"
-    assert second_cmd["apply"] is False
-    assert third_cmd["command"] == "relocalize"
-    assert third_cmd["pose"]["x"] == pytest.approx(1.0)
+    assert slam.do_command.await_count == 4
+    cmds = [c.args[0] for c in slam.do_command.await_args_list]
+    assert cmds[0]["command"] == "global_localize"
+    assert cmds[0]["apply"] is False
+    assert cmds[1]["command"] == "global_localize"
+    assert cmds[2]["command"] == "global_localize"
+    assert cmds[3]["command"] == "relocalize"
+    assert cmds[3]["pose"]["x"] == pytest.approx(1.05)
 
 
 def test_run_startup_global_localize_runs_refinement_pass():
@@ -447,7 +450,8 @@ def test_run_startup_global_localize_runs_refinement_pass():
                 "status": "matched",
                 "score": 0.71,
                 "ray_mae_m": 0.35,
-                "pose": {"x": 3.0, "y": 4.0, "theta": 0.2},
+                # Must agree with the first large-jump candidate to confirm.
+                "pose": {"x": 1.1, "y": 2.05, "theta": 0.12},
             },
             {"status": "relocalizing"},
         ]
@@ -480,7 +484,7 @@ def test_run_startup_global_localize_runs_refinement_pass():
     assert second_cmd["apply"] is False
     assert second_cmd["pose"]["x"] == pytest.approx(1.0)
     assert third_cmd["command"] == "relocalize"
-    assert third_cmd["pose"]["x"] == pytest.approx(3.0)
+    assert third_cmd["pose"]["x"] == pytest.approx(1.1)
 
 
 def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
@@ -491,7 +495,8 @@ def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
                 "status": "matched",
                 "score": 0.58,
                 "ray_mae_m": 0.82,
-                "pose": {"x": 0.5, "y": 1.2, "theta": 0.1},
+                # Small jump applies immediately; post-apply refine still runs.
+                "pose": {"x": 0.3, "y": 0.4, "theta": 0.1},
             },
             {"status": "relocalizing"},
             {
@@ -673,6 +678,8 @@ def test_nav2_drive_base_sends_angular_z_to_viam_base():
 
 # -- periodic relocalize (drift watchdog) -----------------------------------
 def _relocalize_slam(**cfg_overrides):
+    from src.nav.pose_jump_gate import PoseJumpGate
+
     d = {
         "base": "b",
         "lidar": "f",
@@ -682,6 +689,13 @@ def _relocalize_slam(**cfg_overrides):
     d.update(cfg_overrides)
     slam = RosSlam("slam")
     slam._cfg = SlamConfig.from_dict(d)
+    slam._pose_jump_gate = PoseJumpGate(
+        confirm_count=slam._cfg.localize_jump_confirm_count,
+        agree_m=slam._cfg.localize_jump_agree_m,
+        agree_deg=slam._cfg.localize_jump_agree_deg,
+        large_m=slam._cfg.localize_jump_large_m,
+        large_deg=slam._cfg.localize_jump_large_deg,
+    )
     slam._manager = MagicMock()
     slam._manager.get_pose_in_map.return_value = conv.Pose2D(0.0, 0.0, 0.0)
     slam._manager.nav_status.return_value = {
@@ -691,6 +705,17 @@ def _relocalize_slam(**cfg_overrides):
     slam._startup_global_localize_task = None
     slam._is_navigation_active = MagicMock(return_value=False)
     return slam
+
+
+def _run_relocalize_until_settled(slam):
+    """Run up to confirm_count cycles so large jumps can clear the gate."""
+    needed = max(1, int(slam._cfg.localize_jump_confirm_count))
+    result = None
+    for _ in range(needed):
+        result = asyncio.run(slam._periodic_relocalize_cycle())
+        if result.get("status") != "awaiting_confirm":
+            return result
+    return result
 
 
 def test_schedule_periodic_relocalize_skips_when_disabled():
@@ -742,6 +767,11 @@ def test_periodic_relocalize_cycle_corrects_on_drift():
     )
     slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
 
+    first = asyncio.run(slam._periodic_relocalize_cycle())
+    assert first["status"] == "awaiting_confirm"
+    assert first["corrected"] is False
+    slam.do_command.assert_not_awaited()
+
     result = asyncio.run(slam._periodic_relocalize_cycle())
 
     assert result["status"] == "corrected"
@@ -750,6 +780,27 @@ def test_periodic_relocalize_cycle_corrects_on_drift():
     relocalize_cmd = slam.do_command.await_args.args[0]
     assert relocalize_cmd["command"] == "relocalize"
     assert relocalize_cmd["pose"]["x"] == pytest.approx(1.0)
+
+
+def test_periodic_relocalize_cycle_applies_small_jump_immediately():
+    slam = _relocalize_slam(
+        periodic_relocalize_min_shift_m=0.2,
+        localize_jump_large_m=0.75,
+    )
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.8,
+            "ray_mae_m": 0.3,
+            "pose": {"x": 0.4, "y": 0.0, "theta": 0.0},
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+    assert result["status"] == "corrected"
+    assert result["jump_status"] == "apply_small"
+    slam.do_command.assert_awaited_once()
 
 
 def test_periodic_relocalize_cycle_no_correction_when_close():
@@ -800,31 +851,36 @@ def test_periodic_relocalize_cycle_low_quality_no_correction():
 
 def test_periodic_relocalize_cycle_escalates_full_map_on_low_quality():
     slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
-    slam._global_localize = AsyncMock(
-        side_effect=[
-            {
-                "status": "matched",
-                "score": 0.2,
-                "ray_mae_m": 1.5,
-                "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
-            },
-            {
+
+    async def _localize(command):
+        if command.get("full_map"):
+            return {
                 "status": "matched",
                 "score": 0.85,
                 "ray_mae_m": 0.25,
                 "pose": {"x": 2.0, "y": 0.0, "theta": 0.0},
-            },
-        ]
-    )
+            }
+        return {
+            "status": "matched",
+            "score": 0.2,
+            "ray_mae_m": 1.5,
+            "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
+        }
+
+    slam._global_localize = AsyncMock(side_effect=_localize)
     slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
 
-    result = asyncio.run(slam._periodic_relocalize_cycle())
+    result = _run_relocalize_until_settled(slam)
 
     assert result["status"] == "corrected"
     assert result["match_mode"] == "full_map_after_low_quality"
-    assert slam._global_localize.await_count == 2
-    full_cmd = slam._global_localize.await_args_list[1].args[0]
-    assert full_cmd["full_map"] is True
+    assert slam._global_localize.await_count >= 2
+    full_cmds = [
+        call.args[0]
+        for call in slam._global_localize.await_args_list
+        if call.args[0].get("full_map")
+    ]
+    assert full_cmds
     slam.do_command.assert_awaited_once()
 
 
@@ -845,7 +901,7 @@ def test_periodic_relocalize_cycle_full_map_when_nav_recoveries_high():
     )
     slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
 
-    result = asyncio.run(slam._periodic_relocalize_cycle())
+    result = _run_relocalize_until_settled(slam)
 
     assert result["status"] == "corrected"
     assert result["match_mode"] == "full_map"
@@ -879,7 +935,7 @@ def test_periodic_relocalize_cycle_recovery_applies_high_ray_mae():
     )
     slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
 
-    result = asyncio.run(slam._periodic_relocalize_cycle())
+    result = _run_relocalize_until_settled(slam)
 
     assert result["status"] == "corrected"
     assert result["corrected"] is True

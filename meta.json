@@ -25,6 +25,11 @@
       "short_description": "Renders nav costmap, plans, pose, and goal as a live camera image."
     },
     {
+      "api": "rdk:component:base",
+      "model": "viam-labs:nav-stack:sim-base",
+      "short_description": "Simulated base for hardware-free mapping and navigation (raycast world)."
+    },
+    {
       "api": "rdk:component:camera",
       "model": "viam-labs:nav-stack:shm-pointcloud",
       "short_description": "Copies a source camera PCD into POSIX shm for low-latency lidar reads."

@@ -119,6 +119,123 @@ def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
                 return False
 
 
+def bresenham_cells(a: Cell, b: Cell) -> List[Cell]:
+    """Inclusive Bresenham cell chain from ``a`` to ``b`` (no corner checks)."""
+    y0, x0 = a
+    y1, x1 = b
+    dy = abs(y1 - y0)
+    dx = abs(x1 - x0)
+    sy = 1 if y1 >= y0 else -1
+    sx = 1 if x1 >= x0 else -1
+    err = dx - dy
+    y, x = y0, x0
+    out: List[Cell] = []
+    while True:
+        out.append((y, x))
+        if (y, x) == (y1, x1):
+            return out
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x += sx
+        if e2 < dx:
+            err += dx
+            y += sy
+
+
+def world_segment_traversable(
+    costs: np.ndarray,
+    occ: OccupancyGrid,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    *,
+    sample_step_m: float = 0.05,
+) -> bool:
+    """True when the Euclidean segment stays in traversable costmap cells."""
+    seg = math.hypot(x1 - x0, y1 - y0)
+    step = max(1e-3, float(sample_step_m))
+    if seg < 1e-9:
+        row, col = occ.world_to_cell(x0, y0)
+        return occ.in_bounds(row, col) and is_traversable(int(costs[row, col]))
+    n = max(1, int(math.ceil(seg / step)))
+    for k in range(n + 1):
+        t = k / n
+        x = x0 + t * (x1 - x0)
+        y = y0 + t * (y1 - y0)
+        row, col = occ.world_to_cell(x, y)
+        if not occ.in_bounds(row, col) or not is_traversable(int(costs[row, col])):
+            return False
+    return True
+
+
+def _cells_8_adjacent(a: Cell, b: Cell) -> bool:
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1])) <= 1 and a != b
+
+
+def _repair_cell_path(costs: np.ndarray, cells: List[Cell]) -> List[Cell]:
+    """Ensure consecutive path cells are LOS-connected (Lazy Theta can emit gaps).
+
+    Invalid parent jumps are bridged with A* so the polyline of cell centers
+    does not cut through the inflation halo.
+    """
+    if len(cells) < 2:
+        return cells
+    out: List[Cell] = [cells[0]]
+    for nxt in cells[1:]:
+        prev = out[-1]
+        if prev == nxt:
+            continue
+        if _cells_8_adjacent(prev, nxt) and is_traversable(int(costs[nxt])):
+            out.append(nxt)
+            continue
+        if line_of_sight(costs, prev, nxt):
+            chain = bresenham_cells(prev, nxt)
+            # Only accept Bresenham fill when every cell is free (LOS should
+            # guarantee this; still guard against corner-cut mismatches).
+            if all(is_traversable(int(costs[c])) for c in chain):
+                out.extend(chain[1:])
+                continue
+        bridge = _astar(costs, prev, nxt)
+        if bridge is None or len(bridge) < 2:
+            # Last resort: keep the waypoint so planning still returns something.
+            out.append(nxt)
+        else:
+            out.extend(bridge[1:])
+    return out
+
+
+def _densify_world_path(
+    costs: np.ndarray,
+    occ: OccupancyGrid,
+    points: List[Tuple[float, float]],
+    *,
+    sample_step_m: float,
+) -> List[Tuple[float, float]]:
+    """Insert cell-center waypoints when a world chord clips non-traversable cells."""
+    if len(points) < 2:
+        return points
+    out: List[Tuple[float, float]] = [points[0]]
+    for nxt in points[1:]:
+        prev = out[-1]
+        if world_segment_traversable(
+            costs, occ, prev[0], prev[1], nxt[0], nxt[1], sample_step_m=sample_step_m
+        ):
+            out.append(nxt)
+            continue
+        ca = occ.world_to_cell(prev[0], prev[1])
+        cb = occ.world_to_cell(nxt[0], nxt[1])
+        bridge = _astar(costs, ca, cb)
+        if bridge is None or len(bridge) < 2:
+            out.append(nxt)
+            continue
+        for cell in bridge[1:-1]:
+            out.append(occ.cell_to_world(cell[0], cell[1]))
+        out.append(nxt)
+    return out
+
+
 def _reconstruct(came_from: dict, goal: Cell) -> List[Cell]:
     path = [goal]
     current = goal
@@ -217,8 +334,24 @@ def _lazy_theta_star(
                 best_g = cand
                 best_p = n
         if best_p is None:
-            # Should be rare; keep existing parent and g (A*-like local edge).
-            return
+            # No LOS parent among closed cells: fall back to an 8-connected
+            # closed neighbor (A*-style edge). Leaving the invalid lazy parent
+            # produces chords that cut the inflation halo and fail path_blocked.
+            for dy, dx, step in _NEIGHBORS:
+                ny, nx = sy + dy, sx + dx
+                n = (ny, nx)
+                if n not in closed:
+                    continue
+                if not (0 <= ny < h and 0 <= nx < w):
+                    continue
+                if not is_traversable(int(costs[n])):
+                    continue
+                cand = g_score[n] + step
+                if cand < best_g:
+                    best_g = cand
+                    best_p = n
+            if best_p is None:
+                return
         parent[s] = best_p
         g_score[s] = best_g
 
@@ -534,19 +667,27 @@ def plan_on_costmap(
             planning_time_s=time.perf_counter() - t0,
         )
 
+    # Lazy Theta* can emit parent jumps without LOS; repair then densify so the
+    # world polyline matches what path_blocked / the follower will sample.
+    cells = _repair_cell_path(costs, cells)
     cells = _simplify(cells)
-    world = tuple(occ.cell_to_world(r, c) for r, c in cells)
+    world_list = [occ.cell_to_world(r, c) for r, c in cells]
     # Keep endpoints on snapped free cells so exact poses don't pull the path
     # through the inflation halo.
-    if world and start_xy is not None and goal_xy is not None:
-        if len(world) >= 2:
-            world = (start_xy,) + world[1:-1] + (goal_xy,)
+    if world_list and start_xy is not None and goal_xy is not None:
+        if len(world_list) >= 2:
+            world_list[0] = start_xy
+            world_list[-1] = goal_xy
         else:
-            world = (start_xy, goal_xy)
+            world_list = [start_xy, goal_xy]
+    sample_step = max(0.05, float(occ.resolution) * 0.5)
+    world_list = _densify_world_path(
+        costs, occ, world_list, sample_step_m=sample_step
+    )
 
     return PlanResult(
         feasible=True,
-        path=Path2D(points=world, goal_theta=goal.theta),
+        path=Path2D(points=tuple(world_list), goal_theta=goal.theta),
         planning_time_s=time.perf_counter() - t0,
     )
 
@@ -580,17 +721,21 @@ def plan_path(
         occ = occupancy_from_bridge_map(map_data)
     except (KeyError, TypeError, ValueError) as exc:
         return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
-    obs_r = max(float(dynamic_obstacle_radius_m), float(inflation_radius_m))
+    # Paint lidar hits as occupied *cells* (small radius). build_costmap then
+    # applies inflation once. Using inflation_radius here double-inflates walls
+    # already on the map and can seal narrow corridors.
     if scan is not None and scan_pose is not None:
+        hit_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
         occ = mark_scan_on_occupancy(
-            occ, scan_pose, scan, obstacle_radius_m=obs_r
+            occ, scan_pose, scan, obstacle_radius_m=hit_r
         )
     if blocked_path is not None and blocked_path_pose is not None:
+        block_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
         occ = mark_path_ahead_on_occupancy(
             occ,
             blocked_path,
             blocked_path_pose,
-            radius_m=obs_r,
+            radius_m=block_r,
         )
     costs = build_costmap(
         occ,
@@ -646,6 +791,7 @@ def path_blocked(
         else:
             start_t = max(0.0, min(1.0, ((cx - x0) * dx + (cy - y0) * dy) / seg2))
 
+    step = max(1e-3, float(sample_step_m))
     for i in range(start_seg, len(pts) - 1):
         if remaining_budget <= 0.0:
             break
@@ -657,15 +803,15 @@ def path_blocked(
         if usable < 1e-9:
             continue
         check_len = min(usable, remaining_budget)
-        n = max(1, int(math.ceil(check_len / sample_step_m)))
-        for k in range(n + 1):
-            frac = check_len / seg if seg > 1e-9 else 0.0
-            t = t0 + (k / n) * frac
-            t = max(0.0, min(1.0, t))
-            x = x0 + t * (x1 - x0)
-            y = y0 + t * (y1 - y0)
-            r, c = occ.world_to_cell(x, y)
-            if not occ.in_bounds(r, c) or not is_traversable(int(costs[r, c])):
-                return True
+        # Sample the checked sub-segment (from t0 along usable).
+        x_a = x0 + t0 * (x1 - x0)
+        y_a = y0 + t0 * (y1 - y0)
+        frac = check_len / seg if seg > 1e-9 else 0.0
+        x_b = x0 + (t0 + frac) * (x1 - x0)
+        y_b = y0 + (t0 + frac) * (y1 - y0)
+        if not world_segment_traversable(
+            costs, occ, x_a, y_a, x_b, y_b, sample_step_m=step
+        ):
+            return True
         remaining_budget -= check_len
     return False
