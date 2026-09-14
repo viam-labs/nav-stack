@@ -185,8 +185,9 @@ def _disk_offsets(radius_cells: int) -> Tuple[np.ndarray, np.ndarray]:
 # Soft costs at/above this are shown as inflation in nav-camera / UI.
 # Lower costs are planner-only clearance preference (invisible halo).
 _VIZ_SOFT_MIN = 50
-# Preference band past inflation — must stay ≤ LOS soft cap (50) so Lazy Theta*
-# / string-pull can shortcut through it (blocking LOS here forced huge plan arcs).
+# Preference band past inflation. Kept above planner LOS soft cap so any-angle
+# / string-pull cannot shortcut through it — that is what stops corner hugs.
+# (8-connected search can still walk preference cells when no clear detour.)
 _PREF_COST_HI = 48
 _PREF_COST_LO = 32
 
@@ -211,8 +212,9 @@ def build_costmap(
     least the footprint) — that is what UIs show. An additional low-cost
     ``clearance_preference_m`` band past inflation biases planning toward open
     space when a detour exists; it is not drawn as inflation (see
-    ``costs_to_occupancy_viz``) and stays LOS-traversable so string-pull does
-    not have to arc outside inflate+prefer.
+    ``costs_to_occupancy_viz``). Preference costs sit above the planner LOS soft
+    cap so Lazy Theta* / string-pull stay outside that band when clear space
+    exists (narrow gaps remain solvable via 8-connected steps).
     """
     h, w = occ.height, occ.width
     costs = np.full((h, w), FREE, dtype=np.uint8)

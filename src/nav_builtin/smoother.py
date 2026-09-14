@@ -9,9 +9,9 @@ import numpy as np
 from .planner import line_of_sight, world_segment_traversable
 from .types import OccupancyGrid, Path2D
 
-# Reject string-pull shortcuts through the visible soft glow; preference /
-# outer soft (below ~50) may still be shortened so paths don't arc hard.
-_SMOOTH_MAX_SOFT_COST = 50
+# Reject string-pull shortcuts through preference / soft inflation so the
+# smoothed path keeps the clear-space bias Lazy Theta* paid for.
+_SMOOTH_MAX_SOFT_COST = 30
 
 
 def _resample_polyline(

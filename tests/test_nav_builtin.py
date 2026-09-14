@@ -295,8 +295,8 @@ def test_planner_prefers_clear_lane_over_inflation_hug():
                 peak_cost = max(peak_cost, int(costs[r, c]))
     assert ys
     assert min(ys) >= 1.65
-    # Mid-route should stay out of the heavy soft glow (LOS soft cap ~50).
-    assert peak_cost <= 50
+    # Mid-route should stay out of preference / soft (LOS soft cap 30).
+    assert peak_cost <= 30
 
 
 def test_corner_path_stays_out_of_soft_halo():
@@ -329,8 +329,8 @@ def test_corner_path_stays_out_of_soft_halo():
             r, c = occ.world_to_cell(x, y)
             if occ.in_bounds(r, c):
                 peak = max(peak, int(costs[r, c]))
-    # Open space around the tip: stay out of heavy soft glow.
-    assert peak <= 50
+    # Open space around the tip: stay in free / near-free, not soft glow.
+    assert peak <= 5
 
 
 def test_t_pillar_tip_prefers_clear_swing():
@@ -363,11 +363,10 @@ def test_t_pillar_tip_prefers_clear_swing():
                 if occ.in_bounds(r, c):
                     peak = max(peak, int(costs[r, c]))
     assert ys
-    # Tip at y=2.0; soft outer ≈ 1.65. Prefer under-tip clear of the stem, not
-    # a multi-metre swing (preference stays LOS-ok so string-pull can tighten).
-    assert max(ys) <= 1.75
-    assert max(ys) < 1.95
-    assert peak <= 50
+    # Tip at y=2.0; soft outer ≈ 1.65; preference outer ≈ 1.30. Prefer clear
+    # swing outside the visible glow (and ideally past preference).
+    assert max(ys) <= 1.40
+    assert peak <= 5
 
 
 def test_plan_straight_line_on_empty_map():

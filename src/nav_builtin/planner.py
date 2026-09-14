@@ -80,10 +80,11 @@ def _cost_multiplier(cost: int) -> float:
     return 1.0 + 25.0 * t + 120.0 * (t * t)
 
 
-# Any-angle LOS / string-pull may shortcut through preference / outer soft, but
-# not through the visible soft glow (cost ≥ ~50). Narrow gaps still work via
+# Any-angle LOS / string-pull may only shortcut through near-free cells.
+# Preference costs (32–48) and the visible soft glow fail LOS so paths stay in
+# clear space when a detour exists. Narrow gaps remain traversable via
 # 8-connected steps through higher soft cells.
-_LOS_MAX_SOFT_COST = 50
+_LOS_MAX_SOFT_COST = 30
 
 
 def _cell_step_cost(costs: np.ndarray, cell: Cell, base_step: float) -> float:
