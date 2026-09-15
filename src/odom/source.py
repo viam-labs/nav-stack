@@ -114,6 +114,20 @@ class TypedMovementSensorOdom:
         self._integ_y = 0.0
         self._integ_th = 0.0
         self._integ_t: Optional[float] = None
+        # Last twist actually integrated. A read gap (module loop busy with
+        # global_localize, slow base RPC) is bridged by holding this velocity,
+        # not by clamping dt — the clamp silently dropped travel and left the
+        # map pose behind the robot until a manual refine snapped it forward.
+        self._integ_last_twist: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.last_gap_s: float = 0.0
+        self.gap_hold_events: int = 0
+
+    # Beyond this gap the held velocity is no longer trusted (robot may have
+    # been stopped by a command that landed after our last sample).
+    MAX_HOLD_GAP_S = 3.0
+    # Normal sample spacing: past this, the previous twist is held for the
+    # excess instead of attributing the whole gap to the new sample.
+    NOMINAL_GAP_S = 0.25
 
     async def properties(self) -> MovementSensor.Properties:
         """Cache and return the sensor's capabilities (fetched once)."""
@@ -137,23 +151,42 @@ class TypedMovementSensorOdom:
         """Integrate sensor-native twist into a world-frame odom pose."""
         if self._integ_t is None:
             self._integ_t = now
+            self._integ_last_twist = (vx, vy, vtheta)
             return conv.Pose2D(self._integ_x, self._integ_y, self._integ_th)
 
-        dt = max(0.0, min(now - self._integ_t, 0.5))
+        gap = max(0.0, now - self._integ_t)
         self._integ_t = now
-        if dt > 0.0:
-            c = math.cos(self._integ_th)
-            s = math.sin(self._integ_th)
-            if self._cfg.velocity_convention in BASE_VELOCITY_Y_FORWARD:
-                # Body: +y forward, +x right → world (theta=0 faces +X).
-                self._integ_x += (c * vy + s * vx) * dt
-                self._integ_y += (s * vy - c * vx) * dt
-            else:
-                # Body: +x forward, +y left.
-                self._integ_x += (c * vx - s * vy) * dt
-                self._integ_y += (s * vx + c * vy) * dt
-            self._integ_th = conv.normalize_angle(self._integ_th + vtheta * dt)
+        self.last_gap_s = gap
+
+        # Split the gap: the excess beyond a normal sample spacing is bridged
+        # with the *previous* twist (zero-order hold — the base kept executing
+        # its last SetVelocity while we could not read it); the tail uses the
+        # new sample.
+        hold_dt = 0.0
+        if gap > self.NOMINAL_GAP_S:
+            hold_dt = min(gap, self.MAX_HOLD_GAP_S) - self.NOMINAL_GAP_S
+            self.gap_hold_events += 1
+        new_dt = min(gap, self.NOMINAL_GAP_S)
+
+        if hold_dt > 0.0:
+            self._step(*self._integ_last_twist, hold_dt)
+        if new_dt > 0.0:
+            self._step(vx, vy, vtheta, new_dt)
+        self._integ_last_twist = (vx, vy, vtheta)
         return conv.Pose2D(self._integ_x, self._integ_y, self._integ_th)
+
+    def _step(self, vx: float, vy: float, vtheta: float, dt: float) -> None:
+        c = math.cos(self._integ_th)
+        s = math.sin(self._integ_th)
+        if self._cfg.velocity_convention in BASE_VELOCITY_Y_FORWARD:
+            # Body: +y forward, +x right → world (theta=0 faces +X).
+            self._integ_x += (c * vy + s * vx) * dt
+            self._integ_y += (s * vy - c * vx) * dt
+        else:
+            # Body: +x forward, +y left.
+            self._integ_x += (c * vx - s * vy) * dt
+            self._integ_y += (s * vx + c * vy) * dt
+        self._integ_th = conv.normalize_angle(self._integ_th + vtheta * dt)
 
     async def read(self) -> conv.OdomReading:
         p = await self.properties()
@@ -282,6 +315,8 @@ class TypedMovementSensorOdom:
             "raw_av_z_deg_s": d.raw_av_z_deg_s,
             "velocity_convention": d.velocity_convention,
             "remapped": d.remapped,
+            "last_sample_gap_s": round(self.last_gap_s, 3),
+            "gap_hold_events": self.gap_hold_events,
         }
 
 
