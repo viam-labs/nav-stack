@@ -149,6 +149,15 @@ class ViamWorldIO:
         # out (soft-loc / global_localize holding the loop).
         self._pending_drive_fut: Optional[concurrent.futures.Future] = None
         self._drive_followup: Optional[tuple] = None  # (make_coro, intent)
+        # Last twist we accepted (scheduled or skipped-as-duplicate). Used to
+        # skip redundant SetVelocity when the control tick is faster than the
+        # base RPC — identical cmds need not hit the module loop.
+        self._last_desired_twist: Optional[tuple[float, float, float]] = None
+        self._drive_calls = 0
+        self._drive_skipped = 0
+        self._drive_coalesced = 0
+        self._drive_rtt_last_s: Optional[float] = None
+        self._drive_rtt_ema_s: Optional[float] = None
         # How long the control thread waits for SetVelocity to be scheduled /
         # ack'd. Soft-loc cycles often occupy the loop for seconds; waiting the
         # full drive_timeout_s made every tick look like a hard IO failure even
@@ -197,20 +206,30 @@ class ViamWorldIO:
             # Keep the in-flight RPC; send this cmd after it finishes.
             self._drive_followup = (make_coro, intent)
             intent["coalesced"] = True
+            self._drive_coalesced += 1
             self._last_drive = dict(intent)
             return
 
         self._drive_followup = None
+        self._drive_calls += 1
         self._last_drive = dict(intent)
 
         async def _issue():
             current_make = make_coro
             current_intent = intent
             while True:
+                t0 = time.monotonic()
                 try:
                     await current_make()
+                    rtt = time.monotonic() - t0
+                    self._drive_rtt_last_s = rtt
+                    if self._drive_rtt_ema_s is None:
+                        self._drive_rtt_ema_s = rtt
+                    else:
+                        self._drive_rtt_ema_s = 0.8 * self._drive_rtt_ema_s + 0.2 * rtt
                     current_intent["issued"] = True
                     current_intent["error"] = None
+                    current_intent["rtt_s"] = round(rtt, 4)
                     current_intent.pop("pending", None)
                     current_intent.pop("coalesced", None)
                 except asyncio.CancelledError:
@@ -235,6 +254,7 @@ class ViamWorldIO:
                 current_make, current_intent = follow
                 current_intent["pending"] = True
                 current_intent.pop("coalesced", None)
+                self._drive_calls += 1
                 self._last_drive = dict(current_intent)
 
         fut = asyncio.run_coroutine_threadsafe(_issue(), self._loop)
@@ -257,6 +277,28 @@ class ViamWorldIO:
     def last_drive(self) -> Optional[dict]:
         """Most recent SetVelocity mapping (body rad/s → Viam mm/s + deg/s)."""
         return dict(self._last_drive) if self._last_drive else None
+
+    def drive_stats(self) -> dict:
+        """SetVelocity health for higher control-rate soak (RTT / skip / coalesce)."""
+        return {
+            "calls": self._drive_calls,
+            "skipped": self._drive_skipped,
+            "coalesced": self._drive_coalesced,
+            "rtt_last_s": (
+                None
+                if self._drive_rtt_last_s is None
+                else round(self._drive_rtt_last_s, 4)
+            ),
+            "rtt_ema_s": (
+                None
+                if self._drive_rtt_ema_s is None
+                else round(self._drive_rtt_ema_s, 4)
+            ),
+            "pending": bool(
+                self._pending_drive_fut is not None
+                and not self._pending_drive_fut.done()
+            ),
+        }
 
     def pose_source(self) -> str:
         """How the last ``get_pose`` was obtained (``in_process`` / ``get_position`` / …)."""
@@ -728,6 +770,16 @@ class ViamWorldIO:
             "issued": False,
             "error": None,
         }
+        desired = (vx, vy, vtheta)
+        if desired == self._last_desired_twist:
+            # Control tick faster than meaningful cmd changes — don't pile
+            # identical SetVelocity RPCs onto the module loop.
+            self._drive_skipped += 1
+            intent["issued"] = True
+            intent["skipped"] = True
+            self._last_drive = dict(intent)
+            return
+        self._last_desired_twist = desired
 
         def _make_coro():
             async def _issue_with_retry():
@@ -783,6 +835,8 @@ class ViamWorldIO:
                 return
             raise
         except Exception as exc:  # noqa: BLE001
+            # Allow a retry of the same twist after a hard failure.
+            self._last_desired_twist = None
             self._log(
                 f"SetVelocity failed on base {self._base_name!r}: "
                 f"{str(exc).strip() or type(exc).__name__}"
@@ -791,41 +845,9 @@ class ViamWorldIO:
 
     def stop(self) -> None:
         """Zero the base without blocking the control thread on a busy loop."""
-        intent = {
-            "body_vx_mps": 0.0,
-            "body_vy_mps": 0.0,
-            "body_vtheta_rad_s": 0.0,
-            "viam_linear_x_mm_s": 0.0,
-            "viam_linear_y_mm_s": 0.0,
-            "viam_angular_z_deg_s": 0.0,
-            "base": self._base_name,
-            "issued": False,
-            "error": None,
-        }
-
-        def _make_stop():
-            return self._base.set_velocity(
-                linear=Vector3(x=0.0, y=0.0, z=0.0),
-                angular=Vector3(x=0.0, y=0.0, z=0.0),
-            )
-
-        try:
-            self._schedule_drive(
-                _make_stop,
-                intent,
-                # Fire-and-forget-ish: brief wait only. Soft-loc hold must not
-                # sit 5s on stop while global_localize owns the loop.
-                wait_s=min(0.15, self._drive_ack_timeout_s),
-            )
-        except TimeoutError:
-            # Stop is queued; status keeps pending until the loop drains.
-            pass
-        except Exception as exc:  # noqa: BLE001
-            intent["issued"] = False
-            intent["error"] = str(exc).strip() or type(exc).__name__
-            intent.pop("pending", None)
-            self._last_drive = intent
-
+        # Shares skip-duplicate + coalesce paths with set_velocity so loc_hold /
+        # succeed / cancel do not re-issue SetVelocity(0) every tick.
+        self.set_velocity(0.0, 0.0, 0.0)
     def set_viz_plan(
         self,
         path_xy: tuple,

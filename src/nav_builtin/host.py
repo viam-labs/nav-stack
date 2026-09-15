@@ -146,6 +146,20 @@ class BuiltinNavHost:
             drive = last()
             if drive is not None:
                 status["last_drive"] = drive
+        stats_fn = getattr(self._world, "drive_stats", None)
+        if callable(stats_fn):
+            try:
+                status["drive"] = stats_fn()
+            except Exception:  # noqa: BLE001
+                pass
+        ctrl = getattr(self._builtin_nav, "control_stats", None)
+        if callable(ctrl):
+            try:
+                loop_stats = ctrl()
+                if loop_stats is not None:
+                    status["control_loop"] = loop_stats
+            except Exception:  # noqa: BLE001
+                pass
         src = getattr(self._world, "pose_source", None)
         if callable(src):
             status["pose_source"] = src()

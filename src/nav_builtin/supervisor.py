@@ -147,6 +147,12 @@ class NavSupervisor:
         self._status_lock = threading.Lock()
         self._last_cmd_vx = 0.0
         self._io_timeout_streak = 0
+        # Control-loop soak metrics (wall-clock tick vs configured period).
+        self._control_ticks = 0
+        self._control_overruns = 0
+        self._control_tick_last_s: Optional[float] = None
+        self._control_tick_ema_s: Optional[float] = None
+        self._control_period_s = max(1e-3, float(poll_interval_s))
         self._follower = FollowerConfig(
             lookahead_m=lookahead_m,
             min_lookahead_m=min_lookahead_m,
@@ -203,6 +209,44 @@ class NavSupervisor:
                 motion=s.motion,
                 progress=dict(s.progress) if s.progress is not None else None,
             )
+
+    def control_stats(self) -> dict:
+        """Control-loop timing for higher-rate soak (tick vs period)."""
+        period = self._control_period_s
+        return {
+            "period_s": round(period, 4),
+            "target_hz": round(1.0 / period, 2),
+            "ticks": self._control_ticks,
+            "overruns": self._control_overruns,
+            "tick_last_s": (
+                None
+                if self._control_tick_last_s is None
+                else round(self._control_tick_last_s, 4)
+            ),
+            "tick_ema_s": (
+                None
+                if self._control_tick_ema_s is None
+                else round(self._control_tick_ema_s, 4)
+            ),
+        }
+
+    def _note_control_tick(self, work_s: float) -> None:
+        self._control_ticks += 1
+        self._control_tick_last_s = work_s
+        if self._control_tick_ema_s is None:
+            self._control_tick_ema_s = work_s
+        else:
+            self._control_tick_ema_s = 0.8 * self._control_tick_ema_s + 0.2 * work_s
+        if work_s > self._control_period_s:
+            self._control_overruns += 1
+
+    def _sleep_control_period(self, tick_started: float) -> None:
+        """Sleep the remainder of the control period (not a full period after work)."""
+        work_s = time.monotonic() - tick_started
+        self._note_control_tick(work_s)
+        remaining = self._control_period_s - work_s
+        if remaining > 0.0:
+            time.sleep(remaining)
 
     def _set_status(self, **kwargs) -> None:
         with self._status_lock:
@@ -362,7 +406,6 @@ class NavSupervisor:
             vx_sign_history: list[tuple[float, int]] = []
             xy_ok_since: Optional[float] = None
             last_tick_pose: Optional[Pose2D] = None
-            poll = self._follower.motion.poll_interval_s
             # Only validate the next few metres — full-path static checks on
             # long goals trip on far unknown/inflation and abort immediately.
             path_block_horizon_m = 5.0
@@ -374,6 +417,7 @@ class NavSupervisor:
             pending_loc_replan = False
 
             while time.monotonic() < deadline:
+                tick_started = time.monotonic()
                 if self._cancel.is_set():
                     self._world.stop()
                     self._set_status(state="canceled", active=False, error_msg="canceled")
@@ -476,7 +520,7 @@ class NavSupervisor:
                             },
                         },
                     )
-                    time.sleep(poll)
+                    self._sleep_control_period(tick_started)
                     continue
 
                 now = time.monotonic()
@@ -895,7 +939,7 @@ class NavSupervisor:
                 if progress.get("obstacle") == "no_scan":
                     # Fail closed: stop forward; brief wait then continue.
                     self._world.set_velocity(0.0, 0.0, cmd.vtheta)
-                    time.sleep(poll)
+                    self._sleep_control_period(tick_started)
                     continue
 
                 if cmd.done:
@@ -1030,7 +1074,7 @@ class NavSupervisor:
                     self._io_timeout_streak += 1
                     if self._io_timeout_streak >= self._drive_timeout_streak:
                         raise
-                    time.sleep(poll)
+                    self._sleep_control_period(tick_started)
                     continue
                 except Exception as exc:  # noqa: BLE001
                     # Motor "nearly 0 RPM" / similar drive rejects: skip tick.
@@ -1042,7 +1086,7 @@ class NavSupervisor:
                             self._world.stop()
                         except Exception:  # noqa: BLE001
                             pass
-                        time.sleep(poll)
+                        self._sleep_control_period(tick_started)
                         continue
                     if (
                         "goaway" in msg
@@ -1054,14 +1098,14 @@ class NavSupervisor:
                             8, self._drive_timeout_streak
                         ):
                             raise
-                        time.sleep(poll)
+                        self._sleep_control_period(tick_started)
                         continue
                     raise
                 # Smoothed speed for the velocity-scaled lookahead (see
                 # ``update_speed_estimate``): raw cmd feedback limit-cycles.
                 self._last_cmd_vx = update_speed_estimate(self._last_cmd_vx, cmd.vx)
                 prev_cmd = cmd
-                time.sleep(poll)
+                self._sleep_control_period(tick_started)
 
             self._world.stop()
             self._set_status(
