@@ -437,27 +437,51 @@ def test_nav_config_legacy_nav2_block_alias():
     assert prefer.builtin.yaw_goal_tolerance == pytest.approx(0.4)
 
 
-def test_slam_config_legacy_slam_toolbox_block_alias():
-    """Older machine configs used ``slam_toolbox`` for what is now ``map``."""
+def test_nav_config_top_level_goal_tolerances():
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "xy_goal_tolerance": 0.3,
+            "yaw_goal_tolerance": 0.55,
+        }
+    )
+    assert cfg.builtin.xy_goal_tolerance == pytest.approx(0.3)
+    assert cfg.builtin.yaw_goal_tolerance == pytest.approx(0.55)
+    # Nested builtin wins over top-level.
+    nested = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "xy_goal_tolerance": 0.3,
+            "builtin": {"xy_goal_tolerance": 0.18},
+        }
+    )
+    assert nested.builtin.xy_goal_tolerance == pytest.approx(0.18)
+
+
+def test_slam_config_top_level_resolution():
     cfg = SlamConfig.from_dict(
         {
             "base": "b",
             "lidar": "front",
             "mode": "localizing",
-            "slam_toolbox": {"resolution": 0.08},
+            "resolution": 0.08,
+            "max_laser_range": 12.0,
         }
     )
     assert cfg.map.resolution == pytest.approx(0.08)
-    prefer = SlamConfig.from_dict(
+    assert cfg.map.max_laser_range == pytest.approx(12.0)
+    nested = SlamConfig.from_dict(
         {
             "base": "b",
             "lidar": "front",
             "mode": "localizing",
+            "resolution": 0.08,
             "map": {"resolution": 0.05},
-            "slam_toolbox": {"resolution": 0.2},
         }
     )
-    assert prefer.map.resolution == pytest.approx(0.05)
+    assert nested.map.resolution == pytest.approx(0.05)
 
 
 def test_builtin_recovery_wait_defaults():

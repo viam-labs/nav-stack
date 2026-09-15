@@ -295,8 +295,10 @@ class LidarConfig:
 class MapSettings:
     """Map / scan settings used by builtin SLAM (resolution, range, travel gates).
 
-    Config attribute is ``map``. The legacy attribute name ``slam_toolbox`` is
-    still accepted in ``from_dict`` for existing machine configs.
+    Config attribute is ``map``. Common knobs ``resolution`` and
+    ``max_laser_range`` may also be set at the SLAM service top level.
+    The legacy attribute name ``slam_toolbox`` is still accepted in
+    ``from_dict`` for existing machine configs.
     """
 
     resolution: float = 0.05  # meters/cell
@@ -327,6 +329,19 @@ _REMOVED_BACKEND_HINT = (
     "'builtin' only. For the last ROS-based release, check out git tag "
     "pre-ros-removal."
 )
+
+# Common nav tuning accepted at the service top level (also under ``builtin``).
+_TOP_LEVEL_NAV_TUNING_KEYS = ("xy_goal_tolerance", "yaw_goal_tolerance")
+
+
+def _merge_top_level_nav_tuning(d: Mapping) -> dict:
+    """Build the ``builtin`` attribute dict: nested block wins over top-level."""
+    merged = {
+        key: d[key] for key in _TOP_LEVEL_NAV_TUNING_KEYS if key in d
+    }
+    nested = d.get("builtin") or d.get("nav2") or {}
+    merged.update(dict(nested))
+    return merged
 
 BUILTIN_PLANNER_ASTAR = "astar"
 BUILTIN_PLANNER_LAZY_THETA = "lazy_theta_star"
@@ -366,8 +381,10 @@ class BuiltinNavConfig:
     Footprint / velocity limits stay top-level on ``NavConfig``. Defaults are
     tuned for builtin SLAM + pure pursuit.
 
-    Config attribute is ``builtin``. The legacy attribute name ``nav2`` is still
-    accepted in ``NavConfig.from_dict`` for existing machine configs.
+    Config attribute is ``builtin``. Common knobs ``xy_goal_tolerance`` and
+    ``yaw_goal_tolerance`` may also be set at the navigation service top
+    level. The legacy attribute name ``nav2`` is still accepted in
+    ``NavConfig.from_dict`` for existing machine configs.
     """
 
     # ``lazy_theta_star`` (default) or ``astar``.
@@ -801,7 +818,12 @@ class SlamConfig:
         if heading_only_odom:
             imu_odom_mode = IMU_ODOM_NONE
         # Prefer ``map``; accept legacy ``slam_toolbox`` block from older configs.
+        # Top-level ``resolution`` / ``max_laser_range`` fill in when the nested
+        # block omits them (nested wins on conflict).
         stb_raw = dict(d.get("map") or d.get("slam_toolbox") or {})
+        for key in ("resolution", "max_laser_range"):
+            if key in d and key not in stb_raw:
+                stb_raw[key] = d[key]
         slam_params_raw = dict(d.get("slam_params", {}) or {})
         if all_point_cloud:
             max_lidar_range = max(lidar.max_range for lidar in slam_lidars)
@@ -1272,8 +1294,10 @@ class NavConfig:
             ),
             nav_backend=backend,
             # Prefer ``builtin``; accept legacy ``nav2`` block from older configs.
+            # Top-level goal tolerances fill in when the nested block omits them
+            # (nested wins on conflict).
             builtin=BuiltinNavConfig.from_dict(
-                d.get("builtin") or d.get("nav2") or {}
+                _merge_top_level_nav_tuning(d)
             ),
         )
 
