@@ -930,6 +930,34 @@ def test_periodic_relocalize_holds_nav_on_soft_loc_small_shift():
     assert should_hold_drive_for_pose_jump(result)
 
 
+def test_periodic_relocalize_holds_borderline_score_during_nav():
+    """score 0.495 (above recovery floor, below good_match) must hold mid-nav."""
+    slam = _relocalize_slam(
+        periodic_relocalize_min_score=0.5,
+        periodic_relocalize_max_ray_mae_m=1.0,
+        periodic_relocalize_recovery_min_score=0.45,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.495,
+            "ray_mae_m": 0.90,
+            "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
+            "prior_score": 0.495,
+            "prior_ray_mae_m": 0.90,
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "nav_hold"
+    assert result.get("soft_loc") is True
+    assert result.get("previous_ok") is False
+    slam.do_command.assert_not_awaited()
+
+
 def test_periodic_relocalize_soft_candidate_keeps_driving_if_prior_ok():
     """Weak candidate with a still-plausible published pose → no hold."""
     slam = _relocalize_slam(periodic_relocalize_min_score=0.5)
