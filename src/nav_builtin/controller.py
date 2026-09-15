@@ -32,20 +32,20 @@ class FollowerConfig:
     tightens the turn, and the lookahead low-passes SLAM pose jitter.
     """
 
-    # Longer lookahead damps SLAM pose/heading jitter on skid-steer. The dock
-    # corridor snake was hunting at L≈0.6–1.2 m; 0.9–1.5 m trades a bit more
-    # corner cut (still inside clearance_preference) for a straighter trail.
-    lookahead_m: float = 1.1
-    min_lookahead_m: float = 0.9
-    max_lookahead_m: float = 1.5
-    lookahead_time_s: float = 2.5
+    # Longer lookahead damps soft-loc / heading jitter on skid-steer. Mid-path
+    # S-curves still hunt around L≈1.0 m; 1.1–1.8 m trades a bit more corner
+    # cut (still inside clearance_preference) for a straighter trail.
+    lookahead_m: float = 1.35
+    min_lookahead_m: float = 1.1
+    max_lookahead_m: float = 1.8
+    lookahead_time_s: float = 3.0
     # EMA weight on *new* curvature (rest from previous tick). Lower = calmer
-    # mid-path ω; 0.35 ≈ 0.3 s memory at 10 Hz.
-    curvature_smoothing: float = 0.35
+    # mid-path ω; 0.25 ≈ 0.4 s memory at 10 Hz.
+    curvature_smoothing: float = 0.25
     # Ignore |y_l| below this when computing κ so pose noise and densify jogs
     # do not flip vθ every tick on a long straight. Rotate-to-heading still
     # uses the raw bearing.
-    crosstrack_deadband_m: float = 0.04
+    crosstrack_deadband_m: float = 0.06
     approach_dist_m: float = 0.35
     waypoint_tolerance_m: float = 0.15
     # Rotate-to-heading: stop translating when the lookahead bearing exceeds
