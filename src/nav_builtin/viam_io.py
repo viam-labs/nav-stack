@@ -141,10 +141,14 @@ class ViamWorldIO:
         self._obstacles_refresh_inflight: Set[str] = set()
         self._last_drive: Optional[dict] = None
         self._pose_source: str = "none"
-        # In-flight Base.SetVelocity future. Superseded by the next cmd; never
-        # cancelled just because the waiter timed out (that was aborting drive
-        # while soft-loc/global_localize held the module loop).
+        # In-flight Base.SetVelocity future. Never cancel mid-RPC: control ticks
+        # are faster than a busy module loop, and cancelling made every command
+        # land as ``superseded`` while the robot sat still → stall timeout.
+        # Latest cmd is coalesced into ``_drive_followup`` and sent after the
+        # current RPC finishes. Also never cancel just because the waiter timed
+        # out (soft-loc / global_localize holding the loop).
         self._pending_drive_fut: Optional[concurrent.futures.Future] = None
+        self._drive_followup: Optional[tuple] = None  # (make_coro, intent)
         # How long the control thread waits for SetVelocity to be scheduled /
         # ack'd. Soft-loc cycles often occupy the loop for seconds; waiting the
         # full drive_timeout_s made every tick look like a hard IO failure even
@@ -173,49 +177,68 @@ class ViamWorldIO:
                 f"Viam IO timed out after {timeout:.1f}s"
             ) from exc
 
-    def _cancel_pending_drive(self) -> None:
-        fut = self._pending_drive_fut
-        self._pending_drive_fut = None
-        if fut is not None and not fut.done():
-            fut.cancel()
-
-    def _schedule_drive(self, coro, intent: dict, *, wait_s: float) -> None:
+    def _schedule_drive(self, make_coro, intent: dict, *, wait_s: float) -> None:
         """Queue Base.SetVelocity on the module loop without starving on wait.
 
         Soft-loc / global_localize often occupy the shared loop for longer than
-        a control tick. Blocking 5s then cancelling the future made every hold
-        look like a base failure even when a manual SetVelocity worked.
+        a control tick. Blocking then cancelling the future made every hold look
+        like a base failure, and cancelling on the *next* tick made every drive
+        ``superseded`` before the base ever moved.
         """
         if self._loop.is_closed():
-            if asyncio.iscoroutine(coro):
-                coro.close()
             raise RuntimeError("event loop is closed")
 
-        self._cancel_pending_drive()
+        intent["pending"] = True
+        intent.pop("error", None)
+        intent["issued"] = False
+
+        fut = self._pending_drive_fut
+        if fut is not None and not fut.done():
+            # Keep the in-flight RPC; send this cmd after it finishes.
+            self._drive_followup = (make_coro, intent)
+            intent["coalesced"] = True
+            self._last_drive = dict(intent)
+            return
+
+        self._drive_followup = None
+        self._last_drive = dict(intent)
 
         async def _issue():
-            try:
-                await coro
-                intent["issued"] = True
-                intent["error"] = None
-                intent.pop("pending", None)
-            except asyncio.CancelledError:
-                intent["issued"] = False
-                intent["error"] = "superseded"
-                intent.pop("pending", None)
-                raise
-            except Exception as exc:  # noqa: BLE001
-                intent["issued"] = False
-                intent["error"] = str(exc).strip() or type(exc).__name__
-                intent.pop("pending", None)
-                raise
-            finally:
-                self._last_drive = dict(intent)
+            current_make = make_coro
+            current_intent = intent
+            while True:
+                try:
+                    await current_make()
+                    current_intent["issued"] = True
+                    current_intent["error"] = None
+                    current_intent.pop("pending", None)
+                    current_intent.pop("coalesced", None)
+                except asyncio.CancelledError:
+                    current_intent["issued"] = False
+                    current_intent["error"] = "cancelled"
+                    current_intent.pop("pending", None)
+                    self._last_drive = dict(current_intent)
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    current_intent["issued"] = False
+                    current_intent["error"] = str(exc).strip() or type(exc).__name__
+                    current_intent.pop("pending", None)
+                    self._last_drive = dict(current_intent)
+                    # Still drain follow-up (e.g. stop after a failed spin).
+                else:
+                    self._last_drive = dict(current_intent)
+
+                follow = self._drive_followup
+                self._drive_followup = None
+                if follow is None:
+                    return
+                current_make, current_intent = follow
+                current_intent["pending"] = True
+                current_intent.pop("coalesced", None)
+                self._last_drive = dict(current_intent)
 
         fut = asyncio.run_coroutine_threadsafe(_issue(), self._loop)
         self._pending_drive_fut = fut
-        intent["pending"] = True
-        self._last_drive = dict(intent)
         try:
             fut.result(timeout=max(0.0, float(wait_s)))
         except concurrent.futures.TimeoutError as exc:
@@ -226,8 +249,10 @@ class ViamWorldIO:
         finally:
             if self._pending_drive_fut is fut and fut.done():
                 self._pending_drive_fut = None
-        if intent.get("error"):
-            raise RuntimeError(intent["error"])
+        # Surface the intent that finished (may be a follow-up).
+        finished = self._last_drive or intent
+        if finished.get("error"):
+            raise RuntimeError(finished["error"])
 
     def last_drive(self) -> Optional[dict]:
         """Most recent SetVelocity mapping (body rad/s → Viam mm/s + deg/s)."""
@@ -704,44 +729,47 @@ class ViamWorldIO:
             "error": None,
         }
 
-        async def _issue_with_retry():
-            try:
-                await self._base.set_velocity(
-                    linear=Vector3(x=lx_mm, y=ly_mm, z=0.0),
-                    angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
-                )
-                return
-            except Exception as exc:  # noqa: BLE001
-                if not _is_near_zero_rpm_error(exc):
-                    raise
-            if vx > 0.0 and abs(vtheta) >= 0.08:
-                vx_retry = max(vx, 0.06 + 0.32 * abs(vtheta))
-                lx_mm_r, ly_mm_r, _ = body_twist_to_viam_set_velocity(
-                    vx_retry, vy, vtheta, self._convention
-                )
-                intent["retry"] = {"kind": "widen_arc", "body_vx_mps": vx_retry}
-                intent["viam_linear_x_mm_s"] = lx_mm_r
-                intent["viam_linear_y_mm_s"] = ly_mm_r
-                await self._base.set_velocity(
-                    linear=Vector3(x=lx_mm_r, y=ly_mm_r, z=0.0),
-                    angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
-                )
-            elif vx == 0.0 and abs(vtheta) >= 0.15:
-                intent["retry"] = {"kind": "spin"}
-                await self._base.set_velocity(
-                    linear=Vector3(x=0.0, y=0.0, z=0.0),
-                    angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
-                )
-            else:
-                intent["retry"] = {"kind": "stop"}
-                await self._base.set_velocity(
-                    linear=Vector3(x=0.0, y=0.0, z=0.0),
-                    angular=Vector3(x=0.0, y=0.0, z=0.0),
-                )
+        def _make_coro():
+            async def _issue_with_retry():
+                try:
+                    await self._base.set_velocity(
+                        linear=Vector3(x=lx_mm, y=ly_mm, z=0.0),
+                        angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
+                    )
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_near_zero_rpm_error(exc):
+                        raise
+                if vx > 0.0 and abs(vtheta) >= 0.08:
+                    vx_retry = max(vx, 0.06 + 0.32 * abs(vtheta))
+                    lx_mm_r, ly_mm_r, _ = body_twist_to_viam_set_velocity(
+                        vx_retry, vy, vtheta, self._convention
+                    )
+                    intent["retry"] = {"kind": "widen_arc", "body_vx_mps": vx_retry}
+                    intent["viam_linear_x_mm_s"] = lx_mm_r
+                    intent["viam_linear_y_mm_s"] = ly_mm_r
+                    await self._base.set_velocity(
+                        linear=Vector3(x=lx_mm_r, y=ly_mm_r, z=0.0),
+                        angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
+                    )
+                elif vx == 0.0 and abs(vtheta) >= 0.15:
+                    intent["retry"] = {"kind": "spin"}
+                    await self._base.set_velocity(
+                        linear=Vector3(x=0.0, y=0.0, z=0.0),
+                        angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
+                    )
+                else:
+                    intent["retry"] = {"kind": "stop"}
+                    await self._base.set_velocity(
+                        linear=Vector3(x=0.0, y=0.0, z=0.0),
+                        angular=Vector3(x=0.0, y=0.0, z=0.0),
+                    )
+
+            return _issue_with_retry()
 
         try:
             self._schedule_drive(
-                _issue_with_retry(),
+                _make_coro,
                 intent,
                 wait_s=self._drive_ack_timeout_s,
             )
@@ -774,12 +802,16 @@ class ViamWorldIO:
             "issued": False,
             "error": None,
         }
+
+        def _make_stop():
+            return self._base.set_velocity(
+                linear=Vector3(x=0.0, y=0.0, z=0.0),
+                angular=Vector3(x=0.0, y=0.0, z=0.0),
+            )
+
         try:
             self._schedule_drive(
-                self._base.set_velocity(
-                    linear=Vector3(x=0.0, y=0.0, z=0.0),
-                    angular=Vector3(x=0.0, y=0.0, z=0.0),
-                ),
+                _make_stop,
                 intent,
                 # Fire-and-forget-ish: brief wait only. Soft-loc hold must not
                 # sit 5s on stop while global_localize owns the loop.
