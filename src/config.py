@@ -365,6 +365,9 @@ class BuiltinNavConfig:
 
     Footprint / velocity limits stay top-level on ``NavConfig``. Defaults are
     tuned for builtin SLAM + pure pursuit.
+
+    Config attribute is ``builtin``. The legacy attribute name ``nav2`` is still
+    accepted in ``NavConfig.from_dict`` for existing machine configs.
     """
 
     # ``lazy_theta_star`` (default) or ``astar``.
@@ -1268,7 +1271,10 @@ class NavConfig:
                 d.get("min_cmd_vel_theta", d.get("simple_min_vel_theta", 0.0))
             ),
             nav_backend=backend,
-            builtin=BuiltinNavConfig.from_dict(d.get("builtin", {}) or {}),
+            # Prefer ``builtin``; accept legacy ``nav2`` block from older configs.
+            builtin=BuiltinNavConfig.from_dict(
+                d.get("builtin") or d.get("nav2") or {}
+            ),
         )
 
     def uses_builtin_nav(self) -> bool:
