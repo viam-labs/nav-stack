@@ -484,6 +484,29 @@ def test_slam_config_top_level_resolution():
     assert nested.map.resolution == pytest.approx(0.05)
 
 
+def test_slam_config_legacy_slam_toolbox_block_alias():
+    """Older machine configs used ``slam_toolbox`` for what is now ``map``."""
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "mode": "localizing",
+            "slam_toolbox": {"resolution": 0.08},
+        }
+    )
+    assert cfg.map.resolution == pytest.approx(0.08)
+    prefer = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "mode": "localizing",
+            "map": {"resolution": 0.05},
+            "slam_toolbox": {"resolution": 0.2},
+        }
+    )
+    assert prefer.map.resolution == pytest.approx(0.05)
+
+
 def test_builtin_recovery_wait_defaults():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
     assert cfg.builtin.recovery_wait_duration_s == pytest.approx(2.0)
