@@ -892,6 +892,78 @@ def test_periodic_relocalize_holds_nav_on_large_uncertain_shift():
     assert should_hold_drive_for_pose_jump(result)
 
 
+def test_periodic_relocalize_holds_nav_on_soft_loc_small_shift():
+    """Soft loc with tiny shift (locked onto a bad pose) must still hold."""
+    slam = _relocalize_slam(periodic_relocalize_min_score=0.5)
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        side_effect=[
+            {
+                "status": "matched",
+                "score": 0.41,
+                "ray_mae_m": 1.00,
+                "pose": {"x": 0.08, "y": 0.0, "theta": 0.0},
+                "prior_score": 0.32,
+                "prior_ray_mae_m": 1.01,
+            },
+            {
+                "status": "matched",
+                "score": 0.42,
+                "ray_mae_m": 0.98,
+                "pose": {"x": 0.08, "y": 0.0, "theta": 0.0},
+                "prior_score": 0.32,
+                "prior_ray_mae_m": 1.01,
+            },
+        ]
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "nav_hold"
+    assert result.get("soft_loc") is True
+    assert result.get("large_jump") is False
+    assert result["shift_m"] == pytest.approx(0.08)
+    slam.do_command.assert_not_awaited()
+    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+
+    assert should_hold_drive_for_pose_jump(result)
+
+
+def test_periodic_relocalize_soft_candidate_keeps_driving_if_prior_ok():
+    """Weak candidate with a still-plausible published pose → no hold."""
+    slam = _relocalize_slam(periodic_relocalize_min_score=0.5)
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        side_effect=[
+            {
+                "status": "matched",
+                "score": 0.2,
+                "ray_mae_m": 1.5,
+                "pose": {"x": 0.1, "y": 0.0, "theta": 0.0},
+                "prior_score": 0.55,
+                "prior_ray_mae_m": 0.35,
+            },
+            {
+                "status": "matched",
+                "score": 0.22,
+                "ray_mae_m": 1.4,
+                "pose": {"x": 0.1, "y": 0.0, "theta": 0.0},
+                "prior_score": 0.55,
+                "prior_ray_mae_m": 0.35,
+            },
+        ]
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "low_quality"
+    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+
+    assert not should_hold_drive_for_pose_jump(result)
+
+
 def test_periodic_relocalize_cycle_escalates_full_map_on_low_quality():
     slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
 

@@ -1100,21 +1100,46 @@ class SlamService(SLAM):
             return self._publish_relocalize_check(result)
 
         if not should_apply and apply_override is not True and not good_match:
-            # During nav a large unexplained shift means we may already be lost —
-            # hold the base instead of crawling on a disputed pose.
-            if nav_active and large_jump:
-                result["status"] = "nav_hold"
-                result["large_jump"] = True
-                LOGGER.warning(
-                    "periodic relocalize: large shift during nav with weak match "
-                    "(%.2f m / %.1f deg score=%.2f ray_mae=%s prior=%s); holding",
-                    0.0 if math.isinf(shift_m) else shift_m,
-                    0.0 if math.isinf(shift_deg) else shift_deg,
-                    score,
-                    ray_mae,
-                    prior_score,
-                )
-                return self._publish_relocalize_check(result)
+            # During nav, do not keep driving on an untrusted pose.
+            # - Large jump + weak match → nav_hold (existing)
+            # - Small shift but previous also soft (score/ray bad) → nav_hold
+            #   (the 8 cm soft-loc case that still commanded vx=0.4)
+            # - Small shift while previous still looks ok → low_quality, keep going
+            if nav_active:
+                previous_ok = False
+                if prior_score is not None and math.isfinite(float(prior_score)):
+                    previous_ok = (
+                        float(prior_score) >= cfg.periodic_relocalize_recovery_min_score
+                    )
+                    if (
+                        not previous_ok
+                        and prior_ray_mae is not None
+                        and math.isfinite(float(prior_ray_mae))
+                    ):
+                        previous_ok = (
+                            float(prior_ray_mae)
+                            <= cfg.periodic_relocalize_max_ray_mae_m
+                        )
+                soft_previous = prior_score is None or not previous_ok
+                if large_jump or soft_previous:
+                    result["status"] = "nav_hold"
+                    result["large_jump"] = bool(large_jump)
+                    result["soft_loc"] = bool(soft_previous and not large_jump)
+                    if prior_score is not None:
+                        result["previous_ok"] = previous_ok
+                    LOGGER.warning(
+                        "periodic relocalize: soft loc during nav — holding "
+                        "(shift=%.2f m / %.1f deg score=%.2f ray_mae=%s "
+                        "prior=%s large_jump=%s soft_previous=%s)",
+                        0.0 if math.isinf(shift_m) else shift_m,
+                        0.0 if math.isinf(shift_deg) else shift_deg,
+                        score,
+                        ray_mae,
+                        prior_score,
+                        large_jump,
+                        soft_previous,
+                    )
+                    return self._publish_relocalize_check(result)
             result["status"] = "low_quality"
             LOGGER.warning(
                 "periodic relocalize: no trusted match after %s "
