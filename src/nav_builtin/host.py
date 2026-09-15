@@ -38,6 +38,7 @@ def make_builtin_navigator(
         min_cmd_vel_x=nav_cfg.min_cmd_vel_x,
         min_cmd_vel_theta=nav_cfg.min_cmd_vel_theta,
         timeout_s=bcfg.timeout_s,
+        poll_interval_s=nav_cfg.control_period_s(),
         avoid_obstacles=nav_cfg.simple_avoid_obstacles,
         stop_distance_m=nav_cfg.simple_stop_distance,
         slow_distance_m=nav_cfg.simple_slow_distance,

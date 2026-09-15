@@ -147,6 +147,13 @@ def test_builtin_nav_host_status():
     nav = make_builtin_navigator(world, cfg)
     host = BuiltinNavHost(nav, world, viz, nav_cfg=cfg)
     assert host.nav_backend() == "builtin"
+    assert nav._kwargs["poll_interval_s"] == pytest.approx(0.1)  # noqa: SLF001
+
+    fast = NavConfig.from_dict(
+        {"slam_service": "s", "base": "b", "control_rate_hz": 20.0}
+    )
+    fast_nav = make_builtin_navigator(world, fast)
+    assert fast_nav._kwargs["poll_interval_s"] == pytest.approx(0.05)  # noqa: SLF001
     status = host.nav_status()
     assert status["nav_backend"] == "builtin"
 
@@ -416,7 +423,9 @@ async def test_obstacles_only_scan_never_blocks_on_point_cloud():
         loop=loop,
         cameras={"camera": cam},
         lidars=[depth],
+        obstacles_only_period_s=0.1,
     )
+    assert world._obstacles_only_period_s == pytest.approx(0.1)  # noqa: SLF001
     seeded = conv.points_to_scan(np.array([[1.0, 0.0]]), num_bins=360)
     seeded = conv.LaserScan2D(
         ranges=seeded.ranges,

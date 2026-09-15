@@ -85,7 +85,9 @@ mapping). Example depth camera for avoidance only:
 RealSense / OpenCV depth clouds use **optical** axes (Z forward). Set
 ``cloud_frame: "camera_optical"`` so depth is remapped to X-forward before the
 mount and height band; without it, depth collapses into Z and paints a blob on
-the robot in the local costmap.
+the robot in the local costmap. Refresh rate is nav-side
+``obstacles_only_rate_hz`` (default `2.5`); set a POSIX ``shm_name`` (or use
+``shm-pointcloud``) before pushing toward 10–20 Hz.
 **Tuning via Viam config (no YAML editing required):**
 
 | Attribute | Service | Description |
@@ -123,6 +125,9 @@ the robot in the local costmap.
 | lidar `mount.pitch`, `mount.roll` | SLAM | Mount tilt in radians (positive pitch = forward axis tilted down). Levels the cloud before z filtering — even a ~2° mast tilt pulls floor returns into the z band at 15–20 m and imprints phantom borders at max range (default `0`) |
 | `base_velocity_convention` | SLAM | `viam` (default, Y-forward) or `ros` (X-forward); legacy `mir` accepted as alias for `viam` — maps builtin nav `cmd_vel` to Viam base `SetVelocity` axes |
 | `scan_max_age_s` | SLAM | Safety cutoff for the `/scan` publish path: if the lidar reports a cache age (`get_laser_scan` `age_s`) above this, skip publishing that cycle rather than feed SLAM/builtin nav a stale, misregistered scan (default `2.0`) |
+| `scan_rate_hz` / `odom_rate_hz` | SLAM | Builtin SLAM tick rate is `max(scan_rate_hz, odom_rate_hz)` (default `10` each). Scan matching stays throttled (~3 Hz) separately |
+| `control_rate_hz` | Nav | Builtin nav control + local-costmap update rate (default `10`). On `navigation-external` this sits in the same flat attributes block as the SLAM rates |
+| `obstacles_only_rate_hz` | Nav | Background refresh rate for `obstacles_only` depth cams (default `2.5`). Control tick never awaits GetPointCloud; prefer POSIX `shm_name` for 10–20 Hz |
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced map/scan tuning keys (merged into engine defaults) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level footprint / velocity limits |
@@ -189,7 +194,7 @@ For **Viam wheeled bases** (`rdk:builtin:wheeled`) and **MiR250** (`viam-labs:mi
 
 The MiR250 is **differential drive** — use `"kinematics": "differential"` (the default). Configuring `omni` makes builtin nav command lateral velocities the robot cannot execute. Tune lookahead / tolerances under the `builtin` attribute block.
 
-For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a single `get_readings()` per odom tick. It uses **`odom_position_x_m` / `odom_position_y_m` / `odom_yaw_deg`** when present (true `/odom` frame from mir-base ≥ the odom-fields update). Map-frame `position_x_m`/`position_y_m` and fused `yaw_deg` are **not** used for `/odom` — builtin SLAM needs a smooth odom frame. Until mir-base exposes the odom fields, orientation falls back to velocity integration; upgrade mir-base or patch it to publish `odom_*` keys from the parsed `/odom` message. Raise mir-base's `mir_rosbridge_timeout_s` attribute (≥5, on the `viam-labs:mir-base` component, not this module) and `odom_rate_hz` (≥15) if updates lag.
+For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a single `get_readings()` per odom tick. It uses **`odom_position_x_m` / `odom_position_y_m` / `odom_yaw_deg`** when present (true `/odom` frame from mir-base ≥ the odom-fields update). Map-frame `position_x_m`/`position_y_m` and fused `yaw_deg` are **not** used for `/odom` — builtin SLAM needs a smooth odom frame. Until mir-base exposes the odom fields, orientation falls back to velocity integration; upgrade mir-base or patch it to publish `odom_*` keys from the parsed `/odom` message. Raise mir-base's `mir_rosbridge_timeout_s` attribute (≥5, on the `viam-labs:mir-base` component, not this module) and `scan_rate_hz` / `odom_rate_hz` (e.g. `15`–`20`) if updates lag.
 
 ### Navigation service
 

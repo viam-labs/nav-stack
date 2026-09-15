@@ -187,6 +187,7 @@ class NavigationService(NavServiceBase):
             scan_max_age_s=float(
                 getattr(slam_rt.slam_cfg, "scan_max_age_s", 2.0) or 2.0
             ),
+            obstacles_only_period_s=cfg.obstacles_only_period_s(),
             drive_timeout_s=float(getattr(cfg.builtin, "drive_timeout_s", 5.0)),
             pose_provider=_sync_slam_pose_provider(cfg.slam_service),
             map_provider=_in_process_map_provider(cfg.slam_service),

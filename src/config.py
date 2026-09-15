@@ -334,6 +334,13 @@ _REMOVED_BACKEND_HINT = (
 _TOP_LEVEL_NAV_TUNING_KEYS = ("xy_goal_tolerance", "yaw_goal_tolerance")
 
 
+def _positive_hz(value, name: str) -> float:
+    hz = float(value)
+    if hz <= 0.0:
+        raise ValueError(f"{name} must be > 0, got {hz}")
+    return hz
+
+
 def _merge_top_level_nav_tuning(d: Mapping) -> dict:
     """Build the ``builtin`` attribute dict: nested block wins over top-level."""
     merged = {
@@ -541,8 +548,11 @@ class SlamConfig:
     maps_dir: str = "/root/.viam/nav-stack/maps"
     active_map: Optional[str] = None
     frames: Frames = field(default_factory=Frames)
+    # Builtin SLAM tick rate is ``max(scan_rate_hz, odom_rate_hz)`` (scan + odom
+    # are read each tick). Defaults keep the historical ~10 Hz loop. Scan
+    # matching stays throttled separately (``match_period_s`` ≈ 0.3 s).
     scan_rate_hz: float = 10.0
-    odom_rate_hz: float = 20.0
+    odom_rate_hz: float = 10.0
     sensor_read_timeout_s: float = 10.0
     # External-SLAM navigation (navigation-external) poll rates (unused by builtin
     # slam; retained for config compatibility).
@@ -971,8 +981,8 @@ class SlamConfig:
                 odom=frames_d.get("odom", "odom"),
                 base_link=frames_d.get("base_link", "base_link"),
             ),
-            scan_rate_hz=float(d.get("scan_rate_hz", 10.0)),
-            odom_rate_hz=float(d.get("odom_rate_hz", 20.0)),
+            scan_rate_hz=_positive_hz(d.get("scan_rate_hz", 10.0), "scan_rate_hz"),
+            odom_rate_hz=_positive_hz(d.get("odom_rate_hz", 10.0), "odom_rate_hz"),
             sensor_read_timeout_s=float(d.get("sensor_read_timeout_s", 10.0)),
             external_pose_rate_hz=float(d.get("external_pose_rate_hz", 10.0)),
             external_grid_rate_hz=float(d.get("external_grid_rate_hz", 1.5)),
@@ -1226,6 +1236,10 @@ class SlamConfig:
     def uses_builtin_slam(self) -> bool:
         return self.slam_backend == SLAM_BACKEND_BUILTIN
 
+    def tick_rate_hz(self) -> float:
+        """Builtin SLAM predict/update loop rate (Hz)."""
+        return max(float(self.scan_rate_hz), float(self.odom_rate_hz))
+
 
 
 @dataclass
@@ -1241,6 +1255,13 @@ class NavConfig:
     acc_lim_theta: float = 2.0
     inflation_radius: float = 0.25
     cmd_vel_timeout: float = 2.0  # seconds (watchdog)
+    # Builtin nav control + local-costmap update rate (Hz).
+    control_rate_hz: float = 10.0
+    # Background refresh rate for ``obstacles_only`` depth cams (Hz). Nav never
+    # awaits GetPointCloud on the control tick — this only throttles the
+    # fire-and-forget refresh. Default 2.5 (~0.4 s) matches the prior hardcode.
+    # Prefer POSIX shm on the depth lidar for 10–20 Hz without loop contention.
+    obstacles_only_rate_hz: float = 2.5
     # Reactive obstacle avoidance for simple go_to_* motion.
     simple_avoid_obstacles: bool = True
     simple_stop_distance: float = 0.4  # meters: stop forward + turn away inside this
@@ -1281,6 +1302,12 @@ class NavConfig:
             acc_lim_theta=float(d.get("acc_lim_theta", 2.0)),
             inflation_radius=float(d.get("inflation_radius", 0.25)),
             cmd_vel_timeout=float(d.get("cmd_vel_timeout", 2.0)),
+            control_rate_hz=_positive_hz(
+                d.get("control_rate_hz", 10.0), "control_rate_hz"
+            ),
+            obstacles_only_rate_hz=_positive_hz(
+                d.get("obstacles_only_rate_hz", 2.5), "obstacles_only_rate_hz"
+            ),
             simple_avoid_obstacles=bool(d.get("simple_avoid_obstacles", True)),
             simple_stop_distance=float(d.get("simple_stop_distance", 0.4)),
             simple_slow_distance=float(d.get("simple_slow_distance", 1.0)),
@@ -1300,6 +1327,14 @@ class NavConfig:
                 _merge_top_level_nav_tuning(d)
             ),
         )
+
+    def control_period_s(self) -> float:
+        """Seconds between builtin nav control ticks."""
+        return 1.0 / float(self.control_rate_hz)
+
+    def obstacles_only_period_s(self) -> float:
+        """Seconds between background ``obstacles_only`` depth refreshes."""
+        return 1.0 / float(self.obstacles_only_rate_hz)
 
     def uses_builtin_nav(self) -> bool:
         return True
