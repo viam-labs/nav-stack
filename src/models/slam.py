@@ -203,7 +203,11 @@ class SlamService(SLAM):
                 odom_reader=odom_reader,
             )
         self._engine = BuiltinSlamEngine(
-            cfg, sensors, self._map_store, logger=LOGGER.info
+            cfg,
+            sensors,
+            self._map_store,
+            logger=LOGGER.info,
+            rate_hz=cfg.tick_rate_hz(),
         )
         if cfg.uses_sim():
             # SimWorld is ground truth: SLAM pose tracks the body each tick.

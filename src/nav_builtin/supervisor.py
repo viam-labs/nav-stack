@@ -138,7 +138,8 @@ class NavSupervisor:
         self._global_cache_at = 0.0
         self._local_view_cache = None
         self._local_view_at = 0.0
-        self._local_update_period_s = 0.1
+        # Keep local costmap in lockstep with the control tick.
+        self._local_update_period_s = max(0.0, float(poll_interval_s))
         self._local_scan_max_age_s = min(float(scan_max_age_s), 0.5)
         self._global_cache_period_s = 1.0
         self._cancel = threading.Event()
@@ -402,6 +403,7 @@ class NavSupervisor:
                     except Exception:  # noqa: BLE001
                         loc_hold = None
                 holding_for_localize = isinstance(loc_hold, dict)
+                entering_loc_hold = holding_for_localize and not was_loc_holding
                 if was_loc_holding and not holding_for_localize:
                     pending_loc_replan = True
                 was_loc_holding = holding_for_localize
@@ -442,8 +444,11 @@ class NavSupervisor:
                     xy_ok_since = None
 
                 if holding_for_localize:
-                    # Freeze progress clocks; do not crawl/turn on a disputed pose.
-                    self._world.stop()
+                    # Stop once on entry — repeating SetVelocity(0) every control
+                    # tick (esp. at 20 Hz) queues behind lidar/odom RPCs and
+                    # surfaces as ``Viam IO timed out`` / stalled navigation.
+                    if entering_loc_hold:
+                        self._world.stop()
                     last_progress_at = now
                     last_progress_pose = pose
                     last_progress_dist = dist_goal_chk

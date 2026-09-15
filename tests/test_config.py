@@ -402,6 +402,71 @@ def test_nav_config_defaults_and_deps():
     assert cfg.required_dependencies() == ["slam", "b"]
     assert cfg.nav_backend == "builtin"
     assert cfg.uses_builtin_nav() is True
+    assert cfg.control_rate_hz == pytest.approx(10.0)
+    assert cfg.control_period_s() == pytest.approx(0.1)
+
+
+def test_loop_rate_hz_config():
+    slam = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "f",
+            "scan_rate_hz": 20.0,
+            "odom_rate_hz": 20.0,
+        }
+    )
+    assert slam.scan_rate_hz == pytest.approx(20.0)
+    assert slam.odom_rate_hz == pytest.approx(20.0)
+    assert slam.tick_rate_hz() == pytest.approx(20.0)
+    # Tick follows the faster of the two.
+    mixed = SlamConfig.from_dict(
+        {"base": "b", "lidar": "f", "scan_rate_hz": 10.0, "odom_rate_hz": 25.0}
+    )
+    assert mixed.tick_rate_hz() == pytest.approx(25.0)
+
+    nav = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "control_rate_hz": 20.0}
+    )
+    assert nav.control_rate_hz == pytest.approx(20.0)
+    assert nav.control_period_s() == pytest.approx(0.05)
+    assert nav.obstacles_only_rate_hz == pytest.approx(2.5)
+    assert nav.obstacles_only_period_s() == pytest.approx(0.4)
+
+    fast_depth = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "obstacles_only_rate_hz": 10.0,
+        }
+    )
+    assert fast_depth.obstacles_only_period_s() == pytest.approx(0.1)
+
+    # Flat external-nav block accepts all three together.
+    ext = ExternalNavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "lidars": [{"name": "lidar"}],
+            "scan_rate_hz": 20.0,
+            "odom_rate_hz": 20.0,
+            "control_rate_hz": 20.0,
+            "obstacles_only_rate_hz": 10.0,
+        }
+    )
+    assert ext.bridge.tick_rate_hz() == pytest.approx(20.0)
+    assert ext.nav.control_rate_hz == pytest.approx(20.0)
+    assert ext.nav.obstacles_only_rate_hz == pytest.approx(10.0)
+
+    with pytest.raises(ValueError, match="control_rate_hz"):
+        NavConfig.from_dict(
+            {"slam_service": "slam", "base": "b", "control_rate_hz": 0}
+        )
+    with pytest.raises(ValueError, match="obstacles_only_rate_hz"):
+        NavConfig.from_dict(
+            {"slam_service": "slam", "base": "b", "obstacles_only_rate_hz": 0}
+        )
+    with pytest.raises(ValueError, match="scan_rate_hz"):
+        SlamConfig.from_dict({"base": "b", "lidar": "f", "scan_rate_hz": -1})
 
 
 def test_nav_config_nav_backend_nav2_rejected():

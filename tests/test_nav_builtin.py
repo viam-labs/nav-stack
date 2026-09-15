@@ -1109,6 +1109,7 @@ class _FakeWorld:
         self.map_data = map_data
         self.cmds = []
         self.stopped = False
+        self.stop_calls = 0
         self.loc_hold = None
 
     def get_map(self):
@@ -1131,6 +1132,7 @@ class _FakeWorld:
 
     def stop(self):
         self.stopped = True
+        self.stop_calls += 1
         self.cmds.append((0.0, 0.0, 0.0))
 
     def set_viz_plan(self, path_xy, goal=None):
@@ -1198,6 +1200,8 @@ def test_nav_holds_drive_while_localization_awaiting_confirm():
     status = nav.nav_status()
     assert status.get("active") is True
     assert status.get("obstacle") == "loc_hold"
+    # Stop once on hold entry — not every control tick.
+    assert world.stop_calls == 1
     # No forward or turn commands while held (stops only).
     assert all(abs(vx) < 1e-9 and abs(vth) < 1e-9 for vx, _vy, vth in world.cmds)
     world.loc_hold = None

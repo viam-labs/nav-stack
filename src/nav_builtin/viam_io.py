@@ -87,6 +87,7 @@ class ViamWorldIO:
         viz: Optional[NavVizStore] = None,
         shm_lidar=None,
         scan_max_age_s: float = 2.0,
+        obstacles_only_period_s: float = 0.40,
         drive_timeout_s: float = 5.0,
         map_cache_s: float = 1.0,
         scan_bins: int = 360,
@@ -131,7 +132,8 @@ class ViamWorldIO:
         # so RealSense PCD cannot starve SetVelocity on the shared module loop.
         self._per_lidar_scan: dict[str, tuple[conv.LaserScan2D, float]] = {}
         # Depth is async + slow; keep it fresh enough that motion compensation works.
-        self._obstacles_only_period_s = 0.40
+        # Configurable via NavConfig.obstacles_only_rate_hz (default 2.5 Hz).
+        self._obstacles_only_period_s = max(0.0, float(obstacles_only_period_s))
         # Beyond this pose shift, cached depth is dropped (avoids phantom obstacles).
         self._obstacles_max_shift_m = 0.30
         self._obstacles_max_shift_rad = math.radians(20.0)
