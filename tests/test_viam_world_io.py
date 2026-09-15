@@ -383,6 +383,36 @@ async def test_set_velocity_leaves_command_pending_when_loop_busy():
 
 
 @pytest.mark.asyncio
+async def test_set_velocity_skips_duplicate_twist():
+    """Identical sanitized cmds must not schedule another SetVelocity RPC."""
+    loop = asyncio.get_event_loop()
+    base = MagicMock()
+    base.name = "tracer"
+    base.set_velocity = AsyncMock()
+    world = ViamWorldIO(
+        slam=MagicMock(spec=["get_position", "do_command"]),
+        base=base,
+        loop=loop,
+        cameras={},
+        lidars=[],
+        base_velocity_convention="viam",
+    )
+    await asyncio.to_thread(world.set_velocity, 0.2, 0.0, 0.0)
+    await asyncio.to_thread(world.set_velocity, 0.2, 0.0, 0.0)
+    assert base.set_velocity.await_count == 1
+    drive = world.last_drive()
+    assert drive["skipped"] is True
+    assert drive["issued"] is True
+    stats = world.drive_stats()
+    assert stats["calls"] == 1
+    assert stats["skipped"] == 1
+
+    await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.0)
+    assert base.set_velocity.await_count == 2
+    assert world.drive_stats()["calls"] == 2
+
+
+@pytest.mark.asyncio
 async def test_set_velocity_coalesces_instead_of_superseding():
     """Rapid control ticks must not cancel an in-flight SetVelocity.
 
@@ -413,10 +443,11 @@ async def test_set_velocity_coalesces_instead_of_superseding():
     world._drive_ack_timeout_s = 0.05
 
     await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.6)
-    await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.6)
+    await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.5)
     drive = world.last_drive()
     assert drive.get("coalesced") is True
     assert drive.get("error") != "superseded"
+    assert drive.get("skipped") is not True
     assert len(calls) == 1  # second cmd waited; did not cancel the first
 
     release.set()
@@ -425,7 +456,8 @@ async def test_set_velocity_coalesces_instead_of_superseding():
     drive = world.last_drive()
     assert drive["issued"] is True
     assert drive.get("error") is None
-    assert abs(drive["body_vtheta_rad_s"]) == pytest.approx(0.6)
+    assert abs(drive["body_vtheta_rad_s"]) == pytest.approx(0.5)
+    assert world.drive_stats()["coalesced"] == 1
 
 
 @pytest.mark.asyncio

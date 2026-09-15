@@ -232,3 +232,9 @@ class BuiltinNavigator:
             if self._supervisor is not None:
                 return self._supervisor.status().to_dict()
             return dict(self._last_status)
+
+    def control_stats(self) -> Optional[Dict]:
+        with self._lock:
+            if self._supervisor is None:
+                return None
+            return self._supervisor.control_stats()
