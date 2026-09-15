@@ -411,6 +411,55 @@ def test_nav_config_nav_backend_nav2_rejected():
         )
 
 
+def test_nav_config_legacy_nav2_block_alias():
+    """Older machine configs used ``nav2`` for what is now ``builtin``."""
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "nav2": {
+                "xy_goal_tolerance": 0.25,
+                "yaw_goal_tolerance": 0.5,
+            },
+        }
+    )
+    assert cfg.builtin.xy_goal_tolerance == pytest.approx(0.25)
+    assert cfg.builtin.yaw_goal_tolerance == pytest.approx(0.5)
+    # Explicit ``builtin`` wins over legacy ``nav2``.
+    prefer = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "builtin": {"yaw_goal_tolerance": 0.4},
+            "nav2": {"yaw_goal_tolerance": 0.9},
+        }
+    )
+    assert prefer.builtin.yaw_goal_tolerance == pytest.approx(0.4)
+
+
+def test_slam_config_legacy_slam_toolbox_block_alias():
+    """Older machine configs used ``slam_toolbox`` for what is now ``map``."""
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "mode": "localizing",
+            "slam_toolbox": {"resolution": 0.08},
+        }
+    )
+    assert cfg.map.resolution == pytest.approx(0.08)
+    prefer = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "mode": "localizing",
+            "map": {"resolution": 0.05},
+            "slam_toolbox": {"resolution": 0.2},
+        }
+    )
+    assert prefer.map.resolution == pytest.approx(0.05)
+
+
 def test_builtin_recovery_wait_defaults():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
     assert cfg.builtin.recovery_wait_duration_s == pytest.approx(2.0)
