@@ -156,6 +156,9 @@ def should_hold_drive_for_pose_jump(check: Optional[object]) -> bool:
     - ``awaiting_confirm`` — large jump gated until N agreeing matches
     - ``nav_hold`` — during nav, large false peak and/or soft loc where the
       published pose no longer explains the scan (do not keep driving)
+
+    Does **not** hold for ``soft_loc_resume`` (soft quality, no large jump,
+    hold timer expired — continue on the published pose).
     """
     if not isinstance(check, dict):
         return False

@@ -683,6 +683,8 @@ def _relocalize_slam(**cfg_overrides):
     }
     slam._manager.node = None
     slam._engine = None
+    slam._soft_nav_hold_since = None
+    slam._soft_nav_hold_released = False
     slam._startup_global_localize_task = None
     slam._is_navigation_active = MagicMock(return_value=False)
     return slam
@@ -958,6 +960,46 @@ def test_periodic_relocalize_holds_borderline_score_during_nav():
     assert result.get("soft_loc") is True
     assert result.get("previous_ok") is False
     slam.do_command.assert_not_awaited()
+
+
+def test_periodic_relocalize_soft_hold_resumes_after_timeout():
+    """No map jump: brief soft hold, then keep driving on the published pose."""
+    import time
+
+    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+
+    slam = _relocalize_slam(
+        periodic_relocalize_min_score=0.5,
+        periodic_relocalize_soft_hold_max_s=20.0,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    match = {
+        "status": "matched",
+        "score": 0.489,
+        "ray_mae_m": 0.63,
+        "pose": {"x": 0.08, "y": 0.0, "theta": 0.035},
+        "prior_score": 0.42,
+        "prior_ray_mae_m": 0.70,
+    }
+    slam._global_localize = AsyncMock(return_value=match)
+    slam.do_command = AsyncMock()
+
+    first = asyncio.run(slam._periodic_relocalize_cycle())
+    assert first["status"] == "nav_hold"
+    assert first.get("soft_loc") is True
+    assert should_hold_drive_for_pose_jump(first)
+
+    slam._soft_nav_hold_since = time.monotonic() - 21.0
+    second = asyncio.run(slam._periodic_relocalize_cycle())
+    assert second["status"] == "soft_loc_resume"
+    assert second.get("soft_loc") is True
+    assert not should_hold_drive_for_pose_jump(second)
+    slam.do_command.assert_not_awaited()
+
+    # Subsequent soft cycles stay in resume (do not re-hold until quality recovers).
+    third = asyncio.run(slam._periodic_relocalize_cycle())
+    assert third["status"] == "soft_loc_resume"
+    assert not should_hold_drive_for_pose_jump(third)
 
 
 def test_periodic_relocalize_soft_candidate_keeps_driving_if_prior_ok():
