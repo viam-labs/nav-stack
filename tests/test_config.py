@@ -291,7 +291,9 @@ def test_slam_config_periodic_relocalize_defaults():
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "front", "mode": "localizing"})
     assert cfg.periodic_relocalize is True
     assert cfg.periodic_relocalize_interval_s == pytest.approx(20.0)
-    assert cfg.periodic_relocalize_nav_interval_s == pytest.approx(15.0)
+    assert cfg.periodic_relocalize_nav_interval_s == pytest.approx(25.0)
+    assert cfg.periodic_relocalize_max_yaw_rate_rad_s == pytest.approx(0.35)
+    assert cfg.periodic_relocalize_max_scan_age_s == pytest.approx(0.75)
     assert cfg.periodic_relocalize_min_score == pytest.approx(0.5)
     assert cfg.periodic_relocalize_max_ray_mae_m == pytest.approx(1.0)
     assert cfg.periodic_relocalize_recovery_min_score == pytest.approx(0.45)
@@ -424,10 +426,10 @@ def test_builtin_recovery_wait_defaults():
 def test_builtin_follower_snake_defaults():
     """Defaults tuned to damp mid-path S-curve hunting on skid-steer."""
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
-    assert cfg.builtin.lookahead_m == pytest.approx(1.1)
-    assert cfg.builtin.min_lookahead_m == pytest.approx(0.9)
-    assert cfg.builtin.max_lookahead_m == pytest.approx(1.5)
-    assert cfg.builtin.smooth_sample_spacing_m == pytest.approx(0.15)
+    assert cfg.builtin.lookahead_m == pytest.approx(1.35)
+    assert cfg.builtin.min_lookahead_m == pytest.approx(1.1)
+    assert cfg.builtin.max_lookahead_m == pytest.approx(1.8)
+    assert cfg.builtin.smooth_sample_spacing_m == pytest.approx(0.20)
     # Partial override must not resurrect the old from_dict fallbacks.
     partial = NavConfig.from_dict(
         {
@@ -436,8 +438,8 @@ def test_builtin_follower_snake_defaults():
             "builtin": {"replan_period_s": 0.8},
         }
     )
-    assert partial.builtin.lookahead_m == pytest.approx(1.1)
-    assert partial.builtin.smooth_sample_spacing_m == pytest.approx(0.15)
+    assert partial.builtin.lookahead_m == pytest.approx(1.35)
+    assert partial.builtin.smooth_sample_spacing_m == pytest.approx(0.20)
 
 
 def test_nav_config_bad_nav_backend():

@@ -679,17 +679,17 @@ def test_pursuit_crosstrack_deadband_zeros_kappa():
     from src.nav_builtin.controller import pursuit_command
 
     cfg = FollowerConfig()
-    cfg.crosstrack_deadband_m = 0.04
+    cfg.crosstrack_deadband_m = 0.06
     cfg.curvature_smoothing = 1.0  # no EMA; raw κ only
     cfg.motion.max_linear_mps = 0.6
     current = Pose2D(0.0, 0.0, 0.0)
-    # |y_l| = 0.02 < deadband → κ = 0 → straight cruise.
-    cmd, rotating = pursuit_command(current, Pose2D(1.0, 0.02, 0.0), cfg=cfg)
+    # |y_l| = 0.04 < deadband → κ = 0 → straight cruise.
+    cmd, rotating = pursuit_command(current, Pose2D(1.0, 0.04, 0.0), cfg=cfg)
     assert not rotating
     assert cmd.vx > 0.12
     assert abs(cmd.vtheta) < 1e-9
     # Just outside the deadband: still corrects.
-    cmd2, _ = pursuit_command(current, Pose2D(1.0, 0.05, 0.0), cfg=cfg)
+    cmd2, _ = pursuit_command(current, Pose2D(1.0, 0.07, 0.0), cfg=cfg)
     assert cmd2.vtheta > 0.0
 
 

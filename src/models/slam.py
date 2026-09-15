@@ -907,6 +907,56 @@ class SlamService(SLAM):
         )
         return good, score, ray_mae
 
+    def _periodic_relocalize_preflight(
+        self, cfg: SlamConfig
+    ) -> Optional[Mapping[str, ValueTypes]]:
+        """Skip cycles taken on smeared or stale scans (returns a status dict)."""
+        yaw_rate = 0.0
+        scan_age: Optional[float] = None
+        mgr = self._manager
+        try:
+            node = getattr(mgr, "node", None) if mgr is not None else None
+            status_fn = getattr(node, "slam_bridge_status", None) if node else None
+            if callable(status_fn):
+                vel = (status_fn() or {}).get("odom_velocity") or {}
+                yaw_rate = abs(float(vel.get("vtheta", 0.0)))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            engine = self._engine
+            if engine is not None:
+                diag = engine.diagnostics()
+                age_raw = diag.get("last_scan_age_s")
+                if age_raw is not None:
+                    scan_age = float(age_raw)
+                if yaw_rate <= 1e-9:
+                    yaw_rate = abs(
+                        math.radians(float(diag.get("yaw_rate_deg_s", 0.0)))
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
+        max_yaw = float(cfg.periodic_relocalize_max_yaw_rate_rad_s)
+        if max_yaw > 0.0 and yaw_rate >= max_yaw:
+            return {
+                "status": "skipped",
+                "reason": "spinning",
+                "yaw_rate_rad_s": round(yaw_rate, 3),
+            }
+        max_age = float(cfg.periodic_relocalize_max_scan_age_s)
+        if (
+            max_age > 0.0
+            and scan_age is not None
+            and math.isfinite(scan_age)
+            and scan_age > max_age
+        ):
+            return {
+                "status": "skipped",
+                "reason": "stale_scan",
+                "scan_age_s": round(scan_age, 3),
+            }
+        return None
+
     @staticmethod
     def _pose_shift_from_current(
         current: Optional[conv.Pose2D], matched_pose: Optional[Mapping]
@@ -958,6 +1008,10 @@ class SlamService(SLAM):
             return self._publish_relocalize_check(
                 {"status": "skipped", "reason": "navigation_active"}
             )
+        if apply_override is not True:
+            preflight = self._periodic_relocalize_preflight(cfg)
+            if preflight is not None:
+                return self._publish_relocalize_check(preflight)
 
         nav_recoveries = 0
         if nav_active:

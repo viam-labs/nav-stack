@@ -372,11 +372,11 @@ class BuiltinNavConfig:
     # Regulated pure pursuit lookahead: velocity-scaled and clamped to
     # [min, max]; ``lookahead_m`` is the fallback when starting from rest.
     # Longer = smoother / less sensitive to SLAM pose jitter but cuts corners
-    # more; shorter = tighter tracking. Below ~0.9 m real SLAM noise shows up
-    # as S-curve hunting on a skid-steer.
-    lookahead_m: float = 1.1
-    min_lookahead_m: float = 0.9
-    max_lookahead_m: float = 1.5
+    # more; shorter = tighter tracking. Soft-loc holds + pose noise still
+    # hunt below ~1.1 m on skid-steer, so defaults sit a bit longer.
+    lookahead_m: float = 1.35
+    min_lookahead_m: float = 1.1
+    max_lookahead_m: float = 1.8
     replan_period_s: float = 1.0
     timeout_s: float = 300.0
     # Base.SetVelocity wait on the shared module event loop. Mapping+SLAM can
@@ -395,10 +395,9 @@ class BuiltinNavConfig:
     # Final approach: cap linear speed within this distance of the goal.
     approach_dist_m: float = 0.35
     # Post-process global plans (shortcut + resample) before following.
-    # Coarser than 0.10 m: densify jogs at ~cell scale were feeding pure-pursuit
-    # κ flicker on long straights.
+    # Coarser densify: cell-scale jogs feed pure-pursuit κ flicker on straights.
     smooth_path: bool = True
-    smooth_sample_spacing_m: float = 0.15
+    smooth_sample_spacing_m: float = 0.20
     # Rolling local costmap + DWA-style local planner for dynamic obstacles.
     local_costmap_enabled: bool = True
     local_costmap_width_m: float = 4.0
@@ -431,9 +430,9 @@ class BuiltinNavConfig:
             return cls()
         return cls(
             planner=normalize_builtin_planner(d.get("planner", BUILTIN_PLANNER_LAZY_THETA)),
-            lookahead_m=float(d.get("lookahead_m", 1.1)),
-            min_lookahead_m=float(d.get("min_lookahead_m", 0.9)),
-            max_lookahead_m=float(d.get("max_lookahead_m", 1.5)),
+            lookahead_m=float(d.get("lookahead_m", 1.35)),
+            min_lookahead_m=float(d.get("min_lookahead_m", 1.1)),
+            max_lookahead_m=float(d.get("max_lookahead_m", 1.8)),
             replan_period_s=float(d.get("replan_period_s", 1.0)),
             timeout_s=float(d.get("timeout_s", 300.0)),
             drive_timeout_s=float(d.get("drive_timeout_s", 5.0)),
@@ -445,7 +444,7 @@ class BuiltinNavConfig:
             yaw_align_timeout_s=float(d.get("yaw_align_timeout_s", 4.0)),
             approach_dist_m=float(d.get("approach_dist_m", 0.35)),
             smooth_path=bool(d.get("smooth_path", True)),
-            smooth_sample_spacing_m=float(d.get("smooth_sample_spacing_m", 0.15)),
+            smooth_sample_spacing_m=float(d.get("smooth_sample_spacing_m", 0.20)),
             local_costmap_enabled=bool(d.get("local_costmap_enabled", True)),
             local_costmap_width_m=float(d.get("local_costmap_width_m", 4.0)),
             local_costmap_height_m=float(d.get("local_costmap_height_m", 4.0)),
@@ -661,9 +660,14 @@ class SlamConfig:
     # local scan-match on an interval and re-localizes when pose has drifted.
     periodic_relocalize: bool = True
     periodic_relocalize_interval_s: float = 20.0
-    # Shorter interval while navigation is active (localization drift shows up as
-    # planner failures / recoveries mid-goal).
-    periodic_relocalize_nav_interval_s: float = 15.0
+    # While navigating, score less often so matches are not taken mid-whip on
+    # motion-distorted scans (still frequent enough to catch soft loc).
+    periodic_relocalize_nav_interval_s: float = 25.0
+    # Skip a cycle when |yaw rate| is above this (rad/s) — spinning scans smear.
+    periodic_relocalize_max_yaw_rate_rad_s: float = 0.35
+    # Skip when the latest lidar age exceeds this (s). 0 disables. Matches the
+    # builtin SLAM match path's tight age clamp.
+    periodic_relocalize_max_scan_age_s: float = 0.75
     # Below this match score, or above this ray MAE (m), the local match is not
     # trusted; the watchdog then tries a full-map global_localize (like manual).
     # ray MAE default is deliberately generous: on real robots a correctly
@@ -1113,7 +1117,13 @@ class SlamConfig:
                 d.get("periodic_relocalize_interval_s", 20.0)
             ),
             periodic_relocalize_nav_interval_s=float(
-                d.get("periodic_relocalize_nav_interval_s", 15.0)
+                d.get("periodic_relocalize_nav_interval_s", 25.0)
+            ),
+            periodic_relocalize_max_yaw_rate_rad_s=float(
+                d.get("periodic_relocalize_max_yaw_rate_rad_s", 0.35)
+            ),
+            periodic_relocalize_max_scan_age_s=float(
+                d.get("periodic_relocalize_max_scan_age_s", 0.75)
             ),
             periodic_relocalize_min_score=float(
                 d.get("periodic_relocalize_min_score", 0.5)

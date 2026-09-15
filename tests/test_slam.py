@@ -681,6 +681,8 @@ def _relocalize_slam(**cfg_overrides):
         "active": False,
         "number_of_recoveries": 0,
     }
+    slam._manager.node = None
+    slam._engine = None
     slam._startup_global_localize_task = None
     slam._is_navigation_active = MagicMock(return_value=False)
     return slam
@@ -1120,6 +1122,41 @@ def test_periodic_relocalize_cycle_recovery_floor_blocks_garbage():
     from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
 
     assert should_hold_drive_for_pose_jump(result)
+
+
+def test_periodic_relocalize_skips_while_spinning():
+    slam = _relocalize_slam(periodic_relocalize_max_yaw_rate_rad_s=0.35)
+    slam._manager.node = MagicMock()
+    slam._manager.node.slam_bridge_status.return_value = {
+        "odom_velocity": {"vx": 0.0, "vy": 0.0, "vtheta": 0.8}
+    }
+    slam._global_localize = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "spinning"
+    slam._global_localize.assert_not_awaited()
+
+
+def test_periodic_relocalize_skips_stale_scan():
+    slam = _relocalize_slam(periodic_relocalize_max_scan_age_s=0.75)
+    slam._manager.node = MagicMock()
+    slam._manager.node.slam_bridge_status.return_value = {
+        "odom_velocity": {"vx": 0.2, "vy": 0.0, "vtheta": 0.0}
+    }
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {
+        "last_scan_age_s": 1.5,
+        "yaw_rate_deg_s": 0.0,
+    }
+    slam._global_localize = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "stale_scan"
+    slam._global_localize.assert_not_awaited()
 
 
 def test_periodic_relocalize_cycle_skips_during_navigation():
