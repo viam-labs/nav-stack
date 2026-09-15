@@ -154,8 +154,8 @@ def should_hold_drive_for_pose_jump(check: Optional[object]) -> bool:
 
     Holds for:
     - ``awaiting_confirm`` — large jump gated until N agreeing matches
-    - ``nav_hold`` — large shift during nav where the previous pose does not
-      clearly still explain the scan (lost / uncertain; do not keep driving)
+    - ``nav_hold`` — during nav, large false peak and/or soft loc where the
+      published pose no longer explains the scan (do not keep driving)
     """
     if not isinstance(check, dict):
         return False
