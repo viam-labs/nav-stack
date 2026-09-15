@@ -1101,23 +1101,21 @@ class SlamService(SLAM):
 
         if not should_apply and apply_override is not True and not good_match:
             # During nav, do not keep driving on an untrusted pose.
-            # - Large jump + weak match → nav_hold (existing)
-            # - Small shift but previous also soft (score/ray bad) → nav_hold
-            #   (the 8 cm soft-loc case that still commanded vx=0.4)
-            # - Small shift while previous still looks ok → low_quality, keep going
+            # - Large jump + weak match → nav_hold
+            # - Published pose fails the same bars as good_match → nav_hold
+            #   (score 0.495 / ray 0.9 used to slip under the recovery floor)
+            # - Weak candidate while published pose is still a good_match → keep going
             if nav_active:
                 previous_ok = False
                 if prior_score is not None and math.isfinite(float(prior_score)):
-                    previous_ok = (
-                        float(prior_score) >= cfg.periodic_relocalize_recovery_min_score
-                    )
-                    if (
-                        not previous_ok
-                        and prior_ray_mae is not None
-                        and math.isfinite(float(prior_ray_mae))
-                    ):
+                    # Use the *good_match* bars, not the lower recovery floor —
+                    # recovery is for applying a full-map fix, not for deciding
+                    # that it is safe to keep driving.
+                    previous_ok = float(prior_score) >= cfg.periodic_relocalize_min_score
+                    if previous_ok and prior_ray_mae is not None:
                         previous_ok = (
-                            float(prior_ray_mae)
+                            math.isfinite(float(prior_ray_mae))
+                            and float(prior_ray_mae)
                             <= cfg.periodic_relocalize_max_ray_mae_m
                         )
                 soft_previous = prior_score is None or not previous_ok
@@ -1130,12 +1128,13 @@ class SlamService(SLAM):
                     LOGGER.warning(
                         "periodic relocalize: soft loc during nav — holding "
                         "(shift=%.2f m / %.1f deg score=%.2f ray_mae=%s "
-                        "prior=%s large_jump=%s soft_previous=%s)",
+                        "prior=%s prior_mae=%s large_jump=%s soft_previous=%s)",
                         0.0 if math.isinf(shift_m) else shift_m,
                         0.0 if math.isinf(shift_deg) else shift_deg,
                         score,
                         ray_mae,
                         prior_score,
+                        prior_ray_mae,
                         large_jump,
                         soft_previous,
                     )
