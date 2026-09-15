@@ -50,6 +50,7 @@ def make_builtin_navigator(
         local_costmap_height_m=bcfg.local_costmap_height_m,
         local_costmap_resolution=bcfg.local_costmap_resolution,
         local_inflation_radius_m=bcfg.local_inflation_radius_m,
+        local_costmap_rate_hz=float(getattr(bcfg, "local_costmap_rate_hz", 5.0)),
         local_planner_enabled=bcfg.local_planner_enabled,
         local_planner_sim_time_s=bcfg.local_planner_sim_time_s,
         local_planner_activate_cost=bcfg.local_planner_activate_cost,

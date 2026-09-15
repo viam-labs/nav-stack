@@ -431,6 +431,9 @@ class BuiltinNavConfig:
     local_costmap_height_m: float = 4.0
     local_costmap_resolution: float = 0.05
     local_inflation_radius_m: float = 0.25
+    # Local-window refresh rate (Hz). Independent of ``control_rate_hz`` so the
+    # follower tick stays cheap; lidar is typically ~10 Hz anyway.
+    local_costmap_rate_hz: float = 5.0
     local_planner_enabled: bool = True
     local_planner_sim_time_s: float = 1.5
     local_planner_activate_cost: int = 200
@@ -477,6 +480,9 @@ class BuiltinNavConfig:
             local_costmap_height_m=float(d.get("local_costmap_height_m", 4.0)),
             local_costmap_resolution=float(d.get("local_costmap_resolution", 0.05)),
             local_inflation_radius_m=float(d.get("local_inflation_radius_m", 0.25)),
+            local_costmap_rate_hz=_positive_hz(
+                d.get("local_costmap_rate_hz", 5.0), "local_costmap_rate_hz"
+            ),
             local_planner_enabled=bool(d.get("local_planner_enabled", True)),
             local_planner_sim_time_s=float(d.get("local_planner_sim_time_s", 1.5)),
             local_planner_activate_cost=int(d.get("local_planner_activate_cost", 200)),
@@ -1260,7 +1266,8 @@ class NavConfig:
     acc_lim_theta: float = 2.0
     inflation_radius: float = 0.25
     cmd_vel_timeout: float = 2.0  # seconds (watchdog)
-    # Builtin nav control + local-costmap update rate (Hz).
+    # Builtin nav control rate (Hz). Local costmap refreshes separately via
+    # ``builtin.local_costmap_rate_hz`` (default 5) so follower ticks stay cheap.
     control_rate_hz: float = 10.0
     # Background refresh rate for ``obstacles_only`` depth cams (Hz). Nav never
     # awaits GetPointCloud on the control tick — this only throttles the
