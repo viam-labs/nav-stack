@@ -383,6 +383,52 @@ async def test_set_velocity_leaves_command_pending_when_loop_busy():
 
 
 @pytest.mark.asyncio
+async def test_set_velocity_coalesces_instead_of_superseding():
+    """Rapid control ticks must not cancel an in-flight SetVelocity.
+
+    Cancelling mid-RPC left last_drive.error=superseded and the robot never
+    turned — stall detector then failed the goal.
+    """
+    loop = asyncio.get_event_loop()
+    base = MagicMock()
+    base.name = "tracer"
+    release = asyncio.Event()
+    calls: list[float] = []
+
+    async def _slow_set_velocity(**kwargs):
+        ang = float(kwargs["angular"].z)
+        calls.append(ang)
+        await release.wait()
+
+    base.set_velocity = _slow_set_velocity
+    world = ViamWorldIO(
+        slam=MagicMock(spec=["get_position", "do_command"]),
+        base=base,
+        loop=loop,
+        cameras={},
+        lidars=[],
+        base_velocity_convention="viam",
+        drive_timeout_s=5.0,
+    )
+    world._drive_ack_timeout_s = 0.05
+
+    await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.6)
+    await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.6)
+    drive = world.last_drive()
+    assert drive.get("coalesced") is True
+    assert drive.get("error") != "superseded"
+    assert len(calls) == 1  # second cmd waited; did not cancel the first
+
+    release.set()
+    await asyncio.sleep(0.1)
+    assert len(calls) == 2
+    drive = world.last_drive()
+    assert drive["issued"] is True
+    assert drive.get("error") is None
+    assert abs(drive["body_vtheta_rad_s"]) == pytest.approx(0.6)
+
+
+@pytest.mark.asyncio
 async def test_near_zero_rpm_retry_widens_arc_instead_of_spinning():
     """A translating arc the base rejects (inner wheel ~0) must be retried as a
     wider arc, not converted to a pure spin — spins mid-path throw the heading."""
