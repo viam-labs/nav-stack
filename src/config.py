@@ -663,6 +663,10 @@ class SlamConfig:
     # While navigating, score less often so matches are not taken mid-whip on
     # motion-distorted scans (still frequent enough to catch soft loc).
     periodic_relocalize_nav_interval_s: float = 25.0
+    # Soft loc with no large jump: hold drive briefly, then resume on the
+    # published pose (odom continuity). 0 = hold until quality recovers.
+    # Large-jump holds are unchanged (awaiting_confirm / nav_hold until clear).
+    periodic_relocalize_soft_hold_max_s: float = 20.0
     # Skip a cycle when |yaw rate| is above this (rad/s) — spinning scans smear.
     periodic_relocalize_max_yaw_rate_rad_s: float = 0.35
     # Skip when the latest lidar age exceeds this (s). 0 disables. Matches the
@@ -1118,6 +1122,9 @@ class SlamConfig:
             ),
             periodic_relocalize_nav_interval_s=float(
                 d.get("periodic_relocalize_nav_interval_s", 25.0)
+            ),
+            periodic_relocalize_soft_hold_max_s=float(
+                d.get("periodic_relocalize_soft_hold_max_s", 20.0)
             ),
             periodic_relocalize_max_yaw_rate_rad_s=float(
                 d.get("periodic_relocalize_max_yaw_rate_rad_s", 0.35)

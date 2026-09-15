@@ -292,6 +292,7 @@ def test_slam_config_periodic_relocalize_defaults():
     assert cfg.periodic_relocalize is True
     assert cfg.periodic_relocalize_interval_s == pytest.approx(20.0)
     assert cfg.periodic_relocalize_nav_interval_s == pytest.approx(25.0)
+    assert cfg.periodic_relocalize_soft_hold_max_s == pytest.approx(20.0)
     assert cfg.periodic_relocalize_max_yaw_rate_rad_s == pytest.approx(0.35)
     assert cfg.periodic_relocalize_max_scan_age_s == pytest.approx(0.75)
     assert cfg.periodic_relocalize_min_score == pytest.approx(0.5)

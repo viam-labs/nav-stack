@@ -90,6 +90,10 @@ class SlamService(SLAM):
         self._mapping_revisit_task: Optional[asyncio.Task] = None
         self._last_relocalize_check: dict = {"status": "idle"}
         self._last_revisit_check: dict = {"status": "idle"}
+        # Soft-loc nav_hold started_at / released: resume driving on the published
+        # pose after a short hold when there is no large jump to confirm.
+        self._soft_nav_hold_since: Optional[float] = None
+        self._soft_nav_hold_released: bool = False
         self._slice_library: Optional[slice_match.SliceLibrary] = None
         self._pause_keyframes: Optional[pause_keyframes.PauseKeyframeStore] = None
         self._keyframe_lock = threading.Lock()
@@ -1155,9 +1159,10 @@ class SlamService(SLAM):
 
         if not should_apply and apply_override is not True and not good_match:
             # During nav, do not keep driving on an untrusted pose.
-            # - Large jump + weak match → nav_hold
-            # - Published pose fails the same bars as good_match → nav_hold
-            #   (score 0.495 / ray 0.9 used to slip under the recovery floor)
+            # - Large jump + weak match → nav_hold (until confirm / better match)
+            # - Soft published pose, no jump → brief nav_hold, then resume on the
+            #   published pose (odom continuity) so we do not sit forever at
+            #   borderline scores like 0.49.
             # - Weak candidate while published pose is still a good_match → keep going
             if nav_active:
                 previous_ok = False
@@ -1174,11 +1179,46 @@ class SlamService(SLAM):
                         )
                 soft_previous = prior_score is None or not previous_ok
                 if large_jump or soft_previous:
-                    result["status"] = "nav_hold"
                     result["large_jump"] = bool(large_jump)
                     result["soft_loc"] = bool(soft_previous and not large_jump)
                     if prior_score is not None:
                         result["previous_ok"] = previous_ok
+                    soft_hold_max = float(cfg.periodic_relocalize_soft_hold_max_s)
+                    if soft_previous and not large_jump and soft_hold_max > 0.0:
+                        now = time.monotonic()
+                        if self._soft_nav_hold_released:
+                            result["status"] = "soft_loc_resume"
+                            result["hold_max_s"] = soft_hold_max
+                            LOGGER.info(
+                                "periodic relocalize: soft loc resume "
+                                "(no jump; continuing on published pose "
+                                "score=%.2f prior=%s)",
+                                score,
+                                prior_score,
+                            )
+                            return self._publish_relocalize_check(result)
+                        if self._soft_nav_hold_since is None:
+                            self._soft_nav_hold_since = now
+                        held_s = now - float(self._soft_nav_hold_since)
+                        result["hold_elapsed_s"] = round(held_s, 1)
+                        result["hold_max_s"] = soft_hold_max
+                        if held_s >= soft_hold_max:
+                            self._soft_nav_hold_released = True
+                            result["status"] = "soft_loc_resume"
+                            LOGGER.info(
+                                "periodic relocalize: soft hold timed out after "
+                                "%.1fs — resuming on published pose "
+                                "(shift=%.2f m score=%.2f)",
+                                held_s,
+                                0.0 if math.isinf(shift_m) else shift_m,
+                                score,
+                            )
+                            return self._publish_relocalize_check(result)
+                    elif large_jump:
+                        # Disputed jump: do not auto-resume on the soft timer.
+                        self._soft_nav_hold_since = None
+                        self._soft_nav_hold_released = False
+                    result["status"] = "nav_hold"
                     LOGGER.warning(
                         "periodic relocalize: soft loc during nav — holding "
                         "(shift=%.2f m / %.1f deg score=%.2f ray_mae=%s "
@@ -1193,6 +1233,8 @@ class SlamService(SLAM):
                         soft_previous,
                     )
                     return self._publish_relocalize_check(result)
+            self._soft_nav_hold_since = None
+            self._soft_nav_hold_released = False
             result["status"] = "low_quality"
             LOGGER.warning(
                 "periodic relocalize: no trusted match after %s "
@@ -1205,6 +1247,10 @@ class SlamService(SLAM):
                 nav_recoveries,
             )
             return self._publish_relocalize_check(result)
+
+        # Trusted path (or apply override): clear soft-hold bookkeeping.
+        self._soft_nav_hold_since = None
+        self._soft_nav_hold_released = False
 
         if should_apply and isinstance(matched_pose, Mapping):
             candidate = self._pose_from_mapping(matched_pose)
