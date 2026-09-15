@@ -126,7 +126,7 @@ the robot in the local costmap. Refresh rate is nav-side
 | `base_velocity_convention` | SLAM | `viam` (default, Y-forward) or `ros` (X-forward); legacy `mir` accepted as alias for `viam` — maps builtin nav `cmd_vel` to Viam base `SetVelocity` axes |
 | `scan_max_age_s` | SLAM | Safety cutoff for the `/scan` publish path: if the lidar reports a cache age (`get_laser_scan` `age_s`) above this, skip publishing that cycle rather than feed SLAM/builtin nav a stale, misregistered scan (default `2.0`) |
 | `scan_rate_hz` / `odom_rate_hz` | SLAM | Builtin SLAM tick rate is `max(scan_rate_hz, odom_rate_hz)` (default `10` each). Scan matching stays throttled (~3 Hz) separately |
-| `control_rate_hz` | Nav | Builtin nav control + local-costmap update rate (default `10`). On `navigation-external` this sits in the same flat attributes block as the SLAM rates |
+| `control_rate_hz` | Nav | Builtin nav control rate (default `10`). Local costmap refreshes separately (`builtin.local_costmap_rate_hz`, default `5`) so follower ticks stay cheap |
 | `localize_subprocess` | SLAM | Run `global_localize` / periodic relocalize scoring in a dedicated subprocess so the matcher never holds this process's GIL (default `true`). Falls back in-process on error; health in `status.localize_worker` |
 | `obstacles_only_rate_hz` | Nav | Background refresh rate for `obstacles_only` depth cams (default `2.5`). Control tick never awaits GetPointCloud; prefer POSIX `shm_name` for 10–20 Hz |
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |

@@ -70,6 +70,7 @@ class NavSupervisor:
         local_costmap_height_m: float = 4.0,
         local_costmap_resolution: float = 0.05,
         local_inflation_radius_m: float = 0.25,
+        local_costmap_rate_hz: float = 5.0,
         local_planner_enabled: bool = True,
         local_planner_sim_time_s: float = 1.2,
         local_planner_activate_cost: int = 200,
@@ -132,16 +133,23 @@ class NavSupervisor:
             if local_costmap_enabled
             else None
         )
-        # Cached global costmap for local window (rebuild ~1 Hz, not every tick).
+        # Cached global costmap for local window. Full-map inflate is expensive;
+        # rebuild off the control thread and only when the map generation changes.
         self._global_occ_cache = None
         self._global_costs_cache = None
         self._global_cache_at = 0.0
+        self._global_cache_generation = None
+        self._global_cache_lock = threading.Lock()
+        self._global_refresh_inflight = False
         self._local_view_cache = None
         self._local_view_at = 0.0
-        # Keep local costmap in lockstep with the control tick.
-        self._local_update_period_s = max(0.0, float(poll_interval_s))
+        # Independent of control rate — lidar ~10 Hz; 5 Hz local is enough for DWA.
+        rate = max(0.5, float(local_costmap_rate_hz))
+        self._local_update_period_s = 1.0 / rate
         self._local_scan_max_age_s = min(float(scan_max_age_s), 0.5)
         self._global_cache_period_s = 1.0
+        self._local_costmap_updates = 0
+        self._global_costmap_rebuilds = 0
         self._cancel = threading.Event()
         self._status = NavStatus()
         self._status_lock = threading.Lock()
@@ -213,6 +221,8 @@ class NavSupervisor:
     def control_stats(self) -> dict:
         """Control-loop timing for higher-rate soak (tick vs period)."""
         period = self._control_period_s
+        with self._global_cache_lock:
+            global_gen = self._global_cache_generation
         return {
             "period_s": round(period, 4),
             "target_hz": round(1.0 / period, 2),
@@ -228,6 +238,10 @@ class NavSupervisor:
                 if self._control_tick_ema_s is None
                 else round(self._control_tick_ema_s, 4)
             ),
+            "local_costmap_period_s": round(self._local_update_period_s, 4),
+            "local_costmap_updates": self._local_costmap_updates,
+            "global_costmap_rebuilds": self._global_costmap_rebuilds,
+            "global_costmap_generation": global_gen,
         }
 
     def _note_control_tick(self, work_s: float) -> None:
@@ -247,6 +261,66 @@ class NavSupervisor:
         remaining = self._control_period_s - work_s
         if remaining > 0.0:
             time.sleep(remaining)
+
+    def _kick_global_costmap_refresh(self, *, allow_inline: bool = False) -> None:
+        """Rebuild the full inflated map off the control thread when stale.
+
+        The first call may run inline when there is no cache yet so the local
+        window is not empty of static walls on the first tick.
+        """
+        if self._global_refresh_inflight:
+            return
+        now = time.monotonic()
+        with self._global_cache_lock:
+            have_cache = self._global_costs_cache is not None
+        if have_cache and now - self._global_cache_at < self._global_cache_period_s:
+            return
+
+        def _job() -> None:
+            try:
+                try:
+                    map_data = self._world.get_map()
+                except TimeoutError:
+                    return
+                if map_data is None:
+                    return
+                generation = map_data.get("generation")
+                with self._global_cache_lock:
+                    if (
+                        generation is not None
+                        and generation == self._global_cache_generation
+                        and self._global_costs_cache is not None
+                    ):
+                        self._global_cache_at = time.monotonic()
+                        return
+                from .costmap import build_costmap, occupancy_from_map_dict
+
+                occ = occupancy_from_map_dict(map_data)
+                costs = build_costmap(
+                    occ,
+                    inflation_radius_m=self._inflation,
+                    robot_radius_m=self._robot_radius,
+                    cost_scaling_factor=self._cost_scaling,
+                    clearance_preference_m=self._clearance_preference_m,
+                )
+                with self._global_cache_lock:
+                    self._global_occ_cache = occ
+                    self._global_costs_cache = costs
+                    self._global_cache_generation = generation
+                    self._global_cache_at = time.monotonic()
+                    self._global_costmap_rebuilds += 1
+            except Exception:  # noqa: BLE001 - keep driving on last cache
+                pass
+            finally:
+                self._global_refresh_inflight = False
+
+        self._global_refresh_inflight = True
+        if allow_inline and not have_cache:
+            _job()
+            return
+        threading.Thread(
+            target=_job, name="nav-global-costmap", daemon=True
+        ).start()
 
     def _set_status(self, **kwargs) -> None:
         with self._status_lock:
@@ -525,47 +599,29 @@ class NavSupervisor:
 
                 now = time.monotonic()
 
+                need_scan = (
+                    self._follower.obstacle is not None
+                    and self._follower.obstacle.enabled
+                ) or self._local_costmap is not None
+                refresh_local = self._local_costmap is not None and (
+                    now - self._local_view_at >= self._local_update_period_s
+                    or self._local_view_cache is None
+                )
+
                 scan = None
-                if (
-                    (
-                        self._follower.obstacle is not None
-                        and self._follower.obstacle.enabled
-                    )
-                    or self._local_costmap is not None
-                ):
+                if need_scan:
                     try:
-                        # Full merge (incl. depth) for reactive cone slowing.
+                        # One merge for reactive cone (+ reused on local update
+                        # ticks). Depth in the cone is useful; DWA still works
+                        # with the same scan (lidar dominates).
                         scan = self._world.get_scan(self._scan_max_age)
                     except TimeoutError:
                         scan = None
 
                 local_view = self._local_view_cache
-                if self._local_costmap is not None and (
-                    now - self._local_view_at >= self._local_update_period_s
-                    or local_view is None
-                ):
-                    # Lidar-only for the rolling local costmap / DWA. Depth is
-                    # noisy+laggy and was flipping left/right detours every tick.
-                    costmap_scan = None
-                    try:
-                        costmap_scan = self._world.get_scan(
-                            self._local_scan_max_age_s
-                            if self._local_scan_max_age_s > 0
-                            else self._scan_max_age,
-                            include_obstacles_only=False,
-                        )
-                    except TypeError:
-                        # Older WorldIO stubs without the kwarg.
-                        try:
-                            costmap_scan = self._world.get_scan(
-                                self._local_scan_max_age_s
-                                if self._local_scan_max_age_s > 0
-                                else self._scan_max_age
-                            )
-                        except TimeoutError:
-                            costmap_scan = None
-                    except TimeoutError:
-                        costmap_scan = None
+                if refresh_local:
+                    self._kick_global_costmap_refresh(allow_inline=True)
+                    costmap_scan = scan
                     if (
                         costmap_scan is not None
                         and costmap_scan.capture_pose is None
@@ -579,33 +635,18 @@ class NavSupervisor:
                             sensor_pose=costmap_scan.sensor_pose,
                             capture_pose=pose,
                         )
-                    if now - self._global_cache_at >= self._global_cache_period_s or (
-                        self._global_costs_cache is None
-                    ):
-                        try:
-                            map_data = self._world.get_map()
-                        except TimeoutError:
-                            map_data = None
-                        if map_data is not None:
-                            from .costmap import build_costmap, occupancy_from_map_dict
-
-                            self._global_occ_cache = occupancy_from_map_dict(map_data)
-                            self._global_costs_cache = build_costmap(
-                                self._global_occ_cache,
-                                inflation_radius_m=self._inflation,
-                                robot_radius_m=self._robot_radius,
-                                cost_scaling_factor=self._cost_scaling,
-                                clearance_preference_m=self._clearance_preference_m,
-                            )
-                            self._global_cache_at = now
+                    with self._global_cache_lock:
+                        global_occ = self._global_occ_cache
+                        global_costs = self._global_costs_cache
                     local_view = self._local_costmap.update(
                         pose,
                         costmap_scan,
-                        global_occ=self._global_occ_cache,
-                        global_costs=self._global_costs_cache,
+                        global_occ=global_occ,
+                        global_costs=global_costs,
                     )
                     self._local_view_cache = local_view
                     self._local_view_at = now
+                    self._local_costmap_updates += 1
                     if self._local_costmap_enabled:
                         from .costmap import local_view_viz_dict
 
