@@ -126,7 +126,9 @@ the robot in the local costmap.
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced map/scan tuning keys (merged into engine defaults) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level footprint / velocity limits |
+| `xy_goal_tolerance`, `yaw_goal_tolerance` | Nav | Goal arrival tolerances (m / rad). Also accepted under `builtin` |
 | `min_cmd_vel_x`, `min_cmd_vel_theta` | Nav | Optional stiction floors (default **off** / `0`) for simple `go_to_*` motion. Legacy aliases: `simple_min_vel_x` / `simple_min_vel_theta` |
+| `resolution`, `max_laser_range` | SLAM | Map cell size (m) and lidar range used for matching/mapping. Also accepted under `map` |
 
 Example with map resolution tuning:
 
@@ -141,6 +143,8 @@ Example with map resolution tuning:
     "mode": "localizing",
     "maps_dir": "/root/.viam/nav-stack/maps",
     "active_map": "ground-floor",
+    "resolution": 0.05,
+    "max_laser_range": 25.0,
     "global_localize_on_start": true,
     "global_localize_on_start_options": {
       "map_source": "live",
@@ -158,12 +162,6 @@ Example with map resolution tuning:
     },
     "global_localize_on_start_refine_options": {
       "local_yaw_window_deg": 120.0
-    },
-    "builtin SLAM": {
-      "resolution": 0.05,
-      "max_laser_range": 25.0,
-      "minimum_travel_distance": 0.3,
-      "map_update_interval": 1.0
     }
   }
 }
@@ -211,10 +209,10 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
     "max_vel_x": 0.4,
     "max_vel_theta": 1.0,
     "inflation_radius": 0.45,
+    "xy_goal_tolerance": 0.25,
+    "yaw_goal_tolerance": 0.35,
     "nav_backend": "builtin",
     "builtin": {
-      "xy_goal_tolerance": 0.25,
-      "yaw_goal_tolerance": 0.35,
       "replan_period_s": 1.0
     }
   }
