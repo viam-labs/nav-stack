@@ -790,3 +790,62 @@ def test_apply_heading_from_shm_skips_grpc():
     assert math.degrees(out.heading_rad) == pytest.approx(42.0)
     assert out.vtheta == pytest.approx(math.radians(12.0))
     assert sensors.heading_debug()["source"] == "imu_shm"
+
+
+def test_get_odom_does_not_block_slam_tick_on_busy_loop():
+    """Wheel odom is a gRPC round-trip on the module loop. When that loop is
+    busy (soft-loc / global_localize) the SLAM tick must return immediately,
+    keep the read in flight, and collect it later — not block 1 s and cancel
+    (which froze map translation while the robot kept driving)."""
+    import asyncio
+    import threading
+    import time
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    loop = asyncio.new_event_loop()
+    t = threading.Thread(target=loop.run_forever, daemon=True)
+    t.start()
+    try:
+        release = threading.Event()
+        calls = {"n": 0}
+
+        class _Reader:
+            async def read(self):
+                calls["n"] += 1
+                # Simulate the loop being owned by something slow.
+                await asyncio.get_running_loop().run_in_executor(None, release.wait)
+                return conv.OdomReading(0.0, 0.3, 0.0, pose=conv.Pose2D(1.0, 0.0, 0.0))
+
+        cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "movement_sensor": "odom"})
+        sensors = BuiltinSensors(
+            cfg=cfg, cameras={}, movement_sensor=object(), heading_sensor=None,
+            shm_lidar=None, loop=loop, odom_reader=_Reader(),
+        )
+
+        t0 = time.monotonic()
+        assert sensors.get_odom() is None  # pending, no IMU fallback configured
+        assert time.monotonic() - t0 < 0.5
+        assert sensors.get_odom() is None  # still the same in-flight read
+        assert calls["n"] == 1
+        st = sensors.odom_status()
+        assert st["misses"] == 2
+        assert st["inflight_s"] >= 0.0
+        assert st["source"] == "wheels_pending"
+
+        release.set()
+        deadline = time.monotonic() + 2.0
+        got = None
+        while got is None and time.monotonic() < deadline:
+            got = sensors.get_odom()
+            time.sleep(0.01)
+        assert got is not None
+        assert got.pose.x == pytest.approx(1.0)
+        st = sensors.odom_status()
+        assert st["reads"] == 1
+        assert st["source"] == "wheels"
+        assert st["age_s"] is not None and st["age_s"] < 1.0
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        t.join(timeout=2.0)
+        loop.close()

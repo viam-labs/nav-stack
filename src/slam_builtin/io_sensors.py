@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import math
 import time
 from typing import Mapping, Optional, Sequence
@@ -80,6 +81,19 @@ class BuiltinSensors:
         # (wit-motion exposes deg/s); used only when no absolute orientation.
         self._gyro_heading_rad: Optional[float] = None
         self._gyro_heading_t: Optional[float] = None
+        # Wheel odom is a gRPC round-trip on the shared module loop. Never
+        # block the SLAM tick on it: keep one read in flight, collect it when
+        # done, and let the reader's zero-order hold bridge the gap. Blocking
+        # 1 s + cancel per tick froze the map pose (IMU fallback has vx=0)
+        # whenever soft-loc / global_localize owned the loop.
+        self._odom_fut: Optional[concurrent.futures.Future] = None
+        self._odom_fut_at = 0.0
+        self._odom_last_ok_at: Optional[float] = None
+        self._odom_reads = 0
+        self._odom_misses = 0  # tick with no fresh wheel sample
+        self._odom_failures = 0
+        self._odom_timeouts = 0
+        self._odom_source = "none"
         self._imu_shm: Optional[imushm.Reader] = None
         if cfg.imu_shm_name:
             try:
@@ -316,22 +330,100 @@ class BuiltinSensors:
         except Exception:  # noqa: BLE001
             return None
 
+    # Wait this long for an in-flight wheel read so scan + odom stay paired on
+    # a healthy loop (RPC normally returns in a few ms).
+    _ODOM_WAIT_S = 0.08
+    # An in-flight read older than this is presumed wedged; cancel and retry.
+    _ODOM_STUCK_S = 5.0
+
+    def _poll_odom_wheels(self) -> Optional[conv.OdomReading]:
+        """Latest wheel sample without stalling the caller on a busy loop."""
+        if self._loop.is_closed():
+            return None
+        now = time.monotonic()
+        fut = self._odom_fut
+        if fut is not None and not fut.done() and now - self._odom_fut_at > self._ODOM_STUCK_S:
+            fut.cancel()
+            self._odom_timeouts += 1
+            fut = None
+        if fut is None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._read_odom_wheels(), self._loop
+                )
+            except Exception:  # noqa: BLE001
+                self._odom_failures += 1
+                return None
+            self._odom_fut = fut
+            self._odom_fut_at = now
+        try:
+            sample = fut.result(timeout=self._ODOM_WAIT_S)
+        except concurrent.futures.TimeoutError:
+            # Leave it running; collect on a later tick.
+            self._odom_misses += 1
+            return None
+        except (concurrent.futures.CancelledError, asyncio.CancelledError):
+            self._odom_fut = None
+            return None
+        except Exception:  # noqa: BLE001
+            self._odom_fut = None
+            self._odom_failures += 1
+            return None
+        self._odom_fut = None
+        self._odom_reads += 1
+        self._odom_last_ok_at = time.monotonic()
+        return sample
+
+    def odom_status(self) -> dict:
+        """Wheel-odom read health for SLAM diagnostics."""
+        now = time.monotonic()
+        fut = self._odom_fut
+        out: dict = {
+            "source": self._odom_source,
+            "reads": self._odom_reads,
+            "misses": self._odom_misses,
+            "failures": self._odom_failures,
+            "timeouts": self._odom_timeouts,
+            "inflight_s": (
+                round(now - self._odom_fut_at, 3)
+                if fut is not None and not fut.done()
+                else 0.0
+            ),
+            "age_s": (
+                round(now - self._odom_last_ok_at, 3)
+                if self._odom_last_ok_at is not None
+                else None
+            ),
+        }
+        reader = self._odom_reader
+        debug = getattr(reader, "debug_dict", None) if reader is not None else None
+        if callable(debug):
+            try:
+                d = debug()
+                out["last_sample_gap_s"] = d.get("last_sample_gap_s")
+                out["gap_hold_events"] = d.get("gap_hold_events")
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
     def get_odom(self) -> Optional[conv.OdomReading]:
         # Prefer wheel/movement odometry when configured. IMU shm is a fallback
         # for IMU-only setups; it must not starve a velocity-only wheeled sensor
         # or skip the dedicated heading_sensor merge.
         if self._movement is not None:
-            try:
-                sample = self._run(self._read_odom_wheels(), timeout=1.0)
-            except Exception:  # noqa: BLE001
-                sample = None
+            sample = self._poll_odom_wheels()
             if sample is not None:
                 headed = self._apply_heading_prefer_shm(sample)
                 if headed is not None:
+                    self._odom_source = "wheels"
                     return headed
         sample = self._odom_from_imu_shm()
         if sample is None:
+            self._odom_source = "none" if self._movement is None else "wheels_pending"
             return None
+        self._odom_source = (
+            "imu_shm" if self._movement is None else "imu_shm_while_wheels_pending"
+        )
         if sample.heading_rad is not None and self._heading is None:
             return sample
         headed = self._apply_heading_prefer_shm(sample)

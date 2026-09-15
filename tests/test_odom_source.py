@@ -177,6 +177,77 @@ def test_viam_twist_integrator_moves_forward_in_ros_world():
     assert second.vy == pytest.approx(0.5)
 
 
+def test_twist_integrator_holds_last_velocity_across_read_gap():
+    """A read gap (busy module loop) must not drop travel.
+
+    Robot drives 0.3 m/s; reads at t=0, 0.1, then nothing until t=2.6. The old
+    dt clamp (0.5 s) credited 0.15 m for a 2.5 s gap — map pose fell ~0.6 m
+    behind the robot (overshoot until manual refine). Zero-order hold credits
+    the held velocity across the gap.
+    """
+    s = FakeMovementSensor(
+        angular_velocity=True,
+        linear_velocity=True,
+        av=(0.0, 0.0, 0.0),
+        lv=(0.0, 0.3, 0.0),
+    )
+    times = iter([100.0, 100.1, 102.6])
+    reader = TypedMovementSensorOdom(
+        s,
+        TypedOdomConfig(velocity_convention="viam"),
+        clock=lambda: next(times),
+    )
+    asyncio.run(reader.read())
+    asyncio.run(reader.read())
+    third = asyncio.run(reader.read())
+    assert third.pose is not None
+    # 0.1 s + 2.5 s at 0.3 m/s = 0.78 m
+    assert third.pose.x == pytest.approx(0.78, abs=1e-6)
+    dbg = reader.debug_dict()
+    assert dbg["gap_hold_events"] == 1
+    assert dbg["last_sample_gap_s"] == pytest.approx(2.5)
+
+
+def test_twist_integrator_caps_hold_on_very_long_gap():
+    """Past MAX_HOLD_GAP_S the held velocity is no longer trusted."""
+    s = FakeMovementSensor(
+        angular_velocity=True,
+        linear_velocity=True,
+        lv=(0.0, 0.3, 0.0),
+    )
+    times = iter([100.0, 100.1, 110.1])  # 10 s gap
+    reader = TypedMovementSensorOdom(
+        s,
+        TypedOdomConfig(velocity_convention="viam"),
+        clock=lambda: next(times),
+    )
+    asyncio.run(reader.read())
+    asyncio.run(reader.read())
+    third = asyncio.run(reader.read())
+    # 0.1 s + capped 3.0 s at 0.3 m/s = 0.93 m (not 3.03 m)
+    assert third.pose.x == pytest.approx(0.03 + 0.3 * reader.MAX_HOLD_GAP_S, abs=1e-6)
+
+
+def test_twist_integrator_stopped_robot_gap_adds_nothing():
+    """Held velocity of zero across a gap stays put."""
+    s = FakeMovementSensor(
+        angular_velocity=True,
+        linear_velocity=True,
+        lv=(0.0, 0.0, 0.0),
+    )
+    times = iter([100.0, 100.1, 104.0])
+    reader = TypedMovementSensorOdom(
+        s,
+        TypedOdomConfig(velocity_convention="viam"),
+        clock=lambda: next(times),
+    )
+    for _ in range(2):
+        asyncio.run(reader.read())
+    third = asyncio.run(reader.read())
+    assert third.pose.x == pytest.approx(0.0, abs=1e-12)
+    assert third.pose.y == pytest.approx(0.0, abs=1e-12)
+
+
 def test_empty_angular_vector3_is_valid_zero_rate():
     s = FakeMovementSensor(
         angular_velocity=True,

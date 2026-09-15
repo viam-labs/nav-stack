@@ -55,6 +55,7 @@ class BuiltinSlamEngine:
         )
         self._pose = conv.Pose2D(0.0, 0.0, 0.0)
         self._last_odom_pose: Optional[conv.Pose2D] = None
+        self._last_odom_pose_at: Optional[float] = None
         self._last_odom_time: Optional[float] = None
         self._last_odom_heading: Optional[float] = None
         self._mode = cfg.mode
@@ -338,8 +339,16 @@ class BuiltinSlamEngine:
             }
 
     def diagnostics(self) -> dict:
+        odom_status_fn = getattr(self._sensors, "odom_status", None)
+        odom_status = None
+        if callable(odom_status_fn):
+            try:
+                odom_status = odom_status_fn()
+            except Exception:  # noqa: BLE001
+                odom_status = None
         with self._lock:
             return {
+                "odom": odom_status,
                 "slam_backend": "builtin",
                 "mode": self._mode,
                 "running": self._running,
@@ -764,7 +773,9 @@ class BuiltinSlamEngine:
             # odom pose theta) teleport the map pose every tick — the source
             # of correct↔wrong pose flapping.
             prev = self._last_odom_pose
+            prev_at = self._last_odom_pose_at
             self._last_odom_pose = odom.pose
+            self._last_odom_pose_at = now
             self._last_odom_time = now
             self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
             if prev is None:
@@ -786,10 +797,15 @@ class BuiltinSlamEngine:
                 self._last_odom_heading = odom.heading_rad
             else:
                 self._last_odom_heading = odom.pose.theta
-            # Gate implausible per-tick jumps (heading snap, odom reset).
+            # Gate implausible jumps (heading snap, odom reset). A wheel sample
+            # that arrives after a read gap legitimately carries the whole
+            # gap's travel (reader zero-order hold), so scale with elapsed time.
+            gap_s = (now - prev_at) if prev_at is not None else 0.0
+            max_xy = max(0.5, 0.6 * gap_s)
+            max_yaw = max(math.radians(40.0), math.radians(60.0) * gap_s)
             if (
-                math.hypot(delta.x, delta.y) > 0.5
-                or abs(delta.theta) > math.radians(40.0)
+                math.hypot(delta.x, delta.y) > max_xy
+                or abs(delta.theta) > max_yaw
             ):
                 self._log(
                     "builtin SLAM: rejected odom jump "
