@@ -35,12 +35,10 @@ from ..config import (
 )
 from ..nav.global_localize import (
     GlobalLocalizeResult,
-    choose_yaw_or_flip,
-    global_localize_scan,
     load_occupancy_from_map_dict,
     load_occupancy_from_map_dir,
-    score_pose_with_rays,
 )
+from ..nav.localize_worker import LocalizeWorker
 from ..nav import pause_keyframes, slice_match
 from ..nav.maps import MapStore, validate_map_name
 from ..nav.pose_jump_gate import (
@@ -101,6 +99,8 @@ class SlamService(SLAM):
         self._skip_get_laser_scan: set[str] = set()
         self._shm_lidar = ShmPointCloudClient(logger=LOGGER)
         self._pose_jump_gate = PoseJumpGate()
+        # Scan-to-map matcher subprocess (keeps the heavy search off this GIL).
+        self._localizer = LocalizeWorker(enabled=True, logger=LOGGER)
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -129,6 +129,11 @@ class SlamService(SLAM):
         attrs = struct_to_dict(config.attributes)
         cfg = SlamConfig.from_dict(attrs)
         self._cfg = cfg
+        if self._localizer.enabled != bool(cfg.localize_subprocess):
+            self._localizer.close()
+            self._localizer = LocalizeWorker(
+                enabled=bool(cfg.localize_subprocess), logger=LOGGER
+            )
         self._pose_jump_gate = PoseJumpGate(
             confirm_count=cfg.localize_jump_confirm_count,
             agree_m=cfg.localize_jump_agree_m,
@@ -523,10 +528,9 @@ class SlamService(SLAM):
             library.bands if library is not None else None
         )
 
-        loop = asyncio.get_running_loop()
-
-        def _match(radius_m: float, yaw_window_deg: float, full_map: bool):
-            return global_localize_scan(
+        async def _match(radius_m: float, yaw_window_deg: float, full_map: bool):
+            return await self._localizer.run(
+                "global_localize_scan",
                 occ_map,
                 scan,
                 hint=None if full_map else current,
@@ -539,19 +543,13 @@ class SlamService(SLAM):
 
         tiers_tried = []
         match_mode = "local"
-        result = await loop.run_in_executor(
-            None,
-            lambda: _match(cfg.mapping_revisit_search_radius_m, 90.0, False),
-        )
+        result = await _match(cfg.mapping_revisit_search_radius_m, 90.0, False)
         good, score, ray_mae = self._revisit_match_quality(result, cfg)
         tiers_tried.append({"tier": "local", "score": round(score, 3)})
 
         if not good:
             match_mode = "wide"
-            wide = await loop.run_in_executor(
-                None,
-                lambda: _match(cfg.mapping_revisit_wide_radius_m, 180.0, False),
-            )
+            wide = await _match(cfg.mapping_revisit_wide_radius_m, 180.0, False)
             wide_good, wide_score, wide_ray_mae = self._revisit_match_quality(
                 wide, cfg
             )
@@ -561,9 +559,7 @@ class SlamService(SLAM):
 
         if not good and cfg.mapping_revisit_full_map_fallback:
             match_mode = "full_map"
-            full = await loop.run_in_executor(
-                None, lambda: _match(0.0, 360.0, True)
-            )
+            full = await _match(0.0, 360.0, True)
             _, full_score, full_ray_mae = self._revisit_match_quality(full, cfg)
             tiers_tried.append({"tier": "full_map", "score": round(full_score, 3)})
             # Full map needs the stricter gate regardless of ray MAE outcome.
@@ -626,8 +622,8 @@ class SlamService(SLAM):
                 if kf.score >= cfg.mapping_revisit_keyframe_min_score:
                     # Ray-align against the live map at the keyframe pose so
                     # the usual MAE gate still applies.
-                    yaw_probe = await asyncio.to_thread(
-                        choose_yaw_or_flip,
+                    yaw_probe = await self._localizer.run(
+                        "choose_yaw_or_flip",
                         occ_map,
                         scan,
                         kf.pose,
@@ -661,8 +657,8 @@ class SlamService(SLAM):
 
         # Corridor 180° ambiguity: same XY often scores similarly both ways.
         # Re-score pose vs pose+π and prefer IMU-nearer heading on a near-tie.
-        yaw_choice = await asyncio.to_thread(
-            choose_yaw_or_flip,
+        yaw_choice = await self._localizer.run(
+            "choose_yaw_or_flip",
             occ_map,
             scan,
             result.pose,
@@ -1864,6 +1860,9 @@ class SlamService(SLAM):
         # Slice reference geometry is pose-graph-relative; a (re)started SLAM
         # session invalidates it.
         self._reset_slice_library()
+        # Spawn the matcher subprocess now so the first relocalize / revisit
+        # check does not pay the import cost.
+        self._localizer.warm()
 
     def _reset_live_slam(self, mode: str) -> None:
         """Reset SLAM in place when possible; full restart as fallback."""
@@ -2029,6 +2028,7 @@ class SlamService(SLAM):
             status["slam_backend"] = (
                 self._cfg.slam_backend if self._cfg else None
             )
+            status["localize_worker"] = dict(self._localizer.stats)
             status["active_map"] = store.get_active_map_name()
             if self._cfg is not None:
                 status["base"] = self._cfg.base
@@ -2473,11 +2473,12 @@ class SlamService(SLAM):
 
         loop = asyncio.get_running_loop()
 
-        def _run_match(full_map_override: bool):
+        async def _run_match(full_map_override: bool):
             default_coarse_pos = 0.6 if full_map_override else 0.4
             default_coarse_yaw = 18.0 if full_map_override else 12.0
             default_local_yaw_window = 360.0 if full_map_override else 180.0
-            return global_localize_scan(
+            return await self._localizer.run(
+                "global_localize_scan",
                 occ_map,
                 scan,
                 hint=hint,
@@ -2504,7 +2505,7 @@ class SlamService(SLAM):
                 ray_weight=float(command.get("ray_weight", 0.35)),
             )
 
-        result = await loop.run_in_executor(None, lambda: _run_match(full_map))
+        result = await _run_match(full_map)
         fallback_used = False
         if (
             not full_map
@@ -2514,7 +2515,7 @@ class SlamService(SLAM):
                 or result.hit_rate < fallback_hit_rate_threshold
             )
         ):
-            full_result = await loop.run_in_executor(None, lambda: _run_match(True))
+            full_result = await _run_match(True)
             if (
                 full_result.score > result.score
                 or full_result.hit_rate > result.hit_rate
@@ -2526,19 +2527,17 @@ class SlamService(SLAM):
         prior_score = None
         prior_ray_mae_m = None
         if hint is not None:
-            prior_score, prior_ray_mae_m = await loop.run_in_executor(
-                None,
-                lambda: score_pose_with_rays(
-                    occ_map,
-                    scan,
-                    hint,
-                    max_scan_points=int(command.get("max_scan_points", 240)),
-                    min_in_map_points=int(command.get("min_in_map_points", 40)),
-                    min_in_map_ratio=float(command.get("min_in_map_ratio", 0.35)),
-                    hit_radius_cells=int(command.get("hit_radius_cells", 2)),
-                    ray_refine_beams=int(command.get("ray_refine_beams", 64)),
-                    ray_step_m=float(command.get("ray_step_m", 0.08)),
-                ),
+            prior_score, prior_ray_mae_m = await self._localizer.run(
+                "score_pose_with_rays",
+                occ_map,
+                scan,
+                hint,
+                max_scan_points=int(command.get("max_scan_points", 240)),
+                min_in_map_points=int(command.get("min_in_map_points", 40)),
+                min_in_map_ratio=float(command.get("min_in_map_ratio", 0.35)),
+                hit_radius_cells=int(command.get("hit_radius_cells", 2)),
+                ray_refine_beams=int(command.get("ray_refine_beams", 64)),
+                ray_step_m=float(command.get("ray_step_m", 0.08)),
             )
 
         if apply_pose:
@@ -2620,6 +2619,7 @@ class SlamService(SLAM):
         unregister_slam(self.name)
         unregister_slam_service(self.name)
         self._shm_lidar.close()
+        self._localizer.close()
         if self._manager is not None:
             self._manager.shutdown()
             self._manager = None
