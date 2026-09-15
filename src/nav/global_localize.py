@@ -354,6 +354,53 @@ def _ray_alignment(
     return quality, mae
 
 
+def score_pose_with_rays(
+    occ_map: OccupancyMap,
+    scan: conv.LaserScan2D,
+    pose: conv.Pose2D,
+    *,
+    max_scan_points: int = 240,
+    min_in_map_points: int = 40,
+    min_in_map_ratio: float = 0.35,
+    hit_radius_cells: int = 2,
+    ray_refine_beams: int = 64,
+    ray_step_m: float = 0.08,
+) -> Tuple[float, float]:
+    """Score a fixed pose against ``scan`` (endpoint score, ray MAE).
+
+    Used to ask "does the *previous* pose still explain this scan?" when a
+    large jump candidate appears during navigation.
+    """
+    scan_xy = scan_endpoints_base_link(scan)
+    if scan_xy.shape[0] < 8:
+        return float("-inf"), float("inf")
+    if max_scan_points > 0 and scan_xy.shape[0] > max_scan_points:
+        idx = np.linspace(0, scan_xy.shape[0] - 1, max_scan_points, dtype=np.int32)
+        scan_xy = scan_xy[idx]
+    occupied_lookup = _inflate_occupied(
+        occ_map.grid >= 65, max(0, int(hit_radius_cells))
+    )
+    endpoint = _score_pose(
+        occ_map,
+        scan_xy,
+        pose,
+        occupied_lookup=occupied_lookup,
+        min_in_map_points=min_in_map_points,
+        min_in_map_ratio=min_in_map_ratio,
+    )
+    ray_angles, ray_ranges = _sample_scan_beams(scan, max(0, int(ray_refine_beams)))
+    range_max = float(scan.range_max) if math.isfinite(scan.range_max) else 25.0
+    _ray_q, ray_mae = _ray_alignment(
+        occ_map,
+        pose,
+        ray_angles,
+        ray_ranges,
+        range_max_m=range_max,
+        step_m=float(ray_step_m),
+    )
+    return float(endpoint.score), float(ray_mae)
+
+
 def _iter_pose_grid(
     *,
     center_x: float,

@@ -9,10 +9,34 @@ from src.geom import conversions as conv
 
 def test_should_hold_drive_for_awaiting_confirm():
     assert should_hold_drive_for_pose_jump({"status": "awaiting_confirm"})
+    assert should_hold_drive_for_pose_jump({"status": "nav_hold"})
+    assert not should_hold_drive_for_pose_jump({"status": "previous_better"})
     assert not should_hold_drive_for_pose_jump({"status": "corrected"})
     assert not should_hold_drive_for_pose_jump({"status": "ok"})
+    assert not should_hold_drive_for_pose_jump({"status": "low_quality"})
     assert not should_hold_drive_for_pose_jump(None)
     assert not should_hold_drive_for_pose_jump("awaiting_confirm")
+
+
+def test_candidate_beats_previous_requires_margin_on_large_shift():
+    from src.nav.pose_jump_gate import candidate_beats_previous
+
+    # 7.7 m false peak with similar/worse score must not win.
+    assert not candidate_beats_previous(
+        previous_score=0.55,
+        candidate_score=0.43,
+        shift_m=7.7,
+        shift_deg=1.0,
+        previous_ray_mae_m=0.4,
+        candidate_ray_mae_m=1.4,
+    )
+    # Clear win at distance still applies.
+    assert candidate_beats_previous(
+        previous_score=0.2,
+        candidate_score=1.2,
+        shift_m=2.0,
+        shift_deg=5.0,
+    )
 
 
 def test_small_jump_applies_immediately():
