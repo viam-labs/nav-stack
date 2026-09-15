@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import math
 import struct
 import time
@@ -140,6 +141,15 @@ class ViamWorldIO:
         self._obstacles_refresh_inflight: Set[str] = set()
         self._last_drive: Optional[dict] = None
         self._pose_source: str = "none"
+        # In-flight Base.SetVelocity future. Superseded by the next cmd; never
+        # cancelled just because the waiter timed out (that was aborting drive
+        # while soft-loc/global_localize held the module loop).
+        self._pending_drive_fut: Optional[concurrent.futures.Future] = None
+        # How long the control thread waits for SetVelocity to be scheduled /
+        # ack'd. Soft-loc cycles often occupy the loop for seconds; waiting the
+        # full drive_timeout_s made every tick look like a hard IO failure even
+        # though a later manual SetVelocity worked fine.
+        self._drive_ack_timeout_s = min(0.35, max(0.05, float(drive_timeout_s)))
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -162,6 +172,62 @@ class ViamWorldIO:
             raise TimeoutError(
                 f"Viam IO timed out after {timeout:.1f}s"
             ) from exc
+
+    def _cancel_pending_drive(self) -> None:
+        fut = self._pending_drive_fut
+        self._pending_drive_fut = None
+        if fut is not None and not fut.done():
+            fut.cancel()
+
+    def _schedule_drive(self, coro, intent: dict, *, wait_s: float) -> None:
+        """Queue Base.SetVelocity on the module loop without starving on wait.
+
+        Soft-loc / global_localize often occupy the shared loop for longer than
+        a control tick. Blocking 5s then cancelling the future made every hold
+        look like a base failure even when a manual SetVelocity worked.
+        """
+        if self._loop.is_closed():
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            raise RuntimeError("event loop is closed")
+
+        self._cancel_pending_drive()
+
+        async def _issue():
+            try:
+                await coro
+                intent["issued"] = True
+                intent["error"] = None
+                intent.pop("pending", None)
+            except asyncio.CancelledError:
+                intent["issued"] = False
+                intent["error"] = "superseded"
+                intent.pop("pending", None)
+                raise
+            except Exception as exc:  # noqa: BLE001
+                intent["issued"] = False
+                intent["error"] = str(exc).strip() or type(exc).__name__
+                intent.pop("pending", None)
+                raise
+            finally:
+                self._last_drive = dict(intent)
+
+        fut = asyncio.run_coroutine_threadsafe(_issue(), self._loop)
+        self._pending_drive_fut = fut
+        intent["pending"] = True
+        self._last_drive = dict(intent)
+        try:
+            fut.result(timeout=max(0.0, float(wait_s)))
+        except concurrent.futures.TimeoutError as exc:
+            # Leave the RPC running — do not cancel. Caller sees pending.
+            raise TimeoutError(
+                f"Viam IO timed out after {wait_s:.1f}s"
+            ) from exc
+        finally:
+            if self._pending_drive_fut is fut and fut.done():
+                self._pending_drive_fut = None
+        if intent.get("error"):
+            raise RuntimeError(intent["error"])
 
     def last_drive(self) -> Optional[dict]:
         """Most recent SetVelocity mapping (body rad/s → Viam mm/s + deg/s)."""
@@ -637,96 +703,96 @@ class ViamWorldIO:
             "issued": False,
             "error": None,
         }
-        try:
-            self._run(
-                self._base.set_velocity(
+
+        async def _issue_with_retry():
+            try:
+                await self._base.set_velocity(
                     linear=Vector3(x=lx_mm, y=ly_mm, z=0.0),
                     angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
-                ),
-                timeout=self._drive_timeout_s,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                if not _is_near_zero_rpm_error(exc):
+                    raise
+            if vx > 0.0 and abs(vtheta) >= 0.08:
+                vx_retry = max(vx, 0.06 + 0.32 * abs(vtheta))
+                lx_mm_r, ly_mm_r, _ = body_twist_to_viam_set_velocity(
+                    vx_retry, vy, vtheta, self._convention
+                )
+                intent["retry"] = {"kind": "widen_arc", "body_vx_mps": vx_retry}
+                intent["viam_linear_x_mm_s"] = lx_mm_r
+                intent["viam_linear_y_mm_s"] = ly_mm_r
+                await self._base.set_velocity(
+                    linear=Vector3(x=lx_mm_r, y=ly_mm_r, z=0.0),
+                    angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
+                )
+            elif vx == 0.0 and abs(vtheta) >= 0.15:
+                intent["retry"] = {"kind": "spin"}
+                await self._base.set_velocity(
+                    linear=Vector3(x=0.0, y=0.0, z=0.0),
+                    angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
+                )
+            else:
+                intent["retry"] = {"kind": "stop"}
+                await self._base.set_velocity(
+                    linear=Vector3(x=0.0, y=0.0, z=0.0),
+                    angular=Vector3(x=0.0, y=0.0, z=0.0),
+                )
+
+        try:
+            self._schedule_drive(
+                _issue_with_retry(),
+                intent,
+                wait_s=self._drive_ack_timeout_s,
             )
+        except TimeoutError:
+            if intent.get("pending") and not intent.get("error"):
+                # Command is still queued on the module loop; do not fail the tick.
+                self._log(
+                    f"SetVelocity ack slow on base {self._base_name!r} "
+                    f"(loop busy; leaving command pending)"
+                )
+                return
+            raise
         except Exception as exc:  # noqa: BLE001
-            # Wheeled bases reject non-zero but tiny wheel RPM ("nearly 0").
-            if not _is_near_zero_rpm_error(exc):
-                intent["error"] = str(exc).strip() or type(exc).__name__
-                self._last_drive = intent
-                self._log(
-                    f"SetVelocity failed on base {self._base_name!r}: {intent['error']}"
-                )
-                raise
-            try:
-                if vx > 0.0 and abs(vtheta) >= 0.08:
-                    # Translating arc whose inner wheel is ~0: widen it (more
-                    # vx, same vθ) rather than convert to a pure spin — a spin
-                    # mid-path throws the heading and the follower has to
-                    # recover from a pose it never commanded.
-                    vx_retry = max(vx, 0.06 + 0.32 * abs(vtheta))
-                    lx_mm_r, ly_mm_r, _ = body_twist_to_viam_set_velocity(
-                        vx_retry, vy, vtheta, self._convention
-                    )
-                    intent["retry"] = {"kind": "widen_arc", "body_vx_mps": vx_retry}
-                    self._run(
-                        self._base.set_velocity(
-                            linear=Vector3(x=lx_mm_r, y=ly_mm_r, z=0.0),
-                            angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
-                        ),
-                        timeout=self._drive_timeout_s,
-                    )
-                elif vx == 0.0 and abs(vtheta) >= 0.15:
-                    intent["retry"] = {"kind": "spin"}
-                    self._run(
-                        self._base.set_velocity(
-                            linear=Vector3(x=0.0, y=0.0, z=0.0),
-                            angular=Vector3(x=0.0, y=0.0, z=ang_deg_s),
-                        ),
-                        timeout=self._drive_timeout_s,
-                    )
-                else:
-                    intent["retry"] = {"kind": "stop"}
-                    self.stop()
-            except Exception as retry_exc:  # noqa: BLE001
-                intent["error"] = str(retry_exc).strip() or type(retry_exc).__name__
-                self._last_drive = intent
-                self._log(
-                    f"SetVelocity retry failed on base {self._base_name!r}: "
-                    f"{intent['error']}"
-                )
-                raise
-        intent["issued"] = True
-        self._last_drive = intent
+            self._log(
+                f"SetVelocity failed on base {self._base_name!r}: "
+                f"{str(exc).strip() or type(exc).__name__}"
+            )
+            raise
 
     def stop(self) -> None:
+        """Zero the base without blocking the control thread on a busy loop."""
+        intent = {
+            "body_vx_mps": 0.0,
+            "body_vy_mps": 0.0,
+            "body_vtheta_rad_s": 0.0,
+            "viam_linear_x_mm_s": 0.0,
+            "viam_linear_y_mm_s": 0.0,
+            "viam_angular_z_deg_s": 0.0,
+            "base": self._base_name,
+            "issued": False,
+            "error": None,
+        }
         try:
-            self._run(
+            self._schedule_drive(
                 self._base.set_velocity(
                     linear=Vector3(x=0.0, y=0.0, z=0.0),
                     angular=Vector3(x=0.0, y=0.0, z=0.0),
                 ),
-                timeout=self._drive_timeout_s,
+                intent,
+                # Fire-and-forget-ish: brief wait only. Soft-loc hold must not
+                # sit 5s on stop while global_localize owns the loop.
+                wait_s=min(0.15, self._drive_ack_timeout_s),
             )
-            self._last_drive = {
-                "body_vx_mps": 0.0,
-                "body_vy_mps": 0.0,
-                "body_vtheta_rad_s": 0.0,
-                "viam_linear_x_mm_s": 0.0,
-                "viam_linear_y_mm_s": 0.0,
-                "viam_angular_z_deg_s": 0.0,
-                "base": self._base_name,
-                "issued": True,
-                "error": None,
-            }
+        except TimeoutError:
+            # Stop is queued; status keeps pending until the loop drains.
+            pass
         except Exception as exc:  # noqa: BLE001
-            self._last_drive = {
-                "body_vx_mps": 0.0,
-                "body_vy_mps": 0.0,
-                "body_vtheta_rad_s": 0.0,
-                "viam_linear_x_mm_s": 0.0,
-                "viam_linear_y_mm_s": 0.0,
-                "viam_angular_z_deg_s": 0.0,
-                "base": self._base_name,
-                "issued": False,
-                "error": str(exc).strip() or type(exc).__name__,
-            }
+            intent["issued"] = False
+            intent["error"] = str(exc).strip() or type(exc).__name__
+            intent.pop("pending", None)
+            self._last_drive = intent
 
     def set_viz_plan(
         self,

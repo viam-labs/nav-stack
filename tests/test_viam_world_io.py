@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -332,13 +333,53 @@ async def test_viam_world_io_last_drive_issued_only_after_set_velocity():
     assert drive["viam_angular_z_deg_s"] == pytest.approx(-math.degrees(1.0))
     base.set_velocity.assert_awaited()
 
-    base.set_velocity = AsyncMock(side_effect=TimeoutError("Viam IO timed out after 5.0s"))
-    with pytest.raises(TimeoutError):
+    base.set_velocity = AsyncMock(side_effect=RuntimeError("base refused"))
+    with pytest.raises(RuntimeError, match="base refused"):
         await asyncio.to_thread(world.set_velocity, 0.3, 0.0, 0.0)
     drive = world.last_drive()
     assert drive["issued"] is False
-    assert "timed out" in (drive["error"] or "").lower()
+    assert "refused" in (drive["error"] or "").lower()
     assert drive["viam_linear_y_mm_s"] == pytest.approx(300.0)
+
+
+@pytest.mark.asyncio
+async def test_set_velocity_leaves_command_pending_when_loop_busy():
+    """Soft-loc occupying the module loop must not cancel SetVelocity."""
+    loop = asyncio.get_event_loop()
+    base = MagicMock()
+    base.name = "tracer"
+    release = asyncio.Event()
+
+    async def _slow_set_velocity(**kwargs):
+        del kwargs
+        await release.wait()
+
+    base.set_velocity = _slow_set_velocity
+    slam = MagicMock(spec=["get_position", "do_command"])
+    world = ViamWorldIO(
+        slam=slam,
+        base=base,
+        loop=loop,
+        cameras={},
+        lidars=[],
+        base_velocity_convention="viam",
+        drive_timeout_s=5.0,
+    )
+    world._drive_ack_timeout_s = 0.05
+
+    t0 = time.monotonic()
+    await asyncio.to_thread(world.set_velocity, 0.2, 0.0, 0.0)
+    assert time.monotonic() - t0 < 1.0
+    drive = world.last_drive()
+    assert drive["issued"] is False
+    assert drive.get("pending") is True
+    assert drive.get("error") is None
+
+    release.set()
+    await asyncio.sleep(0.05)
+    drive = world.last_drive()
+    assert drive["issued"] is True
+    assert drive.get("error") is None
 
 
 @pytest.mark.asyncio
