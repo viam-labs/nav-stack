@@ -39,10 +39,15 @@ from ..nav.global_localize import (
     global_localize_scan,
     load_occupancy_from_map_dict,
     load_occupancy_from_map_dir,
+    score_pose_with_rays,
 )
 from ..nav import pause_keyframes, slice_match
 from ..nav.maps import MapStore, validate_map_name
-from ..nav.pose_jump_gate import JumpDecision, PoseJumpGate
+from ..nav.pose_jump_gate import (
+    JumpDecision,
+    PoseJumpGate,
+    candidate_beats_previous,
+)
 from ..geom import conversions as conv
 from ..shm.lidar import ShmPointCloudClient
 from ..runtime import (
@@ -1037,8 +1042,79 @@ class SlamService(SLAM):
             "nav_recoveries": nav_recoveries,
             "corrected": False,
         }
+        prior_score = match.get("prior_score")
+        prior_ray_mae = match.get("prior_ray_mae_m")
+        if prior_score is not None:
+            result["previous_score"] = prior_score
+            result["previous_ray_mae_m"] = prior_ray_mae
+
+        large_jump = (
+            (not math.isinf(shift_m) and shift_m >= cfg.localize_jump_large_m)
+            or (
+                not math.isinf(shift_deg)
+                and shift_deg >= cfg.localize_jump_large_deg
+            )
+        )
+        prefer_previous = False
+        if (
+            large_jump
+            and prior_score is not None
+            and math.isfinite(float(prior_score))
+        ):
+            # Only treat "still at previous" when the prior itself is plausible —
+            # two equally bad scores must not resume driving (nav_hold instead).
+            previous_ok = float(prior_score) >= cfg.periodic_relocalize_recovery_min_score
+            if (
+                not previous_ok
+                and prior_ray_mae is not None
+                and math.isfinite(float(prior_ray_mae))
+            ):
+                previous_ok = float(prior_ray_mae) <= cfg.periodic_relocalize_max_ray_mae_m
+            prefer_previous = previous_ok and not candidate_beats_previous(
+                previous_score=float(prior_score),
+                candidate_score=float(score),
+                shift_m=0.0 if math.isinf(shift_m) else float(shift_m),
+                shift_deg=0.0 if math.isinf(shift_deg) else float(shift_deg),
+                previous_ray_mae_m=(
+                    float(prior_ray_mae) if prior_ray_mae is not None else None
+                ),
+                candidate_ray_mae_m=ray_mae,
+            )
+            result["prefer_previous"] = prefer_previous
+            result["previous_ok"] = previous_ok
+            result["large_jump"] = True
+
+        if prefer_previous:
+            # Scan still fits the published pose — treat the far peak as a false
+            # match and keep driving (do not apply, do not hold).
+            self._pose_jump_gate.clear()
+            result["status"] = "previous_better"
+            result["corrected"] = False
+            LOGGER.info(
+                "periodic relocalize: keeping previous pose "
+                "(shift=%.2f m score=%.2f prior=%.2f); candidate rejected",
+                0.0 if math.isinf(shift_m) else shift_m,
+                score,
+                float(prior_score),
+            )
+            return self._publish_relocalize_check(result)
 
         if not should_apply and apply_override is not True and not good_match:
+            # During nav a large unexplained shift means we may already be lost —
+            # hold the base instead of crawling on a disputed pose.
+            if nav_active and large_jump:
+                result["status"] = "nav_hold"
+                result["large_jump"] = True
+                LOGGER.warning(
+                    "periodic relocalize: large shift during nav with weak match "
+                    "(%.2f m / %.1f deg score=%.2f ray_mae=%s prior=%s); holding",
+                    0.0 if math.isinf(shift_m) else shift_m,
+                    0.0 if math.isinf(shift_deg) else shift_deg,
+                    score,
+                    ray_mae,
+                    prior_score,
+                )
+                return self._publish_relocalize_check(result)
             result["status"] = "low_quality"
             LOGGER.warning(
                 "periodic relocalize: no trusted match after %s "
@@ -1063,12 +1139,13 @@ class SlamService(SLAM):
                 result["corrected"] = False
                 LOGGER.info(
                     "periodic relocalize: large jump %.2f m / %.1f deg awaiting "
-                    "confirm %d/%d (score=%.2f)",
+                    "confirm %d/%d (score=%.2f prior=%s)",
                     decision.shift_m,
                     decision.shift_deg,
                     decision.confirm_count,
                     decision.confirm_needed,
                     score,
+                    prior_score,
                 )
                 return self._publish_relocalize_check(result)
             await self.do_command(
@@ -2318,6 +2395,24 @@ class SlamService(SLAM):
                 fallback_used = True
         resolved_full_map = full_map or fallback_used
 
+        prior_score = None
+        prior_ray_mae_m = None
+        if hint is not None:
+            prior_score, prior_ray_mae_m = await loop.run_in_executor(
+                None,
+                lambda: score_pose_with_rays(
+                    occ_map,
+                    scan,
+                    hint,
+                    max_scan_points=int(command.get("max_scan_points", 240)),
+                    min_in_map_points=int(command.get("min_in_map_points", 40)),
+                    min_in_map_ratio=float(command.get("min_in_map_ratio", 0.35)),
+                    hit_radius_cells=int(command.get("hit_radius_cells", 2)),
+                    ray_refine_beams=int(command.get("ray_refine_beams", 64)),
+                    ray_step_m=float(command.get("ray_step_m", 0.08)),
+                ),
+            )
+
         if apply_pose:
             await loop.run_in_executor(
                 None,
@@ -2328,7 +2423,7 @@ class SlamService(SLAM):
                 ),
             )
 
-        return {
+        out: dict = {
             "status": "localized" if apply_pose else "matched",
             "pose": {
                 "x": result.pose.x,
@@ -2346,6 +2441,10 @@ class SlamService(SLAM):
             "full_map": resolved_full_map,
             "fallback_used": fallback_used,
         }
+        if prior_score is not None:
+            out["prior_score"] = prior_score
+            out["prior_ray_mae_m"] = prior_ray_mae_m
+        return out
 
     async def _resolve_relocalize_seed(
         self, command: Mapping[str, ValueTypes]

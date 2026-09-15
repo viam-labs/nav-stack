@@ -150,11 +150,51 @@ class PoseJumpGate:
 
 
 def should_hold_drive_for_pose_jump(check: Optional[object]) -> bool:
-    """True when a published localization/revisit check is awaiting jump confirm.
+    """True when nav must stop for a localization jump / uncertainty hold.
 
-    Nav must stop while a large correction is gated — continuing on the old
-    pose with forward + turn is how robots plow into nearby obstacles.
+    Holds for:
+    - ``awaiting_confirm`` — large jump gated until N agreeing matches
+    - ``nav_hold`` — large shift during nav where the previous pose does not
+      clearly still explain the scan (lost / uncertain; do not keep driving)
     """
     if not isinstance(check, dict):
         return False
-    return str(check.get("status") or "") == "awaiting_confirm"
+    return str(check.get("status") or "") in ("awaiting_confirm", "nav_hold")
+
+
+def candidate_beats_previous(
+    *,
+    previous_score: float,
+    candidate_score: float,
+    shift_m: float,
+    shift_deg: float,
+    previous_ray_mae_m: Optional[float] = None,
+    candidate_ray_mae_m: Optional[float] = None,
+) -> bool:
+    """True if the jumped pose is a clear win over staying put.
+
+    Large jumps need a stronger score margin (same idea as tick ``refine_pose``)
+    so a weak secondary peak cannot yank the robot metres away while the scan
+    still fits the previous pose.
+    """
+    if not math.isfinite(candidate_score):
+        return False
+    if not math.isfinite(previous_score):
+        return True
+    dyaw_rad = math.radians(abs(float(shift_deg)))
+    # Mild bar: base + distance + yaw. A 7 m false peak must beat previous by ~0.8.
+    need = 0.06 + 0.10 * max(0.0, float(shift_m)) + 0.08 * (
+        dyaw_rad / (math.pi / 4.0)
+    )
+    if candidate_score < previous_score + need:
+        return False
+    # Prefer previous when its ray alignment is clearly better.
+    if (
+        previous_ray_mae_m is not None
+        and candidate_ray_mae_m is not None
+        and math.isfinite(previous_ray_mae_m)
+        and math.isfinite(candidate_ray_mae_m)
+        and previous_ray_mae_m + 0.15 < candidate_ray_mae_m
+    ):
+        return False
+    return True

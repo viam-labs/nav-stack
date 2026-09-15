@@ -75,7 +75,8 @@ def _sync_slam_pose_provider(slam_service_name: str):
 
 
 def _localization_hold_provider(slam_service_name: str):
-    """Stop nav while SLAM is awaiting confirm on a large pose jump."""
+    """Stop nav while SLAM awaits confirm on a large pose jump, or holds on
+    uncertain large shifts during navigation (``nav_hold``)."""
     from ..nav.pose_jump_gate import should_hold_drive_for_pose_jump
 
     def _get():

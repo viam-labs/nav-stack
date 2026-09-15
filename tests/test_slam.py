@@ -828,6 +828,70 @@ def test_periodic_relocalize_cycle_low_quality_no_correction():
     slam.do_command.assert_not_awaited()
 
 
+def test_periodic_relocalize_keeps_previous_when_scan_still_fits():
+    """Large weak peak during nav must not yank pose if prior still matches."""
+    slam = _relocalize_slam(periodic_relocalize_min_score=0.5)
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.43,
+            "ray_mae_m": 1.44,
+            "pose": {"x": 7.7, "y": 0.0, "theta": 0.0},
+            "prior_score": 0.55,
+            "prior_ray_mae_m": 0.40,
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "previous_better"
+    assert result["prefer_previous"] is True
+    assert result["shift_m"] == pytest.approx(7.7)
+    slam.do_command.assert_not_awaited()
+    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+
+    assert not should_hold_drive_for_pose_jump(result)
+
+
+def test_periodic_relocalize_holds_nav_on_large_uncertain_shift():
+    """Lost during nav: large shift, weak match, prior also bad → hold base."""
+    slam = _relocalize_slam(periodic_relocalize_min_score=0.5)
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        side_effect=[
+            {
+                "status": "matched",
+                "score": 0.2,
+                "ray_mae_m": 1.5,
+                "pose": {"x": 7.7, "y": 0.0, "theta": 0.0},
+                "prior_score": 0.15,
+                "prior_ray_mae_m": 1.6,
+            },
+            {
+                "status": "matched",
+                "score": 0.22,
+                "ray_mae_m": 1.4,
+                "pose": {"x": 7.7, "y": 0.0, "theta": 0.0},
+                "prior_score": 0.15,
+                "prior_ray_mae_m": 1.6,
+            },
+        ]
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "nav_hold"
+    assert result["navigation_active"] is True
+    assert result["large_jump"] is True
+    slam.do_command.assert_not_awaited()
+    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+
+    assert should_hold_drive_for_pose_jump(result)
+
+
 def test_periodic_relocalize_cycle_escalates_full_map_on_low_quality():
     slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
 
@@ -926,7 +990,7 @@ def test_periodic_relocalize_cycle_recovery_applies_high_ray_mae():
 
 def test_periodic_relocalize_cycle_recovery_floor_blocks_garbage():
     # A full-map recovery match whose score is below the recovery floor is genuine
-    # garbage and must not be applied.
+    # garbage and must not be applied. During nav a large weak shift also holds.
     slam = _relocalize_slam(
         periodic_relocalize_recovery_min_score=0.45,
         periodic_relocalize_nav_recoveries_threshold=2,
@@ -942,15 +1006,20 @@ def test_periodic_relocalize_cycle_recovery_floor_blocks_garbage():
             "score": 0.3,
             "ray_mae_m": 1.4,
             "pose": {"x": 5.0, "y": 0.0, "theta": 0.0},
+            "prior_score": 0.2,
+            "prior_ray_mae_m": 1.5,
         }
     )
     slam.do_command = AsyncMock()
 
     result = asyncio.run(slam._periodic_relocalize_cycle())
 
-    assert result["status"] == "low_quality"
+    assert result["status"] == "nav_hold"
     assert result["recovery_apply"] is False
     slam.do_command.assert_not_awaited()
+    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+
+    assert should_hold_drive_for_pose_jump(result)
 
 
 def test_periodic_relocalize_cycle_skips_during_navigation():
