@@ -731,6 +731,10 @@ class SlamConfig:
     periodic_relocalize_nav_recoveries_threshold: int = 2
     periodic_relocalize_full_map_on_low_quality: bool = True
     periodic_relocalize_during_navigation: bool = True
+    # Run global_localize / ray scoring in a dedicated subprocess so the
+    # matcher's Python loops do not hold this process's GIL (which starved the
+    # nav control tick and wheel-odom reads). Falls back in-process on error.
+    localize_subprocess: bool = True
     periodic_relocalize_options: Mapping = field(
         default_factory=lambda: {
             "full_map": False,
@@ -1196,6 +1200,7 @@ class SlamConfig:
             periodic_relocalize_during_navigation=bool(
                 d.get("periodic_relocalize_during_navigation", True)
             ),
+            localize_subprocess=bool(d.get("localize_subprocess", True)),
             periodic_relocalize_options=d.get(
                 "periodic_relocalize_options",
                 {
