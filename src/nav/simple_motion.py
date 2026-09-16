@@ -141,6 +141,51 @@ def corridor_min_range(
     return float(x[inside].min())
 
 
+def arc_clearance_m(
+    scan: conv.LaserScan2D,
+    *,
+    curvature_1_m: float,
+    half_width_m: float,
+    max_forward_m: float,
+) -> float:
+    """Travel distance along the *commanded arc* before the body sweeps a return.
+
+    A body-fixed forward cone measures the wrong thing while turning: rounding a
+    corridor corner, the wall ahead is not on the path the robot will actually
+    take, so cone-based slowing crawls with the route clear. Returns are tested
+    against the swept band of the commanded arc (a circle of radius
+    ``1/curvature``) and the result is the arc length to the nearest one;
+    ``inf`` when the arc is clear within ``max_forward_m``.
+    """
+    half = max(0.0, float(half_width_m))
+    reach = max(0.0, float(max_forward_m))
+    kappa = float(curvature_1_m)
+    if abs(kappa) < 1e-3:
+        return corridor_min_range(scan, half, reach)
+    pts = scan.to_points()
+    if pts.size == 0:
+        return math.inf
+    x = np.asarray(pts[:, 0], dtype=float)
+    y = np.asarray(pts[:, 1], dtype=float)
+    radius = 1.0 / kappa  # signed: positive turns left
+    r_abs = abs(radius)
+    # Arc centre sits at (0, radius) in the body frame; the robot starts at the
+    # origin. A return is swept only if it lands within the body-wide band.
+    offset = np.abs(np.hypot(x, y - radius) - r_abs)
+    swept = np.isfinite(offset) & (offset <= half)
+    if not swept.any():
+        return math.inf
+    start = math.atan2(-radius, 0.0)
+    angle = np.arctan2(y[swept] - radius, x[swept])
+    # Angle travelled in the direction of motion (CCW turning left).
+    delta = (angle - start) if radius > 0.0 else (start - angle)
+    arc = r_abs * np.mod(delta, 2.0 * math.pi)
+    ahead = arc[arc <= reach]
+    if ahead.size == 0:
+        return math.inf
+    return float(ahead.min())
+
+
 def forward_clearance_m(scan: conv.LaserScan2D, obs: ObstacleConfig) -> float:
     """Forward clearance = min(front cone, body-width corridor)."""
     half = float(obs.front_cone_half_rad)
@@ -223,7 +268,31 @@ def apply_obstacle_avoidance(
 
     if forward > obs.stop_distance_m:
         span = max(obs.slow_distance_m - obs.stop_distance_m, 1e-6)
-        scale = (forward - obs.stop_distance_m) / span
+        # Slow for what the commanded arc will actually reach. Measuring only
+        # straight ahead crawled us to ~⅓ speed against the outside wall of
+        # every corridor corner, with the planner reporting the route clear.
+        # Relaxation only: never closer than the stop bubble below.
+        measured = forward
+        if (
+            obs.footprint_half_width_m is not None
+            and obs.footprint_half_width_m > 0.0
+            and abs(cmd.vtheta) > 1e-6
+        ):
+            measured = max(
+                forward,
+                min(
+                    arc_clearance_m(
+                        scan,
+                        curvature_1_m=cmd.vtheta / cmd.vx,
+                        half_width_m=float(obs.footprint_half_width_m),
+                        max_forward_m=float(obs.slow_distance_m),
+                    ),
+                    float(obs.slow_distance_m),
+                ),
+            )
+        scale = min(1.0, max(0.0, (measured - obs.stop_distance_m) / span))
+        if scale >= 1.0:
+            return cmd, "slow", forward
         # Scale vθ with vx so the turn *radius* is preserved. Scaling vx alone
         # tightens the arc as the robot slows (κ = vθ/vx), which is exactly the
         # sharp swerve-near-walls behaviour a slow-down is supposed to prevent.
