@@ -400,6 +400,79 @@ def test_compute_path_command_defers_local_planner_when_misaligned():
     assert cmd.vx == 0.0
     assert abs(cmd.vtheta) > 0.05
 
+    # Path-blocked recovery must still run DWA despite the large bearing —
+    # otherwise we spin in place forever while replans fail.
+    cmd2, progress2 = compute_path_command(
+        pose,
+        path,
+        cfg=FollowerConfig(),
+        local_view=view,
+        local_planner=LocalPlannerConfig(enabled=True, activate_cost_threshold=1),
+        robot_radius_m=0.08,
+        force_local_planner=True,
+    )
+    assert progress2.get("local_planner") is True
+
+
+def test_hard_stop_blocks_local_planner_into_stop_bubble():
+    """DWA must not translate forward through the reactive stop distance."""
+    from src.nav.simple_motion import ObstacleConfig
+
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=3.0,
+            height_m=3.0,
+            resolution=0.05,
+            inflation_radius_m=0.05,
+            robot_radius_m=0.08,
+            use_global_static=False,
+        )
+    )
+    pose = Pose2D(1.0, 1.5, 0.0)
+    # Costmap: open path so DWA wants forward. Live scan: wall in stop bubble.
+    open_scan = conv.LaserScan2D(
+        np.full(72, 3.0),
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / 72,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(pose, open_scan)
+    n = 72
+    close = np.full(n, 3.0)
+    close[n // 2] = 0.35
+    live = conv.LaserScan2D(
+        close,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    path = Path2D(points=((1.0, 1.5), (2.5, 1.5)), goal_theta=0.0)
+    cfg = FollowerConfig(
+        obstacle=ObstacleConfig(
+            enabled=True, stop_distance_m=0.45, slow_distance_m=0.9
+        )
+    )
+    cmd, progress = compute_path_command(
+        pose,
+        path,
+        cfg=cfg,
+        scan=live,
+        local_view=view,
+        local_planner=LocalPlannerConfig(
+            enabled=True, activate_cost_threshold=250
+        ),
+        robot_radius_m=0.08,
+    )
+    assert cmd.vx <= 1e-9
+    if progress["obstacle"] == "avoid":
+        assert cmd.vx == 0.0
+    else:
+        # DWA may reverse out; it must not drive forward into the bubble.
+        assert progress["obstacle"] == "local_planner"
+        assert cmd.vx <= 0.0
+
 
 def test_compute_path_command_uses_local_planner_when_blocked():
     lc = LocalCostmap(

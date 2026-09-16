@@ -11,6 +11,7 @@ from ..nav.simple_motion import (
     SimpleMotionConfig,
     apply_obstacle_avoidance,
     apply_velocity_floor,
+    cone_min_range,
     distance_m,
     forward_clearance_m,
     heading_error_rad,
@@ -472,12 +473,16 @@ def compute_path_command(
     prev_local_cmd: Optional[DriveCommand] = None,
     rotate_active: bool = False,
     prev_cmd: Optional[DriveCommand] = None,
+    force_local_planner: bool = False,
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``.
 
     ``rotate_active`` is the rotate-to-heading state from the previous tick
     (``progress["rotate_to_heading"]``); feed it back for hysteresis.
     ``prev_cmd`` is the last command actually issued (curvature smoothing).
+    ``force_local_planner`` lets DWA run with a large bearing error when the
+    path is locally blocked — otherwise rotate-in-place spins forever while
+    replans fail and the detour never starts.
     """
     est_speed = cfg.motion.max_linear_mps * 0.5 if speed_mps is None else speed_mps
     goal_xy = Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
@@ -504,11 +509,12 @@ def compute_path_command(
     rotating = False
 
     local_active = False
+    bearing_ok = abs(bearing) <= cfg.rotate_in_place_rad or force_local_planner
     if (
         local_view is not None
         and local_planner is not None
         and not near_goal
-        and abs(bearing) <= cfg.rotate_in_place_rad
+        and bearing_ok
     ):
         local_cmd = compute_local_command(
             current,
@@ -520,7 +526,7 @@ def compute_path_command(
             robot_radius_m=robot_radius_m,
             min_cmd_vel_x=min_cmd_vel_x,
             min_cmd_vel_theta=min_cmd_vel_theta,
-            local_planner_active=local_planner_active,
+            local_planner_active=local_planner_active or force_local_planner,
             prev_cmd=prev_local_cmd if local_planner_active else None,
         )
         if local_cmd is not None:
@@ -570,6 +576,12 @@ def compute_path_command(
             cmd = apply_velocity_floor(keep_arc_drivable(cmd, cfg), cfg.motion)
     elif local_active:
         obstacle_state = "local_planner"
+        if (
+            scan is not None
+            and cfg.obstacle is not None
+            and cfg.obstacle.enabled
+        ):
+            forward_clearance = forward_clearance_m(scan, cfg.obstacle)
     elif (
         cfg.obstacle is not None
         and cfg.obstacle.enabled
@@ -578,6 +590,30 @@ def compute_path_command(
     ):
         forward_clearance = forward_clearance_m(scan, cfg.obstacle)
         obstacle_state = "clear"
+
+    # Hard safety: never translate into the stop bubble — including during DWA.
+    if (
+        cfg.obstacle is not None
+        and cfg.obstacle.enabled
+        and scan is not None
+        and cmd.vx > 1e-6
+        and dist_goal > cfg.motion.xy_tolerance_m
+    ):
+        if not math.isfinite(forward_clearance):
+            forward_clearance = forward_clearance_m(scan, cfg.obstacle)
+        if forward_clearance <= cfg.obstacle.stop_distance_m:
+            left = cone_min_range(scan, 0.0, cfg.obstacle.side_cone_rad)
+            right = cone_min_range(scan, -cfg.obstacle.side_cone_rad, 0.0)
+            direction = 1.0 if left >= right else -1.0
+            if abs(bearing) >= math.radians(12.0):
+                prefer_left = bearing > 0.0
+                preferred = left if prefer_left else right
+                if preferred >= cfg.obstacle.stop_distance_m:
+                    direction = 1.0 if prefer_left else -1.0
+            cmd = DriveCommand(
+                0.0, 0.0, direction * cfg.motion.max_angular_rad_s, False
+            )
+            obstacle_state = "avoid"
 
     progress = {
         "waypoint_index": idx,
