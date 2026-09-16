@@ -212,6 +212,93 @@ def test_avoidance_slows_in_band():
     assert out.vtheta / out.vx == pytest.approx(cmd.vtheta / cmd.vx)
 
 
+def test_arc_clearance_ignores_wall_the_turn_curves_away_from():
+    """Corridor corner: wall ahead, tight turn — the arc misses it."""
+    from src.nav.simple_motion import arc_clearance_m
+
+    scan = _scan_with({0.0: 0.68})
+    straight = arc_clearance_m(
+        scan, curvature_1_m=0.0, half_width_m=0.28, max_forward_m=1.0
+    )
+    assert straight == pytest.approx(0.68, abs=0.02)
+    # Turning left on a ~0.43 m radius (the robot's own commanded arc).
+    turning = arc_clearance_m(
+        scan, curvature_1_m=1.0 / 0.43, half_width_m=0.28, max_forward_m=1.0
+    )
+    assert math.isinf(turning)
+    # A gentle turn still drives into the same wall.
+    gentle = arc_clearance_m(
+        scan, curvature_1_m=1.0 / 3.0, half_width_m=0.28, max_forward_m=1.0
+    )
+    assert gentle == pytest.approx(0.68, abs=0.05)
+
+
+def test_avoidance_does_not_crawl_when_arc_clears_corner_wall():
+    """The reported stall: 0.68 m to the corner wall throttled us to ~⅓ speed."""
+    obs = ObstacleConfig(
+        stop_distance_m=0.5, slow_distance_m=1.0, footprint_half_width_m=0.28
+    )
+    scan = _scan_with({0.0: 0.68})
+    # Tight left turn (κ ≈ 2.3 /m) rounding the corner.
+    cmd = DriveCommand(0.25, 0.0, 0.58, False)
+    out, state, clr = apply_obstacle_avoidance(
+        cmd, scan, obs, max_angular_rad_s=1.0
+    )
+    assert out.vx == pytest.approx(cmd.vx)
+    assert clr == pytest.approx(0.68, abs=0.02)
+    assert state == "slow"  # still reported as near something
+
+    # Heading straight at the same wall must still slow down.
+    ahead = DriveCommand(0.25, 0.0, 0.0, False)
+    out2, state2, _ = apply_obstacle_avoidance(
+        ahead, scan, obs, max_angular_rad_s=1.0
+    )
+    assert state2 == "slow"
+    assert out2.vx < ahead.vx
+
+
+def test_avoidance_slows_for_dead_end_but_not_for_corner():
+    """Same 0.68 m reading: a corner the arc clears must not throttle; a wall
+    spanning the front must slow exactly as before."""
+    obs = ObstacleConfig(
+        stop_distance_m=0.5, slow_distance_m=1.0, footprint_half_width_m=0.28
+    )
+
+    def _wall(span_deg: int) -> conv.LaserScan2D:
+        """Flat wall 0.68 m ahead, spanning ±``span_deg``."""
+        return _scan_with(
+            {
+                math.radians(deg): 0.68 / math.cos(math.radians(deg))
+                for deg in range(-span_deg, span_deg + 1, 2)
+            }
+        )
+
+    cmd = DriveCommand(0.25, 0.0, 0.58, False)  # tight left turn, κ ≈ 2.3 /m
+    corner, _s1, _c1 = apply_obstacle_avoidance(
+        cmd, _wall(12), obs, max_angular_rad_s=1.0
+    )
+    assert corner.vx == pytest.approx(cmd.vx)
+
+    dead_end, _s2, _c2 = apply_obstacle_avoidance(
+        cmd, _wall(60), obs, max_angular_rad_s=1.0
+    )
+    # Unchanged behaviour: scale = (0.68 - 0.5) / (1.0 - 0.5).
+    assert dead_end.vx == pytest.approx(cmd.vx * 0.36, abs=0.01)
+    assert dead_end.vtheta / dead_end.vx == pytest.approx(cmd.vtheta / cmd.vx)
+
+
+def test_avoidance_stop_bubble_unchanged_by_arc_relaxation():
+    """Inside stop_distance still stops and turns, however the arc curves."""
+    obs = ObstacleConfig(
+        stop_distance_m=0.5, slow_distance_m=1.0, footprint_half_width_m=0.28
+    )
+    scan = _scan_with({0.0: 0.35})
+    cmd = DriveCommand(0.25, 0.0, 0.58, False)
+    out, state, _ = apply_obstacle_avoidance(cmd, scan, obs, max_angular_rad_s=1.0)
+    assert state == "avoid"
+    assert out.vx == 0.0
+
+
 def test_velocity_floor_skips_angular_when_translating():
     from src.nav.simple_motion import apply_velocity_floor
 
