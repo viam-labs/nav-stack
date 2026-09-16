@@ -76,6 +76,7 @@ class NavSupervisor:
         local_planner_enabled: bool = True,
         local_planner_sim_time_s: float = 1.2,
         local_planner_activate_cost: int = 200,
+        local_planner_max_vel_x_mps: float = 0.25,
         local_planner_max_vel_x_reverse_m: float = 0.15,
         backup_enabled: bool = True,
         backup_stuck_time_s: float = 3.0,
@@ -86,7 +87,7 @@ class NavSupervisor:
         backup_cooldown_s: float = 4.0,
         recovery_wait_duration_s: float = 2.0,
         replan_local_blocked_time_s: float = 0.3,
-        replan_local_min_period_s: float = 0.5,
+        replan_local_min_period_s: float = 4.0,
         drive_timeout_streak: int = 20,
         yaw_align_timeout_s: float = 6.0,
         max_goal_snap_m: float = 0.5,
@@ -110,6 +111,7 @@ class NavSupervisor:
             enabled=local_planner_enabled,
             sim_time_s=local_planner_sim_time_s,
             activate_cost_threshold=local_planner_activate_cost,
+            max_detour_forward_mps=local_planner_max_vel_x_mps,
             max_vel_x_reverse_m=local_planner_max_vel_x_reverse_m,
         )
         self._backup_enabled = backup_enabled
@@ -121,7 +123,9 @@ class NavSupervisor:
         self._backup_cooldown_s = backup_cooldown_s
         self._recovery_wait_duration_s = max(0.0, float(recovery_wait_duration_s))
         self._replan_local_blocked_time_s = max(0.0, float(replan_local_blocked_time_s))
-        self._replan_local_min_period_s = replan_local_min_period_s
+        self._replan_local_min_period_s = max(
+            1.0, float(replan_local_min_period_s)
+        )
         self._local_planner_activate_cost = local_planner_activate_cost
         self._local_costmap = (
             LocalCostmap(
@@ -439,6 +443,18 @@ class NavSupervisor:
         the previous cmd_vel running for that whole window is what made the
         robot plow into a live obstacle and only *then* get a new path.
         """
+        # Keep status consistent with the command actually sent while planning.
+        # Previously progress kept advertising the prior 0.5 m/s command while
+        # last_drive correctly showed zero, which hid stop/replan churn.
+        with self._status_lock:
+            progress = dict(self._status.progress or {})
+            progress.update(
+                obstacle="planning",
+                local_planner=False,
+                cmd_vx_mps=0.0,
+                cmd_vtheta_rad_s=0.0,
+            )
+            self._status.progress = progress
         try:
             self._world.set_velocity(0.0, 0.0, 0.0)
         except Exception:  # noqa: BLE001 - never skip replan because stop failed
@@ -875,12 +891,10 @@ class NavSupervisor:
                     local_blocked = True
                     if local_blocked_since is None:
                         local_blocked_since = reactive_avoid_since
-                # Nav2 Wait analogue: hold translation so a transient mover can
-                # clear. Skip the wait when the nose is already clear — a bin on
-                # Static vs moving: nose_clear ⇒ obstacle is off the bumper
-                # (box on the route, wall clutter) — replan/detour immediately.
-                # Nose blocked ⇒ likely a mover (person); pause briefly so they
-                # can clear, then replan if they stay.
+                # Front-vs-side policy (not motion classification): a clear nose
+                # means the blocking cost is beside/farther along the path, so
+                # replan/peel now. A blocked nose gets a brief wait (useful for
+                # people crossing), then replans if it stays occupied.
                 wait_before_replan_s = max(
                     self._recovery_wait_duration_s,
                     self._replan_local_blocked_time_s,
@@ -905,10 +919,7 @@ class NavSupervisor:
                         and not nose_clear
                     ):
                         waiting_for_clear = True
-                    elif (
-                        now - last_local_replan_at
-                        >= self._replan_local_min_period_s
-                    ):
+                    elif now - last_local_replan_at >= self._replan_local_min_period_s:
                         # Stop only long enough to plan. Paint + forced-via
                         # kick in so we do not keep accepting the same corridor.
                         self._stop_before_replan()
@@ -921,8 +932,12 @@ class NavSupervisor:
                             require_different=failed_replan_while_blocked < 3,
                             local_view=local_view,
                         )
-                        last_local_replan_at = now
-                        last_replan = now
+                        # Start cooldown when planning *finishes*. Planning can
+                        # take >2 s; stamping its start with a 0.5 s cooldown
+                        # made the next control tick replan again immediately.
+                        replan_finished = time.monotonic()
+                        last_local_replan_at = replan_finished
+                        last_replan = replan_finished
                         if new_path is not None:
                             path = new_path
                             local_blocked_since = None
@@ -932,6 +947,10 @@ class NavSupervisor:
                             spin_stuck_since = None
                             reactive_avoid_since = None
                             last_obstacle_state = ""
+                            prev_local_cmd = None
+                            local_planner_active = False
+                            prev_cmd = None
+                            rotate_active = False
                         else:
                             failed_replan_while_blocked += 1
                 else:
@@ -990,6 +1009,14 @@ class NavSupervisor:
                     "failed_replan_while_blocked": int(failed_replan_while_blocked),
                     "last_replan_error": self._last_replan_error,
                     "nose_clear": bool(nose_clear),
+                    "local_replan_cooldown_s": round(
+                        max(
+                            0.0,
+                            self._replan_local_min_period_s
+                            - (time.monotonic() - last_local_replan_at),
+                        ),
+                        2,
+                    ),
                     "distance_remaining_m": distance_m(pose, goal),
                 }
 
@@ -1071,9 +1098,11 @@ class NavSupervisor:
                             failed_count=failed_replan_while_blocked,
                             local_view=local_view,
                         )
+                        replan_finished = time.monotonic()
+                        last_local_replan_at = replan_finished
+                        last_replan = replan_finished
                         if new_path is not None:
                             path = new_path
-                            last_replan = now
                             last_progress_at = now
                             local_blocked_since = None
                             failed_replan_while_blocked = 0
@@ -1213,9 +1242,11 @@ class NavSupervisor:
                         failed_count=failed_replan_while_blocked if local_blocked else 0,
                         local_view=local_view,
                     )
+                    replan_finished = time.monotonic()
+                    last_local_replan_at = replan_finished
+                    last_replan = replan_finished
                     if new_path is not None:
                         path = new_path
-                        last_replan = now
                         last_progress_at = now
                         local_blocked_since = None
                         failed_replan_while_blocked = 0
@@ -1226,7 +1257,6 @@ class NavSupervisor:
                         pending_loc_replan = False
                     elif static_blocked:
                         failed_static_replan += 1
-                        last_replan = now
                         clearance = progress.get("forward_clearance_m")
                         has_room = clearance is None or float(clearance) >= 0.35
                         obstacle = str(progress.get("obstacle") or "")
@@ -1250,7 +1280,7 @@ class NavSupervisor:
                             )
                             return
                     else:
-                        last_replan = now
+                        last_replan = time.monotonic()
 
                 self._set_status(
                     pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
@@ -1264,6 +1294,7 @@ class NavSupervisor:
                             "failed_replan_while_blocked",
                             "last_replan_error",
                             "nose_clear",
+                            "local_replan_cooldown_s",
                             "forward_clearance_m",
                             "cmd_vx_mps",
                             "cmd_vtheta_rad_s",
@@ -1326,7 +1357,7 @@ class NavSupervisor:
                     """Try replan (incl. forced via). True ⇒ caller should return."""
                     nonlocal path, last_progress_at, last_progress_dist
                     nonlocal last_progress_bearing, last_replan
-                    nonlocal local_blocked_since, backup_attempts
+                    nonlocal last_local_replan_at, local_blocked_since, backup_attempts
                     nonlocal failed_replan_while_blocked
                     self._stop_before_replan()
                     new_path = self._try_replan(
@@ -1337,12 +1368,14 @@ class NavSupervisor:
                         failed_count=max(2, failed_replan_while_blocked),
                         local_view=local_view,
                     )
+                    replan_finished = time.monotonic()
+                    last_local_replan_at = replan_finished
+                    last_replan = replan_finished
                     if new_path is not None:
                         path = new_path
                         last_progress_at = now
                         last_progress_dist = dist_goal
                         last_progress_bearing = bearing_err
-                        last_replan = now
                         local_blocked_since = None
                         failed_replan_while_blocked = 0
                         backup_attempts = 0

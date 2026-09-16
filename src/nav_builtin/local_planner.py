@@ -36,6 +36,9 @@ class LocalPlannerConfig:
     obstacle_weight: float = 3.0
     # Reverse samples (~0.15 m/s) so DWA can back out of nose-first blocks.
     max_vel_x_reverse_m: float = 0.15
+    # A local detour runs beside a live obstacle and should never use global
+    # cruise speed. This also gives the rolling map time to update smoothly.
+    max_detour_forward_mps: float = 0.25
     reverse_speed_weight: float = 0.85
     spin_penalty: float = 1.0  # prefer translate (incl. reverse) over rotate-only
     # Prefer continuity with the previous DWA command so vθ doesn't flip each tick.
@@ -560,6 +563,11 @@ def compute_local_command(
         min(float(cfg.collision_margin_m), float(robot_radius_m)),
     )
     max_reverse = min(float(cfg.max_vel_x_reverse_m), float(max_vel_x))
+    forward_max = (
+        max(0.0, min(float(max_vel_x), float(cfg.max_detour_forward_mps)))
+        if path_blocked_ahead
+        else float(max_vel_x)
+    )
     best: Optional[Tuple[float, float, float]] = None
     n_vx = max(3, int(cfg.vx_samples))
     n_vt = max(3, int(cfg.vtheta_samples))
@@ -614,7 +622,7 @@ def compute_local_command(
         if n_vx == 1:
             vx = 0.0
         else:
-            vx = -max_reverse + (max_vel_x + max_reverse) * i / (n_vx - 1)
+            vx = -max_reverse + (forward_max + max_reverse) * i / (n_vx - 1)
         # When the path ahead is blocked, still allow shallow reverse to unstick;
         # deep reverse is for backup recovery, not DWA.
         if path_blocked_ahead and vx < -0.08:
@@ -748,7 +756,7 @@ def compute_local_command(
         if abs(turn) > math.radians(8.0):
             direction = 1.0 if turn >= 0.0 else -1.0
             vtheta = direction * max(0.4, min(max_vel_theta * 0.55, abs(turn) * 1.2))
-            vx = min(vx, 0.18)
+            vx = min(vx, min(0.18, float(cfg.max_detour_forward_mps)))
     cmd = DriveCommand(vx, 0.0, vtheta, False)
     from ..nav.simple_motion import SimpleMotionConfig
 

@@ -79,20 +79,19 @@ def mark_local_costmap_on_occupancy(
     occ: OccupancyGrid,
     view,
     *,
-    cost_threshold: int = 253,
+    occupied_threshold: int = 50,
     radius_m: float = 0.08,
     max_points: int = 400,
 ) -> OccupancyGrid:
-    """Paint local-costmap obstacles onto the global occupancy for replanning.
+    """Paint novel raw local scan hits onto global occupancy for replanning.
 
     Scan-only marking can miss the blob that already tripped ``path_cost_ahead``
-    (timing, beam gaps, novel-hit filter). The local view is the ground truth
-    the controller is reacting to — copy its high-cost cells so the global
-    planner must leave that corridor.
+    (timing or a cached local view). Do not copy ``view.costs``: that layer also
+    contains the already-inflated global map, and painting it as raw occupancy
+    inflates static walls a second time and can falsely block the goal.
     """
-    costs = view.costs
-    h, w = costs.shape
-    ys, xs = np.nonzero(costs >= int(cost_threshold))
+    raw = np.asarray(view.occ.grid)
+    ys, xs = np.nonzero(raw >= int(occupied_threshold))
     if ys.size == 0:
         return occ
     if ys.size > max_points:
@@ -102,8 +101,20 @@ def mark_local_costmap_on_occupancy(
     res = float(view.occ.resolution)
     wx = view.origin_x + (xs.astype(np.float64) + 0.5) * res
     wy = view.origin_y + (ys.astype(np.float64) + 0.5) * res
+    # Lidar returns from mapped walls are not dynamic obstacles. The static
+    # occupancy is already present and will be inflated exactly once below.
+    novel: list[tuple[float, float]] = []
+    for x, y in zip(wx, wy):
+        row, col = occ.world_to_cell(float(x), float(y))
+        if not occ.in_bounds(row, col):
+            continue
+        if int(occ.grid[row, col]) >= int(occupied_threshold):
+            continue
+        novel.append((float(x), float(y)))
+    if not novel:
+        return occ
     return mark_points_on_occupancy(
-        occ, np.column_stack([wx, wy]), radius_m=radius_m
+        occ, np.asarray(novel, dtype=np.float64), radius_m=radius_m
     )
 
 
@@ -118,6 +129,7 @@ def mark_path_block_from_local(
     radius_m: float = 0.25,
     lookahead_m: float = 1.5,
     start_offset_m: float = 0.3,
+    end_offset_m: float = 0.45,
     sample_step_m: float = 0.08,
 ) -> OccupancyGrid:
     """Seal path samples that the local costmap already flags as blocked.
@@ -142,7 +154,12 @@ def mark_path_block_from_local(
         seg_lens.append(length)
         cum.append(cum[-1] + length)
     total = cum[-1]
-    target = min(total, along + max(float(lookahead_m), sample_step_m))
+    target = min(
+        max(0.0, total - max(0.0, float(end_offset_m))),
+        along + max(float(lookahead_m), sample_step_m),
+    )
+    if target < along:
+        return occ
     step = max(float(sample_step_m), occ.resolution * 0.5)
     blocked_pts: list[tuple[float, float]] = []
     d = max(0.0, along)
@@ -209,6 +226,7 @@ def mark_path_ahead_on_occupancy(
     lookahead_m: float = 2.5,
     sample_step_m: float = 0.08,
     start_offset_m: float = 0.0,
+    end_offset_m: float = 0.45,
 ) -> OccupancyGrid:
     """Mark the current route segment ahead of the robot so replans must detour.
 
@@ -230,7 +248,12 @@ def mark_path_ahead_on_occupancy(
         seg_lens.append(length)
         cum.append(cum[-1] + length)
     total = cum[-1]
-    target_end = min(total, along + max(float(lookahead_m), sample_step_m))
+    target_end = min(
+        max(0.0, total - max(0.0, float(end_offset_m))),
+        along + max(float(lookahead_m), sample_step_m),
+    )
+    if target_end < along:
+        return occ
     samples: list[tuple[float, float]] = []
     step = max(float(sample_step_m), occ.resolution * 0.5)
     d = max(0.0, along)

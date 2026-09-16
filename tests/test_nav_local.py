@@ -501,7 +501,77 @@ def test_local_planner_does_not_charge_blocked_corridor():
         robot_radius_m=0.32,
     )
     assert cmd is not None
+    assert cmd.vx <= cfg.max_detour_forward_mps + 1e-9
     assert not (cmd.vx >= 0.35 and abs(cmd.vtheta) < 0.05), f"charged: {cmd}"
+
+
+def test_local_replan_paints_raw_hits_not_merged_static_inflation():
+    """Do not turn an already-inflated mapped wall into new occupancy."""
+    from src.nav_builtin.costmap import mark_local_costmap_on_occupancy
+    from src.nav_builtin.local_costmap import LocalCostmapView
+
+    grid = np.zeros((40, 40), dtype=np.int16)
+    grid[20, 20] = 100
+    occ = OccupancyGrid(
+        grid=grid,
+        resolution=0.05,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    raw = np.zeros_like(grid)
+    raw[20, 20] = 100  # lidar return from the mapped wall: skip
+    raw[20, 28] = 100  # novel box in mapped-free space: retain
+    local_occ = OccupancyGrid(
+        grid=raw,
+        resolution=0.05,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    merged_costs = np.zeros_like(grid, dtype=np.uint8)
+    merged_costs[15:26, 15:26] = 253  # projected static inflation
+    merged_costs[20, 28] = 253
+    view = LocalCostmapView(
+        costs=merged_costs,
+        occ=local_occ,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+
+    marked = mark_local_costmap_on_occupancy(occ, view, radius_m=0.05)
+    # Static inflation was not copied as a large raw obstacle.
+    assert np.count_nonzero(marked.grid[15:26, 15:26]) == 1
+    # The novel raw hit was copied.
+    assert marked.grid[20, 28] == 100
+
+
+def test_corridor_paint_preserves_requested_goal():
+    """A short remaining route must keep paint/inflation away from its goal."""
+    from src.nav_builtin.planner import plan_path
+
+    m = _empty_map(size=80, resolution=0.05)
+    start = Pose2D(0.5, 2.0, 0.0)
+    goal = Pose2D(2.5, 2.0, 0.0)
+    base = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+    )
+    assert base.feasible
+    detour = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        blocked_path=base.path,
+        blocked_path_pose=start,
+        paint_corridor=True,
+    )
+    assert detour.feasible, detour.error_msg
+    end_x, end_y = detour.path.points[-1]
+    assert math.hypot(end_x - goal.x, end_y - goal.y) < 0.1
 
 
 def test_plan_seals_blocked_path_samples_from_local():
