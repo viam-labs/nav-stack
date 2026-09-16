@@ -89,6 +89,7 @@ class NavSupervisor:
         replan_local_min_period_s: float = 0.5,
         drive_timeout_streak: int = 20,
         yaw_align_timeout_s: float = 6.0,
+        max_goal_snap_m: float = 0.5,
     ):
         self._world = world
         self._inflation = inflation_radius_m
@@ -96,6 +97,7 @@ class NavSupervisor:
         self._cost_scaling = cost_scaling_factor
         self._clearance_preference_m = max(0.0, float(clearance_preference_m))
         self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
+        self._max_goal_snap_m = max(0.0, float(max_goal_snap_m))
         self._algorithm = algorithm
         self._replan_period = replan_period_s
         self._timeout_s = timeout_s
@@ -327,6 +329,21 @@ class NavSupervisor:
             target=_job, name="nav-global-costmap", daemon=True
         ).start()
 
+    def _xy_at_nav_goal(self, pose: Pose2D, goal: Pose2D, path: Path2D) -> bool:
+        """True when XY is close enough to the *requested* goal (not a far snap)."""
+        xy_tol = self._follower.motion.xy_tolerance_m
+        if distance_m(pose, goal) <= xy_tol:
+            return True
+        if not path.points:
+            return False
+        end = Pose2D(path.points[-1][0], path.points[-1][1], goal.theta)
+        # Path may end on a small free-cell snap; accept that only when the snap
+        # itself stayed near the requested goal.
+        return (
+            distance_m(end, goal) <= self._max_goal_snap_m
+            and distance_m(pose, end) <= xy_tol
+        )
+
     def _set_status(self, **kwargs) -> None:
         with self._status_lock:
             for k, v in kwargs.items():
@@ -365,6 +382,7 @@ class NavSupervisor:
             blocked_path=blocked_path,
             blocked_path_pose=blocked_path_pose,
             dynamic_obstacle_radius_m=max(0.05, min(self._robot_radius, 0.12)),
+            max_goal_snap_m=self._max_goal_snap_m,
         )
         if result.feasible:
             result = connect_plan_start(
@@ -533,13 +551,13 @@ class NavSupervisor:
                     pending_loc_replan = True
                 was_loc_holding = holding_for_localize
 
-                # Goal reached?
-                goal_pose = Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta)
-                dist_goal_chk = distance_m(pose, goal_pose)
+                # Goal reached? Use the *requested* goal — path[-1] can be a
+                # free-cell snap that used to let us "succeed" a metre away.
+                dist_goal_chk = distance_m(pose, goal)
                 xy_tol = self._follower.motion.xy_tolerance_m
-                xy_ok = dist_goal_chk <= xy_tol
+                xy_ok = self._xy_at_nav_goal(pose, goal, path)
                 yaw_ok = (
-                    abs(conv.normalize_angle(pose.theta - goal_pose.theta))
+                    abs(conv.normalize_angle(pose.theta - goal.theta))
                     <= self._follower.motion.yaw_tolerance_rad
                 )
                 now = time.monotonic()
@@ -802,6 +820,7 @@ class NavSupervisor:
                     "path_cost_ahead": int(path_ahead_cost),
                     "failed_replan_while_blocked": int(failed_replan_while_blocked),
                     "nose_clear": bool(nose_clear),
+                    "distance_remaining_m": distance_m(pose, goal),
                 }
 
                 if waiting_for_clear:
@@ -824,10 +843,7 @@ class NavSupervisor:
                     }
                     last_progress_at = now
                     last_progress_pose = pose
-                    last_progress_dist = distance_m(
-                        pose,
-                        Pose2D(path.points[-1][0], path.points[-1][1], path.goal_theta),
-                    ) if path.points else last_progress_dist
+                    last_progress_dist = distance_m(pose, goal)
                     last_progress_bearing = float("inf")
 
                 allow_backup = (
@@ -1090,13 +1106,8 @@ class NavSupervisor:
                     continue
 
                 if cmd.done:
-                    goal_pose = Pose2D(
-                        path.points[-1][0], path.points[-1][1], path.goal_theta
-                    )
-                    at_goal = (
-                        distance_m(pose, goal_pose)
-                        <= self._follower.motion.xy_tolerance_m
-                        and abs(conv.normalize_angle(pose.theta - goal_pose.theta))
+                    at_goal = self._xy_at_nav_goal(pose, goal, path) and (
+                        abs(conv.normalize_angle(pose.theta - goal.theta))
                         <= self._follower.motion.yaw_tolerance_rad
                     )
                     if at_goal:
@@ -1108,12 +1119,10 @@ class NavSupervisor:
                 # Pure spin with no bearing improvement must not reset the timer
                 # forever (stuck local-planner / RIP loops need to replan). But
                 # intentional align spins that shrink |bearing| are real progress.
-                goal_pose_stall = Pose2D(
-                    path.points[-1][0], path.points[-1][1], path.goal_theta
-                )
-                dist_goal = distance_m(pose, goal_pose_stall)
+                dist_goal = distance_m(pose, goal)
                 near_goal_stall = (
                     dist_goal <= self._follower.motion.xy_tolerance_m * 2.0
+                    or self._xy_at_nav_goal(pose, goal, path)
                 )
                 # Near goal, tiny crawls are real progress — don't require 0.05 m/s.
                 translating_floor = 0.03 if near_goal_stall else 0.05

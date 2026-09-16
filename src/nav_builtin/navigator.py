@@ -63,6 +63,7 @@ class BuiltinNavigator:
         replan_local_min_period_s: float = 0.5,
         drive_timeout_streak: int = 20,
         yaw_align_timeout_s: float = 6.0,
+        max_goal_snap_m: float = 0.5,
         logger=None,
     ):
         self._world = world
@@ -115,6 +116,7 @@ class BuiltinNavigator:
             replan_local_min_period_s=replan_local_min_period_s,
             drive_timeout_streak=drive_timeout_streak,
             yaw_align_timeout_s=yaw_align_timeout_s,
+            max_goal_snap_m=max_goal_snap_m,
         )
         self._lock = threading.Lock()
         self._worker: Optional[threading.Thread] = None

@@ -24,7 +24,7 @@ class LocalPlannerConfig:
     # centerline). Live hits are inflated by exactly robot_radius, so a
     # centerline-only check had zero margin: an obstacle 1 cm outside the
     # footprint read as free, and any pose error became a collision.
-    path_clearance_margin_m: float = 0.10
+    path_clearance_margin_m: float = 0.18
     path_weight: float = 2.0
     goal_weight: float = 1.0
     speed_weight: float = 0.5

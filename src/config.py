@@ -403,7 +403,7 @@ class BuiltinNavConfig:
     # hunt below ~1.1 m on skid-steer, so defaults sit a bit longer.
     lookahead_m: float = 1.35
     min_lookahead_m: float = 1.1
-    max_lookahead_m: float = 1.8
+    max_lookahead_m: float = 1.55
     replan_period_s: float = 1.0
     timeout_s: float = 300.0
     # Base.SetVelocity wait on the shared module event loop. Mapping+SLAM can
@@ -413,12 +413,15 @@ class BuiltinNavConfig:
     drive_timeout_streak: int = 20
     cost_scaling_factor: float = 4.0
     # Extra planning clearance past inflation_radius (not drawn as soft inflation).
-    clearance_preference_m: float = 0.35
+    clearance_preference_m: float = 0.50
     xy_goal_tolerance: float = 0.25  # meters
     yaw_goal_tolerance: float = 0.35  # radians (~20 deg; mugger uses 0.6)
     # After XY is inside tolerance, accept the goal if final yaw still has not
     # settled (noisy heading / goal θ far from approach). 0 disables.
     yaw_align_timeout_s: float = 6.0
+    # Reject plans whose free-cell goal snap exceeds this (metres). Live scan
+    # inflation used to snap the goal ~1 m away and then "succeed" there.
+    max_goal_snap_m: float = 0.5
     # Final approach: cap linear speed within this distance of the goal.
     approach_dist_m: float = 0.35
     # Post-process global plans (shortcut + resample) before following.
@@ -430,7 +433,7 @@ class BuiltinNavConfig:
     local_costmap_width_m: float = 4.0
     local_costmap_height_m: float = 4.0
     local_costmap_resolution: float = 0.05
-    local_inflation_radius_m: float = 0.25
+    local_inflation_radius_m: float = 0.35
     # Local-window refresh rate (Hz). Independent of ``control_rate_hz`` so the
     # follower tick stays cheap; lidar is typically ~10 Hz anyway.
     local_costmap_rate_hz: float = 5.0
@@ -462,16 +465,17 @@ class BuiltinNavConfig:
             planner=normalize_builtin_planner(d.get("planner", BUILTIN_PLANNER_LAZY_THETA)),
             lookahead_m=float(d.get("lookahead_m", 1.35)),
             min_lookahead_m=float(d.get("min_lookahead_m", 1.1)),
-            max_lookahead_m=float(d.get("max_lookahead_m", 1.8)),
+            max_lookahead_m=float(d.get("max_lookahead_m", 1.55)),
             replan_period_s=float(d.get("replan_period_s", 1.0)),
             timeout_s=float(d.get("timeout_s", 300.0)),
             drive_timeout_s=float(d.get("drive_timeout_s", 5.0)),
             drive_timeout_streak=int(d.get("drive_timeout_streak", 20)),
             cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),
-            clearance_preference_m=float(d.get("clearance_preference_m", 0.35)),
+            clearance_preference_m=float(d.get("clearance_preference_m", 0.50)),
             xy_goal_tolerance=float(d.get("xy_goal_tolerance", 0.25)),
             yaw_goal_tolerance=float(d.get("yaw_goal_tolerance", 0.35)),
             yaw_align_timeout_s=float(d.get("yaw_align_timeout_s", 6.0)),
+            max_goal_snap_m=float(d.get("max_goal_snap_m", 0.5)),
             approach_dist_m=float(d.get("approach_dist_m", 0.35)),
             smooth_path=bool(d.get("smooth_path", True)),
             smooth_sample_spacing_m=float(d.get("smooth_sample_spacing_m", 0.20)),
@@ -479,7 +483,7 @@ class BuiltinNavConfig:
             local_costmap_width_m=float(d.get("local_costmap_width_m", 4.0)),
             local_costmap_height_m=float(d.get("local_costmap_height_m", 4.0)),
             local_costmap_resolution=float(d.get("local_costmap_resolution", 0.05)),
-            local_inflation_radius_m=float(d.get("local_inflation_radius_m", 0.25)),
+            local_inflation_radius_m=float(d.get("local_inflation_radius_m", 0.35)),
             local_costmap_rate_hz=_positive_hz(
                 d.get("local_costmap_rate_hz", 5.0), "local_costmap_rate_hz"
             ),
