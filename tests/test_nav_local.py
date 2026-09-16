@@ -387,7 +387,7 @@ def test_local_planner_detours_around_bin_on_route():
 
 @pytest.mark.parametrize(
     "robot_r, bin_x",
-    [(0.22, 1.0), (0.22, 1.2), (0.45, 1.2), (0.45, 0.9)],
+    [(0.22, 1.0), (0.22, 1.2), (0.32, 1.0), (0.45, 1.2)],
 )
 def test_local_planner_closed_loop_detour_passes_bin(robot_r, bin_x):
     """Drive the DWA loop against a bin on the route: must get past, not creep/spin."""
@@ -399,6 +399,7 @@ def test_local_planner_closed_loop_detour_passes_bin(robot_r, bin_x):
     active = False
     dt = 0.1
     min_clear = math.inf
+    max_abs_y = 0.0
     used_dwa = 0
     for _ in range(300):
         view = _open_view_with_bin(pose, bin_xy, robot_radius_m=robot_r)
@@ -434,12 +435,17 @@ def test_local_planner_closed_loop_detour_passes_bin(robot_r, bin_x):
         )
         clear = math.hypot(pose.x - bin_xy[0], pose.y - bin_xy[1])
         min_clear = min(min_clear, clear)
+        max_abs_y = max(max_abs_y, abs(pose.y))
         if pose.x > bin_x + 0.6:
             break
     assert used_dwa > 0
     assert pose.x > bin_x + 0.6, f"never passed the bin: ended at {pose}"
     # Never overlap the bin (half-size 0.15) with the footprint.
     assert min_clear > 0.15 + robot_r, f"clipped the bin: {min_clear:.2f} m"
+    # Middle peel: clear the footprint, but don't swing past ~1.1 m off path.
+    need = 0.15 + robot_r
+    assert max_abs_y > need * 0.85, f"too tight: max|y|={max_abs_y:.2f}"
+    assert max_abs_y < 1.15, f"too wide: max|y|={max_abs_y:.2f}"
 
 
 def path_point_ahead_for_test(path: Path2D, pose: Pose2D, ahead: float):

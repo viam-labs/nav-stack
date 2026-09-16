@@ -440,18 +440,24 @@ class NavSupervisor:
     ) -> Optional[Path2D]:
         """Replan from ``pose``, optionally marking live scan hits on the map.
 
-        With ``failed_count >= 1`` the current corridor is painted so the retry
-        must detour. If that over-constrained map is infeasible, fall back to a
-        scan-only plan rather than failing outright — an identical route is
-        rejected by ``require_different``, but a genuinely new one is fine.
-        The reason for the last failure is kept in ``self._last_replan_error``
-        for status / logs.
+        Prefer a scan-only plan first (small peel around the live obstacle).
+        Only paint the current corridor after that fails or is identical —
+        painting first sealed the short route and forced room-scale detours.
+        Among feasible different plans, keep the shortest remaining length
+        (cap ~1.8× the current remaining path) so a corridor-seal fallback
+        does not replace a mild detour with a loop around the room.
+        The reason for the last failure is kept in ``self._last_replan_error``.
         """
-        attempts: list[tuple[str, bool]] = []
+        from .controller import _path_length
+        from .path_utils import closest_point_on_path
+
+        attempts: list[tuple[str, bool]] = [("scan", False)]
         if failed_count >= 1:
             attempts.append(("blocked-corridor", True))
-        attempts.append(("scan", False))
         reasons: list[str] = []
+        _, _, _, along = closest_point_on_path(pose, path)
+        remaining = max(0.5, _path_length(path) - along)
+        best: Optional[tuple[float, Path2D, PlanResult]] = None
         for label, paint in attempts:
             replanned = self.plan(
                 goal,
@@ -468,12 +474,27 @@ class NavSupervisor:
             ):
                 reasons.append(f"{label}: same route")
                 continue
-            self._last_replan_error = ""
-            preview = self._publish_plan_viz(replanned, goal, start=pose)
-            self._set_status(path=preview["path"], length_m=preview["length_m"])
-            return replanned.path
-        self._last_replan_error = "; ".join(reasons)
-        return None
+            new_len = _path_length(replanned.path)
+            # Corridor paint can open a long way around; skip if much longer
+            # than remaining route, unless nothing shorter succeeded.
+            if paint and new_len > remaining * 1.8 and best is not None:
+                reasons.append(
+                    f"{label}: too long ({new_len:.1f} m > {remaining * 1.8:.1f} m)"
+                )
+                continue
+            if best is None or new_len < best[0]:
+                best = (new_len, replanned.path, replanned)
+            # Scan-only short detour is enough — don't keep looking for paint.
+            if not paint:
+                break
+        if best is None:
+            self._last_replan_error = "; ".join(reasons)
+            return None
+        self._last_replan_error = ""
+        _, new_path, result = best
+        preview = self._publish_plan_viz(result, goal, start=pose)
+        self._set_status(path=preview["path"], length_m=preview["length_m"])
+        return new_path
 
     def run_goal(self, goal: Pose2D) -> None:
         """Plan and follow until success, failure, or cancel. Blocking."""
