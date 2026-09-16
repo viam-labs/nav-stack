@@ -846,6 +846,35 @@ def path_blocked(
         inflation_radius_m=inflation_radius_m,
         robot_radius_m=robot_radius_m,
     )
+    return path_blocked_on_costmap(
+        occ,
+        costs,
+        path,
+        robot_radius_m=robot_radius_m,
+        sample_step_m=sample_step_m,
+        from_pose=from_pose,
+        ahead_m=ahead_m,
+    )
+
+
+def path_blocked_on_costmap(
+    occ: OccupancyGrid,
+    costs: np.ndarray,
+    path: Path2D,
+    *,
+    robot_radius_m: float = 0.22,
+    sample_step_m: float = 0.15,
+    from_pose: Optional[Pose2D] = None,
+    ahead_m: Optional[float] = None,
+) -> bool:
+    """Like ``path_blocked`` but reuses an already-built costmap (control-loop safe).
+
+    ``robot_radius_m`` is accepted for API symmetry with ``path_blocked``; the
+    footprint is already encoded in ``costs``.
+    """
+    _ = robot_radius_m
+    if path.empty:
+        return True
     pts = path.points
     start_seg = 0
     start_t = 0.0

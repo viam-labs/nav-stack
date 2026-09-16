@@ -488,6 +488,32 @@ def test_plan_fails_when_goal_in_lethal():
     assert result.error_code != 0
 
 
+def test_path_blocked_on_costmap_matches_path_blocked():
+    """Cached-costmap check must agree with a fresh inflate (control-loop path)."""
+    from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav_builtin.planner import path_blocked_on_costmap
+
+    m = _empty_map(size=40, resolution=0.1)
+    m["grid"][20, 15] = 100
+    path = Path2D(points=((0.5, 2.0), (3.5, 2.0)), goal_theta=0.0)
+    pose = Pose2D(0.5, 2.0, 0.0)
+    fresh = path_blocked(
+        m,
+        path,
+        inflation_radius_m=0.2,
+        robot_radius_m=0.15,
+        from_pose=pose,
+        ahead_m=3.0,
+    )
+    occ = occupancy_from_map_dict(m)
+    costs = build_costmap(occ, inflation_radius_m=0.2, robot_radius_m=0.15)
+    cached = path_blocked_on_costmap(
+        occ, costs, path, robot_radius_m=0.15, from_pose=pose, ahead_m=3.0
+    )
+    assert fresh is True
+    assert cached is True
+
+
 def test_path_blocked_horizon_ignores_far_obstacle():
     """Long routes must not fail static checks on far-ahead map changes."""
     m = _empty_map(size=80, resolution=0.1)

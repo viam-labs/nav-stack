@@ -25,6 +25,7 @@ from .local_planner import LocalPlannerConfig
 from .planner import (
     path_blocked,
     path_blocked_local,
+    path_blocked_on_costmap,
     paths_meaningfully_differ,
     plan_path,
     connect_plan_start,
@@ -477,6 +478,8 @@ class NavSupervisor:
             failed_replan_while_blocked = 0
             failed_static_replan = 0
             local_planner_active = False
+            reactive_avoid_since: Optional[float] = None
+            last_obstacle_state = ""
             prev_local_cmd: Optional[DriveCommand] = None
             prev_cmd: Optional[DriveCommand] = None
             rotate_active = False
@@ -624,52 +627,75 @@ class NavSupervisor:
                 local_view = self._local_view_cache
                 if refresh_local:
                     self._kick_global_costmap_refresh(allow_inline=True)
-                    costmap_scan = scan
-                    if (
-                        costmap_scan is not None
-                        and costmap_scan.capture_pose is None
-                    ):
-                        costmap_scan = conv.LaserScan2D(
-                            ranges=costmap_scan.ranges,
-                            angle_min=costmap_scan.angle_min,
-                            angle_increment=costmap_scan.angle_increment,
-                            range_min=costmap_scan.range_min,
-                            range_max=costmap_scan.range_max,
-                            sensor_pose=costmap_scan.sensor_pose,
-                            capture_pose=pose,
-                        )
-                    with self._global_cache_lock:
-                        global_occ = self._global_occ_cache
-                        global_costs = self._global_costs_cache
-                    local_view = self._local_costmap.update(
-                        pose,
-                        costmap_scan,
-                        global_occ=global_occ,
-                        global_costs=global_costs,
-                    )
-                    self._local_view_cache = local_view
-                    self._local_view_at = now
-                    self._local_costmap_updates += 1
-                    if self._local_costmap_enabled:
-                        from .costmap import local_view_viz_dict
-
-                        try:
-                            self._world.set_viz_local_costmap(
-                                local_view_viz_dict(local_view)
+                    # Missing scan must not wipe live marks — that made
+                    # path_blocked_local flicker false under IO load while
+                    # reactive avoid still saw the obstacle on the next tick.
+                    if scan is None and self._local_view_cache is not None:
+                        local_view = self._local_view_cache
+                    else:
+                        costmap_scan = scan
+                        if (
+                            costmap_scan is not None
+                            and costmap_scan.capture_pose is None
+                        ):
+                            costmap_scan = conv.LaserScan2D(
+                                ranges=costmap_scan.ranges,
+                                angle_min=costmap_scan.angle_min,
+                                angle_increment=costmap_scan.angle_increment,
+                                range_min=costmap_scan.range_min,
+                                range_max=costmap_scan.range_max,
+                                sensor_pose=costmap_scan.sensor_pose,
+                                capture_pose=pose,
                             )
-                        except Exception:  # noqa: BLE001 - viz is best-effort
-                            pass
+                        with self._global_cache_lock:
+                            global_occ = self._global_occ_cache
+                            global_costs = self._global_costs_cache
+                        local_view = self._local_costmap.update(
+                            pose,
+                            costmap_scan,
+                            global_occ=global_occ,
+                            global_costs=global_costs,
+                        )
+                        self._local_view_cache = local_view
+                        self._local_view_at = now
+                        self._local_costmap_updates += 1
+                        if self._local_costmap_enabled:
+                            from .costmap import local_view_viz_dict
 
-                local_blocked = (
-                    local_view is not None
-                    and path_blocked_local(
-                        pose,
-                        path,
-                        local_view,
-                        cost_threshold=self._local_planner_activate_cost,
-                        margin_m=self._local_planner.path_clearance_margin_m,
+                            try:
+                                self._world.set_viz_local_costmap(
+                                    local_view_viz_dict(local_view)
+                                )
+                            except Exception:  # noqa: BLE001 - viz is best-effort
+                                pass
+
+                path_ahead_cost = 0
+                local_blocked = False
+                if local_view is not None:
+                    from .local_planner import path_cost_ahead as _path_cost_ahead
+
+                    path_ahead_cost = int(
+                        _path_cost_ahead(
+                            pose,
+                            path,
+                            local_view,
+                            lookahead_m=self._local_planner.path_clearance_lookahead_m,
+                            margin_m=self._local_planner.path_clearance_margin_m,
+                        )
                     )
-                )
+                    local_blocked = (
+                        path_ahead_cost >= self._local_planner_activate_cost
+                    )
+                # Reactive avoid spinning with a clear-looking path still means
+                # the robot cannot proceed — escalate to the blocked/replan path.
+                if (
+                    last_obstacle_state == "avoid"
+                    and reactive_avoid_since is not None
+                    and now - reactive_avoid_since >= 0.8
+                ):
+                    local_blocked = True
+                    if local_blocked_since is None:
+                        local_blocked_since = reactive_avoid_since
                 # Nav2 Wait analogue: hold still so transient movers can clear
                 # before we burn a detour replan.
                 wait_before_replan_s = max(
@@ -703,12 +729,24 @@ class NavSupervisor:
                             backup_attempts = 0
                             vx_sign_history.clear()
                             spin_stuck_since = None
+                            reactive_avoid_since = None
+                            last_obstacle_state = ""
                         else:
                             failed_replan_while_blocked += 1
                 else:
                     local_blocked_since = None
                     failed_replan_while_blocked = 0
 
+                # Keep DWA available after a failed detour replan — otherwise
+                # local_blocked permanently disables the only layer that can
+                # swerve, leaving reactive avoid to spin in place.
+                allow_local_planner = (
+                    self._local_costmap_enabled
+                    and not waiting_for_clear
+                    and (
+                        not local_blocked or failed_replan_while_blocked >= 1
+                    )
+                )
                 cmd, progress = compute_path_command(
                     pose,
                     path,
@@ -716,11 +754,7 @@ class NavSupervisor:
                     scan=scan,
                     speed_mps=self._last_cmd_vx,
                     local_view=local_view,
-                    local_planner=self._local_planner
-                    if self._local_costmap_enabled
-                    and not local_blocked
-                    and not waiting_for_clear
-                    else None,
+                    local_planner=self._local_planner if allow_local_planner else None,
                     robot_radius_m=self._robot_radius,
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
                     min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
@@ -735,6 +769,20 @@ class NavSupervisor:
                     prev_local_cmd = cmd
                 else:
                     prev_local_cmd = None
+
+                obs_state = str(progress.get("obstacle") or "")
+                if obs_state == "avoid":
+                    if reactive_avoid_since is None:
+                        reactive_avoid_since = now
+                else:
+                    reactive_avoid_since = None
+                last_obstacle_state = obs_state
+                progress = {
+                    **progress,
+                    "local_blocked": bool(local_blocked),
+                    "path_cost_ahead": int(path_ahead_cost),
+                    "failed_replan_while_blocked": int(failed_replan_while_blocked),
+                }
 
                 if waiting_for_clear:
                     # Stop and let the blocker move; don't trip stall timeout.
@@ -891,15 +939,32 @@ class NavSupervisor:
                     )
                 last_tick_pose = pose
                 if replan_due or pose_jumped:
-                    map_data = self._world.get_map()
-                    static_blocked = map_data is not None and path_blocked(
-                        map_data,
-                        path,
-                        inflation_radius_m=self._inflation,
-                        robot_radius_m=self._robot_radius,
-                        from_pose=pose,
-                        ahead_m=path_block_horizon_m,
-                    )
+                    # Prefer the already-inflated global cache (background thread).
+                    # Falling back to path_blocked() rebuilds the full map costmap
+                    # (~0.4 s on a large grid) on the control thread.
+                    static_blocked = False
+                    with self._global_cache_lock:
+                        cached_occ = self._global_occ_cache
+                        cached_costs = self._global_costs_cache
+                    if cached_occ is not None and cached_costs is not None:
+                        static_blocked = path_blocked_on_costmap(
+                            cached_occ,
+                            cached_costs,
+                            path,
+                            robot_radius_m=self._robot_radius,
+                            from_pose=pose,
+                            ahead_m=path_block_horizon_m,
+                        )
+                    else:
+                        map_data = self._world.get_map()
+                        static_blocked = map_data is not None and path_blocked(
+                            map_data,
+                            path,
+                            inflation_radius_m=self._inflation,
+                            robot_radius_m=self._robot_radius,
+                            from_pose=pose,
+                            ahead_m=path_block_horizon_m,
+                        )
                     # Large localization corrections invalidate the old polyline;
                     # force a replan even if the first few metres still look free.
                     if pose_jumped:
@@ -913,6 +978,11 @@ class NavSupervisor:
                     or (oscillating and local_blocked)
                     or backup_exhausted
                 )
+                # Periodic check said "still clear" — still advance the timer.
+                # Otherwise replan_due stays true and the expensive static check
+                # (or a full inflate fallback) runs on every subsequent tick.
+                if replan_due and not should_replan:
+                    last_replan = now
                 if should_replan:
                     # On static/pose-jump recovery, accept any feasible plan —
                     # require_different would reject a valid near-identical route
