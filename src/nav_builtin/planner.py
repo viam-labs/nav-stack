@@ -829,12 +829,11 @@ def plan_path(
         )
     if local_view is not None:
         hit_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
-        # Soft ring (≥200) is enough to trip the controller; paint that, not
-        # only inscribed/lethal, or replan keeps the same corridor.
+        # Copy only raw, novel scan hits from the cached local view. Its merged
+        # cost layer includes global inflation and must not be painted/reinflated.
         occ = mark_local_costmap_on_occupancy(
             occ,
             local_view,
-            cost_threshold=200,
             radius_m=hit_r,
         )
         if blocked_path is not None and blocked_path_pose is not None:
@@ -849,6 +848,11 @@ def plan_path(
                 radius_m=seal_r,
                 lookahead_m=1.5,
                 start_offset_m=float(robot_radius_m) + 0.05,
+                end_offset_m=(
+                    seal_r
+                    + 2.0 * float(robot_radius_m)
+                    + 2.0 * float(occ.resolution)
+                ),
             )
     if (
         paint_corridor
@@ -866,6 +870,11 @@ def plan_path(
             radius_m=block_r,
             lookahead_m=1.5,
             start_offset_m=float(robot_radius_m) + block_r + 2.0 * float(occ.resolution),
+            end_offset_m=(
+                block_r
+                + 2.0 * float(robot_radius_m)
+                + 2.0 * float(occ.resolution)
+            ),
         )
     costs = build_costmap(
         occ,
