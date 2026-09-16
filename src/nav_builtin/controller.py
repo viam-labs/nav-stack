@@ -558,7 +558,11 @@ def compute_path_command(
     )
     if apply_obstacle:
         cmd, obstacle_state, forward_clearance = apply_obstacle_avoidance(
-            cmd, scan, cfg.obstacle, max_angular_rad_s=cfg.motion.max_angular_rad_s
+            cmd,
+            scan,
+            cfg.obstacle,
+            max_angular_rad_s=cfg.motion.max_angular_rad_s,
+            prefer_bearing_rad=bearing,
         )
         if not cmd.done and (cmd.vx != 0.0 or cmd.vtheta != 0.0):
             # Slow-down scaled vx; keep the arc drivable before the floor so a

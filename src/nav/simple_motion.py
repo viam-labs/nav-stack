@@ -118,6 +118,8 @@ def apply_obstacle_avoidance(
     obs: ObstacleConfig,
     *,
     max_angular_rad_s: float,
+    prefer_bearing_rad: Optional[float] = None,
+    prefer_min_clearance_m: Optional[float] = None,
 ) -> tuple["DriveCommand", str, float]:
     """Adjust a drive command for obstacles seen in ``scan``.
 
@@ -125,8 +127,10 @@ def apply_obstacle_avoidance(
     ``clear`` / ``slow`` / ``avoid`` / ``hold`` / ``no_scan``.
 
     Forward motion (``vx > 0``): slow inside ``slow_distance``, and at
-    ``stop_distance`` stop translating and turn toward the clearer side
-    (``avoid``).
+    ``stop_distance`` stop translating and turn (``avoid``). When
+    ``prefer_bearing_rad`` is set (path/goal bearing, + = left), prefer that
+    side only if its side-cone clearance is at least ``prefer_min_clearance_m``
+    (default: ``stop_distance``); otherwise fall back to freer-flank.
 
     In-place rotation / reverse (``vx <= 0``): freeze (``hold``) only for a
     true nose collision (``spin_collision_m``) or when swinging the bumper into
@@ -185,11 +189,23 @@ def apply_obstacle_avoidance(
             forward,
         )
 
-    # Too close to keep going: stop forward motion and rotate toward whichever
-    # side has more room. +vtheta (CCW) turns left (+y / positive bearings).
+    # Too close to keep going: stop forward and rotate. Prefer the path/goal
+    # side when that flank is actually open; otherwise freer left/right.
     left = cone_min_range(scan, 0.0, obs.side_cone_rad)
     right = cone_min_range(scan, -obs.side_cone_rad, 0.0)
     direction = 1.0 if left >= right else -1.0
+    min_clear = float(
+        prefer_min_clearance_m
+        if prefer_min_clearance_m is not None
+        else obs.stop_distance_m
+    )
+    min_clear = max(0.0, min_clear)
+    prefer_eps = math.radians(12.0)
+    if prefer_bearing_rad is not None and abs(prefer_bearing_rad) >= prefer_eps:
+        prefer_left = prefer_bearing_rad > 0.0
+        preferred_clear = left if prefer_left else right
+        if preferred_clear >= min_clear:
+            direction = 1.0 if prefer_left else -1.0
     return DriveCommand(0.0, 0.0, direction * max_angular_rad_s, False), "avoid", forward
 
 
@@ -365,7 +381,11 @@ async def drive_to_pose(
             if obstacle is not None and obstacle.enabled and get_scan is not None:
                 scan = await asyncio.to_thread(get_scan)
                 cmd, obstacle_state, forward_clearance = apply_obstacle_avoidance(
-                    cmd, scan, obstacle, max_angular_rad_s=cfg.max_angular_rad_s
+                    cmd,
+                    scan,
+                    obstacle,
+                    max_angular_rad_s=cfg.max_angular_rad_s,
+                    prefer_bearing_rad=bearing,
                 )
                 # Fail closed: if avoidance is on but we have no fresh scan, we
                 # suppressed forward motion above. Give up (rather than sit
