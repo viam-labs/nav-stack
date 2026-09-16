@@ -95,7 +95,9 @@ the robot in the local costmap. Refresh rate is nav-side
 | `mode` | SLAM | `mapping` or `localizing` — selects builtin SLAM node and sets its mode |
 | `global_localize_on_start` | SLAM | When `true` in `localizing` mode, run `global_localize` automatically after startup (default `true`) |
 | `global_localize_on_start_delay_s` | SLAM | Delay before startup auto-localize (default `4.0`) |
-| `global_localize_on_start_options` | SLAM | Optional args merged into startup `global_localize` command; defaults prefer robust boot localization (`full_map: true`, `map_source: live`) |
+| `global_localize_on_start_options` | SLAM | Optional args merged into startup `global_localize` command; defaults prefer robust boot localization (`full_map: true`, `map_source: live`, finer coarse grid / stronger ray weight) |
+| `periodic_relocalize` | SLAM | Background scan-to-map watchdog while localizing (default `false`) |
+| `periodic_relocalize_during_navigation` | SLAM | Allow periodic relocalize while MoveOnMap is active (default `false`; soft-holds during nav were disruptive) |
 | `global_localize_on_start_refine` | SLAM | Run a second auto `global_localize` pass after startup (default `true`) |
 | `global_localize_on_start_refine_delay_s` | SLAM | Delay before second refine pass (default `8.0`) |
 | `global_localize_on_start_refine_max_passes` | SLAM | Max startup refine passes while quality is below target (default `3`) |

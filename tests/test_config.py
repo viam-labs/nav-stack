@@ -302,7 +302,7 @@ def test_slam_config_periodic_relocalize_defaults():
     assert cfg.periodic_relocalize_min_shift_deg == pytest.approx(10.0)
     assert cfg.periodic_relocalize_nav_recoveries_threshold == 2
     assert cfg.periodic_relocalize_full_map_on_low_quality is True
-    assert cfg.periodic_relocalize_during_navigation is True
+    assert cfg.periodic_relocalize_during_navigation is False
     assert cfg.periodic_relocalize_options["search_radius_m"] == pytest.approx(3.0)
     assert cfg.periodic_relocalize_options["auto_full_map_fallback"] is True
 
@@ -334,6 +334,10 @@ def test_slam_config_global_localize_on_start_defaults_enabled():
     assert cfg.global_localize_on_start_options == {
         "full_map": True,
         "map_source": "live",
+        "coarse_position_step_m": 0.35,
+        "coarse_yaw_step_deg": 10.0,
+        "ray_weight": 0.55,
+        "ray_refine_candidates": 48,
     }
     assert cfg.global_localize_on_start_refine is True
     assert cfg.global_localize_on_start_refine_delay_s == pytest.approx(8.0)

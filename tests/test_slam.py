@@ -421,8 +421,8 @@ def test_run_startup_global_localize_runs_refinement_pass():
         side_effect=[
             {
                 "status": "matched",
-                "score": 0.52,
-                "ray_mae_m": 0.9,
+                "score": 0.56,
+                "ray_mae_m": 0.50,
                 "pose": {"x": 1.0, "y": 2.0, "theta": 0.1},
             },
             {
@@ -473,7 +473,7 @@ def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
             {
                 "status": "matched",
                 "score": 0.58,
-                "ray_mae_m": 0.82,
+                "ray_mae_m": 0.50,
                 # Small jump applies immediately; post-apply refine still runs.
                 "pose": {"x": 0.3, "y": 0.4, "theta": 0.1},
             },
@@ -664,6 +664,8 @@ def _relocalize_slam(**cfg_overrides):
         "lidar": "f",
         "mode": "localizing",
         "periodic_relocalize": True,
+        # Unit tests exercise mid-nav hold/correct paths; production default is off.
+        "periodic_relocalize_during_navigation": True,
     }
     d.update(cfg_overrides)
     slam = SlamService("slam")

@@ -52,6 +52,10 @@ class GlobalLocalizeResult:
     hit_rate: float
     ray_score: float
     ray_mae_m: float
+    # Combined (endpoint + ray) score of the runner-up after ray rerank.
+    # Used to refuse applying an ambiguous full-map peak.
+    second_best_score: float = float("-inf")
+    ambiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -486,8 +490,15 @@ def global_localize_scan(
     ray_refine_beams: int = 64,
     ray_step_m: float = 0.08,
     ray_weight: float = 0.35,
+    ambiguity_margin: float = 0.06,
 ) -> GlobalLocalizeResult:
-    """Find the map-frame pose that best explains ``scan`` against ``occ_map``."""
+    """Find the map-frame pose that best explains ``scan`` against ``occ_map``.
+
+    For ``full_map`` searches, prefer a finer coarse grid and higher
+    ``ray_weight`` / ``ray_refine_candidates`` (callers should pass those). The
+    result's ``ambiguous`` flag is set when the best and second-best combined
+    scores are within ``ambiguity_margin`` — callers should not auto-apply.
+    """
     scan_xy = scan_endpoints_base_link(scan)
     if scan_xy.shape[0] < 8:
         raise ValueError(
@@ -496,6 +507,20 @@ def global_localize_scan(
     if max_scan_points > 0 and scan_xy.shape[0] > max_scan_points:
         idx = np.linspace(0, scan_xy.shape[0] - 1, max_scan_points, dtype=np.int32)
         scan_xy = scan_xy[idx]
+
+    # Full-map defaults: denser coarse grid + stronger ray voice so repetitive
+    # corridors are less likely to win on endpoint hits alone. Only rewrite the
+    # legacy defaults so explicit coarser/faster callers (e.g. revisit) keep
+    # their steps.
+    if full_map or hint is None:
+        if abs(coarse_position_step_m - 0.4) < 1e-9:
+            coarse_position_step_m = 0.35
+        if abs(coarse_yaw_step_deg - 12.0) < 1e-9:
+            coarse_yaw_step_deg = 10.0
+        if abs(ray_weight - 0.35) < 1e-9:
+            ray_weight = 0.55
+        if ray_refine_candidates == 24:
+            ray_refine_candidates = 48
 
     coarse_yaw = math.radians(coarse_yaw_step_deg)
     fine_yaw = math.radians(fine_yaw_step_deg)
@@ -530,14 +555,22 @@ def global_localize_scan(
 
     def rerank_with_rays(
         scored: List[_ScoredPose],
-    ) -> Tuple[conv.Pose2D, _PoseScore, float, float]:
+    ) -> Tuple[conv.Pose2D, _PoseScore, float, float, float]:
+        """Returns pose, endpoint eval, ray_score, ray_mae, second_best_combined."""
         if not scored:
-            return conv.Pose2D(0.0, 0.0, 0.0), _PoseScore(float("-inf"), 0, 0.0), 0.0, float("inf")
+            return (
+                conv.Pose2D(0.0, 0.0, 0.0),
+                _PoseScore(float("-inf"), 0, 0.0),
+                0.0,
+                float("inf"),
+                float("-inf"),
+            )
         best_pose = scored[0].pose
         best_eval = scored[0].endpoint_eval
         best_ray_score = 0.0
         best_ray_mae = float("inf")
         best_combined = float("-inf")
+        second_combined = float("-inf")
         limit = min(len(scored), max(1, int(ray_refine_candidates)))
         for item in scored[:limit]:
             ray_quality, ray_mae = _ray_alignment(
@@ -550,12 +583,15 @@ def global_localize_scan(
             )
             combined = item.endpoint_eval.score + ray_weight * ((2.0 * ray_quality) - 1.0)
             if combined > best_combined:
+                second_combined = best_combined
                 best_combined = combined
                 best_pose = item.pose
                 best_eval = item.endpoint_eval
                 best_ray_score = ray_quality
                 best_ray_mae = ray_mae
-        return best_pose, best_eval, best_ray_score, best_ray_mae
+            elif combined > second_combined:
+                second_combined = combined
+        return best_pose, best_eval, best_ray_score, best_ray_mae, second_combined
 
     if full_map or hint is None:
         coarse_candidates = _iter_full_map_poses(
@@ -577,7 +613,7 @@ def global_localize_scan(
     coarse_scored = search_candidates(
         coarse_candidates, keep=max(8, int(ray_refine_candidates))
     )
-    best_pose, best_eval, _, _ = rerank_with_rays(coarse_scored)
+    best_pose, best_eval, _, _, _ = rerank_with_rays(coarse_scored)
 
     fine_yaw_window = math.radians(fine_yaw_window_deg)
     fine_candidates = _iter_pose_grid(
@@ -592,12 +628,51 @@ def global_localize_scan(
     fine_scored = search_candidates(
         fine_candidates, keep=max(12, int(ray_refine_candidates))
     )
-    best_pose, best_eval, best_ray_score, best_ray_mae = rerank_with_rays(fine_scored)
+    best_pose, best_eval, best_ray_score, best_ray_mae, second_best = rerank_with_rays(
+        fine_scored
+    )
 
     if not math.isfinite(best_eval.score):
         raise RuntimeError(
             "global scan match failed; no valid candidate in map bounds"
         )
+
+    # Corridor 180° check on the fine winner (cheap; breaks common false peaks).
+    yaw_choice = choose_yaw_or_flip(
+        occ_map,
+        scan,
+        best_pose,
+        reference_theta=hint.theta if hint is not None else None,
+        hit_radius_cells=hit_radius_cells,
+        max_scan_points=max_scan_points,
+        ray_beams=ray_refine_beams,
+        ray_step_m=ray_step_m,
+        ray_weight=ray_weight,
+    )
+    if yaw_choice.flipped:
+        best_pose = yaw_choice.pose
+        best_ray_mae = yaw_choice.ray_mae_m
+        best_eval = _PoseScore(
+            yaw_choice.score,
+            best_eval.in_map_points,
+            best_eval.hit_rate,
+        )
+        # Refresh ray quality at the flipped heading for status reporting.
+        best_ray_score, best_ray_mae = _ray_alignment(
+            occ_map,
+            best_pose,
+            ray_angles,
+            ray_ranges,
+            range_max_m=range_max,
+            step_m=ray_step_m,
+        )
+
+    best_combined = best_eval.score + ray_weight * ((2.0 * best_ray_score) - 1.0)
+    ambiguous = (
+        math.isfinite(second_best)
+        and math.isfinite(best_combined)
+        and (best_combined - second_best) < float(ambiguity_margin)
+    )
 
     return GlobalLocalizeResult(
         pose=best_pose,
@@ -608,6 +683,8 @@ def global_localize_scan(
         hit_rate=best_eval.hit_rate,
         ray_score=best_ray_score,
         ray_mae_m=best_ray_mae,
+        second_best_score=second_best,
+        ambiguous=ambiguous,
     )
 
 

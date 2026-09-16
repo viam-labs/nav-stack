@@ -1489,9 +1489,36 @@ class SlamService(SLAM):
         best_result: Optional[Mapping[str, ValueTypes]] = None
         applied = False
 
-        async def _observe_startup_pose(pose_map: object) -> bool:
-            """Feed one match into the jump gate; apply when confirmed."""
+        async def _observe_startup_pose(pose_map: object, match: Mapping) -> bool:
+            """Feed one match into the jump gate; apply when confirmed + trusted."""
             if not isinstance(pose_map, Mapping):
+                return False
+            # Do not lock continuous matching onto a weak / ambiguous full-map peak.
+            if bool(match.get("ambiguous")):
+                LOGGER.info(
+                    "startup global_localize: skipping apply (ambiguous peak "
+                    "score=%s second_best=%s)",
+                    match.get("score"),
+                    match.get("second_best_score"),
+                )
+                return False
+            score = match.get("score")
+            ray_mae = match.get("ray_mae_m")
+            if score is not None and float(score) < 0.55:
+                LOGGER.info(
+                    "startup global_localize: skipping apply (low score=%.3f)",
+                    float(score),
+                )
+                return False
+            if (
+                ray_mae is not None
+                and math.isfinite(float(ray_mae))
+                and float(ray_mae) > 0.55
+            ):
+                LOGGER.info(
+                    "startup global_localize: skipping apply (ray_mae=%.3f)",
+                    float(ray_mae),
+                )
                 return False
             mgr = self._manager
             current = mgr.get_pose_in_map() if mgr is not None else None
@@ -1519,11 +1546,14 @@ class SlamService(SLAM):
                 }
             )
             LOGGER.info(
-                "startup global_localize applied (%.2f, %.2f, %.2f) jump=%s",
+                "startup global_localize applied (%.2f, %.2f, %.2f) jump=%s "
+                "score=%s ray_mae=%s",
                 candidate.x,
                 candidate.y,
                 candidate.theta,
                 decision.status,
+                match.get("score"),
+                match.get("ray_mae_m"),
             )
             return True
 
@@ -1537,7 +1567,7 @@ class SlamService(SLAM):
                     result.get("score"),
                     result.get("ray_mae_m"),
                 )
-                if await _observe_startup_pose(result.get("pose")):
+                if await _observe_startup_pose(result.get("pose"), result):
                     applied = True
                 if run_refine_pass and not applied:
                     passes = max(0, int(refine_max_passes))
@@ -1585,7 +1615,9 @@ class SlamService(SLAM):
                             refine_result.get("score"),
                             refine_result.get("ray_mae_m"),
                         )
-                        if await _observe_startup_pose(best_result.get("pose")):
+                        if await _observe_startup_pose(
+                            best_result.get("pose"), best_result
+                        ):
                             applied = True
                             break
 
@@ -2474,9 +2506,11 @@ class SlamService(SLAM):
         loop = asyncio.get_running_loop()
 
         async def _run_match(full_map_override: bool):
-            default_coarse_pos = 0.6 if full_map_override else 0.4
-            default_coarse_yaw = 18.0 if full_map_override else 12.0
+            default_coarse_pos = 0.35 if full_map_override else 0.4
+            default_coarse_yaw = 10.0 if full_map_override else 12.0
             default_local_yaw_window = 360.0 if full_map_override else 180.0
+            default_ray_weight = 0.55 if full_map_override else 0.35
+            default_ray_candidates = 48 if full_map_override else 24
             return await self._localizer.run(
                 "global_localize_scan",
                 occ_map,
@@ -2499,10 +2533,13 @@ class SlamService(SLAM):
                 min_in_map_points=int(command.get("min_in_map_points", 40)),
                 min_in_map_ratio=float(command.get("min_in_map_ratio", 0.35)),
                 hit_radius_cells=int(command.get("hit_radius_cells", 2)),
-                ray_refine_candidates=int(command.get("ray_refine_candidates", 24)),
+                ray_refine_candidates=int(
+                    command.get("ray_refine_candidates", default_ray_candidates)
+                ),
                 ray_refine_beams=int(command.get("ray_refine_beams", 64)),
                 ray_step_m=float(command.get("ray_step_m", 0.08)),
-                ray_weight=float(command.get("ray_weight", 0.35)),
+                ray_weight=float(command.get("ray_weight", default_ray_weight)),
+                ambiguity_margin=float(command.get("ambiguity_margin", 0.06)),
             )
 
         result = await _run_match(full_map)
@@ -2540,7 +2577,36 @@ class SlamService(SLAM):
                 ray_step_m=float(command.get("ray_step_m", 0.08)),
             )
 
+        # Refuse to auto-apply a weak or ambiguous full-map peak — that was
+        # placing the robot in a "random" corridor that then locked continuous
+        # matching. Local refine around a good hint still applies freely.
+        min_apply_score = float(
+            command.get(
+                "min_apply_score",
+                0.55 if resolved_full_map else 0.35,
+            )
+        )
+        max_apply_ray_mae_m = float(
+            command.get(
+                "max_apply_ray_mae_m",
+                0.55 if resolved_full_map else 1.0,
+            )
+        )
+        refuse_ambiguous = bool(command.get("refuse_ambiguous", resolved_full_map))
+        apply_blocked_reason = None
         if apply_pose:
+            if float(result.score) < min_apply_score:
+                apply_blocked_reason = "low_score"
+            elif (
+                math.isfinite(float(result.ray_mae_m))
+                and float(result.ray_mae_m) > max_apply_ray_mae_m
+            ):
+                apply_blocked_reason = "high_ray_mae"
+            elif refuse_ambiguous and bool(getattr(result, "ambiguous", False)):
+                apply_blocked_reason = "ambiguous"
+
+        did_apply = False
+        if apply_pose and apply_blocked_reason is None:
             await loop.run_in_executor(
                 None,
                 lambda: mgr.relocalize(
@@ -2549,9 +2615,25 @@ class SlamService(SLAM):
                     yaw_variance_rad2=0.06853891945200942,
                 ),
             )
+            did_apply = True
+        elif apply_pose and apply_blocked_reason is not None:
+            LOGGER.warning(
+                "global_localize: not applying (%s) score=%.3f ray_mae=%s "
+                "ambiguous=%s second_best=%s full_map=%s",
+                apply_blocked_reason,
+                float(result.score),
+                result.ray_mae_m,
+                getattr(result, "ambiguous", False),
+                getattr(result, "second_best_score", None),
+                resolved_full_map,
+            )
 
         out: dict = {
-            "status": "localized" if apply_pose else "matched",
+            "status": (
+                "localized"
+                if did_apply
+                else ("matched_rejected" if apply_blocked_reason else "matched")
+            ),
             "pose": {
                 "x": result.pose.x,
                 "y": result.pose.y,
@@ -2564,10 +2646,15 @@ class SlamService(SLAM):
             "hit_rate": result.hit_rate,
             "ray_score": result.ray_score,
             "ray_mae_m": result.ray_mae_m,
+            "second_best_score": getattr(result, "second_best_score", None),
+            "ambiguous": bool(getattr(result, "ambiguous", False)),
             "map_source": map_source,
             "full_map": resolved_full_map,
             "fallback_used": fallback_used,
+            "applied": did_apply,
         }
+        if apply_blocked_reason is not None:
+            out["apply_blocked_reason"] = apply_blocked_reason
         if prior_score is not None:
             out["prior_score"] = prior_score
             out["prior_ray_mae_m"] = prior_ray_mae_m
