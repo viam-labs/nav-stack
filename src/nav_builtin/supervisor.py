@@ -1159,6 +1159,7 @@ class NavSupervisor:
                             "local_blocked",
                             "path_cost_ahead",
                             "failed_replan_while_blocked",
+                            "last_replan_error",
                             "nose_clear",
                             "forward_clearance_m",
                             "cmd_vx_mps",
@@ -1190,6 +1191,9 @@ class NavSupervisor:
                 # Pure spin with no bearing improvement must not reset the timer
                 # forever (stuck local-planner / RIP loops need to replan). But
                 # intentional align spins that shrink |bearing| are real progress.
+                # While the route is locally blocked, give more time — stop/replan
+                # cycles and peels look like "no progress" and were aborting with
+                # cmd_vx still showing a full-speed charge at the block.
                 dist_goal = distance_m(pose, goal)
                 near_goal_stall = (
                     dist_goal <= self._follower.motion.xy_tolerance_m * 2.0
@@ -1197,9 +1201,10 @@ class NavSupervisor:
                 )
                 # Near goal, tiny crawls are real progress — don't require 0.05 m/s.
                 translating_floor = 0.03 if near_goal_stall else 0.05
-                stall_limit_s = self._follower.motion.stall_timeout_s * (
-                    2.0 if near_goal_stall else 1.0
-                )
+                stall_scale = 2.0 if near_goal_stall else 1.0
+                if local_blocked:
+                    stall_scale = max(stall_scale, 2.5)
+                stall_limit_s = self._follower.motion.stall_timeout_s * stall_scale
                 bearing_err = abs(float(progress.get("bearing_error_rad", 0.0)))
                 spinning = (
                     abs(float(cmd.vtheta)) >= 0.08
