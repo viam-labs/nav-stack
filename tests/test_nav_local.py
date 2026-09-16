@@ -485,6 +485,28 @@ def test_local_planner_blocked_turns_toward_route_not_away():
     assert cmd.vtheta < 0.0
 
 
+def test_local_planner_does_not_charge_blocked_corridor():
+    """Aligned with a lethal cell ~1 m ahead: must peel/turn, not cmd_vx=max."""
+    pose = Pose2D(0.0, 0.0, 0.0)
+    path = Path2D(points=((0.0, 0.0), (3.0, 0.0)), goal_theta=0.0)
+    view = _open_view_with_bin(pose, (1.0, 0.0), robot_radius_m=0.32)
+    cfg = LocalPlannerConfig(enabled=True, sim_time_s=1.2)
+    cmd = compute_local_command(
+        pose,
+        path,
+        view,
+        cfg=cfg,
+        max_vel_x=0.5,
+        max_vel_theta=1.0,
+        robot_radius_m=0.32,
+    )
+    assert cmd is not None
+    # The failure mode was vx=max, vθ=0 straight at path_cost_ahead=254.
+    charging = cmd.vx >= 0.35 and abs(cmd.vtheta) < 0.05
+    assert not charging, f"charged the block: {cmd}"
+    assert cmd.vx < 0.35 or abs(cmd.vtheta) > 0.1
+
+
 def test_local_planner_avoids_marked_obstacle():
     lc = LocalCostmap(
         LocalCostmapConfig(

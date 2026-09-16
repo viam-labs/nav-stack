@@ -274,8 +274,12 @@ def build_detour_field(
             rejoin_along = d
             break
         d += step
-    if rejoin_along is None:
+    if rejoin_along is None and not seen_block:
         return None
+    # Path never cleared inside the window (large footprint / block near the
+    # edge): seed past the last blocked sample with free cells beside the route.
+    if rejoin_along is None:
+        rejoin_along = min(total, along0 + 1.2)
 
     f = max(1, int(coarse_factor))
     costs = view.costs
@@ -297,12 +301,24 @@ def build_detour_field(
     end_along = min(total, rejoin_along + max_seed_span_m)
     while d <= end_along + 1e-9:
         x, y = _at(d)
-        col = int(math.floor((x - view.origin_x) / res))
-        row = int(math.floor((y - view.origin_y) / res))
-        if 0 <= row < hh and 0 <= col < ww and base_trav[row, col]:
-            seed_cells.append((row, col))
-            if first_xy is None:
-                first_xy = (x, y)
+        # Path yaw for lateral seeds when the centerline is still lethal.
+        if d + 0.05 <= total:
+            x2, y2 = _at(min(total, d + 0.2))
+        else:
+            x2, y2 = _at(max(0.0, d - 0.2))
+            x2, y2 = x - (x2 - x), y - (y2 - y)
+        path_yaw = math.atan2(y2 - y, x2 - x)
+        nx, ny = -math.sin(path_yaw), math.cos(path_yaw)
+        candidates = [(x, y)]
+        for side in (0.35, 0.55, 0.75, -0.35, -0.55, -0.75):
+            candidates.append((x + side * nx, y + side * ny))
+        for sx, sy in candidates:
+            col = int(math.floor((sx - view.origin_x) / res))
+            row = int(math.floor((sy - view.origin_y) / res))
+            if 0 <= row < hh and 0 <= col < ww and base_trav[row, col]:
+                seed_cells.append((row, col))
+                if first_xy is None:
+                    first_xy = (sx, sy)
         d += step
     if first_xy is None:
         return None
@@ -373,6 +389,52 @@ def _erode(trav: np.ndarray, cells: int) -> np.ndarray:
         n[:-1, :-1] &= out[1:, 1:]
         out = n
     return out
+
+
+def path_block_distance_m(
+    pose: Pose2D,
+    path: Path2D,
+    view: LocalCostmapView,
+    *,
+    threshold: int,
+    lookahead_m: float,
+    margin_m: float = 0.0,
+    sample_step_m: float = 0.08,
+) -> Optional[float]:
+    """Distance along the path from the robot to the first blocked sample.
+
+    ``None`` when nothing at/above ``threshold`` is found within ``lookahead_m``.
+    """
+    if path.empty:
+        return 0.0
+    _, _, _, along0 = closest_point_on_path(pose, path)
+    pts = path.points
+    seg_lens: list[float] = []
+    cum = [0.0]
+    for i in range(len(pts) - 1):
+        length = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        seg_lens.append(length)
+        cum.append(cum[-1] + length)
+    total = cum[-1]
+    target = min(total, along0 + max(lookahead_m, sample_step_m))
+    step = max(float(sample_step_m), 0.05)
+    d = along0
+    while d <= target + 1e-9:
+        # Locate segment.
+        for i in range(len(pts) - 1):
+            if cum[i + 1] + 1e-9 < d:
+                continue
+            seg = seg_lens[i]
+            t = 0.0 if seg < 1e-9 else (d - cum[i]) / seg
+            t = max(0.0, min(1.0, t))
+            x = pts[i][0] + t * (pts[i + 1][0] - pts[i][0])
+            y = pts[i][1] + t * (pts[i + 1][1] - pts[i][1])
+            c = max_cost_along_segment(view, x, y, x, y, margin_m=margin_m)
+            if c >= threshold:
+                return max(0.0, d - along0)
+            break
+        d += step
+    return None
 
 
 def path_cost_ahead(
@@ -479,6 +541,18 @@ def compute_local_command(
         margin_m=cfg.path_clearance_margin_m,
     )
     path_blocked_ahead = ahead_cost >= cfg.activate_cost_threshold
+    block_dist = (
+        path_block_distance_m(
+            pose,
+            path,
+            view,
+            threshold=cfg.activate_cost_threshold,
+            lookahead_m=cfg.path_clearance_lookahead_m,
+            margin_m=cfg.path_clearance_margin_m,
+        )
+        if path_blocked_ahead
+        else None
+    )
     # Costs already encode the footprint; ``robot_radius_m`` is kept for API
     # compatibility and only bounds the margin.
     collision_r = max(
@@ -580,6 +654,37 @@ def compute_local_command(
             ):
                 continue
             end = rollout[-1]
+            path_dist = _path_distance_m(path, end.x, end.y)
+            # Straight-on toward a block beyond the short rollout horizon used
+            # to score as "free + on path" at full speed (cmd_vx=0.5 with
+            # path_cost_ahead=254). Require a peel or detour-field progress
+            # before driving as far as the block.
+            if path_blocked_ahead and vx > 0.02:
+                travel = abs(vx) * float(cfg.sim_time_s)
+                peeling = path_dist >= 0.28
+                field_progress = False
+                if detour is not None:
+                    dd_end = detour.at(end.x, end.y)
+                    dd_now = detour.at(pose.x, pose.y)
+                    if math.isfinite(dd_end) and (
+                        not math.isfinite(dd_now) or dd_end < dd_now - 0.05
+                    ):
+                        field_progress = True
+                approaches_block = (
+                    block_dist is not None
+                    and travel >= max(0.15, float(block_dist) - 0.25)
+                )
+                if approaches_block and not peeling and not field_progress:
+                    continue
+                # With a field, refuse corridor-hugging creep that makes no
+                # progress toward the rejoin lane.
+                if (
+                    detour is not None
+                    and not peeling
+                    and not field_progress
+                    and path_dist < 0.18
+                ):
+                    continue
             heading_err = abs(conv.normalize_angle(heading_ref - end.theta))
             # Max (not summed) cost along the rollout: summing made every
             # motion from inside an inflation ring look equally bad, so the
@@ -615,7 +720,6 @@ def compute_local_command(
                 # the goal distance" against full price for forward, and a
                 # 1 cm reverse creep beat every forward arc whenever the route
                 # was blocked.
-                path_dist = _path_distance_m(path, end.x, end.y)
                 goal_dist = math.hypot(end.x - gx, end.y - gy)
                 path_pen = cfg.path_weight * (path_dist - path_dist_now)
                 goal_pen = cfg.goal_weight * (goal_dist - goal_dist_now)
