@@ -1207,6 +1207,16 @@ def prepare_lidar_point_cloud(
 ) -> np.ndarray:
     """Optical remap → mount → height band (returns base_link XYZ)."""
     pts = np.asarray(points, dtype=float)
+    if pts.ndim == 2 and pts.size:
+        # Depth cameras emit a full-frame cloud where invalid pixels are
+        # (0, 0, 0) (RealSense: ~1/3 of the frame). Those would land exactly on
+        # the sensor mount after the transform and paint a lethal blob on the
+        # robot unless the z band happens to exclude the mount height. Drop
+        # them (and NaN/inf) before downsampling so the point budget is spent
+        # on real returns.
+        keep = np.isfinite(pts).all(axis=1) & np.any(pts != 0.0, axis=1)
+        if not keep.all():
+            pts = pts[keep]
     if max_points > 0:
         pts = downsample_points(pts, max_points=max_points)
     if pts.size == 0:
