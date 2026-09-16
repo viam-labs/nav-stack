@@ -98,9 +98,23 @@ def test_connect_plan_start_prepends_escape_from_blocked_pose():
         occ, inflation_radius_m=0.25, robot_radius_m=0.22, cost_scaling_factor=4.0
     )
     sx, sy = connected.path.points[0]
-    assert footprint_traversable(
-        costs, occ, sx, sy, robot_radius_m=0.22
-    )
+    # Costs are already inflated by robot_radius: the start cell (plus one cell
+    # of slack) being traversable means the robot can stand there.
+    assert footprint_traversable(costs, occ, sx, sy, robot_radius_m=0.05)
+    assert math.hypot(sx - 1.52, sy - 1.52) >= 0.22
+
+
+def test_plan_start_next_to_live_obstacle_stays_feasible():
+    """Start 0.5 m from a bin with a 0.45 m robot: must not be 'start in lethal'."""
+    m = _empty_map(size=100, resolution=0.05)
+    grid = m["grid"]
+    grid[48:52, 60:64] = 100  # ~0.2 m bin around (3.1, 2.5)
+    start = Pose2D(2.5, 2.5, 0.0)  # 0.5 m from the bin face
+    goal = Pose2D(4.5, 2.5, 0.0)
+    res = plan_path(m, start, goal, inflation_radius_m=0.35, robot_radius_m=0.45)
+    assert res.feasible, res.error_msg
+    sx, sy = res.path.points[0]
+    assert math.hypot(sx - start.x, sy - start.y) < 0.15
 
 
 def test_plan_path_marks_scan_for_dynamic_replan():
@@ -155,6 +169,55 @@ def test_mark_path_ahead_forces_detour_on_replan():
     )
     assert blocked.feasible
     assert paths_meaningfully_differ(baseline.path, blocked.path)
+
+
+def test_mark_path_ahead_keeps_robot_footprint_free():
+    """Painting the corridor must start ahead of the robot, not under it.
+
+    A 0.45 m robot in a 2.6 m-wide room, replanning from *on* its own route:
+    painting from the robot's position made the start lethal and every retry
+    infeasible (57 failed replans while spinning).
+    """
+    grid = np.zeros((80, 120), dtype=np.int16)
+    grid[0:2, :] = 100  # walls: room is y in [0.1, 3.9] -> effectively 2.6 m
+    grid[78:80, :] = 100
+    grid[0:14, :] = 100
+    grid[66:80, :] = 100
+    m = {"grid": grid, "resolution": 0.05, "origin_x": 0.0, "origin_y": 0.0}
+    r = 0.45
+    start = Pose2D(1.0, 2.0, 0.0)
+    goal = Pose2D(5.0, 2.0, 0.0)
+    baseline = plan_path(m, start, goal, inflation_radius_m=0.35, robot_radius_m=r)
+    assert baseline.feasible
+    from src.nav_builtin.costmap import mark_path_ahead_on_occupancy, occupancy_from_map_dict
+
+    occ = occupancy_from_map_dict(m)
+    painted = mark_path_ahead_on_occupancy(
+        occ,
+        baseline.path,
+        start,
+        radius_m=0.12,
+        lookahead_m=1.5,
+        start_offset_m=r + 0.12 + 0.1,
+    )
+    costs = build_costmap(painted, inflation_radius_m=0.35, robot_radius_m=r)
+    # Robot cell itself stays traversable (no lethal within robot_radius).
+    row, col = painted.world_to_cell(start.x, start.y)
+    assert is_traversable(int(costs[row, col]))
+    # And the corridor ahead really is painted.
+    row2, col2 = painted.world_to_cell(start.x + 1.2, start.y)
+    assert int(painted.grid[row2, col2]) >= 50
+    replanned = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.35,
+        robot_radius_m=r,
+        blocked_path=baseline.path,
+        blocked_path_pose=start,
+    )
+    assert replanned.feasible, replanned.error_msg
+    assert paths_meaningfully_differ(baseline.path, replanned.path)
 
 
 def test_build_costmap_inflates_obstacles():
@@ -1204,6 +1267,62 @@ def test_builtin_navigator_compute_path_and_status():
     status = nav.nav_status()
     assert status["motion"] == "builtin"
     assert status["active"] is False
+
+
+def test_try_replan_falls_back_to_scan_plan_and_records_reason():
+    """Painted-corridor retry infeasible -> scan-only plan; reasons kept for status."""
+    from src.nav_builtin.supervisor import NavSupervisor
+
+    # 0.6 m-wide corridor: painting the route seals it, but a scan-only plan
+    # past a bin hugging one wall still exists.
+    grid = np.zeros((60, 120), dtype=np.int16)
+    grid[:24, :] = 100
+    grid[36:, :] = 100
+    m = {"grid": grid, "resolution": 0.05, "origin_x": 0.0, "origin_y": 0.0}
+    world = _FakeWorld(Pose2D(1.0, 1.5, 0.0), m)
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.15,
+        robot_radius_m=0.1,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+    )
+    goal = Pose2D(5.0, 1.5, 0.0)
+    base = sup.plan(goal, start=world.pose)
+    assert base.feasible
+    # Bin 0.8 m ahead, offset toward the +y wall, seen by the scan.
+    n = 72
+    ranges = np.full(n, np.inf)
+    ranges[n // 2 + 2] = math.hypot(0.8, 0.15)  # beam at +10 deg -> (1.8, 1.65)
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    painted = sup.plan(
+        goal,
+        start=world.pose,
+        scan=scan,
+        blocked_path=base.path,
+        blocked_path_pose=world.pose,
+    )
+    assert not painted.feasible  # corridor sealed by the painted route
+    new = sup._try_replan(
+        goal, world.pose, base.path, scan, failed_count=1, require_different=True
+    )
+    assert new is not None
+    assert paths_meaningfully_differ(base.path, new)
+    assert sup._last_replan_error == ""
+
+    # No scan and nothing painted differently -> same route -> reason recorded.
+    same = sup._try_replan(
+        goal, world.pose, base.path, None, failed_count=0, require_different=True
+    )
+    assert same is None
+    assert "same route" in sup._last_replan_error
 
 
 def test_builtin_navigator_cancel_sets_status():

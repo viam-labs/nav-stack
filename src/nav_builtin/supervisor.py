@@ -158,6 +158,7 @@ class NavSupervisor:
         self._status = NavStatus()
         self._status_lock = threading.Lock()
         self._last_cmd_vx = 0.0
+        self._last_replan_error = ""
         self._io_timeout_streak = 0
         # Control-loop soak metrics (wall-clock tick vs configured period).
         self._control_ticks = 0
@@ -437,25 +438,47 @@ class NavSupervisor:
         require_different: bool = True,
         failed_count: int = 0,
     ) -> Optional[Path2D]:
-        """Replan from ``pose``, optionally marking live scan hits on the map."""
-        replanned = self.plan(
-            goal,
-            start=pose,
-            scan=scan,
-            blocked_path=path if failed_count >= 1 else None,
-            blocked_path_pose=pose if failed_count >= 1 else None,
-        )
-        if not replanned.feasible:
-            return None
-        if require_different and not paths_meaningfully_differ(path, replanned.path):
-            return None
-        preview = self._publish_plan_viz(replanned, goal, start=pose)
-        self._set_status(path=preview["path"], length_m=preview["length_m"])
-        return replanned.path
+        """Replan from ``pose``, optionally marking live scan hits on the map.
+
+        With ``failed_count >= 1`` the current corridor is painted so the retry
+        must detour. If that over-constrained map is infeasible, fall back to a
+        scan-only plan rather than failing outright — an identical route is
+        rejected by ``require_different``, but a genuinely new one is fine.
+        The reason for the last failure is kept in ``self._last_replan_error``
+        for status / logs.
+        """
+        attempts: list[tuple[str, bool]] = []
+        if failed_count >= 1:
+            attempts.append(("blocked-corridor", True))
+        attempts.append(("scan", False))
+        reasons: list[str] = []
+        for label, paint in attempts:
+            replanned = self.plan(
+                goal,
+                start=pose,
+                scan=scan,
+                blocked_path=path if paint else None,
+                blocked_path_pose=pose if paint else None,
+            )
+            if not replanned.feasible:
+                reasons.append(f"{label}: {replanned.error_msg or 'infeasible'}")
+                continue
+            if require_different and not paths_meaningfully_differ(
+                path, replanned.path
+            ):
+                reasons.append(f"{label}: same route")
+                continue
+            self._last_replan_error = ""
+            preview = self._publish_plan_viz(replanned, goal, start=pose)
+            self._set_status(path=preview["path"], length_m=preview["length_m"])
+            return replanned.path
+        self._last_replan_error = "; ".join(reasons)
+        return None
 
     def run_goal(self, goal: Pose2D) -> None:
         """Plan and follow until success, failure, or cancel. Blocking."""
         self._cancel.clear()
+        self._last_replan_error = ""
         goal_dict = {"x": float(goal.x), "y": float(goal.y), "theta": float(goal.theta)}
         self._set_status(
             state="active",
@@ -826,6 +849,7 @@ class NavSupervisor:
                     "local_blocked": bool(local_blocked),
                     "path_cost_ahead": int(path_ahead_cost),
                     "failed_replan_while_blocked": int(failed_replan_while_blocked),
+                    "last_replan_error": self._last_replan_error,
                     "nose_clear": bool(nose_clear),
                     "distance_remaining_m": distance_m(pose, goal),
                 }

@@ -116,14 +116,21 @@ def mark_path_ahead_on_occupancy(
     radius_m: float,
     lookahead_m: float = 2.5,
     sample_step_m: float = 0.08,
+    start_offset_m: float = 0.0,
 ) -> OccupancyGrid:
-    """Mark the current route segment ahead of the robot so replans must detour."""
+    """Mark the current route segment ahead of the robot so replans must detour.
+
+    ``start_offset_m`` skips the first stretch of route so the robot's own
+    footprint is not painted lethal (which forced the start to snap sideways
+    and made every retry infeasible in tighter rooms).
+    """
     from .path_utils import closest_point_on_path
 
     pts = path.points
     if len(pts) < 2:
         return occ
     _, _, _, along = closest_point_on_path(pose, path)
+    along += max(0.0, float(start_offset_m))
     seg_lens: list[float] = []
     cum = [0.0]
     for i in range(len(pts) - 1):
