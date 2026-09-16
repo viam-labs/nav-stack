@@ -358,6 +358,7 @@ class NavSupervisor:
         *,
         blocked_path: Optional[Path2D] = None,
         blocked_path_pose: Optional[Pose2D] = None,
+        local_view=None,
     ) -> PlanResult:
         pose = start if start is not None else self._world.get_pose()
         if pose is None:
@@ -382,6 +383,7 @@ class NavSupervisor:
             scan_pose=pose if scan is not None else None,
             blocked_path=blocked_path,
             blocked_path_pose=blocked_path_pose,
+            local_view=local_view,
             dynamic_obstacle_radius_m=max(0.05, min(self._robot_radius, 0.12)),
             max_goal_snap_m=self._max_goal_snap_m,
         )
@@ -453,21 +455,22 @@ class NavSupervisor:
         *,
         require_different: bool = True,
         failed_count: int = 0,
+        local_view=None,
     ) -> Optional[Path2D]:
         """Replan from ``pose``, optionally marking live scan hits on the map.
 
-        Prefer a scan-only plan first (small peel around the live obstacle).
-        Only paint the current corridor after that fails or is identical —
-        painting first sealed the short route and forced room-scale detours.
-        Among feasible different plans, keep the shortest remaining length
-        (cap ~1.8× the current remaining path) so a corridor-seal fallback
-        does not replace a mild detour with a loop around the room.
+        Prefer a scan+local-costmap plan first (small peel around the live
+        obstacle). Only paint the current corridor after that fails or is
+        identical — painting first sealed the short route and forced room-scale
+        detours. Among feasible different plans, keep the shortest remaining
+        length (cap ~1.8× the current remaining path) so a corridor-seal
+        fallback does not replace a mild detour with a loop around the room.
         The reason for the last failure is kept in ``self._last_replan_error``.
         """
         from .controller import _path_length
         from .path_utils import closest_point_on_path
 
-        attempts: list[tuple[str, bool]] = [("scan", False)]
+        attempts: list[tuple[str, bool]] = [("scan+local", False)]
         if failed_count >= 1:
             attempts.append(("blocked-corridor", True))
         reasons: list[str] = []
@@ -481,6 +484,7 @@ class NavSupervisor:
                 scan=scan,
                 blocked_path=path if paint else None,
                 blocked_path_pose=pose if paint else None,
+                local_view=local_view,
             )
             if not replanned.feasible:
                 reasons.append(f"{label}: {replanned.error_msg or 'infeasible'}")
@@ -819,6 +823,7 @@ class NavSupervisor:
                             scan,
                             failed_count=max(1, failed_replan_while_blocked),
                             require_different=failed_replan_while_blocked < 3,
+                            local_view=local_view,
                         )
                         last_local_replan_at = now
                         last_replan = now
@@ -968,6 +973,7 @@ class NavSupervisor:
                             path,
                             scan,
                             failed_count=failed_replan_while_blocked,
+                            local_view=local_view,
                         )
                         if new_path is not None:
                             path = new_path
@@ -1109,6 +1115,7 @@ class NavSupervisor:
                         scan,
                         require_different=not static_blocked,
                         failed_count=failed_replan_while_blocked if local_blocked else 0,
+                        local_view=local_view,
                     )
                     if new_path is not None:
                         path = new_path
@@ -1250,6 +1257,7 @@ class NavSupervisor:
                                 path,
                                 scan,
                                 failed_count=failed_replan_while_blocked,
+                                local_view=local_view,
                             )
                             if new_path is not None:
                                 path = new_path
@@ -1280,6 +1288,7 @@ class NavSupervisor:
                             path,
                             scan,
                             failed_count=failed_replan_while_blocked,
+                            local_view=local_view,
                         )
                         if new_path is not None:
                             path = new_path
