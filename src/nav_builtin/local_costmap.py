@@ -193,15 +193,27 @@ def max_cost_along_segment(
     y1: float,
     *,
     sample_step_m: float = 0.05,
+    margin_m: float = 0.0,
 ) -> int:
-    """Maximum local cost along a world-frame segment."""
+    """Maximum local cost along a world-frame segment.
+
+    ``margin_m > 0`` widens each sample to a disc of that radius so the check
+    covers a band around the segment instead of a one-cell line.
+    """
     seg = math.hypot(x1 - x0, y1 - y0)
     n = max(1, int(math.ceil(seg / max(sample_step_m, 1e-3))))
     worst = FREE
     for k in range(n + 1):
         t = k / n
-        c = view.cost_at_world(x0 + t * (x1 - x0), y0 + t * (y1 - y0))
+        x = x0 + t * (x1 - x0)
+        y = y0 + t * (y1 - y0)
+        if margin_m > 0.0:
+            c = footprint_max_cost(view, x, y, robot_radius_m=margin_m)
+        else:
+            c = view.cost_at_world(x, y)
         worst = max(worst, c)
+        if worst >= LETHAL:
+            break
     return worst
 
 

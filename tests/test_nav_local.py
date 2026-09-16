@@ -191,6 +191,57 @@ def test_local_costmap_marks_scan_hit():
     assert view.cost_at_world(2.0, 1.0) > 0
 
 
+def test_path_cost_ahead_margin_catches_obstacle_just_outside_footprint():
+    """Live hits inflate by robot_radius; a hit 1 cell past that reads free on
+    the centerline. The margin disc must still flag it as blocked."""
+    from src.nav_builtin.local_planner import path_cost_ahead
+    from src.nav_builtin.planner import path_blocked_local
+
+    robot_r = 0.20
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=3.0,
+            height_m=3.0,
+            resolution=0.05,
+            inflation_radius_m=robot_r,
+            robot_radius_m=robot_r,
+            use_global_static=False,
+        )
+    )
+    pose = Pose2D(1.5, 1.5, 0.0)
+    # Path straight ahead along y=1.5; obstacle at (2.2, 1.5 + 0.27): 0.27 m
+    # off the centerline, robot_r + 1 cell → centerline cost 0.
+    dy = robot_r + 0.07
+    bearing = math.atan2(dy, 0.7)
+    rng = math.hypot(0.7, dy)
+    n = 360
+    ranges = np.full(n, math.inf)
+    b = int((bearing + math.pi) / (2 * math.pi / n)) % n
+    ranges[b] = rng
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(pose, scan)
+    # Stay inside the 3 m local window (x < 3.0) so bounds never read lethal.
+    path = Path2D(points=[(1.5, 1.5), (2.2, 1.5), (2.7, 1.5)], goal_theta=0.0)
+
+    centerline = path_cost_ahead(pose, path, view, lookahead_m=1.2)
+    with_margin = path_cost_ahead(pose, path, view, lookahead_m=1.2, margin_m=0.10)
+    assert centerline < 200
+    assert with_margin >= 200
+    assert (
+        path_blocked_local(pose, path, view, cost_threshold=200, lookahead_m=1.2)
+        is False
+    )
+    assert path_blocked_local(
+        pose, path, view, cost_threshold=200, lookahead_m=1.2, margin_m=0.10
+    )
+
+
 def test_reverse_backup_feasible_requires_cost_improvement():
     lc = LocalCostmap(
         LocalCostmapConfig(

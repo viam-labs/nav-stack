@@ -133,7 +133,7 @@ the robot in the local costmap. Refresh rate is nav-side
 | `obstacles_only_rate_hz` | Nav | Background refresh rate for `obstacles_only` depth cams (default `2.5`). Control tick never awaits GetPointCloud; prefer POSIX `shm_name` for 10–20 Hz |
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced map/scan tuning keys (merged into engine defaults) |
-| `robot_radius`, `max_vel_x`, … | Nav | Top-level footprint / velocity limits |
+| `robot_radius`, `max_vel_x`, … | Nav | Top-level footprint / velocity limits. `robot_radius` also sizes the reactive stop: any live return inside the body-width corridor ahead (not just the ±35° cone) counts as forward clearance, and the live "path blocked" check samples a 0.10 m band around the route |
 | `xy_goal_tolerance`, `yaw_goal_tolerance` | Nav | Goal arrival tolerances (m / rad). Also accepted under `builtin` |
 | `min_cmd_vel_x`, `min_cmd_vel_theta` | Nav | Optional stiction floors (default **off** / `0`) for simple `go_to_*` motion. Legacy aliases: `simple_min_vel_x` / `simple_min_vel_theta` |
 | `resolution`, `max_laser_range` | SLAM | Map cell size (m) and lidar range used for matching/mapping. Also accepted under `map` |
