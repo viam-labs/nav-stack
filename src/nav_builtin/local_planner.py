@@ -658,7 +658,7 @@ def compute_local_command(
             # On a blocked route, forward motion must leave the corridor —
             # not drive down it at max speed toward a block beyond the horizon.
             if path_blocked_ahead and vx > 0.08:
-                leaving = path_dist >= 0.18 or path_dist >= path_dist_now + 0.10
+                leaving = path_dist >= 0.22 or path_dist >= path_dist_now + 0.12
                 if not leaving:
                     continue
             heading_err = abs(conv.normalize_angle(heading_ref - end.theta))
@@ -740,6 +740,15 @@ def compute_local_command(
         return DriveCommand(0.0, 0.0, direction * max_vel_theta * 0.5, False)
 
     vx, vtheta, _ = best
+    # Hard ban on corridor charge: peel gate + scoring can still pick a
+    # near-straight max-vx sample when the robot is already a bit off-path
+    # (path_dist looks "leaving"). Cap that to a slow peel toward heading_ref.
+    if path_blocked_ahead and vx > 0.15 and abs(vtheta) < 0.25:
+        turn = conv.normalize_angle(heading_ref - pose.theta)
+        if abs(turn) > math.radians(8.0):
+            direction = 1.0 if turn >= 0.0 else -1.0
+            vtheta = direction * max(0.4, min(max_vel_theta * 0.55, abs(turn) * 1.2))
+            vx = min(vx, 0.18)
     cmd = DriveCommand(vx, 0.0, vtheta, False)
     from ..nav.simple_motion import SimpleMotionConfig
 
