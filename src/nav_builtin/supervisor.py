@@ -11,6 +11,7 @@ from ..nav.simple_motion import (
     ObstacleConfig,
     SimpleMotionConfig,
     distance_m,
+    forward_clearance_m,
     rear_clearance_m,
 )
 from ..geom import conversions as conv
@@ -696,18 +697,34 @@ class NavSupervisor:
                     local_blocked = True
                     if local_blocked_since is None:
                         local_blocked_since = reactive_avoid_since
-                # Nav2 Wait analogue: hold still so transient movers can clear
-                # before we burn a detour replan.
+                # Nav2 Wait analogue: hold translation so a transient mover can
+                # clear. Skip the wait when the nose is already clear — a bin on
+                # the path is not a person who will move, and freezing yaw left
+                # the robot stuck facing away from the route (bearing ~50° with
+                # 2.7 m forward clearance).
                 wait_before_replan_s = max(
                     self._recovery_wait_duration_s,
                     self._replan_local_blocked_time_s,
                 )
+                nose_clear = True
+                obs_cfg = self._follower.obstacle
+                if (
+                    scan is not None
+                    and obs_cfg is not None
+                    and obs_cfg.enabled
+                ):
+                    nose_clear = (
+                        forward_clearance_m(scan, obs_cfg) > obs_cfg.stop_distance_m
+                    )
                 waiting_for_clear = False
                 if local_blocked:
                     if local_blocked_since is None:
                         local_blocked_since = now
                     blocked_for = now - local_blocked_since
-                    if blocked_for < wait_before_replan_s:
+                    if (
+                        blocked_for < wait_before_replan_s
+                        and not nose_clear
+                    ):
                         waiting_for_clear = True
                     elif (
                         now - last_local_replan_at
@@ -737,14 +754,16 @@ class NavSupervisor:
                     local_blocked_since = None
                     failed_replan_while_blocked = 0
 
-                # Keep DWA available after a failed detour replan — otherwise
-                # local_blocked permanently disables the only layer that can
-                # swerve, leaving reactive avoid to spin in place.
+                # Keep DWA available when the path is blocked but the nose is
+                # clear (or after a failed detour) — otherwise we only spin in
+                # reactive avoid / sit in wait.
                 allow_local_planner = (
                     self._local_costmap_enabled
                     and not waiting_for_clear
                     and (
-                        not local_blocked or failed_replan_while_blocked >= 1
+                        not local_blocked
+                        or failed_replan_while_blocked >= 1
+                        or nose_clear
                     )
                 )
                 cmd, progress = compute_path_command(
@@ -782,17 +801,26 @@ class NavSupervisor:
                     "local_blocked": bool(local_blocked),
                     "path_cost_ahead": int(path_ahead_cost),
                     "failed_replan_while_blocked": int(failed_replan_while_blocked),
+                    "nose_clear": bool(nose_clear),
                 }
 
                 if waiting_for_clear:
-                    # Stop and let the blocker move; don't trip stall timeout.
-                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                    # Freeze translation only — still allow rotate-to-heading so
+                    # a large bearing error can shrink while we wait.
+                    keep_yaw = (
+                        abs(cmd.vx) < 1e-6
+                        and abs(cmd.vy) < 1e-6
+                        and abs(cmd.vtheta) > 1e-6
+                    )
+                    cmd = DriveCommand(
+                        0.0, 0.0, cmd.vtheta if keep_yaw else 0.0, False
+                    )
                     progress = {
                         **progress,
                         "obstacle": "wait",
                         "local_planner": False,
                         "cmd_vx_mps": 0.0,
-                        "cmd_vtheta_rad_s": 0.0,
+                        "cmd_vtheta_rad_s": cmd.vtheta,
                     }
                     last_progress_at = now
                     last_progress_pose = pose
@@ -1041,6 +1069,10 @@ class NavSupervisor:
                         for k in (
                             "obstacle",
                             "local_planner",
+                            "local_blocked",
+                            "path_cost_ahead",
+                            "failed_replan_while_blocked",
+                            "nose_clear",
                             "forward_clearance_m",
                             "cmd_vx_mps",
                             "cmd_vtheta_rad_s",
