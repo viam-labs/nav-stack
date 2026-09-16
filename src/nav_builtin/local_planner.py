@@ -65,7 +65,9 @@ class LocalPlannerConfig:
     # 100° off — into clutter that was not in the nose cone.
     max_translate_heading_err_rad: float = math.radians(70.0)
     vx_samples: int = 5
-    vtheta_samples: int = 5
+    # 5 samples over [-max, max] meant 0.75 rad/s steps at max_vel_theta=1.5, so
+    # consecutive ticks could only jump between coarse turn rates (twitch).
+    vtheta_samples: int = 9
     sim_time_s: float = 1.2
     sim_dt_s: float = 0.15
     enabled: bool = True
@@ -755,7 +757,7 @@ def compute_local_command(
         turn = conv.normalize_angle(heading_ref - pose.theta)
         if abs(turn) > math.radians(8.0):
             direction = 1.0 if turn >= 0.0 else -1.0
-            vtheta = direction * max(0.4, min(max_vel_theta * 0.55, abs(turn) * 1.2))
+            vtheta = direction * max(0.25, min(max_vel_theta * 0.55, abs(turn) * 1.2))
             vx = min(vx, min(0.18, float(cfg.max_detour_forward_mps)))
     cmd = DriveCommand(vx, 0.0, vtheta, False)
     from ..nav.simple_motion import SimpleMotionConfig

@@ -22,6 +22,7 @@ from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
 from src.nav_builtin.controller import (
     FollowerConfig,
     compute_path_command,
+    limit_twist_rate,
     update_speed_estimate,
 )
 from src.nav_builtin.path_utils import signed_crosstrack_m
@@ -138,6 +139,7 @@ def _run(
     stop_dist_m: float = 0.5,
     seed: int = 0,
     base: Optional[BaseModel] = IDEAL,
+    slew_limit: bool = False,
 ) -> RunLog:
     rng = random.Random(seed)
     true = start
@@ -168,6 +170,9 @@ def _run(
             prev_cmd=prev_cmd,
         )
         rotate_active = bool(progress.get("rotate_to_heading"))
+        if slew_limit:
+            # Mirrors the supervisor's final gate before SetVelocity.
+            cmd = limit_twist_rate(cmd, prev_cmd, cfg=cfg, dt_s=dt)
         last_vx = update_speed_estimate(last_vx, cmd.vx)  # mirrors supervisor
         prev_cmd = cmd
         vx, _vy, w = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
@@ -247,6 +252,24 @@ def test_corner_bounded_cut_and_recovery(seed: int):
     assert max(abs(c) for c in after) < 0.12
     assert log.spin_toggles() == 0
     # One corner → at most one real direction change plus small settling.
+    assert log.sign_flips() <= 3
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_slew_limited_corner_still_tracks(seed: int):
+    """The final slew gate must smooth commands without loosening tracking."""
+    log = _run(
+        _l_corner(),
+        Pose2D(0.0, 0.0, 0.0),
+        cfg=_robot_cfg(),
+        seed=seed,
+        slew_limit=True,
+    )
+    assert log.reached
+    assert max(abs(c) for c in log.crosstrack) < 0.32
+    after = [c for c, v in zip(log.crosstrack, log.vx) if v > 0][-30:]
+    assert max(abs(c) for c in after) < 0.12
+    assert log.spin_toggles() == 0
     assert log.sign_flips() <= 3
 
 

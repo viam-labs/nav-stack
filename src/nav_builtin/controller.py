@@ -70,6 +70,13 @@ class FollowerConfig:
     wheel_half_track_m: float = 0.27
     wheel_min_speed_mps: float = 0.06
     min_turn_radius_m: Optional[float] = None
+    # Command slew limits. The base has no onboard ramp, so every handoff
+    # between command sources (pursuit / DWA / reactive avoid / planning stop)
+    # used to step vx and vθ in a single tick — that is the visible jerk.
+    # Braking to a standstill is exempt (see ``limit_twist_rate``).
+    max_linear_accel_mps2: float = 0.8
+    max_linear_decel_mps2: float = 1.2
+    max_angular_accel_rad_s2: float = 2.0
     motion: SimpleMotionConfig = field(default_factory=SimpleMotionConfig)
     obstacle: Optional[ObstacleConfig] = None
 
@@ -286,6 +293,58 @@ def keep_arc_drivable(cmd: DriveCommand, cfg: Optional[FollowerConfig] = None) -
     if vx == cmd.vx and kappa == cmd.vtheta / cmd.vx:
         return cmd
     return DriveCommand(vx, cmd.vy, vx * kappa, False)
+
+
+def limit_twist_rate(
+    cmd: DriveCommand,
+    prev: Optional[DriveCommand],
+    *,
+    cfg: FollowerConfig,
+    dt_s: float,
+) -> DriveCommand:
+    """Bound how far a command may move from the one already on the base.
+
+    Applied as the last gate before ``SetVelocity``. Ramping     ``vx`` alone would
+    tighten the arc (ω/vx grows), so a translating command keeps its curvature
+    by scaling ``vθ`` with the limited speed, then gets re-checked against the
+    skid-steer wheel envelope.
+
+    Any command that asks translation to stop takes effect on the same tick —
+    the reactive stop bubble, costmap hard stop, wait, and pre-replan stop must
+    never be slewed. Only speeding up, changing speed between nonzero values,
+    and yaw changes are rate limited.
+    """
+    if cmd.done:
+        return cmd
+    dt = max(1e-3, float(dt_s))
+    target_vx = float(cmd.vx)
+    target_w = float(cmd.vtheta)
+    if abs(target_vx) < 1e-6 and abs(target_w) < 1e-6:
+        return cmd
+    prev_vx = 0.0 if prev is None else float(prev.vx)
+    prev_w = 0.0 if prev is None else float(prev.vtheta)
+
+    if abs(target_vx) < 1e-6:
+        vx = 0.0
+        w = target_w
+    else:
+        speeding_up = abs(target_vx) > abs(prev_vx) and target_vx * prev_vx >= 0.0
+        max_dv = dt * float(
+            cfg.max_linear_accel_mps2 if speeding_up else cfg.max_linear_decel_mps2
+        )
+        vx = prev_vx + max(-max_dv, min(max_dv, target_vx - prev_vx))
+        # Preserve the requested arc while the speed ramps.
+        w = target_w * (vx / target_vx)
+    max_dw = dt * float(cfg.max_angular_accel_rad_s2)
+    w = prev_w + max(-max_dw, min(max_dw, w - prev_w))
+
+    out = DriveCommand(vx, cmd.vy, w, False)
+    if vx > 0.0:
+        # May raise vx to the slowest speed that still drives this arc; never
+        # past what the caller asked for.
+        out = keep_arc_drivable(out, cfg)
+        out = DriveCommand(min(out.vx, target_vx), out.vy, out.vtheta, False)
+    return apply_velocity_floor(out, cfg.motion)
 
 
 def _prev_curvature(prev_cmd: Optional[DriveCommand]) -> Optional[float]:

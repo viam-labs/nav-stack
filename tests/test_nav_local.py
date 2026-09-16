@@ -505,6 +505,72 @@ def test_local_planner_does_not_charge_blocked_corridor():
     assert not (cmd.vx >= 0.35 and abs(cmd.vtheta) < 0.05), f"charged: {cmd}"
 
 
+def _slew_cfg() -> FollowerConfig:
+    from src.nav.simple_motion import SimpleMotionConfig
+
+    cfg = FollowerConfig()
+    cfg.motion = SimpleMotionConfig(max_linear_mps=0.5, max_angular_rad_s=1.5)
+    return cfg
+
+
+def test_slew_limit_ramps_forward_speed_from_rest():
+    """No instant step from standstill to cruise (the visible jerk)."""
+    from src.nav_builtin.controller import limit_twist_rate
+
+    cfg = _slew_cfg()
+    target = DriveCommand(0.5, 0.0, 0.0, False)
+    cmd = None
+    speeds = []
+    for _ in range(6):
+        cmd = limit_twist_rate(target, cmd, cfg=cfg, dt_s=0.1)
+        speeds.append(cmd.vx)
+    # First command is the base's own crawl floor, not 0.5 m/s.
+    assert speeds[0] < 0.2
+    assert all(b >= a - 1e-9 for a, b in zip(speeds, speeds[1:]))
+    # Steps after the crawl floor respect max_linear_accel_mps2 * dt.
+    steps = [b - a for a, b in zip(speeds, speeds[1:])]
+    assert max(steps) <= cfg.max_linear_accel_mps2 * 0.1 + 1e-6
+    # Still reaches the requested speed promptly.
+    assert speeds[-1] == pytest.approx(0.5)
+
+
+def test_slew_limit_ramps_yaw_and_preserves_arc():
+    """Yaw steps are bounded, and a ramping arc keeps its curvature."""
+    from src.nav_builtin.controller import limit_twist_rate
+
+    cfg = _slew_cfg()
+    spin = limit_twist_rate(
+        DriveCommand(0.0, 0.0, 1.5, False), None, cfg=cfg, dt_s=0.1
+    )
+    assert spin.vx == 0.0
+    assert spin.vtheta == pytest.approx(cfg.max_angular_accel_rad_s2 * 0.1)
+
+    prev = DriveCommand(0.2, 0.0, 0.2, False)  # curvature 1.0 /m
+    out = limit_twist_rate(
+        DriveCommand(0.5, 0.0, 0.5, False), prev, cfg=cfg, dt_s=0.1
+    )
+    assert out.vx < 0.5
+    assert out.vtheta / out.vx == pytest.approx(1.0, abs=1e-6)
+
+
+def test_slew_limit_never_delays_stopping():
+    """Stop bubble / hard stop / wait must still take effect on the same tick."""
+    from src.nav_builtin.controller import limit_twist_rate
+
+    cfg = _slew_cfg()
+    cruising = DriveCommand(0.5, 0.0, 0.0, False)
+    # Freeze translation but keep turning (reactive avoid, wait-for-mover).
+    turn_only = limit_twist_rate(
+        DriveCommand(0.0, 0.0, 1.0, False), cruising, cfg=cfg, dt_s=0.1
+    )
+    assert turn_only.vx == 0.0
+    # Full stop passes through untouched.
+    full_stop = limit_twist_rate(
+        DriveCommand(0.0, 0.0, 0.0, False), cruising, cfg=cfg, dt_s=0.1
+    )
+    assert full_stop.vx == 0.0 and full_stop.vtheta == 0.0
+
+
 def test_local_replan_paints_raw_hits_not_merged_static_inflation():
     """Do not turn an already-inflated mapped wall into new occupancy."""
     from src.nav_builtin.costmap import mark_local_costmap_on_occupancy

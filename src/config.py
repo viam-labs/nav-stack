@@ -459,6 +459,11 @@ class BuiltinNavConfig:
     # Cooldown begins when a blocking plan finishes. Give the local planner
     # time to execute the peel instead of stop/replanning every control tick.
     replan_local_min_period_s: float = 4.0
+    # Command slew limits (the base has no onboard ramp). Requests to stop
+    # translating are never slewed, so stop distances are unaffected.
+    max_linear_accel_mps2: float = 0.8
+    max_linear_decel_mps2: float = 1.2
+    max_angular_accel_rad_s2: float = 2.0
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":
@@ -511,6 +516,9 @@ class BuiltinNavConfig:
                 d.get("replan_local_blocked_time_s", 0.3)
             ),
             replan_local_min_period_s=float(d.get("replan_local_min_period_s", 4.0)),
+            max_linear_accel_mps2=float(d.get("max_linear_accel_mps2", 0.8)),
+            max_linear_decel_mps2=float(d.get("max_linear_decel_mps2", 1.2)),
+            max_angular_accel_rad_s2=float(d.get("max_angular_accel_rad_s2", 2.0)),
         )
 
 
