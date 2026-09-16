@@ -1433,6 +1433,131 @@ def test_builtin_navigator_cancel_sets_status():
     assert _path_length(new) < base_len * 1.6
 
 
+def test_forced_side_detour_peels_around_blocked_sample():
+    """Synthetic left/right via must leave the corridor without a room loop."""
+    from src.nav_builtin.controller import _path_length
+    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav_builtin.supervisor import NavSupervisor
+
+    m = _empty_map(size=120, resolution=0.05)
+    world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        clearance_preference_m=0.0,
+    )
+    goal = Pose2D(5.0, 3.0, 0.0)
+    base = plan_path(
+        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert base.feasible
+    base_len = _path_length(base.path)
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=4.0,
+            height_m=4.0,
+            resolution=0.05,
+            inflation_radius_m=0.25,
+            robot_radius_m=0.22,
+            use_global_static=False,
+        )
+    )
+    n = 72
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 1.2
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(world.pose, scan)
+    forced = sup._forced_side_detour(goal, world.pose, base.path, scan, view)
+    assert forced is not None, "expected a left/right via peel"
+    new_path, _result, label = forced
+    assert label.startswith("via")
+    assert paths_meaningfully_differ(base.path, new_path, tol_m=0.12)
+    assert _path_length(new_path) < base_len * 2.2
+
+
+def test_try_replan_falls_to_forced_via_when_plans_identical():
+    """If scan+local/paint keep returning the same path, use forced via."""
+    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav_builtin.types import PlanResult
+
+    m = _empty_map(size=120, resolution=0.05)
+    world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        clearance_preference_m=0.0,
+    )
+    goal = Pose2D(5.0, 3.0, 0.0)
+    base = plan_path(
+        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert base.feasible
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=4.0,
+            height_m=4.0,
+            resolution=0.05,
+            inflation_radius_m=0.25,
+            robot_radius_m=0.22,
+            use_global_static=False,
+        )
+    )
+    n = 72
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 1.2
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(world.pose, scan)
+
+    real_plan = sup.plan
+
+    def sticky_same_route(g, start=None, scan=None, **kwargs):
+        # From the live pose to the final goal: pretend the planner is stuck
+        # on the old corridor. Via hops (different goals / starts) plan for real.
+        start_pose = start if start is not None else world.pose
+        at_live = (
+            abs(start_pose.x - world.pose.x) < 1e-6
+            and abs(start_pose.y - world.pose.y) < 1e-6
+        )
+        to_goal = abs(g.x - goal.x) < 1e-6 and abs(g.y - goal.y) < 1e-6
+        if at_live and to_goal:
+            return PlanResult(feasible=True, path=base.path)
+        return real_plan(g, start=start, scan=scan, **kwargs)
+
+    sup.plan = sticky_same_route  # type: ignore[method-assign]
+    new = sup._try_replan(
+        goal,
+        world.pose,
+        base.path,
+        scan,
+        failed_count=2,
+        require_different=True,
+        local_view=view,
+    )
+    assert new is not None
+    assert paths_meaningfully_differ(base.path, new, tol_m=0.12)
+
+
 def test_builtin_navigator_cancel_sets_status():
     world = _FakeWorld(Pose2D(0.2, 0.2, 0.0), _empty_map())
     nav = BuiltinNavigator(world, avoid_obstacles=False)

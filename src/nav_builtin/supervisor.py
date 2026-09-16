@@ -448,6 +448,91 @@ class NavSupervisor:
                 pass
         self._last_cmd_vx = 0.0
 
+    def _forced_side_detour(
+        self,
+        goal: Pose2D,
+        pose: Pose2D,
+        path: Path2D,
+        scan: Optional[conv.LaserScan2D],
+        local_view,
+    ) -> Optional[tuple[Path2D, PlanResult, str]]:
+        """Plan pose → side via → goal when corridor seals keep returning the
+        same route. Picks the shorter left/right peel that stays moderate.
+        """
+        from .controller import _path_length
+        from .local_costmap import footprint_collides
+        from .local_planner import path_block_distance_m, path_point_ahead
+        from .planner import _merge_path_prefix
+
+        if path.empty or len(path.points) < 2:
+            return None
+        block_dist = 0.9
+        if local_view is not None:
+            bd = path_block_distance_m(
+                pose,
+                path,
+                local_view,
+                threshold=self._local_planner.activate_cost_threshold,
+                lookahead_m=self._local_planner.path_clearance_lookahead_m,
+                margin_m=self._local_planner.path_clearance_margin_m,
+            )
+            if bd is not None:
+                block_dist = max(0.4, float(bd))
+        bx, by = path_point_ahead(path, pose.x, pose.y, block_dist)
+        bx2, by2 = path_point_ahead(path, pose.x, pose.y, block_dist + 0.25)
+        yaw = math.atan2(by2 - by, bx2 - bx)
+        nx, ny = -math.sin(yaw), math.cos(yaw)
+        remaining = max(0.5, _path_length(path))
+        best: Optional[tuple[float, Path2D, PlanResult, str]] = None
+        for side in (0.45, -0.45, 0.65, -0.65, 0.35, -0.35):
+            via = Pose2D(bx + side * nx, by + side * ny, yaw)
+            if local_view is not None and footprint_collides(
+                local_view,
+                via.x,
+                via.y,
+                robot_radius_m=max(0.05, min(0.08, self._robot_radius)),
+            ):
+                continue
+            to_via = self.plan(
+                via,
+                start=pose,
+                scan=scan,
+                blocked_path=path,
+                blocked_path_pose=pose,
+                local_view=local_view,
+                paint_corridor=False,
+            )
+            if not to_via.feasible:
+                continue
+            to_goal = self.plan(
+                goal,
+                start=via,
+                scan=scan,
+                local_view=local_view,
+                paint_corridor=False,
+            )
+            if not to_goal.feasible:
+                continue
+            merged = _merge_path_prefix(to_via.path, to_goal.path)
+            if not paths_meaningfully_differ(path, merged, tol_m=0.12):
+                continue
+            new_len = _path_length(merged)
+            # Mild peel only — reject room-scale loops.
+            if new_len > remaining * 2.2:
+                continue
+            label = f"via{'L' if side > 0 else 'R'}{abs(side):.2f}"
+            result = PlanResult(
+                feasible=True,
+                path=merged,
+                planning_time_s=to_via.planning_time_s + to_goal.planning_time_s,
+                costmap_viz=to_goal.costmap_viz or to_via.costmap_viz,
+            )
+            if best is None or new_len < best[0]:
+                best = (new_len, merged, result, label)
+        if best is None:
+            return None
+        return best[1], best[2], best[3]
+
     def _try_replan(
         self,
         goal: Pose2D,
@@ -459,15 +544,16 @@ class NavSupervisor:
         failed_count: int = 0,
         local_view=None,
     ) -> Optional[Path2D]:
-        """Replan from ``pose``, optionally marking live scan hits on the map.
+        """Replan around a live block: mild peel first, forced side via last.
 
-        Prefer a scan+local-costmap plan first (small peel around the live
-        obstacle). Only paint the current corridor after that fails or is
-        identical — painting first sealed the short route and forced room-scale
-        detours. Among feasible different plans, keep the shortest remaining
-        length (cap ~1.8× the current remaining path) so a corridor-seal
-        fallback does not replace a mild detour with a loop around the room.
-        The reason for the last failure is kept in ``self._last_replan_error``.
+        Policy:
+        - Prefer scan+local (and optional corridor paint) that actually leaves
+          the old route (tol 0.12 m — 0.25 m was rejecting useful peels as
+          ``same route``).
+        - Cap length at ~1.8× remaining so we don't take room-scale loops.
+        - If every attempt is same-route/infeasible, force left/right vias
+          around the first blocked path sample — that is the static-box case
+          where Lazy Theta* stubbornly hugs the old corridor.
         """
         from .controller import _path_length
         from .path_utils import closest_point_on_path
@@ -479,13 +565,12 @@ class NavSupervisor:
         _, _, _, along = closest_point_on_path(pose, path)
         remaining = max(0.5, _path_length(path) - along)
         best: Optional[tuple[float, Path2D, PlanResult]] = None
+        differ_tol = 0.12 if local_view is not None else 0.25
         for label, paint in attempts:
             replanned = self.plan(
                 goal,
                 start=pose,
                 scan=scan,
-                # Always pass the live path so local high-cost samples on it
-                # get sealed; paint_corridor controls the extra corridor strip.
                 blocked_path=path,
                 blocked_path_pose=pose,
                 local_view=local_view,
@@ -495,13 +580,11 @@ class NavSupervisor:
                 reasons.append(f"{label}: {replanned.error_msg or 'infeasible'}")
                 continue
             if require_different and not paths_meaningfully_differ(
-                path, replanned.path
+                path, replanned.path, tol_m=differ_tol
             ):
                 reasons.append(f"{label}: same route")
                 continue
             new_len = _path_length(replanned.path)
-            # Corridor paint can open a long way around; skip if much longer
-            # than remaining route, unless nothing shorter succeeded.
             if paint and new_len > remaining * 1.8 and best is not None:
                 reasons.append(
                     f"{label}: too long ({new_len:.1f} m > {remaining * 1.8:.1f} m)"
@@ -509,9 +592,17 @@ class NavSupervisor:
                 continue
             if best is None or new_len < best[0]:
                 best = (new_len, replanned.path, replanned)
-            # Scan-only short detour is enough — don't keep looking for paint.
             if not paint:
                 break
+        if best is None and local_view is not None:
+            forced = self._forced_side_detour(goal, pose, path, scan, local_view)
+            if forced is not None:
+                new_path, result, label = forced
+                self._last_replan_error = ""
+                preview = self._publish_plan_viz(result, goal, start=pose)
+                self._set_status(path=preview["path"], length_m=preview["length_m"])
+                return new_path
+            reasons.append("forced-via: none feasible")
         if best is None:
             self._last_replan_error = "; ".join(reasons)
             return None
@@ -786,9 +877,10 @@ class NavSupervisor:
                         local_blocked_since = reactive_avoid_since
                 # Nav2 Wait analogue: hold translation so a transient mover can
                 # clear. Skip the wait when the nose is already clear — a bin on
-                # the path is not a person who will move, and freezing yaw left
-                # the robot stuck facing away from the route (bearing ~50° with
-                # 2.7 m forward clearance).
+                # Static vs moving: nose_clear ⇒ obstacle is off the bumper
+                # (box on the route, wall clutter) — replan/detour immediately.
+                # Nose blocked ⇒ likely a mover (person); pause briefly so they
+                # can clear, then replan if they stay.
                 wait_before_replan_s = max(
                     self._recovery_wait_duration_s,
                     self._replan_local_blocked_time_s,
@@ -817,9 +909,8 @@ class NavSupervisor:
                         now - last_local_replan_at
                         >= self._replan_local_min_period_s
                     ):
-                        # Always paint the current route as blocked so the first
-                        # retry must leave the corridor — waiting for
-                        # failed_count>=1 left us spinning with identical plans.
+                        # Stop only long enough to plan. Paint + forced-via
+                        # kick in so we do not keep accepting the same corridor.
                         self._stop_before_replan()
                         new_path = self._try_replan(
                             goal,
@@ -1203,9 +1294,9 @@ class NavSupervisor:
                 # Pure spin with no bearing improvement must not reset the timer
                 # forever (stuck local-planner / RIP loops need to replan). But
                 # intentional align spins that shrink |bearing| are real progress.
-                # While the route is locally blocked, give more time — stop/replan
-                # cycles and peels look like "no progress" and were aborting with
-                # cmd_vx still showing a full-speed charge at the block.
+                # While the route is locally blocked, give recovery room —
+                # stop/replan/forced-via look like "no progress" and were
+                # aborting with cmd_vx still showing a corridor charge.
                 dist_goal = distance_m(pose, goal)
                 near_goal_stall = (
                     dist_goal <= self._follower.motion.xy_tolerance_m * 2.0
@@ -1215,7 +1306,7 @@ class NavSupervisor:
                 translating_floor = 0.03 if near_goal_stall else 0.05
                 stall_scale = 2.0 if near_goal_stall else 1.0
                 if local_blocked:
-                    stall_scale = max(stall_scale, 2.5)
+                    stall_scale = max(stall_scale, 4.0)
                 stall_limit_s = self._follower.motion.stall_timeout_s * stall_scale
                 bearing_err = abs(float(progress.get("bearing_error_rad", 0.0)))
                 spinning = (
@@ -1230,6 +1321,45 @@ class NavSupervisor:
                     last_progress_at = now
                     last_progress_dist = dist_goal
                     last_progress_bearing = bearing_err
+
+                def _stall_replan_or_fail(error_msg: str) -> bool:
+                    """Try replan (incl. forced via). True ⇒ caller should return."""
+                    nonlocal path, last_progress_at, last_progress_dist
+                    nonlocal last_progress_bearing, last_replan
+                    nonlocal local_blocked_since, backup_attempts
+                    nonlocal failed_replan_while_blocked
+                    self._stop_before_replan()
+                    new_path = self._try_replan(
+                        goal,
+                        pose,
+                        path,
+                        scan,
+                        failed_count=max(2, failed_replan_while_blocked),
+                        local_view=local_view,
+                    )
+                    if new_path is not None:
+                        path = new_path
+                        last_progress_at = now
+                        last_progress_dist = dist_goal
+                        last_progress_bearing = bearing_err
+                        last_replan = now
+                        local_blocked_since = None
+                        failed_replan_while_blocked = 0
+                        backup_attempts = 0
+                        return False
+                    # Still recovering: do not abort while local_blocked and
+                    # we have not exhausted several forced-via attempts.
+                    if local_blocked and failed_replan_while_blocked < 5:
+                        failed_replan_while_blocked += 1
+                        last_progress_at = now
+                        return False
+                    self._world.stop()
+                    self._set_status(
+                        state="failed",
+                        active=False,
+                        error_msg=error_msg,
+                    )
+                    return True
 
                 if last_progress_pose is None:
                     _mark_progress()
@@ -1255,30 +1385,7 @@ class NavSupervisor:
                         if turned >= self._follower.motion.stall_progress_rad:
                             _mark_progress()
                         elif now - last_progress_at >= stall_limit_s:
-                            self._stop_before_replan()
-                            new_path = self._try_replan(
-                                goal,
-                                pose,
-                                path,
-                                scan,
-                                failed_count=failed_replan_while_blocked,
-                                local_view=local_view,
-                            )
-                            if new_path is not None:
-                                path = new_path
-                                last_progress_at = now
-                                last_progress_dist = dist_goal
-                                last_progress_bearing = bearing_err
-                                last_replan = now
-                                local_blocked_since = None
-                                backup_attempts = 0
-                            else:
-                                self._world.stop()
-                                self._set_status(
-                                    state="failed",
-                                    active=False,
-                                    error_msg="navigation stalled",
-                                )
+                            if _stall_replan_or_fail("navigation stalled"):
                                 return
                     elif spinning and (
                         turned >= self._follower.motion.stall_progress_rad
@@ -1286,30 +1393,9 @@ class NavSupervisor:
                     ):
                         _mark_progress()
                     elif now - last_progress_at >= stall_limit_s:
-                        self._stop_before_replan()
-                        new_path = self._try_replan(
-                            goal,
-                            pose,
-                            path,
-                            scan,
-                            failed_count=failed_replan_while_blocked,
-                            local_view=local_view,
-                        )
-                        if new_path is not None:
-                            path = new_path
-                            last_progress_at = now
-                            last_progress_dist = dist_goal
-                            last_progress_bearing = bearing_err
-                            last_replan = now
-                            local_blocked_since = None
-                            backup_attempts = 0
-                        else:
-                            self._world.stop()
-                            self._set_status(
-                                state="failed",
-                                active=False,
-                                error_msg="navigation stalled (no forward progress)",
-                            )
+                        if _stall_replan_or_fail(
+                            "navigation stalled (no forward progress)"
+                        ):
                             return
 
                 try:
