@@ -672,6 +672,12 @@ class SlamConfig:
         default_factory=lambda: {
             "full_map": True,
             "map_source": "live",
+            # Finer than the generic full-map defaults — office maps need it
+            # to keep the true pose in the coarse winner set.
+            "coarse_position_step_m": 0.35,
+            "coarse_yaw_step_deg": 10.0,
+            "ray_weight": 0.55,
+            "ray_refine_candidates": 48,
         }
     )
     global_localize_on_start_refine: bool = True
@@ -736,7 +742,7 @@ class SlamConfig:
     # cheap local match and run full-map global_localize immediately.
     periodic_relocalize_nav_recoveries_threshold: int = 2
     periodic_relocalize_full_map_on_low_quality: bool = True
-    periodic_relocalize_during_navigation: bool = True
+    periodic_relocalize_during_navigation: bool = False
     # Run global_localize / ray scoring in a dedicated subprocess so the
     # matcher's Python loops do not hold this process's GIL (which starved the
     # nav control tick and wheel-odom reads). Falls back in-process on error.
@@ -1114,11 +1120,19 @@ class SlamConfig:
                 {
                     "full_map": True,
                     "map_source": "live",
+                    "coarse_position_step_m": 0.35,
+                    "coarse_yaw_step_deg": 10.0,
+                    "ray_weight": 0.55,
+                    "ray_refine_candidates": 48,
                 },
             )
             or {
                 "full_map": True,
                 "map_source": "live",
+                "coarse_position_step_m": 0.35,
+                "coarse_yaw_step_deg": 10.0,
+                "ray_weight": 0.55,
+                "ray_refine_candidates": 48,
             },
             global_localize_on_start_refine=bool(
                 d.get("global_localize_on_start_refine", True)
@@ -1204,7 +1218,7 @@ class SlamConfig:
                 d.get("periodic_relocalize_full_map_on_low_quality", True)
             ),
             periodic_relocalize_during_navigation=bool(
-                d.get("periodic_relocalize_during_navigation", True)
+                d.get("periodic_relocalize_during_navigation", False)
             ),
             localize_subprocess=bool(d.get("localize_subprocess", True)),
             periodic_relocalize_options=d.get(

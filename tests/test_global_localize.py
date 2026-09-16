@@ -104,6 +104,8 @@ def test_global_localize_full_map_without_hint():
     assert result.ray_score >= 0.0
     assert abs(result.pose.x - true_pose.x) <= 1.0
     assert abs(result.pose.y - true_pose.y) <= 1.0
+    assert hasattr(result, "ambiguous")
+    assert hasattr(result, "second_best_score")
 
 
 def test_global_localize_rejects_off_map_candidates():
