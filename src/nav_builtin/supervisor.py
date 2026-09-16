@@ -428,6 +428,22 @@ class NavSupervisor:
             pass
         return preview
 
+    def _stop_before_replan(self) -> None:
+        """Zero the base before a blocking replan on the control thread.
+
+        Replan can take hundreds of ms (sometimes >1 s on a big map). Leaving
+        the previous cmd_vel running for that whole window is what made the
+        robot plow into a live obstacle and only *then* get a new path.
+        """
+        try:
+            self._world.set_velocity(0.0, 0.0, 0.0)
+        except Exception:  # noqa: BLE001 - never skip replan because stop failed
+            try:
+                self._world.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self._last_cmd_vx = 0.0
+
     def _try_replan(
         self,
         goal: Pose2D,
@@ -795,6 +811,7 @@ class NavSupervisor:
                         # Always paint the current route as blocked so the first
                         # retry must leave the corridor — waiting for
                         # failed_count>=1 left us spinning with identical plans.
+                        self._stop_before_replan()
                         new_path = self._try_replan(
                             goal,
                             pose,
@@ -944,6 +961,7 @@ class NavSupervisor:
                         backup_start = None
                         spin_stuck_since = None
                         backup_cooldown_until = now + self._backup_cooldown_s
+                        self._stop_before_replan()
                         new_path = self._try_replan(
                             goal,
                             pose,
@@ -1083,6 +1101,7 @@ class NavSupervisor:
                     # On static/pose-jump recovery, accept any feasible plan —
                     # require_different would reject a valid near-identical route
                     # and count it as "replan failed".
+                    self._stop_before_replan()
                     new_path = self._try_replan(
                         goal,
                         pose,
@@ -1219,6 +1238,7 @@ class NavSupervisor:
                         if turned >= self._follower.motion.stall_progress_rad:
                             _mark_progress()
                         elif now - last_progress_at >= stall_limit_s:
+                            self._stop_before_replan()
                             new_path = self._try_replan(
                                 goal,
                                 pose,
@@ -1248,6 +1268,7 @@ class NavSupervisor:
                     ):
                         _mark_progress()
                     elif now - last_progress_at >= stall_limit_s:
+                        self._stop_before_replan()
                         new_path = self._try_replan(
                             goal,
                             pose,

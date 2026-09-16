@@ -569,6 +569,54 @@ def test_compute_path_command_defers_local_planner_when_misaligned():
         force_local_planner=True,
     )
     assert progress2.get("local_planner") is True
+    # Even under force_local, do not creep forward while ~129° off heading.
+    assert cmd2.vx <= 0.02
+    assert abs(cmd2.vtheta) > 0.05
+
+
+def test_costmap_hard_stop_blocks_translate_into_inscribed():
+    """Lidar nose clear but costmap inscribed ahead — must not translate."""
+    from src.nav.simple_motion import ObstacleConfig
+    from src.nav_builtin.costmap import LETHAL
+    from src.nav_builtin.local_costmap import LocalCostmapView
+    from src.nav_builtin.types import OccupancyGrid
+
+    costs = np.zeros((40, 40), dtype=np.uint8)
+    # Inscribed wall directly ahead of pose at (1.0, 1.0) facing +x.
+    costs[18:22, 28:32] = 253
+    occ = OccupancyGrid(
+        grid=np.zeros((40, 40), dtype=np.int16),
+        resolution=0.05,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    view = LocalCostmapView(costs=costs, occ=occ, origin_x=0.0, origin_y=0.0)
+    pose = Pose2D(1.0, 1.0, 0.0)
+    # Wide-open lidar — nose_clear would be true without the costmap check.
+    scan = conv.LaserScan2D(
+        np.full(36, 5.0),
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / 36,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    path = Path2D(points=((1.0, 1.0), (2.5, 1.0)), goal_theta=0.0)
+    cfg = FollowerConfig(
+        obstacle=ObstacleConfig(
+            enabled=True, stop_distance_m=0.45, slow_distance_m=0.9
+        )
+    )
+    cmd, progress = compute_path_command(
+        pose,
+        path,
+        cfg=cfg,
+        scan=scan,
+        local_view=view,
+        local_planner=None,
+        robot_radius_m=0.08,
+    )
+    assert cmd.vx <= 1e-9
+    assert progress["obstacle"] == "avoid"
 
 
 def test_hard_stop_blocks_local_planner_into_stop_bubble():

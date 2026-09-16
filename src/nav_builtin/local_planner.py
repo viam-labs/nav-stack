@@ -57,6 +57,10 @@ class LocalPlannerConfig:
     # Soft pull back toward the global path while following the detour field
     # (0 = field-only wide arcs; ~1 = path_weight scale).
     detour_path_bias: float = 0.55
+    # When heading error to the detour/path exceeds this, refuse forward samples
+    # (rotate first). force_local used to creep at 1 cm/s with vθ=0 while facing
+    # 100° off — into clutter that was not in the nose cone.
+    max_translate_heading_err_rad: float = math.radians(70.0)
     vx_samples: int = 5
     vtheta_samples: int = 5
     sim_time_s: float = 1.2
@@ -529,6 +533,8 @@ def compute_local_command(
     )
     path_dist_now = _path_distance_m(path, pose.x, pose.y)
     goal_dist_now = math.hypot(pose.x - gx, pose.y - gy)
+    pose_heading_err = abs(conv.normalize_angle(heading_ref - pose.theta))
+    translate_ok = pose_heading_err <= float(cfg.max_translate_heading_err_rad)
 
     for i in range(n_vx):
         if n_vx == 1:
@@ -538,6 +544,11 @@ def compute_local_command(
         # When the path ahead is blocked, still allow shallow reverse to unstick;
         # deep reverse is for backup recovery, not DWA.
         if path_blocked_ahead and vx < -0.08:
+            continue
+        # Facing way off the clear direction: rotate in place first. Tiny
+        # forward creeps with vθ=0 were how the robot walked into side clutter
+        # with nose_clear still true (obstacle not in the forward cone).
+        if not translate_ok and vx > 0.02:
             continue
         for j in range(n_vt):
             vtheta = -max_vel_theta + (2.0 * max_vel_theta) * j / (n_vt - 1)
