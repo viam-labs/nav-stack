@@ -107,6 +107,66 @@ def mark_local_costmap_on_occupancy(
     )
 
 
+def mark_path_block_from_local(
+    occ: OccupancyGrid,
+    path,
+    pose,
+    view,
+    *,
+    cost_threshold: int = 200,
+    margin_m: float = 0.18,
+    radius_m: float = 0.25,
+    lookahead_m: float = 1.5,
+    start_offset_m: float = 0.3,
+    sample_step_m: float = 0.08,
+) -> OccupancyGrid:
+    """Seal path samples that the local costmap already flags as blocked.
+
+    Corridor paint alone can be too thin / offset; copying every local inscribed
+    cell can still leave a Lazy Theta* corridor within 25 cm of the old route
+    (``same route``). Marking the blocked *path samples* with a fat disk forces
+    a real peel.
+    """
+    from .path_utils import closest_point_on_path
+    from .local_costmap import max_cost_along_segment
+
+    pts = path.points
+    if len(pts) < 2:
+        return occ
+    _, _, _, along = closest_point_on_path(pose, path)
+    along += max(0.0, float(start_offset_m))
+    seg_lens: list[float] = []
+    cum = [0.0]
+    for i in range(len(pts) - 1):
+        length = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        seg_lens.append(length)
+        cum.append(cum[-1] + length)
+    total = cum[-1]
+    target = min(total, along + max(float(lookahead_m), sample_step_m))
+    step = max(float(sample_step_m), occ.resolution * 0.5)
+    blocked_pts: list[tuple[float, float]] = []
+    d = max(0.0, along)
+    while d <= target + 1e-9:
+        for i in range(len(pts) - 1):
+            if cum[i + 1] + 1e-9 < d:
+                continue
+            seg = seg_lens[i]
+            t = 0.0 if seg < 1e-9 else (d - cum[i]) / seg
+            t = max(0.0, min(1.0, t))
+            x = pts[i][0] + t * (pts[i + 1][0] - pts[i][0])
+            y = pts[i][1] + t * (pts[i + 1][1] - pts[i][1])
+            c = max_cost_along_segment(view, x, y, x, y, margin_m=margin_m)
+            if c >= cost_threshold:
+                blocked_pts.append((x, y))
+            break
+        d += step
+    if not blocked_pts:
+        return occ
+    return mark_points_on_occupancy(
+        occ, np.asarray(blocked_pts, dtype=np.float64), radius_m=radius_m
+    )
+
+
 def mark_scan_on_occupancy(
     occ: OccupancyGrid,
     pose: conv.Pose2D,
