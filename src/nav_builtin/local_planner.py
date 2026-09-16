@@ -51,8 +51,12 @@ class LocalPlannerConfig:
     # every rollout "collided" and DWA fell back to a fixed +0.5*max spin.
     collision_margin_m: float = 0.05
     # Lane the detour field keeps off the blocked region (on top of the
-    # inflated footprint) so the geodesic is drivable by coarse rollouts.
-    detour_clearance_m: float = 0.2
+    # inflated footprint). Too small hugs the blob and stalls; too large
+    # swings room-scale. ~0.12 m is a middle peel for typical bins.
+    detour_clearance_m: float = 0.12
+    # Soft pull back toward the global path while following the detour field
+    # (0 = field-only wide arcs; ~1 = path_weight scale).
+    detour_path_bias: float = 0.55
     vx_samples: int = 5
     vtheta_samples: int = 5
     sim_time_s: float = 1.2
@@ -147,11 +151,12 @@ class DetourField:
             return math.inf
         return float(self.dist_m[row, col])
 
-    def descent_heading(self, x: float, y: float, *, ring_m: float = 0.4) -> Optional[float]:
+    def descent_heading(self, x: float, y: float, *, ring_m: float = 0.28) -> Optional[float]:
         """Heading (rad) toward the lowest field value on a ring around (x, y).
 
         This is the local geodesic direction around the blockage — sideways
-        when the robot is nose-to-bin, diagonal from further back.
+        when the robot is nose-to-bin, diagonal from further back. A modest
+        ring (not 0.4+ m) avoids locking onto the far-out lane early.
         """
         h, w = self.dist_m.shape
         res = self.resolution
@@ -583,11 +588,15 @@ def compute_local_command(
             else:
                 speed_term = cfg.speed_weight * 0.35 * abs(vx)
             if detour is not None:
-                # Around-the-bin distance replaces both path and goal pull.
+                # Field progress around the bin, plus a soft path bias so the
+                # peel stays near the route instead of a room-scale arc.
                 dd = detour.at(end.x, end.y)
                 if not math.isfinite(dd):
                     dd = field_far_m
-                path_pen = 0.0
+                path_dist = _path_distance_m(path, end.x, end.y)
+                path_pen = (
+                    cfg.path_weight * cfg.detour_path_bias * path_dist
+                )
                 goal_pen = (cfg.path_weight + cfg.goal_weight) * dd
             else:
                 # Progress relative to where we are, so every sample is on the

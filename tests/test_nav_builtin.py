@@ -1325,6 +1325,50 @@ def test_try_replan_falls_back_to_scan_plan_and_records_reason():
     assert "same route" in sup._last_replan_error
 
 
+def test_try_replan_prefers_scan_over_long_corridor_paint():
+    """Open room: scan peels around a bin; corridor paint must not replace it
+    with a room-scale loop."""
+    from src.nav_builtin.controller import _path_length
+    from src.nav_builtin.supervisor import NavSupervisor
+
+    m = _empty_map(size=120, resolution=0.05)
+    world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
+    # Mark a bin on the map so a scan-free paint has something to avoid too.
+    m["grid"][58:62, 50:54] = 100  # ~ (2.6, 3.0)
+    world.map_data = m
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        clearance_preference_m=0.0,
+    )
+    goal = Pose2D(5.0, 3.0, 0.0)
+    base = plan_path(
+        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert base.feasible
+    base_len = _path_length(base.path)
+    n = 72
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 1.5
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    new = sup._try_replan(
+        goal, world.pose, base.path, scan, failed_count=3, require_different=True
+    )
+    assert new is not None
+    # Mild peel — not a multi-metre loop around the room.
+    assert _path_length(new) < base_len * 1.6
+
+
 def test_builtin_navigator_cancel_sets_status():
     world = _FakeWorld(Pose2D(0.2, 0.2, 0.0), _empty_map())
     nav = BuiltinNavigator(world, avoid_obstacles=False)
