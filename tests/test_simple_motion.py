@@ -242,6 +242,38 @@ def test_avoidance_stops_and_turns_to_clearer_side():
     assert out.vtheta > 0.0
 
 
+def test_avoidance_footprint_corridor_catches_shoulder_obstacle():
+    """Wide robot: a bin at the shoulder sits outside the ±35° cone but inside
+    the body's swept corridor. Cone-only says clear; corridor must stop."""
+    cmd = DriveCommand(0.3, 0.0, 0.0, False)
+    # Bearing 50°, range 0.5 → x≈0.32, y≈0.38: outside cone, inside a 0.48 m
+    # half-width body.
+    scan = _scan_with({math.radians(50): 0.5})
+    cone_only = ObstacleConfig(stop_distance_m=0.5, slow_distance_m=1.0)
+    out, state, _ = apply_obstacle_avoidance(cmd, scan, cone_only, max_angular_rad_s=0.8)
+    assert state == "clear"
+
+    wide = ObstacleConfig(
+        stop_distance_m=0.5, slow_distance_m=1.0, footprint_half_width_m=0.48
+    )
+    out, state, clr = apply_obstacle_avoidance(cmd, scan, wide, max_angular_rad_s=0.8)
+    assert state == "avoid"
+    assert out.vx == 0.0
+    assert clr == pytest.approx(0.5 * math.cos(math.radians(50)), abs=0.02)
+
+
+def test_avoidance_footprint_corridor_ignores_points_beside_body():
+    """Returns wider than the body (a wall you fit past) do not trip the corridor."""
+    cmd = DriveCommand(0.3, 0.0, 0.0, False)
+    scan = _scan_with({math.radians(70): 0.6})  # x≈0.21, y≈0.56
+    wide = ObstacleConfig(
+        stop_distance_m=0.5, slow_distance_m=1.0, footprint_half_width_m=0.48
+    )
+    out, state, _ = apply_obstacle_avoidance(cmd, scan, wide, max_angular_rad_s=0.8)
+    assert state == "clear"
+    assert out == cmd
+
+
 def test_avoidance_prefers_path_side_when_that_flank_is_clear():
     """Object ahead; open space behind on the right, corridor on the left.
 

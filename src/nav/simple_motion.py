@@ -55,6 +55,11 @@ class ObstacleConfig:
     stop_distance_m: float = 0.4  # inside this: stop forward, turn to clearer side
     slow_distance_m: float = 1.0  # inside this: scale linear speed down
     front_cone_half_rad: float = math.radians(35.0)  # forward "will I hit it" cone
+    # Body-width corridor ahead (|y| ≤ half width, 0 < x ≤ slow_distance). The
+    # angular cone is narrower than a wide robot at short range (±35° at 0.6 m
+    # is only ±0.35 m), so shoulder-height bins/chairs slid past it. ``None``
+    # disables; builtin nav sets robot_radius + a small margin.
+    footprint_half_width_m: Optional[float] = None
     side_cone_rad: float = math.radians(100.0)  # left/right span for turn decision
     # While spinning (vx≈0), freeze only for true nose collisions — NOT the full
     # stop_distance. Using stop_distance here froze rotate-to-heading whenever a
@@ -110,6 +115,46 @@ def cone_min_range(scan: conv.LaserScan2D, lo_rad: float, hi_rad: float) -> floa
     if not valid.any():
         return math.inf
     return float(ranges[valid].min())
+
+
+def corridor_min_range(
+    scan: conv.LaserScan2D,
+    half_width_m: float,
+    max_forward_m: float,
+) -> float:
+    """Nearest forward distance of any return inside the body-width corridor.
+
+    Considers points with ``0 < x <= max_forward_m`` and ``|y| <= half_width_m``
+    in the scan (base_link) frame and returns the smallest ``x``; ``inf`` when
+    the corridor is clear. Complements ``cone_min_range``: an angular cone
+    misses obstacles at the robot's shoulders when they are close.
+    """
+    pts = scan.to_points()
+    if pts.size == 0:
+        return math.inf
+    x = pts[:, 0]
+    y = pts[:, 1]
+    inside = (x > 0.0) & (x <= max_forward_m) & (np.abs(y) <= half_width_m)
+    inside &= np.isfinite(x) & np.isfinite(y)
+    if not inside.any():
+        return math.inf
+    return float(x[inside].min())
+
+
+def forward_clearance_m(scan: conv.LaserScan2D, obs: ObstacleConfig) -> float:
+    """Forward clearance = min(front cone, body-width corridor)."""
+    half = float(obs.front_cone_half_rad)
+    clearance = cone_min_range(scan, -half, half)
+    if obs.footprint_half_width_m is not None and obs.footprint_half_width_m > 0.0:
+        clearance = min(
+            clearance,
+            corridor_min_range(
+                scan,
+                float(obs.footprint_half_width_m),
+                float(obs.slow_distance_m),
+            ),
+        )
+    return clearance
 
 
 def apply_obstacle_avoidance(
@@ -172,8 +217,7 @@ def apply_obstacle_avoidance(
     if scan is None:
         return DriveCommand(0.0, 0.0, cmd.vtheta, False), "no_scan", math.inf
 
-    half = obs.front_cone_half_rad
-    forward = cone_min_range(scan, -half, half)
+    forward = forward_clearance_m(scan, obs)
     if forward > obs.slow_distance_m:
         return cmd, "clear", forward
 

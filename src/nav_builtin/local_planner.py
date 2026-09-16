@@ -20,6 +20,11 @@ class LocalPlannerConfig:
     activate_cost_threshold: int = 200
     deactivate_cost_threshold: int = 120
     path_clearance_lookahead_m: float = 1.2
+    # Sample a disc of this radius around each path point (not just the
+    # centerline). Live hits are inflated by exactly robot_radius, so a
+    # centerline-only check had zero margin: an obstacle 1 cm outside the
+    # footprint read as free, and any pose error became a collision.
+    path_clearance_margin_m: float = 0.10
     path_weight: float = 2.0
     goal_weight: float = 1.0
     speed_weight: float = 0.5
@@ -72,8 +77,14 @@ def path_cost_ahead(
     view: LocalCostmapView,
     *,
     lookahead_m: float,
+    margin_m: float = 0.0,
 ) -> int:
-    """Max local cost on the global path segment ahead of the robot."""
+    """Max local cost on the global path segment ahead of the robot.
+
+    With ``margin_m > 0`` each sample checks a disc of that radius around the
+    centerline, so obstacles just outside the (already inflated) footprint
+    still register.
+    """
     if path.empty:
         return 0
     _, _, _, along = closest_point_on_path(pose, path)
@@ -100,7 +111,7 @@ def path_cost_ahead(
         y1 = pts[i][1] + t1 * (pts[i + 1][1] - pts[i][1])
         worst = max(
             worst,
-            max_cost_along_segment(view, x0, y0, x1, y1),
+            max_cost_along_segment(view, x0, y0, x1, y1, margin_m=margin_m),
         )
         if cum[i + 1] >= target:
             break
@@ -129,6 +140,7 @@ def should_use_local_planner(
         path,
         view,
         lookahead_m=cfg.path_clearance_lookahead_m,
+        margin_m=cfg.path_clearance_margin_m,
     )
     return ahead >= threshold
 
@@ -160,6 +172,7 @@ def compute_local_command(
         path,
         view,
         lookahead_m=cfg.path_clearance_lookahead_m,
+        margin_m=cfg.path_clearance_margin_m,
     )
     path_blocked_ahead = ahead_cost >= cfg.activate_cost_threshold
     max_reverse = min(float(cfg.max_vel_x_reverse_m), float(max_vel_x))

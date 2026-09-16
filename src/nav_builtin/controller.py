@@ -11,8 +11,8 @@ from ..nav.simple_motion import (
     SimpleMotionConfig,
     apply_obstacle_avoidance,
     apply_velocity_floor,
-    cone_min_range,
     distance_m,
+    forward_clearance_m,
     heading_error_rad,
 )
 from ..geom import conversions as conv
@@ -576,8 +576,7 @@ def compute_path_command(
         and dist_goal <= cfg.motion.xy_tolerance_m
         and scan is not None
     ):
-        half = cfg.obstacle.front_cone_half_rad
-        forward_clearance = cone_min_range(scan, -half, half)
+        forward_clearance = forward_clearance_m(scan, cfg.obstacle)
         obstacle_state = "clear"
 
     progress = {

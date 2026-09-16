@@ -550,12 +550,15 @@ def path_blocked_local(
     *,
     cost_threshold: int = 200,
     lookahead_m: float = 1.5,
+    margin_m: float = 0.0,
 ) -> bool:
     """True when live local costs block the global path ahead of the robot."""
     if path.empty:
         return True
     return (
-        path_cost_ahead(pose, path, view, lookahead_m=lookahead_m)
+        path_cost_ahead(
+            pose, path, view, lookahead_m=lookahead_m, margin_m=margin_m
+        )
         >= cost_threshold
     )
 

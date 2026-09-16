@@ -190,6 +190,9 @@ class NavSupervisor:
                     float(slow_distance_m),
                     max(float(stop_distance_m), float(robot_radius_m) + 0.05) + 0.35,
                 ),
+                # Anything inside the body's swept corridor counts as "ahead" —
+                # the ±35° cone alone let shoulder-side bins slide past.
+                footprint_half_width_m=float(robot_radius_m) + 0.03,
                 max_age_s=scan_max_age_s,
             )
             if avoid_obstacles
@@ -664,6 +667,7 @@ class NavSupervisor:
                         path,
                         local_view,
                         cost_threshold=self._local_planner_activate_cost,
+                        margin_m=self._local_planner.path_clearance_margin_m,
                     )
                 )
                 # Nav2 Wait analogue: hold still so transient movers can clear
