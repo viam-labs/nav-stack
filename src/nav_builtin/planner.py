@@ -608,7 +608,11 @@ def connect_plan_start(
     sx, sy = result.path.points[0]
     at_start = math.hypot(pose.x - sx, pose.y - sy) <= xy_tolerance_m
     if at_start and footprint_traversable(
-        costs, occ, pose.x, pose.y, robot_radius_m=robot_radius_m
+        costs,
+        occ,
+        pose.x,
+        pose.y,
+        robot_radius_m=min(float(robot_radius_m), float(occ.resolution)),
     ):
         return result
     bridge = plan_path(
@@ -652,12 +656,16 @@ def plan_on_costmap(
 ) -> PlanResult:
     t0 = time.perf_counter()
     if robot_radius_m > 0.0:
+        # ``costs`` is already inflated by robot_radius, so the start only
+        # needs its own cell (plus one cell of slack) traversable. Checking a
+        # full robot disc here demanded 2x clearance and, next to a live
+        # obstacle, reported "start pose is in lethal" on every replan.
         start_xy = nearest_free_pose(
             costs,
             occ,
             start.x,
             start.y,
-            robot_radius_m=robot_radius_m,
+            robot_radius_m=min(float(robot_radius_m), float(occ.resolution)),
             max_radius_cells=snap_radius_cells,
         )
         goal_xy = nearest_free_pose(
@@ -814,11 +822,16 @@ def plan_path(
         )
     if blocked_path is not None and blocked_path_pose is not None:
         block_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
+        # Leave the robot's own footprint unpainted (start would otherwise be
+        # lethal and snap sideways), and only paint the stretch the local
+        # costmap actually flagged — not 2.5 m of route.
         occ = mark_path_ahead_on_occupancy(
             occ,
             blocked_path,
             blocked_path_pose,
             radius_m=block_r,
+            lookahead_m=1.5,
+            start_offset_m=float(robot_radius_m) + block_r + 2.0 * float(occ.resolution),
         )
     costs = build_costmap(
         occ,

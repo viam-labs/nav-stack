@@ -324,8 +324,159 @@ def test_local_planner_prefers_reverse_when_blocked_ahead():
         robot_radius_m=0.08,
     )
     assert cmd is not None
-    # Path blocked ahead → reroute, not reverse; expect spin or stop.
-    assert cmd.vx <= 0.05
+    # Path blocked ahead → detour (turn) or hold; never drive straight in.
+    assert cmd.vx <= 0.05 or abs(cmd.vtheta) > 0.1
+
+
+def _open_view_with_bin(pose: Pose2D, bin_xy: tuple[float, float], *, robot_radius_m: float = 0.22):
+    """4 m open window around ``pose`` with a ~0.3 m box marked at ``bin_xy``."""
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=4.0,
+            height_m=4.0,
+            resolution=0.05,
+            inflation_radius_m=0.35,
+            robot_radius_m=robot_radius_m,
+            use_global_static=False,
+        )
+    )
+    # Build a scan whose hits paint the bin faces, everything else far.
+    n = 360
+    ranges = np.full(n, 8.0)
+    angle_min = -math.pi
+    inc = 2 * math.pi / n
+    bx, by = bin_xy
+    for dx in np.linspace(-0.15, 0.15, 7):
+        for dy in np.linspace(-0.15, 0.15, 7):
+            wx, wy = bx + dx, by + dy
+            rx = wx - pose.x
+            ry = wy - pose.y
+            ang = conv.normalize_angle(math.atan2(ry, rx) - pose.theta)
+            k = int(round((ang - angle_min) / inc)) % n
+            ranges[k] = min(ranges[k], math.hypot(rx, ry))
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=angle_min,
+        angle_increment=inc,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    return lc.update(pose, scan)
+
+
+def test_local_planner_detours_around_bin_on_route():
+    """Lethal cost *on the route* must not veto every forward rollout."""
+    pose = Pose2D(0.0, 0.0, 0.0)
+    path = Path2D(points=((0.0, 0.0), (3.0, 0.0)), goal_theta=0.0)
+    view = _open_view_with_bin(pose, (1.0, 0.0))
+    cfg = LocalPlannerConfig(enabled=True, sim_time_s=1.2)
+    cmd = compute_local_command(
+        pose,
+        path,
+        view,
+        cfg=cfg,
+        max_vel_x=0.4,
+        max_vel_theta=1.0,
+        robot_radius_m=0.22,
+    )
+    assert cmd is not None
+    # Route is blocked, flanks are open: expect a forward arc, not rotate-only.
+    assert cmd.vx > 0.05
+    assert abs(cmd.vtheta) > 0.05
+
+
+@pytest.mark.parametrize(
+    "robot_r, bin_x",
+    [(0.22, 1.0), (0.22, 1.2), (0.45, 1.2), (0.45, 0.9)],
+)
+def test_local_planner_closed_loop_detour_passes_bin(robot_r, bin_x):
+    """Drive the DWA loop against a bin on the route: must get past, not creep/spin."""
+    path = Path2D(points=((0.0, 0.0), (3.0, 0.0)), goal_theta=0.0)
+    bin_xy = (bin_x, 0.0)
+    pose = Pose2D(0.0, 0.0, 0.0)
+    cfg = LocalPlannerConfig(enabled=True, sim_time_s=1.2)
+    prev = None
+    active = False
+    dt = 0.1
+    min_clear = math.inf
+    used_dwa = 0
+    for _ in range(300):
+        view = _open_view_with_bin(pose, bin_xy, robot_radius_m=robot_r)
+        cmd = compute_local_command(
+            pose,
+            path,
+            view,
+            cfg=cfg,
+            max_vel_x=0.4,
+            max_vel_theta=1.0,
+            robot_radius_m=robot_r,
+            local_planner_active=active,
+            prev_cmd=prev if active else None,
+        )
+        if cmd is None:
+            # Route clear locally: plain pursuit toward a point 0.5 m ahead.
+            tx, ty = path_point_ahead_for_test(path, pose, 0.5)
+            bearing = conv.normalize_angle(
+                math.atan2(ty - pose.y, tx - pose.x) - pose.theta
+            )
+            cmd = DriveCommand(0.3 if abs(bearing) < 1.0 else 0.0, 0.0, max(-1.0, min(1.0, 2.0 * bearing)), False)
+            active = False
+            prev = None
+        else:
+            active = True
+            prev = cmd
+            used_dwa += 1
+        th = pose.theta + cmd.vtheta * dt
+        pose = Pose2D(
+            pose.x + math.cos(pose.theta) * cmd.vx * dt,
+            pose.y + math.sin(pose.theta) * cmd.vx * dt,
+            conv.normalize_angle(th),
+        )
+        clear = math.hypot(pose.x - bin_xy[0], pose.y - bin_xy[1])
+        min_clear = min(min_clear, clear)
+        if pose.x > bin_x + 0.6:
+            break
+    assert used_dwa > 0
+    assert pose.x > bin_x + 0.6, f"never passed the bin: ended at {pose}"
+    # Never overlap the bin (half-size 0.15) with the footprint.
+    assert min_clear > 0.15 + robot_r, f"clipped the bin: {min_clear:.2f} m"
+
+
+def path_point_ahead_for_test(path: Path2D, pose: Pose2D, ahead: float):
+    from src.nav_builtin.local_planner import path_point_ahead
+
+    return path_point_ahead(path, pose.x, pose.y, ahead)
+
+
+def test_local_planner_blocked_turns_toward_route_not_away():
+    """Facing ~106° off the route with the route blocked: rotate toward it."""
+    # Route runs at -54° (south-east); robot faces +52°.
+    theta_path = math.radians(-54.0)
+    pose = Pose2D(0.0, 0.0, math.radians(52.0))
+    pts = tuple(
+        (k * 0.2 * math.cos(theta_path), k * 0.2 * math.sin(theta_path))
+        for k in range(15)
+    )
+    path = Path2D(points=pts, goal_theta=theta_path)
+    bin_xy = (0.7 * math.cos(theta_path), 0.7 * math.sin(theta_path))
+    view = _open_view_with_bin(pose, bin_xy)
+    cfg = LocalPlannerConfig(enabled=True, sim_time_s=1.2)
+    # Seed continuity with the *wrong-way* spin the robot had locked into.
+    prev = DriveCommand(0.0, 0.0, 0.75, False)
+    cmd = compute_local_command(
+        pose,
+        path,
+        view,
+        cfg=cfg,
+        max_vel_x=0.4,
+        max_vel_theta=0.75,
+        robot_radius_m=0.22,
+        local_planner_active=True,
+        prev_cmd=prev,
+    )
+    assert cmd is not None
+    # Bearing to the route is negative (clockwise) → vθ must be negative.
+    assert cmd.vtheta < 0.0
 
 
 def test_local_planner_avoids_marked_obstacle():
