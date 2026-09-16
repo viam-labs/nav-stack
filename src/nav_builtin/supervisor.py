@@ -359,6 +359,7 @@ class NavSupervisor:
         blocked_path: Optional[Path2D] = None,
         blocked_path_pose: Optional[Pose2D] = None,
         local_view=None,
+        paint_corridor: bool = True,
     ) -> PlanResult:
         pose = start if start is not None else self._world.get_pose()
         if pose is None:
@@ -384,6 +385,7 @@ class NavSupervisor:
             blocked_path=blocked_path,
             blocked_path_pose=blocked_path_pose,
             local_view=local_view,
+            paint_corridor=paint_corridor,
             dynamic_obstacle_radius_m=max(0.05, min(self._robot_radius, 0.12)),
             max_goal_snap_m=self._max_goal_snap_m,
         )
@@ -482,9 +484,12 @@ class NavSupervisor:
                 goal,
                 start=pose,
                 scan=scan,
-                blocked_path=path if paint else None,
-                blocked_path_pose=pose if paint else None,
+                # Always pass the live path so local high-cost samples on it
+                # get sealed; paint_corridor controls the extra corridor strip.
+                blocked_path=path,
+                blocked_path_pose=pose,
                 local_view=local_view,
+                paint_corridor=paint,
             )
             if not replanned.feasible:
                 reasons.append(f"{label}: {replanned.error_msg or 'infeasible'}")

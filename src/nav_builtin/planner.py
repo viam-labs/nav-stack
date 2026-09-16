@@ -16,6 +16,7 @@ from .costmap import (
     is_traversable,
     mark_local_costmap_on_occupancy,
     mark_path_ahead_on_occupancy,
+    mark_path_block_from_local,
     mark_scan_on_occupancy,
     nearest_free_cell,
     nearest_free_pose,
@@ -797,6 +798,7 @@ def plan_path(
     blocked_path: Optional[Path2D] = None,
     blocked_path_pose: Optional[Pose2D] = None,
     local_view: Optional[LocalCostmapView] = None,
+    paint_corridor: bool = True,
     dynamic_obstacle_radius_m: float = 0.35,
     max_goal_snap_m: float = 0.5,
 ) -> PlanResult:
@@ -827,13 +829,32 @@ def plan_path(
         )
     if local_view is not None:
         hit_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
+        # Soft ring (≥200) is enough to trip the controller; paint that, not
+        # only inscribed/lethal, or replan keeps the same corridor.
         occ = mark_local_costmap_on_occupancy(
             occ,
             local_view,
-            cost_threshold=INSCRIBED,
+            cost_threshold=200,
             radius_m=hit_r,
         )
-    if blocked_path is not None and blocked_path_pose is not None:
+        if blocked_path is not None and blocked_path_pose is not None:
+            seal_r = max(0.22, min(float(robot_radius_m) + 0.05, 0.35))
+            occ = mark_path_block_from_local(
+                occ,
+                blocked_path,
+                blocked_path_pose,
+                local_view,
+                cost_threshold=200,
+                margin_m=0.18,
+                radius_m=seal_r,
+                lookahead_m=1.5,
+                start_offset_m=float(robot_radius_m) + 0.05,
+            )
+    if (
+        paint_corridor
+        and blocked_path is not None
+        and blocked_path_pose is not None
+    ):
         block_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
         # Leave the robot's own footprint unpainted (start would otherwise be
         # lethal and snap sideways), and only paint the stretch the local

@@ -655,24 +655,11 @@ def compute_local_command(
                 continue
             end = rollout[-1]
             path_dist = _path_distance_m(path, end.x, end.y)
-            # Straight-on toward a block beyond the short rollout horizon used
-            # to score as "free + on path" at full speed (cmd_vx=0.5 with
-            # path_cost_ahead=254). On the corridor, demand a peel or real
-            # detour-field *decrease* — not "inf → finite" which any free cell
-            # satisfies.
+            # On a blocked route, forward motion must leave the corridor —
+            # not drive down it at max speed toward a block beyond the horizon.
             if path_blocked_ahead and vx > 0.08:
-                peeling = path_dist >= 0.28
-                field_progress = False
-                if detour is not None:
-                    dd_end = detour.at(end.x, end.y)
-                    dd_now = detour.at(pose.x, pose.y)
-                    if (
-                        math.isfinite(dd_now)
-                        and math.isfinite(dd_end)
-                        and dd_end < dd_now - 0.05
-                    ):
-                        field_progress = True
-                if not peeling and not field_progress:
+                leaving = path_dist >= 0.18 or path_dist >= path_dist_now + 0.10
+                if not leaving:
                     continue
             heading_err = abs(conv.normalize_angle(heading_ref - end.theta))
             # Max (not summed) cost along the rollout: summing made every
