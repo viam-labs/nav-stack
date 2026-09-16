@@ -748,12 +748,16 @@ class NavSupervisor:
                         now - last_local_replan_at
                         >= self._replan_local_min_period_s
                     ):
+                        # Always paint the current route as blocked so the first
+                        # retry must leave the corridor — waiting for
+                        # failed_count>=1 left us spinning with identical plans.
                         new_path = self._try_replan(
                             goal,
                             pose,
                             path,
                             scan,
-                            failed_count=failed_replan_while_blocked,
+                            failed_count=max(1, failed_replan_while_blocked),
+                            require_different=failed_replan_while_blocked < 3,
                         )
                         last_local_replan_at = now
                         last_replan = now
@@ -774,7 +778,8 @@ class NavSupervisor:
 
                 # Keep DWA available when the path is blocked but the nose is
                 # clear (or after a failed detour) — otherwise we only spin in
-                # reactive avoid / sit in wait.
+                # reactive avoid / sit in wait. force_local also bypasses the
+                # ±60° bearing gate so large heading error cannot block DWA.
                 allow_local_planner = (
                     self._local_costmap_enabled
                     and not waiting_for_clear
@@ -784,6 +789,7 @@ class NavSupervisor:
                         or nose_clear
                     )
                 )
+                force_local = bool(local_blocked and allow_local_planner)
                 cmd, progress = compute_path_command(
                     pose,
                     path,
@@ -799,6 +805,7 @@ class NavSupervisor:
                     prev_local_cmd=prev_local_cmd,
                     rotate_active=rotate_active,
                     prev_cmd=prev_cmd,
+                    force_local_planner=force_local,
                 )
                 rotate_active = bool(progress.get("rotate_to_heading"))
                 local_planner_active = bool(progress.get("local_planner"))
