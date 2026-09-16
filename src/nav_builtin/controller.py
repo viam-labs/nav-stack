@@ -615,6 +615,36 @@ def compute_path_command(
             )
             obstacle_state = "avoid"
 
+    # Costmap hard stop: lidar cone can look clear while the robot is already
+    # driving into an inflated blob beside the nose (or while misaligned). If
+    # the next ~stop_distance along the commanded heading is inscribed, freeze
+    # translation.
+    if (
+        local_view is not None
+        and cmd.vx > 1e-6
+        and dist_goal > cfg.motion.xy_tolerance_m
+    ):
+        from .costmap import INSCRIBED
+        from .local_costmap import max_cost_along_segment
+
+        stop_m = (
+            float(cfg.obstacle.stop_distance_m)
+            if cfg.obstacle is not None and cfg.obstacle.enabled
+            else max(0.35, float(robot_radius_m) + 0.1)
+        )
+        hx = current.x + math.cos(current.theta) * stop_m
+        hy = current.y + math.sin(current.theta) * stop_m
+        ahead = max_cost_along_segment(local_view, current.x, current.y, hx, hy)
+        if ahead >= INSCRIBED:
+            cmd = DriveCommand(0.0, 0.0, cmd.vtheta, False)
+            if abs(cmd.vtheta) < 1e-6:
+                # No yaw command: turn toward freer flank using path bearing.
+                direction = 1.0 if bearing >= 0.0 else -1.0
+                cmd = DriveCommand(
+                    0.0, 0.0, direction * cfg.motion.max_angular_rad_s, False
+                )
+            obstacle_state = "avoid"
+
     progress = {
         "waypoint_index": idx,
         "is_final": is_final,
