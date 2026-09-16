@@ -646,6 +646,7 @@ def plan_on_costmap(
     goal: Pose2D,
     *,
     snap_radius_cells: int = 40,
+    max_goal_snap_m: float = 0.5,
     robot_radius_m: float = 0.22,
     algorithm: str = DEFAULT_PLANNER,
 ) -> PlanResult:
@@ -679,6 +680,17 @@ def plan_on_costmap(
                 feasible=False,
                 error_code=2,
                 error_msg="goal pose is in lethal / unknown space",
+                planning_time_s=time.perf_counter() - t0,
+            )
+        snap_m = math.hypot(goal_xy[0] - goal.x, goal_xy[1] - goal.y)
+        if snap_m > max(0.0, float(max_goal_snap_m)):
+            return PlanResult(
+                feasible=False,
+                error_code=2,
+                error_msg=(
+                    f"goal snap {snap_m:.2f} m exceeds max_goal_snap_m="
+                    f"{float(max_goal_snap_m):.2f} (goal blocked / over-inflated)"
+                ),
                 planning_time_s=time.perf_counter() - t0,
             )
         start_cell = occ.world_to_cell(start_xy[0], start_xy[1])
@@ -776,6 +788,7 @@ def plan_path(
     blocked_path: Optional[Path2D] = None,
     blocked_path_pose: Optional[Pose2D] = None,
     dynamic_obstacle_radius_m: float = 0.35,
+    max_goal_snap_m: float = 0.5,
 ) -> PlanResult:
     """Plan from a bridge-style map dict.
 
@@ -815,7 +828,13 @@ def plan_path(
         clearance_preference_m=clearance_preference_m,
     )
     result = plan_on_costmap(
-        occ, costs, start, goal, algorithm=algorithm, robot_radius_m=robot_radius_m
+        occ,
+        costs,
+        start,
+        goal,
+        algorithm=algorithm,
+        robot_radius_m=robot_radius_m,
+        max_goal_snap_m=max_goal_snap_m,
     )
     result.costmap_viz = costmap_viz_dict(occ, costs)
     return result

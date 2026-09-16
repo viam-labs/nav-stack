@@ -151,6 +151,7 @@ def test_mark_path_ahead_forces_detour_on_replan():
         robot_radius_m=0.22,
         blocked_path=baseline.path,
         blocked_path_pose=mid,
+        max_goal_snap_m=1.0,
     )
     assert blocked.feasible
     assert paths_meaningfully_differ(baseline.path, blocked.path)
@@ -486,6 +487,25 @@ def test_plan_fails_when_goal_in_lethal():
     )
     assert result.feasible is False
     assert result.error_code != 0
+
+
+def test_plan_rejects_large_goal_snap():
+    """Live inflation must not silently move the goal a metre away."""
+    from src.nav_builtin.planner import plan_on_costmap
+    from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+
+    m = _empty_map(size=60, resolution=0.1)
+    # Block a wide region around the requested goal so nearest free is far.
+    m["grid"][20:40, 20:45] = 100
+    occ = occupancy_from_map_dict(m)
+    costs = build_costmap(occ, inflation_radius_m=0.2, robot_radius_m=0.15)
+    start = Pose2D(0.5, 0.5, 0.0)
+    goal = Pose2D(3.0, 3.0, 0.0)  # inside the blocked blob
+    bad = plan_on_costmap(
+        occ, costs, start, goal, robot_radius_m=0.15, max_goal_snap_m=0.5
+    )
+    assert bad.feasible is False
+    assert "goal snap" in (bad.error_msg or "")
 
 
 def test_path_blocked_on_costmap_matches_path_blocked():

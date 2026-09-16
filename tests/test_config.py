@@ -595,7 +595,10 @@ def test_builtin_follower_snake_defaults():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
     assert cfg.builtin.lookahead_m == pytest.approx(1.35)
     assert cfg.builtin.min_lookahead_m == pytest.approx(1.1)
-    assert cfg.builtin.max_lookahead_m == pytest.approx(1.8)
+    assert cfg.builtin.max_lookahead_m == pytest.approx(1.55)
+    assert cfg.builtin.clearance_preference_m == pytest.approx(0.50)
+    assert cfg.builtin.max_goal_snap_m == pytest.approx(0.5)
+    assert cfg.builtin.local_inflation_radius_m == pytest.approx(0.35)
     assert cfg.builtin.smooth_sample_spacing_m == pytest.approx(0.20)
     # Partial override must not resurrect the old from_dict fallbacks.
     partial = NavConfig.from_dict(
