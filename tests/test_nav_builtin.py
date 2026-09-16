@@ -1325,7 +1325,71 @@ def test_try_replan_falls_back_to_scan_plan_and_records_reason():
     assert "same route" in sup._last_replan_error
 
 
-def test_try_replan_prefers_scan_over_long_corridor_paint():
+def test_plan_path_marks_local_costmap_for_replan():
+    """Local-costmap blob must force a different global path (scan can miss it)."""
+    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+
+    m = _empty_map(size=80, resolution=0.05)
+    start = Pose2D(0.5, 2.0, 0.0)
+    goal = Pose2D(3.5, 2.0, 0.0)
+    baseline = plan_path(
+        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert baseline.feasible
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=4.0,
+            height_m=4.0,
+            resolution=0.05,
+            inflation_radius_m=0.25,
+            robot_radius_m=0.22,
+            use_global_static=False,
+        )
+    )
+    # Bin on the straight route, seen only via the local costmap.
+    n = 72
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 1.0
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(start, scan)
+    # Empty scan for plan_path — only local_view carries the obstacle.
+    empty = conv.LaserScan2D(
+        np.full(n, np.inf),
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    same = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        scan=empty,
+        scan_pose=start,
+    )
+    assert same.feasible
+    assert not paths_meaningfully_differ(baseline.path, same.path)
+    detoured = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        local_view=view,
+    )
+    assert detoured.feasible, detoured.error_msg
+    assert paths_meaningfully_differ(baseline.path, detoured.path)
+
+
+def test_builtin_navigator_cancel_sets_status():
     """Open room: scan peels around a bin; corridor paint must not replace it
     with a room-scale loop."""
     from src.nav_builtin.controller import _path_length

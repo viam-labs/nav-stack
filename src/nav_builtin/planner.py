@@ -14,6 +14,7 @@ from .costmap import (
     costmap_viz_dict,
     footprint_traversable,
     is_traversable,
+    mark_local_costmap_on_occupancy,
     mark_path_ahead_on_occupancy,
     mark_scan_on_occupancy,
     nearest_free_cell,
@@ -795,6 +796,7 @@ def plan_path(
     scan_pose: Optional[conv.Pose2D] = None,
     blocked_path: Optional[Path2D] = None,
     blocked_path_pose: Optional[Pose2D] = None,
+    local_view: Optional[LocalCostmapView] = None,
     dynamic_obstacle_radius_m: float = 0.35,
     max_goal_snap_m: float = 0.5,
 ) -> PlanResult:
@@ -802,6 +804,9 @@ def plan_path(
 
     When ``scan`` is supplied, hits are marked on the map so replans can route
     around dynamic obstacles (people, chairs) not in the static SLAM map.
+    When ``local_view`` is set, high-cost cells from the rolling local costmap
+    are painted too — that is what already tripped the controller, and scan-only
+    marking can miss it (beam gaps / novel-hit filter) and return the same route.
     When ``blocked_path`` is set, the current route segment ahead of the robot
     is also marked so a retry must pick a different corridor.
 
@@ -819,6 +824,14 @@ def plan_path(
         hit_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
         occ = mark_scan_on_occupancy(
             occ, scan_pose, scan, obstacle_radius_m=hit_r
+        )
+    if local_view is not None:
+        hit_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
+        occ = mark_local_costmap_on_occupancy(
+            occ,
+            local_view,
+            cost_threshold=INSCRIBED,
+            radius_m=hit_r,
         )
     if blocked_path is not None and blocked_path_pose is not None:
         block_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))

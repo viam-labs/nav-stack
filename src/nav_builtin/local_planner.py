@@ -657,33 +657,22 @@ def compute_local_command(
             path_dist = _path_distance_m(path, end.x, end.y)
             # Straight-on toward a block beyond the short rollout horizon used
             # to score as "free + on path" at full speed (cmd_vx=0.5 with
-            # path_cost_ahead=254). Require a peel or detour-field progress
-            # before driving as far as the block.
-            if path_blocked_ahead and vx > 0.02:
-                travel = abs(vx) * float(cfg.sim_time_s)
+            # path_cost_ahead=254). On the corridor, demand a peel or real
+            # detour-field *decrease* — not "inf → finite" which any free cell
+            # satisfies.
+            if path_blocked_ahead and vx > 0.08:
                 peeling = path_dist >= 0.28
                 field_progress = False
                 if detour is not None:
                     dd_end = detour.at(end.x, end.y)
                     dd_now = detour.at(pose.x, pose.y)
-                    if math.isfinite(dd_end) and (
-                        not math.isfinite(dd_now) or dd_end < dd_now - 0.05
+                    if (
+                        math.isfinite(dd_now)
+                        and math.isfinite(dd_end)
+                        and dd_end < dd_now - 0.05
                     ):
                         field_progress = True
-                approaches_block = (
-                    block_dist is not None
-                    and travel >= max(0.15, float(block_dist) - 0.25)
-                )
-                if approaches_block and not peeling and not field_progress:
-                    continue
-                # With a field, refuse corridor-hugging creep that makes no
-                # progress toward the rejoin lane.
-                if (
-                    detour is not None
-                    and not peeling
-                    and not field_progress
-                    and path_dist < 0.18
-                ):
+                if not peeling and not field_progress:
                     continue
             heading_err = abs(conv.normalize_angle(heading_ref - end.theta))
             # Max (not summed) cost along the rollout: summing made every

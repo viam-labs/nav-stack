@@ -75,6 +75,38 @@ def mark_points_on_occupancy(
     )
 
 
+def mark_local_costmap_on_occupancy(
+    occ: OccupancyGrid,
+    view,
+    *,
+    cost_threshold: int = 253,
+    radius_m: float = 0.08,
+    max_points: int = 400,
+) -> OccupancyGrid:
+    """Paint local-costmap obstacles onto the global occupancy for replanning.
+
+    Scan-only marking can miss the blob that already tripped ``path_cost_ahead``
+    (timing, beam gaps, novel-hit filter). The local view is the ground truth
+    the controller is reacting to — copy its high-cost cells so the global
+    planner must leave that corridor.
+    """
+    costs = view.costs
+    h, w = costs.shape
+    ys, xs = np.nonzero(costs >= int(cost_threshold))
+    if ys.size == 0:
+        return occ
+    if ys.size > max_points:
+        pick = np.linspace(0, ys.size - 1, max_points, dtype=np.int32)
+        ys = ys[pick]
+        xs = xs[pick]
+    res = float(view.occ.resolution)
+    wx = view.origin_x + (xs.astype(np.float64) + 0.5) * res
+    wy = view.origin_y + (ys.astype(np.float64) + 0.5) * res
+    return mark_points_on_occupancy(
+        occ, np.column_stack([wx, wy]), radius_m=radius_m
+    )
+
+
 def mark_scan_on_occupancy(
     occ: OccupancyGrid,
     pose: conv.Pose2D,
