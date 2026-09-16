@@ -15,7 +15,12 @@ from ..nav.simple_motion import (
     rear_clearance_m,
 )
 from ..geom import conversions as conv
-from .controller import FollowerConfig, compute_path_command, update_speed_estimate
+from .controller import (
+    FollowerConfig,
+    compute_path_command,
+    limit_twist_rate,
+    update_speed_estimate,
+)
 from .local_costmap import (
     LocalCostmap,
     LocalCostmapConfig,
@@ -91,6 +96,9 @@ class NavSupervisor:
         drive_timeout_streak: int = 20,
         yaw_align_timeout_s: float = 6.0,
         max_goal_snap_m: float = 0.5,
+        max_linear_accel_mps2: float = 0.8,
+        max_linear_decel_mps2: float = 1.2,
+        max_angular_accel_rad_s2: float = 2.0,
     ):
         self._world = world
         self._inflation = inflation_radius_m
@@ -162,6 +170,9 @@ class NavSupervisor:
         self._status = NavStatus()
         self._status_lock = threading.Lock()
         self._last_cmd_vx = 0.0
+        # Last twist actually handed to the base, for slew limiting.
+        self._last_sent_cmd: Optional[DriveCommand] = None
+        self._last_sent_at: Optional[float] = None
         self._last_replan_error = ""
         self._io_timeout_streak = 0
         # Control-loop soak metrics (wall-clock tick vs configured period).
@@ -179,6 +190,9 @@ class NavSupervisor:
             # Skid-steer track ≈ 1.2·robot_radius; keeps translating arcs
             # above the base's inner-wheel "nearly 0 RPM" rejection.
             wheel_half_track_m=max(0.08, 0.6 * float(robot_radius_m)),
+            max_linear_accel_mps2=max(0.05, float(max_linear_accel_mps2)),
+            max_linear_decel_mps2=max(0.05, float(max_linear_decel_mps2)),
+            max_angular_accel_rad_s2=max(0.1, float(max_angular_accel_rad_s2)),
             motion=SimpleMotionConfig(
                 poll_interval_s=poll_interval_s,
                 xy_tolerance_m=xy_tolerance_m,
@@ -462,7 +476,35 @@ class NavSupervisor:
                 self._world.stop()
             except Exception:  # noqa: BLE001
                 pass
+        self._note_base_stopped()
+
+    def _note_base_stopped(self) -> None:
+        """Record that the base is at rest so the next command ramps from zero."""
+        self._last_sent_cmd = DriveCommand(0.0, 0.0, 0.0, False)
+        self._last_sent_at = time.monotonic()
         self._last_cmd_vx = 0.0
+
+    def _rate_limited(self, cmd: DriveCommand) -> DriveCommand:
+        """Slew-limit ``cmd`` against the twist already on the base.
+
+        ``dt`` comes from the real gap since the last command, not the nominal
+        period: a slow tick (costmap rebuild, blocking replan) should be allowed
+        a proportionally larger step rather than crawling back up to speed.
+        """
+        now = time.monotonic()
+        if self._last_sent_at is None:
+            dt = self._control_period_s
+        else:
+            dt = min(
+                max(now - self._last_sent_at, self._control_period_s),
+                4.0 * self._control_period_s,
+            )
+        limited = limit_twist_rate(
+            cmd, self._last_sent_cmd, cfg=self._follower, dt_s=dt
+        )
+        self._last_sent_cmd = limited
+        self._last_sent_at = now
+        return limited
 
     def _forced_side_detour(
         self,
@@ -768,6 +810,7 @@ class NavSupervisor:
                     # surfaces as ``Viam IO timed out`` / stalled navigation.
                     if entering_loc_hold:
                         self._world.stop()
+                        self._note_base_stopped()
                     last_progress_at = now
                     last_progress_pose = pose
                     last_progress_dist = dist_goal_chk
@@ -1282,6 +1325,17 @@ class NavSupervisor:
                     else:
                         last_replan = time.monotonic()
 
+                # Final gate: slew-limit against the twist already on the base so
+                # source handoffs (pursuit ↔ DWA ↔ avoid ↔ post-replan resume)
+                # ramp instead of stepping. Status and stall detection below use
+                # the limited command, which is what the base actually gets.
+                cmd = self._rate_limited(cmd)
+                progress = {
+                    **progress,
+                    "cmd_vx_mps": cmd.vx,
+                    "cmd_vtheta_rad_s": cmd.vtheta,
+                }
+
                 self._set_status(
                     pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
                     progress={
@@ -1308,6 +1362,8 @@ class NavSupervisor:
                 if progress.get("obstacle") == "no_scan":
                     # Fail closed: stop forward; brief wait then continue.
                     self._world.set_velocity(0.0, 0.0, cmd.vtheta)
+                    self._last_sent_cmd = DriveCommand(0.0, 0.0, cmd.vtheta, False)
+                    self._last_sent_at = time.monotonic()
                     self._sleep_control_period(tick_started)
                     continue
 
@@ -1453,6 +1509,7 @@ class NavSupervisor:
                             self._world.stop()
                         except Exception:  # noqa: BLE001
                             pass
+                        self._note_base_stopped()
                         self._sleep_control_period(tick_started)
                         continue
                     if (

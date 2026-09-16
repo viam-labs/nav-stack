@@ -69,6 +69,9 @@ def make_builtin_navigator(
         drive_timeout_streak=int(getattr(bcfg, "drive_timeout_streak", 20)),
         yaw_align_timeout_s=float(getattr(bcfg, "yaw_align_timeout_s", 6.0)),
         max_goal_snap_m=float(getattr(bcfg, "max_goal_snap_m", 0.5)),
+        max_linear_accel_mps2=bcfg.max_linear_accel_mps2,
+        max_linear_decel_mps2=bcfg.max_linear_decel_mps2,
+        max_angular_accel_rad_s2=bcfg.max_angular_accel_rad_s2,
         logger=logger,
     )
 
