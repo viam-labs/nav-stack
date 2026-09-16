@@ -165,6 +165,46 @@ def test_prepare_lidar_point_cloud_optical_does_not_blob_on_robot():
     assert np.allclose(right[:, 2], mount["z"], atol=1e-6)
 
 
+def test_prepare_lidar_point_cloud_drops_invalid_zero_and_nan_points():
+    """RealSense full-frame clouds carry (0,0,0) for invalid pixels (~1/3 of
+    the frame on the real robot). Those map exactly onto the camera mount and
+    would mark the robot's own footprint lethal if the z band includes the
+    mount height. They must be dropped, and dropped *before* downsampling so
+    the point budget goes to real returns."""
+    mount = dict(x=0.29, y=-0.22, z=0.05, theta=0.0)
+    real = np.column_stack(
+        [np.zeros(100), np.full(100, -0.2), np.linspace(0.5, 2.0, 100)]
+    )
+    zeros = np.zeros((300, 3))
+    nans = np.full((10, 3), np.nan)
+    cloud = np.vstack([zeros[:150], real, nans, zeros[150:]])
+
+    out = conv.prepare_lidar_point_cloud(
+        cloud, cloud_frame="camera_optical", z_min=0.0, z_max=1.0, **mount
+    )
+    assert len(out) == 100
+    assert np.all(np.isfinite(out))
+    # Nothing sits on the mount position.
+    d_mount = np.hypot(out[:, 0] - mount["x"], out[:, 1] - mount["y"])
+    assert np.min(d_mount) > 0.4
+
+    # Downsample budget is spent on real points, not on invalid ones.
+    out_ds = conv.prepare_lidar_point_cloud(
+        cloud,
+        cloud_frame="camera_optical",
+        z_min=0.0,
+        z_max=1.0,
+        max_points=50,
+        **mount,
+    )
+    assert 25 <= len(out_ds) <= 50
+
+    # Lidar-style clouds (z == 0 everywhere) are untouched: only all-zero rows go.
+    lidar = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]])
+    kept = conv.prepare_lidar_point_cloud(lidar, z_min=-0.2, z_max=1.0)
+    assert len(kept) == 2
+
+
 def test_lidar_config_cloud_frame_optical():
     from src.config import LidarConfig
 
