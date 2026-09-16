@@ -62,7 +62,7 @@ class BuiltinNavigator:
         replan_local_blocked_time_s: float = 0.3,
         replan_local_min_period_s: float = 0.5,
         drive_timeout_streak: int = 20,
-        yaw_align_timeout_s: float = 4.0,
+        yaw_align_timeout_s: float = 6.0,
         logger=None,
     ):
         self._world = world

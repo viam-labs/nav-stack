@@ -242,6 +242,55 @@ def test_avoidance_stops_and_turns_to_clearer_side():
     assert out.vtheta > 0.0
 
 
+def test_avoidance_prefers_path_side_when_that_flank_is_clear():
+    """Object ahead; open space behind on the right, corridor on the left.
+
+    Blind freer-flank would spin right (180° retreat). Path bearing left +
+    left clearance above stop → turn left into the plan.
+    """
+    cmd = DriveCommand(0.3, 0.0, 0.0, False)
+    scan = _scan_with(
+        {
+            0.0: 0.3,
+            math.radians(50): 0.9,  # left corridor open
+            -math.radians(50): 5.0,  # right freer (behind / open room)
+        }
+    )
+    obs = ObstacleConfig(stop_distance_m=0.4, slow_distance_m=1.0)
+    out, state, _ = apply_obstacle_avoidance(
+        cmd,
+        scan,
+        obs,
+        max_angular_rad_s=0.8,
+        prefer_bearing_rad=math.radians(30.0),
+    )
+    assert state == "avoid"
+    assert out.vx == 0.0
+    assert out.vtheta > 0.0  # left / path side
+
+
+def test_avoidance_falls_back_when_path_side_is_unsafe():
+    """Path wants left, but left flank is tighter than stop — freer-flank."""
+    cmd = DriveCommand(0.3, 0.0, 0.0, False)
+    scan = _scan_with(
+        {
+            0.0: 0.3,
+            math.radians(50): 0.2,  # left blocked
+            -math.radians(50): 2.0,  # right open
+        }
+    )
+    obs = ObstacleConfig(stop_distance_m=0.4, slow_distance_m=1.0)
+    out, state, _ = apply_obstacle_avoidance(
+        cmd,
+        scan,
+        obs,
+        max_angular_rad_s=0.8,
+        prefer_bearing_rad=math.radians(30.0),
+    )
+    assert state == "avoid"
+    assert out.vtheta < 0.0  # freer right
+
+
 def test_avoidance_holds_spin_when_front_occupied():
     """Rotate-to-heading must freeze for a true nose collision."""
     cmd = DriveCommand(0.0, 0.0, 0.5, False)
