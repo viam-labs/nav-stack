@@ -191,9 +191,63 @@ def test_local_costmap_marks_scan_hit():
     assert view.cost_at_world(2.0, 1.0) > 0
 
 
-def test_path_cost_ahead_margin_catches_obstacle_just_outside_footprint():
-    """Live hits inflate by robot_radius; a hit 1 cell past that reads free on
-    the centerline. The margin disc must still flag it as blocked."""
+def test_path_cost_ahead_centerline_allows_fit_doorway():
+    """An 84 cm gap leaves ~12 cm free beside a 59 cm-wide robot after
+    footprint inflation. Centerline cost must stay below the block threshold;
+    the old 0.18 m path-clearance disc falsely sealed this route.
+    """
+    from src.nav_builtin.local_planner import (
+        LocalPlannerConfig,
+        path_cost_ahead,
+        should_use_local_planner,
+    )
+    from src.nav_builtin.planner import path_blocked_local
+
+    robot_r = 0.59 / 2.0  # half-width / inscribed
+    gap_m = 0.84
+    half_gap = gap_m / 2.0
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=4.0,
+            height_m=4.0,
+            resolution=0.05,
+            inflation_radius_m=robot_r,
+            robot_radius_m=robot_r,
+            use_global_static=False,
+        )
+    )
+    pose = Pose2D(2.0, 2.0, 0.0)
+    # Side walls at ±half_gap, front clear — doorway the body fits through.
+    n = 360
+    ranges = np.full(n, math.inf)
+    for deg in list(range(60, 121)) + list(range(-120, -59)):
+        rad = math.radians(deg)
+        idx = int((rad + math.pi) / (2 * math.pi / n)) % n
+        ranges[idx] = half_gap / abs(math.sin(rad))
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(pose, scan)
+    path = Path2D(points=[(2.0, 2.0), (3.2, 2.0), (3.8, 2.0)], goal_theta=0.0)
+
+    centerline = path_cost_ahead(pose, path, view, lookahead_m=1.2)
+    fat_disc = path_cost_ahead(pose, path, view, lookahead_m=1.2, margin_m=0.18)
+    assert centerline < 200, f"centerline sealed doorway: cost={centerline}"
+    assert fat_disc >= 200, "regression: fat disc should still over-clear"
+    assert not path_blocked_local(
+        pose, path, view, cost_threshold=200, lookahead_m=1.2
+    )
+    assert not should_use_local_planner(
+        pose, path, view, LocalPlannerConfig(enabled=True)
+    )
+
+
+def test_path_cost_ahead_flags_obstacle_on_centerline():
+    """A hit on the route itself still blocks once inflated by the footprint."""
     from src.nav_builtin.local_planner import path_cost_ahead
     from src.nav_builtin.planner import path_blocked_local
 
@@ -209,15 +263,11 @@ def test_path_cost_ahead_margin_catches_obstacle_just_outside_footprint():
         )
     )
     pose = Pose2D(1.5, 1.5, 0.0)
-    # Path straight ahead along y=1.5; obstacle at (2.2, 1.5 + 0.27): 0.27 m
-    # off the centerline, robot_r + 1 cell → centerline cost 0.
-    dy = robot_r + 0.07
-    bearing = math.atan2(dy, 0.7)
-    rng = math.hypot(0.7, dy)
     n = 360
     ranges = np.full(n, math.inf)
-    b = int((bearing + math.pi) / (2 * math.pi / n)) % n
-    ranges[b] = rng
+    # Obstacle dead ahead on the path at 0.7 m.
+    b = int((0.0 + math.pi) / (2 * math.pi / n)) % n
+    ranges[b] = 0.7
     scan = conv.LaserScan2D(
         ranges,
         angle_min=-math.pi,
@@ -226,19 +276,11 @@ def test_path_cost_ahead_margin_catches_obstacle_just_outside_footprint():
         range_max=10.0,
     )
     view = lc.update(pose, scan)
-    # Stay inside the 3 m local window (x < 3.0) so bounds never read lethal.
     path = Path2D(points=[(1.5, 1.5), (2.2, 1.5), (2.7, 1.5)], goal_theta=0.0)
 
-    centerline = path_cost_ahead(pose, path, view, lookahead_m=1.2)
-    with_margin = path_cost_ahead(pose, path, view, lookahead_m=1.2, margin_m=0.10)
-    assert centerline < 200
-    assert with_margin >= 200
-    assert (
-        path_blocked_local(pose, path, view, cost_threshold=200, lookahead_m=1.2)
-        is False
-    )
+    assert path_cost_ahead(pose, path, view, lookahead_m=1.2) >= 200
     assert path_blocked_local(
-        pose, path, view, cost_threshold=200, lookahead_m=1.2, margin_m=0.10
+        pose, path, view, cost_threshold=200, lookahead_m=1.2
     )
 
 

@@ -554,7 +554,6 @@ class NavSupervisor:
                 local_view,
                 threshold=self._local_planner.activate_cost_threshold,
                 lookahead_m=self._local_planner.path_clearance_lookahead_m,
-                margin_m=self._local_planner.path_clearance_margin_m,
             )
             if bd is not None:
                 block_dist = max(0.4, float(bd))
@@ -940,7 +939,6 @@ class NavSupervisor:
                             path,
                             local_view,
                             lookahead_m=self._local_planner.path_clearance_lookahead_m,
-                            margin_m=self._local_planner.path_clearance_margin_m,
                         )
                     )
                     local_blocked = (

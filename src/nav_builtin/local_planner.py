@@ -25,11 +25,6 @@ class LocalPlannerConfig:
     activate_cost_threshold: int = 200
     deactivate_cost_threshold: int = 120
     path_clearance_lookahead_m: float = 1.2
-    # Sample a disc of this radius around each path point (not just the
-    # centerline). Live hits are inflated by exactly robot_radius, so a
-    # centerline-only check had zero margin: an obstacle 1 cm outside the
-    # footprint read as free, and any pose error became a collision.
-    path_clearance_margin_m: float = 0.18
     path_weight: float = 2.0
     goal_weight: float = 1.0
     speed_weight: float = 0.5
@@ -452,9 +447,10 @@ def path_cost_ahead(
 ) -> int:
     """Max local cost on the global path segment ahead of the robot.
 
-    With ``margin_m > 0`` each sample checks a disc of that radius around the
-    centerline, so obstacles just outside the (already inflated) footprint
-    still register.
+    Default is centerline-only: the costmap already encodes the footprint via
+    inflation. Extra disc clearance belongs in ``collision_margin_m`` (DWA
+    rollouts), ``inflation_margin_m``, and the reactive stop bubble — not here,
+    where it false-blocks legal tight gaps.
     """
     if path.empty:
         return 0
@@ -511,7 +507,6 @@ def should_use_local_planner(
         path,
         view,
         lookahead_m=cfg.path_clearance_lookahead_m,
-        margin_m=cfg.path_clearance_margin_m,
     )
     return ahead >= threshold
 
@@ -543,7 +538,6 @@ def compute_local_command(
         path,
         view,
         lookahead_m=cfg.path_clearance_lookahead_m,
-        margin_m=cfg.path_clearance_margin_m,
     )
     path_blocked_ahead = ahead_cost >= cfg.activate_cost_threshold
     block_dist = (
@@ -553,7 +547,6 @@ def compute_local_command(
             view,
             threshold=cfg.activate_cost_threshold,
             lookahead_m=cfg.path_clearance_lookahead_m,
-            margin_m=cfg.path_clearance_margin_m,
         )
         if path_blocked_ahead
         else None
@@ -586,7 +579,7 @@ def compute_local_command(
             path,
             view,
             block_threshold=cfg.activate_cost_threshold,
-            margin_m=cfg.path_clearance_margin_m,
+            margin_m=0.0,
             clearance_m=cfg.detour_clearance_m,
         )
         # The robot's own cell may be inside the soft ring (>= threshold) and

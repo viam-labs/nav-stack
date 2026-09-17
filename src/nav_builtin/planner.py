@@ -844,7 +844,7 @@ def plan_path(
                 blocked_path_pose,
                 local_view,
                 cost_threshold=200,
-                margin_m=0.18,
+                margin_m=0.0,
                 radius_m=seal_r,
                 lookahead_m=1.5,
                 start_offset_m=float(robot_radius_m) + 0.05,
