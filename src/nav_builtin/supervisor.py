@@ -195,6 +195,9 @@ class NavSupervisor:
         self._last_sent_cmd: Optional[DriveCommand] = None
         self._last_sent_at: Optional[float] = None
         self._last_replan_error = ""
+        # Last replan diagnostics for get_status (trigger + attempt outcomes).
+        self._last_replan_trigger = ""
+        self._last_replan_info: dict = {}
         self._io_timeout_streak = 0
         # Control-loop soak metrics (wall-clock tick vs configured period).
         self._control_ticks = 0
@@ -472,13 +475,15 @@ class NavSupervisor:
             pass
         return preview
 
-    def _stop_before_replan(self) -> None:
+    def _stop_before_replan(self, trigger: str = "") -> None:
         """Zero the base before a blocking replan on the control thread.
 
         Replan can take hundreds of ms (sometimes >1 s on a big map). Leaving
         the previous cmd_vel running for that whole window is what made the
         robot plow into a live obstacle and only *then* get a new path.
         """
+        if trigger:
+            self._last_replan_trigger = str(trigger)
         # Keep status consistent with the command actually sent while planning.
         # Previously progress kept advertising the prior 0.5 m/s command while
         # last_drive correctly showed zero, which hid stop/replan churn.
@@ -489,6 +494,7 @@ class NavSupervisor:
                 local_planner=False,
                 cmd_vx_mps=0.0,
                 cmd_vtheta_rad_s=0.0,
+                last_replan_trigger=self._last_replan_trigger,
             )
             self._status.progress = progress
         try:
@@ -622,6 +628,7 @@ class NavSupervisor:
         require_different: bool = True,
         failed_count: int = 0,
         local_view=None,
+        trigger: str = "",
     ) -> Optional[Path2D]:
         """Replan around a live block: mild peel first, forced side via last.
 
@@ -637,13 +644,15 @@ class NavSupervisor:
         from .controller import _path_length
         from .path_utils import closest_point_on_path
 
+        old_len = _path_length(path)
+        self._last_replan_trigger = str(trigger or "")
         attempts: list[tuple[str, bool]] = [("scan+local", False)]
         if failed_count >= 1:
             attempts.append(("blocked-corridor", True))
         reasons: list[str] = []
         _, _, _, along = closest_point_on_path(pose, path)
-        remaining = max(0.5, _path_length(path) - along)
-        best: Optional[tuple[float, Path2D, PlanResult]] = None
+        remaining = max(0.5, old_len - along)
+        best: Optional[tuple[float, Path2D, PlanResult, str]] = None
         differ_tol = 0.12 if local_view is not None else 0.25
         for label, paint in attempts:
             replanned = self.plan(
@@ -661,7 +670,9 @@ class NavSupervisor:
             if require_different and not paths_meaningfully_differ(
                 path, replanned.path, tol_m=differ_tol
             ):
-                reasons.append(f"{label}: same route")
+                reasons.append(
+                    f"{label}: same route ({_path_length(replanned.path):.1f} m)"
+                )
                 continue
             new_len = _path_length(replanned.path)
             if paint and new_len > remaining * 1.8 and best is not None:
@@ -670,23 +681,48 @@ class NavSupervisor:
                 )
                 continue
             if best is None or new_len < best[0]:
-                best = (new_len, replanned.path, replanned)
+                best = (new_len, replanned.path, replanned, label)
             if not paint:
                 break
         if best is None and local_view is not None:
             forced = self._forced_side_detour(goal, pose, path, scan, local_view)
             if forced is not None:
                 new_path, result, label = forced
+                new_len = _path_length(new_path)
                 self._last_replan_error = ""
+                self._last_replan_info = {
+                    "trigger": self._last_replan_trigger,
+                    "accepted": label,
+                    "old_length_m": round(old_len, 3),
+                    "new_length_m": round(new_len, 3),
+                    "require_different": bool(require_different),
+                    "attempts": list(reasons),
+                }
                 preview = self._publish_plan_viz(result, goal, start=pose)
                 self._set_status(path=preview["path"], length_m=preview["length_m"])
                 return new_path
             reasons.append("forced-via: none feasible")
         if best is None:
             self._last_replan_error = "; ".join(reasons)
+            self._last_replan_info = {
+                "trigger": self._last_replan_trigger,
+                "accepted": None,
+                "old_length_m": round(old_len, 3),
+                "new_length_m": None,
+                "require_different": bool(require_different),
+                "attempts": list(reasons),
+            }
             return None
         self._last_replan_error = ""
-        _, new_path, result = best
+        new_len, new_path, result, label = best
+        self._last_replan_info = {
+            "trigger": self._last_replan_trigger,
+            "accepted": label,
+            "old_length_m": round(old_len, 3),
+            "new_length_m": round(new_len, 3),
+            "require_different": bool(require_different),
+            "attempts": list(reasons),
+        }
         preview = self._publish_plan_viz(result, goal, start=pose)
         self._set_status(path=preview["path"], length_m=preview["length_m"])
         return new_path
@@ -695,6 +731,8 @@ class NavSupervisor:
         """Plan and follow until success, failure, or cancel. Blocking."""
         self._cancel.clear()
         self._last_replan_error = ""
+        self._last_replan_trigger = ""
+        self._last_replan_info = {}
         goal_dict = {"x": float(goal.x), "y": float(goal.y), "theta": float(goal.theta)}
         self._set_status(
             state="active",
@@ -985,7 +1023,11 @@ class NavSupervisor:
                     elif now - last_local_replan_at >= self._replan_local_min_period_s:
                         # Stop only long enough to plan. Paint + forced-via
                         # kick in so we do not keep accepting the same corridor.
-                        self._stop_before_replan()
+                        _trig = (
+                            f"local_blocked cost={path_ahead_cost} "
+                            f"nose_clear={nose_clear}"
+                        )
+                        self._stop_before_replan(_trig)
                         new_path = self._try_replan(
                             goal,
                             pose,
@@ -994,6 +1036,7 @@ class NavSupervisor:
                             failed_count=max(1, failed_replan_while_blocked),
                             require_different=failed_replan_while_blocked < 3,
                             local_view=local_view,
+                            trigger=_trig,
                         )
                         # Start cooldown when planning *finishes*. Planning can
                         # take >2 s; stamping its start with a 0.5 s cooldown
@@ -1072,6 +1115,8 @@ class NavSupervisor:
                     "path_cost_ahead": int(path_ahead_cost),
                     "failed_replan_while_blocked": int(failed_replan_while_blocked),
                     "last_replan_error": self._last_replan_error,
+                    "last_replan_trigger": self._last_replan_trigger,
+                    "last_replan_info": dict(self._last_replan_info),
                     "nose_clear": bool(nose_clear),
                     "local_replan_cooldown_s": round(
                         max(
@@ -1153,7 +1198,7 @@ class NavSupervisor:
                         backup_start = None
                         spin_stuck_since = None
                         backup_cooldown_until = now + self._backup_cooldown_s
-                        self._stop_before_replan()
+                        self._stop_before_replan("backup_done")
                         new_path = self._try_replan(
                             goal,
                             pose,
@@ -1161,6 +1206,7 @@ class NavSupervisor:
                             scan,
                             failed_count=failed_replan_while_blocked,
                             local_view=local_view,
+                            trigger="backup_done",
                         )
                         replan_finished = time.monotonic()
                         last_local_replan_at = replan_finished
@@ -1296,7 +1342,12 @@ class NavSupervisor:
                     # On static/pose-jump recovery, accept any feasible plan —
                     # require_different would reject a valid near-identical route
                     # and count it as "replan failed".
-                    self._stop_before_replan()
+                    _trig = (
+                        f"periodic static_blocked={static_blocked} "
+                        f"pose_jumped={pose_jumped} "
+                        f"oscillating={oscillating}"
+                    )
+                    self._stop_before_replan(_trig)
                     new_path = self._try_replan(
                         goal,
                         pose,
@@ -1305,6 +1356,7 @@ class NavSupervisor:
                         require_different=not static_blocked,
                         failed_count=failed_replan_while_blocked if local_blocked else 0,
                         local_view=local_view,
+                        trigger=_trig,
                     )
                     replan_finished = time.monotonic()
                     last_local_replan_at = replan_finished
@@ -1437,7 +1489,8 @@ class NavSupervisor:
                     nonlocal last_progress_bearing, last_replan
                     nonlocal last_local_replan_at, local_blocked_since, backup_attempts
                     nonlocal failed_replan_while_blocked
-                    self._stop_before_replan()
+                    _trig = f"stall:{error_msg}"
+                    self._stop_before_replan(_trig)
                     new_path = self._try_replan(
                         goal,
                         pose,
@@ -1445,6 +1498,7 @@ class NavSupervisor:
                         scan,
                         failed_count=max(2, failed_replan_while_blocked),
                         local_view=local_view,
+                        trigger=_trig,
                     )
                     replan_finished = time.monotonic()
                     last_local_replan_at = replan_finished

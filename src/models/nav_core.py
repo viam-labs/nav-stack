@@ -159,6 +159,14 @@ class NavServiceBase(Motion):
         # Builtin get_costmap cache (nav-stack-ui polls while Costmap is on).
         self._builtin_costmap_cache: Optional[dict] = None
         self._builtin_costmap_cache_at: float = 0.0
+        # Idle local costmap (built on demand when UI asks for Local while not
+        # navigating — the follower only refreshes local while a plan is active).
+        self._idle_local_costmap = None
+        self._idle_local_costmap_cache: Optional[dict] = None
+        self._idle_local_costmap_cache_at: float = 0.0
+        self._idle_global_occ = None
+        self._idle_global_costs = None
+        self._idle_global_costs_at: float = 0.0
 
     # -- runtime resolution (subclass-specific) ------------------------------
     def _resolve_runtime(self):
@@ -707,8 +715,9 @@ class NavServiceBase(Motion):
             )
         if cmd == "get_costmap":
             # Inflated costmap for operator UIs (nav-stack-ui Costmap toggle).
-            # ``layer``: ``auto`` (local while navigating, else global), ``local``,
-            # or ``global``.
+            # ``layer``: ``auto`` (local while navigating, else global), ``local``
+            # (rolling window around the robot — refreshed on demand even when
+            # idle), or ``global``.
             from ..runtime import get_nav_view
 
             view = get_nav_view(self.name)
@@ -747,6 +756,15 @@ class NavServiceBase(Motion):
                     if local_cm is not None and local_cm.get("grid") is not None:
                         cm = local_cm
                         layer_used = "local"
+                    elif layer_req == "local":
+                        # Follower only publishes local while a plan is active.
+                        # Build/refresh a rolling window on demand for the UI.
+                        idle = self._build_idle_local_costmap(
+                            runtime, view, cfg
+                        )
+                        if idle is not None:
+                            cm = idle
+                            layer_used = "local"
 
                 if cm is None:
                     cm = snap.get("costmap")
@@ -854,6 +872,130 @@ class NavServiceBase(Motion):
             }
 
         raise ValueError(f"unknown command: {cmd!r}")
+
+    def _build_idle_local_costmap(self, runtime, view, cfg: NavConfig):
+        """Rolling local costmap while idle (UI Local layer / get_costmap).
+
+        Builtin nav only refreshes local inside an active follower; without this
+        the Local toggle falls back to global whenever no plan is running.
+        """
+        import time as _time
+
+        now = _time.monotonic()
+        cached = self._idle_local_costmap_cache
+        if cached is not None and now - self._idle_local_costmap_cache_at < 0.4:
+            return cached
+
+        if not bool(getattr(cfg.builtin, "local_costmap_enabled", True)):
+            return None
+
+        world = getattr(runtime.manager, "_world", None)
+        if world is None:
+            world = getattr(runtime.manager, "_builtin_world", None)
+        if world is None:
+            return None
+
+        pose = None
+        if hasattr(world, "get_pose"):
+            try:
+                pose = world.get_pose()
+            except Exception:  # noqa: BLE001
+                pose = None
+        if pose is None:
+            getter = getattr(runtime.manager, "get_pose_in_map", None)
+            if callable(getter):
+                try:
+                    pose = getter()
+                except Exception:  # noqa: BLE001
+                    pose = None
+        if pose is None:
+            return None
+
+        scan = None
+        if hasattr(world, "get_scan"):
+            try:
+                age = float(getattr(cfg, "simple_scan_max_age", 2.0) or 2.0)
+                scan = world.get_scan(age)
+            except Exception:  # noqa: BLE001
+                scan = None
+
+        from ..nav_builtin.costmap import (
+            build_costmap,
+            local_view_viz_dict,
+            occupancy_from_map_dict,
+        )
+        from ..nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+
+        bcfg = cfg.builtin
+        if self._idle_local_costmap is None:
+            self._idle_local_costmap = LocalCostmap(
+                LocalCostmapConfig(
+                    width_m=float(bcfg.local_costmap_width_m),
+                    height_m=float(bcfg.local_costmap_height_m),
+                    resolution=float(bcfg.local_costmap_resolution),
+                    inflation_radius_m=float(
+                        cfg.effective_local_inflation_radius_m()
+                    ),
+                    robot_radius_m=float(cfg.inscribed_radius_m()),
+                    cost_scaling_factor=float(bcfg.cost_scaling_factor),
+                    scan_inflation_radius_m=float(
+                        cfg.effective_local_inflation_radius_m()
+                    ),
+                )
+            )
+
+        global_occ = self._idle_global_occ
+        global_costs = self._idle_global_costs
+        if (
+            global_occ is None
+            or global_costs is None
+            or now - self._idle_global_costs_at >= 2.0
+        ):
+            global_occ = None
+            global_costs = None
+            mp = None
+            if hasattr(world, "get_map"):
+                try:
+                    mp = world.get_map()
+                except Exception:  # noqa: BLE001
+                    mp = None
+            if mp is not None and mp.get("grid") is not None:
+                try:
+                    global_occ = occupancy_from_map_dict(mp)
+                    global_costs = build_costmap(
+                        global_occ,
+                        inflation_radius_m=cfg.effective_inflation_radius_m(),
+                        robot_radius_m=cfg.inscribed_radius_m(),
+                        cost_scaling_factor=float(bcfg.cost_scaling_factor),
+                    )
+                    self._idle_global_occ = global_occ
+                    self._idle_global_costs = global_costs
+                    self._idle_global_costs_at = now
+                except Exception:  # noqa: BLE001
+                    global_occ = None
+                    global_costs = None
+
+        try:
+            local_view = self._idle_local_costmap.update(
+                pose,
+                scan,
+                global_occ=global_occ,
+                global_costs=global_costs,
+            )
+            cm = local_view_viz_dict(local_view)
+        except Exception:  # noqa: BLE001
+            return None
+
+        self._idle_local_costmap_cache = cm
+        self._idle_local_costmap_cache_at = now
+        try:
+            if hasattr(view, "set_viz_local_costmap"):
+                view.set_viz_local_costmap(cm)
+            elif hasattr(world, "set_viz_local_costmap"):
+                world.set_viz_local_costmap(cm)
+        except Exception:  # noqa: BLE001
+            pass
+        return cm
 
     def _add_location(self, command, runtime):
         store = self._locations()
