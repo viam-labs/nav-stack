@@ -22,6 +22,9 @@ from .models.slam import SlamService
 
 async def main() -> None:
     module = Module.from_args()
+    from .runtime import set_module
+
+    set_module(module)
     module.add_model_from_registry(SlamService.API, SlamService.MODEL)
     module.add_model_from_registry(NavigationService.API, NavigationService.MODEL)
     module.add_model_from_registry(
