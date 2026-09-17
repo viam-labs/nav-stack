@@ -15,6 +15,7 @@ from ..nav.simple_motion import (
     distance_m,
     forward_clearance_m,
     heading_error_rad,
+    spin_clearance_m,
 )
 from ..geom import conversions as conv
 from .local_costmap import LocalCostmapView
@@ -526,6 +527,7 @@ def compute_path_command(
     local_view: Optional[LocalCostmapView] = None,
     local_planner: Optional[LocalPlannerConfig] = None,
     robot_radius_m: float = 0.22,
+    spin_radius_m: Optional[float] = None,
     min_cmd_vel_x: float = 0.0,
     min_cmd_vel_theta: float = 0.0,
     local_planner_active: bool = False,
@@ -674,6 +676,33 @@ def compute_path_command(
             )
             obstacle_state = "avoid"
 
+    # Rotation gate. Driving clearance is the half-width, but turning in place
+    # sweeps the half-diagonal, so there are gaps the robot fits through and
+    # cannot spin inside. Rather than swing the corners into the walls, keep
+    # translating straight and defer the turn until there is room for it.
+    spin_radius = (
+        float(spin_radius_m) if spin_radius_m is not None else float(robot_radius_m)
+    )
+    spin_blocked = False
+    if (
+        scan is not None
+        and not near_goal
+        and spin_radius > float(robot_radius_m)
+        and abs(cmd.vx) < 0.02
+        and abs(cmd.vtheta) > 0.05
+        # Only when nothing is close ahead: an "avoid"/"hold" spin exists
+        # precisely because translating is unsafe.
+        and obstacle_state in ("clear", "slow")
+        and spin_clearance_m(scan) < spin_radius + 0.05
+    ):
+        spin_blocked = True
+        crawl = min(
+            max(float(cfg.motion.min_linear_mps), 0.12),
+            float(cfg.motion.max_linear_mps),
+        )
+        cmd = DriveCommand(crawl, 0.0, 0.0, False)
+        obstacle_state = "narrow"
+
     # Costmap hard stop: lidar cone can look clear while the robot is already
     # driving into an inflated blob beside the nose (or while misaligned). If
     # the next ~stop_distance along the commanded heading is inscribed, freeze
@@ -713,6 +742,7 @@ def compute_path_command(
         ),
         "path_length_m": _path_length(path),
         "obstacle": obstacle_state,
+        "spin_blocked": spin_blocked,
         "forward_clearance_m": None if math.isinf(forward_clearance) else forward_clearance,
         "bearing_error_rad": bearing,
         "crosstrack_m": crosstrack,

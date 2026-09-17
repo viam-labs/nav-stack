@@ -134,6 +134,7 @@ the robot in the local costmap. Refresh rate is nav-side
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced map/scan tuning keys (merged into engine defaults) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level footprint / velocity limits. `robot_radius` also sizes the reactive stop: any live return inside the body-width corridor ahead (not just the ±35° cone) counts as forward clearance, and the live "path blocked" check samples a 0.10 m band around the route |
+| `footprint_width_m`, `footprint_length_m` | Nav | **Recommended for non-square robots.** Given both, planning clearance uses the half-**width** (what must fit through a gap) while rotating in place is gated on the half-**diagonal** (what the body sweeps). A single `robot_radius` has to cover both, so it must be the half-diagonal — which seals every gap narrower than `2 × robot_radius` even where the robot easily fits (a 0.59 m-wide robot refusing an 0.84 m doorway). Also sizes the forward stop bubble from the bumper (half-length) and the skid-steer arc envelope from the track. Omit to keep the legacy single-circle behaviour |
 | `xy_goal_tolerance`, `yaw_goal_tolerance` | Nav | Goal arrival tolerances (m / rad). Also accepted under `builtin` |
 | `min_cmd_vel_x`, `min_cmd_vel_theta` | Nav | Optional stiction floors (default **off** / `0`) for simple `go_to_*` motion. Legacy aliases: `simple_min_vel_x` / `simple_min_vel_theta` |
 | `resolution`, `max_laser_range` | SLAM | Map cell size (m) and lidar range used for matching/mapping. Also accepted under `map` |
@@ -214,6 +215,8 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
     "base": "my-base",
     "kinematics": "differential",
     "robot_radius": 0.22,
+    "footprint_width_m": 0.59,
+    "footprint_length_m": 0.72,
     "max_vel_x": 0.4,
     "max_vel_theta": 1.0,
     "inflation_radius": 0.45,

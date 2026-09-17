@@ -505,6 +505,117 @@ def test_local_planner_does_not_charge_blocked_corridor():
     assert not (cmd.vx >= 0.35 and abs(cmd.vtheta) < 0.05), f"charged: {cmd}"
 
 
+def _narrow_gap_scan(half_gap_m: float = 0.42) -> conv.LaserScan2D:
+    """Walls to each side (a doorway the robot fits through), front clear."""
+    n = 360
+    ranges = np.full(n, np.inf)
+    for deg in list(range(60, 121)) + list(range(-120, -59)):
+        rad = math.radians(deg)
+        idx = int((rad + math.pi) / (2 * math.pi / n)) % n
+        ranges[idx] = half_gap_m / abs(math.sin(rad))
+    return conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+
+
+def _footprint_cfg() -> FollowerConfig:
+    """0.59 x 0.72 m robot: half-width drives, half-diagonal spins."""
+    from src.nav.simple_motion import ObstacleConfig
+
+    inscribed = 0.59 / 2.0
+    return FollowerConfig(
+        wheel_half_track_m=0.9 * inscribed,
+        obstacle=ObstacleConfig(
+            enabled=True,
+            stop_distance_m=0.41,
+            slow_distance_m=1.0,
+            footprint_half_width_m=inscribed + 0.03,
+        ),
+    )
+
+
+def test_spin_gate_translates_instead_of_sweeping_corners_into_walls():
+    """Inside a gap too tight to rotate, drive straight out rather than spin."""
+    inscribed = 0.59 / 2.0
+    circumscribed = math.hypot(0.72 / 2.0, 0.59 / 2.0)
+    cfg = _footprint_cfg()
+    pose = Pose2D(0.0, 0.0, 0.0)
+    # Path doubles back, so the follower wants a ~180° rotate-to-heading.
+    path = Path2D(points=((0.0, 0.0), (-3.0, 0.0)), goal_theta=math.pi)
+    scan = _narrow_gap_scan()
+
+    # One disc (spin radius == drive radius): unchanged rotate-in-place.
+    spin, progress = compute_path_command(
+        pose, path, cfg=cfg, scan=scan, robot_radius_m=inscribed
+    )
+    assert spin.vx == 0.0 and abs(spin.vtheta) > 0.05
+    assert progress["spin_blocked"] is False
+
+    # Dual radius: the corners would sweep the walls, so translate instead.
+    gated, gated_progress = compute_path_command(
+        pose,
+        path,
+        cfg=cfg,
+        scan=scan,
+        robot_radius_m=inscribed,
+        spin_radius_m=circumscribed,
+    )
+    assert gated_progress["spin_blocked"] is True
+    assert gated.vx > 0.0
+    assert gated.vtheta == pytest.approx(0.0)
+    assert gated_progress["obstacle"] == "narrow"
+
+
+def test_spin_gate_allows_rotation_once_there_is_room():
+    """The same command in open space must still rotate in place."""
+    inscribed = 0.59 / 2.0
+    cfg = _footprint_cfg()
+    cmd, progress = compute_path_command(
+        Pose2D(0.0, 0.0, 0.0),
+        Path2D(points=((0.0, 0.0), (-3.0, 0.0)), goal_theta=math.pi),
+        cfg=cfg,
+        scan=_narrow_gap_scan(half_gap_m=1.2),
+        robot_radius_m=inscribed,
+        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
+    )
+    assert progress["spin_blocked"] is False
+    assert cmd.vx == 0.0 and abs(cmd.vtheta) > 0.05
+
+
+def test_spin_gate_does_not_override_reactive_avoid():
+    """A wall inside the stop bubble must still stop and turn, not translate."""
+    inscribed = 0.59 / 2.0
+    cfg = _footprint_cfg()
+    n = 360
+    ranges = np.full(n, np.inf)
+    ranges[int(math.pi / (2 * math.pi / n))] = 0.3  # wall 0.3 m dead ahead
+    for deg in (90, -90):
+        rad = math.radians(deg)
+        ranges[int((rad + math.pi) / (2 * math.pi / n)) % n] = 0.42
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    cmd, progress = compute_path_command(
+        Pose2D(0.0, 0.0, 0.0),
+        Path2D(points=((0.0, 0.0), (3.0, 0.0)), goal_theta=0.0),
+        cfg=cfg,
+        scan=scan,
+        robot_radius_m=inscribed,
+        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
+    )
+    assert progress["obstacle"] == "avoid"
+    assert cmd.vx == 0.0
+    assert progress["spin_blocked"] is False
+
+
 def _slew_cfg() -> FollowerConfig:
     from src.nav.simple_motion import SimpleMotionConfig
 

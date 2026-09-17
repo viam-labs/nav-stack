@@ -141,6 +141,23 @@ def corridor_min_range(
     return float(x[inside].min())
 
 
+def spin_clearance_m(scan: conv.LaserScan2D) -> float:
+    """Distance to the nearest return in *any* direction (rotation clearance).
+
+    Turning in place sweeps a disc of the body's circumscribed radius, so the
+    limiting measurement is the closest return anywhere around the robot — a
+    forward cone says nothing about the corners that swing into the walls.
+    """
+    pts = scan.to_points()
+    if pts.size == 0:
+        return math.inf
+    dist = np.hypot(pts[:, 0], pts[:, 1])
+    dist = dist[np.isfinite(dist)]
+    if dist.size == 0:
+        return math.inf
+    return float(dist.min())
+
+
 def arc_clearance_m(
     scan: conv.LaserScan2D,
     *,

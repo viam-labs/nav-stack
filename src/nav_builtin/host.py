@@ -22,7 +22,11 @@ def make_builtin_navigator(
     return BuiltinNavigator(
         world,
         inflation_radius_m=nav_cfg.inflation_radius,
-        robot_radius_m=nav_cfg.robot_radius,
+        # Driving clearance uses the half-width; rotation uses the half-diagonal.
+        robot_radius_m=nav_cfg.inscribed_radius_m(),
+        spin_radius_m=nav_cfg.circumscribed_radius_m(),
+        nose_offset_m=nav_cfg.nose_offset_m(),
+        wheel_half_track_m=nav_cfg.wheel_half_track_m(),
         cost_scaling_factor=bcfg.cost_scaling_factor,
         clearance_preference_m=bcfg.clearance_preference_m,
         algorithm=bcfg.planner,
