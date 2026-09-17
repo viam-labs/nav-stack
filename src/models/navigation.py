@@ -41,7 +41,7 @@ from ..runtime import (
 )
 from ..viam_frames import (
     apply_framesystem_to_nav_cfg,
-    fetch_frame_system_config_sync,
+    fetch_frame_system_config,
 )
 from .nav_core import NavServiceBase, _nav_status_to_plan_state  # noqa: F401
 
@@ -124,6 +124,10 @@ class NavigationService(NavServiceBase):
         self._slam_resource = None
         # SlamRuntime whose ``manager`` is BuiltinNavHost.
         self._builtin_runtime: Optional[SlamRuntime] = None
+        self._framesystem_task: Optional[asyncio.Task] = None
+        self._framesystem_gen = 0
+        self._framesystem_raw_attrs: Optional[Mapping] = None
+        self._nav_host: Optional[BuiltinNavHost] = None
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -151,20 +155,13 @@ class NavigationService(NavServiceBase):
     def reconfigure(
         self, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
+        self._cancel_framesystem_task()
         attrs = struct_to_dict(config.attributes)
         cfg = NavConfig.from_dict(attrs)
-        robot = get_parent_robot()
-        if robot is not None:
-            try:
-                fs = fetch_frame_system_config_sync(robot)
-                cfg, _notes = apply_framesystem_to_nav_cfg(
-                    cfg, fs, raw_attrs=attrs, logger=LOGGER
-                )
-            except Exception as exc:  # noqa: BLE001 - keep JSON footprint on failure
-                LOGGER.warning(
-                    "framesystem footprint resolve failed; using config: %s", exc
-                )
+        # Footprint from framesystem is applied async after reconfigure — never
+        # block here on a cross-thread parent RobotClient RPC.
         self._cfg = cfg
+        self._framesystem_raw_attrs = attrs
         self._base = cast(Base, dependencies[Base.get_resource_name(cfg.base)])
         self._slam_resource = cast(
             SLAM, dependencies[SLAM.get_resource_name(cfg.slam_service)]
@@ -182,6 +179,7 @@ class NavigationService(NavServiceBase):
         unregister_nav_viz(self.name)
         unregister_nav_host(self.name)
         self._viz = None
+        self._nav_host = None
         if self._builtin_runtime is not None:
             try:
                 self._builtin_runtime.manager.shutdown()
@@ -220,6 +218,7 @@ class NavigationService(NavServiceBase):
             world, cfg, logger=lambda m: LOGGER.info(m)
         )
         host = BuiltinNavHost(navigator, world, viz, nav_cfg=cfg)
+        self._nav_host = host
         self._builtin_runtime = SlamRuntime(
             host,
             slam_rt.map_store,
@@ -232,15 +231,79 @@ class NavigationService(NavServiceBase):
         register_nav_viz(self.name, viz)
         register_nav_host(self.name, host)
         self._refresh_zone_masks()
+        self._schedule_framesystem_footprint(loop)
         LOGGER.info(
             f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}, "
             f"nav_backend=builtin, ViamWorldIO)"
         )
 
+    def _cancel_framesystem_task(self) -> None:
+        task = self._framesystem_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._framesystem_task = None
+        self._framesystem_gen += 1
+
+    def _schedule_framesystem_footprint(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        if get_parent_robot() is None:
+            return
+        self._framesystem_gen += 1
+        gen = self._framesystem_gen
+        raw = self._framesystem_raw_attrs or {}
+        self._framesystem_task = loop.create_task(
+            self._apply_framesystem_footprint(gen, raw)
+        )
+
+    async def _apply_framesystem_footprint(
+        self, gen: int, raw_attrs: Mapping
+    ) -> None:
+        if gen != self._framesystem_gen:
+            return
+        robot = get_parent_robot()
+        cfg = self._cfg
+        host = self._nav_host
+        if robot is None or cfg is None or host is None:
+            return
+        try:
+            fs = await fetch_frame_system_config(robot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep JSON footprint on failure
+            LOGGER.warning(
+                "framesystem footprint resolve failed; using config: %s", exc
+            )
+            return
+        if gen != self._framesystem_gen or self._cfg is not cfg or self._nav_host is not host:
+            return
+        try:
+            new_cfg, _notes = apply_framesystem_to_nav_cfg(
+                cfg, fs, raw_attrs=raw_attrs, logger=LOGGER
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "framesystem footprint apply failed; using config: %s", exc
+            )
+            return
+        if gen != self._framesystem_gen or self._nav_host is not host:
+            return
+        self._cfg = new_cfg
+        try:
+            host.set_nav_config(new_cfg)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "framesystem footprint applied to config but navigator rebuild "
+                "failed: %s",
+                exc,
+            )
+
     async def close(self) -> None:
         await self._cancel_simple_nav()
+        self._cancel_framesystem_task()
         unregister_nav_viz(self.name)
         unregister_nav_host(self.name)
+        self._nav_host = None
         if self._builtin_runtime is not None:
             try:
                 self._builtin_runtime.manager.shutdown()
