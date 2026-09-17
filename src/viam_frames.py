@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 
-from .geom.conversions import mm_to_m, orientation_vector_to_rpy
+from .geom.conversions import mm_to_m
 
 LOGGER = logging.getLogger(__name__)
 
@@ -81,21 +81,27 @@ def _pose_to_matrix(pose) -> np.ndarray:
 
 
 def _matrix_to_mount(T: np.ndarray) -> MountPose:
-    """Convert a base←sensor matrix (mm) into a nav-stack mount pose (m/rad)."""
-    from viam.spatialmath import RotationMatrix
+    """Convert a base←sensor matrix (mm) into a nav-stack mount pose (m/rad).
 
-    R = T[:3, :3]
-    # RotationMatrix.elements is a flat row-major length-9 list.
-    rm = RotationMatrix(elements=list(R.reshape(-1)))
-    ov = rm.to_quaternion().to_orientation_vector()
-    # spatialmath OV stores theta in radians.
-    roll, pitch, yaw = orientation_vector_to_rpy(
-        float(ov.o_x),
-        float(ov.o_y),
-        float(ov.o_z),
-        float(ov.theta),
-        theta_unit="rad",
+    Yaw/pitch/roll are solved for nav-stack's ``Rz(yaw) @ Ry(pitch) @ Rx(roll)``
+    (see ``geom.conversions._mount_rotation``). Do **not** use Viam EulerAngles
+    / OV θ directly: Viam's yaw sign for the same matrix is opposite ours on
+    pure Z rotations (OV θ=-90° ≡ our mount θ=+π/2), which showed up as a
+    consistent 90° CW localization error when mounts came from the framesystem.
+    """
+    R = np.asarray(T[:3, :3], dtype=float)
+    # R = Rz(yaw) Ry(pitch) Rx(roll): R[2,0] = -sin(pitch).
+    pitch = math.atan2(
+        -float(R[2, 0]),
+        math.sqrt(float(R[2, 1]) ** 2 + float(R[2, 2]) ** 2),
     )
+    if abs(math.cos(pitch)) > 1e-6:
+        roll = math.atan2(float(R[2, 1]), float(R[2, 2]))
+        yaw = math.atan2(float(R[1, 0]), float(R[0, 0]))
+    else:
+        # Gimbal lock: fold into yaw, zero roll.
+        roll = 0.0
+        yaw = math.atan2(-float(R[0, 1]), float(R[1, 1]))
     return MountPose(
         x=mm_to_m(float(T[0, 3])),
         y=mm_to_m(float(T[1, 3])),
