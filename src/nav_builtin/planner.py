@@ -23,7 +23,7 @@ from .costmap import (
     occupancy_from_map_dict,
 )
 from .path_utils import closest_point_on_path
-from .local_costmap import LocalCostmapView
+from .local_costmap import LocalCostmapView, overlay_local_costs_on_costmap
 from .local_planner import path_cost_ahead
 from .types import OccupancyGrid, Path2D, PlanResult, Pose2D
 from ..geom import conversions as conv
@@ -809,6 +809,9 @@ def plan_path(
     When ``local_view`` is set, high-cost cells from the rolling local costmap
     are painted too — that is what already tripped the controller, and scan-only
     marking can miss it (beam gaps / novel-hit filter) and return the same route.
+    Live local costs (≥200) are also overlaid onto the planning costmap (no
+    second occupancy inflation) so a peel around one blob cannot thread a
+    second blob already visible in the window.
     When ``blocked_path`` is set, the current route segment ahead of the robot
     is also marked so a retry must pick a different corridor.
 
@@ -883,6 +886,8 @@ def plan_path(
         cost_scaling_factor=cost_scaling_factor,
         clearance_preference_m=clearance_preference_m,
     )
+    if local_view is not None:
+        costs = overlay_local_costs_on_costmap(costs, occ, local_view, min_cost=200)
     result = plan_on_costmap(
         occ,
         costs,

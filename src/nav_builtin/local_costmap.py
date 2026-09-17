@@ -198,6 +198,38 @@ class LocalCostmap:
         )
 
 
+def overlay_local_costs_on_costmap(
+    costs: np.ndarray,
+    occ: OccupancyGrid,
+    view: LocalCostmapView,
+    *,
+    min_cost: int = 200,
+) -> np.ndarray:
+    """Raise global planning costs where the live local window is blocked.
+
+    Does not edit occupancy (avoids a second inflation pass on static walls).
+    ``np.maximum`` keeps static cells unchanged and makes novel live blobs
+    non-traversable so replans cannot peel through a second obstacle that was
+    already visible locally.
+    """
+    local = np.asarray(view.costs)
+    if local.size == 0:
+        return costs
+    ys, xs = np.nonzero(local >= int(min_cost))
+    if ys.size == 0:
+        return costs
+    out = np.array(costs, copy=True, dtype=np.uint8)
+    res = float(view.occ.resolution)
+    wx = view.origin_x + (xs.astype(np.float64) + 0.5) * res
+    wy = view.origin_y + (ys.astype(np.float64) + 0.5) * res
+    for x, y, lc in zip(wx, wy, local[ys, xs]):
+        row, col = occ.world_to_cell(float(x), float(y))
+        if not occ.in_bounds(row, col):
+            continue
+        out[row, col] = max(int(out[row, col]), int(lc))
+    return out
+
+
 def max_cost_along_segment(
     view: LocalCostmapView,
     x0: float,

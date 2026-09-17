@@ -485,6 +485,54 @@ def path_cost_ahead(
     return worst
 
 
+def path_cost_in_local_window(
+    pose: Pose2D,
+    path: Path2D,
+    view: LocalCostmapView,
+    *,
+    start_offset_m: float = 0.0,
+    sample_step_m: float = 0.08,
+) -> int:
+    """Max local cost on path samples that fall inside the rolling window.
+
+    Samples outside the window are skipped (unknown, not lethal) so a long
+    global path is not rejected just because it leaves the local crop.
+    ``start_offset_m`` skips the robot's own footprint at the path head.
+    """
+    if path.empty:
+        return 0
+    _, _, _, along0 = closest_point_on_path(pose, path)
+    along = along0 + max(0.0, float(start_offset_m))
+    pts = path.points
+    seg_lens: list[float] = []
+    cum = [0.0]
+    for i in range(len(pts) - 1):
+        length = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        seg_lens.append(length)
+        cum.append(cum[-1] + length)
+    total = cum[-1]
+    if along >= total:
+        return 0
+    step = max(float(sample_step_m), float(view.occ.resolution) * 0.5)
+    worst = 0
+    d = along
+    while d <= total + 1e-9:
+        for i in range(len(pts) - 1):
+            if cum[i + 1] + 1e-9 < d:
+                continue
+            seg = seg_lens[i]
+            t = 0.0 if seg < 1e-9 else (d - cum[i]) / seg
+            t = max(0.0, min(1.0, t))
+            x = pts[i][0] + t * (pts[i + 1][0] - pts[i][0])
+            y = pts[i][1] + t * (pts[i + 1][1] - pts[i][1])
+            row, col = view.world_to_cell(x, y)
+            if view.in_bounds(row, col):
+                worst = max(worst, int(view.costs[row, col]))
+            break
+        d += step
+    return worst
+
+
 def should_use_local_planner(
     pose: Pose2D,
     path: Path2D,
