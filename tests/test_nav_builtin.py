@@ -1476,6 +1476,148 @@ def test_plan_path_marks_local_costmap_for_replan():
     assert paths_meaningfully_differ(baseline.path, detoured.path)
 
 
+def test_plan_path_overlay_avoids_second_local_obstacle():
+    """Peeling around one live blob must not thread a second blob in-window."""
+    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav_builtin.local_planner import path_cost_in_local_window
+
+    m = _empty_map(size=120, resolution=0.05)
+    start = Pose2D(1.0, 3.0, 0.0)
+    goal = Pose2D(5.0, 3.0, 0.0)
+    baseline = plan_path(
+        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert baseline.feasible
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=6.0,
+            height_m=6.0,
+            resolution=0.05,
+            inflation_radius_m=0.30,
+            robot_radius_m=0.22,
+            use_global_static=False,
+            scan_inflation_radius_m=0.30,
+        )
+    )
+    # Two bins: on the straight path, and on the natural +y peel.
+    n = 180
+    ranges = np.full(n, np.inf)
+    # ~1.2 m ahead on centerline
+    ranges[n // 2] = 1.2
+    # ~1.2 m ahead, ~0.55 m to +y (peel corridor)
+    ang = math.atan2(0.55, 1.2)
+    idx = int((ang - (-math.pi)) / (2 * math.pi / n)) % n
+    ranges[idx] = math.hypot(1.2, 0.55)
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(start, scan)
+    # Straight path should be locally blocked.
+    assert (
+        path_cost_in_local_window(start, baseline.path, view, start_offset_m=0.22)
+        >= 200
+    )
+    detoured = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        local_view=view,
+        clearance_preference_m=0.0,
+    )
+    assert detoured.feasible, detoured.error_msg
+    assert paths_meaningfully_differ(baseline.path, detoured.path)
+    # Accepted path must stay clear of *both* live blobs inside the window.
+    assert (
+        path_cost_in_local_window(start, detoured.path, view, start_offset_m=0.22)
+        < 200
+    ), "replan still intersects a live local obstacle"
+
+
+def test_try_replan_rejects_path_still_hitting_local_cost():
+    """Safety net: do not accept a 'different' route that is still local-lethal."""
+    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav_builtin.types import PlanResult
+
+    m = _empty_map(size=120, resolution=0.05)
+    world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        clearance_preference_m=0.0,
+    )
+    goal = Pose2D(5.0, 3.0, 0.0)
+    base = plan_path(
+        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert base.feasible
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=6.0,
+            height_m=6.0,
+            resolution=0.05,
+            inflation_radius_m=0.30,
+            robot_radius_m=0.22,
+            use_global_static=False,
+            scan_inflation_radius_m=0.30,
+        )
+    )
+    n = 180
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 1.2
+    ang = math.atan2(0.55, 1.2)
+    idx = int((ang - (-math.pi)) / (2 * math.pi / n)) % n
+    ranges[idx] = math.hypot(1.2, 0.55)
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(world.pose, scan)
+
+    # Force every plan attempt to return a peel that still hits the +y blob.
+    bad_pts = [
+        (1.0, 3.0),
+        (1.6, 3.55),
+        (2.2, 3.55),
+        (3.0, 3.55),
+        (4.0, 3.2),
+        (5.0, 3.0),
+    ]
+    bad_path = Path2D(points=bad_pts, goal_theta=0.0)
+
+    def sticky_bad(g, start=None, scan=None, **kwargs):
+        return PlanResult(feasible=True, path=bad_path)
+
+    sup.plan = sticky_bad  # type: ignore[method-assign]
+    new = sup._try_replan(
+        goal,
+        world.pose,
+        base.path,
+        scan,
+        failed_count=2,
+        require_different=True,
+        local_view=view,
+    )
+    assert new is None
+    assert "still local-blocked" in (sup._last_replan_error or "")
+    assert any(
+        "still local-blocked" in str(a) for a in (sup._last_replan_info or {}).get("attempts", [])
+    )
+
+
 def test_builtin_navigator_cancel_sets_status():
     """Open room: scan peels around a bin; corridor paint must not replace it
     with a room-scale loop."""

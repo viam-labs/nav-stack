@@ -658,6 +658,8 @@ class NavSupervisor:
         - Prefer scan+local (and optional corridor paint) that actually leaves
           the old route (tol 0.12 m — 0.25 m was rejecting useful peels as
           ``same route``).
+        - Reject any candidate whose in-window local path cost is still at or
+          above the activate threshold (peeling past one blob into another).
         - Cap length at ~1.8× remaining on the blocked-corridor attempt so we
           don't take room-scale loops when a milder peel already exists.
         - If every attempt is same-route/infeasible, force left/right vias
@@ -665,6 +667,7 @@ class NavSupervisor:
           where Lazy Theta* stubbornly hugs the old corridor.
         """
         from .controller import _path_length
+        from .local_planner import path_cost_in_local_window
         from .path_utils import closest_point_on_path
 
         old_len = _path_length(path)
@@ -677,6 +680,24 @@ class NavSupervisor:
         remaining = max(0.5, old_len - along)
         best: Optional[tuple[float, Path2D, PlanResult, str]] = None
         differ_tol = 0.12 if local_view is not None else 0.25
+        block_cost = int(self._local_planner_activate_cost)
+        footprint_skip = max(0.05, float(self._robot_radius))
+
+        def _still_local_blocked(candidate: Path2D) -> Optional[int]:
+            if local_view is None:
+                return None
+            cost = int(
+                path_cost_in_local_window(
+                    pose,
+                    candidate,
+                    local_view,
+                    start_offset_m=footprint_skip,
+                )
+            )
+            if cost >= block_cost:
+                return cost
+            return None
+
         for label, paint in attempts:
             replanned = self.plan(
                 goal,
@@ -697,6 +718,12 @@ class NavSupervisor:
                     f"{label}: same route ({_path_length(replanned.path):.1f} m)"
                 )
                 continue
+            stuck_cost = _still_local_blocked(replanned.path)
+            if stuck_cost is not None:
+                reasons.append(
+                    f"{label}: still local-blocked (cost={stuck_cost})"
+                )
+                continue
             new_len = _path_length(replanned.path)
             if paint and new_len > remaining * 1.8 and best is not None:
                 reasons.append(
@@ -711,20 +738,27 @@ class NavSupervisor:
             forced = self._forced_side_detour(goal, pose, path, scan, local_view)
             if forced is not None:
                 new_path, result, label = forced
-                new_len = _path_length(new_path)
-                self._last_replan_error = ""
-                self._last_replan_info = {
-                    "trigger": self._last_replan_trigger,
-                    "accepted": label,
-                    "old_length_m": round(old_len, 3),
-                    "new_length_m": round(new_len, 3),
-                    "require_different": bool(require_different),
-                    "attempts": list(reasons),
-                }
-                preview = self._publish_plan_viz(result, goal, start=pose)
-                self._set_status(path=preview["path"], length_m=preview["length_m"])
-                return new_path
-            reasons.append("forced-via: none feasible")
+                stuck_cost = _still_local_blocked(new_path)
+                if stuck_cost is not None:
+                    reasons.append(
+                        f"{label}: still local-blocked (cost={stuck_cost})"
+                    )
+                else:
+                    new_len = _path_length(new_path)
+                    self._last_replan_error = ""
+                    self._last_replan_info = {
+                        "trigger": self._last_replan_trigger,
+                        "accepted": label,
+                        "old_length_m": round(old_len, 3),
+                        "new_length_m": round(new_len, 3),
+                        "require_different": bool(require_different),
+                        "attempts": list(reasons),
+                    }
+                    preview = self._publish_plan_viz(result, goal, start=pose)
+                    self._set_status(path=preview["path"], length_m=preview["length_m"])
+                    return new_path
+            else:
+                reasons.append("forced-via: none feasible")
         if best is None:
             self._last_replan_error = "; ".join(reasons)
             self._last_replan_info = {
