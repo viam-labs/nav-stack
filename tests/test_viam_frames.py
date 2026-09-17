@@ -1,8 +1,10 @@
 """Tests for Viam framesystem → mount / footprint resolution."""
 from __future__ import annotations
 
+import asyncio
 import math
 
+import pytest
 from viam.proto.common import (
     Geometry,
     Pose,
@@ -13,10 +15,11 @@ from viam.proto.common import (
 )
 from viam.proto.robot import FrameSystemConfig
 
-from src.config import LidarConfig, NavConfig, SlamConfig
+from src.config import NavConfig, SlamConfig
 from src.viam_frames import (
     apply_framesystem_to_nav_cfg,
     apply_framesystem_to_slam_cfg,
+    fetch_frame_system_config,
     footprint_from_base_geometry,
     pose_of_frame_in_destination,
 )
@@ -159,3 +162,29 @@ def test_apply_nav_keeps_explicit_footprint():
     assert abs(cfg2.footprint_length_m - 0.8) < 1e-9
     assert abs(cfg2.footprint_width_m - 0.5) < 1e-9
     assert abs(cfg2.robot_radius - 0.31) < 1e-9
+
+
+def test_apply_slam_mutates_lidar_in_place():
+    """Live BuiltinSensors holds the same LidarConfig instances."""
+    configs = _tracer_like_frames()
+    raw = {
+        "base": "base",
+        "movement_sensor": "odom",
+        "lidars": [{"name": "rplidar", "scan_source": "point_cloud"}],
+    }
+    cfg = SlamConfig.from_dict(raw)
+    lidar = cfg.lidars[0]
+    apply_framesystem_to_slam_cfg(cfg, configs, raw_attrs=raw)
+    assert lidar is cfg.lidars[0]
+    assert abs(lidar.x - (-0.05)) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_fetch_frame_system_config_times_out():
+    class _SlowRobot:
+        async def get_frame_system_config(self):
+            await asyncio.sleep(10.0)
+            return []
+
+    with pytest.raises(asyncio.TimeoutError):
+        await fetch_frame_system_config(_SlowRobot(), timeout_s=0.05)

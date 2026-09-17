@@ -59,7 +59,7 @@ from ..runtime import (
 )
 from ..viam_frames import (
     apply_framesystem_to_slam_cfg,
-    fetch_frame_system_config_sync,
+    fetch_frame_system_config,
 )
 from ..slam_builtin import BuiltinSlamEngine, BuiltinSlamHost
 from ..slam_builtin.io_sensors import BuiltinSensors
@@ -106,6 +106,9 @@ class SlamService(SLAM):
         self._pose_jump_gate = PoseJumpGate()
         # Scan-to-map matcher subprocess (keeps the heavy search off this GIL).
         self._localizer = LocalizeWorker(enabled=True, logger=LOGGER)
+        self._framesystem_task: Optional[asyncio.Task] = None
+        self._framesystem_gen = 0
+        self._framesystem_raw_attrs: Optional[Mapping] = None
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -130,21 +133,14 @@ class SlamService(SLAM):
         self._cancel_startup_global_localize_task()
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
+        self._cancel_framesystem_task()
         self._skip_get_laser_scan = set()
         attrs = struct_to_dict(config.attributes)
         cfg = SlamConfig.from_dict(attrs)
-        robot = get_parent_robot()
-        if robot is not None and not cfg.uses_sim():
-            try:
-                fs = fetch_frame_system_config_sync(robot)
-                cfg, _notes = apply_framesystem_to_slam_cfg(
-                    cfg, fs, raw_attrs=attrs, logger=LOGGER
-                )
-            except Exception as exc:  # noqa: BLE001 - keep JSON mounts on failure
-                LOGGER.warning(
-                    "framesystem mount resolve failed; using config mounts: %s", exc
-                )
+        # Framesystem mounts are resolved async on the module loop after
+        # reconfigure returns — never via a sync cross-thread parent RPC.
         self._cfg = cfg
+        self._framesystem_raw_attrs = attrs
         if self._localizer.enabled != bool(cfg.localize_subprocess):
             self._localizer.close()
             self._localizer = LocalizeWorker(
@@ -247,6 +243,7 @@ class SlamService(SLAM):
         self._schedule_startup_global_localize(loop)
         self._schedule_periodic_relocalize(loop)
         self._schedule_mapping_revisit(loop)
+        self._schedule_framesystem_mounts(loop)
 
         register_slam(
             self.name,
@@ -283,6 +280,55 @@ class SlamService(SLAM):
         if task is not None and not task.done():
             task.cancel()
         self._mapping_revisit_task = None
+
+    def _cancel_framesystem_task(self) -> None:
+        task = self._framesystem_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._framesystem_task = None
+        self._framesystem_gen += 1
+
+    def _schedule_framesystem_mounts(self, loop: asyncio.AbstractEventLoop) -> None:
+        cfg = self._cfg
+        if cfg is None or cfg.uses_sim():
+            return
+        if get_parent_robot() is None:
+            return
+        self._framesystem_gen += 1
+        gen = self._framesystem_gen
+        raw = self._framesystem_raw_attrs or {}
+        self._framesystem_task = loop.create_task(
+            self._apply_framesystem_mounts(gen, raw)
+        )
+
+    async def _apply_framesystem_mounts(
+        self, gen: int, raw_attrs: Mapping
+    ) -> None:
+        if gen != self._framesystem_gen:
+            return
+        robot = get_parent_robot()
+        cfg = self._cfg
+        if robot is None or cfg is None:
+            return
+        try:
+            fs = await fetch_frame_system_config(robot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep JSON mounts on failure
+            LOGGER.warning(
+                "framesystem mount resolve failed; using config mounts: %s", exc
+            )
+            return
+        if gen != self._framesystem_gen or self._cfg is not cfg:
+            return
+        try:
+            apply_framesystem_to_slam_cfg(
+                cfg, fs, raw_attrs=raw_attrs, logger=LOGGER
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "framesystem mount apply failed; using config mounts: %s", exc
+            )
 
     def _reschedule_mode_watchdogs(self) -> None:
         """Restart mode-gated background tasks after a runtime mode switch.
@@ -2719,6 +2765,7 @@ class SlamService(SLAM):
         self._cancel_startup_global_localize_task()
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
+        self._cancel_framesystem_task()
         unregister_slam(self.name)
         unregister_slam_service(self.name)
         self._shm_lidar.close()

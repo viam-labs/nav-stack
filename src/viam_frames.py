@@ -9,15 +9,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import threading
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 
 from .geom.conversions import mm_to_m, orientation_vector_to_rpy
 
 LOGGER = logging.getLogger(__name__)
+
+# Parent RobotClient RPCs must stay on the module event loop. Bound the wait so
+# a wedged parent cannot stall slam/nav forever after startup.
+FRAME_SYSTEM_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -52,30 +55,6 @@ class FootprintBox:
     @property
     def inscribed_radius_m(self) -> float:
         return min(self.length_m, self.width_m) / 2.0
-
-
-def _run_coro(coro):
-    """Run ``coro`` to completion from sync reconfigure (may already be on a loop)."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-
-    result: Dict[str, Any] = {}
-    error: Dict[str, BaseException] = {}
-
-    def _target() -> None:
-        try:
-            result["value"] = asyncio.run(coro)
-        except BaseException as exc:  # noqa: BLE001 - surface to caller
-            error["exc"] = exc
-
-    thread = threading.Thread(target=_target, name="viam-framesystem", daemon=True)
-    thread.start()
-    thread.join()
-    if "exc" in error:
-        raise error["exc"]
-    return result.get("value")
 
 
 def _pose_to_matrix(pose) -> np.ndarray:
@@ -217,13 +196,18 @@ def footprint_from_base_geometry(
     return FootprintBox(length_m=length_m, width_m=width_m)
 
 
-async def fetch_frame_system_config(robot) -> List[Any]:
-    """``robot.get_frame_system_config()`` — list of FrameSystemConfig."""
-    return list(await robot.get_frame_system_config())
+async def fetch_frame_system_config(
+    robot, *, timeout_s: float = FRAME_SYSTEM_TIMEOUT_S
+) -> List[Any]:
+    """``robot.get_frame_system_config()`` on the caller's event loop.
 
-
-def fetch_frame_system_config_sync(robot) -> List[Any]:
-    return list(_run_coro(fetch_frame_system_config(robot)) or [])
+    Must not be driven from a worker thread via ``asyncio.run`` — the module
+    parent ``RobotClient`` is bound to the module loop and that pattern can
+    deadlock reconfigure (seen after v1.0.40).
+    """
+    return list(
+        await asyncio.wait_for(robot.get_frame_system_config(), timeout=timeout_s)
+    )
 
 
 def apply_framesystem_to_slam_cfg(
@@ -235,10 +219,11 @@ def apply_framesystem_to_slam_cfg(
 ):
     """Fill lidar mounts from framesystem when JSON omitted ``mount``.
 
+    Mutates existing ``LidarConfig`` objects in place so live sensor facades
+    that hold the same instances pick up mounts without a rebuild.
+
     Returns ``(cfg, notes)`` where notes are human-readable resolution lines.
     """
-    from dataclasses import replace
-
     log = logger or LOGGER
     raw = raw_attrs or {}
     raw_lidars = list(raw.get("lidars") or [])
@@ -249,7 +234,6 @@ def apply_framesystem_to_slam_cfg(
 
     base_name = str(getattr(cfg, "base", "") or "base")
     notes: List[str] = []
-    new_lidars = []
     for lidar in cfg.lidars:
         raw_l = raw_by_name.get(lidar.name, {})
         explicit_mount = isinstance(raw_l, Mapping) and (
@@ -257,7 +241,6 @@ def apply_framesystem_to_slam_cfg(
             or any(k in raw_l for k in ("x", "y", "z", "theta", "pitch", "roll"))
         )
         if explicit_mount or bool(lidar.points_in_base_link):
-            new_lidars.append(lidar)
             if explicit_mount:
                 notes.append(f"lidar {lidar.name}: mount from config (override)")
             else:
@@ -265,7 +248,6 @@ def apply_framesystem_to_slam_cfg(
             continue
         mount = pose_of_frame_in_destination(configs, lidar.name, base_name)
         if mount is None:
-            new_lidars.append(lidar)
             notes.append(
                 f"lidar {lidar.name}: no framesystem frame named {lidar.name!r} "
                 f"relative to {base_name!r}; keeping defaults "
@@ -276,30 +258,22 @@ def apply_framesystem_to_slam_cfg(
         # that same component frame, so do not also apply camera_optical remap.
         from .config import CLOUD_FRAME_CAMERA_OPTICAL, CLOUD_FRAME_SENSOR
 
-        cloud_frame = lidar.cloud_frame
         optical_note = ""
-        if cloud_frame == CLOUD_FRAME_CAMERA_OPTICAL:
-            cloud_frame = CLOUD_FRAME_SENSOR
+        if lidar.cloud_frame == CLOUD_FRAME_CAMERA_OPTICAL:
+            lidar.cloud_frame = CLOUD_FRAME_SENSOR
             optical_note = "; cloud_frame sensor (FS pose is full base transform)"
-        new_lidars.append(
-            replace(
-                lidar,
-                x=mount.x,
-                y=mount.y,
-                z=mount.z,
-                theta=mount.theta,
-                pitch=mount.pitch,
-                roll=mount.roll,
-                cloud_frame=cloud_frame,
-            )
-        )
+        lidar.x = mount.x
+        lidar.y = mount.y
+        lidar.z = mount.z
+        lidar.theta = mount.theta
+        lidar.pitch = mount.pitch
+        lidar.roll = mount.roll
         notes.append(
             f"lidar {lidar.name}: mount from framesystem "
             f"({mount.x:.3f},{mount.y:.3f},{mount.z:.3f}) "
             f"θ={mount.theta:.3f} pitch={mount.pitch:.3f} roll={mount.roll:.3f}"
             f"{optical_note}"
         )
-    cfg = replace(cfg, lidars=new_lidars)
     for line in notes:
         log.info("framesystem: %s", line)
     return cfg, notes
