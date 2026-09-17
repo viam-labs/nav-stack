@@ -65,7 +65,10 @@ A single lidar can be given as `"lidar": "front-lidar"`.
 Per-lidar options include mount pose, `scan_source` (`auto` / `get_laser_scan` /
 `point_cloud`), height band (`z_min` / `z_max`), and `obstacles_only` (when
 `true`, the sensor is used only for obstacle avoidance — not SLAM matching or
-mapping). Example depth camera for avoidance only:
+mapping). When `mount` is omitted, the module fills it from the Viam
+framesystem (component → `base`), converting Viam's Y-forward base axes into
+nav-stack's ROS X-forward mounts so scans align with odom. Explicit `mount`
+still wins. Example depth camera for avoidance only:
 
 ```json
 {

@@ -112,6 +112,28 @@ def _matrix_to_mount(T: np.ndarray) -> MountPose:
     )
 
 
+def _viam_y_forward_base_to_ros(T: np.ndarray) -> np.ndarray:
+    """Map a pose expressed in Viam Y-forward ``base`` into ROS X-forward ``base_link``.
+
+    Viam wheeled / Tracer / MiR: +Y forward, +X right, +Z up.
+    Nav-stack mounts + SLAM map: +X forward, +Y left, +Z up (ROS).
+
+    ``p_ros = Rz(-π/2) @ p_viam`` so forward (+Y_v) → (+X_r) and right (+X_v) → (−Y_r).
+    Odom already applies this via ``base_velocity_convention: viam``; framesystem
+    mounts must too or every scan is painted 90° CW relative to drive.
+    """
+    r_vr = np.array(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    return r_vr @ np.asarray(T, dtype=float)
+
+
 def _frame_entries(configs: Sequence[Any]) -> Dict[str, Any]:
     """Map frame name → FrameSystemConfig / Transform."""
     out: Dict[str, Any] = {}
@@ -127,10 +149,15 @@ def pose_of_frame_in_destination(
     configs: Sequence[Any],
     frame_name: str,
     destination: str,
+    *,
+    y_forward_base: bool = False,
 ) -> Optional[MountPose]:
     """Compose framesystem transforms so ``frame_name`` is expressed in ``destination``.
 
     Each framesystem entry is the named frame's pose in its parent (observer).
+
+    When ``y_forward_base`` is true (Viam/Tracer/MiR ``base``), the result is
+    converted into nav-stack ROS X-forward ``base_link`` axes.
     """
     frames = _frame_entries(configs)
     if frame_name not in frames and frame_name != destination:
@@ -170,6 +197,8 @@ def pose_of_frame_in_destination(
         if len(seen) > 64:
             LOGGER.warning("framesystem chain too deep for %s → %s", frame_name, destination)
             return None
+    if y_forward_base:
+        T = _viam_y_forward_base_to_ros(T)
     return _matrix_to_mount(T)
 
 
@@ -222,11 +251,15 @@ def apply_framesystem_to_slam_cfg(
     *,
     raw_attrs: Optional[Mapping] = None,
     logger: Optional[logging.Logger] = None,
+    y_forward_base: Optional[bool] = None,
 ):
     """Fill lidar mounts from framesystem when JSON omitted ``mount``.
 
     Mutates existing ``LidarConfig`` objects in place so live sensor facades
     that hold the same instances pick up mounts without a rebuild.
+
+    ``y_forward_base`` converts Viam Y-forward ``base`` poses into ROS X-forward
+    mounts (default True — all Viam bases are Y-forward).
 
     Returns ``(cfg, notes)`` where notes are human-readable resolution lines.
     """
@@ -238,8 +271,15 @@ def apply_framesystem_to_slam_cfg(
         if isinstance(entry, Mapping) and entry.get("name"):
             raw_by_name[str(entry["name"])] = entry
 
+    if y_forward_base is None:
+        # All Viam bases are Y-forward in the framesystem; nav-stack mounts are
+        # ROS X-forward. Always convert unless a caller opts out (tests).
+        y_forward_base = True
+
     base_name = str(getattr(cfg, "base", "") or "base")
     notes: List[str] = []
+    if y_forward_base:
+        notes.append("base axes: Viam Y-forward → nav-stack X-forward")
     for lidar in cfg.lidars:
         raw_l = raw_by_name.get(lidar.name, {})
         explicit_mount = isinstance(raw_l, Mapping) and (
@@ -252,7 +292,9 @@ def apply_framesystem_to_slam_cfg(
             else:
                 notes.append(f"lidar {lidar.name}: points_in_base_link — skip mount")
             continue
-        mount = pose_of_frame_in_destination(configs, lidar.name, base_name)
+        mount = pose_of_frame_in_destination(
+            configs, lidar.name, base_name, y_forward_base=bool(y_forward_base)
+        )
         if mount is None:
             notes.append(
                 f"lidar {lidar.name}: no framesystem frame named {lidar.name!r} "
