@@ -109,6 +109,7 @@ class SlamService(SLAM):
         self._framesystem_task: Optional[asyncio.Task] = None
         self._framesystem_gen = 0
         self._framesystem_raw_attrs: Optional[Mapping] = None
+        self._builtin_sensors: Optional[BuiltinSensors] = None
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -199,6 +200,7 @@ class SlamService(SLAM):
 
         loop = asyncio.get_event_loop()
         sim_sensors = None
+        self._builtin_sensors = None
         if cfg.uses_sim():
             from ..sim import SimSensors, ensure_sim_world_from_slam_cfg
 
@@ -219,6 +221,10 @@ class SlamService(SLAM):
                 scan_max_age_s=float(cfg.scan_max_age_s or 2.0),
                 odom_reader=odom_reader,
             )
+            self._builtin_sensors = sensors
+            if self._lidars_need_framesystem(attrs) and get_parent_robot() is not None:
+                # Hold scans until FS mounts land — identity mounts poison maps.
+                sensors._mounts_ready = False  # noqa: SLF001
         self._engine = BuiltinSlamEngine(
             cfg,
             sensors,
@@ -281,6 +287,27 @@ class SlamService(SLAM):
             task.cancel()
         self._mapping_revisit_task = None
 
+    def _lidars_need_framesystem(self, raw_attrs: Mapping) -> bool:
+        """True when at least one lidar will take its mount from the framesystem."""
+        for entry in list(raw_attrs.get("lidars") or []):
+            if isinstance(entry, str):
+                return True
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get("points_in_base_link"):
+                continue
+            if "mount" in entry or any(
+                k in entry for k in ("x", "y", "z", "theta", "pitch", "roll")
+            ):
+                continue
+            return True
+        return False
+
+    def _set_mounts_ready(self, ready: bool) -> None:
+        sensors = self._builtin_sensors
+        if sensors is not None:
+            sensors._mounts_ready = bool(ready)  # noqa: SLF001
+
     def _cancel_framesystem_task(self) -> None:
         task = self._framesystem_task
         if task is not None and not task.done():
@@ -291,12 +318,17 @@ class SlamService(SLAM):
     def _schedule_framesystem_mounts(self, loop: asyncio.AbstractEventLoop) -> None:
         cfg = self._cfg
         if cfg is None or cfg.uses_sim():
+            self._set_mounts_ready(True)
             return
         if get_parent_robot() is None:
+            self._set_mounts_ready(True)
+            return
+        raw = self._framesystem_raw_attrs or {}
+        if not self._lidars_need_framesystem(raw):
+            self._set_mounts_ready(True)
             return
         self._framesystem_gen += 1
         gen = self._framesystem_gen
-        raw = self._framesystem_raw_attrs or {}
         self._framesystem_task = loop.create_task(
             self._apply_framesystem_mounts(gen, raw)
         )
@@ -309,6 +341,7 @@ class SlamService(SLAM):
         robot = get_parent_robot()
         cfg = self._cfg
         if robot is None or cfg is None:
+            self._set_mounts_ready(True)
             return
         try:
             fs = await fetch_frame_system_config(robot)
@@ -318,6 +351,7 @@ class SlamService(SLAM):
             LOGGER.warning(
                 "framesystem mount resolve failed; using config mounts: %s", exc
             )
+            self._set_mounts_ready(True)
             return
         if gen != self._framesystem_gen or self._cfg is not cfg:
             return
@@ -329,6 +363,9 @@ class SlamService(SLAM):
             LOGGER.warning(
                 "framesystem mount apply failed; using config mounts: %s", exc
             )
+        finally:
+            if gen == self._framesystem_gen:
+                self._set_mounts_ready(True)
 
     def _reschedule_mode_watchdogs(self) -> None:
         """Restart mode-gated background tasks after a runtime mode switch.

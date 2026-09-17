@@ -81,6 +81,9 @@ class BuiltinSensors:
         # (wit-motion exposes deg/s); used only when no absolute orientation.
         self._gyro_heading_rad: Optional[float] = None
         self._gyro_heading_t: Optional[float] = None
+        # False while async framesystem mount resolve is in flight — avoid
+        # painting keyframes with identity mounts before FS applies.
+        self._mounts_ready: bool = True
         # Wheel odom is a gRPC round-trip on the shared module loop. Never
         # block the SLAM tick on it: keep one read in flight, collect it when
         # done, and let the reader's zero-order hold bridge the gap. Blocking
@@ -146,6 +149,8 @@ class BuiltinSensors:
         Sensors with ``obstacles_only=true`` are omitted (nav costmap reads them
         via ViamWorldIO instead).
         """
+        if not self._mounts_ready:
+            return None
         now = time.monotonic()
         cached = self._scan_cache
         if cached is not None:
