@@ -464,9 +464,10 @@ class BuiltinNavConfig:
     backup_max_attempts: int = 1
     backup_cooldown_s: float = 4.0
     # Wait: stop and wait for a dynamic blocker to clear before
-    # the first local replan (people crossing).
+    # the first local replan (people crossing). Same grace is used when the
+    # nose is clear to prefer DWA on the short path before escalating.
     recovery_wait_duration_s: float = 2.0
-    # Legacy grace before local replan; effective wait is
+    # Legacy grace before local replan; effective wait / DWA grace is
     # max(recovery_wait_duration_s, replan_local_blocked_time_s).
     replan_local_blocked_time_s: float = 0.3
     # Cooldown begins when a blocking plan finishes. Give the local planner

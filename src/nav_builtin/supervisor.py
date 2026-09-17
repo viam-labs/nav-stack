@@ -618,6 +618,28 @@ class NavSupervisor:
             return None
         return best[1], best[2], best[3]
 
+    @staticmethod
+    def _local_block_action(
+        *,
+        nose_clear: bool,
+        blocked_for_s: float,
+        wait_before_replan_s: float,
+        replan_cooldown_ready: bool,
+    ) -> str:
+        """Choose wait / keep_dwa / replan while the local path cost is high.
+
+        ``keep_dwa``: clear forward cone — stay on the short global path and
+        peel with the local planner (fit doorway inflation pinch).
+        ``wait``: blocked nose — freeze briefly for dynamic crossers.
+        ``replan``: grace/cooldown elapsed — escalate to a new global path.
+        """
+        if blocked_for_s < wait_before_replan_s:
+            return "wait" if not nose_clear else "keep_dwa"
+        if replan_cooldown_ready:
+            return "replan"
+        # Still in replan cooldown: keep peeling if the nose is open, else hold.
+        return "keep_dwa" if nose_clear else "wait"
+
     def _try_replan(
         self,
         goal: Pose2D,
@@ -636,7 +658,8 @@ class NavSupervisor:
         - Prefer scan+local (and optional corridor paint) that actually leaves
           the old route (tol 0.12 m — 0.25 m was rejecting useful peels as
           ``same route``).
-        - Cap length at ~1.8× remaining so we don't take room-scale loops.
+        - Cap length at ~1.8× remaining on the blocked-corridor attempt so we
+          don't take room-scale loops when a milder peel already exists.
         - If every attempt is same-route/infeasible, force left/right vias
           around the first blocked path sample — that is the static-box case
           where Lazy Theta* stubbornly hugs the old corridor.
@@ -992,10 +1015,12 @@ class NavSupervisor:
                     local_blocked = True
                     if local_blocked_since is None:
                         local_blocked_since = reactive_avoid_since
-                # Front-vs-side policy (not motion classification): a clear nose
-                # means the blocking cost is beside/farther along the path, so
-                # replan/peel now. A blocked nose gets a brief wait (useful for
-                # people crossing), then replans if it stays occupied.
+                # Front-vs-side policy (not motion classification):
+                # - Blocked nose: brief wait (people crossing), then replan.
+                # - Clear nose + local path cost: inflation pinch / side hit —
+                #   keep the short global path and let DWA peel first. Immediate
+                #   replan here was sealing fit doorways (scan paint → 40 m+
+                #   room loops). Escalate to replan only after the grace window.
                 wait_before_replan_s = max(
                     self._recovery_wait_duration_s,
                     self._replan_local_blocked_time_s,
@@ -1015,12 +1040,18 @@ class NavSupervisor:
                     if local_blocked_since is None:
                         local_blocked_since = now
                     blocked_for = now - local_blocked_since
-                    if (
-                        blocked_for < wait_before_replan_s
-                        and not nose_clear
-                    ):
+                    cooldown_ready = (
+                        now - last_local_replan_at >= self._replan_local_min_period_s
+                    )
+                    action = self._local_block_action(
+                        nose_clear=nose_clear,
+                        blocked_for_s=blocked_for,
+                        wait_before_replan_s=wait_before_replan_s,
+                        replan_cooldown_ready=cooldown_ready,
+                    )
+                    if action == "wait":
                         waiting_for_clear = True
-                    elif now - last_local_replan_at >= self._replan_local_min_period_s:
+                    elif action == "replan":
                         # Stop only long enough to plan. Paint + forced-via
                         # kick in so we do not keep accepting the same corridor.
                         _trig = (

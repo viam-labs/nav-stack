@@ -1,4 +1,9 @@
-"""Replan scan-paint seals a fit doorway that the static plan uses."""
+"""Replan scan-paint seals a fit doorway that the static plan uses.
+
+Also documents the runtime policy: with a clear nose, the supervisor keeps the
+short path and peels with DWA for a grace window before escalating to replan
+(so scan-paint room loops are not the first response).
+"""
 from __future__ import annotations
 
 import math
@@ -6,8 +11,9 @@ import math
 import numpy as np
 
 from src.geom.conversions import LaserScan2D, Pose2D
-from src.nav_builtin.costmap import OccupancyGrid, build_costmap
-from src.nav_builtin.planner import plan_on_costmap, plan_path
+from src.nav_builtin.costmap import OccupancyGrid
+from src.nav_builtin.planner import plan_path
+from src.nav_builtin.supervisor import NavSupervisor
 
 
 RES = 0.05
@@ -55,13 +61,66 @@ def _frame_scan(pose: Pose2D, *, inward_m: float) -> LaserScan2D:
     )
 
 
+def test_local_block_policy_prefers_dwa_when_nose_clear():
+    """Doorway pinch: clear nose → keep short path; blocked nose → wait."""
+    wait = 2.0
+    assert (
+        NavSupervisor._local_block_action(
+            nose_clear=True,
+            blocked_for_s=0.1,
+            wait_before_replan_s=wait,
+            replan_cooldown_ready=True,
+        )
+        == "keep_dwa"
+    )
+    assert (
+        NavSupervisor._local_block_action(
+            nose_clear=False,
+            blocked_for_s=0.1,
+            wait_before_replan_s=wait,
+            replan_cooldown_ready=True,
+        )
+        == "wait"
+    )
+    # After grace, escalate either way once cooldown allows.
+    assert (
+        NavSupervisor._local_block_action(
+            nose_clear=True,
+            blocked_for_s=wait + 0.1,
+            wait_before_replan_s=wait,
+            replan_cooldown_ready=True,
+        )
+        == "replan"
+    )
+    assert (
+        NavSupervisor._local_block_action(
+            nose_clear=False,
+            blocked_for_s=wait + 0.1,
+            wait_before_replan_s=wait,
+            replan_cooldown_ready=True,
+        )
+        == "replan"
+    )
+    # Cooldown not ready: keep peeling / waiting, do not replan.
+    assert (
+        NavSupervisor._local_block_action(
+            nose_clear=True,
+            blocked_for_s=wait + 0.1,
+            wait_before_replan_s=wait,
+            replan_cooldown_ready=False,
+        )
+        == "keep_dwa"
+    )
+
+
 def test_static_plan_uses_doorway_but_scan_replan_takes_long_detour():
     """Mirrors live: plan_to_point ~4 m through gap; navigate replan ~47 m.
 
     Initial plan is scan-free. Every ``_try_replan`` paints live hits with a
     0.12 m disc then full footprint inflation — enough to seal a 1.08 m gap
     when the frames read even slightly inward — and the 1.8× length cap does
-    not apply to that first scan+local attempt.
+    not apply to that first scan+local attempt. Runtime policy now delays that
+    replan while the nose is clear so DWA can keep the short route.
     """
     occ = _gap_map()
     start = Pose2D(DOOR_X, WALL_Y - 1.5, math.pi / 2)
