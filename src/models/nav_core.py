@@ -706,6 +706,20 @@ class NavServiceBase(Motion):
 
             status = await asyncio.to_thread(_status)
             if cmd == "get_status":
+                try:
+                    cfg = self._require_cfg()
+                    fl = cfg.footprint_length_m
+                    fw = cfg.footprint_width_m
+                    if fl and fw:
+                        status["footprint_length_m"] = float(fl)
+                        status["footprint_width_m"] = float(fw)
+                    else:
+                        diam = 2.0 * float(cfg.robot_radius)
+                        status["footprint_length_m"] = diam
+                        status["footprint_width_m"] = diam
+                    status["robot_radius_m"] = float(cfg.inscribed_radius_m())
+                except Exception:  # noqa: BLE001
+                    pass
                 return status
             cfg = self._require_cfg()
             return summarize_nav_motion(
