@@ -51,10 +51,15 @@ from ..shm.lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
     any_navigation_active,
+    get_parent_robot,
     register_slam,
     register_slam_service,
     unregister_slam,
     unregister_slam_service,
+)
+from ..viam_frames import (
+    apply_framesystem_to_slam_cfg,
+    fetch_frame_system_config_sync,
 )
 from ..slam_builtin import BuiltinSlamEngine, BuiltinSlamHost
 from ..slam_builtin.io_sensors import BuiltinSensors
@@ -128,6 +133,17 @@ class SlamService(SLAM):
         self._skip_get_laser_scan = set()
         attrs = struct_to_dict(config.attributes)
         cfg = SlamConfig.from_dict(attrs)
+        robot = get_parent_robot()
+        if robot is not None and not cfg.uses_sim():
+            try:
+                fs = fetch_frame_system_config_sync(robot)
+                cfg, _notes = apply_framesystem_to_slam_cfg(
+                    cfg, fs, raw_attrs=attrs, logger=LOGGER
+                )
+            except Exception as exc:  # noqa: BLE001 - keep JSON mounts on failure
+                LOGGER.warning(
+                    "framesystem mount resolve failed; using config mounts: %s", exc
+                )
         self._cfg = cfg
         if self._localizer.enabled != bool(cfg.localize_subprocess):
             self._localizer.close()

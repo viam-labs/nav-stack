@@ -107,6 +107,29 @@ def get_nav_view(nav_name: str) -> Optional[object]:
     return get_nav_viz(nav_name)
 
 
+# Module parent RobotClient (set from ``main`` after Module.from_args).
+_MODULE: Optional[object] = None
+
+
+def set_module(module: object) -> None:
+    global _MODULE
+    with _LOCK:
+        _MODULE = module
+
+
+def get_module() -> Optional[object]:
+    with _LOCK:
+        return _MODULE
+
+
+def get_parent_robot() -> Optional[object]:
+    """Viam ``RobotClient`` connected to the module parent, if available."""
+    mod = get_module()
+    if mod is None:
+        return None
+    return getattr(mod, "parent", None)
+
+
 # Navigation hosts, keyed by motion service name. SLAM uses this so
 # ``_is_navigation_active`` works with BuiltinSlamHost.
 _NAV_HOSTS: Dict[str, object] = {}

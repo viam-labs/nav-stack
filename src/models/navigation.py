@@ -31,12 +31,17 @@ from ..nav_builtin import (
 )
 from ..runtime import (
     SlamRuntime,
+    get_parent_robot,
     get_slam,
     get_slam_service,
     register_nav_host,
     register_nav_viz,
     unregister_nav_host,
     unregister_nav_viz,
+)
+from ..viam_frames import (
+    apply_framesystem_to_nav_cfg,
+    fetch_frame_system_config_sync,
 )
 from .nav_core import NavServiceBase, _nav_status_to_plan_state  # noqa: F401
 
@@ -146,7 +151,19 @@ class NavigationService(NavServiceBase):
     def reconfigure(
         self, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
-        cfg = NavConfig.from_dict(struct_to_dict(config.attributes))
+        attrs = struct_to_dict(config.attributes)
+        cfg = NavConfig.from_dict(attrs)
+        robot = get_parent_robot()
+        if robot is not None:
+            try:
+                fs = fetch_frame_system_config_sync(robot)
+                cfg, _notes = apply_framesystem_to_nav_cfg(
+                    cfg, fs, raw_attrs=attrs, logger=LOGGER
+                )
+            except Exception as exc:  # noqa: BLE001 - keep JSON footprint on failure
+                LOGGER.warning(
+                    "framesystem footprint resolve failed; using config: %s", exc
+                )
         self._cfg = cfg
         self._base = cast(Base, dependencies[Base.get_resource_name(cfg.base)])
         self._slam_resource = cast(
