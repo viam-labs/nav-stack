@@ -791,8 +791,10 @@ class NavServiceBase(Motion):
                         occ = occupancy_from_map_dict(mp)
                         costs = build_costmap(
                             occ,
-                            inflation_radius_m=cfg.inflation_radius,
-                            robot_radius_m=cfg.robot_radius,
+                            # Same radii the planner uses, so the rendered ring
+                            # matches the costmap paths are actually planned on.
+                            inflation_radius_m=cfg.effective_inflation_radius_m(),
+                            robot_radius_m=cfg.inscribed_radius_m(),
                             cost_scaling_factor=float(
                                 cfg.builtin.cost_scaling_factor
                             ),
@@ -1236,7 +1238,7 @@ class NavServiceBase(Motion):
             enabled=cfg.simple_avoid_obstacles,
             stop_distance_m=cfg.simple_stop_distance,
             slow_distance_m=cfg.simple_slow_distance,
-            footprint_half_width_m=float(cfg.robot_radius) + 0.03,
+            footprint_half_width_m=cfg.inscribed_radius_m() + 0.03,
             max_age_s=cfg.simple_scan_max_age,
         )
 

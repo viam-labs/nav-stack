@@ -17,7 +17,10 @@ class LocalCostmapConfig:
     width_m: float = 4.0
     height_m: float = 4.0
     resolution: float = 0.05
-    inflation_radius_m: float = 0.25
+    # Soft outer radius for live scan hits (absolute, from the obstacle). At or
+    # below ``robot_radius_m`` there is no soft band: only the footprint itself
+    # is lethal, so ``path_cost_ahead`` means "route inside a live return".
+    inflation_radius_m: float = 0.0
     robot_radius_m: float = 0.22
     cost_scaling_factor: float = 4.0
     # Include static lethal/inscribed cells from the global map in the window.
@@ -159,16 +162,26 @@ class LocalCostmap:
             origin_x=self._origin_x,
             origin_y=self._origin_y,
         )
+        # Soft outer radius for live hits: explicit override first, else the
+        # configured inflation radius (clamped to the footprint, which is the
+        # "no soft band" default). This is the knob ``local_inflation_radius_m``
+        # feeds — it used to be accepted and then ignored entirely.
         scan_inflation = (
             float(self._cfg.scan_inflation_radius_m)
             if self._cfg.scan_inflation_radius_m is not None
-            else float(self._cfg.robot_radius_m)
+            else max(
+                float(self._cfg.robot_radius_m),
+                float(self._cfg.inflation_radius_m),
+            )
         )
         scan_costs = build_costmap(
             scan_occ,
             inflation_radius_m=scan_inflation,
             robot_radius_m=self._cfg.robot_radius_m,
             cost_scaling_factor=self._cfg.cost_scaling_factor,
+            # The clearance-preference band is a planner-only routing bias; it
+            # has no business in the layer used for collision / DWA thresholds.
+            clearance_preference_m=0.0,
         )
         costs = np.maximum(costs, scan_costs)
         occ = OccupancyGrid(
