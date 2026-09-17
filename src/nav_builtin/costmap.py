@@ -125,7 +125,7 @@ def mark_path_block_from_local(
     view,
     *,
     cost_threshold: int = 200,
-    margin_m: float = 0.18,
+    margin_m: float = 0.0,
     radius_m: float = 0.25,
     lookahead_m: float = 1.5,
     start_offset_m: float = 0.3,
