@@ -5,6 +5,7 @@ logic easy to unit-test and shareable between the models and the runtime layer.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Mapping, Optional
 
@@ -339,6 +340,14 @@ def _positive_hz(value, name: str) -> float:
     if hz <= 0.0:
         raise ValueError(f"{name} must be > 0, got {hz}")
     return hz
+
+
+def _optional_positive(value) -> Optional[float]:
+    """Parse an optional positive dimension; absent / non-positive -> None."""
+    if value is None:
+        return None
+    parsed = float(value)
+    return parsed if parsed > 0.0 else None
 
 
 def _merge_top_level_nav_tuning(d: Mapping) -> dict:
@@ -1291,6 +1300,13 @@ class NavConfig:
     base: str
     kinematics: str = DIFFERENTIAL
     robot_radius: float = 0.22  # meters
+    # Rectangular footprint (metres, optional). A single ``robot_radius`` has to
+    # cover both driving and spinning, so it must be the half-diagonal — which
+    # seals every gap narrower than 2·radius even when the robot easily fits
+    # (0.59 m robot refusing an 0.84 m doorway). Given length+width, clearance
+    # uses the half-width and rotation uses the half-diagonal instead.
+    footprint_length_m: Optional[float] = None
+    footprint_width_m: Optional[float] = None
     max_vel_x: float = 0.6  # m/s
     max_vel_y: float = 0.0  # m/s (omni only)
     max_vel_theta: float = 1.5  # rad/s
@@ -1339,6 +1355,8 @@ class NavConfig:
             base=d["base"],
             kinematics=kinematics,
             robot_radius=float(d.get("robot_radius", 0.22)),
+            footprint_length_m=_optional_positive(d.get("footprint_length_m")),
+            footprint_width_m=_optional_positive(d.get("footprint_width_m")),
             max_vel_x=float(d.get("max_vel_x", 0.6)),
             max_vel_y=float(d.get("max_vel_y", 0.0)),
             max_vel_theta=float(d.get("max_vel_theta", 1.5)),
@@ -1371,6 +1389,33 @@ class NavConfig:
                 _merge_top_level_nav_tuning(d)
             ),
         )
+
+    def inscribed_radius_m(self) -> float:
+        """Clearance radius for *driving*: what has to fit through a gap."""
+        if self.footprint_width_m:
+            return max(0.01, float(self.footprint_width_m) / 2.0)
+        return float(self.robot_radius)
+
+    def circumscribed_radius_m(self) -> float:
+        """Clearance radius for *rotating*: what the body sweeps turning in place."""
+        if self.footprint_width_m and self.footprint_length_m:
+            return math.hypot(
+                float(self.footprint_length_m) / 2.0,
+                float(self.footprint_width_m) / 2.0,
+            )
+        return max(float(self.robot_radius), self.inscribed_radius_m())
+
+    def nose_offset_m(self) -> float:
+        """Distance from the body centre to the bumper (forward stop distance)."""
+        if self.footprint_length_m:
+            return max(0.01, float(self.footprint_length_m) / 2.0)
+        return float(self.robot_radius)
+
+    def wheel_half_track_m(self) -> float:
+        """Half the drive track, for the skid-steer arc envelope."""
+        if self.footprint_width_m:
+            return max(0.08, 0.9 * float(self.footprint_width_m) / 2.0)
+        return max(0.08, 0.6 * float(self.robot_radius))
 
     def control_period_s(self) -> float:
         """Seconds between builtin nav control ticks."""

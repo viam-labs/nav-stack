@@ -530,6 +530,33 @@ def test_nav_config_top_level_goal_tolerances():
     assert nested.builtin.xy_goal_tolerance == pytest.approx(0.18)
 
 
+def test_nav_config_footprint_splits_drive_and_spin_radii():
+    """0.59 x 0.72 m robot: drive on the half-width, spin on the half-diagonal."""
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "robot_radius": 0.45,
+            "footprint_width_m": 0.59,
+            "footprint_length_m": 0.72,
+        }
+    )
+    assert cfg.inscribed_radius_m() == pytest.approx(0.295)
+    assert cfg.circumscribed_radius_m() == pytest.approx(0.4654, abs=0.001)
+    assert cfg.nose_offset_m() == pytest.approx(0.36)
+    assert cfg.wheel_half_track_m() == pytest.approx(0.2655)
+
+
+def test_nav_config_without_footprint_keeps_single_radius():
+    cfg = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "robot_radius": 0.45}
+    )
+    assert cfg.inscribed_radius_m() == pytest.approx(0.45)
+    assert cfg.circumscribed_radius_m() == pytest.approx(0.45)
+    assert cfg.nose_offset_m() == pytest.approx(0.45)
+    assert cfg.wheel_half_track_m() == pytest.approx(0.27)
+
+
 def test_nav_local_recovery_defaults_are_cautious_not_twitchy():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
     assert cfg.builtin.local_planner_max_vel_x_mps == pytest.approx(0.25)

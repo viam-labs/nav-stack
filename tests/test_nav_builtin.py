@@ -363,6 +363,93 @@ def test_planner_prefers_clear_lane_over_inflation_hug():
     assert peak_cost <= 30
 
 
+def _gap_map(gap_m: float, resolution: float = 0.05) -> OccupancyGrid:
+    """Room split by a wall with a ``gap_m`` doorway, open at both far ends."""
+    h = int(8.0 / resolution)
+    w = int(12.0 / resolution)
+    grid = np.zeros((h, w), dtype=np.int16)
+    wall = int(4.0 / resolution)
+    grid[wall : wall + 3, :] = 100
+    centre = int(6.0 / resolution)
+    half = int((gap_m / 2.0) / resolution)
+    grid[wall : wall + 3, centre - half : centre + half] = 0
+    grid[wall : wall + 3, :6] = 0  # detour around the left end
+    grid[wall : wall + 3, w - 6 :] = 0  # and the right end
+    return OccupancyGrid(
+        grid=grid, resolution=resolution, origin_x=0.0, origin_y=0.0
+    )
+
+
+def test_half_diagonal_radius_seals_gap_the_robot_fits_through():
+    """A 0.59x0.72 m robot fits an 0.84 m doorway; one disc of its half-diagonal
+    (0.465) does not, and sealed it with no feasible route."""
+    occ = _gap_map(0.84)
+    start = Pose2D(6.0, 3.0, 0.0)
+    goal = Pose2D(6.0, 5.0, 0.0)
+
+    circumscribed = math.hypot(0.72 / 2.0, 0.59 / 2.0)
+    assert circumscribed == pytest.approx(0.465, abs=0.005)
+    sealed_costs = build_costmap(
+        occ,
+        inflation_radius_m=0.25,
+        robot_radius_m=circumscribed,
+        cost_scaling_factor=4.0,
+    )
+    row, col = occ.world_to_cell(6.0, 4.075)
+    assert int(sealed_costs[row, col]) >= 253  # inscribed: no cell to plan through
+    sealed = plan_on_costmap(
+        occ, sealed_costs, start, goal, robot_radius_m=circumscribed
+    )
+    assert not sealed.feasible
+
+    # Half-width (what actually has to fit) leaves the doorway open.
+    inscribed = 0.59 / 2.0
+    costs = build_costmap(
+        occ,
+        inflation_radius_m=0.25,
+        robot_radius_m=inscribed,
+        cost_scaling_factor=4.0,
+    )
+    assert int(costs[row, col]) < 253
+    through = plan_on_costmap(occ, costs, start, goal, robot_radius_m=inscribed)
+    assert through.feasible, through.error_msg
+    # Straight through the doorway, not around either end of the wall.
+    assert all(abs(p[0] - 6.0) < 1.5 for p in through.path.points)
+
+
+def test_supervisor_wires_footprint_derived_clearances():
+    """Footprint dims must reach the follower: bumper stop, body-width corridor,
+    drive radius on the half-width, spin radius on the half-diagonal."""
+    from src.config import NavConfig
+    from src.nav_builtin.supervisor import NavSupervisor
+
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "robot_radius": 0.45,
+            "footprint_width_m": 0.59,
+            "footprint_length_m": 0.72,
+            "simple_stop_distance": 0.4,
+        }
+    )
+    sup = NavSupervisor(
+        _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map()),
+        robot_radius_m=cfg.inscribed_radius_m(),
+        spin_radius_m=cfg.circumscribed_radius_m(),
+        nose_offset_m=cfg.nose_offset_m(),
+        wheel_half_track_m=cfg.wheel_half_track_m(),
+        stop_distance_m=cfg.simple_stop_distance,
+    )
+    assert sup._robot_radius == pytest.approx(0.295)
+    assert sup._spin_radius == pytest.approx(0.4654, abs=0.001)
+    follower = sup._follower
+    # Bumper is 0.36 m out, so stop at 0.41 — not a 0.5 m half-diagonal disc.
+    assert follower.obstacle.stop_distance_m == pytest.approx(0.41)
+    assert follower.obstacle.footprint_half_width_m == pytest.approx(0.325)
+    assert follower.wheel_half_track_m == pytest.approx(0.2655)
+
+
 def test_corner_path_stays_out_of_soft_halo():
     """Repro: round a pillar tip in clear space, not through the soft glow."""
     import numpy as np

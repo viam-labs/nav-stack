@@ -50,6 +50,9 @@ class NavSupervisor:
         *,
         inflation_radius_m: float = 0.25,
         robot_radius_m: float = 0.22,
+        spin_radius_m: Optional[float] = None,
+        nose_offset_m: Optional[float] = None,
+        wheel_half_track_m: Optional[float] = None,
         cost_scaling_factor: float = 4.0,
         clearance_preference_m: float = 0.35,
         algorithm: str = "lazy_theta_star",
@@ -102,7 +105,25 @@ class NavSupervisor:
     ):
         self._world = world
         self._inflation = inflation_radius_m
+        # Driving clearance (half-width when a footprint is configured). Every
+        # costmap / path / footprint check uses this.
         self._robot_radius = robot_radius_m
+        # Rotation clearance (half-diagonal): what the body sweeps turning in
+        # place. Larger than _robot_radius on a non-square robot, so it gates
+        # spins without sealing gaps the robot can drive through.
+        self._spin_radius = max(
+            float(robot_radius_m),
+            float(spin_radius_m) if spin_radius_m else float(robot_radius_m),
+        )
+        # Centre-to-bumper distance for the forward stop bubble.
+        nose_offset = (
+            float(nose_offset_m) if nose_offset_m else float(robot_radius_m)
+        )
+        half_track = (
+            float(wheel_half_track_m)
+            if wheel_half_track_m
+            else 0.6 * float(robot_radius_m)
+        )
         self._cost_scaling = cost_scaling_factor
         self._clearance_preference_m = max(0.0, float(clearance_preference_m))
         self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
@@ -187,9 +208,9 @@ class NavSupervisor:
             max_lookahead_m=max_lookahead_m,
             approach_dist_m=approach_dist_m,
             waypoint_tolerance_m=max(0.1, xy_tolerance_m),
-            # Skid-steer track ≈ 1.2·robot_radius; keeps translating arcs
-            # above the base's inner-wheel "nearly 0 RPM" rejection.
-            wheel_half_track_m=max(0.08, 0.6 * float(robot_radius_m)),
+            # Keeps translating arcs above the base's inner-wheel "nearly 0 RPM"
+            # rejection. From the footprint width when configured, else ≈0.6·r.
+            wheel_half_track_m=max(0.08, half_track),
             max_linear_accel_mps2=max(0.05, float(max_linear_accel_mps2)),
             max_linear_decel_mps2=max(0.05, float(max_linear_decel_mps2)),
             max_angular_accel_rad_s2=max(0.1, float(max_angular_accel_rad_s2)),
@@ -206,12 +227,13 @@ class NavSupervisor:
             ),
             obstacle=ObstacleConfig(
                 enabled=avoid_obstacles,
-                # Lidar stop must respect the footprint; default 0.4 < a 0.45 m
-                # robot_radius lets execution crawl closer than the costmap shows.
-                stop_distance_m=max(float(stop_distance_m), float(robot_radius_m) + 0.05),
+                # Lidar stop must clear the bumper, which is a half-*length* out
+                # from the centre — not a half-diagonal disc, which stopped a
+                # 0.72 m robot 0.5 m short of everything.
+                stop_distance_m=max(float(stop_distance_m), nose_offset + 0.05),
                 slow_distance_m=max(
                     float(slow_distance_m),
-                    max(float(stop_distance_m), float(robot_radius_m) + 0.05) + 0.35,
+                    max(float(stop_distance_m), nose_offset + 0.05) + 0.35,
                 ),
                 # Anything inside the body's swept corridor counts as "ahead" —
                 # the ±35° cone alone let shoulder-side bins slide past.
@@ -1023,6 +1045,7 @@ class NavSupervisor:
                     local_view=local_view,
                     local_planner=self._local_planner if allow_local_planner else None,
                     robot_radius_m=self._robot_radius,
+                    spin_radius_m=self._spin_radius,
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
                     min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
                     local_planner_active=local_planner_active,
@@ -1348,6 +1371,7 @@ class NavSupervisor:
                             "failed_replan_while_blocked",
                             "last_replan_error",
                             "nose_clear",
+                            "spin_blocked",
                             "local_replan_cooldown_s",
                             "forward_clearance_m",
                             "cmd_vx_mps",

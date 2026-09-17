@@ -212,6 +212,17 @@ def test_avoidance_slows_in_band():
     assert out.vtheta / out.vx == pytest.approx(cmd.vtheta / cmd.vx)
 
 
+def test_spin_clearance_measures_nearest_return_in_any_direction():
+    """Rotation sweeps a disc, so side walls matter even with a clear front."""
+    from src.nav.simple_motion import spin_clearance_m
+
+    # 0.84 m gap: walls 0.42 m to each side, nothing ahead.
+    gap = _scan_with({math.radians(90): 0.42, math.radians(-90): 0.42})
+    assert spin_clearance_m(gap) == pytest.approx(0.42, abs=0.02)
+    open_room = _scan_with({0.0: 3.0, math.radians(90): 2.5})
+    assert spin_clearance_m(open_room) == pytest.approx(2.5, abs=0.02)
+
+
 def test_arc_clearance_ignores_wall_the_turn_curves_away_from():
     """Corridor corner: wall ahead, tight turn — the arc misses it."""
     from src.nav.simple_motion import arc_clearance_m
