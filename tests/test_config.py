@@ -1,5 +1,11 @@
 
+import math
+
+import numpy as np
 import pytest
+
+from src.geom import conversions as conv
+from src.nav_builtin.types import Pose2D
 
 from src.config import (
     DIFFERENTIAL,
@@ -530,6 +536,99 @@ def test_nav_config_top_level_goal_tolerances():
     assert nested.builtin.xy_goal_tolerance == pytest.approx(0.18)
 
 
+def test_inflation_margin_is_additive_past_the_footprint():
+    """``inflation_margin_m`` is measured past the footprint, like
+    ``clearance_preference_m`` — unlike absolute ``inflation_radius``."""
+    additive = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "footprint_width_m": 0.59,
+            "footprint_length_m": 0.72,
+            "inflation_margin_m": 0.2,
+        }
+    )
+    assert additive.inscribed_radius_m() == pytest.approx(0.295)
+    assert additive.effective_inflation_radius_m() == pytest.approx(0.495)
+    assert not additive.inflation_is_noop()
+
+    # Legacy absolute key keeps its meaning.
+    absolute = NavConfig.from_dict(
+        {"slam_service": "slam", "base": "b", "inflation_radius": 0.35}
+    )
+    assert absolute.effective_inflation_radius_m() == pytest.approx(0.35)
+
+
+def test_inflation_radius_below_footprint_is_flagged_as_noop():
+    """The silent no-op that hid a missing soft ring: 0.25 under a 0.295 footprint."""
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "footprint_width_m": 0.59,
+            "footprint_length_m": 0.72,
+            "inflation_radius": 0.25,
+        }
+    )
+    assert cfg.inflation_is_noop()
+    # A margin fixes it; the absolute key would have to exceed 0.295.
+    fixed = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "footprint_width_m": 0.59,
+            "footprint_length_m": 0.72,
+            "inflation_radius": 0.25,
+            "inflation_margin_m": 0.15,
+        }
+    )
+    assert not fixed.inflation_is_noop()
+    assert fixed.effective_inflation_radius_m() == pytest.approx(0.445)
+
+
+def test_local_inflation_knob_reaches_the_live_scan_layer():
+    """``local_inflation_radius_m`` used to be plumbed and then ignored."""
+    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "robot_radius": 0.22,
+            "builtin": {"local_inflation_margin_m": 0.15},
+        }
+    )
+    assert cfg.effective_local_inflation_radius_m() == pytest.approx(0.37)
+
+    def _cost_at(soft_radius: float) -> int:
+        lc = LocalCostmap(
+            LocalCostmapConfig(
+                width_m=3.0,
+                height_m=3.0,
+                resolution=0.05,
+                inflation_radius_m=soft_radius,
+                robot_radius_m=0.22,
+                use_global_static=False,
+            )
+        )
+        n = 72
+        ranges = np.full(n, np.inf)
+        ranges[n // 2] = 1.0  # single hit 1.0 m ahead
+        scan = conv.LaserScan2D(
+            ranges,
+            angle_min=-math.pi,
+            angle_increment=2 * math.pi / n,
+            range_min=0.05,
+            range_max=10.0,
+        )
+        view = lc.update(Pose2D(1.5, 1.5, 0.0), scan)
+        # 0.30 m from the hit: outside the footprint, inside a 0.37 m soft ring.
+        return view.cost_at_world(2.5 - 0.30, 1.5)
+
+    assert _cost_at(0.0) == 0  # footprint only (default): no soft band
+    assert _cost_at(0.37) > 0  # configured band now actually paints
+
+
 def test_nav_config_footprint_splits_drive_and_spin_radii():
     """0.59 x 0.72 m robot: drive on the half-width, spin on the half-diagonal."""
     cfg = NavConfig.from_dict(
@@ -631,7 +730,12 @@ def test_builtin_follower_snake_defaults():
     assert cfg.builtin.max_lookahead_m == pytest.approx(1.55)
     assert cfg.builtin.clearance_preference_m == pytest.approx(0.50)
     assert cfg.builtin.max_goal_snap_m == pytest.approx(0.5)
-    assert cfg.builtin.local_inflation_radius_m == pytest.approx(0.35)
+    # Unset: live hits inflate to the footprint only (what the local planner has
+    # always done — the old 0.35 default was accepted and then ignored).
+    assert cfg.builtin.local_inflation_radius_m is None
+    assert cfg.effective_local_inflation_radius_m() == pytest.approx(
+        cfg.inscribed_radius_m()
+    )
     assert cfg.builtin.smooth_sample_spacing_m == pytest.approx(0.20)
     # Partial override must not resurrect the old from_dict fallbacks.
     partial = NavConfig.from_dict(

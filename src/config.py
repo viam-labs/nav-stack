@@ -442,7 +442,11 @@ class BuiltinNavConfig:
     local_costmap_width_m: float = 4.0
     local_costmap_height_m: float = 4.0
     local_costmap_resolution: float = 0.05
-    local_inflation_radius_m: float = 0.35
+    # Soft outer radius for live scan hits. Absolute (legacy); unset means the
+    # footprint alone, which is what the local planner has always used.
+    local_inflation_radius_m: Optional[float] = None
+    # Additive band past the footprint for live hits (preferred spelling).
+    local_inflation_margin_m: Optional[float] = None
     # Local-window refresh rate (Hz). Independent of ``control_rate_hz`` so the
     # follower tick stays cheap; lidar is typically ~10 Hz anyway.
     local_costmap_rate_hz: float = 5.0
@@ -500,7 +504,12 @@ class BuiltinNavConfig:
             local_costmap_width_m=float(d.get("local_costmap_width_m", 4.0)),
             local_costmap_height_m=float(d.get("local_costmap_height_m", 4.0)),
             local_costmap_resolution=float(d.get("local_costmap_resolution", 0.05)),
-            local_inflation_radius_m=float(d.get("local_inflation_radius_m", 0.35)),
+            local_inflation_radius_m=_optional_positive(
+                d.get("local_inflation_radius_m")
+            ),
+            local_inflation_margin_m=_optional_positive(
+                d.get("local_inflation_margin_m")
+            ),
             local_costmap_rate_hz=_positive_hz(
                 d.get("local_costmap_rate_hz", 5.0), "local_costmap_rate_hz"
             ),
@@ -1312,7 +1321,13 @@ class NavConfig:
     max_vel_theta: float = 1.5  # rad/s
     acc_lim_x: float = 1.0
     acc_lim_theta: float = 2.0
+    # Absolute soft-inflation outer radius, measured from the obstacle (Nav2
+    # convention). Values at or below the footprint clearance radius add no soft
+    # band at all — a silent no-op. Prefer ``inflation_margin_m``.
     inflation_radius: float = 0.25
+    # Soft-inflation band width *past* the footprint (additive), matching how
+    # ``clearance_preference_m`` is measured. Wins over ``inflation_radius``.
+    inflation_margin_m: Optional[float] = None
     cmd_vel_timeout: float = 2.0  # seconds (watchdog)
     # Builtin nav control rate (Hz). Local costmap refreshes separately via
     # ``builtin.local_costmap_rate_hz`` (default 5) so follower ticks stay cheap.
@@ -1363,6 +1378,7 @@ class NavConfig:
             acc_lim_x=float(d.get("acc_lim_x", 1.0)),
             acc_lim_theta=float(d.get("acc_lim_theta", 2.0)),
             inflation_radius=float(d.get("inflation_radius", 0.25)),
+            inflation_margin_m=_optional_positive(d.get("inflation_margin_m")),
             cmd_vel_timeout=float(d.get("cmd_vel_timeout", 2.0)),
             control_rate_hz=_positive_hz(
                 d.get("control_rate_hz", 10.0), "control_rate_hz"
@@ -1416,6 +1432,31 @@ class NavConfig:
         if self.footprint_width_m:
             return max(0.08, 0.9 * float(self.footprint_width_m) / 2.0)
         return max(0.08, 0.6 * float(self.robot_radius))
+
+    def effective_inflation_radius_m(self) -> float:
+        """Absolute soft-inflation outer radius the costmap should use."""
+        if self.inflation_margin_m is not None:
+            return self.inscribed_radius_m() + float(self.inflation_margin_m)
+        return float(self.inflation_radius)
+
+    def inflation_is_noop(self) -> bool:
+        """True when the configured inflation adds no soft band at all."""
+        return self.effective_inflation_radius_m() <= self.inscribed_radius_m() + 1e-6
+
+    def effective_local_inflation_radius_m(self) -> float:
+        """Absolute soft outer radius for *live* (scan) hits in the local costmap.
+
+        Defaults to the footprint alone, which is what the local planner has
+        always used: ``path_cost_ahead`` then means "the route is inside the
+        footprint of a live return", not "near one".
+        """
+        inscribed = self.inscribed_radius_m()
+        builtin = self.builtin
+        if builtin.local_inflation_margin_m is not None:
+            return inscribed + float(builtin.local_inflation_margin_m)
+        if builtin.local_inflation_radius_m is not None:
+            return max(inscribed, float(builtin.local_inflation_radius_m))
+        return inscribed
 
     def control_period_s(self) -> float:
         """Seconds between builtin nav control ticks."""

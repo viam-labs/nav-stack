@@ -19,9 +19,19 @@ def make_builtin_navigator(
     logger=None,
 ) -> BuiltinNavigator:
     bcfg = nav_cfg.builtin
+    if nav_cfg.inflation_is_noop() and logger is not None:
+        inscribed = nav_cfg.inscribed_radius_m()
+        logger.warn(
+            f"inflation_radius={nav_cfg.inflation_radius:.2f} m is at or below the "
+            f"footprint clearance radius ({inscribed:.2f} m), so it adds no soft "
+            "inflation at all (it is measured from the obstacle, not added to the "
+            "footprint). Set inflation_margin_m for a band past the footprint — "
+            f"e.g. inflation_margin_m: 0.20 gives a soft ring out to "
+            f"{inscribed + 0.20:.2f} m."
+        )
     return BuiltinNavigator(
         world,
-        inflation_radius_m=nav_cfg.inflation_radius,
+        inflation_radius_m=nav_cfg.effective_inflation_radius_m(),
         # Driving clearance uses the half-width; rotation uses the half-diagonal.
         robot_radius_m=nav_cfg.inscribed_radius_m(),
         spin_radius_m=nav_cfg.circumscribed_radius_m(),
@@ -53,7 +63,7 @@ def make_builtin_navigator(
         local_costmap_width_m=bcfg.local_costmap_width_m,
         local_costmap_height_m=bcfg.local_costmap_height_m,
         local_costmap_resolution=bcfg.local_costmap_resolution,
-        local_inflation_radius_m=bcfg.local_inflation_radius_m,
+        local_inflation_radius_m=nav_cfg.effective_local_inflation_radius_m(),
         local_costmap_rate_hz=float(getattr(bcfg, "local_costmap_rate_hz", 5.0)),
         local_planner_enabled=bcfg.local_planner_enabled,
         local_planner_sim_time_s=bcfg.local_planner_sim_time_s,
