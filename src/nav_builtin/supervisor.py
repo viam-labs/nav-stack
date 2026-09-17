@@ -1024,8 +1024,10 @@ class NavSupervisor:
                                 pass
 
                 path_ahead_cost = 0
+                pose_cost = 0
                 local_blocked = False
                 if local_view is not None:
+                    from .costmap import INSCRIBED
                     from .local_planner import path_cost_ahead as _path_cost_ahead
 
                     path_ahead_cost = int(
@@ -1036,8 +1038,13 @@ class NavSupervisor:
                             lookahead_m=self._local_planner.path_clearance_lookahead_m,
                         )
                     )
+                    # Local costs are footprint-inflated: center cell >= inscribed
+                    # means the body already overlaps an obstacle, even when the
+                    # path centerline ahead is still free (off-path drift).
+                    pose_cost = int(local_view.cost_at_world(pose.x, pose.y))
                     local_blocked = (
                         path_ahead_cost >= self._local_planner_activate_cost
+                        or pose_cost >= INSCRIBED
                     )
                 # Reactive avoid spinning with a clear-looking path still means
                 # the robot cannot proceed — escalate to the blocked/replan path.
@@ -1049,6 +1056,12 @@ class NavSupervisor:
                     local_blocked = True
                     if local_blocked_since is None:
                         local_blocked_since = reactive_avoid_since
+                # Also treat "already in lethal" from the follower as blocked so
+                # we enter keep_dwa / replan instead of stalling on a clear path.
+                if last_obstacle_state == "in_lethal":
+                    local_blocked = True
+                    if local_blocked_since is None:
+                        local_blocked_since = now
                 # Front-vs-side policy (not motion classification):
                 # - Blocked nose: brief wait (people crossing), then replan.
                 # - Clear nose + local path cost: inflation pinch / side hit —
@@ -1178,6 +1191,7 @@ class NavSupervisor:
                     **progress,
                     "local_blocked": bool(local_blocked),
                     "path_cost_ahead": int(path_ahead_cost),
+                    "pose_cost": int(pose_cost),
                     "failed_replan_while_blocked": int(failed_replan_while_blocked),
                     "last_replan_error": self._last_replan_error,
                     "last_replan_trigger": self._last_replan_trigger,

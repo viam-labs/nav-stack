@@ -658,6 +658,55 @@ def test_spin_gate_does_not_override_reactive_avoid():
     assert progress["spin_blocked"] is False
 
 
+def test_compute_path_command_stops_when_pose_already_in_lethal():
+    """Off-path drift into inflation: path ahead can look clear — still stop.
+
+    Local costs are footprint-inflated, so an inscribed cell under the robot
+    means the body already overlaps an obstacle. Pure pursuit used to keep
+    translating because path_cost_ahead / the nose cone stayed clear.
+    """
+    from src.nav_builtin.costmap import LETHAL
+    from src.nav_builtin.local_costmap import LocalCostmapView
+    from src.nav_builtin.types import OccupancyGrid
+
+    res = 0.05
+    h = w = 80
+    costs = np.zeros((h, w), dtype=np.uint8)
+    # Lethal under the robot at (2, 2); free corridor along +x for the path.
+    for r in range(35, 45):
+        for c in range(35, 45):
+            costs[r, c] = LETHAL
+    occ = OccupancyGrid(
+        grid=np.zeros((h, w), dtype=np.int16),
+        resolution=res,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    view = LocalCostmapView(costs=costs, occ=occ, origin_x=0.0, origin_y=0.0)
+    # Wide-open lidar — nose cone would not stop us.
+    n = 72
+    scan = conv.LaserScan2D(
+        np.full(n, np.inf),
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    cfg = FollowerConfig()
+    cfg.obstacle = None
+    cmd, progress = compute_path_command(
+        Pose2D(2.0, 2.0, 0.0),
+        Path2D(points=((2.0, 2.0), (3.5, 2.0)), goal_theta=0.0),
+        cfg=cfg,
+        scan=scan,
+        local_view=view,
+        robot_radius_m=0.22,
+    )
+    assert progress["obstacle"] == "in_lethal"
+    assert progress["pose_cost"] >= 253
+    assert cmd.vx == 0.0
+
+
 def _slew_cfg() -> FollowerConfig:
     from src.nav.simple_motion import SimpleMotionConfig
 
