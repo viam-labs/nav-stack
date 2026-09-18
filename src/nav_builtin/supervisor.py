@@ -109,7 +109,7 @@ class NavSupervisor:
         replan_local_blocked_time_s = kw["replan_local_blocked_time_s"]
         replan_local_min_period_s = kw["replan_local_min_period_s"]
         nav_policy = kw.get("nav_policy", "heuristic")
-        jev_min_confidence = kw.get("jev_min_confidence", 0.45)
+        jev_min_confidence = kw.get("jev_min_confidence", 0.7)
         jev_timeout_s = kw.get("jev_timeout_s", 1.25)
         jev_min_period_s = kw.get("jev_min_period_s", 1.0)
         jev_history_s = kw.get("jev_history_s", 3.0)
@@ -1112,6 +1112,7 @@ class NavSupervisor:
                         forward_clearance_m(scan, obs_cfg) > obs_cfg.stop_distance_m
                     )
                 waiting_for_clear = False
+                jev_wants_backup = False
                 if local_blocked:
                     if local_blocked_since is None:
                         local_blocked_since = now
@@ -1157,6 +1158,32 @@ class NavSupervisor:
                         remaining_m = max(0.0, _path_length(path) - along)
                     except Exception:  # noqa: BLE001
                         remaining_m = None
+                    rear_clear = (
+                        float(rear_clearance_m(scan))
+                        if scan is not None
+                        else None
+                    )
+                    backup_cooldown_ready = now >= backup_cooldown_until
+                    backup_attempts_left = max(
+                        0, self._backup_max_attempts - int(backup_attempts)
+                    )
+                    backup_feasible = bool(
+                        self._backup_enabled
+                        and scan is not None
+                        and local_view is not None
+                        and backup_attempts_left > 0
+                        and backup_cooldown_ready
+                        and rear_clear is not None
+                        and rear_clear >= self._backup_rear_clear_m
+                        and reverse_backup_feasible(
+                            local_view,
+                            pose.x,
+                            pose.y,
+                            pose.theta,
+                            robot_radius_m=self._robot_radius,
+                            distance_m=self._backup_dist_m,
+                        )
+                    )
                     policy = self._jev_policy.decide(
                         LocalBlockContext(
                             heuristic_action=heuristic_action,
@@ -1177,11 +1204,22 @@ class NavSupervisor:
                             nearest_bearing_rad=near_b,
                             pose_xy=(float(pose.x), float(pose.y)),
                             goal_xy=(float(goal.x), float(goal.y)),
+                            rear_clearance_m=rear_clear,
+                            backup_feasible=backup_feasible,
+                            backup_attempts_remaining=backup_attempts_left,
+                            backup_cooldown_ready=backup_cooldown_ready,
                         )
                     )
                     action = policy.applied_action
                     if action == "wait":
                         waiting_for_clear = True
+                    elif action == "backup":
+                        # Defer actual reverse to the backup block below; still
+                        # allow local planner this tick unless we successfully start.
+                        if backup_feasible:
+                            jev_wants_backup = True
+                        else:
+                            waiting_for_clear = True
                     elif action == "replan":
                         # Stop only long enough to plan. Paint + forced-via
                         # kick in so we do not keep accepting the same corridor.
@@ -1329,15 +1367,20 @@ class NavSupervisor:
                     self._backup_enabled
                     and scan is not None
                     and local_view is not None
-                    and progress.get("local_planner")
-                    and abs(cmd.vx) < 0.05
-                    and abs(cmd.vtheta) > 0.1
                     and backup_attempts < self._backup_max_attempts
                     and now >= backup_cooldown_until
                     and not waiting_for_clear
                     and (
-                        not local_blocked
-                        or failed_replan_while_blocked >= 2
+                        jev_wants_backup
+                        or (
+                            progress.get("local_planner")
+                            and abs(cmd.vx) < 0.05
+                            and abs(cmd.vtheta) > 0.1
+                            and (
+                                not local_blocked
+                                or failed_replan_while_blocked >= 2
+                            )
+                        )
                     )
                 )
 
@@ -1404,9 +1447,13 @@ class NavSupervisor:
                             "cmd_vtheta_rad_s": cmd.vtheta,
                         }
                 elif allow_backup:
-                    if spin_stuck_since is None:
-                        spin_stuck_since = now
-                    elif now - spin_stuck_since >= self._backup_stuck_time_s:
+                    start_now = bool(jev_wants_backup)
+                    if not start_now:
+                        if spin_stuck_since is None:
+                            spin_stuck_since = now
+                        elif now - spin_stuck_since >= self._backup_stuck_time_s:
+                            start_now = True
+                    if start_now:
                         rear_ok = rear_clearance_m(scan) >= self._backup_rear_clear_m
                         costmap_ok = reverse_backup_feasible(
                             local_view,
@@ -1437,8 +1484,16 @@ class NavSupervisor:
                                 "cmd_vx_mps": cmd.vx,
                                 "cmd_vtheta_rad_s": cmd.vtheta,
                             }
-                        else:
-                            spin_stuck_since = None
+                        elif jev_wants_backup:
+                            # Jev asked to backup but rear/costmap unsafe — hold.
+                            cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                            progress = {
+                                **progress,
+                                "obstacle": "wait",
+                                "local_planner": False,
+                                "cmd_vx_mps": 0.0,
+                                "cmd_vtheta_rad_s": 0.0,
+                            }
                 else:
                     spin_stuck_since = None
 

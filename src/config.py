@@ -520,7 +520,7 @@ class BuiltinNavConfig:
     # ``shadow``: call Jev, log both, execute heuristic.
     # ``jev``: call Jev; use its action when confidence is high enough.
     nav_policy: str = "heuristic"
-    jev_min_confidence: float = 0.45
+    jev_min_confidence: float = 0.7
     jev_timeout_s: float = 1.25
     jev_min_period_s: float = 1.0
     jev_history_s: float = 3.0

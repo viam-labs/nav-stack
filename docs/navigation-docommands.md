@@ -229,7 +229,7 @@ Configure under the navigation service `builtin` block (or top-level aliases whe
 | Attribute | Default | Notes |
 |---|---|---|
 | `nav_policy` | `heuristic` | `heuristic` \| `shadow` \| `jev` |
-| `jev_min_confidence` | `0.45` | In `jev` mode, fall back to heuristic below this |
+| `jev_min_confidence` | `0.7` | In `jev` mode, fall back to heuristic below this |
 | `jev_timeout_s` | `1.25` | Per TypeSafe call |
 | `jev_min_period_s` | `1.0` | Min seconds between Jev queries |
 | `jev_history_s` | `3.0` | Obstacle-track window for mover-vs-fixed features |
@@ -240,7 +240,7 @@ Configure under the navigation service `builtin` block (or top-level aliases whe
 
 - `heuristic` — unchanged behavior; no TypeSafe calls.
 - `shadow` — call Jev on local blocks, **always log** heuristic vs Jev, still **execute heuristic** (safe for robot trials).
-- `jev` — execute Jev’s mapped action when confidence is high enough; otherwise heuristic. Always logs both.
+- `jev` — execute Jev’s mapped action when confidence is high enough; otherwise heuristic. Always logs both. Actions: `wait` / `keep_dwa` / `replan` / `backup`.
 
 `get_status` → `progress.jev_policy` (while navigating) includes `heuristic_action`, `jev_action`, `applied_action`, `confidence`, `features` (incl. `motion_score` / `likely_mover`), and answer snippets.
 

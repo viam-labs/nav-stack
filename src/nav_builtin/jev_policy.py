@@ -31,7 +31,8 @@ NAV_POLICIES = (NAV_POLICY_HEURISTIC, NAV_POLICY_SHADOW, NAV_POLICY_JEV)
 ACTION_WAIT = "wait"
 ACTION_KEEP_DWA = "keep_dwa"
 ACTION_REPLAN = "replan"
-ACTIONS = (ACTION_WAIT, ACTION_KEEP_DWA, ACTION_REPLAN)
+ACTION_BACKUP = "backup"
+ACTIONS = (ACTION_WAIT, ACTION_KEEP_DWA, ACTION_REPLAN, ACTION_BACKUP)
 
 
 def normalize_nav_policy(raw: Any) -> str:
@@ -60,7 +61,7 @@ class ObstacleSample:
 
 @dataclass
 class LocalBlockContext:
-    """Inputs for a single wait / peel / replan decision."""
+    """Inputs for a single wait / peel / replan / backup decision."""
 
     heuristic_action: str
     nose_clear: bool
@@ -76,6 +77,10 @@ class LocalBlockContext:
     nearest_bearing_rad: Optional[float] = None
     pose_xy: Optional[tuple[float, float]] = None
     goal_xy: Optional[tuple[float, float]] = None
+    rear_clearance_m: Optional[float] = None
+    backup_feasible: bool = False
+    backup_attempts_remaining: int = 0
+    backup_cooldown_ready: bool = True
 
 
 @dataclass
@@ -202,14 +207,26 @@ def build_policy_state(
                 "Commit to a new global path — static block or sustained failure; "
                 "detour may be longer but progress resumes"
             ),
+            ACTION_BACKUP: (
+                "Reverse a short distance to free the footprint, then replan — "
+                "use when nose is jammed / spinning in place and rear is clear"
+            ),
         },
         "efficiency_hint": (
             "Prefer keep_dwa when the nose is clear or the gap may fit. "
             "Prefer wait when obstacle_motion.likely_mover is true. "
+            "Prefer backup when jammed nose-on into a static block, rear is clear, "
+            "and backup_feasible is true — then replan from the new pose. "
             "Prefer replan when the block looks static and grace/cooldown elapsed, "
             "or failed_replan_while_blocked is high — but avoid huge detours if "
-            "inching could clear a temporary pinch."
+            "inching could clear a temporary pinch. Do not choose backup when "
+            "backup_feasible is false."
         ),
+        "backup": {
+            "feasible": bool(ctx.backup_feasible),
+            "attempts_remaining": int(ctx.backup_attempts_remaining),
+            "cooldown_ready": bool(ctx.backup_cooldown_ready),
+        },
     }
     if ctx.remaining_path_m is not None:
         state["remaining_path_m"] = round(float(ctx.remaining_path_m), 2)
@@ -217,6 +234,8 @@ def build_policy_state(
         state["nearest_range_m"] = round(float(ctx.nearest_range_m), 3)
     if ctx.nearest_bearing_rad is not None:
         state["nearest_bearing_rad"] = round(float(ctx.nearest_bearing_rad), 3)
+    if ctx.rear_clearance_m is not None:
+        state["rear_clearance_m"] = round(float(ctx.rear_clearance_m), 3)
     if ctx.pose_xy is not None:
         state["pose_xy"] = [round(ctx.pose_xy[0], 3), round(ctx.pose_xy[1], 3)]
     if ctx.goal_xy is not None:
@@ -235,12 +254,16 @@ def build_policy_questions() -> Dict[str, Any]:
                 "next action for efficiency and safety. Use obstacle_motion to judge "
                 "movers vs fixed obstacles. Prefer keep_dwa (inch/peel) over a long "
                 "replan when the nose is clear or a gap may fit. Prefer wait for "
-                "likely people/movers. Prefer replan for sustained static blocks."
+                "likely people/movers. Prefer backup when jammed into a static nose "
+                "block with backup.feasible true and rear clear. Prefer replan for "
+                "sustained static blocks when peeling/backup will not help. Never "
+                "choose backup when backup.feasible is false."
             ),
             criteria={
                 ACTION_WAIT: "Stop and wait for a dynamic blocker to clear",
                 ACTION_KEEP_DWA: "Keep short path; peel/inch with local planner",
                 ACTION_REPLAN: "Escalate to a new global path (may be longer)",
+                ACTION_BACKUP: "Reverse briefly (rear clear) then replan",
             },
         ),
         "temporary_mover": Noul(
@@ -254,6 +277,13 @@ def build_policy_questions() -> Dict[str, Any]:
             instructions=(
                 "Is it worth inching/peeling forward to test whether the robot can "
                 "fit, instead of immediately taking a much longer global detour?"
+            )
+        ),
+        "should_backup": Noul(
+            instructions=(
+                "Should the robot reverse a short distance to unstick before "
+                "replanning? Only yes if backup.feasible is true, the nose is "
+                "jammed on a likely-static block, and waiting/peeling looks futile."
             )
         ),
         "replan_urgency": Score(
@@ -294,7 +324,9 @@ def map_jev_to_action(
     choice: Optional[str],
     temporary_mover: Optional[float],
     gap_worth_trying: Optional[float],
+    should_backup: Optional[float],
     heuristic_action: str,
+    backup_feasible: bool = False,
 ) -> str:
     """Compose Choice + Nouls into a supervisor action (code remains in control)."""
     action = str(choice or "").strip().lower()
@@ -303,6 +335,20 @@ def map_jev_to_action(
     # Soft overrides when Choice is weakly aligned with physics cues.
     if temporary_mover is not None and temporary_mover >= 0.7 and action == ACTION_REPLAN:
         return ACTION_WAIT
+    if (
+        should_backup is not None
+        and should_backup >= 0.7
+        and backup_feasible
+        and action in (ACTION_REPLAN, ACTION_KEEP_DWA, ACTION_WAIT)
+    ):
+        return ACTION_BACKUP
+    if action == ACTION_BACKUP and not backup_feasible:
+        # Never reverse into unknown rear space.
+        return (
+            heuristic_action
+            if heuristic_action in ACTIONS and heuristic_action != ACTION_BACKUP
+            else ACTION_WAIT
+        )
     if (
         gap_worth_trying is not None
         and gap_worth_trying >= 0.7
@@ -323,7 +369,7 @@ class JevNavPolicy:
         self,
         *,
         mode: str = NAV_POLICY_HEURISTIC,
-        min_confidence: float = 0.45,
+        min_confidence: float = 0.7,
         timeout_s: float = 1.25,
         min_period_s: float = 1.0,
         history_s: float = 3.0,
@@ -439,11 +485,16 @@ class JevNavPolicy:
             confidence = choice_ans.get("confidence")
             mover = (answers.get("temporary_mover") or {}).get("noul")
             gap = (answers.get("gap_worth_trying") or {}).get("noul")
+            should_backup = (answers.get("should_backup") or {}).get("noul")
             mapped = map_jev_to_action(
                 choice=str(jev_choice) if jev_choice is not None else None,
                 temporary_mover=float(mover) if mover is not None else None,
                 gap_worth_trying=float(gap) if gap is not None else None,
+                should_backup=float(should_backup)
+                if should_backup is not None
+                else None,
                 heuristic_action=ctx.heuristic_action,
+                backup_feasible=bool(ctx.backup_feasible),
             )
             fallback = ""
             if self.mode == NAV_POLICY_SHADOW:

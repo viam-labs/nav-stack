@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.nav_builtin.jev_policy import (
+    ACTION_BACKUP,
     ACTION_KEEP_DWA,
     ACTION_REPLAN,
     ACTION_WAIT,
@@ -65,6 +66,7 @@ def test_map_jev_soft_overrides():
             choice=ACTION_REPLAN,
             temporary_mover=0.9,
             gap_worth_trying=0.1,
+            should_backup=0.1,
             heuristic_action=ACTION_WAIT,
         )
         == ACTION_WAIT
@@ -74,9 +76,32 @@ def test_map_jev_soft_overrides():
             choice=ACTION_REPLAN,
             temporary_mover=0.1,
             gap_worth_trying=0.9,
+            should_backup=0.1,
             heuristic_action=ACTION_KEEP_DWA,
         )
         == ACTION_KEEP_DWA
+    )
+    assert (
+        map_jev_to_action(
+            choice=ACTION_REPLAN,
+            temporary_mover=0.1,
+            gap_worth_trying=0.2,
+            should_backup=0.85,
+            heuristic_action=ACTION_WAIT,
+            backup_feasible=True,
+        )
+        == ACTION_BACKUP
+    )
+    assert (
+        map_jev_to_action(
+            choice=ACTION_BACKUP,
+            temporary_mover=0.1,
+            gap_worth_trying=0.2,
+            should_backup=0.9,
+            heuristic_action=ACTION_WAIT,
+            backup_feasible=False,
+        )
+        == ACTION_WAIT
     )
 
 
@@ -152,7 +177,7 @@ def test_mode_jev_applies_when_confident():
         query_fn=lambda s, q: _stub_result(
             choice=ACTION_KEEP_DWA, confidence=0.8, mover=0.1, gap=0.85
         ),
-        min_confidence=0.45,
+        min_confidence=0.7,
         min_period_s=0,
     )
     d = policy.decide(_ctx(ACTION_REPLAN))
@@ -165,9 +190,9 @@ def test_mode_jev_falls_back_on_low_confidence():
     policy = JevNavPolicy(
         mode="jev",
         query_fn=lambda s, q: _stub_result(
-            choice=ACTION_WAIT, confidence=0.2, mover=0.5, gap=0.5
+            choice=ACTION_WAIT, confidence=0.55, mover=0.5, gap=0.5
         ),
-        min_confidence=0.45,
+        min_confidence=0.7,
         min_period_s=0,
     )
     d = policy.decide(_ctx(ACTION_REPLAN))
@@ -193,5 +218,6 @@ def test_builtin_nav_config_accepts_nav_policy():
     cfg = BuiltinNavConfig.from_dict({"nav_policy": "shadow", "jev_timeout_s": 0.9})
     assert cfg.nav_policy == "shadow"
     assert cfg.jev_timeout_s == pytest.approx(0.9)
+    assert cfg.jev_min_confidence == pytest.approx(0.7)
     with pytest.raises(ValueError):
         BuiltinNavConfig.from_dict({"nav_policy": "chatgpt"})
