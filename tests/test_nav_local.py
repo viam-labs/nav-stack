@@ -895,6 +895,83 @@ def test_plan_seals_blocked_path_samples_from_local():
     assert paths_meaningfully_differ(baseline.path, sealed.path)
 
 
+def _chair_scan_ahead(start: Pose2D, ahead_m: float = 1.2, half_m: float = 0.2):
+    n = 720
+    ranges = np.full(n, np.inf)
+    for dx in np.linspace(-half_m, half_m, 9):
+        for dy in np.linspace(-half_m, half_m, 9):
+            rx = start.x + ahead_m + dx - start.x
+            ry = start.y + dy - start.y
+            ang = conv.normalize_angle(math.atan2(ry, rx) - start.theta)
+            k = int(round((ang + math.pi) / (2 * math.pi / n))) % n
+            ranges[k] = min(ranges[k], math.hypot(rx, ry))
+    return conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+
+
+def test_smoothing_on_planning_costmap_keeps_detour_around_live_obstacle():
+    """Regression: static-only smoothing string-pulled detours back through
+    a live (scan-only) obstacle, so every replan was rejected as still-blocked
+    and forced vias collapsed to 'same route'."""
+    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav_builtin.local_planner import path_cost_in_local_window
+    from src.nav_builtin.planner import plan_path, paths_meaningfully_differ
+    from src.nav_builtin.smoother import smooth_path, smooth_plan_path
+
+    m = _empty_map(size=100, resolution=0.05)
+    start = Pose2D(0.6, 2.5, 0.0)
+    goal = Pose2D(4.2, 2.5, 0.0)
+    robot_r, infl = 0.295, 0.35
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=5.0,
+            height_m=5.0,
+            resolution=0.05,
+            inflation_radius_m=infl,
+            robot_radius_m=robot_r,
+            use_global_static=False,
+        )
+    )
+    scan = _chair_scan_ahead(start)
+    view = lc.update(start, scan)
+    baseline = plan_path(m, start, goal, inflation_radius_m=infl, robot_radius_m=robot_r)
+    raw = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=infl,
+        robot_radius_m=robot_r,
+        scan=scan,
+        scan_pose=start,
+        local_view=view,
+        blocked_path=baseline.path,
+        blocked_path_pose=start,
+        paint_corridor=False,
+    )
+    assert raw.feasible, raw.error_msg
+    assert raw.planning_costs is not None and raw.planning_occ is not None
+
+    def worst(p):
+        return int(path_cost_in_local_window(start, p, view, start_offset_m=robot_r))
+
+    assert worst(raw.path) < 200
+    # The old behaviour (documented, not desired): static-only smoothing cuts
+    # straight through the chair.
+    static_smoothed = smooth_plan_path(
+        raw.path, m, inflation_radius_m=infl, robot_radius_m=robot_r, cost_scaling_factor=4.0
+    )
+    assert worst(static_smoothed) >= 200
+    # Fixed behaviour: smoothing on the planning costmap keeps the detour.
+    live_smoothed = smooth_path(raw.path, raw.planning_costs, raw.planning_occ)
+    assert worst(live_smoothed) < 200
+    assert paths_meaningfully_differ(baseline.path, live_smoothed, tol_m=0.12)
+
+
 def test_local_planner_avoids_marked_obstacle():
     """Fat seal on path samples the local map flags must change the route."""
     from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
