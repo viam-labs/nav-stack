@@ -29,8 +29,33 @@ def test_normalize_nav_policy():
     assert normalize_nav_policy("heuristic") == "heuristic"
     assert normalize_nav_policy("SHADOW") == "shadow"
     assert normalize_nav_policy("typesafe") == "jev"
+    assert normalize_nav_policy("random") == "random"
     with pytest.raises(ValueError):
         normalize_nav_policy("gpt")
+
+
+def test_available_policy_actions_respects_gates():
+    from src.nav_builtin.jev_policy import available_policy_actions
+
+    assert available_policy_actions() == [
+        ACTION_WAIT,
+        ACTION_KEEP_DWA,
+        ACTION_REPLAN,
+    ]
+    assert available_policy_actions(backup_feasible=True)[-1] == ACTION_BACKUP
+    full = available_policy_actions(
+        backup_feasible=True,
+        wide_replan_available=True,
+        abort_available=True,
+    )
+    assert full == [
+        ACTION_WAIT,
+        ACTION_KEEP_DWA,
+        ACTION_REPLAN,
+        ACTION_BACKUP,
+        ACTION_WIDE_REPLAN,
+        ACTION_ABORT,
+    ]
 
 
 def test_obstacle_motion_features_mover_vs_fixed():
@@ -336,8 +361,71 @@ def test_builtin_nav_config_accepts_nav_policy():
     assert cfg.nav_policy == "shadow"
     assert cfg.jev_timeout_s == pytest.approx(0.9)
     assert cfg.jev_min_confidence == pytest.approx(0.7)
+    assert BuiltinNavConfig.from_dict({"nav_policy": "random"}).nav_policy == "random"
     with pytest.raises(ValueError):
         BuiltinNavConfig.from_dict({"nav_policy": "chatgpt"})
+
+
+def test_mode_random_picks_executable_action():
+    import random
+
+    from src.nav_builtin.jev_policy import available_policy_actions
+
+    rng = random.Random(0)
+    policy = JevNavPolicy(mode="random", min_period_s=0, rng=rng)
+    ctx = LocalBlockContext(
+        heuristic_action=ACTION_WAIT,
+        nose_clear=False,
+        blocked_for_s=2.0,
+        wait_before_replan_s=2.0,
+        replan_cooldown_ready=True,
+        path_ahead_cost=250,
+        obstacle_state="avoid",
+        forward_clearance_m=0.4,
+        backup_feasible=True,
+        wide_replan_available=False,
+        abort_available=False,
+    )
+    expected = set(
+        available_policy_actions(
+            backup_feasible=True,
+            wide_replan_available=False,
+            abort_available=False,
+        )
+    )
+    seen = set()
+    for _ in range(40):
+        d = policy.decide(ctx)
+        assert d.mode == "random"
+        assert d.applied_action in expected
+        assert d.jev_action == d.applied_action
+        assert d.fallback_reason == "random"
+        assert d.queried is False
+        seen.add(d.applied_action)
+    assert len(seen) >= 2
+
+
+def test_mode_random_rate_limit_reuses_choice():
+    import random
+
+    policy = JevNavPolicy(
+        mode="random", min_period_s=60.0, rng=random.Random(1)
+    )
+    ctx = LocalBlockContext(
+        heuristic_action=ACTION_REPLAN,
+        nose_clear=False,
+        blocked_for_s=1.0,
+        wait_before_replan_s=2.0,
+        replan_cooldown_ready=True,
+        path_ahead_cost=250,
+        obstacle_state="avoid",
+        forward_clearance_m=0.5,
+    )
+    first = policy.decide(ctx)
+    second = policy.decide(ctx)
+    assert first.applied_action == second.applied_action
+    assert second.fallback_reason == "rate_limited_reuse_random"
+    assert second.queried is False
 
 
 def test_stuck_progress_reports_raw_motion_only():

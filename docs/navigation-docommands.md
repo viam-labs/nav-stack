@@ -228,14 +228,14 @@ Configure under the navigation service `builtin` block (or top-level aliases whe
 
 | Attribute | Default | Notes |
 |---|---|---|
-| `nav_policy` | `heuristic` | `heuristic` \| `shadow` \| `jev` |
+| `nav_policy` | `heuristic` | `heuristic` \| `shadow` \| `jev` \| `random` |
 | `jev_min_confidence` | `0.7` | In `jev` mode, fall back to heuristic below this |
 | `jev_timeout_s` | `1.25` | Per TypeSafe call |
-| `jev_min_period_s` | `1.0` | Min seconds between Jev queries |
+| `jev_min_period_s` | `1.0` | Min seconds between Jev / random re-rolls |
 | `jev_history_s` | `3.0` | Obstacle-track window for mover-vs-fixed features |
 | `jev_model` | `jev-latest` | TypeSafe model id |
 | `jev_api_key` | _(env)_ | Or set `TYPESAFE_API_KEY` on the machine |
-| `jev_allow_abort` | `true` | Offer `abort` to Jev at all |
+| `jev_allow_abort` | `true` | Offer `abort` to Jev / random at all |
 | `jev_abort_min_blocked_s` | `15` | `abort` only becomes available after this much cumulative blocked time in the run |
 
 **Modes**
@@ -245,6 +245,7 @@ Configure under the navigation service `builtin` block (or top-level aliases whe
 - `jev` — execute Jev’s mapped action when confidence is high enough; otherwise heuristic. Always logs both. Actions: `wait` / `keep_dwa` / `replan` / `backup`, plus two Jev-only escalations the heuristic never picks:
   - `wide_replan` — global replan that seals the current corridor with a footprint-wide band 3.5 m ahead and accepts up to 3× the remaining length. Available when the replan cooldown has elapsed.
   - `abort` — fail this goal now (`state: failed`, `error_msg: "aborted by nav policy: …"`) so a route loop can move on. Available only after `jev_abort_min_blocked_s` of cumulative blocked time.
+- `random` — same executable action set and safety gates as `jev`, but pick uniformly at random (no API key / TypeSafe). Good A/B baseline vs `jev`.
 
 A local-block **episode** now survives brief cost flicker: it only ends after the robot has been unblocked for ≥2 s *and* moved ≥0.3 m, so `blocked_for_s` and the obstacle history are not wiped every time DWA nudges the path cost under the threshold.
 

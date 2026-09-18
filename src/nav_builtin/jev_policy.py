@@ -6,6 +6,8 @@ Modes (``builtin.nav_policy``):
 - ``shadow`` — call Jev, log heuristic vs Jev, **execute heuristic**.
 - ``jev`` — call Jev; if confidence ≥ threshold execute Jev's choice,
   else fall back to heuristic (still log both).
+- ``random`` — pick uniformly among currently executable actions (same
+  gates as Jev); no TypeSafe call. Useful as an A/B baseline vs ``jev``.
 
 Never runs on the free-path control tick — only when the supervisor already
 sees a local block and would consult ``_local_block_action``.
@@ -15,6 +17,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import random
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -25,7 +28,13 @@ LOGGER = logging.getLogger(__name__)
 NAV_POLICY_HEURISTIC = "heuristic"
 NAV_POLICY_SHADOW = "shadow"
 NAV_POLICY_JEV = "jev"
-NAV_POLICIES = (NAV_POLICY_HEURISTIC, NAV_POLICY_SHADOW, NAV_POLICY_JEV)
+NAV_POLICY_RANDOM = "random"
+NAV_POLICIES = (
+    NAV_POLICY_HEURISTIC,
+    NAV_POLICY_SHADOW,
+    NAV_POLICY_JEV,
+    NAV_POLICY_RANDOM,
+)
 
 # Supervisor local-block actions (must stay in sync with _local_block_action).
 ACTION_WAIT = "wait"
@@ -598,6 +607,23 @@ def _answers_to_dict(result: Any) -> Dict[str, Any]:
     return out
 
 
+def available_policy_actions(
+    *,
+    backup_feasible: bool = False,
+    wide_replan_available: bool = False,
+    abort_available: bool = False,
+) -> List[str]:
+    """Executable action set for ``random`` / Jev (same hard gates)."""
+    actions = [ACTION_WAIT, ACTION_KEEP_DWA, ACTION_REPLAN]
+    if backup_feasible:
+        actions.append(ACTION_BACKUP)
+    if wide_replan_available:
+        actions.append(ACTION_WIDE_REPLAN)
+    if abort_available:
+        actions.append(ACTION_ABORT)
+    return actions
+
+
 def map_jev_to_action(
     *,
     choice: Optional[str],
@@ -653,6 +679,7 @@ class JevNavPolicy:
         api_key: Optional[str] = None,
         query_fn: Optional[QueryFn] = None,
         logger: Optional[Callable[[str], None]] = None,
+        rng: Optional[random.Random] = None,
     ):
         self.mode = normalize_nav_policy(mode)
         self.min_confidence = float(min_confidence)
@@ -663,6 +690,7 @@ class JevNavPolicy:
         self.api_key = api_key or os.environ.get("TYPESAFE_API_KEY")
         self._query_fn = query_fn
         self._log = logger
+        self._rng = rng if rng is not None else random.Random()
         self._history: Deque[ObstacleSample] = deque(maxlen=64)
         self._last_query_at = 0.0
         self._last_decision: Optional[PolicyDecision] = None
@@ -892,6 +920,9 @@ class JevNavPolicy:
             self._record_applied(now, decision.applied_action)
             return decision
 
+        if self.mode == NAV_POLICY_RANDOM:
+            return self._decide_random(ctx, features, now)
+
         state_key = self._state_key(ctx)
         situation_changed = (
             self._last_state_key is not None and state_key != self._last_state_key
@@ -988,6 +1019,90 @@ class JevNavPolicy:
                 features=features,
                 error=str(exc),
             )
+        self._last_decision = decision
+        self._record_applied(now, decision.applied_action)
+        self._append_decision_log(ctx, decision)
+        self._emit(f"jev_policy {decision.to_dict()}")
+        return decision
+
+    def _decide_random(
+        self,
+        ctx: LocalBlockContext,
+        features: Mapping[str, Any],
+        now: float,
+    ) -> PolicyDecision:
+        """Uniform random among executable actions (no TypeSafe call)."""
+        state_key = self._state_key(ctx)
+        situation_changed = (
+            self._last_state_key is not None and state_key != self._last_state_key
+        )
+        rate_limited = (
+            self.min_period_s > 0
+            and (now - self._last_query_at) < self.min_period_s
+        )
+        gate_kw = dict(
+            backup_feasible=bool(ctx.backup_feasible),
+            wide_replan_available=bool(ctx.wide_replan_available),
+            abort_available=bool(ctx.abort_available),
+        )
+        if rate_limited and not situation_changed:
+            prev = self._last_decision
+            reused = prev.jev_action if prev and prev.jev_action else None
+            if reused:
+                mapped = map_jev_to_action(
+                    choice=reused,
+                    heuristic_action=ctx.heuristic_action,
+                    **gate_kw,
+                )
+                reason = "rate_limited_reuse_random"
+            else:
+                mapped = ctx.heuristic_action
+                reason = "rate_limited_heuristic"
+            decision = PolicyDecision(
+                applied_action=mapped,
+                heuristic_action=ctx.heuristic_action,
+                jev_action=mapped if reused else None,
+                mode=self.mode,
+                confidence=1.0 if reused else None,
+                fallback_reason=reason,
+                queried=False,
+                features=dict(features),
+                answers=dict(prev.answers) if prev else {},
+            )
+            self._last_decision = decision
+            self._record_applied(now, decision.applied_action)
+            self._append_decision_log(ctx, decision)
+            self._emit(f"jev_policy {decision.to_dict()}")
+            return decision
+
+        candidates = available_policy_actions(**gate_kw)
+        choice = self._rng.choice(candidates)
+        mapped = map_jev_to_action(
+            choice=choice,
+            heuristic_action=ctx.heuristic_action,
+            **gate_kw,
+        )
+        self._last_query_at = now
+        self._last_state_key = state_key
+        answers = {
+            "action": {
+                "choice": mapped,
+                "confidence": 1.0,
+                "source": "random",
+                "candidates": list(candidates),
+            }
+        }
+        decision = PolicyDecision(
+            applied_action=mapped,
+            heuristic_action=ctx.heuristic_action,
+            jev_action=mapped,
+            mode=self.mode,
+            confidence=1.0,
+            fallback_reason="random",
+            queried=False,
+            features=dict(features),
+            answers=answers,
+        )
         self._last_decision = decision
         self._record_applied(now, decision.applied_action)
         self._append_decision_log(ctx, decision)

@@ -519,6 +519,7 @@ class BuiltinNavConfig:
     # ``heuristic`` (default): existing rules only.
     # ``shadow``: call Jev, log both, execute heuristic.
     # ``jev``: call Jev; use its action when confidence is high enough.
+    # ``random``: uniform pick among executable actions (A/B baseline vs jev).
     nav_policy: str = "heuristic"
     jev_min_confidence: float = 0.7
     jev_timeout_s: float = 1.25
@@ -559,10 +560,10 @@ class BuiltinNavConfig:
             name = str(d.get("nav_policy") or "heuristic").strip().lower()
             if name in ("typesafe", "ai"):
                 name = "jev"
-            if name not in ("heuristic", "shadow", "jev"):
+            if name not in ("heuristic", "shadow", "jev", "random"):
                 raise ValueError(
                     "builtin.nav_policy must be one of "
-                    "['heuristic', 'shadow', 'jev']; "
+                    "['heuristic', 'shadow', 'jev', 'random']; "
                     f"got {d.get('nav_policy')!r}"
                 )
             overrides["nav_policy"] = name
