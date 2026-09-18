@@ -237,3 +237,14 @@ def test_decision_log_records_pose_and_survives_clear_obstacle_history():
     assert len(policy.decision_log()) == 1
     policy.clear_decision_log()
     assert policy.decision_log() == []
+
+
+def test_builtin_nav_config_accepts_nav_policy():
+    from src.config import BuiltinNavConfig
+
+    cfg = BuiltinNavConfig.from_dict({"nav_policy": "shadow", "jev_timeout_s": 0.9})
+    assert cfg.nav_policy == "shadow"
+    assert cfg.jev_timeout_s == pytest.approx(0.9)
+    assert cfg.jev_min_confidence == pytest.approx(0.7)
+    with pytest.raises(ValueError):
+        BuiltinNavConfig.from_dict({"nav_policy": "chatgpt"})
