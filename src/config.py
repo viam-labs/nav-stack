@@ -527,6 +527,10 @@ class BuiltinNavConfig:
     jev_model: str = "jev-latest"
     # Optional; defaults to env TYPESAFE_API_KEY.
     jev_api_key: Optional[str] = None
+    # ``abort`` is offered to Jev only after this much cumulative blocked time
+    # in the run (it is irreversible: the goal fails). 0 disables the gate.
+    jev_allow_abort: bool = True
+    jev_abort_min_blocked_s: float = 15.0
     # Command slew limits (the base has no onboard ramp). Requests to stop
     # translating are never slewed, so stop distances are unaffected.
     max_linear_accel_mps2: float = 0.8

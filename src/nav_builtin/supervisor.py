@@ -118,6 +118,10 @@ class NavSupervisor:
         jev_history_s = kw.get("jev_history_s", 3.0)
         jev_model = kw.get("jev_model", "jev-latest")
         jev_api_key = kw.get("jev_api_key")
+        self._jev_allow_abort = bool(kw.get("jev_allow_abort", True))
+        self._jev_abort_min_blocked_s = max(
+            0.0, float(kw.get("jev_abort_min_blocked_s", 15.0))
+        )
         drive_timeout_streak = kw["drive_timeout_streak"]
         yaw_align_timeout_s = kw["yaw_align_timeout_s"]
         max_goal_snap_m = kw["max_goal_snap_m"]
@@ -439,6 +443,7 @@ class NavSupervisor:
         blocked_path_pose: Optional[Pose2D] = None,
         local_view=None,
         paint_corridor: bool = True,
+        wide: bool = False,
     ) -> PlanResult:
         pose = start if start is not None else self._world.get_pose()
         if pose is None:
@@ -467,6 +472,10 @@ class NavSupervisor:
             paint_corridor=paint_corridor,
             dynamic_obstacle_radius_m=max(0.05, min(self._robot_radius, 0.12)),
             max_goal_snap_m=self._max_goal_snap_m,
+            # wide_replan: footprint-wide seal for several metres so the
+            # planner cannot re-select this corridor.
+            corridor_seal_radius_m=(float(self._robot_radius) if wide else None),
+            corridor_lookahead_m=(3.5 if wide else 1.5),
         )
         if result.feasible:
             result = connect_plan_start(
@@ -701,8 +710,12 @@ class NavSupervisor:
         failed_count: int = 0,
         local_view=None,
         trigger: str = "",
+        wide: bool = False,
     ) -> Optional[Path2D]:
         """Replan around a live block: mild peel first, forced side via last.
+
+        ``wide=True`` (Jev ``wide_replan``): a single wide-corridor attempt —
+        footprint-wide seal 3.5 m ahead, length cap relaxed to 3× remaining.
 
         Policy:
         - Prefer scan+local (and optional corridor paint) that actually leaves
@@ -722,9 +735,13 @@ class NavSupervisor:
 
         old_len = _path_length(path)
         self._last_replan_trigger = str(trigger or "")
-        attempts: list[tuple[str, bool]] = [("scan+local", False)]
-        if failed_count >= 1:
-            attempts.append(("blocked-corridor", True))
+        if wide:
+            attempts: list[tuple[str, bool]] = [("wide-corridor", True)]
+        else:
+            attempts = [("scan+local", False)]
+            if failed_count >= 1:
+                attempts.append(("blocked-corridor", True))
+        length_cap = 3.0 if wide else 1.8
         reasons: list[str] = []
         _, _, _, along = closest_point_on_path(pose, path)
         remaining = max(0.5, old_len - along)
@@ -757,6 +774,7 @@ class NavSupervisor:
                 blocked_path_pose=pose,
                 local_view=local_view,
                 paint_corridor=paint,
+                wide=wide,
             )
             if not replanned.feasible:
                 reasons.append(f"{label}: {replanned.error_msg or 'infeasible'}")
@@ -775,9 +793,10 @@ class NavSupervisor:
                 )
                 continue
             new_len = _path_length(replanned.path)
-            if paint and new_len > remaining * 1.8 and best is not None:
+            if paint and new_len > remaining * length_cap and best is not None:
                 reasons.append(
-                    f"{label}: too long ({new_len:.1f} m > {remaining * 1.8:.1f} m)"
+                    f"{label}: too long ({new_len:.1f} m > "
+                    f"{remaining * length_cap:.1f} m)"
                 )
                 continue
             if best is None or new_len < best[0]:
@@ -906,6 +925,14 @@ class NavSupervisor:
             pose_jump_replan_m = 1.5
             was_loc_holding = False
             pending_loc_replan = False
+            # Block-episode hysteresis: the path cost flickers across the
+            # activate threshold while DWA peels, which used to end the
+            # episode (and wipe blocked_for / history) every few ticks.
+            unblocked_since: Optional[float] = None
+            unblocked_pose: Optional[Pose2D] = None
+            episode_end_min_s = 2.0
+            episode_end_min_progress_m = 0.3
+            last_tick_now: Optional[float] = None
 
             while time.monotonic() < deadline:
                 tick_started = time.monotonic()
@@ -1142,9 +1169,29 @@ class NavSupervisor:
                     )
                 waiting_for_clear = False
                 jev_wants_backup = False
+                jev_wants_wide_replan = False
+                jev_wants_abort = False
+                # Run-level facts for the policy (every tick, blocked or not).
+                tick_dt = (
+                    max(0.0, now - last_tick_now)
+                    if last_tick_now is not None
+                    else self._control_period_s
+                )
+                last_tick_now = now
+                self._jev_policy.note_tick(
+                    now=now,
+                    x=float(pose.x),
+                    y=float(pose.y),
+                    dist_to_goal=float(distance_m(pose, goal)),
+                    blocked=bool(local_blocked),
+                    dt=float(tick_dt),
+                )
                 if local_blocked:
+                    unblocked_since = None
+                    unblocked_pose = None
                     if local_blocked_since is None:
                         local_blocked_since = now
+                        self._jev_policy.note_block_episode_started()
                     blocked_for = now - local_blocked_since
                     cooldown_ready = (
                         now - last_local_replan_at >= self._replan_local_min_period_s
@@ -1274,6 +1321,23 @@ class NavSupervisor:
                         if last_local_replan_at > 0.0 and replan_info
                         else None
                     )
+                    # Jev-only escalations: state whether each is executable.
+                    wide_ok = bool(cooldown_ready and local_view is not None)
+                    wide_denial = (
+                        ""
+                        if wide_ok
+                        else ("cooldown" if local_view is not None else "no_local_costmap")
+                    )
+                    blocked_total = float(self._jev_policy.run_stats.blocked_total_s)
+                    if not self._jev_allow_abort:
+                        abort_ok, abort_denial = False, "disabled"
+                    elif blocked_total < self._jev_abort_min_blocked_s:
+                        abort_ok, abort_denial = False, (
+                            f"blocked_total_s {blocked_total:.0f} < "
+                            f"{self._jev_abort_min_blocked_s:.0f}"
+                        )
+                    else:
+                        abort_ok, abort_denial = True, ""
                     policy = self._jev_policy.decide(
                         LocalBlockContext(
                             heuristic_action=heuristic_action,
@@ -1320,6 +1384,11 @@ class NavSupervisor:
                             last_replan_error=str(self._last_replan_error or ""),
                             last_replan_age_s=replan_age,
                             pose_theta=float(pose.theta),
+                            wide_replan_available=wide_ok,
+                            wide_replan_denial_reason=wide_denial,
+                            abort_available=abort_ok,
+                            abort_denial_reason=abort_denial,
+                            backup_max_attempts=int(self._backup_max_attempts),
                         )
                     )
                     action = policy.applied_action
@@ -1332,12 +1401,15 @@ class NavSupervisor:
                             jev_wants_backup = True
                         else:
                             waiting_for_clear = True
-                    elif action == "replan":
+                    elif action == "abort":
+                        jev_wants_abort = True
+                    elif action in ("replan", "wide_replan"):
+                        wide = action == "wide_replan"
                         # Stop only long enough to plan. Paint + forced-via
                         # kick in so we do not keep accepting the same corridor.
                         _trig = (
-                            f"local_blocked cost={path_ahead_cost} "
-                            f"nose_clear={nose_clear}"
+                            f"{'wide_replan' if wide else 'local_blocked'} "
+                            f"cost={path_ahead_cost} nose_clear={nose_clear}"
                         )
                         self._stop_before_replan(_trig)
                         new_path = self._try_replan(
@@ -1349,6 +1421,7 @@ class NavSupervisor:
                             require_different=failed_replan_while_blocked < 3,
                             local_view=local_view,
                             trigger=_trig,
+                            wide=wide,
                         )
                         # Start cooldown when planning *finishes*. Planning can
                         # take >2 s; stamping its start with a 0.5 s cooldown
@@ -1356,6 +1429,9 @@ class NavSupervisor:
                         replan_finished = time.monotonic()
                         last_local_replan_at = replan_finished
                         last_replan = replan_finished
+                        self._jev_policy.note_replan(
+                            accepted=new_path is not None, wide=wide
+                        )
                         if new_path is not None:
                             path = new_path
                             local_blocked_since = None
@@ -1372,10 +1448,46 @@ class NavSupervisor:
                             rotate_active = False
                         else:
                             failed_replan_while_blocked += 1
-                else:
-                    local_blocked_since = None
-                    failed_replan_while_blocked = 0
-                    self._jev_policy.clear_history()
+                elif local_blocked_since is not None:
+                    # Unblocked this tick, but keep the episode open until the
+                    # robot has clearly left the block (time + distance), so a
+                    # cost flicker cannot reset blocked_for / history.
+                    if unblocked_since is None:
+                        unblocked_since = now
+                        unblocked_pose = pose
+                    moved = (
+                        distance_m(pose, unblocked_pose)
+                        if unblocked_pose is not None
+                        else 0.0
+                    )
+                    if (
+                        now - unblocked_since >= episode_end_min_s
+                        and moved >= episode_end_min_progress_m
+                    ):
+                        local_blocked_since = None
+                        failed_replan_while_blocked = 0
+                        self._jev_policy.clear_history()
+                        unblocked_since = None
+                        unblocked_pose = None
+
+                if jev_wants_abort:
+                    self._world.stop()
+                    stats = self._jev_policy.run_stats
+                    msg = (
+                        "aborted by nav policy: blocked "
+                        f"{stats.blocked_total_s:.0f}s over "
+                        f"{stats.block_episodes} episodes, "
+                        f"{stats.replans_failed} failed replans, "
+                        f"{stats.backups_started} backups"
+                    )
+                    self._set_status(state="failed", active=False, error_msg=msg)
+                    _log = getattr(self._world, "log", None)
+                    if callable(_log):
+                        try:
+                            _log(msg)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return
 
                 # Keep DWA available when the path is blocked but the nose is
                 # clear (or after a failed detour) — otherwise we only spin in
@@ -1545,6 +1657,7 @@ class NavSupervisor:
                         replan_finished = time.monotonic()
                         last_local_replan_at = replan_finished
                         last_replan = replan_finished
+                        self._jev_policy.note_replan(accepted=new_path is not None)
                         if new_path is not None:
                             path = new_path
                             last_progress_at = now
@@ -1591,6 +1704,7 @@ class NavSupervisor:
                                 robot_radius_m=self._robot_radius,
                             )
                             backup_attempts += 1
+                            self._jev_policy.note_backup_started()
                             spin_stuck_since = None
                             cmd = DriveCommand(
                                 -self._backup_speed_mps, 0.0, 0.0, False
@@ -1707,6 +1821,7 @@ class NavSupervisor:
                     replan_finished = time.monotonic()
                     last_local_replan_at = replan_finished
                     last_replan = replan_finished
+                    self._jev_policy.note_replan(accepted=new_path is not None)
                     if new_path is not None:
                         path = new_path
                         last_progress_at = now
@@ -1852,6 +1967,7 @@ class NavSupervisor:
                     replan_finished = time.monotonic()
                     last_local_replan_at = replan_finished
                     last_replan = replan_finished
+                    self._jev_policy.note_replan(accepted=new_path is not None)
                     if new_path is not None:
                         path = new_path
                         last_progress_at = now

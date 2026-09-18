@@ -74,6 +74,8 @@ def builtin_nav_runtime_kwargs(
         "jev_history_s": bcfg.jev_history_s,
         "jev_model": bcfg.jev_model,
         "jev_api_key": bcfg.jev_api_key,
+        "jev_allow_abort": bcfg.jev_allow_abort,
+        "jev_abort_min_blocked_s": bcfg.jev_abort_min_blocked_s,
         "drive_timeout_streak": bcfg.drive_timeout_streak,
         "yaw_align_timeout_s": bcfg.yaw_align_timeout_s,
         "max_goal_snap_m": bcfg.max_goal_snap_m,

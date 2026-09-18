@@ -32,7 +32,17 @@ ACTION_WAIT = "wait"
 ACTION_KEEP_DWA = "keep_dwa"
 ACTION_REPLAN = "replan"
 ACTION_BACKUP = "backup"
-ACTIONS = (ACTION_WAIT, ACTION_KEEP_DWA, ACTION_REPLAN, ACTION_BACKUP)
+# Jev-only escalations (the heuristic never picks these).
+ACTION_WIDE_REPLAN = "wide_replan"
+ACTION_ABORT = "abort"
+ACTIONS = (
+    ACTION_WAIT,
+    ACTION_KEEP_DWA,
+    ACTION_REPLAN,
+    ACTION_BACKUP,
+    ACTION_WIDE_REPLAN,
+    ACTION_ABORT,
+)
 
 
 def normalize_nav_policy(raw: Any) -> str:
@@ -100,6 +110,73 @@ class LocalBlockContext:
     pose_theta: Optional[float] = None
     # Age of the last replan attempt (None = none this block).
     last_replan_age_s: Optional[float] = None
+    # Jev-only escalations: whether the supervisor can execute them now.
+    wide_replan_available: bool = False
+    wide_replan_denial_reason: str = ""
+    abort_available: bool = False
+    abort_denial_reason: str = ""
+    backup_max_attempts: int = 0
+
+
+@dataclass
+class RunStats:
+    """Run-level facts that survive block-episode flicker."""
+
+    started_at: float = 0.0
+    block_episodes: int = 0
+    blocked_total_s: float = 0.0
+    replans_failed: int = 0
+    replans_accepted: int = 0
+    backups_started: int = 0
+    wide_replans: int = 0
+    # (t, x, y, dist_to_goal) trail for progress windows.
+    trail: Deque[tuple[float, float, float, float]] = field(
+        default_factory=lambda: deque(maxlen=1200)
+    )
+
+    def note_tick(
+        self,
+        t: float,
+        x: float,
+        y: float,
+        dist_to_goal: float,
+        *,
+        blocked: bool,
+        dt: float,
+    ) -> None:
+        self.trail.append((float(t), float(x), float(y), float(dist_to_goal)))
+        cutoff = t - 60.0
+        while self.trail and self.trail[0][0] < cutoff:
+            self.trail.popleft()
+        if blocked:
+            self.blocked_total_s += max(0.0, float(dt))
+
+    def progress(self, now: float, window_s: float) -> Dict[str, float]:
+        """Goal-distance reduction and path length travelled over ``window_s``."""
+        pts = [p for p in self.trail if now - p[0] <= window_s]
+        if len(pts) < 2:
+            return {"toward_goal_m": 0.0, "travelled_m": 0.0}
+        toward = pts[0][3] - pts[-1][3]
+        travelled = 0.0
+        for a, b in zip(pts, pts[1:]):
+            travelled += math.hypot(b[1] - a[1], b[2] - a[2])
+        return {
+            "toward_goal_m": round(float(toward), 3),
+            "travelled_m": round(float(travelled), 3),
+        }
+
+    def to_dict(self, now: float) -> Dict[str, Any]:
+        return {
+            "elapsed_s": round(max(0.0, now - self.started_at), 1),
+            "block_episodes": int(self.block_episodes),
+            "blocked_total_s": round(self.blocked_total_s, 1),
+            "replans_failed": int(self.replans_failed),
+            "replans_accepted": int(self.replans_accepted),
+            "backups_started": int(self.backups_started),
+            "wide_replans": int(self.wide_replans),
+            "progress_10s": self.progress(now, 10.0),
+            "progress_30s": self.progress(now, 30.0),
+        }
 
 
 @dataclass
@@ -302,6 +379,7 @@ def build_policy_state(
     motion: Mapping[str, Any],
     *,
     recent_actions: Optional[Mapping[str, Any]] = None,
+    run: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Compact JSON state for TypeSafe ``system_one``.
 
@@ -330,6 +408,9 @@ def build_policy_state(
         # progress while keep_dwa means peeling is not working.
         "motion_while_blocked": {k: motion[k] for k in stuck_keys if k in motion},
         "recent_actions": dict(recent_actions or {}),
+        # Whole-run facts. blocked_for_s above is this *episode*; the run
+        # counters do not reset when the path cost flickers below threshold.
+        "run": dict(run or {}),
         "actions": {
             ACTION_WAIT: (
                 "Stop translating (rotate-to-heading still allowed). Costs time; "
@@ -349,12 +430,36 @@ def build_policy_state(
                 "Reverse a short distance, then replan from the new pose. Only "
                 "executable when backup.feasible is true."
             ),
+            ACTION_WIDE_REPLAN: (
+                "Global replan that seals the current corridor for several "
+                "metres ahead with a footprint-wide band and accepts a much "
+                "longer detour (up to ~3x remaining). Slower to compute; use "
+                "when normal replans keep returning the same corridor. Only "
+                "executable when wide_replan.available is true."
+            ),
+            ACTION_ABORT: (
+                "Give up on this goal now and report failure so a supervisor / "
+                "route loop can move on. Irreversible for this goal. Only "
+                "executable when abort.available is true."
+            ),
         },
         "backup": {
             "feasible": bool(ctx.backup_feasible),
+            "attempts_used": int(
+                max(0, ctx.backup_max_attempts - ctx.backup_attempts_remaining)
+            ),
+            "attempts_max": int(ctx.backup_max_attempts),
             "attempts_remaining": int(ctx.backup_attempts_remaining),
             "cooldown_ready": bool(ctx.backup_cooldown_ready),
             "denial_reason": str(ctx.backup_denial_reason or ""),
+        },
+        "wide_replan": {
+            "available": bool(ctx.wide_replan_available),
+            "denial_reason": str(ctx.wide_replan_denial_reason or ""),
+        },
+        "abort": {
+            "available": bool(ctx.abort_available),
+            "denial_reason": str(ctx.abort_denial_reason or ""),
         },
         "motion_cmd": {
             "vx_mps": (
@@ -416,16 +521,24 @@ def build_policy_questions() -> Dict[str, Any]:
                 "without collision. The state gives obstacle clearances, obstacle "
                 "motion history, robot displacement over the recent window, which "
                 "actions the controller has already been applying and for how "
-                "long (recent_actions), and the outcomes of recent global replan "
-                "attempts (last_replan). backup is only executable when "
-                "backup.feasible is true. Weigh each action by whether it is "
-                "likely to change the situation given what has already been tried."
+                "long (recent_actions), whole-run counters (run: elapsed, block "
+                "episodes, total blocked time, progress over 10 s / 30 s, "
+                "replans failed/accepted, backups used), and the outcomes of "
+                "recent global replan attempts (last_replan). backup, "
+                "wide_replan and abort are only executable when their "
+                "feasible/available flag is true. Weigh each action by whether "
+                "it is likely to change the situation given what has already "
+                "been tried."
             ),
             criteria={
                 ACTION_WAIT: "Stop and hold position",
                 ACTION_KEEP_DWA: "Keep the path; local planner peels/inches",
                 ACTION_REPLAN: "Compute a new global path from here",
                 ACTION_BACKUP: "Reverse briefly, then replan",
+                ACTION_WIDE_REPLAN: (
+                    "Seal this corridor widely and accept a long detour"
+                ),
+                ACTION_ABORT: "Fail this goal now so the mission can move on",
             },
         ),
         "temporary_mover": Noul(
@@ -490,25 +603,35 @@ def map_jev_to_action(
     choice: Optional[str],
     heuristic_action: str,
     backup_feasible: bool = False,
+    wide_replan_available: bool = False,
+    abort_available: bool = False,
     **_ignored: Any,
 ) -> str:
     """Turn Jev's Choice into a supervisor action.
 
-    Jev decides. Code applies only hard safety gates:
+    Jev decides. Code applies only hard executability gates:
     - unknown choice → heuristic
     - ``backup`` when reverse is not physically feasible → heuristic (or wait)
+    - ``wide_replan`` when not available (cooldown) → ``replan`` if that is
+      allowed, else heuristic
+    - ``abort`` when not available (blocked-time gate / disabled) → heuristic
     Reactive stops in the follower always win regardless of this mapping.
     """
     action = str(choice or "").strip().lower()
+    fallback = (
+        heuristic_action
+        if heuristic_action in ACTIONS and heuristic_action != ACTION_BACKUP
+        else ACTION_WAIT
+    )
     if action not in ACTIONS:
-        return heuristic_action if heuristic_action in ACTIONS else ACTION_WAIT
+        return fallback
     if action == ACTION_BACKUP and not backup_feasible:
         # Never reverse into unknown rear space.
-        return (
-            heuristic_action
-            if heuristic_action in ACTIONS and heuristic_action != ACTION_BACKUP
-            else ACTION_WAIT
-        )
+        return fallback
+    if action == ACTION_WIDE_REPLAN and not wide_replan_available:
+        return fallback
+    if action == ACTION_ABORT and not abort_available:
+        return fallback
     return action
 
 
@@ -550,6 +673,7 @@ class JevNavPolicy:
         # What we have actually been applying during this block (facts for Jev).
         self._applied_history: Deque[tuple[float, str]] = deque(maxlen=400)
         self._last_state_key: Optional[tuple] = None
+        self._run = RunStats(started_at=time.monotonic())
 
     def _emit(self, msg: str) -> None:
         if self._log is not None:
@@ -577,8 +701,41 @@ class JevNavPolicy:
         self._decision_log.clear()
         self._decision_seq = 0
         self._last_decision = None
+        self._run = RunStats(started_at=time.monotonic())
         self.clear_history()
         return self._run_id
+
+    # --- run-level fact hooks (called by the supervisor every tick) ---------
+
+    @property
+    def run_stats(self) -> RunStats:
+        return self._run
+
+    def note_tick(
+        self,
+        *,
+        now: float,
+        x: float,
+        y: float,
+        dist_to_goal: float,
+        blocked: bool,
+        dt: float,
+    ) -> None:
+        self._run.note_tick(now, x, y, dist_to_goal, blocked=blocked, dt=dt)
+
+    def note_block_episode_started(self) -> None:
+        self._run.block_episodes += 1
+
+    def note_replan(self, *, accepted: bool, wide: bool = False) -> None:
+        if accepted:
+            self._run.replans_accepted += 1
+        else:
+            self._run.replans_failed += 1
+        if wide:
+            self._run.wide_replans += 1
+
+    def note_backup_started(self) -> None:
+        self._run.backups_started += 1
 
     def _record_applied(self, t: float, action: str) -> None:
         self._applied_history.append((t, action))
@@ -617,6 +774,8 @@ class JevNavPolicy:
         return (
             bool(ctx.nose_clear),
             bool(ctx.backup_feasible),
+            bool(ctx.wide_replan_available),
+            bool(ctx.abort_available),
             tuple(ctx.block_reasons),
             int(ctx.failed_replan_while_blocked),
             ctx.last_replan_accepted is not None,
@@ -686,6 +845,7 @@ class JevNavPolicy:
             **stuck_progress_features(list(self._history)),
         }
         recent = self._recent_actions(now)
+        run = self._run.to_dict(now)
         features = {
             **motion,
             "nose_clear": ctx.nose_clear,
@@ -698,8 +858,11 @@ class JevNavPolicy:
             "replan_cooldown_ready": bool(ctx.replan_cooldown_ready),
             "backup_feasible": bool(ctx.backup_feasible),
             "backup_denial_reason": str(ctx.backup_denial_reason or ""),
+            "wide_replan_available": bool(ctx.wide_replan_available),
+            "abort_available": bool(ctx.abort_available),
             "local_planner_active": bool(ctx.local_planner_active),
             "recent_actions": recent,
+            "run": run,
         }
         if ctx.remaining_path_m is not None:
             features["remaining_path_m"] = round(float(ctx.remaining_path_m), 2)
@@ -772,7 +935,7 @@ class JevNavPolicy:
             self._emit(f"jev_policy {decision.to_dict()}")
             return decision
 
-        state = build_policy_state(ctx, motion, recent_actions=recent)
+        state = build_policy_state(ctx, motion, recent_actions=recent, run=run)
         t0 = time.monotonic()
         try:
             result = self._query(state)
@@ -787,6 +950,8 @@ class JevNavPolicy:
                 choice=str(jev_choice) if jev_choice is not None else None,
                 heuristic_action=ctx.heuristic_action,
                 backup_feasible=bool(ctx.backup_feasible),
+                wide_replan_available=bool(ctx.wide_replan_available),
+                abort_available=bool(ctx.abort_available),
             )
             fallback = "" if not situation_changed else "requeried_state_change"
             if self.mode == NAV_POLICY_SHADOW:

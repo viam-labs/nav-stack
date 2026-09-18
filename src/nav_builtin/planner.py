@@ -813,8 +813,15 @@ def plan_path(
     paint_corridor: bool = True,
     dynamic_obstacle_radius_m: float = 0.35,
     max_goal_snap_m: float = 0.5,
+    corridor_seal_radius_m: Optional[float] = None,
+    corridor_lookahead_m: float = 1.5,
 ) -> PlanResult:
     """Plan from a bridge-style map dict.
+
+    ``corridor_seal_radius_m`` / ``corridor_lookahead_m`` widen and lengthen
+    the painted block on the current route (``wide_replan``): a footprint-wide
+    band several metres ahead forces the planner out of a corridor that
+    thin paint keeps re-selecting.
 
     When ``scan`` is supplied, hits are marked on the map so replans can route
     around dynamic obstacles (people, chairs) not in the static SLAM map.
@@ -875,6 +882,8 @@ def plan_path(
         and blocked_path_pose is not None
     ):
         block_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
+        if corridor_seal_radius_m is not None:
+            block_r = max(block_r, float(corridor_seal_radius_m))
         # Leave the robot's own footprint unpainted (start would otherwise be
         # lethal and snap sideways), and only paint the stretch the local
         # costmap actually flagged — not 2.5 m of route.
@@ -883,7 +892,7 @@ def plan_path(
             blocked_path,
             blocked_path_pose,
             radius_m=block_r,
-            lookahead_m=1.5,
+            lookahead_m=max(0.3, float(corridor_lookahead_m)),
             start_offset_m=float(robot_radius_m) + block_r + 2.0 * float(occ.resolution),
             end_offset_m=(
                 block_r

@@ -235,16 +235,22 @@ Configure under the navigation service `builtin` block (or top-level aliases whe
 | `jev_history_s` | `3.0` | Obstacle-track window for mover-vs-fixed features |
 | `jev_model` | `jev-latest` | TypeSafe model id |
 | `jev_api_key` | _(env)_ | Or set `TYPESAFE_API_KEY` on the machine |
+| `jev_allow_abort` | `true` | Offer `abort` to Jev at all |
+| `jev_abort_min_blocked_s` | `15` | `abort` only becomes available after this much cumulative blocked time in the run |
 
 **Modes**
 
 - `heuristic` — unchanged behavior; no TypeSafe calls.
 - `shadow` — call Jev on local blocks, **always log** heuristic vs Jev, still **execute heuristic** (safe for robot trials).
-- `jev` — execute Jev’s mapped action when confidence is high enough; otherwise heuristic. Always logs both. Actions: `wait` / `keep_dwa` / `replan` / `backup`.
+- `jev` — execute Jev’s mapped action when confidence is high enough; otherwise heuristic. Always logs both. Actions: `wait` / `keep_dwa` / `replan` / `backup`, plus two Jev-only escalations the heuristic never picks:
+  - `wide_replan` — global replan that seals the current corridor with a footprint-wide band 3.5 m ahead and accepts up to 3× the remaining length. Available when the replan cooldown has elapsed.
+  - `abort` — fail this goal now (`state: failed`, `error_msg: "aborted by nav policy: …"`) so a route loop can move on. Available only after `jev_abort_min_blocked_s` of cumulative blocked time.
+
+A local-block **episode** now survives brief cost flicker: it only ends after the robot has been unblocked for ≥2 s *and* moved ≥0.3 m, so `blocked_for_s` and the obstacle history are not wiped every time DWA nudges the path cost under the threshold.
 
 `get_status` → `progress.jev_policy` (while navigating) includes `heuristic_action`, `jev_action`, `applied_action`, `confidence`, `features` (incl. `motion_score` / `likely_mover` / `block_reasons` / `recent_actions`), and answer snippets.
 
-Jev is the decider: the state it receives is **facts only** (clearances front/left/right/rear, obstacle motion history, robot displacement + yaw over the recent window, which action the controller has actually been applying and for how long, replan attempt outcomes + age, `backup.denial_reason`). Code applies only hard safety gates — an infeasible `backup` falls back to heuristic, and the follower's reactive stop always wins. A reused (rate-limited) answer is discarded and Jev re-queried as soon as the situation fingerprint changes (nose clears, backup becomes feasible, replan outcome changes).
+Jev is the decider: the state it receives is **facts only** (clearances front/left/right/rear, obstacle motion history, robot displacement + yaw over the recent window, which action the controller has actually been applying and for how long, replan attempt outcomes + age, `backup.denial_reason`), plus **run-level counters** under `run` that do not reset with the block episode: `elapsed_s`, `block_episodes`, `blocked_total_s`, `progress_10s` / `progress_30s` (`toward_goal_m`, `travelled_m`), `replans_failed` / `replans_accepted`, `backups_started`, `wide_replans`. Code applies only hard executability gates — infeasible `backup`, unavailable `wide_replan` / `abort` fall back to heuristic, and the follower's reactive stop always wins. A reused (rate-limited) answer is discarded and Jev re-queried as soon as the situation fingerprint changes (nose clears, backup becomes feasible, replan outcome changes).
 
 **Robot trial (recommended order)**
 

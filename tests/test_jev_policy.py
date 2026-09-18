@@ -6,10 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from src.nav_builtin.jev_policy import (
+    ACTION_ABORT,
     ACTION_BACKUP,
     ACTION_KEEP_DWA,
     ACTION_REPLAN,
     ACTION_WAIT,
+    ACTION_WIDE_REPLAN,
     JevNavPolicy,
     LocalBlockContext,
     ObstacleSample,
@@ -103,6 +105,94 @@ def test_map_jev_safety_gates_only():
         map_jev_to_action(choice="teleport", heuristic_action=ACTION_REPLAN)
         == ACTION_REPLAN
     )
+    # Jev-only escalations pass through only when the supervisor says so.
+    assert (
+        map_jev_to_action(
+            choice=ACTION_WIDE_REPLAN,
+            heuristic_action=ACTION_REPLAN,
+            wide_replan_available=True,
+        )
+        == ACTION_WIDE_REPLAN
+    )
+    assert (
+        map_jev_to_action(
+            choice=ACTION_WIDE_REPLAN,
+            heuristic_action=ACTION_KEEP_DWA,
+            wide_replan_available=False,
+        )
+        == ACTION_KEEP_DWA
+    )
+    assert (
+        map_jev_to_action(
+            choice=ACTION_ABORT, heuristic_action=ACTION_WAIT, abort_available=True
+        )
+        == ACTION_ABORT
+    )
+    assert (
+        map_jev_to_action(
+            choice=ACTION_ABORT, heuristic_action=ACTION_WAIT, abort_available=False
+        )
+        == ACTION_WAIT
+    )
+
+
+def test_run_stats_survive_block_flicker_and_report_progress():
+    policy = JevNavPolicy(
+        mode="jev",
+        query_fn=lambda s, q: _stub_result(
+            choice=ACTION_KEEP_DWA, confidence=0.9, mover=0.1, gap=0.5
+        ),
+        min_period_s=0,
+    )
+    policy.start_run()
+    t0 = 1000.0
+    # 30 s of ticks: robot creeps 0.02 m/s toward goal, blocked half the time.
+    for i in range(600):
+        t = t0 + i * 0.05
+        policy.note_tick(
+            now=t,
+            x=i * 0.001,
+            y=0.0,
+            dist_to_goal=4.0 - i * 0.001,
+            blocked=(i // 40) % 2 == 0,
+            dt=0.05,
+        )
+    policy.note_block_episode_started()
+    policy.note_block_episode_started()
+    policy.note_replan(accepted=False)
+    policy.note_replan(accepted=False)
+    policy.note_replan(accepted=True, wide=True)
+    policy.note_backup_started()
+    run = policy.run_stats.to_dict(t0 + 600 * 0.05)
+    assert run["block_episodes"] == 2
+    # 15 windows of 40 ticks (2 s); indices 0,2,..,14 blocked → 8 × 2 s.
+    assert run["blocked_total_s"] == pytest.approx(16.0, abs=0.5)
+    assert run["replans_failed"] == 2
+    assert run["replans_accepted"] == 1
+    assert run["wide_replans"] == 1
+    assert run["backups_started"] == 1
+    assert run["progress_30s"]["toward_goal_m"] == pytest.approx(0.6, abs=0.05)
+    assert run["progress_10s"]["toward_goal_m"] == pytest.approx(0.2, abs=0.05)
+    # decide() ships run facts to Jev and into features / the decision log.
+    ctx = _ctx(ACTION_REPLAN)
+    ctx.abort_available = True
+    ctx.wide_replan_available = True
+    captured = {}
+
+    def q(state, questions):
+        captured["state"] = state
+        return _stub_result(choice=ACTION_ABORT, confidence=0.9, mover=0.0, gap=0.0)
+
+    policy._query_fn = q
+    d = policy.decide(ctx)
+    assert captured["state"]["run"]["block_episodes"] == 2
+    assert captured["state"]["abort"]["available"] is True
+    assert ACTION_WIDE_REPLAN in captured["state"]["actions"]
+    assert d.applied_action == ACTION_ABORT
+    assert d.features["run"]["replans_failed"] == 2
+    # New run wipes the counters.
+    policy.start_run()
+    assert policy.run_stats.block_episodes == 0
 
 
 def _stub_result(*, choice: str, confidence: float, mover: float, gap: float):
