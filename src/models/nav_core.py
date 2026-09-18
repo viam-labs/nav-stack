@@ -125,6 +125,7 @@ class _SuspendedNav:
     route: Optional[str] = None
     route_index: Optional[int] = None
     route_waypoints: Optional[List[dict]] = None
+    route_loop: bool = False
 
     def to_dict(self) -> dict:
         out = {
@@ -141,6 +142,7 @@ class _SuspendedNav:
             out["route"] = self.route
             out["route_index"] = int(self.route_index or 0)
             out["route_total"] = len(self.route_waypoints or [])
+            out["loop"] = bool(self.route_loop)
         return out
 
 
@@ -1198,6 +1200,7 @@ class NavServiceBase(Motion):
         route_waypoints = (
             list(route_st.get("waypoints") or []) if route_active else None
         )
+        route_loop = bool(route_st.get("loop")) if route_active else False
 
         simple = self._simple_nav_status
         if simple.get("state") == "active":
@@ -1212,6 +1215,7 @@ class NavServiceBase(Motion):
                     route=route_name,
                     route_index=route_index,
                     route_waypoints=route_waypoints,
+                    route_loop=route_loop,
                 )
 
         status: Mapping = {}
@@ -1233,6 +1237,7 @@ class NavServiceBase(Motion):
                 route=route_name,
                 route_index=route_index,
                 route_waypoints=route_waypoints,
+                route_loop=route_loop,
             )
         if route_active and route_waypoints and route_index is not None:
             if 0 <= route_index < len(route_waypoints):
@@ -1246,6 +1251,7 @@ class NavServiceBase(Motion):
                     route=route_name,
                     route_index=route_index,
                     route_waypoints=route_waypoints,
+                    route_loop=route_loop,
                 )
 
         execution = self._plan_execution
@@ -1264,6 +1270,7 @@ class NavServiceBase(Motion):
                 route=route_name,
                 route_index=route_index,
                 route_waypoints=route_waypoints,
+                route_loop=route_loop,
             )
         return None
 
@@ -1321,6 +1328,7 @@ class NavServiceBase(Motion):
                     "name": suspended.route,
                     "waypoints": suspended.route_waypoints,
                     "start_index": start,
+                    "loop": bool(suspended.route_loop),
                     "wait": False,
                 }
             )
@@ -1439,18 +1447,52 @@ class NavServiceBase(Motion):
             raise ValueError("navigate_route requires at least one waypoint")
         return route_name, resolved
 
+    def _nearest_route_index(
+        self, waypoints: Sequence[Mapping], pose: conv.Pose2D
+    ) -> int:
+        """Return the index of the waypoint closest to ``pose`` in XY."""
+        best_i = 0
+        best_d2 = float("inf")
+        px, py = float(pose.x), float(pose.y)
+        for i, wp in enumerate(waypoints):
+            dx = float(wp["x"]) - px
+            dy = float(wp["y"]) - py
+            d2 = dx * dx + dy * dy
+            if d2 < best_d2:
+                best_d2 = d2
+                best_i = i
+        return best_i
+
+    def _current_map_pose(self) -> conv.Pose2D:
+        runtime = self._require_runtime()
+        getter = getattr(runtime.manager, "get_pose_in_map", None)
+        pose = getter() if callable(getter) else None
+        if pose is None:
+            node = getattr(runtime.manager, "node", None)
+            pose = node.get_pose_in_map() if node is not None else None
+        if pose is None:
+            raise RuntimeError("current map pose unavailable")
+        return pose
+
     async def _start_navigate_route(
         self, command: Mapping[str, ValueTypes]
     ) -> Mapping[str, ValueTypes]:
         """Follow a route's waypoints sequentially with the builtin navigator."""
         wait = bool(command.get("wait", False))
+        loop = bool(command.get("loop", False))
+        start_nearest = bool(
+            command.get("start_nearest", command.get("nearest", False))
+        )
         start_index = max(0, int(command.get("start_index", 0)))
         inline = command.get("waypoints")
         route_name, waypoints = self._resolve_route_waypoints(
             name=command.get("name"),
             waypoints=inline if isinstance(inline, (list, tuple)) else None,
         )
-        if start_index >= len(waypoints):
+        if start_nearest:
+            pose = await asyncio.to_thread(self._current_map_pose)
+            start_index = self._nearest_route_index(waypoints, pose)
+        elif start_index >= len(waypoints):
             raise ValueError(
                 f"start_index {start_index} out of range "
                 f"(0..{len(waypoints) - 1})"
@@ -1470,11 +1512,15 @@ class NavServiceBase(Motion):
             "total": len(waypoints),
             "location": waypoints[start_index].get("location"),
             "waypoints": waypoints,
+            "loop": loop,
+            "lap": 0,
             "error_msg": "",
         }
 
         async def _run() -> None:
-            await self._run_route(route_name, waypoints, start_index, cancel)
+            await self._run_route(
+                route_name, waypoints, start_index, cancel, loop=loop
+            )
 
         if wait:
             await _run()
@@ -1489,6 +1535,8 @@ class NavServiceBase(Motion):
             "total": len(waypoints),
             "location": waypoints[start_index].get("location"),
             "target": dict(waypoints[start_index]),
+            "loop": loop,
+            "start_nearest": start_nearest,
         }
 
     async def _cancel_route(self, *, mark_canceled: bool = True) -> None:
@@ -1526,17 +1574,23 @@ class NavServiceBase(Motion):
         waypoints: List[dict],
         start_index: int,
         cancel: asyncio.Event,
+        *,
+        loop: bool = False,
     ) -> None:
         runtime = self._require_runtime()
         mgr = runtime.manager
         terminal = {"succeeded", "failed", "canceled", "cancelled"}
+        lap = 0
+        idx = start_index
         try:
-            for idx in range(start_index, len(waypoints)):
+            while True:
                 if cancel.is_set():
                     self._route_status = {
                         **self._route_status,
                         "state": "canceled",
                         "index": idx,
+                        "lap": lap,
+                        "loop": loop,
                         "error_msg": "canceled",
                     }
                     return
@@ -1551,6 +1605,8 @@ class NavServiceBase(Motion):
                     "total": len(waypoints),
                     "location": loc_name,
                     "waypoints": waypoints,
+                    "loop": loop,
+                    "lap": lap,
                     "error_msg": "",
                 }
                 await asyncio.to_thread(
@@ -1632,16 +1688,27 @@ class NavServiceBase(Motion):
                         return
                     # succeeded — advance
                     break
-            self._route_status = {
-                "state": "succeeded",
-                "motion": "route",
-                "name": route_name,
-                "index": len(waypoints) - 1,
-                "total": len(waypoints),
-                "location": waypoints[-1].get("location"),
-                "waypoints": waypoints,
-                "error_msg": "",
-            }
+
+                idx += 1
+                if idx < len(waypoints):
+                    continue
+                if not loop:
+                    self._route_status = {
+                        "state": "succeeded",
+                        "motion": "route",
+                        "name": route_name,
+                        "index": len(waypoints) - 1,
+                        "total": len(waypoints),
+                        "location": waypoints[-1].get("location"),
+                        "waypoints": waypoints,
+                        "loop": False,
+                        "lap": lap,
+                        "error_msg": "",
+                    }
+                    return
+                # Wrap for another lap.
+                lap += 1
+                idx = 0
         except asyncio.CancelledError:
             try:
                 await asyncio.to_thread(mgr.cancel)
