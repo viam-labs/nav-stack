@@ -519,3 +519,72 @@ def test_navigate_route_suspend_resume(monkeypatch):
         assert mgr.navigate.call_count >= 2
 
     asyncio.run(_run())
+
+
+def test_navigate_route_start_nearest(monkeypatch):
+    nav, mgr = _configured_nav(pose=Pose2D(2.8, 1.0, 0.0))
+    _stub_locations(
+        nav,
+        {
+            "dock": (0.0, 0.0, 0.0),
+            "kitchen": (3.0, 1.0, 0.0),
+            "lobby": (10.0, 10.0, 0.0),
+        },
+    )
+    _route_status_queue(mgr)
+    _real_sleep = asyncio.sleep
+
+    async def _fast_sleep(*_a, **_k):
+        await _real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    result = asyncio.run(
+        nav.do_command(
+            {
+                "command": "navigate_route",
+                "waypoints": ["dock", "kitchen", "lobby"],
+                "start_nearest": True,
+                "wait": True,
+            }
+        )
+    )
+    assert result["state"] == "succeeded"
+    # Nearest to (2.8, 1.0) is kitchen — should not visit dock first.
+    assert mgr.navigate.call_args_list[0].args[:2] == (3.0, 1.0)
+    assert mgr.navigate.call_count == 2  # kitchen then lobby
+
+
+def test_navigate_route_loop_wraps_until_cancel(monkeypatch):
+    nav, mgr = _configured_nav()
+    _stub_locations(nav, {"a": (0.0, 0.0, 0.0), "b": (1.0, 0.0, 0.0)})
+    _route_status_queue(mgr)
+    _real_sleep = asyncio.sleep
+
+    async def _fast_sleep(*_a, **_k):
+        await _real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    async def _run():
+        started = await nav.do_command(
+            {
+                "command": "navigate_route",
+                "waypoints": ["a", "b"],
+                "loop": True,
+                "wait": False,
+            }
+        )
+        assert started["loop"] is True
+        # Wait until we've wrapped onto a second lap (3rd navigate = a again).
+        for _ in range(200):
+            await _real_sleep(0)
+            if mgr.navigate.call_count >= 3:
+                break
+        assert mgr.navigate.call_count >= 3
+        assert nav._route_status.get("loop") is True
+        assert int(nav._route_status.get("lap", 0)) >= 1
+        await nav.do_command({"command": "cancel"})
+        assert nav._route_status["state"] == "canceled"
+
+    asyncio.run(_run())
