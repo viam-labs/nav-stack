@@ -1634,7 +1634,10 @@ class NavServiceBase(Motion):
                     if (
                         (not active)
                         and state in terminal
-                        and self._route_goal_matches(status, wp)
+                        and (
+                            self._route_goal_matches(status, wp)
+                            or self._route_pose_near_wp(status, wp)
+                        )
                     ):
                         started = True
                         break
@@ -1667,7 +1670,10 @@ class NavServiceBase(Motion):
                     if state not in terminal:
                         await asyncio.sleep(0.2)
                         continue
-                    if not self._route_goal_matches(status, wp) and state == "succeeded":
+                    if state == "succeeded" and not (
+                        self._route_goal_matches(status, wp)
+                        or self._route_pose_near_wp(status, wp)
+                    ):
                         # Stale success from a previous goal — keep waiting.
                         await asyncio.sleep(0.2)
                         continue
@@ -1693,6 +1699,7 @@ class NavServiceBase(Motion):
                 if idx < len(waypoints):
                     continue
                 if not loop:
+                    self._active_goal_name = None
                     self._route_status = {
                         "state": "succeeded",
                         "motion": "route",
@@ -1733,15 +1740,34 @@ class NavServiceBase(Motion):
                 self._route_task = None
 
     @staticmethod
-    def _route_goal_matches(status: Mapping, wp: Mapping, *, tol: float = 1e-3) -> bool:
+    def _route_goal_matches(status: Mapping, wp: Mapping, *, tol: float = 0.05) -> bool:
+        """True when nav status goal matches this waypoint (coords and/or name)."""
         goal = status.get("goal") if isinstance(status.get("goal"), Mapping) else None
         if goal is None:
             return False
+        loc = str(wp.get("location") or "")
+        goal_name = str(goal.get("name") or "")
+        if loc and goal_name and loc == goal_name:
+            return True
         try:
             return (
                 abs(float(goal["x"]) - float(wp["x"])) < tol
                 and abs(float(goal["y"]) - float(wp["y"])) < tol
             )
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _route_pose_near_wp(
+        status: Mapping, wp: Mapping, *, tol: float = 0.35
+    ) -> bool:
+        pose = status.get("pose") if isinstance(status.get("pose"), Mapping) else None
+        if pose is None:
+            return False
+        try:
+            dx = float(pose["x"]) - float(wp["x"])
+            dy = float(pose["y"]) - float(wp["y"])
+            return dx * dx + dy * dy <= tol * tol
         except (KeyError, TypeError, ValueError):
             return False
 
