@@ -18,7 +18,6 @@ def make_builtin_navigator(
     *,
     logger=None,
 ) -> BuiltinNavigator:
-    bcfg = nav_cfg.builtin
     if nav_cfg.inflation_is_noop() and logger is not None:
         inscribed = nav_cfg.inscribed_radius_m()
         logger.warn(
@@ -29,65 +28,7 @@ def make_builtin_navigator(
             f"e.g. inflation_margin_m: 0.20 gives a soft ring out to "
             f"{inscribed + 0.20:.2f} m."
         )
-    return BuiltinNavigator(
-        world,
-        inflation_radius_m=nav_cfg.effective_inflation_radius_m(),
-        # Driving clearance uses the half-width; rotation uses the half-diagonal.
-        robot_radius_m=nav_cfg.inscribed_radius_m(),
-        spin_radius_m=nav_cfg.circumscribed_radius_m(),
-        nose_offset_m=nav_cfg.nose_offset_m(),
-        wheel_half_track_m=nav_cfg.wheel_half_track_m(),
-        cost_scaling_factor=bcfg.cost_scaling_factor,
-        clearance_preference_m=bcfg.clearance_preference_m,
-        algorithm=bcfg.planner,
-        replan_period_s=bcfg.replan_period_s,
-        lookahead_m=bcfg.lookahead_m,
-        min_lookahead_m=bcfg.min_lookahead_m,
-        max_lookahead_m=bcfg.max_lookahead_m,
-        approach_dist_m=bcfg.approach_dist_m,
-        xy_tolerance_m=bcfg.xy_goal_tolerance,
-        yaw_tolerance_rad=bcfg.yaw_goal_tolerance,
-        max_vel_x=nav_cfg.max_vel_x,
-        max_vel_theta=nav_cfg.max_vel_theta,
-        min_cmd_vel_x=nav_cfg.min_cmd_vel_x,
-        min_cmd_vel_theta=nav_cfg.min_cmd_vel_theta,
-        timeout_s=bcfg.timeout_s,
-        poll_interval_s=nav_cfg.control_period_s(),
-        avoid_obstacles=nav_cfg.simple_avoid_obstacles,
-        stop_distance_m=nav_cfg.simple_stop_distance,
-        slow_distance_m=nav_cfg.simple_slow_distance,
-        scan_max_age_s=nav_cfg.simple_scan_max_age,
-        smooth_path=bcfg.smooth_path,
-        smooth_sample_spacing_m=bcfg.smooth_sample_spacing_m,
-        local_costmap_enabled=bcfg.local_costmap_enabled,
-        local_costmap_width_m=bcfg.local_costmap_width_m,
-        local_costmap_height_m=bcfg.local_costmap_height_m,
-        local_costmap_resolution=bcfg.local_costmap_resolution,
-        local_inflation_radius_m=nav_cfg.effective_local_inflation_radius_m(),
-        local_costmap_rate_hz=float(getattr(bcfg, "local_costmap_rate_hz", 5.0)),
-        local_planner_enabled=bcfg.local_planner_enabled,
-        local_planner_sim_time_s=bcfg.local_planner_sim_time_s,
-        local_planner_activate_cost=bcfg.local_planner_activate_cost,
-        local_planner_max_vel_x_mps=bcfg.local_planner_max_vel_x_mps,
-        local_planner_max_vel_x_reverse_m=bcfg.local_planner_max_vel_x_reverse_m,
-        backup_enabled=bcfg.backup_enabled,
-        backup_stuck_time_s=bcfg.backup_stuck_time_s,
-        backup_dist_m=bcfg.backup_dist_m,
-        backup_speed_mps=bcfg.backup_speed_mps,
-        backup_rear_clear_m=bcfg.backup_rear_clear_m,
-        backup_max_attempts=bcfg.backup_max_attempts,
-        backup_cooldown_s=bcfg.backup_cooldown_s,
-        recovery_wait_duration_s=bcfg.recovery_wait_duration_s,
-        replan_local_blocked_time_s=bcfg.replan_local_blocked_time_s,
-        replan_local_min_period_s=bcfg.replan_local_min_period_s,
-        drive_timeout_streak=int(getattr(bcfg, "drive_timeout_streak", 20)),
-        yaw_align_timeout_s=float(getattr(bcfg, "yaw_align_timeout_s", 6.0)),
-        max_goal_snap_m=float(getattr(bcfg, "max_goal_snap_m", 0.5)),
-        max_linear_accel_mps2=bcfg.max_linear_accel_mps2,
-        max_linear_decel_mps2=bcfg.max_linear_decel_mps2,
-        max_angular_accel_rad_s2=bcfg.max_angular_accel_rad_s2,
-        logger=logger,
-    )
+    return BuiltinNavigator(world, nav_cfg, logger=logger)
 
 
 class BuiltinNavHost:

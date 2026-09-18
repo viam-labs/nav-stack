@@ -6,8 +6,8 @@ logic easy to unit-test and shareable between the models and the runtime layer.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import List, Mapping, Optional
+from dataclasses import MISSING, dataclass, field, fields
+from typing import Any, Dict, List, Mapping, Optional
 
 DIFFERENTIAL = "differential"
 OMNI = "omni"
@@ -181,18 +181,13 @@ class SimConfig:
         if convention == BASE_VELOCITY_ROS:
             convention = BASE_VELOCITY_X_FORWARD
         map_path = d.get("map_path")
-        return cls(
-            enabled=bool(d.get("enabled", False)),
-            world_name=str(d.get("world_name", "default") or "default"),
-            map_path=str(map_path).strip() or None if map_path else None,
-            seed_x=float(d.get("seed_x", 1.0)),
-            seed_y=float(d.get("seed_y", 1.0)),
-            seed_theta=float(d.get("seed_theta", 0.0)),
-            scan_bins=int(d.get("scan_bins", 360)),
-            range_min=float(d.get("range_min", 0.05)),
-            range_max=float(d.get("range_max", 20.0)),
-            base_velocity_convention=str(convention),
-        )
+        overrides: Dict[str, Any] = {
+            "base_velocity_convention": str(convention),
+            "map_path": str(map_path).strip() or None if map_path else None,
+        }
+        if "world_name" in d:
+            overrides["world_name"] = str(d.get("world_name") or "default")
+        return _dataclass_from_dict(cls, d, overrides=overrides)
 
 
 @dataclass
@@ -311,12 +306,7 @@ class MapSettings:
     def from_dict(cls, d: Mapping) -> "MapSettings":
         if not d:
             return cls()
-        return cls(
-            resolution=float(d.get("resolution", 0.05)),
-            minimum_travel_distance=float(d.get("minimum_travel_distance", 0.3)),
-            minimum_travel_heading=float(d.get("minimum_travel_heading", 0.3)),
-            max_laser_range=float(d.get("max_laser_range", 25.0)),
-        )
+        return _dataclass_from_dict(cls, d)
 
 
 NAV_BACKEND_BUILTIN = "builtin"
@@ -348,6 +338,58 @@ def _optional_positive(value) -> Optional[float]:
         return None
     parsed = float(value)
     return parsed if parsed > 0.0 else None
+
+
+def _config_field_defaults(cls) -> Dict[str, Any]:
+    """Field name → default value (evaluates ``default_factory`` when needed)."""
+    out: Dict[str, Any] = {}
+    for f in fields(cls):
+        if f.default is not MISSING:
+            out[f.name] = f.default
+        elif f.default_factory is not MISSING:  # type: ignore[misc]
+            out[f.name] = f.default_factory()  # type: ignore[misc]
+    return out
+
+
+def _coerce_config_value(default: Any, raw: Any) -> Any:
+    """Cast ``raw`` to the type implied by the dataclass field default."""
+    if isinstance(default, bool):
+        return bool(raw)
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(raw)
+    if isinstance(default, float):
+        return float(raw)
+    if isinstance(default, str):
+        return default if raw is None else str(raw)
+    if isinstance(default, Mapping):
+        return dict(raw) if raw else dict(default)
+    if isinstance(default, list):
+        return list(raw) if raw is not None else list(default)
+    return raw
+
+
+def _dataclass_from_dict(
+    cls,
+    d: Mapping,
+    *,
+    overrides: Optional[Mapping[str, Any]] = None,
+):
+    """Build ``cls`` from ``d``; missing keys keep dataclass field defaults.
+
+    ``overrides`` supplies values that need custom parsing (normalization,
+    validators, or context-dependent defaults). Keys present only in ``d`` are
+    coerced from the field default's type.
+    """
+    overrides = dict(overrides or {})
+    defs = _config_field_defaults(cls)
+    kwargs: Dict[str, Any] = dict(overrides)
+    for name, default in defs.items():
+        if name in kwargs:
+            continue
+        if name not in d:
+            continue
+        kwargs[name] = _coerce_config_value(default, d[name])
+    return cls(**kwargs)
 
 
 def _merge_top_level_nav_tuning(d: Mapping) -> dict:
@@ -427,7 +469,7 @@ class BuiltinNavConfig:
     yaw_goal_tolerance: float = 0.35  # radians (~20 deg; mugger uses 0.6)
     # After XY is inside tolerance, accept the goal if final yaw still has not
     # settled (noisy heading / goal θ far from approach). 0 disables.
-    yaw_align_timeout_s: float = 6.0
+    yaw_align_timeout_s: float = 12.0
     # Reject plans whose free-cell goal snap exceeds this (metres). Live scan
     # inflation used to snap the goal ~1 m away and then "succeed" there.
     max_goal_snap_m: float = 0.5
@@ -483,62 +525,21 @@ class BuiltinNavConfig:
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":
         if not d:
             return cls()
-        return cls(
-            planner=normalize_builtin_planner(d.get("planner", BUILTIN_PLANNER_LAZY_THETA)),
-            lookahead_m=float(d.get("lookahead_m", 1.35)),
-            min_lookahead_m=float(d.get("min_lookahead_m", 1.1)),
-            max_lookahead_m=float(d.get("max_lookahead_m", 1.55)),
-            replan_period_s=float(d.get("replan_period_s", 1.0)),
-            timeout_s=float(d.get("timeout_s", 300.0)),
-            drive_timeout_s=float(d.get("drive_timeout_s", 5.0)),
-            drive_timeout_streak=int(d.get("drive_timeout_streak", 20)),
-            cost_scaling_factor=float(d.get("cost_scaling_factor", 4.0)),
-            clearance_preference_m=float(d.get("clearance_preference_m", 0.50)),
-            xy_goal_tolerance=float(d.get("xy_goal_tolerance", 0.25)),
-            yaw_goal_tolerance=float(d.get("yaw_goal_tolerance", 0.35)),
-            yaw_align_timeout_s=float(d.get("yaw_align_timeout_s", 6.0)),
-            max_goal_snap_m=float(d.get("max_goal_snap_m", 0.5)),
-            approach_dist_m=float(d.get("approach_dist_m", 0.35)),
-            smooth_path=bool(d.get("smooth_path", True)),
-            smooth_sample_spacing_m=float(d.get("smooth_sample_spacing_m", 0.20)),
-            local_costmap_enabled=bool(d.get("local_costmap_enabled", True)),
-            local_costmap_width_m=float(d.get("local_costmap_width_m", 4.0)),
-            local_costmap_height_m=float(d.get("local_costmap_height_m", 4.0)),
-            local_costmap_resolution=float(d.get("local_costmap_resolution", 0.05)),
-            local_inflation_radius_m=_optional_positive(
+        overrides: Dict[str, Any] = {
+            "local_inflation_radius_m": _optional_positive(
                 d.get("local_inflation_radius_m")
             ),
-            local_inflation_margin_m=_optional_positive(
+            "local_inflation_margin_m": _optional_positive(
                 d.get("local_inflation_margin_m")
             ),
-            local_costmap_rate_hz=_positive_hz(
-                d.get("local_costmap_rate_hz", 5.0), "local_costmap_rate_hz"
-            ),
-            local_planner_enabled=bool(d.get("local_planner_enabled", True)),
-            local_planner_sim_time_s=float(d.get("local_planner_sim_time_s", 1.5)),
-            local_planner_activate_cost=int(d.get("local_planner_activate_cost", 200)),
-            local_planner_max_vel_x_mps=float(
-                d.get("local_planner_max_vel_x_mps", 0.25)
-            ),
-            local_planner_max_vel_x_reverse_m=float(
-                d.get("local_planner_max_vel_x_reverse_m", 0.15)
-            ),
-            backup_enabled=bool(d.get("backup_enabled", True)),
-            backup_stuck_time_s=float(d.get("backup_stuck_time_s", 3.0)),
-            backup_dist_m=float(d.get("backup_dist_m", 0.30)),
-            backup_speed_mps=float(d.get("backup_speed_mps", 0.12)),
-            backup_rear_clear_m=float(d.get("backup_rear_clear_m", 0.45)),
-            backup_max_attempts=int(d.get("backup_max_attempts", 1)),
-            backup_cooldown_s=float(d.get("backup_cooldown_s", 4.0)),
-            recovery_wait_duration_s=float(d.get("recovery_wait_duration_s", 2.0)),
-            replan_local_blocked_time_s=float(
-                d.get("replan_local_blocked_time_s", 0.3)
-            ),
-            replan_local_min_period_s=float(d.get("replan_local_min_period_s", 4.0)),
-            max_linear_accel_mps2=float(d.get("max_linear_accel_mps2", 0.8)),
-            max_linear_decel_mps2=float(d.get("max_linear_decel_mps2", 1.2)),
-            max_angular_accel_rad_s2=float(d.get("max_angular_accel_rad_s2", 2.0)),
-        )
+        }
+        if "planner" in d:
+            overrides["planner"] = normalize_builtin_planner(d.get("planner"))
+        if "local_costmap_rate_hz" in d:
+            overrides["local_costmap_rate_hz"] = _positive_hz(
+                d["local_costmap_rate_hz"], "local_costmap_rate_hz"
+            )
+        return _dataclass_from_dict(cls, d, overrides=overrides)
 
 
 @dataclass
@@ -1010,271 +1011,62 @@ class SlamConfig:
             imu_shm_name = default_imu_shm_name(str(heading_sensor))
         else:
             imu_shm_name = None
-        return cls(
-            base=d["base"],
-            lidars=lidars,
-            movement_sensor=d.get("movement_sensor"),
-            imu_shm_name=imu_shm_name,
-            imu_shm_region_size=int(d.get("imu_shm_region_size", 4096)),
-            imu_shm_max_age_s=float(d.get("imu_shm_max_age_s", 0.5)),
-            heading_sensor=d.get("heading_sensor"),
-            movement_sensor_yaw_deg=float(d.get("movement_sensor_yaw_deg", 0.0)),
-            movement_sensor_upside_down=bool(
-                d.get("movement_sensor_upside_down", False)
+        frames_default = Frames()
+        overrides: Dict[str, Any] = {
+            "base": d["base"],
+            "lidars": lidars,
+            "movement_sensor": d.get("movement_sensor"),
+            "imu_shm_name": imu_shm_name,
+            "heading_sensor": heading_sensor,
+            "mode": mode,
+            "slam_backend": slam_backend,
+            "active_map": d.get("active_map"),
+            "frames": Frames(
+                map=frames_d.get("map", frames_default.map),
+                odom=frames_d.get("odom", frames_default.odom),
+                base_link=frames_d.get("base_link", frames_default.base_link),
             ),
-            heading_sensor_yaw_deg=float(d.get("heading_sensor_yaw_deg", 0.0)),
-            heading_sensor_invert=bool(d.get("heading_sensor_invert", False)),
-            map_pose_yaw_offset_deg=float(d.get("map_pose_yaw_offset_deg", 0.0)),
-            mode=mode,
-            slam_backend=slam_backend,
-            maps_dir=d.get("maps_dir", "/root/.viam/nav-stack/maps"),
-            active_map=d.get("active_map"),
-            frames=Frames(
-                map=frames_d.get("map", "map"),
-                odom=frames_d.get("odom", "odom"),
-                base_link=frames_d.get("base_link", "base_link"),
-            ),
-            scan_rate_hz=_positive_hz(d.get("scan_rate_hz", 10.0), "scan_rate_hz"),
-            odom_rate_hz=_positive_hz(d.get("odom_rate_hz", 10.0), "odom_rate_hz"),
-            sensor_read_timeout_s=float(d.get("sensor_read_timeout_s", 10.0)),
-            external_pose_rate_hz=float(d.get("external_pose_rate_hz", 10.0)),
-            external_grid_rate_hz=float(d.get("external_grid_rate_hz", 1.5)),
-            external_transform_timeout_s=float(
-                d.get("external_transform_timeout_s", 0.2)
-            ),
-            scan_bins=int(d.get("scan_bins", 720)),
-            scan_accumulation_s=float(
-                d.get("scan_accumulation_s", default_accum)
-            ),
-            imu_odom_mode=imu_odom_mode,
-            heading_only_odom=heading_only_odom,
-            lidar_odom_enabled=lidar_odom_enabled,
-            lidar_odom_range_flow_only=lidar_odom_range_flow_only,
-            map_when_still=map_when_still,
-            map_when_still_dwell_s=map_when_still_dwell_s,
-            map_when_still_linear_speed_m_s=float(
-                d.get("map_when_still_linear_speed_m_s", 0.02)
-            ),
-            map_when_still_yaw_rate_rad_s=float(
-                d.get("map_when_still_yaw_rate_rad_s", 0.04)
-            ),
-            map_when_still_yaw_step_deg=map_when_still_yaw_step_deg,
-            map_when_still_max_drift_m=float(
-                d.get("map_when_still_max_drift_m", 0.03)
-            ),
-            map_when_still_max_drift_deg=float(
-                d.get("map_when_still_max_drift_deg", 1.5)
-            ),
-            wall_yaw_correction=wall_yaw_correction,
-            wall_yaw_min_length_m=float(d.get("wall_yaw_min_length_m", 2.0)),
-            wall_yaw_max_step_deg=float(d.get("wall_yaw_max_step_deg", 2.0)),
-            wall_yaw_blend=float(d.get("wall_yaw_blend", 0.5)),
-            mapping_revisit_check=mapping_revisit_check,
-            mapping_revisit_interval_s=float(
-                d.get("mapping_revisit_interval_s", 20.0)
-            ),
-            mapping_revisit_search_radius_m=float(
-                d.get("mapping_revisit_search_radius_m", 5.0)
-            ),
-            mapping_revisit_wide_radius_m=float(
-                d.get("mapping_revisit_wide_radius_m", 12.0)
-            ),
-            mapping_revisit_min_score=float(d.get("mapping_revisit_min_score", 0.6)),
-            mapping_revisit_max_ray_mae_m=float(
-                d.get("mapping_revisit_max_ray_mae_m", 0.8)
-            ),
-            mapping_revisit_min_shift_m=float(
-                d.get("mapping_revisit_min_shift_m", 1.0)
-            ),
-            mapping_revisit_min_shift_deg=float(
-                d.get("mapping_revisit_min_shift_deg", 10.0)
-            ),
-            mapping_revisit_max_shift_m=float(
-                d.get("mapping_revisit_max_shift_m", 10.0)
-            ),
-            mapping_revisit_full_map_fallback=bool(
-                d.get("mapping_revisit_full_map_fallback", True)
-            ),
-            mapping_revisit_full_map_min_score=float(
-                d.get("mapping_revisit_full_map_min_score", 0.75)
-            ),
-            mapping_revisit_slice_verify=bool(
-                d.get("mapping_revisit_slice_verify", True)
-            ),
-            mapping_revisit_slice_bands=[
-                [float(pair[0]), float(pair[1])]
-                for pair in d.get(
-                    "mapping_revisit_slice_bands", [[0.15, 0.45], [1.6, 2.4]]
-                )
-            ],
-            mapping_revisit_slice_min_hit_rate=float(
-                d.get("mapping_revisit_slice_min_hit_rate", 0.4)
-            ),
-            mapping_revisit_slice_resolution_m=float(
-                d.get("mapping_revisit_slice_resolution_m", 0.15)
-            ),
-            mapping_revisit_keyframes=bool(d.get("mapping_revisit_keyframes", True)),
-            mapping_revisit_keyframe_min_spacing_m=float(
-                d.get("mapping_revisit_keyframe_min_spacing_m", 0.5)
-            ),
-            mapping_revisit_keyframe_min_spacing_deg=float(
-                d.get("mapping_revisit_keyframe_min_spacing_deg", 20.0)
-            ),
-            mapping_revisit_keyframe_max=int(d.get("mapping_revisit_keyframe_max", 250)),
-            mapping_revisit_keyframe_match_tol_m=float(
-                d.get("mapping_revisit_keyframe_match_tol_m", 0.3)
-            ),
-            mapping_revisit_keyframe_min_score=float(
-                d.get("mapping_revisit_keyframe_min_score", 0.55)
-            ),
-            builtin_rebuild_map_on_revisit=bool(
-                d.get("builtin_rebuild_map_on_revisit", True)
-            ),
-            builtin_mapping_keyframe_max=int(
-                d.get("builtin_mapping_keyframe_max", 500)
-            ),
-            mapping_revisit_while_moving=mapping_revisit_while_moving,
-            mapping_revisit_max_yaw_rate_rad_s=float(
-                d.get("mapping_revisit_max_yaw_rate_rad_s", 0.35)
-            ),
-            scan_max_age_s=float(d.get("scan_max_age_s", 2.0)),
-            base_velocity_convention=convention,
-            map=MapSettings.from_dict(stb_raw),
-            slam_params=slam_params_raw,
+            "scan_accumulation_s": float(d.get("scan_accumulation_s", default_accum)),
+            "imu_odom_mode": imu_odom_mode,
+            "heading_only_odom": heading_only_odom,
+            "lidar_odom_enabled": lidar_odom_enabled,
+            "lidar_odom_range_flow_only": lidar_odom_range_flow_only,
+            "map_when_still": map_when_still,
+            "map_when_still_dwell_s": map_when_still_dwell_s,
+            "map_when_still_yaw_step_deg": map_when_still_yaw_step_deg,
+            "wall_yaw_correction": wall_yaw_correction,
+            "mapping_revisit_check": mapping_revisit_check,
+            "mapping_revisit_while_moving": mapping_revisit_while_moving,
+            "base_velocity_convention": convention,
+            "map": MapSettings.from_dict(stb_raw),
+            "slam_params": slam_params_raw,
             # Sim seeds SLAM pose from sim.seed_*; startup global_localize is
             # optional and off by default (avoids fighting the ground-truth seed).
-            global_localize_on_start=bool(
+            "global_localize_on_start": bool(
                 d.get("global_localize_on_start", not sim.enabled)
             ),
-            global_localize_on_start_delay_s=float(
-                d.get("global_localize_on_start_delay_s", 4.0)
-            ),
-            global_localize_on_start_readiness_timeout_s=float(
-                d.get("global_localize_on_start_readiness_timeout_s", 90.0)
-            ),
-            global_localize_on_start_options=d.get(
-                "global_localize_on_start_options",
-                {
-                    "full_map": True,
-                    "map_source": "live",
-                    "coarse_position_step_m": 0.35,
-                    "coarse_yaw_step_deg": 10.0,
-                    "ray_weight": 0.55,
-                    "ray_refine_candidates": 48,
-                },
-            )
-            or {
-                "full_map": True,
-                "map_source": "live",
-                "coarse_position_step_m": 0.35,
-                "coarse_yaw_step_deg": 10.0,
-                "ray_weight": 0.55,
-                "ray_refine_candidates": 48,
-            },
-            global_localize_on_start_refine=bool(
-                d.get("global_localize_on_start_refine", True)
-            ),
-            global_localize_on_start_refine_delay_s=float(
-                d.get("global_localize_on_start_refine_delay_s", 8.0)
-            ),
-            global_localize_on_start_refine_max_passes=int(
-                d.get("global_localize_on_start_refine_max_passes", 3)
-            ),
-            global_localize_on_start_target_score=float(
-                d.get("global_localize_on_start_target_score", 0.7)
-            ),
-            global_localize_on_start_target_ray_mae_m=float(
-                d.get("global_localize_on_start_target_ray_mae_m", 0.4)
-            ),
-            global_localize_on_start_post_apply_refine=bool(
-                d.get("global_localize_on_start_post_apply_refine", True)
-            ),
-            global_localize_on_start_post_apply_refine_delay_s=float(
-                d.get("global_localize_on_start_post_apply_refine_delay_s", 8.0)
-            ),
-            global_localize_on_start_post_apply_refine_options=d.get(
-                "global_localize_on_start_post_apply_refine_options",
-                {"map_source": "live"},
-            )
-            or {"map_source": "live"},
-            global_localize_on_start_refine_options=d.get(
-                "global_localize_on_start_refine_options",
-                {
-                    "full_map": False,
-                    "map_source": "live",
-                    "local_yaw_window_deg": 120.0,
-                    "search_radius_m": 6.0,
-                },
-            )
-            or {
-                "full_map": False,
-                "map_source": "live",
-                "local_yaw_window_deg": 120.0,
-                "search_radius_m": 6.0,
-            },
-            periodic_relocalize=bool(d.get("periodic_relocalize", True)),
-            periodic_relocalize_interval_s=float(
-                d.get("periodic_relocalize_interval_s", 20.0)
-            ),
-            periodic_relocalize_nav_interval_s=float(
-                d.get("periodic_relocalize_nav_interval_s", 25.0)
-            ),
-            periodic_relocalize_soft_hold_max_s=float(
-                d.get("periodic_relocalize_soft_hold_max_s", 20.0)
-            ),
-            periodic_relocalize_max_yaw_rate_rad_s=float(
-                d.get("periodic_relocalize_max_yaw_rate_rad_s", 0.35)
-            ),
-            periodic_relocalize_max_scan_age_s=float(
-                d.get("periodic_relocalize_max_scan_age_s", 0.75)
-            ),
-            periodic_relocalize_min_score=float(
-                d.get("periodic_relocalize_min_score", 0.5)
-            ),
-            periodic_relocalize_max_ray_mae_m=float(
-                d.get("periodic_relocalize_max_ray_mae_m", 1.0)
-            ),
-            periodic_relocalize_recovery_min_score=float(
-                d.get("periodic_relocalize_recovery_min_score", 0.45)
-            ),
-            periodic_relocalize_min_shift_m=float(
-                d.get("periodic_relocalize_min_shift_m", 0.2)
-            ),
-            periodic_relocalize_min_shift_deg=float(
-                d.get("periodic_relocalize_min_shift_deg", 10.0)
-            ),
-            localize_jump_confirm_count=int(d.get("localize_jump_confirm_count", 2)),
-            localize_jump_agree_m=float(d.get("localize_jump_agree_m", 0.4)),
-            localize_jump_agree_deg=float(d.get("localize_jump_agree_deg", 15.0)),
-            localize_jump_large_m=float(d.get("localize_jump_large_m", 0.75)),
-            localize_jump_large_deg=float(d.get("localize_jump_large_deg", 25.0)),
-            periodic_relocalize_nav_recoveries_threshold=int(
-                d.get("periodic_relocalize_nav_recoveries_threshold", 2)
-            ),
-            periodic_relocalize_full_map_on_low_quality=bool(
-                d.get("periodic_relocalize_full_map_on_low_quality", True)
-            ),
-            periodic_relocalize_during_navigation=bool(
-                d.get("periodic_relocalize_during_navigation", False)
-            ),
-            localize_subprocess=bool(d.get("localize_subprocess", True)),
-            periodic_relocalize_options=d.get(
-                "periodic_relocalize_options",
-                {
-                    "full_map": False,
-                    "map_source": "live",
-                    "search_radius_m": 3.0,
-                    "auto_full_map_fallback": True,
-                },
-            )
-            or {
-                "full_map": False,
-                "map_source": "live",
-                "search_radius_m": 3.0,
-                "auto_full_map_fallback": True,
-            },
-            sim=sim,
-        )
+            "sim": sim,
+        }
+        if "scan_rate_hz" in d:
+            overrides["scan_rate_hz"] = _positive_hz(d["scan_rate_hz"], "scan_rate_hz")
+        if "odom_rate_hz" in d:
+            overrides["odom_rate_hz"] = _positive_hz(d["odom_rate_hz"], "odom_rate_hz")
+        if "mapping_revisit_slice_bands" in d:
+            overrides["mapping_revisit_slice_bands"] = [
+                [float(pair[0]), float(pair[1])]
+                for pair in d["mapping_revisit_slice_bands"]
+            ]
+        # Empty mapping blocks fall back to field defaults (same as ``x or default``).
+        defs = _config_field_defaults(cls)
+        for key in (
+            "global_localize_on_start_options",
+            "global_localize_on_start_post_apply_refine_options",
+            "global_localize_on_start_refine_options",
+            "periodic_relocalize_options",
+        ):
+            if key in d:
+                overrides[key] = d[key] or defs[key]
+        return _dataclass_from_dict(cls, d, overrides=overrides)
 
     def required_dependencies(self) -> List[str]:
         if self.sim.enabled:
@@ -1366,46 +1158,40 @@ class NavConfig:
             raise ValueError(
                 f"nav_backend must be {NAV_BACKEND_BUILTIN!r}, got {backend!r}"
             )
-        return cls(
-            slam_service=d["slam_service"],
-            base=d["base"],
-            kinematics=kinematics,
-            robot_radius=float(d.get("robot_radius", 0.22)),
-            footprint_length_m=_optional_positive(d.get("footprint_length_m")),
-            footprint_width_m=_optional_positive(d.get("footprint_width_m")),
-            max_vel_x=float(d.get("max_vel_x", 0.6)),
-            max_vel_y=float(d.get("max_vel_y", 0.0)),
-            max_vel_theta=float(d.get("max_vel_theta", 1.5)),
-            acc_lim_x=float(d.get("acc_lim_x", 1.0)),
-            acc_lim_theta=float(d.get("acc_lim_theta", 2.0)),
-            inflation_radius=float(d.get("inflation_radius", 0.25)),
-            inflation_margin_m=_optional_positive(d.get("inflation_margin_m")),
-            cmd_vel_timeout=float(d.get("cmd_vel_timeout", 2.0)),
-            control_rate_hz=_positive_hz(
-                d.get("control_rate_hz", 10.0), "control_rate_hz"
-            ),
-            obstacles_only_rate_hz=_positive_hz(
-                d.get("obstacles_only_rate_hz", 2.5), "obstacles_only_rate_hz"
-            ),
-            simple_avoid_obstacles=bool(d.get("simple_avoid_obstacles", True)),
-            simple_stop_distance=float(d.get("simple_stop_distance", 0.4)),
-            simple_slow_distance=float(d.get("simple_slow_distance", 1.0)),
-            simple_scan_max_age=float(d.get("simple_scan_max_age", 2.0)),
-            # Legacy aliases: simple_min_vel_x / simple_min_vel_theta.
-            min_cmd_vel_x=float(
-                d.get("min_cmd_vel_x", d.get("simple_min_vel_x", 0.0))
-            ),
-            min_cmd_vel_theta=float(
-                d.get("min_cmd_vel_theta", d.get("simple_min_vel_theta", 0.0))
-            ),
-            nav_backend=backend,
+        defs = _config_field_defaults(cls)
+        overrides: Dict[str, Any] = {
+            "slam_service": d["slam_service"],
+            "base": d["base"],
+            "kinematics": kinematics,
+            "footprint_length_m": _optional_positive(d.get("footprint_length_m")),
+            "footprint_width_m": _optional_positive(d.get("footprint_width_m")),
+            "inflation_margin_m": _optional_positive(d.get("inflation_margin_m")),
+            "nav_backend": backend,
             # Prefer ``builtin``; accept legacy ``nav2`` block from older configs.
             # Top-level goal tolerances fill in when the nested block omits them
             # (nested wins on conflict).
-            builtin=BuiltinNavConfig.from_dict(
-                _merge_top_level_nav_tuning(d)
+            "builtin": BuiltinNavConfig.from_dict(_merge_top_level_nav_tuning(d)),
+            # Legacy aliases: simple_min_vel_x / simple_min_vel_theta.
+            "min_cmd_vel_x": float(
+                d["min_cmd_vel_x"]
+                if "min_cmd_vel_x" in d
+                else d.get("simple_min_vel_x", defs["min_cmd_vel_x"])
             ),
-        )
+            "min_cmd_vel_theta": float(
+                d["min_cmd_vel_theta"]
+                if "min_cmd_vel_theta" in d
+                else d.get("simple_min_vel_theta", defs["min_cmd_vel_theta"])
+            ),
+        }
+        if "control_rate_hz" in d:
+            overrides["control_rate_hz"] = _positive_hz(
+                d["control_rate_hz"], "control_rate_hz"
+            )
+        if "obstacles_only_rate_hz" in d:
+            overrides["obstacles_only_rate_hz"] = _positive_hz(
+                d["obstacles_only_rate_hz"], "obstacles_only_rate_hz"
+            )
+        return _dataclass_from_dict(cls, d, overrides=overrides)
 
     def inscribed_radius_m(self) -> float:
         """Clearance radius for *driving*: what has to fit through a gap."""

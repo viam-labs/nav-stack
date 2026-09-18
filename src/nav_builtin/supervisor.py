@@ -4,8 +4,10 @@ from __future__ import annotations
 import math
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
+from ..config import NavConfig
+from .runtime_kwargs import builtin_nav_runtime_kwargs
 from ..nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
@@ -47,62 +49,64 @@ class NavSupervisor:
     def __init__(
         self,
         world: WorldIO,
-        *,
-        inflation_radius_m: float = 0.25,
-        robot_radius_m: float = 0.22,
-        spin_radius_m: Optional[float] = None,
-        nose_offset_m: Optional[float] = None,
-        wheel_half_track_m: Optional[float] = None,
-        cost_scaling_factor: float = 4.0,
-        clearance_preference_m: float = 0.35,
-        algorithm: str = "lazy_theta_star",
-        replan_period_s: float = 1.0,
-        lookahead_m: float = 1.35,
-        min_lookahead_m: float = 1.1,
-        max_lookahead_m: float = 1.8,
-        approach_dist_m: float = 0.35,
-        xy_tolerance_m: float = 0.25,
-        yaw_tolerance_rad: float = 0.35,
-        max_vel_x: float = 0.6,
-        max_vel_theta: float = 1.5,
-        min_cmd_vel_x: float = 0.0,
-        min_cmd_vel_theta: float = 0.0,
-        timeout_s: float = 300.0,
-        poll_interval_s: float = 0.1,
-        avoid_obstacles: bool = True,
-        stop_distance_m: float = 0.4,
-        slow_distance_m: float = 1.0,
-        scan_max_age_s: float = 2.0,
-        smooth_path: bool = True,
-        smooth_sample_spacing_m: float = 0.15,
-        local_costmap_enabled: bool = True,
-        local_costmap_width_m: float = 4.0,
-        local_costmap_height_m: float = 4.0,
-        local_costmap_resolution: float = 0.05,
-        local_inflation_radius_m: float = 0.25,
-        local_costmap_rate_hz: float = 5.0,
-        local_planner_enabled: bool = True,
-        local_planner_sim_time_s: float = 1.2,
-        local_planner_activate_cost: int = 200,
-        local_planner_max_vel_x_mps: float = 0.25,
-        local_planner_max_vel_x_reverse_m: float = 0.15,
-        backup_enabled: bool = True,
-        backup_stuck_time_s: float = 3.0,
-        backup_dist_m: float = 0.30,
-        backup_speed_mps: float = 0.12,
-        backup_rear_clear_m: float = 0.45,
-        backup_max_attempts: int = 1,
-        backup_cooldown_s: float = 4.0,
-        recovery_wait_duration_s: float = 2.0,
-        replan_local_blocked_time_s: float = 0.3,
-        replan_local_min_period_s: float = 4.0,
-        drive_timeout_streak: int = 20,
-        yaw_align_timeout_s: float = 6.0,
-        max_goal_snap_m: float = 0.5,
-        max_linear_accel_mps2: float = 0.8,
-        max_linear_decel_mps2: float = 1.2,
-        max_angular_accel_rad_s2: float = 2.0,
+        nav_cfg: Optional[NavConfig] = None,
+        **overrides: Any,
     ):
+        kw = builtin_nav_runtime_kwargs(nav_cfg, **overrides)
+        inflation_radius_m = kw["inflation_radius_m"]
+        robot_radius_m = kw["robot_radius_m"]
+        spin_radius_m = kw["spin_radius_m"]
+        nose_offset_m = kw["nose_offset_m"]
+        wheel_half_track_m = kw["wheel_half_track_m"]
+        cost_scaling_factor = kw["cost_scaling_factor"]
+        clearance_preference_m = kw["clearance_preference_m"]
+        algorithm = kw["algorithm"]
+        replan_period_s = kw["replan_period_s"]
+        lookahead_m = kw["lookahead_m"]
+        min_lookahead_m = kw["min_lookahead_m"]
+        max_lookahead_m = kw["max_lookahead_m"]
+        approach_dist_m = kw["approach_dist_m"]
+        xy_tolerance_m = kw["xy_tolerance_m"]
+        yaw_tolerance_rad = kw["yaw_tolerance_rad"]
+        max_vel_x = kw["max_vel_x"]
+        max_vel_theta = kw["max_vel_theta"]
+        min_cmd_vel_x = kw["min_cmd_vel_x"]
+        min_cmd_vel_theta = kw["min_cmd_vel_theta"]
+        timeout_s = kw["timeout_s"]
+        poll_interval_s = kw["poll_interval_s"]
+        avoid_obstacles = kw["avoid_obstacles"]
+        stop_distance_m = kw["stop_distance_m"]
+        slow_distance_m = kw["slow_distance_m"]
+        scan_max_age_s = kw["scan_max_age_s"]
+        smooth_path = kw["smooth_path"]
+        smooth_sample_spacing_m = kw["smooth_sample_spacing_m"]
+        local_costmap_enabled = kw["local_costmap_enabled"]
+        local_costmap_width_m = kw["local_costmap_width_m"]
+        local_costmap_height_m = kw["local_costmap_height_m"]
+        local_costmap_resolution = kw["local_costmap_resolution"]
+        local_inflation_radius_m = kw["local_inflation_radius_m"]
+        local_costmap_rate_hz = kw["local_costmap_rate_hz"]
+        local_planner_enabled = kw["local_planner_enabled"]
+        local_planner_sim_time_s = kw["local_planner_sim_time_s"]
+        local_planner_activate_cost = kw["local_planner_activate_cost"]
+        local_planner_max_vel_x_mps = kw["local_planner_max_vel_x_mps"]
+        local_planner_max_vel_x_reverse_m = kw["local_planner_max_vel_x_reverse_m"]
+        backup_enabled = kw["backup_enabled"]
+        backup_stuck_time_s = kw["backup_stuck_time_s"]
+        backup_dist_m = kw["backup_dist_m"]
+        backup_speed_mps = kw["backup_speed_mps"]
+        backup_rear_clear_m = kw["backup_rear_clear_m"]
+        backup_max_attempts = kw["backup_max_attempts"]
+        backup_cooldown_s = kw["backup_cooldown_s"]
+        recovery_wait_duration_s = kw["recovery_wait_duration_s"]
+        replan_local_blocked_time_s = kw["replan_local_blocked_time_s"]
+        replan_local_min_period_s = kw["replan_local_min_period_s"]
+        drive_timeout_streak = kw["drive_timeout_streak"]
+        yaw_align_timeout_s = kw["yaw_align_timeout_s"]
+        max_goal_snap_m = kw["max_goal_snap_m"]
+        max_linear_accel_mps2 = kw["max_linear_accel_mps2"]
+        max_linear_decel_mps2 = kw["max_linear_decel_mps2"]
+        max_angular_accel_rad_s2 = kw["max_angular_accel_rad_s2"]
         self._world = world
         self._inflation = inflation_radius_m
         # Driving clearance (half-width when a footprint is configured). Every
