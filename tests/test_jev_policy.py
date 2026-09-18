@@ -13,9 +13,13 @@ from src.nav_builtin.jev_policy import (
     JevNavPolicy,
     LocalBlockContext,
     ObstacleSample,
+    backup_denial_reason,
+    build_policy_state,
+    classify_block_reasons,
     map_jev_to_action,
     normalize_nav_policy,
     obstacle_motion_features,
+    stuck_progress_features,
 )
 
 
@@ -103,6 +107,32 @@ def test_map_jev_soft_overrides():
         )
         == ACTION_WAIT
     )
+    # Peel-loop: do not keep inching.
+    assert (
+        map_jev_to_action(
+            choice=ACTION_KEEP_DWA,
+            temporary_mover=0.1,
+            gap_worth_trying=0.8,
+            should_backup=0.2,
+            heuristic_action=ACTION_KEEP_DWA,
+            backup_feasible=False,
+            likely_peel_loop=True,
+        )
+        == ACTION_WAIT
+    )
+    assert (
+        map_jev_to_action(
+            choice=ACTION_REPLAN,
+            temporary_mover=0.1,
+            gap_worth_trying=0.2,
+            should_backup=0.2,
+            heuristic_action=ACTION_REPLAN,
+            backup_feasible=True,
+            replan_looks_futile=True,
+            likely_peel_loop=True,
+        )
+        == ACTION_BACKUP
+    )
 
 
 def _stub_result(*, choice: str, confidence: float, mover: float, gap: float):
@@ -132,7 +162,7 @@ def _ctx(heuristic: str = ACTION_REPLAN) -> LocalBlockContext:
         path_ahead_cost=240,
         obstacle_state="avoid",
         forward_clearance_m=0.3,
-        failed_replan_while_blocked=1,
+        failed_replan_while_blocked=0,
         remaining_path_m=4.0,
     )
 
@@ -248,3 +278,128 @@ def test_builtin_nav_config_accepts_nav_policy():
     assert cfg.jev_min_confidence == pytest.approx(0.7)
     with pytest.raises(ValueError):
         BuiltinNavConfig.from_dict({"nav_policy": "chatgpt"})
+
+
+def test_stuck_progress_detects_peel_loop():
+    t0 = 50.0
+    samples = [
+        ObstacleSample(
+            t=t0 + i * 0.25,
+            nose_clear=False,
+            forward_clearance_m=0.35,
+            path_ahead_cost=0,
+            obstacle_state="avoid",
+            pose_x=0.0 + i * 0.01,
+            pose_y=0.0,
+            pose_theta=i * 0.25,
+        )
+        for i in range(10)
+    ]
+    stuck = stuck_progress_features(samples)
+    assert stuck["progress_m"] < 0.15
+    assert stuck["yaw_delta_rad"] >= 0.45
+    assert stuck["spinning_in_place"] is True
+    assert stuck["likely_peel_loop"] is True
+
+
+def test_classify_block_reasons_and_backup_denial():
+    assert classify_block_reasons(
+        path_ahead_cost=0,
+        activate_cost=200,
+        pose_cost=0,
+        inscribed_cost=253,
+        obstacle_state="avoid",
+        reactive_avoid_for_s=1.2,
+    ) == ["reactive_avoid"]
+    assert classify_block_reasons(
+        path_ahead_cost=254,
+        activate_cost=200,
+        pose_cost=253,
+        inscribed_cost=253,
+        obstacle_state="clear",
+    ) == ["path_cost", "pose_inscribed"]
+    assert backup_denial_reason(
+        enabled=True,
+        feasible=False,
+        attempts_remaining=2,
+        cooldown_ready=True,
+        has_scan=True,
+        rear_clearance_m=0.1,
+        rear_clear_min_m=0.35,
+        reverse_footprint_ok=None,
+    ) == "rear_blocked"
+    assert (
+        backup_denial_reason(
+            enabled=True,
+            feasible=True,
+            attempts_remaining=2,
+            cooldown_ready=True,
+            has_scan=True,
+            rear_clearance_m=1.0,
+            rear_clear_min_m=0.35,
+            reverse_footprint_ok=True,
+        )
+        == ""
+    )
+
+
+def test_build_policy_state_includes_stuck_and_replan():
+    ctx = LocalBlockContext(
+        heuristic_action=ACTION_REPLAN,
+        nose_clear=False,
+        blocked_for_s=3.0,
+        wait_before_replan_s=2.0,
+        replan_cooldown_ready=True,
+        path_ahead_cost=0,
+        obstacle_state="avoid",
+        forward_clearance_m=0.37,
+        block_reasons=["reactive_avoid"],
+        pose_cost=10,
+        cmd_vx_mps=0.0,
+        cmd_vtheta_rad_s=0.4,
+        bearing_error_rad=0.7,
+        backup_denial_reason="rear_blocked",
+        last_replan_attempts=[
+            "scan+local: still local-blocked (cost=254)",
+            "viaR0.65: still local-blocked (cost=253)",
+        ],
+        last_replan_error="scan+local: still local-blocked",
+    )
+    motion = {
+        "samples": 5,
+        "motion_score": 0.0,
+        "likely_mover": False,
+        "progress_m": 0.05,
+        "yaw_delta_rad": 0.9,
+        "spinning_in_place": True,
+        "likely_peel_loop": True,
+    }
+    state = build_policy_state(ctx, motion)
+    assert state["block_reasons"] == ["reactive_avoid"]
+    assert state["stuck"]["likely_peel_loop"] is True
+    assert state["motion_cmd"]["vtheta_rad_s"] == pytest.approx(0.4)
+    assert "still local-blocked" in state["last_replan"]["attempts"][0]
+    assert state["backup"]["denial_reason"] == "rear_blocked"
+
+
+def test_decide_marks_replan_futile_from_attempts():
+    captured = {}
+
+    def query_fn(state, questions):
+        captured["state"] = state
+        return _stub_result(
+            choice=ACTION_KEEP_DWA, confidence=0.85, mover=0.05, gap=0.7
+        )
+
+    policy = JevNavPolicy(mode="jev", query_fn=query_fn, min_period_s=0)
+    ctx = _ctx(ACTION_REPLAN)
+    ctx.last_replan_attempts = [
+        "scan+local: still local-blocked (cost=254)",
+        "blocked-corridor: still local-blocked (cost=254)",
+    ]
+    ctx.failed_replan_while_blocked = 1
+    d = policy.decide(ctx)
+    assert d.features["replan_looks_futile"] is True
+    # Soft override: peel/futile + keep_dwa → wait (no backup feasible).
+    assert d.jev_action == ACTION_WAIT
+    assert captured["state"]["last_replan"]["attempts"]

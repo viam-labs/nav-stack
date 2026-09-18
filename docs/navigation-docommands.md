@@ -242,7 +242,9 @@ Configure under the navigation service `builtin` block (or top-level aliases whe
 - `shadow` — call Jev on local blocks, **always log** heuristic vs Jev, still **execute heuristic** (safe for robot trials).
 - `jev` — execute Jev’s mapped action when confidence is high enough; otherwise heuristic. Always logs both. Actions: `wait` / `keep_dwa` / `replan` / `backup`.
 
-`get_status` → `progress.jev_policy` (while navigating) includes `heuristic_action`, `jev_action`, `applied_action`, `confidence`, `features` (incl. `motion_score` / `likely_mover`), and answer snippets.
+`get_status` → `progress.jev_policy` (while navigating) includes `heuristic_action`, `jev_action`, `applied_action`, `confidence`, `features` (incl. `motion_score` / `likely_mover` / `likely_peel_loop` / `block_reasons` / `replan_looks_futile`), and answer snippets.
+
+State sent to Jev also includes `block_reasons`, `stuck` (progress/yaw while blocked), `motion_cmd` (last vx/vθ/bearing), flank + rear clearances, `backup.denial_reason`, and `last_replan.attempts` so peel-loops / dead corridors are visible.
 
 **Robot trial (recommended order)**
 

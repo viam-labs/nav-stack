@@ -12,6 +12,7 @@ from ..nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
     SimpleMotionConfig,
+    cone_min_range,
     distance_m,
     forward_clearance_m,
     rear_clearance_m,
@@ -33,6 +34,8 @@ from .jev_policy import (
     JevNavPolicy,
     LocalBlockContext,
     ObstacleSample,
+    backup_denial_reason,
+    classify_block_reasons,
     nearest_scan_obstacle,
     normalize_nav_policy,
 )
@@ -876,6 +879,7 @@ class NavSupervisor:
             prev_local_cmd: Optional[DriveCommand] = None
             prev_cmd: Optional[DriveCommand] = None
             rotate_active = False
+            last_bearing_error_rad = 0.0
             vx_sign_history: list[tuple[float, int]] = []
             xy_ok_since: Optional[float] = None
             last_tick_pose: Optional[Pose2D] = None
@@ -1147,6 +1151,37 @@ class NavSupervisor:
                         else float("inf")
                     )
                     near_r, near_b = nearest_scan_obstacle(scan)
+                    left_clear: Optional[float] = None
+                    right_clear: Optional[float] = None
+                    if scan is not None and obs_cfg is not None and obs_cfg.enabled:
+                        half = float(obs_cfg.front_cone_half_rad)
+                        side = float(getattr(obs_cfg, "side_cone_rad", 1.2) or 1.2)
+                        try:
+                            lc = cone_min_range(scan, half, side)
+                            rc = cone_min_range(scan, -side, -half)
+                            left_clear = (
+                                float(lc) if math.isfinite(lc) else None
+                            )
+                            right_clear = (
+                                float(rc) if math.isfinite(rc) else None
+                            )
+                        except Exception:  # noqa: BLE001
+                            left_clear = right_clear = None
+                    from .costmap import INSCRIBED as _INSCRIBED
+
+                    reactive_age = (
+                        now - reactive_avoid_since
+                        if reactive_avoid_since is not None
+                        else 0.0
+                    )
+                    block_reasons = classify_block_reasons(
+                        path_ahead_cost=int(path_ahead_cost),
+                        activate_cost=int(self._local_planner_activate_cost),
+                        pose_cost=int(pose_cost),
+                        inscribed_cost=int(_INSCRIBED),
+                        obstacle_state=str(last_obstacle_state or ""),
+                        reactive_avoid_for_s=float(reactive_age),
+                    )
                     self._jev_policy.record_obstacle(
                         ObstacleSample(
                             t=now,
@@ -1158,6 +1193,9 @@ class NavSupervisor:
                             obstacle_state=str(last_obstacle_state or ""),
                             nearest_range_m=near_r,
                             nearest_bearing_rad=near_b,
+                            pose_x=float(pose.x),
+                            pose_y=float(pose.y),
+                            pose_theta=float(pose.theta),
                         )
                     )
                     remaining_m = None
@@ -1178,6 +1216,24 @@ class NavSupervisor:
                     backup_attempts_left = max(
                         0, self._backup_max_attempts - int(backup_attempts)
                     )
+                    reverse_ok: Optional[bool] = None
+                    if (
+                        self._backup_enabled
+                        and scan is not None
+                        and local_view is not None
+                        and backup_attempts_left > 0
+                        and backup_cooldown_ready
+                        and rear_clear is not None
+                        and rear_clear >= self._backup_rear_clear_m
+                    ):
+                        reverse_ok = reverse_backup_feasible(
+                            local_view,
+                            pose.x,
+                            pose.y,
+                            pose.theta,
+                            robot_radius_m=self._robot_radius,
+                            distance_m=self._backup_dist_m,
+                        )
                     backup_feasible = bool(
                         self._backup_enabled
                         and scan is not None
@@ -1186,15 +1242,19 @@ class NavSupervisor:
                         and backup_cooldown_ready
                         and rear_clear is not None
                         and rear_clear >= self._backup_rear_clear_m
-                        and reverse_backup_feasible(
-                            local_view,
-                            pose.x,
-                            pose.y,
-                            pose.theta,
-                            robot_radius_m=self._robot_radius,
-                            distance_m=self._backup_dist_m,
-                        )
+                        and reverse_ok is True
                     )
+                    denial = backup_denial_reason(
+                        enabled=bool(self._backup_enabled),
+                        feasible=backup_feasible,
+                        attempts_remaining=backup_attempts_left,
+                        cooldown_ready=backup_cooldown_ready,
+                        has_scan=scan is not None,
+                        rear_clearance_m=rear_clear,
+                        rear_clear_min_m=float(self._backup_rear_clear_m),
+                        reverse_footprint_ok=reverse_ok,
+                    )
+                    replan_info = dict(self._last_replan_info or {})
                     policy = self._jev_policy.decide(
                         LocalBlockContext(
                             heuristic_action=heuristic_action,
@@ -1219,6 +1279,27 @@ class NavSupervisor:
                             backup_feasible=backup_feasible,
                             backup_attempts_remaining=backup_attempts_left,
                             backup_cooldown_ready=backup_cooldown_ready,
+                            block_reasons=block_reasons,
+                            pose_cost=int(pose_cost),
+                            left_clearance_m=left_clear,
+                            right_clearance_m=right_clear,
+                            cmd_vx_mps=(
+                                float(prev_cmd.vx) if prev_cmd is not None else 0.0
+                            ),
+                            cmd_vtheta_rad_s=(
+                                float(prev_cmd.vtheta)
+                                if prev_cmd is not None
+                                else 0.0
+                            ),
+                            bearing_error_rad=float(last_bearing_error_rad),
+                            local_planner_active=bool(local_planner_active),
+                            backup_denial_reason=denial,
+                            last_replan_accepted=replan_info.get("accepted"),
+                            last_replan_attempts=list(
+                                replan_info.get("attempts") or []
+                            ),
+                            last_replan_error=str(self._last_replan_error or ""),
+                            pose_theta=float(pose.theta),
                         )
                     )
                     action = policy.applied_action
@@ -1310,6 +1391,12 @@ class NavSupervisor:
                 )
                 rotate_active = bool(progress.get("rotate_to_heading"))
                 local_planner_active = bool(progress.get("local_planner"))
+                try:
+                    last_bearing_error_rad = float(
+                        progress.get("bearing_error_rad", last_bearing_error_rad) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    pass
                 if local_planner_active:
                     prev_local_cmd = cmd
                 else:

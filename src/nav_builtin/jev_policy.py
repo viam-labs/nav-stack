@@ -57,6 +57,9 @@ class ObstacleSample:
     obstacle_state: str
     nearest_range_m: Optional[float] = None
     nearest_bearing_rad: Optional[float] = None
+    pose_x: Optional[float] = None
+    pose_y: Optional[float] = None
+    pose_theta: Optional[float] = None
 
 
 @dataclass
@@ -81,6 +84,20 @@ class LocalBlockContext:
     backup_feasible: bool = False
     backup_attempts_remaining: int = 0
     backup_cooldown_ready: bool = True
+    # Richer stuck / peel-loop signals (optional; supervisor fills when known).
+    block_reasons: Sequence[str] = ()
+    pose_cost: int = 0
+    left_clearance_m: Optional[float] = None
+    right_clearance_m: Optional[float] = None
+    cmd_vx_mps: Optional[float] = None
+    cmd_vtheta_rad_s: Optional[float] = None
+    bearing_error_rad: Optional[float] = None
+    local_planner_active: bool = False
+    backup_denial_reason: str = ""
+    last_replan_accepted: Optional[str] = None
+    last_replan_attempts: Sequence[str] = ()
+    last_replan_error: str = ""
+    pose_theta: Optional[float] = None
 
 
 @dataclass
@@ -179,10 +196,123 @@ def obstacle_motion_features(
     }
 
 
+def _wrap_pi(rad: float) -> float:
+    while rad > math.pi:
+        rad -= 2.0 * math.pi
+    while rad < -math.pi:
+        rad += 2.0 * math.pi
+    return rad
+
+
+def stuck_progress_features(
+    history: Sequence[ObstacleSample], *, window_s: float = 3.0
+) -> Dict[str, Any]:
+    """Meters advanced + yaw churn while blocked — peel-loop detector."""
+    empty = {
+        "progress_m": 0.0,
+        "yaw_delta_rad": 0.0,
+        "spinning_in_place": False,
+        "likely_peel_loop": False,
+    }
+    if not history:
+        return empty
+    t_now = history[-1].t
+    window = [
+        s
+        for s in history
+        if t_now - s.t <= window_s
+        and s.pose_x is not None
+        and s.pose_y is not None
+    ]
+    if len(window) < 2:
+        return empty
+    first, last = window[0], window[-1]
+    assert first.pose_x is not None and first.pose_y is not None
+    assert last.pose_x is not None and last.pose_y is not None
+    progress_m = math.hypot(last.pose_x - first.pose_x, last.pose_y - first.pose_y)
+    yaw_delta = 0.0
+    if first.pose_theta is not None and last.pose_theta is not None:
+        yaw_delta = abs(_wrap_pi(float(last.pose_theta) - float(first.pose_theta)))
+    dwell_s = max(0.0, last.t - first.t)
+    spinning = progress_m < 0.15 and yaw_delta >= 0.45 and dwell_s >= 1.0
+    peel_loop = spinning or (
+        progress_m < 0.25 and yaw_delta >= 0.7 and dwell_s >= 1.5
+    )
+    return {
+        "progress_m": round(progress_m, 3),
+        "yaw_delta_rad": round(yaw_delta, 3),
+        "spinning_in_place": bool(spinning),
+        "likely_peel_loop": bool(peel_loop),
+    }
+
+
+def classify_block_reasons(
+    *,
+    path_ahead_cost: int,
+    activate_cost: int,
+    pose_cost: int,
+    inscribed_cost: int,
+    obstacle_state: str,
+    reactive_avoid_for_s: float = 0.0,
+) -> List[str]:
+    """Why local_blocked is true (may be multiple)."""
+    reasons: List[str] = []
+    if int(path_ahead_cost) >= int(activate_cost):
+        reasons.append("path_cost")
+    if int(pose_cost) >= int(inscribed_cost):
+        reasons.append("pose_inscribed")
+    if str(obstacle_state) == "in_lethal":
+        reasons.append("in_lethal")
+    if str(obstacle_state) == "avoid" and float(reactive_avoid_for_s) >= 0.8:
+        reasons.append("reactive_avoid")
+    return reasons or ["unknown"]
+
+
+def backup_denial_reason(
+    *,
+    enabled: bool,
+    feasible: bool,
+    attempts_remaining: int,
+    cooldown_ready: bool,
+    has_scan: bool,
+    rear_clearance_m: Optional[float],
+    rear_clear_min_m: float,
+    reverse_footprint_ok: Optional[bool],
+) -> str:
+    """Why backup_feasible is false (empty string when feasible)."""
+    if feasible:
+        return ""
+    if not enabled:
+        return "disabled"
+    if int(attempts_remaining) <= 0:
+        return "attempts_exhausted"
+    if not cooldown_ready:
+        return "cooldown"
+    if not has_scan:
+        return "no_scan"
+    if rear_clearance_m is None:
+        return "no_rear"
+    if float(rear_clearance_m) < float(rear_clear_min_m):
+        return "rear_blocked"
+    if reverse_footprint_ok is False:
+        return "reverse_footprint"
+    return "unknown"
+
+
 def build_policy_state(
     ctx: LocalBlockContext, motion: Mapping[str, Any]
 ) -> Dict[str, Any]:
     """Compact JSON state for TypeSafe ``system_one``."""
+    stuck = {
+        k: motion[k]
+        for k in (
+            "progress_m",
+            "yaw_delta_rad",
+            "spinning_in_place",
+            "likely_peel_loop",
+        )
+        if k in motion
+    }
     state: Dict[str, Any] = {
         "task": "mobile_robot_local_navigation_block",
         "heuristic_action": ctx.heuristic_action,
@@ -191,10 +321,23 @@ def build_policy_state(
         "wait_before_replan_s": round(float(ctx.wait_before_replan_s), 3),
         "replan_cooldown_ready": bool(ctx.replan_cooldown_ready),
         "path_ahead_cost": int(ctx.path_ahead_cost),
+        "pose_cost": int(ctx.pose_cost),
+        "block_reasons": list(ctx.block_reasons) or ["unknown"],
         "obstacle_state": ctx.obstacle_state,
         "forward_clearance_m": round(float(ctx.forward_clearance_m), 3),
         "failed_replan_while_blocked": int(ctx.failed_replan_while_blocked),
-        "obstacle_motion": dict(motion),
+        "obstacle_motion": {
+            k: v
+            for k, v in dict(motion).items()
+            if k
+            not in (
+                "progress_m",
+                "yaw_delta_rad",
+                "spinning_in_place",
+                "likely_peel_loop",
+            )
+        },
+        "stuck": stuck,
         "actions": {
             ACTION_WAIT: (
                 "Stop briefly — blocker may be a person/mover that will clear"
@@ -213,19 +356,48 @@ def build_policy_state(
             ),
         },
         "efficiency_hint": (
-            "Prefer keep_dwa when the nose is clear or the gap may fit. "
-            "Prefer wait when obstacle_motion.likely_mover is true. "
-            "Prefer backup when jammed nose-on into a static block, rear is clear, "
+            "Prefer keep_dwa when the nose is clear or the gap may fit AND "
+            "stuck.likely_peel_loop is false. "
+            "Prefer wait when obstacle_motion.likely_mover is true, or when "
+            "stuck.spinning_in_place with backup not feasible. "
+            "Prefer backup when jammed nose-on / peel-looping, rear is clear, "
             "and backup_feasible is true — then replan from the new pose. "
             "Prefer replan when the block looks static and grace/cooldown elapsed, "
-            "or failed_replan_while_blocked is high — but avoid huge detours if "
-            "inching could clear a temporary pinch. Do not choose backup when "
-            "backup_feasible is false."
+            "or failed_replan_while_blocked is high — but if last_replan.attempts "
+            "all say still local-blocked, replan alone will not help: prefer "
+            "backup (if feasible) or wait, not keep_dwa thrash. "
+            "Do not choose backup when backup_feasible is false; see "
+            "backup.denial_reason. path_ahead_cost may be 0 while still blocked "
+            "via reactive_avoid / pose_inscribed — trust block_reasons."
         ),
         "backup": {
             "feasible": bool(ctx.backup_feasible),
             "attempts_remaining": int(ctx.backup_attempts_remaining),
             "cooldown_ready": bool(ctx.backup_cooldown_ready),
+            "denial_reason": str(ctx.backup_denial_reason or ""),
+        },
+        "motion_cmd": {
+            "vx_mps": (
+                round(float(ctx.cmd_vx_mps), 3)
+                if ctx.cmd_vx_mps is not None
+                else None
+            ),
+            "vtheta_rad_s": (
+                round(float(ctx.cmd_vtheta_rad_s), 3)
+                if ctx.cmd_vtheta_rad_s is not None
+                else None
+            ),
+            "bearing_error_rad": (
+                round(float(ctx.bearing_error_rad), 3)
+                if ctx.bearing_error_rad is not None
+                else None
+            ),
+            "local_planner_active": bool(ctx.local_planner_active),
+        },
+        "last_replan": {
+            "accepted": ctx.last_replan_accepted,
+            "error": str(ctx.last_replan_error or ""),
+            "attempts": list(ctx.last_replan_attempts)[:6],
         },
     }
     if ctx.remaining_path_m is not None:
@@ -236,6 +408,10 @@ def build_policy_state(
         state["nearest_bearing_rad"] = round(float(ctx.nearest_bearing_rad), 3)
     if ctx.rear_clearance_m is not None:
         state["rear_clearance_m"] = round(float(ctx.rear_clearance_m), 3)
+    if ctx.left_clearance_m is not None:
+        state["left_clearance_m"] = round(float(ctx.left_clearance_m), 3)
+    if ctx.right_clearance_m is not None:
+        state["right_clearance_m"] = round(float(ctx.right_clearance_m), 3)
     if ctx.pose_xy is not None:
         state["pose_xy"] = [round(ctx.pose_xy[0], 3), round(ctx.pose_xy[1], 3)]
     if ctx.goal_xy is not None:
@@ -251,13 +427,16 @@ def build_policy_questions() -> Dict[str, Any]:
         "action": Choice(
             instructions=(
                 "Given this robot's local navigation block, choose the single best "
-                "next action for efficiency and safety. Use obstacle_motion to judge "
-                "movers vs fixed obstacles. Prefer keep_dwa (inch/peel) over a long "
-                "replan when the nose is clear or a gap may fit. Prefer wait for "
-                "likely people/movers. Prefer backup when jammed into a static nose "
-                "block with backup.feasible true and rear clear. Prefer replan for "
-                "sustained static blocks when peeling/backup will not help. Never "
-                "choose backup when backup.feasible is false."
+                "next action for efficiency and safety. Use obstacle_motion for "
+                "movers vs fixed obstacles. Use stuck.likely_peel_loop / "
+                "spinning_in_place and last_replan.attempts to detect futile "
+                "peel/replan thrash. Prefer keep_dwa only when the nose/gap may "
+                "fit AND not peel-looping. Prefer wait for movers or when jammed "
+                "but backup is not feasible. Prefer backup when peel-looping or "
+                "nose-jammed with backup.feasible true. Prefer replan for static "
+                "blocks only when recent replan attempts did not all fail as "
+                "still local-blocked. Never choose backup when backup.feasible "
+                "is false. Trust block_reasons even if path_ahead_cost is 0."
             ),
             criteria={
                 ACTION_WAIT: "Stop and wait for a dynamic blocker to clear",
@@ -276,18 +455,24 @@ def build_policy_questions() -> Dict[str, Any]:
         "gap_worth_trying": Noul(
             instructions=(
                 "Is it worth inching/peeling forward to test whether the robot can "
-                "fit, instead of immediately taking a much longer global detour?"
+                "fit, instead of immediately taking a much longer global detour? "
+                "Answer low if stuck.likely_peel_loop is true or last_replan "
+                "attempts are all still local-blocked."
             )
         ),
         "should_backup": Noul(
             instructions=(
                 "Should the robot reverse a short distance to unstick before "
-                "replanning? Only yes if backup.feasible is true, the nose is "
-                "jammed on a likely-static block, and waiting/peeling looks futile."
+                "replanning? Only yes if backup.feasible is true, and the robot "
+                "is peel-looping / nose-jammed on a likely-static block."
             )
         ),
         "replan_urgency": Score(
-            instructions="How urgently should we replan globally?",
+            instructions=(
+                "How urgently should we replan globally? Score low when recent "
+                "replans already failed as still local-blocked (need backup/wait "
+                "first), high when a fresh corridor looks available."
+            ),
             criteria=["low", "medium", "high"],
         ),
     }
@@ -327,6 +512,8 @@ def map_jev_to_action(
     should_backup: Optional[float],
     heuristic_action: str,
     backup_feasible: bool = False,
+    likely_peel_loop: bool = False,
+    replan_looks_futile: bool = False,
 ) -> str:
     """Compose Choice + Nouls into a supervisor action (code remains in control)."""
     action = str(choice or "").strip().lower()
@@ -349,11 +536,26 @@ def map_jev_to_action(
             if heuristic_action in ACTIONS and heuristic_action != ACTION_BACKUP
             else ACTION_WAIT
         )
+    # Peel-loop / dead-corridor: don't keep inching; backup or wait.
+    if likely_peel_loop and action == ACTION_KEEP_DWA:
+        if backup_feasible:
+            return ACTION_BACKUP
+        return ACTION_WAIT
+    if (
+        replan_looks_futile
+        and action == ACTION_REPLAN
+        and (likely_peel_loop or backup_feasible)
+    ):
+        if backup_feasible:
+            return ACTION_BACKUP
+        return ACTION_WAIT
     if (
         gap_worth_trying is not None
         and gap_worth_trying >= 0.7
         and action == ACTION_REPLAN
         and heuristic_action == ACTION_KEEP_DWA
+        and not likely_peel_loop
+        and not replan_looks_futile
     ):
         return ACTION_KEEP_DWA
     return action if action in ACTIONS else heuristic_action
@@ -480,19 +682,53 @@ class JevNavPolicy:
 
     def decide(self, ctx: LocalBlockContext) -> PolicyDecision:
         """Return the action to apply; always logs both sides in shadow/jev."""
-        motion = obstacle_motion_features(list(self._history))
+        motion = {
+            **obstacle_motion_features(list(self._history)),
+            **stuck_progress_features(list(self._history)),
+        }
+        # Failed-replan attempts that stayed local-blocked ⇒ corridor is dead.
+        attempts = [str(a).lower() for a in ctx.last_replan_attempts]
+        replan_futile = bool(attempts) and all(
+            "still local-blocked" in a or "same route" in a for a in attempts
+        )
+        if ctx.failed_replan_while_blocked >= 1 and not ctx.last_replan_accepted:
+            replan_futile = True
+        likely_peel = bool(motion.get("likely_peel_loop"))
+        if replan_futile and (
+            motion.get("spinning_in_place")
+            or float(motion.get("progress_m") or 0.0) < 0.2
+        ):
+            likely_peel = True
+            motion["likely_peel_loop"] = True
         features = {
             **motion,
             "nose_clear": ctx.nose_clear,
             "blocked_for_s": round(float(ctx.blocked_for_s), 3),
             "path_ahead_cost": int(ctx.path_ahead_cost),
+            "pose_cost": int(ctx.pose_cost),
+            "block_reasons": list(ctx.block_reasons) or ["unknown"],
             "failed_replan_while_blocked": int(ctx.failed_replan_while_blocked),
             "forward_clearance_m": round(float(ctx.forward_clearance_m), 3),
             "replan_cooldown_ready": bool(ctx.replan_cooldown_ready),
             "backup_feasible": bool(ctx.backup_feasible),
+            "backup_denial_reason": str(ctx.backup_denial_reason or ""),
+            "replan_looks_futile": bool(replan_futile),
+            "local_planner_active": bool(ctx.local_planner_active),
         }
         if ctx.remaining_path_m is not None:
             features["remaining_path_m"] = round(float(ctx.remaining_path_m), 2)
+        if ctx.left_clearance_m is not None:
+            features["left_clearance_m"] = round(float(ctx.left_clearance_m), 3)
+        if ctx.right_clearance_m is not None:
+            features["right_clearance_m"] = round(float(ctx.right_clearance_m), 3)
+        if ctx.cmd_vx_mps is not None:
+            features["cmd_vx_mps"] = round(float(ctx.cmd_vx_mps), 3)
+        if ctx.cmd_vtheta_rad_s is not None:
+            features["cmd_vtheta_rad_s"] = round(float(ctx.cmd_vtheta_rad_s), 3)
+        if ctx.bearing_error_rad is not None:
+            features["bearing_error_rad"] = round(float(ctx.bearing_error_rad), 3)
+        if ctx.last_replan_attempts:
+            features["last_replan_attempts"] = list(ctx.last_replan_attempts)[:6]
 
         if self.mode == NAV_POLICY_HEURISTIC:
             decision = PolicyDecision(
@@ -561,6 +797,8 @@ class JevNavPolicy:
                 else None,
                 heuristic_action=ctx.heuristic_action,
                 backup_feasible=bool(ctx.backup_feasible),
+                likely_peel_loop=bool(likely_peel),
+                replan_looks_futile=bool(replan_futile),
             )
             fallback = ""
             if self.mode == NAV_POLICY_SHADOW:
