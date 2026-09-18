@@ -1593,6 +1593,8 @@ class NavSupervisor:
                             "path_cost_ahead",
                             "failed_replan_while_blocked",
                             "last_replan_error",
+                            "last_replan_trigger",
+                            "last_replan_info",
                             "nose_clear",
                             "spin_blocked",
                             "local_replan_cooldown_s",
@@ -1602,6 +1604,7 @@ class NavSupervisor:
                             "bearing_error_rad",
                             "distance_remaining_m",
                             "waypoint_index",
+                            "jev_policy",
                         )
                         if k in progress
                     },
