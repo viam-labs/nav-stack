@@ -515,6 +515,18 @@ class BuiltinNavConfig:
     # Cooldown begins when a blocking plan finishes. Give the local planner
     # time to execute the peel instead of stop/replanning every control tick.
     replan_local_min_period_s: float = 4.0
+    # Optional TypeSafe/Jev overlay on local-block decisions (wait / peel / replan).
+    # ``heuristic`` (default): existing rules only.
+    # ``shadow``: call Jev, log both, execute heuristic.
+    # ``jev``: call Jev; use its action when confidence is high enough.
+    nav_policy: str = "heuristic"
+    jev_min_confidence: float = 0.45
+    jev_timeout_s: float = 1.25
+    jev_min_period_s: float = 1.0
+    jev_history_s: float = 3.0
+    jev_model: str = "jev-latest"
+    # Optional; defaults to env TYPESAFE_API_KEY.
+    jev_api_key: Optional[str] = None
     # Command slew limits (the base has no onboard ramp). Requests to stop
     # translating are never slewed, so stop distances are unaffected.
     max_linear_accel_mps2: float = 0.8
@@ -539,6 +551,17 @@ class BuiltinNavConfig:
             overrides["local_costmap_rate_hz"] = _positive_hz(
                 d["local_costmap_rate_hz"], "local_costmap_rate_hz"
             )
+        if "nav_policy" in d:
+            name = str(d.get("nav_policy") or "heuristic").strip().lower()
+            if name in ("typesafe", "ai"):
+                name = "jev"
+            if name not in ("heuristic", "shadow", "jev"):
+                raise ValueError(
+                    "builtin.nav_policy must be one of "
+                    "['heuristic', 'shadow', 'jev']; "
+                    f"got {d.get('nav_policy')!r}"
+                )
+            overrides["nav_policy"] = name
         return _dataclass_from_dict(cls, d, overrides=overrides)
 
 

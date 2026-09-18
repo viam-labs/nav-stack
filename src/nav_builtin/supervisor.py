@@ -29,6 +29,13 @@ from .local_costmap import (
     footprint_max_cost,
     reverse_backup_feasible,
 )
+from .jev_policy import (
+    JevNavPolicy,
+    LocalBlockContext,
+    ObstacleSample,
+    nearest_scan_obstacle,
+    normalize_nav_policy,
+)
 from .local_planner import LocalPlannerConfig
 from .planner import (
     path_blocked,
@@ -101,6 +108,13 @@ class NavSupervisor:
         recovery_wait_duration_s = kw["recovery_wait_duration_s"]
         replan_local_blocked_time_s = kw["replan_local_blocked_time_s"]
         replan_local_min_period_s = kw["replan_local_min_period_s"]
+        nav_policy = kw.get("nav_policy", "heuristic")
+        jev_min_confidence = kw.get("jev_min_confidence", 0.45)
+        jev_timeout_s = kw.get("jev_timeout_s", 1.25)
+        jev_min_period_s = kw.get("jev_min_period_s", 1.0)
+        jev_history_s = kw.get("jev_history_s", 3.0)
+        jev_model = kw.get("jev_model", "jev-latest")
+        jev_api_key = kw.get("jev_api_key")
         drive_timeout_streak = kw["drive_timeout_streak"]
         yaw_align_timeout_s = kw["yaw_align_timeout_s"]
         max_goal_snap_m = kw["max_goal_snap_m"]
@@ -158,6 +172,17 @@ class NavSupervisor:
         self._replan_local_blocked_time_s = max(0.0, float(replan_local_blocked_time_s))
         self._replan_local_min_period_s = max(
             1.0, float(replan_local_min_period_s)
+        )
+        _world_log = getattr(self._world, "log", None)
+        self._jev_policy = JevNavPolicy(
+            mode=normalize_nav_policy(nav_policy),
+            min_confidence=float(jev_min_confidence),
+            timeout_s=float(jev_timeout_s),
+            min_period_s=float(jev_min_period_s),
+            history_s=float(jev_history_s),
+            model=str(jev_model or "jev-latest"),
+            api_key=str(jev_api_key) if jev_api_key else None,
+            logger=_world_log if callable(_world_log) else None,
         )
         self._local_planner_activate_cost = local_planner_activate_cost
         self._local_costmap = (
@@ -1094,12 +1119,67 @@ class NavSupervisor:
                     cooldown_ready = (
                         now - last_local_replan_at >= self._replan_local_min_period_s
                     )
-                    action = self._local_block_action(
+                    heuristic_action = self._local_block_action(
                         nose_clear=nose_clear,
                         blocked_for_s=blocked_for,
                         wait_before_replan_s=wait_before_replan_s,
                         replan_cooldown_ready=cooldown_ready,
                     )
+                    fwd_clear = (
+                        forward_clearance_m(scan, obs_cfg)
+                        if (
+                            scan is not None
+                            and obs_cfg is not None
+                            and obs_cfg.enabled
+                        )
+                        else float("inf")
+                    )
+                    near_r, near_b = nearest_scan_obstacle(scan)
+                    self._jev_policy.record_obstacle(
+                        ObstacleSample(
+                            t=now,
+                            nose_clear=nose_clear,
+                            forward_clearance_m=float(fwd_clear)
+                            if math.isfinite(fwd_clear)
+                            else 99.0,
+                            path_ahead_cost=int(path_ahead_cost),
+                            obstacle_state=str(last_obstacle_state or ""),
+                            nearest_range_m=near_r,
+                            nearest_bearing_rad=near_b,
+                        )
+                    )
+                    remaining_m = None
+                    try:
+                        from .controller import _path_length
+                        from .path_utils import closest_point_on_path
+
+                        _, _, _, along = closest_point_on_path(pose, path)
+                        remaining_m = max(0.0, _path_length(path) - along)
+                    except Exception:  # noqa: BLE001
+                        remaining_m = None
+                    policy = self._jev_policy.decide(
+                        LocalBlockContext(
+                            heuristic_action=heuristic_action,
+                            nose_clear=nose_clear,
+                            blocked_for_s=blocked_for,
+                            wait_before_replan_s=wait_before_replan_s,
+                            replan_cooldown_ready=cooldown_ready,
+                            path_ahead_cost=int(path_ahead_cost),
+                            obstacle_state=str(last_obstacle_state or ""),
+                            forward_clearance_m=float(fwd_clear)
+                            if math.isfinite(fwd_clear)
+                            else 99.0,
+                            failed_replan_while_blocked=int(
+                                failed_replan_while_blocked
+                            ),
+                            remaining_path_m=remaining_m,
+                            nearest_range_m=near_r,
+                            nearest_bearing_rad=near_b,
+                            pose_xy=(float(pose.x), float(pose.y)),
+                            goal_xy=(float(goal.x), float(goal.y)),
+                        )
+                    )
+                    action = policy.applied_action
                     if action == "wait":
                         waiting_for_clear = True
                     elif action == "replan":
@@ -1130,6 +1210,7 @@ class NavSupervisor:
                             path = new_path
                             local_blocked_since = None
                             failed_replan_while_blocked = 0
+                            self._jev_policy.clear_history()
                             backup_attempts = 0
                             vx_sign_history.clear()
                             spin_stuck_since = None
@@ -1144,6 +1225,7 @@ class NavSupervisor:
                 else:
                     local_blocked_since = None
                     failed_replan_while_blocked = 0
+                    self._jev_policy.clear_history()
 
                 # Keep DWA available when the path is blocked but the nose is
                 # clear (or after a failed detour) — otherwise we only spin in
@@ -1201,6 +1283,14 @@ class NavSupervisor:
                     "last_replan_trigger": self._last_replan_trigger,
                     "last_replan_info": dict(self._last_replan_info),
                     "nose_clear": bool(nose_clear),
+                    "jev_policy": (
+                        self._jev_policy.last_decision.to_dict()
+                        if self._jev_policy.last_decision is not None
+                        else {
+                            "mode": self._jev_policy.mode,
+                            "queried": False,
+                        }
+                    ),
                     "local_replan_cooldown_s": round(
                         max(
                             0.0,

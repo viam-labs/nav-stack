@@ -230,11 +230,18 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
     "yaw_goal_tolerance": 0.35,
     "nav_backend": "builtin",
     "builtin": {
-      "replan_period_s": 1.0
+      "replan_period_s": 1.0,
+      "nav_policy": "heuristic"
     }
   }
 }
 ```
+
+Optional TypeSafe/Jev overlay on local-block wait/peel/replan decisions:
+`builtin.nav_policy` = `heuristic` (default) | `shadow` | `jev`. Use `shadow` on
+a real robot first (logs both sides, still runs heuristics). Requires
+`TYPESAFE_API_KEY` or `builtin.jev_api_key`. See
+[`docs/navigation-docommands.md`](docs/navigation-docommands.md) “Optional Jev local-block policy”.
 
 #### MoveOnMap (Motion API)
 

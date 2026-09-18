@@ -220,6 +220,41 @@ await nav.do_command({"command": "cancel"})
 
 ---
 
+## Optional Jev local-block policy
+
+When the builtin follower sees a **local path block**, it normally chooses among `wait` / `keep_dwa` (inch/peel) / `replan` with fixed heuristics. You can overlay [TypeSafe Jev](https://docs.typesafe.ai/introduction) as an experimental advisor.
+
+Configure under the navigation service `builtin` block (or top-level aliases where applicable):
+
+| Attribute | Default | Notes |
+|---|---|---|
+| `nav_policy` | `heuristic` | `heuristic` \| `shadow` \| `jev` |
+| `jev_min_confidence` | `0.45` | In `jev` mode, fall back to heuristic below this |
+| `jev_timeout_s` | `1.25` | Per TypeSafe call |
+| `jev_min_period_s` | `1.0` | Min seconds between Jev queries |
+| `jev_history_s` | `3.0` | Obstacle-track window for mover-vs-fixed features |
+| `jev_model` | `jev-latest` | TypeSafe model id |
+| `jev_api_key` | _(env)_ | Or set `TYPESAFE_API_KEY` on the machine |
+
+**Modes**
+
+- `heuristic` — unchanged behavior; no TypeSafe calls.
+- `shadow` — call Jev on local blocks, **always log** heuristic vs Jev, still **execute heuristic** (safe for robot trials).
+- `jev` — execute Jev’s mapped action when confidence is high enough; otherwise heuristic. Always logs both.
+
+`get_status` → `progress.jev_policy` (while navigating) includes `heuristic_action`, `jev_action`, `applied_action`, `confidence`, `features` (incl. `motion_score` / `likely_mover`), and answer snippets.
+
+**Robot trial (recommended order)**
+
+1. `pip install typesafe-sdk` (already in `requirements.txt`); export `TYPESAFE_API_KEY`.
+2. Set `"nav_policy": "shadow"` on the nav service; restart the module.
+3. Drive into a person-crossing and a fixed-box corridor; watch module logs for `jev_policy {...}` and compare `heuristic_action` vs `jev_action`.
+4. Only then try `"nav_policy": "jev"` on a supervised run.
+
+Hard stops (lethal footprint, cancel) stay rule-based — Jev only advises the wait/peel/replan fork.
+
+---
+
 ## Simple closed-loop go-to
 
 Direct map-frame approach without full builtin planning (useful for short hops / docks). Cancels any prior simple-nav and builtin goal first.

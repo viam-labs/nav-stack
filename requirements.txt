@@ -5,3 +5,5 @@ PyYAML>=6.0
 # Pillow renders the nav-camera occupancy/plan overlay to PNG.
 Pillow>=10.0
 pyserial>=3.5
+# Optional TypeSafe/Jev overlay (builtin.nav_policy = shadow|jev).
+typesafe-sdk>=0.7.0
