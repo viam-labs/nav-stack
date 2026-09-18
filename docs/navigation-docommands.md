@@ -242,9 +242,9 @@ Configure under the navigation service `builtin` block (or top-level aliases whe
 - `shadow` — call Jev on local blocks, **always log** heuristic vs Jev, still **execute heuristic** (safe for robot trials).
 - `jev` — execute Jev’s mapped action when confidence is high enough; otherwise heuristic. Always logs both. Actions: `wait` / `keep_dwa` / `replan` / `backup`.
 
-`get_status` → `progress.jev_policy` (while navigating) includes `heuristic_action`, `jev_action`, `applied_action`, `confidence`, `features` (incl. `motion_score` / `likely_mover` / `likely_peel_loop` / `block_reasons` / `replan_looks_futile`), and answer snippets.
+`get_status` → `progress.jev_policy` (while navigating) includes `heuristic_action`, `jev_action`, `applied_action`, `confidence`, `features` (incl. `motion_score` / `likely_mover` / `block_reasons` / `recent_actions`), and answer snippets.
 
-State sent to Jev also includes `block_reasons`, `stuck` (progress/yaw while blocked), `motion_cmd` (last vx/vθ/bearing), flank + rear clearances, `backup.denial_reason`, and `last_replan.attempts` so peel-loops / dead corridors are visible.
+Jev is the decider: the state it receives is **facts only** (clearances front/left/right/rear, obstacle motion history, robot displacement + yaw over the recent window, which action the controller has actually been applying and for how long, replan attempt outcomes + age, `backup.denial_reason`). Code applies only hard safety gates — an infeasible `backup` falls back to heuristic, and the follower's reactive stop always wins. A reused (rate-limited) answer is discarded and Jev re-queried as soon as the situation fingerprint changes (nose clears, backup becomes feasible, replan outcome changes).
 
 **Robot trial (recommended order)**
 

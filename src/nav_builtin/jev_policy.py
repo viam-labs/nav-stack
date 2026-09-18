@@ -98,6 +98,8 @@ class LocalBlockContext:
     last_replan_attempts: Sequence[str] = ()
     last_replan_error: str = ""
     pose_theta: Optional[float] = None
+    # Age of the last replan attempt (None = none this block).
+    last_replan_age_s: Optional[float] = None
 
 
 @dataclass
@@ -207,12 +209,14 @@ def _wrap_pi(rad: float) -> float:
 def stuck_progress_features(
     history: Sequence[ObstacleSample], *, window_s: float = 3.0
 ) -> Dict[str, Any]:
-    """Meters advanced + yaw churn while blocked — peel-loop detector."""
+    """Raw motion facts while blocked: meters advanced and yaw change.
+
+    No verdicts — Jev decides what "stuck" means given what we were doing.
+    """
     empty = {
         "progress_m": 0.0,
         "yaw_delta_rad": 0.0,
-        "spinning_in_place": False,
-        "likely_peel_loop": False,
+        "window_s": 0.0,
     }
     if not history:
         return empty
@@ -233,16 +237,10 @@ def stuck_progress_features(
     yaw_delta = 0.0
     if first.pose_theta is not None and last.pose_theta is not None:
         yaw_delta = abs(_wrap_pi(float(last.pose_theta) - float(first.pose_theta)))
-    dwell_s = max(0.0, last.t - first.t)
-    spinning = progress_m < 0.15 and yaw_delta >= 0.45 and dwell_s >= 1.0
-    peel_loop = spinning or (
-        progress_m < 0.25 and yaw_delta >= 0.7 and dwell_s >= 1.5
-    )
     return {
         "progress_m": round(progress_m, 3),
         "yaw_delta_rad": round(yaw_delta, 3),
-        "spinning_in_place": bool(spinning),
-        "likely_peel_loop": bool(peel_loop),
+        "window_s": round(max(0.0, last.t - first.t), 3),
     }
 
 
@@ -300,19 +298,17 @@ def backup_denial_reason(
 
 
 def build_policy_state(
-    ctx: LocalBlockContext, motion: Mapping[str, Any]
+    ctx: LocalBlockContext,
+    motion: Mapping[str, Any],
+    *,
+    recent_actions: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Compact JSON state for TypeSafe ``system_one``."""
-    stuck = {
-        k: motion[k]
-        for k in (
-            "progress_m",
-            "yaw_delta_rad",
-            "spinning_in_place",
-            "likely_peel_loop",
-        )
-        if k in motion
-    }
+    """Compact JSON state for TypeSafe ``system_one``.
+
+    Facts only. No "prefer X when Y" hints — Jev is the decider; code keeps
+    just the hard safety gates (see ``map_jev_to_action``).
+    """
+    stuck_keys = ("progress_m", "yaw_delta_rad", "window_s")
     state: Dict[str, Any] = {
         "task": "mobile_robot_local_navigation_block",
         "heuristic_action": ctx.heuristic_action,
@@ -327,49 +323,33 @@ def build_policy_state(
         "forward_clearance_m": round(float(ctx.forward_clearance_m), 3),
         "failed_replan_while_blocked": int(ctx.failed_replan_while_blocked),
         "obstacle_motion": {
-            k: v
-            for k, v in dict(motion).items()
-            if k
-            not in (
-                "progress_m",
-                "yaw_delta_rad",
-                "spinning_in_place",
-                "likely_peel_loop",
-            )
+            k: v for k, v in dict(motion).items() if k not in stuck_keys
         },
-        "stuck": stuck,
+        # Robot displacement / yaw over the recent window. Read alongside
+        # recent_actions: zero progress while waiting is expected, zero
+        # progress while keep_dwa means peeling is not working.
+        "motion_while_blocked": {k: motion[k] for k in stuck_keys if k in motion},
+        "recent_actions": dict(recent_actions or {}),
         "actions": {
             ACTION_WAIT: (
-                "Stop briefly — blocker may be a person/mover that will clear"
+                "Stop translating (rotate-to-heading still allowed). Costs time; "
+                "only helps if the blocker moves away."
             ),
             ACTION_KEEP_DWA: (
-                "Inch/peel forward with the local planner — gap may be passable; "
-                "avoid a long global detour"
+                "Keep the current global path and let the local planner "
+                "inch/peel around the block. Cheap if a gap exists; makes no "
+                "progress if the corridor is truly sealed."
             ),
             ACTION_REPLAN: (
-                "Commit to a new global path — static block or sustained failure; "
-                "detour may be longer but progress resumes"
+                "Plan a new global path from the current pose with the block "
+                "painted in. The detour may be longer; recent attempt outcomes "
+                "are in last_replan."
             ),
             ACTION_BACKUP: (
-                "Reverse a short distance to free the footprint, then replan — "
-                "use when nose is jammed / spinning in place and rear is clear"
+                "Reverse a short distance, then replan from the new pose. Only "
+                "executable when backup.feasible is true."
             ),
         },
-        "efficiency_hint": (
-            "Prefer keep_dwa when the nose is clear or the gap may fit AND "
-            "stuck.likely_peel_loop is false. "
-            "Prefer wait when obstacle_motion.likely_mover is true, or when "
-            "stuck.spinning_in_place with backup not feasible. "
-            "Prefer backup when jammed nose-on / peel-looping, rear is clear, "
-            "and backup_feasible is true — then replan from the new pose. "
-            "Prefer replan when the block looks static and grace/cooldown elapsed, "
-            "or failed_replan_while_blocked is high — but if last_replan.attempts "
-            "all say still local-blocked, replan alone will not help: prefer "
-            "backup (if feasible) or wait, not keep_dwa thrash. "
-            "Do not choose backup when backup_feasible is false; see "
-            "backup.denial_reason. path_ahead_cost may be 0 while still blocked "
-            "via reactive_avoid / pose_inscribed — trust block_reasons."
-        ),
         "backup": {
             "feasible": bool(ctx.backup_feasible),
             "attempts_remaining": int(ctx.backup_attempts_remaining),
@@ -398,6 +378,11 @@ def build_policy_state(
             "accepted": ctx.last_replan_accepted,
             "error": str(ctx.last_replan_error or ""),
             "attempts": list(ctx.last_replan_attempts)[:6],
+            "age_s": (
+                round(float(ctx.last_replan_age_s), 1)
+                if ctx.last_replan_age_s is not None
+                else None
+            ),
         },
     }
     if ctx.remaining_path_m is not None:
@@ -426,52 +411,48 @@ def build_policy_questions() -> Dict[str, Any]:
     return {
         "action": Choice(
             instructions=(
-                "Given this robot's local navigation block, choose the single best "
-                "next action for efficiency and safety. Use obstacle_motion for "
-                "movers vs fixed obstacles. Use stuck.likely_peel_loop / "
-                "spinning_in_place and last_replan.attempts to detect futile "
-                "peel/replan thrash. Prefer keep_dwa only when the nose/gap may "
-                "fit AND not peel-looping. Prefer wait for movers or when jammed "
-                "but backup is not feasible. Prefer backup when peel-looping or "
-                "nose-jammed with backup.feasible true. Prefer replan for static "
-                "blocks only when recent replan attempts did not all fail as "
-                "still local-blocked. Never choose backup when backup.feasible "
-                "is false. Trust block_reasons even if path_ahead_cost is 0."
+                "A mobile robot following a planned path is locally blocked. "
+                "Choose the single next action that gets it to the goal soonest "
+                "without collision. The state gives obstacle clearances, obstacle "
+                "motion history, robot displacement over the recent window, which "
+                "actions the controller has already been applying and for how "
+                "long (recent_actions), and the outcomes of recent global replan "
+                "attempts (last_replan). backup is only executable when "
+                "backup.feasible is true. Weigh each action by whether it is "
+                "likely to change the situation given what has already been tried."
             ),
             criteria={
-                ACTION_WAIT: "Stop and wait for a dynamic blocker to clear",
-                ACTION_KEEP_DWA: "Keep short path; peel/inch with local planner",
-                ACTION_REPLAN: "Escalate to a new global path (may be longer)",
-                ACTION_BACKUP: "Reverse briefly (rear clear) then replan",
+                ACTION_WAIT: "Stop and hold position",
+                ACTION_KEEP_DWA: "Keep the path; local planner peels/inches",
+                ACTION_REPLAN: "Compute a new global path from here",
+                ACTION_BACKUP: "Reverse briefly, then replan",
             },
         ),
         "temporary_mover": Noul(
             instructions=(
                 "Is the blocker likely a temporary mover (person, cart) rather than "
                 "a fixed obstacle? Use obstacle_motion.motion_score, range_delta_m, "
-                "and bearing_span_rad."
+                "bearing_span_rad, and how long the block has lasted."
             )
         ),
         "gap_worth_trying": Noul(
             instructions=(
-                "Is it worth inching/peeling forward to test whether the robot can "
-                "fit, instead of immediately taking a much longer global detour? "
-                "Answer low if stuck.likely_peel_loop is true or last_replan "
-                "attempts are all still local-blocked."
+                "Is it plausible the robot can inch/peel through or around the "
+                "block from here, given forward/left/right clearances and what "
+                "keep_dwa has achieved so far (recent_actions, motion_while_blocked)?"
             )
         ),
         "should_backup": Noul(
             instructions=(
-                "Should the robot reverse a short distance to unstick before "
-                "replanning? Only yes if backup.feasible is true, and the robot "
-                "is peel-looping / nose-jammed on a likely-static block."
+                "Would reversing a short distance and replanning from there "
+                "likely open a path that is not available from the current pose? "
+                "Only meaningful when backup.feasible is true."
             )
         ),
         "replan_urgency": Score(
             instructions=(
-                "How urgently should we replan globally? Score low when recent "
-                "replans already failed as still local-blocked (need backup/wait "
-                "first), high when a fresh corridor looks available."
+                "How likely is a fresh global replan from the current pose to "
+                "find a usable path, given last_replan outcomes and their age?"
             ),
             criteria=["low", "medium", "high"],
         ),
@@ -507,28 +488,20 @@ def _answers_to_dict(result: Any) -> Dict[str, Any]:
 def map_jev_to_action(
     *,
     choice: Optional[str],
-    temporary_mover: Optional[float],
-    gap_worth_trying: Optional[float],
-    should_backup: Optional[float],
     heuristic_action: str,
     backup_feasible: bool = False,
-    likely_peel_loop: bool = False,
-    replan_looks_futile: bool = False,
+    **_ignored: Any,
 ) -> str:
-    """Compose Choice + Nouls into a supervisor action (code remains in control)."""
+    """Turn Jev's Choice into a supervisor action.
+
+    Jev decides. Code applies only hard safety gates:
+    - unknown choice → heuristic
+    - ``backup`` when reverse is not physically feasible → heuristic (or wait)
+    Reactive stops in the follower always win regardless of this mapping.
+    """
     action = str(choice or "").strip().lower()
     if action not in ACTIONS:
-        action = heuristic_action
-    # Soft overrides when Choice is weakly aligned with physics cues.
-    if temporary_mover is not None and temporary_mover >= 0.7 and action == ACTION_REPLAN:
-        return ACTION_WAIT
-    if (
-        should_backup is not None
-        and should_backup >= 0.7
-        and backup_feasible
-        and action in (ACTION_REPLAN, ACTION_KEEP_DWA, ACTION_WAIT)
-    ):
-        return ACTION_BACKUP
+        return heuristic_action if heuristic_action in ACTIONS else ACTION_WAIT
     if action == ACTION_BACKUP and not backup_feasible:
         # Never reverse into unknown rear space.
         return (
@@ -536,29 +509,7 @@ def map_jev_to_action(
             if heuristic_action in ACTIONS and heuristic_action != ACTION_BACKUP
             else ACTION_WAIT
         )
-    # Peel-loop / dead-corridor: don't keep inching; backup or wait.
-    if likely_peel_loop and action == ACTION_KEEP_DWA:
-        if backup_feasible:
-            return ACTION_BACKUP
-        return ACTION_WAIT
-    if (
-        replan_looks_futile
-        and action == ACTION_REPLAN
-        and (likely_peel_loop or backup_feasible)
-    ):
-        if backup_feasible:
-            return ACTION_BACKUP
-        return ACTION_WAIT
-    if (
-        gap_worth_trying is not None
-        and gap_worth_trying >= 0.7
-        and action == ACTION_REPLAN
-        and heuristic_action == ACTION_KEEP_DWA
-        and not likely_peel_loop
-        and not replan_looks_futile
-    ):
-        return ACTION_KEEP_DWA
-    return action if action in ACTIONS else heuristic_action
+    return action
 
 
 QueryFn = Callable[[Mapping[str, Any], Mapping[str, Any]], Any]
@@ -596,6 +547,9 @@ class JevNavPolicy:
         self._decision_log: Deque[Dict[str, Any]] = deque(maxlen=256)
         self._decision_seq = 0
         self._run_id = 0
+        # What we have actually been applying during this block (facts for Jev).
+        self._applied_history: Deque[tuple[float, str]] = deque(maxlen=400)
+        self._last_state_key: Optional[tuple] = None
 
     def _emit(self, msg: str) -> None:
         if self._log is not None:
@@ -614,6 +568,8 @@ class JevNavPolicy:
 
     def clear_history(self) -> None:
         self._history.clear()
+        self._applied_history.clear()
+        self._last_state_key = None
 
     def start_run(self) -> int:
         """Begin a new navigate run; clears the decision timeline for the UI."""
@@ -623,6 +579,48 @@ class JevNavPolicy:
         self._last_decision = None
         self.clear_history()
         return self._run_id
+
+    def _record_applied(self, t: float, action: str) -> None:
+        self._applied_history.append((t, action))
+        cutoff = t - max(self.history_s, 10.0)
+        while self._applied_history and self._applied_history[0][0] < cutoff:
+            self._applied_history.popleft()
+
+    def _recent_actions(self, now: float) -> Dict[str, Any]:
+        """Facts about what the controller has been doing during this block."""
+        if not self._applied_history:
+            return {"current": None, "current_for_s": 0.0, "time_share_s": {}}
+        current = self._applied_history[-1][1]
+        current_since = self._applied_history[-1][0]
+        for t, a in reversed(self._applied_history):
+            if a != current:
+                break
+            current_since = t
+        share: Dict[str, float] = {}
+        prev_t: Optional[float] = None
+        prev_a: Optional[str] = None
+        for t, a in self._applied_history:
+            if prev_t is not None and prev_a is not None:
+                share[prev_a] = share.get(prev_a, 0.0) + max(0.0, t - prev_t)
+            prev_t, prev_a = t, a
+        if prev_t is not None and prev_a is not None:
+            share[prev_a] = share.get(prev_a, 0.0) + max(0.0, now - prev_t)
+        return {
+            "current": current,
+            "current_for_s": round(max(0.0, now - current_since), 2),
+            "time_share_s": {k: round(v, 2) for k, v in share.items()},
+        }
+
+    @staticmethod
+    def _state_key(ctx: LocalBlockContext) -> tuple:
+        """Coarse situation fingerprint; a change invalidates a reused answer."""
+        return (
+            bool(ctx.nose_clear),
+            bool(ctx.backup_feasible),
+            tuple(ctx.block_reasons),
+            int(ctx.failed_replan_while_blocked),
+            ctx.last_replan_accepted is not None,
+        )
 
     def clear_decision_log(self) -> None:
         self._decision_log.clear()
@@ -682,24 +680,12 @@ class JevNavPolicy:
 
     def decide(self, ctx: LocalBlockContext) -> PolicyDecision:
         """Return the action to apply; always logs both sides in shadow/jev."""
+        now = time.monotonic()
         motion = {
             **obstacle_motion_features(list(self._history)),
             **stuck_progress_features(list(self._history)),
         }
-        # Failed-replan attempts that stayed local-blocked ⇒ corridor is dead.
-        attempts = [str(a).lower() for a in ctx.last_replan_attempts]
-        replan_futile = bool(attempts) and all(
-            "still local-blocked" in a or "same route" in a for a in attempts
-        )
-        if ctx.failed_replan_while_blocked >= 1 and not ctx.last_replan_accepted:
-            replan_futile = True
-        likely_peel = bool(motion.get("likely_peel_loop"))
-        if replan_futile and (
-            motion.get("spinning_in_place")
-            or float(motion.get("progress_m") or 0.0) < 0.2
-        ):
-            likely_peel = True
-            motion["likely_peel_loop"] = True
+        recent = self._recent_actions(now)
         features = {
             **motion,
             "nose_clear": ctx.nose_clear,
@@ -712,8 +698,8 @@ class JevNavPolicy:
             "replan_cooldown_ready": bool(ctx.replan_cooldown_ready),
             "backup_feasible": bool(ctx.backup_feasible),
             "backup_denial_reason": str(ctx.backup_denial_reason or ""),
-            "replan_looks_futile": bool(replan_futile),
             "local_planner_active": bool(ctx.local_planner_active),
+            "recent_actions": recent,
         }
         if ctx.remaining_path_m is not None:
             features["remaining_path_m"] = round(float(ctx.remaining_path_m), 2)
@@ -729,6 +715,8 @@ class JevNavPolicy:
             features["bearing_error_rad"] = round(float(ctx.bearing_error_rad), 3)
         if ctx.last_replan_attempts:
             features["last_replan_attempts"] = list(ctx.last_replan_attempts)[:6]
+        if ctx.last_replan_age_s is not None:
+            features["last_replan_age_s"] = round(float(ctx.last_replan_age_s), 1)
 
         if self.mode == NAV_POLICY_HEURISTIC:
             decision = PolicyDecision(
@@ -738,10 +726,18 @@ class JevNavPolicy:
                 features=features,
             )
             self._last_decision = decision
+            self._record_applied(now, decision.applied_action)
             return decision
 
-        now = time.monotonic()
-        if self.min_period_s > 0 and (now - self._last_query_at) < self.min_period_s:
+        state_key = self._state_key(ctx)
+        situation_changed = (
+            self._last_state_key is not None and state_key != self._last_state_key
+        )
+        rate_limited = (
+            self.min_period_s > 0
+            and (now - self._last_query_at) < self.min_period_s
+        )
+        if rate_limited and not situation_changed:
             # Reuse last Jev suggestion if still fresh; else heuristic.
             prev = self._last_decision
             reused = prev.jev_action if prev and prev.jev_action else None
@@ -771,36 +767,28 @@ class JevNavPolicy:
                 answers=dict(prev.answers) if prev else {},
             )
             self._last_decision = decision
+            self._record_applied(now, decision.applied_action)
             self._append_decision_log(ctx, decision)
             self._emit(f"jev_policy {decision.to_dict()}")
             return decision
 
-        state = build_policy_state(ctx, motion)
+        state = build_policy_state(ctx, motion, recent_actions=recent)
         t0 = time.monotonic()
         try:
             result = self._query(state)
             latency = time.monotonic() - t0
             self._last_query_at = time.monotonic()
+            self._last_state_key = state_key
             answers = _answers_to_dict(result)
             choice_ans = answers.get("action") or {}
             jev_choice = choice_ans.get("choice")
             confidence = choice_ans.get("confidence")
-            mover = (answers.get("temporary_mover") or {}).get("noul")
-            gap = (answers.get("gap_worth_trying") or {}).get("noul")
-            should_backup = (answers.get("should_backup") or {}).get("noul")
             mapped = map_jev_to_action(
                 choice=str(jev_choice) if jev_choice is not None else None,
-                temporary_mover=float(mover) if mover is not None else None,
-                gap_worth_trying=float(gap) if gap is not None else None,
-                should_backup=float(should_backup)
-                if should_backup is not None
-                else None,
                 heuristic_action=ctx.heuristic_action,
                 backup_feasible=bool(ctx.backup_feasible),
-                likely_peel_loop=bool(likely_peel),
-                replan_looks_futile=bool(replan_futile),
             )
-            fallback = ""
+            fallback = "" if not situation_changed else "requeried_state_change"
             if self.mode == NAV_POLICY_SHADOW:
                 applied = ctx.heuristic_action
                 fallback = "shadow"
@@ -836,6 +824,7 @@ class JevNavPolicy:
                 error=str(exc),
             )
         self._last_decision = decision
+        self._record_applied(now, decision.applied_action)
         self._append_decision_log(ctx, decision)
         self._emit(f"jev_policy {decision.to_dict()}")
         return decision

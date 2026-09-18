@@ -1255,6 +1255,11 @@ class NavSupervisor:
                         reverse_footprint_ok=reverse_ok,
                     )
                     replan_info = dict(self._last_replan_info or {})
+                    replan_age: Optional[float] = (
+                        max(0.0, now - last_local_replan_at)
+                        if last_local_replan_at > 0.0 and replan_info
+                        else None
+                    )
                     policy = self._jev_policy.decide(
                         LocalBlockContext(
                             heuristic_action=heuristic_action,
@@ -1299,6 +1304,7 @@ class NavSupervisor:
                                 replan_info.get("attempts") or []
                             ),
                             last_replan_error=str(self._last_replan_error or ""),
+                            last_replan_age_s=replan_age,
                             pose_theta=float(pose.theta),
                         )
                     )

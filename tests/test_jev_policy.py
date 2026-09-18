@@ -64,74 +64,44 @@ def test_obstacle_motion_features_mover_vs_fixed():
     assert f["likely_mover"] is False
 
 
-def test_map_jev_soft_overrides():
+def test_map_jev_safety_gates_only():
+    # Jev's choice is applied as-is...
     assert (
         map_jev_to_action(
-            choice=ACTION_REPLAN,
-            temporary_mover=0.9,
-            gap_worth_trying=0.1,
-            should_backup=0.1,
-            heuristic_action=ACTION_WAIT,
-        )
-        == ACTION_WAIT
-    )
-    assert (
-        map_jev_to_action(
-            choice=ACTION_REPLAN,
-            temporary_mover=0.1,
-            gap_worth_trying=0.9,
-            should_backup=0.1,
-            heuristic_action=ACTION_KEEP_DWA,
+            choice=ACTION_KEEP_DWA,
+            heuristic_action=ACTION_REPLAN,
+            backup_feasible=False,
         )
         == ACTION_KEEP_DWA
     )
     assert (
         map_jev_to_action(
             choice=ACTION_REPLAN,
-            temporary_mover=0.1,
-            gap_worth_trying=0.2,
-            should_backup=0.85,
             heuristic_action=ACTION_WAIT,
-            backup_feasible=True,
         )
-        == ACTION_BACKUP
+        == ACTION_REPLAN
+    )
+    # ...except infeasible backup → heuristic (or wait).
+    assert (
+        map_jev_to_action(
+            choice=ACTION_BACKUP,
+            heuristic_action=ACTION_KEEP_DWA,
+            backup_feasible=False,
+        )
+        == ACTION_KEEP_DWA
     )
     assert (
         map_jev_to_action(
             choice=ACTION_BACKUP,
-            temporary_mover=0.1,
-            gap_worth_trying=0.2,
-            should_backup=0.9,
             heuristic_action=ACTION_WAIT,
-            backup_feasible=False,
-        )
-        == ACTION_WAIT
-    )
-    # Peel-loop: do not keep inching.
-    assert (
-        map_jev_to_action(
-            choice=ACTION_KEEP_DWA,
-            temporary_mover=0.1,
-            gap_worth_trying=0.8,
-            should_backup=0.2,
-            heuristic_action=ACTION_KEEP_DWA,
-            backup_feasible=False,
-            likely_peel_loop=True,
-        )
-        == ACTION_WAIT
-    )
-    assert (
-        map_jev_to_action(
-            choice=ACTION_REPLAN,
-            temporary_mover=0.1,
-            gap_worth_trying=0.2,
-            should_backup=0.2,
-            heuristic_action=ACTION_REPLAN,
             backup_feasible=True,
-            replan_looks_futile=True,
-            likely_peel_loop=True,
         )
         == ACTION_BACKUP
+    )
+    # Unknown choice → heuristic.
+    assert (
+        map_jev_to_action(choice="teleport", heuristic_action=ACTION_REPLAN)
+        == ACTION_REPLAN
     )
 
 
@@ -280,7 +250,7 @@ def test_builtin_nav_config_accepts_nav_policy():
         BuiltinNavConfig.from_dict({"nav_policy": "chatgpt"})
 
 
-def test_stuck_progress_detects_peel_loop():
+def test_stuck_progress_reports_raw_motion_only():
     t0 = 50.0
     samples = [
         ObstacleSample(
@@ -298,8 +268,10 @@ def test_stuck_progress_detects_peel_loop():
     stuck = stuck_progress_features(samples)
     assert stuck["progress_m"] < 0.15
     assert stuck["yaw_delta_rad"] >= 0.45
-    assert stuck["spinning_in_place"] is True
-    assert stuck["likely_peel_loop"] is True
+    assert stuck["window_s"] == pytest.approx(2.25)
+    # No verdict keys — Jev decides what "stuck" means.
+    assert "likely_peel_loop" not in stuck
+    assert "spinning_in_place" not in stuck
 
 
 def test_classify_block_reasons_and_backup_denial():
@@ -343,7 +315,7 @@ def test_classify_block_reasons_and_backup_denial():
     )
 
 
-def test_build_policy_state_includes_stuck_and_replan():
+def test_build_policy_state_is_facts_only():
     ctx = LocalBlockContext(
         heuristic_action=ACTION_REPLAN,
         nose_clear=False,
@@ -364,6 +336,7 @@ def test_build_policy_state_includes_stuck_and_replan():
             "viaR0.65: still local-blocked (cost=253)",
         ],
         last_replan_error="scan+local: still local-blocked",
+        last_replan_age_s=22.3,
     )
     motion = {
         "samples": 5,
@@ -371,18 +344,26 @@ def test_build_policy_state_includes_stuck_and_replan():
         "likely_mover": False,
         "progress_m": 0.05,
         "yaw_delta_rad": 0.9,
-        "spinning_in_place": True,
-        "likely_peel_loop": True,
+        "window_s": 2.5,
     }
-    state = build_policy_state(ctx, motion)
+    recent = {"current": "wait", "current_for_s": 12.0, "time_share_s": {"wait": 12.0}}
+    state = build_policy_state(ctx, motion, recent_actions=recent)
     assert state["block_reasons"] == ["reactive_avoid"]
-    assert state["stuck"]["likely_peel_loop"] is True
+    assert state["motion_while_blocked"]["progress_m"] == pytest.approx(0.05)
+    assert state["recent_actions"]["current"] == "wait"
     assert state["motion_cmd"]["vtheta_rad_s"] == pytest.approx(0.4)
     assert "still local-blocked" in state["last_replan"]["attempts"][0]
+    assert state["last_replan"]["age_s"] == pytest.approx(22.3)
     assert state["backup"]["denial_reason"] == "rear_blocked"
+    # No editorial hints / verdicts.
+    assert "efficiency_hint" not in state
+    assert "stuck" not in state
+    blob = repr(state).lower()
+    assert "prefer " not in blob
+    assert "likely_peel_loop" not in blob
 
 
-def test_decide_marks_replan_futile_from_attempts():
+def test_decide_applies_jev_choice_and_tracks_recent_actions():
     captured = {}
 
     def query_fn(state, questions):
@@ -399,7 +380,36 @@ def test_decide_marks_replan_futile_from_attempts():
     ]
     ctx.failed_replan_while_blocked = 1
     d = policy.decide(ctx)
-    assert d.features["replan_looks_futile"] is True
-    # Soft override: peel/futile + keep_dwa → wait (no backup feasible).
-    assert d.jev_action == ACTION_WAIT
+    # Jev said keep_dwa; code does not second-guess it.
+    assert d.jev_action == ACTION_KEEP_DWA
+    assert d.applied_action == ACTION_KEEP_DWA
+    assert "replan_looks_futile" not in d.features
     assert captured["state"]["last_replan"]["attempts"]
+    d2 = policy.decide(ctx)
+    assert d2.features["recent_actions"]["current"] == ACTION_KEEP_DWA
+    assert captured["state"]["recent_actions"]["current"] == ACTION_KEEP_DWA
+
+
+def test_rate_limited_reuse_requeries_when_situation_changes():
+    calls = []
+
+    def query_fn(state, questions):
+        calls.append(state["nose_clear"])
+        return _stub_result(
+            choice=ACTION_WAIT, confidence=0.9, mover=0.1, gap=0.1
+        )
+
+    policy = JevNavPolicy(mode="jev", query_fn=query_fn, min_period_s=60.0)
+    ctx = _ctx(ACTION_REPLAN)
+    ctx.nose_clear = False
+    d1 = policy.decide(ctx)
+    assert d1.queried is True
+    d2 = policy.decide(ctx)
+    assert d2.queried is False
+    assert d2.fallback_reason == "rate_limited_reuse_jev"
+    # Nose opens up → do not keep replaying the stale wait.
+    ctx.nose_clear = True
+    d3 = policy.decide(ctx)
+    assert d3.queried is True
+    assert d3.fallback_reason == "requeried_state_change"
+    assert calls == [False, True]
