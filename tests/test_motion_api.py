@@ -278,3 +278,244 @@ def test_suspend_already_suspended_is_idempotent():
     assert second["already_suspended"] is True
     assert second["goal"]["reason"] == "b"
     assert first["goal"]["x"] == pytest.approx(1.5)
+
+
+def _stub_locations(nav: NavigationService, poses: dict) -> None:
+    class _Loc:
+        def __init__(self, name: str, x: float, y: float, theta: float = 0.0):
+            self.name = name
+            self.x = x
+            self.y = y
+            self.theta = theta
+
+    store = MagicMock()
+    store.get.side_effect = lambda name: _Loc(name, *poses[name]) if name in poses else (_ for _ in ()).throw(KeyError(name))
+    nav._locations = MagicMock(return_value=store)  # type: ignore[method-assign]
+
+
+def _route_status_queue(mgr: MagicMock) -> list:
+    """Drive nav_status from navigate() goals: active once, then succeeded."""
+    queue: list = []
+
+    def on_navigate(x, y, theta):
+        queue.clear()
+        goal = {"x": float(x), "y": float(y), "theta": float(theta)}
+        queue.extend(
+            [
+                {"active": True, "state": "active", "goal": goal},
+                {"active": False, "state": "succeeded", "goal": goal},
+            ]
+        )
+
+    def nav_status():
+        if not queue:
+            return {"active": False, "state": "idle", "goal": None}
+        if len(queue) > 1:
+            return queue.pop(0)
+        return queue[0]
+
+    mgr.navigate.side_effect = on_navigate
+    mgr.nav_status.side_effect = nav_status
+    return queue
+
+
+def test_navigate_route_follows_waypoints_in_order(monkeypatch):
+    nav, mgr = _configured_nav()
+    _stub_locations(nav, {"dock": (0.0, 0.0, 0.0), "kitchen": (1.0, 2.0, 0.5)})
+    _route_status_queue(mgr)
+    _real_sleep = asyncio.sleep
+
+    async def _fast_sleep(*_a, **_k):
+        await _real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    result = asyncio.run(
+        nav.do_command(
+            {
+                "command": "navigate_route",
+                "waypoints": ["dock", "kitchen"],
+                "wait": True,
+            }
+        )
+    )
+    assert result["state"] == "succeeded"
+    assert result["total"] == 2
+    assert result["location"] == "kitchen"
+    assert mgr.navigate.call_count == 2
+    assert mgr.navigate.call_args_list[0].args == (0.0, 0.0, 0.0)
+    assert mgr.navigate.call_args_list[1].args == (1.0, 2.0, 0.5)
+
+
+def test_navigate_route_from_saved_route(monkeypatch, tmp_path):
+    from src.nav.routes import RouteStore
+
+    nav, mgr = _configured_nav()
+    _stub_locations(nav, {"a": (0.0, 0.0, 0.0), "b": (2.0, 0.0, 0.0)})
+    store = RouteStore(tmp_path / "routes.json")
+    store.add("patrol", ["a", "b"])
+    nav._routes = MagicMock(return_value=store)  # type: ignore[method-assign]
+    _route_status_queue(mgr)
+    _real_sleep = asyncio.sleep
+
+    async def _fast_sleep(*_a, **_k):
+        await _real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    result = asyncio.run(
+        nav.do_command({"command": "navigate_route", "name": "patrol", "wait": True})
+    )
+    assert result["state"] == "succeeded"
+    assert result["name"] == "patrol"
+    assert mgr.navigate.call_count == 2
+
+
+def test_navigate_route_async_exposes_status(monkeypatch):
+    nav, mgr = _configured_nav()
+    _stub_locations(nav, {"dock": (0.0, 0.0, 0.0), "kitchen": (3.0, 1.0, 0.0)})
+    queue = _route_status_queue(mgr)
+    # Hold the first leg active until we poll get_status.
+    held = {"x": 0.0, "y": 0.0, "theta": 0.0}
+
+    def on_navigate(x, y, theta):
+        queue.clear()
+        held.update(x=float(x), y=float(y), theta=float(theta))
+        queue.append(
+            {
+                "active": True,
+                "state": "active",
+                "goal": dict(held),
+            }
+        )
+
+    def release():
+        queue.clear()
+        queue.append(
+            {
+                "active": False,
+                "state": "succeeded",
+                "goal": dict(held),
+            }
+        )
+
+    mgr.navigate.side_effect = on_navigate
+    mgr.nav_status.side_effect = lambda: queue[0] if queue else {"active": False, "state": "idle"}
+    _real_sleep = asyncio.sleep
+
+    async def _fast_sleep(*_a, **_k):
+        await _real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    async def _run():
+        started = await nav.do_command(
+            {
+                "command": "navigate_route",
+                "waypoints": ["dock", "kitchen"],
+                "wait": False,
+            }
+        )
+        assert started["status"] == "navigating"
+        assert started["motion"] == "route"
+        # Let the route task issue the first navigate + status poll.
+        for _ in range(20):
+            await _real_sleep(0)
+            status = await nav.do_command({"command": "get_status"})
+            if status.get("motion") == "route" and status.get("route", {}).get("state") == "active":
+                assert status["active"] is True
+                assert status["route"]["location"] == "dock"
+                break
+        else:
+            raise AssertionError("route never became active")
+        release()
+        # Finish first leg; second leg will hold active again via on_navigate.
+        for _ in range(50):
+            await _real_sleep(0)
+            if mgr.navigate.call_count >= 2:
+                break
+        release()
+        for _ in range(50):
+            await _real_sleep(0)
+            if nav._route_status.get("state") == "succeeded":
+                break
+        assert nav._route_status["state"] == "succeeded"
+
+    asyncio.run(_run())
+
+
+def test_navigate_route_suspend_resume(monkeypatch):
+    nav, mgr = _configured_nav()
+    _stub_locations(nav, {"dock": (0.0, 0.0, 0.0), "kitchen": (1.0, 0.0, 0.0)})
+    queue: list = []
+
+    def on_navigate(x, y, theta):
+        queue.clear()
+        queue.append(
+            {
+                "active": True,
+                "state": "active",
+                "goal": {"x": float(x), "y": float(y), "theta": float(theta)},
+            }
+        )
+
+    mgr.navigate.side_effect = on_navigate
+    mgr.nav_status.side_effect = lambda: (
+        queue[0] if queue else {"active": False, "state": "idle", "goal": None}
+    )
+    _real_sleep = asyncio.sleep
+
+    async def _fast_sleep(*_a, **_k):
+        await _real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    async def _run():
+        await nav.do_command(
+            {
+                "command": "navigate_route",
+                "waypoints": ["dock", "kitchen"],
+                "wait": False,
+            }
+        )
+        for _ in range(30):
+            await _real_sleep(0)
+            if nav._route_status.get("state") == "active" and mgr.navigate.call_count >= 1:
+                break
+        suspended = await nav.do_command({"command": "suspend", "reason": "safety"})
+        assert suspended["status"] == "suspended"
+        assert suspended["goal"]["route"] == "inline"
+        assert suspended["goal"]["route_index"] == 0
+        assert nav._route_status["state"] == "idle"
+
+        # Resume: finish remaining waypoints quickly.
+        def finish_leg(x, y, theta):
+            queue.clear()
+            goal = {"x": float(x), "y": float(y), "theta": float(theta)}
+            queue.extend(
+                [
+                    {"active": True, "state": "active", "goal": goal},
+                    {"active": False, "state": "succeeded", "goal": goal},
+                ]
+            )
+
+        def nav_status():
+            if not queue:
+                return {"active": False, "state": "idle", "goal": None}
+            if len(queue) > 1:
+                return queue.pop(0)
+            return queue[0]
+
+        mgr.navigate.side_effect = finish_leg
+        mgr.nav_status.side_effect = nav_status
+        resumed = await nav.do_command({"command": "resume"})
+        assert resumed["status"] == "navigating"
+        assert resumed["motion"] == "route"
+        for _ in range(100):
+            await _real_sleep(0)
+            if nav._route_status.get("state") == "succeeded":
+                break
+        assert nav._route_status["state"] == "succeeded"
+        assert mgr.navigate.call_count >= 2
+
+    asyncio.run(_run())

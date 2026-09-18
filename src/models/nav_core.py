@@ -51,6 +51,7 @@ from ..nav import zones as zones_mod
 from ..nav.locations import LocationStore
 from ..nav.maps import MapHandle
 from ..nav.motion_summary import summarize_nav_motion
+from ..nav.routes import Route, RouteStore
 from ..nav.simple_motion import (
     ObstacleConfig,
     SimpleMotionCanceled,
@@ -110,7 +111,10 @@ class _PlanExecution:
 
 @dataclass
 class _SuspendedNav:
-    """Goal remembered by ``suspend`` so ``resume`` can re-issue navigate."""
+    """Goal remembered by ``suspend`` so ``resume`` can re-issue navigate.
+
+    Optional ``route_*`` fields resume a multi-waypoint route from this leg.
+    """
 
     x: float
     y: float
@@ -118,6 +122,9 @@ class _SuspendedNav:
     name: Optional[str] = None
     motion: str = "builtin"  # "builtin" | "simple"
     reason: Optional[str] = None
+    route: Optional[str] = None
+    route_index: Optional[int] = None
+    route_waypoints: Optional[List[dict]] = None
 
     def to_dict(self) -> dict:
         out = {
@@ -130,6 +137,10 @@ class _SuspendedNav:
             out["name"] = self.name
         if self.reason:
             out["reason"] = self.reason
+        if self.route:
+            out["route"] = self.route
+            out["route_index"] = int(self.route_index or 0)
+            out["route_total"] = len(self.route_waypoints or [])
         return out
 
 
@@ -153,6 +164,10 @@ class NavServiceBase(Motion):
         self._plan_status_history: List[PlanStatusWithID] = []
         self._logged_motion_ignored: bool = False
         self._last_preview_plan: Optional[dict] = None
+        # Multi-waypoint route runner (navigate_route).
+        self._route_task: Optional[asyncio.Task] = None
+        self._route_cancel: Optional[asyncio.Event] = None
+        self._route_status: dict = {"state": "idle", "motion": "route"}
         # Set by ``suspend``; cleared by ``resume``, ``cancel``, ``stop_plan``,
         # or any new navigate / MoveOnMap / simple go.
         self._suspended: Optional[_SuspendedNav] = None
@@ -309,6 +324,7 @@ class NavServiceBase(Motion):
         self._active_goal_name = None
         self._upsert_plan_status_history(execution)
 
+        await self._cancel_route()
         await self._cancel_simple_nav()
         await asyncio.to_thread(mgr.navigate, pose2d.x, pose2d.y, pose2d.theta)
         self._sync_plan_state_from_nav()
@@ -324,6 +340,7 @@ class NavServiceBase(Motion):
         runtime = self._require_runtime()
         self._active_goal_name = None
         self._suspended = None
+        await self._cancel_route()
         await self._cancel_simple_nav()
         await asyncio.to_thread(runtime.manager.cancel)
         if self._plan_execution is not None:
@@ -502,8 +519,33 @@ class NavServiceBase(Motion):
     def _locations(self) -> LocationStore:
         return LocationStore(self._active_handle().locations_path)
 
+    def _routes(self) -> RouteStore:
+        return RouteStore(self._active_handle().routes_path)
+
     def _zones(self) -> ZoneStore:
         return ZoneStore(self._active_handle().zones_path)
+
+    def _route_to_dict(self, route: Route, *, resolve: bool = True) -> dict:
+        """Serialize a route; optionally attach pose fields from locations."""
+        out: dict = {"name": route.name, "waypoints": []}
+        locs = self._locations() if resolve else None
+        for loc_name in route.waypoints:
+            wp: dict = {"location": loc_name}
+            if locs is not None:
+                try:
+                    loc = locs.get(loc_name)
+                    wp["x"] = loc.x
+                    wp["y"] = loc.y
+                    wp["theta"] = loc.theta
+                except KeyError:
+                    wp["missing"] = True
+            out["waypoints"].append(wp)
+        return out
+
+    def _require_location_names(self, names: Sequence[str]) -> None:
+        store = self._locations()
+        for n in names:
+            store.get(str(n))
 
     def _refresh_zone_masks(self) -> None:
         runtime = self._require_runtime()
@@ -540,20 +582,118 @@ class NavServiceBase(Motion):
         if cmd == "list_locations":
             return {"locations": [l.to_dict() for l in self._locations().list()]}
         if cmd == "update_location":
+            old_name = str(command["name"])
             loc = self._locations().update(
-                str(command["name"]),
+                old_name,
                 x=command.get("x"),
                 y=command.get("y"),
                 theta=command.get("theta"),
                 new_name=command.get("new_name"),
             )
+            new_name = command.get("new_name")
+            if new_name is not None and str(new_name) != old_name:
+                self._routes().rename_location_refs(old_name, str(new_name))
             return {"location": loc.to_dict()}
         if cmd in ("delete_location", "remove_location"):
-            self._locations().delete(str(command["name"]))
+            name = str(command["name"])
+            self._locations().delete(name)
+            self._routes().remove_location_refs(name)
             return {"status": "deleted"}
         if cmd == "delete_all_locations":
             self._locations().delete_all()
+            # Empty locations → clear every route's waypoints (routes remain).
+            routes = self._routes()
+            for route in routes.list():
+                routes.clear_waypoints(route.name)
             return {"status": "deleted"}
+
+        # -- routes / waypoints CRUD --
+        if cmd == "add_route":
+            name = str(command["name"])
+            raw_wps = command.get("waypoints") or []
+            if not isinstance(raw_wps, (list, tuple)):
+                raise ValueError("waypoints must be a list of location names")
+            waypoints = [
+                str(w.get("location", w) if isinstance(w, Mapping) else w)
+                for w in raw_wps
+            ]
+            self._require_location_names(waypoints)
+            route = self._routes().add(name, waypoints)
+            return {"route": self._route_to_dict(route)}
+        if cmd == "get_route":
+            route = self._routes().get(str(command["name"]))
+            return {"route": self._route_to_dict(route)}
+        if cmd == "list_routes":
+            return {
+                "routes": [self._route_to_dict(r) for r in self._routes().list()]
+            }
+        if cmd == "update_route":
+            route = self._routes().update(
+                str(command["name"]),
+                new_name=command.get("new_name"),
+            )
+            return {"route": self._route_to_dict(route)}
+        if cmd in ("delete_route", "remove_route"):
+            self._routes().delete(str(command["name"]))
+            return {"status": "deleted"}
+        if cmd == "delete_all_routes":
+            self._routes().delete_all()
+            return {"status": "deleted"}
+
+        if cmd == "list_waypoints":
+            route = self._routes().get(str(command["route"]))
+            return {"route": route.name, "waypoints": self._route_to_dict(route)["waypoints"]}
+        if cmd == "set_waypoints":
+            route_name = str(command["route"])
+            raw_wps = command.get("waypoints") or []
+            if not isinstance(raw_wps, (list, tuple)):
+                raise ValueError("waypoints must be a list of location names")
+            waypoints = [
+                str(w.get("location", w) if isinstance(w, Mapping) else w)
+                for w in raw_wps
+            ]
+            self._require_location_names(waypoints)
+            route = self._routes().set_waypoints(route_name, waypoints)
+            return {"route": self._route_to_dict(route)}
+        if cmd == "clear_waypoints":
+            route = self._routes().clear_waypoints(str(command["route"]))
+            return {"route": self._route_to_dict(route)}
+        if cmd == "add_waypoint":
+            route_name = str(command["route"])
+            location = str(command["location"])
+            self._require_location_names([location])
+            index = command.get("index")
+            route = self._routes().add_waypoint(
+                route_name,
+                location,
+                index=int(index) if index is not None else None,
+            )
+            return {"route": self._route_to_dict(route)}
+        if cmd == "update_waypoint":
+            route_name = str(command["route"])
+            location = str(command["location"])
+            self._require_location_names([location])
+            route = self._routes().update_waypoint(
+                route_name, int(command["index"]), location
+            )
+            return {"route": self._route_to_dict(route)}
+        if cmd in ("remove_waypoint", "delete_waypoint"):
+            route_name = str(command["route"])
+            index = command.get("index")
+            location = command.get("location")
+            route = self._routes().remove_waypoint(
+                route_name,
+                index=int(index) if index is not None else None,
+                location=str(location) if location is not None else None,
+            )
+            return {"route": self._route_to_dict(route)}
+        if cmd == "move_waypoint":
+            route = self._routes().move_waypoint(
+                str(command["route"]),
+                int(command["from_index"]),
+                int(command["to_index"]),
+            )
+            return {"route": self._route_to_dict(route)}
 
         # -- zones CRUD --
         if cmd == "add_zone":
@@ -596,6 +736,7 @@ class NavServiceBase(Motion):
             loc = self._locations().get(str(command["name"]))
             self._suspended = None
             self._active_goal_name = loc.name
+            await self._cancel_route()
             await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.navigate, loc.x, loc.y, loc.theta)
             return {"status": "navigating", "target": loc.to_dict()}
@@ -605,9 +746,12 @@ class NavServiceBase(Motion):
             theta = float(command.get("theta", 0.0))
             self._suspended = None
             self._active_goal_name = None
+            await self._cancel_route()
             await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.navigate, x, y, theta)
             return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
+        if cmd == "navigate_route":
+            return await self._start_navigate_route(command)
         if cmd in ("plan_to_point", "compute_path_to_point"):
             return await self._plan_preview(command, mgr)
         if cmd in ("plan_to_location", "compute_path_to_location"):
@@ -641,6 +785,7 @@ class NavServiceBase(Motion):
             name = preview.get("location", {}).get("name") if isinstance(preview.get("location"), dict) else None
             self._suspended = None
             self._active_goal_name = name
+            await self._cancel_route()
             await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.navigate, x, y, theta)
             return {
@@ -653,6 +798,7 @@ class NavServiceBase(Motion):
             loc = self._locations().get(str(command["name"]))
             self._suspended = None
             self._active_goal_name = loc.name
+            await self._cancel_route()
             return await self._start_simple_go(loc.x, loc.y, loc.theta, command)
         if cmd == "go_to_point":
             x = float(command["x"])
@@ -660,6 +806,7 @@ class NavServiceBase(Motion):
             theta = float(command.get("theta", 0.0))
             self._suspended = None
             self._active_goal_name = None
+            await self._cancel_route()
             return await self._start_simple_go(x, y, theta, command)
         if cmd in ("suspend", "pause_nav", "suspend_nav"):
             return await self._suspend_nav(command)
@@ -668,6 +815,7 @@ class NavServiceBase(Motion):
         if cmd == "cancel":
             self._active_goal_name = None
             self._suspended = None
+            await self._cancel_route()
             await self._cancel_simple_nav()
             await asyncio.to_thread(mgr.cancel)
             if self._plan_execution is not None:
@@ -702,6 +850,11 @@ class NavServiceBase(Motion):
                 status["suspended_goal"] = (
                     suspended.to_dict() if suspended is not None else None
                 )
+                route = dict(self._route_status)
+                status["route"] = route
+                if route.get("state") == "active":
+                    status["active"] = True
+                    status["motion"] = "route"
                 return status
 
             status = await asyncio.to_thread(_status)
@@ -1036,8 +1189,16 @@ class NavServiceBase(Motion):
 
     # -- suspend / resume (cancel + remembered goal) -------------------------
     def _snapshot_active_goal(self) -> Optional[_SuspendedNav]:
-        """Capture the in-flight builtin or simple-nav target, if any."""
+        """Capture the in-flight builtin, simple-nav, or route target, if any."""
         name = self._active_goal_name
+        route_st = self._route_status
+        route_active = route_st.get("state") == "active"
+        route_name = route_st.get("name") if route_active else None
+        route_index = int(route_st.get("index", 0)) if route_active else None
+        route_waypoints = (
+            list(route_st.get("waypoints") or []) if route_active else None
+        )
+
         simple = self._simple_nav_status
         if simple.get("state") == "active":
             target = simple.get("target")
@@ -1048,6 +1209,9 @@ class NavServiceBase(Motion):
                     theta=float(target.get("theta", 0.0)),
                     name=name,
                     motion="simple",
+                    route=route_name,
+                    route_index=route_index,
+                    route_waypoints=route_waypoints,
                 )
 
         status: Mapping = {}
@@ -1059,14 +1223,30 @@ class NavServiceBase(Motion):
             status.get("state") or ""
         ).lower() in ("active",)
         goal = status.get("goal") if isinstance(status.get("goal"), Mapping) else None
-        if nav_active and goal is not None:
+        if (nav_active or route_active) and goal is not None:
             return _SuspendedNav(
                 x=float(goal["x"]),
                 y=float(goal["y"]),
                 theta=float(goal.get("theta", 0.0)),
                 name=name,
                 motion="builtin",
+                route=route_name,
+                route_index=route_index,
+                route_waypoints=route_waypoints,
             )
+        if route_active and route_waypoints and route_index is not None:
+            if 0 <= route_index < len(route_waypoints):
+                wp = route_waypoints[route_index]
+                return _SuspendedNav(
+                    x=float(wp["x"]),
+                    y=float(wp["y"]),
+                    theta=float(wp.get("theta", 0.0)),
+                    name=str(wp.get("location") or name or ""),
+                    motion="builtin",
+                    route=route_name,
+                    route_index=route_index,
+                    route_waypoints=route_waypoints,
+                )
 
         execution = self._plan_execution
         if execution is not None and execution.state not in _TERMINAL_PLAN_STATES:
@@ -1081,6 +1261,9 @@ class NavServiceBase(Motion):
                 theta=pose2d.theta,
                 name=name,
                 motion="builtin",
+                route=route_name,
+                route_index=route_index,
+                route_waypoints=route_waypoints,
             )
         return None
 
@@ -1107,6 +1290,7 @@ class NavServiceBase(Motion):
         runtime = self._require_runtime()
         # Keep the label on the suspended snapshot; clear live goal name.
         self._active_goal_name = None
+        await self._cancel_route(mark_canceled=False)
         await self._cancel_simple_nav()
         await asyncio.to_thread(runtime.manager.cancel)
         if self._plan_execution is not None:
@@ -1128,6 +1312,19 @@ class NavServiceBase(Motion):
             raise ValueError("nothing to resume (call suspend first)")
 
         self._suspended = None
+
+        # Resume a multi-waypoint route from the suspended leg.
+        if suspended.route and suspended.route_waypoints is not None:
+            start = int(suspended.route_index or 0)
+            return await self._start_navigate_route(
+                {
+                    "name": suspended.route,
+                    "waypoints": suspended.route_waypoints,
+                    "start_index": start,
+                    "wait": False,
+                }
+            )
+
         self._active_goal_name = suspended.name
         target = {
             "x": suspended.x,
@@ -1181,6 +1378,305 @@ class NavServiceBase(Motion):
             "target": target,
             "execution_id": execution_id,
         }
+
+    # -- route navigation (ordered location waypoints) -----------------------
+    def _resolve_route_waypoints(
+        self,
+        *,
+        name: Optional[str] = None,
+        waypoints: Optional[Sequence] = None,
+    ) -> tuple[str, List[dict]]:
+        """Build resolved waypoint list ``[{location,x,y,theta}, ...]``."""
+        route_name = str(name) if name else ""
+        resolved: List[dict] = []
+        if waypoints is not None:
+            raw = list(waypoints)
+            if not route_name:
+                route_name = "inline"
+            for item in raw:
+                if isinstance(item, Mapping):
+                    if "x" in item and "y" in item:
+                        resolved.append(
+                            {
+                                "location": str(
+                                    item.get("location") or item.get("name") or ""
+                                ),
+                                "x": float(item["x"]),
+                                "y": float(item["y"]),
+                                "theta": float(item.get("theta", 0.0)),
+                            }
+                        )
+                        continue
+                    loc_name = str(item.get("location") or item.get("name") or "")
+                else:
+                    loc_name = str(item)
+                loc = self._locations().get(loc_name)
+                resolved.append(
+                    {
+                        "location": loc.name,
+                        "x": loc.x,
+                        "y": loc.y,
+                        "theta": loc.theta,
+                    }
+                )
+        else:
+            if not route_name:
+                raise ValueError("navigate_route requires name or waypoints")
+            route = self._routes().get(route_name)
+            if not route.waypoints:
+                raise ValueError(f"route {route_name!r} has no waypoints")
+            for loc_name in route.waypoints:
+                loc = self._locations().get(loc_name)
+                resolved.append(
+                    {
+                        "location": loc.name,
+                        "x": loc.x,
+                        "y": loc.y,
+                        "theta": loc.theta,
+                    }
+                )
+        if not resolved:
+            raise ValueError("navigate_route requires at least one waypoint")
+        return route_name, resolved
+
+    async def _start_navigate_route(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        """Follow a route's waypoints sequentially with the builtin navigator."""
+        wait = bool(command.get("wait", False))
+        start_index = max(0, int(command.get("start_index", 0)))
+        inline = command.get("waypoints")
+        route_name, waypoints = self._resolve_route_waypoints(
+            name=command.get("name"),
+            waypoints=inline if isinstance(inline, (list, tuple)) else None,
+        )
+        if start_index >= len(waypoints):
+            raise ValueError(
+                f"start_index {start_index} out of range "
+                f"(0..{len(waypoints) - 1})"
+            )
+
+        self._suspended = None
+        await self._cancel_route()
+        await self._cancel_simple_nav()
+
+        cancel = asyncio.Event()
+        self._route_cancel = cancel
+        self._route_status = {
+            "state": "active",
+            "motion": "route",
+            "name": route_name,
+            "index": start_index,
+            "total": len(waypoints),
+            "location": waypoints[start_index].get("location"),
+            "waypoints": waypoints,
+            "error_msg": "",
+        }
+
+        async def _run() -> None:
+            await self._run_route(route_name, waypoints, start_index, cancel)
+
+        if wait:
+            await _run()
+            return dict(self._route_status)
+
+        self._route_task = asyncio.create_task(_run(), name=f"nav-route:{route_name}")
+        return {
+            "status": "navigating",
+            "motion": "route",
+            "route": route_name,
+            "index": start_index,
+            "total": len(waypoints),
+            "location": waypoints[start_index].get("location"),
+            "target": dict(waypoints[start_index]),
+        }
+
+    async def _cancel_route(self, *, mark_canceled: bool = True) -> None:
+        was_active = self._route_status.get("state") == "active"
+        task = self._route_task
+        had_running = task is not None and not task.done()
+        if self._route_cancel is not None:
+            self._route_cancel.set()
+        if had_running:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._route_task = None
+        self._route_cancel = None
+        if was_active and mark_canceled:
+            self._route_status = {
+                **self._route_status,
+                "state": "canceled",
+                "motion": "route",
+                "error_msg": "canceled",
+            }
+        elif was_active:
+            self._route_status = {
+                **self._route_status,
+                "state": "idle",
+                "motion": "route",
+                "error_msg": "",
+            }
+
+    async def _run_route(
+        self,
+        route_name: str,
+        waypoints: List[dict],
+        start_index: int,
+        cancel: asyncio.Event,
+    ) -> None:
+        runtime = self._require_runtime()
+        mgr = runtime.manager
+        terminal = {"succeeded", "failed", "canceled", "cancelled"}
+        try:
+            for idx in range(start_index, len(waypoints)):
+                if cancel.is_set():
+                    self._route_status = {
+                        **self._route_status,
+                        "state": "canceled",
+                        "index": idx,
+                        "error_msg": "canceled",
+                    }
+                    return
+                wp = waypoints[idx]
+                loc_name = str(wp.get("location") or "")
+                self._active_goal_name = loc_name or None
+                self._route_status = {
+                    "state": "active",
+                    "motion": "route",
+                    "name": route_name,
+                    "index": idx,
+                    "total": len(waypoints),
+                    "location": loc_name,
+                    "waypoints": waypoints,
+                    "error_msg": "",
+                }
+                await asyncio.to_thread(
+                    mgr.navigate, float(wp["x"]), float(wp["y"]), float(wp["theta"])
+                )
+                # Wait for this leg to start (or finish immediately if already there).
+                # Only treat a terminal status as "this leg" when the goal matches
+                # this waypoint — otherwise a stale prior-leg success could skip ahead.
+                started = False
+                for _ in range(50):
+                    if cancel.is_set():
+                        await asyncio.to_thread(mgr.cancel)
+                        self._route_status = {
+                            **self._route_status,
+                            "state": "canceled",
+                            "error_msg": "canceled",
+                        }
+                        return
+                    status = await asyncio.to_thread(mgr.nav_status)
+                    state = str(status.get("state") or "").lower()
+                    active = bool(status.get("active"))
+                    if active or state == "active":
+                        started = True
+                        break
+                    if (
+                        (not active)
+                        and state in terminal
+                        and self._route_goal_matches(status, wp)
+                    ):
+                        started = True
+                        break
+                    await asyncio.sleep(0.1)
+                if not started:
+                    self._route_status = {
+                        **self._route_status,
+                        "state": "failed",
+                        "error_msg": (
+                            f"waypoint {idx} ({loc_name!r}) did not start navigating"
+                        ),
+                    }
+                    return
+                # Wait until this leg leaves "active".
+                while True:
+                    if cancel.is_set():
+                        await asyncio.to_thread(mgr.cancel)
+                        self._route_status = {
+                            **self._route_status,
+                            "state": "canceled",
+                            "error_msg": "canceled",
+                        }
+                        return
+                    status = await asyncio.to_thread(mgr.nav_status)
+                    state = str(status.get("state") or "").lower()
+                    active = bool(status.get("active"))
+                    if active or state == "active":
+                        await asyncio.sleep(0.2)
+                        continue
+                    if state not in terminal:
+                        await asyncio.sleep(0.2)
+                        continue
+                    if not self._route_goal_matches(status, wp) and state == "succeeded":
+                        # Stale success from a previous goal — keep waiting.
+                        await asyncio.sleep(0.2)
+                        continue
+                    if state in ("canceled", "cancelled"):
+                        self._route_status = {
+                            **self._route_status,
+                            "state": "canceled",
+                            "error_msg": status.get("error_msg") or "canceled",
+                        }
+                        return
+                    if state == "failed":
+                        self._route_status = {
+                            **self._route_status,
+                            "state": "failed",
+                            "error_msg": status.get("error_msg")
+                            or f"waypoint {idx} ({loc_name!r}) failed",
+                        }
+                        return
+                    # succeeded — advance
+                    break
+            self._route_status = {
+                "state": "succeeded",
+                "motion": "route",
+                "name": route_name,
+                "index": len(waypoints) - 1,
+                "total": len(waypoints),
+                "location": waypoints[-1].get("location"),
+                "waypoints": waypoints,
+                "error_msg": "",
+            }
+        except asyncio.CancelledError:
+            try:
+                await asyncio.to_thread(mgr.cancel)
+            except Exception:  # noqa: BLE001
+                pass
+            self._route_status = {
+                **self._route_status,
+                "state": "canceled",
+                "error_msg": "canceled",
+            }
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._route_status = {
+                **self._route_status,
+                "state": "failed",
+                "error_msg": str(exc),
+            }
+        finally:
+            if self._route_cancel is cancel:
+                self._route_cancel = None
+            if self._route_task is asyncio.current_task():
+                self._route_task = None
+
+    @staticmethod
+    def _route_goal_matches(status: Mapping, wp: Mapping, *, tol: float = 1e-3) -> bool:
+        goal = status.get("goal") if isinstance(status.get("goal"), Mapping) else None
+        if goal is None:
+            return False
+        try:
+            return (
+                abs(float(goal["x"]) - float(wp["x"])) < tol
+                and abs(float(goal["y"]) - float(wp["y"])) < tol
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
 
     # -- simple closed-loop navigation (map frame) ---------------------------
     async def _start_simple_go(

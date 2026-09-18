@@ -2,6 +2,7 @@ import pytest
 
 from src.nav.locations import LocationStore
 from src.nav.maps import MapStore
+from src.nav.routes import RouteStore
 from src.nav import zones as zmod
 from src.nav.zones import ZoneStore
 
@@ -33,6 +34,66 @@ def test_location_invalid_name(tmp_path):
         store.add("bad/name", 0, 0)
 
 
+# -- routes ------------------------------------------------------------------
+def test_route_and_waypoint_crud(tmp_path):
+    store = RouteStore(tmp_path / "routes.json")
+    store.add("patrol", ["dock", "kitchen"])
+    assert store.get("patrol").waypoints == ["dock", "kitchen"]
+    with pytest.raises(ValueError):
+        store.add("patrol", [])
+
+    store.add_waypoint("patrol", "lobby")
+    store.add_waypoint("patrol", "lab", index=1)
+    assert store.get("patrol").waypoints == ["dock", "lab", "kitchen", "lobby"]
+
+    store.update_waypoint("patrol", 1, "office")
+    assert store.get("patrol").waypoints[1] == "office"
+
+    store.move_waypoint("patrol", 0, 2)
+    assert store.get("patrol").waypoints == ["office", "kitchen", "dock", "lobby"]
+
+    store.remove_waypoint("patrol", location="kitchen")
+    store.remove_waypoint("patrol", index=0)
+    assert store.get("patrol").waypoints == ["dock", "lobby"]
+
+    store.set_waypoints("patrol", ["a", "b"])
+    assert store.list_waypoints("patrol") == ["a", "b"]
+    store.clear_waypoints("patrol")
+    assert store.get("patrol").waypoints == []
+
+    store.update("patrol", new_name="loop")
+    assert store.get("loop").name == "loop"
+    with pytest.raises(KeyError):
+        store.get("patrol")
+
+    reloaded = RouteStore(tmp_path / "routes.json")
+    assert reloaded.get("loop").waypoints == []
+    reloaded.delete("loop")
+    assert reloaded.list() == []
+
+
+def test_route_location_ref_maintenance(tmp_path):
+    store = RouteStore(tmp_path / "routes.json")
+    store.add("a", ["dock", "kitchen", "dock"])
+    store.add("b", ["kitchen"])
+    assert store.rename_location_refs("kitchen", "galley") == 2
+    assert store.get("a").waypoints == ["dock", "galley", "dock"]
+    assert store.get("b").waypoints == ["galley"]
+    assert store.remove_location_refs("dock") == 2
+    assert store.get("a").waypoints == ["galley"]
+
+
+def test_route_invalid_name_and_index(tmp_path):
+    store = RouteStore(tmp_path / "routes.json")
+    with pytest.raises(ValueError):
+        store.add("bad/name")
+    store.add("ok", ["a"])
+    with pytest.raises(ValueError):
+        store.add_waypoint("ok", "b", index=5)
+    with pytest.raises(ValueError):
+        store.remove_waypoint("ok")
+
+
 # -- maps --------------------------------------------------------------------
 def test_map_store_lifecycle(tmp_path):
     store = MapStore(str(tmp_path))
@@ -57,6 +118,12 @@ def test_map_duplicate_rejected(tmp_path):
     store.create_map("a")
     with pytest.raises(ValueError):
         store.create_map("a")
+
+
+def test_map_handle_routes_path(tmp_path):
+    store = MapStore(str(tmp_path))
+    handle = store.create_map("floor1")
+    assert handle.routes_path == handle.root / "routes.json"
 
 
 # -- zones -------------------------------------------------------------------

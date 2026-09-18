@@ -11,9 +11,10 @@ Layout on disk::
             map.yaml / map.pgm     # occupancy grid (optional, for export)
             locations.json         # named locations (scoped to this map)
             zones.json             # keepout / speed_limit zones (scoped to this map)
+            routes.json            # named routes = ordered location waypoints
 
-Locations and zones are intentionally scoped to a map: switching the active map
-switches its locations and zones too.
+Locations, zones, and routes are intentionally scoped to a map: switching the
+active map switches them too.
 """
 from __future__ import annotations
 
@@ -77,6 +78,10 @@ class MapHandle:
     @property
     def zones_path(self) -> Path:
         return self.root / "zones.json"
+
+    @property
+    def routes_path(self) -> Path:
+        return self.root / "routes.json"
 
     @property
     def occupancy_yaml_path(self) -> Path:
