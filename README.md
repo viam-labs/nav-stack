@@ -499,6 +499,9 @@ await slam.do_command({"command": "relocalize"})
 
 ### 3. Create and use locations
 
+Full DoCommand reference (all commands, args, aliases):
+[`docs/navigation-docommands.md`](docs/navigation-docommands.md).
+
 `nav` is a Motion service — prefer `move_on_map` for map goals (mm / degrees).
 DoCommand `navigate_to_point` / locations still use **meters / radians**:
 
@@ -548,6 +551,14 @@ Locations CRUD: `add_location`, `get_location`, `list_locations`,
 `update_location`, `delete_location` (alias `remove_location`),
 `delete_all_locations`.
 
+Routes are ordered lists of location waypoints (same map). CRUD:
+`add_route`, `get_route`, `list_routes`, `update_route`, `delete_route`
+(alias `remove_route`), `delete_all_routes`; waypoint ops:
+`add_waypoint`, `update_waypoint`, `remove_waypoint` /
+`delete_waypoint`, `move_waypoint`, `set_waypoints`, `clear_waypoints`,
+`list_waypoints`. Drive a saved route (or an inline waypoint list) with
+`navigate_route`. See [`docs/navigation-docommands.md`](docs/navigation-docommands.md).
+
 ### 4. Define virtual zones
 
 Physical obstacles are avoided automatically. Virtual zones are user-defined:
@@ -566,7 +577,7 @@ await nav.do_command({"command": "add_zone", "name": "busy-aisle",
 
 Zones CRUD: `add_zone`, `get_zone`, `list_zones`, `update_zone`, `delete_zone`,
 `delete_all_zones`. Geometry types: `circle`, `box` (optionally `rotation`),
-`polygon`. Locations and zones are stored per-map.
+`polygon`. Locations, zones, and routes are stored per-map.
 
 ### Map management (SLAM service)
 

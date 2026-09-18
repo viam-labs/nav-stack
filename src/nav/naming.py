@@ -1,4 +1,4 @@
-"""Shared name validation for maps, locations, and zones."""
+"""Shared name validation for maps, locations, zones, and routes."""
 from __future__ import annotations
 
 import re
