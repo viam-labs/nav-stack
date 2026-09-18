@@ -592,21 +592,30 @@ def connect_plan_start(
     algorithm: str = DEFAULT_PLANNER,
     xy_tolerance_m: float = 0.15,
     scan: Optional[conv.LaserScan2D] = None,
+    local_view: Optional[LocalCostmapView] = None,
 ) -> PlanResult:
-    """Prepend a feasible segment when the robot cannot reach ``path[0]`` safely."""
+    """Prepend a feasible segment when the robot cannot reach ``path[0]`` safely.
+
+    Uses ``result.planning_costs`` (static + live obstacles) when available so
+    the bridge and the at-start check see the same world the planner did.
+    """
     if not result.feasible or result.path.empty:
         return result
-    try:
-        occ = occupancy_from_map_dict(map_data)
-    except (KeyError, TypeError, ValueError) as exc:
-        return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
-    costs = build_costmap(
-        occ,
-        inflation_radius_m=inflation_radius_m,
-        robot_radius_m=robot_radius_m,
-        cost_scaling_factor=cost_scaling_factor,
-        clearance_preference_m=clearance_preference_m,
-    )
+    if result.planning_costs is not None and result.planning_occ is not None:
+        occ = result.planning_occ
+        costs = result.planning_costs
+    else:
+        try:
+            occ = occupancy_from_map_dict(map_data)
+        except (KeyError, TypeError, ValueError) as exc:
+            return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
+        costs = build_costmap(
+            occ,
+            inflation_radius_m=inflation_radius_m,
+            robot_radius_m=robot_radius_m,
+            cost_scaling_factor=cost_scaling_factor,
+            clearance_preference_m=clearance_preference_m,
+        )
     sx, sy = result.path.points[0]
     at_start = math.hypot(pose.x - sx, pose.y - sy) <= xy_tolerance_m
     if at_start and footprint_traversable(
@@ -628,6 +637,7 @@ def connect_plan_start(
         algorithm=algorithm,
         scan=scan,
         scan_pose=pose if scan is not None else None,
+        local_view=local_view,
     )
     if not bridge.feasible:
         return PlanResult(
@@ -641,6 +651,8 @@ def connect_plan_start(
         path=merged,
         planning_time_s=result.planning_time_s + bridge.planning_time_s,
         costmap_viz=result.costmap_viz,
+        planning_costs=result.planning_costs,
+        planning_occ=result.planning_occ,
     )
     return out
 
@@ -898,6 +910,8 @@ def plan_path(
         max_goal_snap_m=max_goal_snap_m,
     )
     result.costmap_viz = costmap_viz_dict(occ, costs)
+    result.planning_costs = costs
+    result.planning_occ = occ
     return result
 
 

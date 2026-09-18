@@ -120,6 +120,11 @@ class PlanResult:
     planning_time_s: float = 0.0
     # Optional OccupancyGrid-style dict for nav-camera (inflated costs).
     costmap_viz: Optional[dict] = None
+    # The exact costmap the path was planned on (static + scan + local
+    # overlay). Post-processing (smoothing, start bridging) must use this, not
+    # a fresh static-only build, or it will shortcut through live obstacles.
+    planning_costs: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+    planning_occ: Optional["OccupancyGrid"] = field(default=None, repr=False, compare=False)
 
     def to_preview_dict(
         self,

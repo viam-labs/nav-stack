@@ -48,7 +48,7 @@ from .planner import (
     plan_path,
     connect_plan_start,
 )
-from .smoother import smooth_plan_path
+from .smoother import smooth_path, smooth_plan_path
 from .types import NavStatus, Path2D, PlanResult, Pose2D
 from .world_io import WorldIO
 
@@ -480,18 +480,32 @@ class NavSupervisor:
                 algorithm=self._algorithm,
                 xy_tolerance_m=self._follower.motion.xy_tolerance_m,
                 scan=scan,
+                local_view=local_view,
             )
         if result.feasible and self._smooth_path:
-            smoothed = smooth_plan_path(
-                result.path,
-                map_data,
-                inflation_radius_m=self._inflation,
-                robot_radius_m=self._robot_radius,
-                cost_scaling_factor=self._cost_scaling,
-                clearance_preference_m=self._clearance_preference_m,
-                enabled=True,
-                sample_spacing_m=self._smooth_spacing,
-            )
+            if result.planning_costs is not None and result.planning_occ is not None:
+                # Smooth on the costmap the planner actually used (static +
+                # scan + local overlay). A static-only rebuild here used to
+                # string-pull the detour straight back through the live
+                # obstacle, so every replan was rejected as still-blocked.
+                smoothed = smooth_path(
+                    result.path,
+                    result.planning_costs,
+                    result.planning_occ,
+                    enabled=True,
+                    sample_spacing_m=self._smooth_spacing,
+                )
+            else:
+                smoothed = smooth_plan_path(
+                    result.path,
+                    map_data,
+                    inflation_radius_m=self._inflation,
+                    robot_radius_m=self._robot_radius,
+                    cost_scaling_factor=self._cost_scaling,
+                    clearance_preference_m=self._clearance_preference_m,
+                    enabled=True,
+                    sample_spacing_m=self._smooth_spacing,
+                )
             result.path = smoothed
         return result
 
