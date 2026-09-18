@@ -121,6 +121,7 @@ class NavSupervisor:
         max_linear_accel_mps2 = kw["max_linear_accel_mps2"]
         max_linear_decel_mps2 = kw["max_linear_decel_mps2"]
         max_angular_accel_rad_s2 = kw["max_angular_accel_rad_s2"]
+        shared_jev_policy = kw.get("jev_policy")
         self._world = world
         self._inflation = inflation_radius_m
         # Driving clearance (half-width when a footprint is configured). Every
@@ -174,16 +175,19 @@ class NavSupervisor:
             1.0, float(replan_local_min_period_s)
         )
         _world_log = getattr(self._world, "log", None)
-        self._jev_policy = JevNavPolicy(
-            mode=normalize_nav_policy(nav_policy),
-            min_confidence=float(jev_min_confidence),
-            timeout_s=float(jev_timeout_s),
-            min_period_s=float(jev_min_period_s),
-            history_s=float(jev_history_s),
-            model=str(jev_model or "jev-latest"),
-            api_key=str(jev_api_key) if jev_api_key else None,
-            logger=_world_log if callable(_world_log) else None,
-        )
+        if isinstance(shared_jev_policy, JevNavPolicy):
+            self._jev_policy = shared_jev_policy
+        else:
+            self._jev_policy = JevNavPolicy(
+                mode=normalize_nav_policy(nav_policy),
+                min_confidence=float(jev_min_confidence),
+                timeout_s=float(jev_timeout_s),
+                min_period_s=float(jev_min_period_s),
+                history_s=float(jev_history_s),
+                model=str(jev_model or "jev-latest"),
+                api_key=str(jev_api_key) if jev_api_key else None,
+                logger=_world_log if callable(_world_log) else None,
+            )
         self._local_planner_activate_cost = local_planner_activate_cost
         self._local_costmap = (
             LocalCostmap(
@@ -813,12 +817,19 @@ class NavSupervisor:
         self._set_status(path=preview["path"], length_m=preview["length_m"])
         return new_path
 
+    def jev_decision_log(self) -> list:
+        return self._jev_policy.decision_log()
+
+    def clear_jev_decision_log(self) -> None:
+        self._jev_policy.clear_decision_log()
+
     def run_goal(self, goal: Pose2D) -> None:
         """Plan and follow until success, failure, or cancel. Blocking."""
         self._cancel.clear()
         self._last_replan_error = ""
         self._last_replan_trigger = ""
         self._last_replan_info = {}
+        self._jev_policy.start_run()
         goal_dict = {"x": float(goal.x), "y": float(goal.y), "theta": float(goal.theta)}
         self._set_status(
             state="active",

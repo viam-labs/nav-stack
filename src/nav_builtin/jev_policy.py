@@ -18,7 +18,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
@@ -391,6 +391,9 @@ class JevNavPolicy:
         self._last_query_at = 0.0
         self._last_decision: Optional[PolicyDecision] = None
         self._client = None
+        self._decision_log: Deque[Dict[str, Any]] = deque(maxlen=256)
+        self._decision_seq = 0
+        self._run_id = 0
 
     def _emit(self, msg: str) -> None:
         if self._log is not None:
@@ -410,6 +413,67 @@ class JevNavPolicy:
     def clear_history(self) -> None:
         self._history.clear()
 
+    def start_run(self) -> int:
+        """Begin a new navigate run; clears the decision timeline for the UI."""
+        self._run_id += 1
+        self._decision_log.clear()
+        self._decision_seq = 0
+        self._last_decision = None
+        self.clear_history()
+        return self._run_id
+
+    def clear_decision_log(self) -> None:
+        self._decision_log.clear()
+        self._decision_seq = 0
+
+    def decision_log(self) -> List[Dict[str, Any]]:
+        return list(self._decision_log)
+
+    def _append_decision_log(
+        self, ctx: LocalBlockContext, decision: PolicyDecision
+    ) -> None:
+        if self.mode == NAV_POLICY_HEURISTIC:
+            return
+        # Skip pure rate-limit echoes that change nothing (noise for the UI).
+        if (
+            not decision.queried
+            and decision.fallback_reason.startswith("rate_limited")
+            and decision.applied_action == decision.heuristic_action
+            and self._decision_log
+            and self._decision_log[-1].get("applied_action")
+            == decision.applied_action
+            and self._decision_log[-1].get("jev_action") == decision.jev_action
+        ):
+            return
+        self._decision_seq += 1
+        entry = decision.to_dict()
+        entry.update(
+            {
+                "seq": self._decision_seq,
+                "run_id": self._run_id,
+                "t_wall": time.time(),
+                "t_mono": time.monotonic(),
+            }
+        )
+        if ctx.pose_xy is not None:
+            entry["pose"] = {
+                "x": round(ctx.pose_xy[0], 4),
+                "y": round(ctx.pose_xy[1], 4),
+            }
+        if ctx.goal_xy is not None:
+            entry["goal"] = {
+                "x": round(ctx.goal_xy[0], 4),
+                "y": round(ctx.goal_xy[1], 4),
+            }
+        if ctx.nearest_range_m is not None:
+            entry["nearest_range_m"] = round(float(ctx.nearest_range_m), 3)
+        if ctx.nearest_bearing_rad is not None:
+            entry["nearest_bearing_rad"] = round(float(ctx.nearest_bearing_rad), 3)
+        if ctx.rear_clearance_m is not None:
+            entry["rear_clearance_m"] = round(float(ctx.rear_clearance_m), 3)
+        entry["backup_feasible"] = bool(ctx.backup_feasible)
+        self._decision_log.append(entry)
+
     @property
     def last_decision(self) -> Optional[PolicyDecision]:
         return self._last_decision
@@ -425,6 +489,7 @@ class JevNavPolicy:
             "failed_replan_while_blocked": int(ctx.failed_replan_while_blocked),
             "forward_clearance_m": round(float(ctx.forward_clearance_m), 3),
             "replan_cooldown_ready": bool(ctx.replan_cooldown_ready),
+            "backup_feasible": bool(ctx.backup_feasible),
         }
         if ctx.remaining_path_m is not None:
             features["remaining_path_m"] = round(float(ctx.remaining_path_m), 2)
@@ -470,6 +535,7 @@ class JevNavPolicy:
                 answers=dict(prev.answers) if prev else {},
             )
             self._last_decision = decision
+            self._append_decision_log(ctx, decision)
             self._emit(f"jev_policy {decision.to_dict()}")
             return decision
 
@@ -532,6 +598,7 @@ class JevNavPolicy:
                 error=str(exc),
             )
         self._last_decision = decision
+        self._append_decision_log(ctx, decision)
         self._emit(f"jev_policy {decision.to_dict()}")
         return decision
 

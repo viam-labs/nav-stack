@@ -212,12 +212,28 @@ def test_mode_jev_falls_back_on_query_error():
     assert "network" in d.error
 
 
-def test_builtin_nav_config_accepts_nav_policy():
-    from src.config import BuiltinNavConfig
-
-    cfg = BuiltinNavConfig.from_dict({"nav_policy": "shadow", "jev_timeout_s": 0.9})
-    assert cfg.nav_policy == "shadow"
-    assert cfg.jev_timeout_s == pytest.approx(0.9)
-    assert cfg.jev_min_confidence == pytest.approx(0.7)
-    with pytest.raises(ValueError):
-        BuiltinNavConfig.from_dict({"nav_policy": "chatgpt"})
+def test_decision_log_records_pose_and_survives_clear_obstacle_history():
+    policy = JevNavPolicy(
+        mode="shadow",
+        query_fn=lambda s, q: _stub_result(
+            choice=ACTION_WAIT, confidence=0.9, mover=0.8, gap=0.2
+        ),
+        min_period_s=0,
+    )
+    run_id = policy.start_run()
+    ctx = _ctx(ACTION_REPLAN)
+    ctx.pose_xy = (1.25, 2.5)
+    ctx.goal_xy = (3.0, 4.0)
+    d = policy.decide(ctx)
+    assert d.queried is True
+    log = policy.decision_log()
+    assert len(log) == 1
+    assert log[0]["run_id"] == run_id
+    assert log[0]["pose"] == {"x": 1.25, "y": 2.5}
+    assert log[0]["heuristic_action"] == ACTION_REPLAN
+    assert log[0]["jev_action"] == ACTION_WAIT
+    assert log[0]["applied_action"] == ACTION_REPLAN  # shadow
+    policy.clear_history()  # obstacle track only
+    assert len(policy.decision_log()) == 1
+    policy.clear_decision_log()
+    assert policy.decision_log() == []

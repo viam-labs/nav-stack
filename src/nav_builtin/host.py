@@ -126,6 +126,19 @@ class BuiltinNavHost:
             status["pose_source"] = src()
         return status
 
+    def jev_decision_log(self) -> list:
+        fn = getattr(self._builtin_nav, "jev_decision_log", None)
+        return list(fn()) if callable(fn) else []
+
+    def clear_jev_decision_log(self) -> None:
+        fn = getattr(self._builtin_nav, "clear_jev_decision_log", None)
+        if callable(fn):
+            fn()
+
+    def jev_policy_info(self) -> dict:
+        fn = getattr(self._builtin_nav, "jev_policy_info", None)
+        return dict(fn()) if callable(fn) else {"mode": "heuristic", "entries": 0}
+
     def get_pose_in_map(self) -> Optional[conv.Pose2D]:
         return self._world.get_pose()
 

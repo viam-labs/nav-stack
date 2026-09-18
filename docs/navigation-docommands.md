@@ -295,13 +295,32 @@ await nav.do_command({"command": "resume"})
 | ----------------- | ----------------- | --------------------- | -------------------------------------------------------- |
 | `get_status`      | —                 | —                     | Full nav status (see below)                              |
 | `describe_motion` | `what_am_i_doing` | —                     | Plain-English summary fields from `summarize_nav_motion` |
+| `get_jev_policy_log` | `list_jev_decisions` | optional `limit`, `queried_only` | Timeline of Jev/heuristic decisions for the current/last run |
+| `clear_jev_policy_log` | `clear_jev_decisions` | —              | Clear the decision timeline                              |
 | `test_drive`      | —                 | body twist + duration | Echo of sent body / Viam SetVelocity units               |
 | `get_costmap`     | —                 | `layer`, `stride`     | Base64 costmap grid for UIs                              |
 
 
 ### `get_status`
 
-Includes (among other fields): `state`, `active`, `motion`, `goal`, `pose`, progress / error fields from the follower, `simple_nav`, `route`, `localization_check`, `suspended` / `suspended_goal`, footprint (`footprint_length_m`, `footprint_width_m`, `robot_radius_m`), and when available drive / control-loop stats (`last_drive`, `drive`, `control_loop`, `pose_source`, `nav_backend`).
+Includes (among other fields): `state`, `active`, `motion`, `goal`, `pose`, progress / error fields from the follower (including `progress.jev_policy` when enabled), `simple_nav`, `route`, `localization_check`, `suspended` / `suspended_goal`, footprint (`footprint_length_m`, `footprint_width_m`, `robot_radius_m`), and when available drive / control-loop stats (`last_drive`, `drive`, `control_loop`, `pose_source`, `nav_backend`).
+
+### `get_jev_policy_log`
+
+Returns the decision timeline for the **current or last** navigate run (cleared when a new goal starts). Intended for nav-stack-ui overlays.
+
+| Arg | Notes |
+|---|---|
+| `limit` | Optional max events (most recent) |
+| `queried_only` | If `true`, only entries where TypeSafe was actually called |
+
+Each event includes `seq`, `run_id`, `t_wall`, `t_mono`, `pose` `{x,y}`, `goal` `{x,y}`, `heuristic_action`, `jev_action`, `applied_action`, `confidence`, `queried`, `fallback_reason`, `features`, `answers`, latency/error when present.
+
+```python
+log = await nav.do_command({"command": "get_jev_policy_log"})
+# log["events"] → plot markers along the path in the UI
+await nav.do_command({"command": "clear_jev_policy_log"})
+```
 
 ### `test_drive`
 
@@ -387,6 +406,8 @@ await nav.do_command({"command": "get_costmap", "layer": "local", "stride": 2})
 | `test_drive`           |                            |
 | `get_status`           |                            |
 | `describe_motion`      | `what_am_i_doing`          |
+| `get_jev_policy_log`   | `list_jev_decisions`       |
+| `clear_jev_policy_log` | `clear_jev_decisions`      |
 | `get_costmap`          |                            |
 
 

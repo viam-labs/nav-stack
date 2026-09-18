@@ -882,6 +882,37 @@ class NavServiceBase(Motion):
                 max_vel_x=float(cfg.max_vel_x),
                 max_vel_theta=float(cfg.max_vel_theta),
             )
+        if cmd in (
+            "get_jev_policy_log",
+            "list_jev_decisions",
+            "get_jev_decisions",
+        ):
+            getter = getattr(mgr, "jev_decision_log", None)
+            info_fn = getattr(mgr, "jev_policy_info", None)
+            events = list(getter()) if callable(getter) else []
+            info = dict(info_fn()) if callable(info_fn) else {}
+            limit = command.get("limit")
+            if limit is not None:
+                try:
+                    n = max(1, int(limit))
+                    events = events[-n:]
+                except (TypeError, ValueError):
+                    pass
+            queried_only = bool(command.get("queried_only", False))
+            if queried_only:
+                events = [e for e in events if e.get("queried")]
+            return {
+                "mode": info.get("mode", "heuristic"),
+                "run_id": info.get("run_id", 0),
+                "min_confidence": info.get("min_confidence"),
+                "count": len(events),
+                "events": events,
+            }
+        if cmd in ("clear_jev_policy_log", "clear_jev_decisions"):
+            clearer = getattr(mgr, "clear_jev_decision_log", None)
+            if callable(clearer):
+                clearer()
+            return {"status": "cleared"}
         if cmd == "get_costmap":
             # Inflated costmap for operator UIs (nav-stack-ui Costmap toggle).
             # ``layer``: ``auto`` (local while navigating, else global), ``local``

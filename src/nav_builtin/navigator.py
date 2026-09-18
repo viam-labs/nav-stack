@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import threading
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..config import NavConfig
 from ..geom import conversions as conv
+from .jev_policy import JevNavPolicy, normalize_nav_policy
 from .runtime_kwargs import builtin_nav_runtime_kwargs
 from .supervisor import NavSupervisor
 from .types import Pose2D
@@ -38,6 +39,22 @@ class BuiltinNavigator:
             "goal": None,
             "pose": None,
         }
+        _world_log = getattr(world, "log", None)
+        self._jev_policy = JevNavPolicy(
+            mode=normalize_nav_policy(self._kwargs.get("nav_policy", "heuristic")),
+            min_confidence=float(self._kwargs.get("jev_min_confidence", 0.7)),
+            timeout_s=float(self._kwargs.get("jev_timeout_s", 1.25)),
+            min_period_s=float(self._kwargs.get("jev_min_period_s", 1.0)),
+            history_s=float(self._kwargs.get("jev_history_s", 3.0)),
+            model=str(self._kwargs.get("jev_model") or "jev-latest"),
+            api_key=(
+                str(self._kwargs["jev_api_key"])
+                if self._kwargs.get("jev_api_key")
+                else None
+            ),
+            logger=_world_log if callable(_world_log) else None,
+        )
+        self._kwargs["jev_policy"] = self._jev_policy
 
     def _log(self, msg: str) -> None:
         if self._logger is not None:
@@ -50,6 +67,23 @@ class BuiltinNavigator:
 
     def _new_supervisor(self) -> NavSupervisor:
         return NavSupervisor(self._world, **self._kwargs)
+
+    def jev_decision_log(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return self._jev_policy.decision_log()
+
+    def clear_jev_decision_log(self) -> None:
+        with self._lock:
+            self._jev_policy.clear_decision_log()
+
+    def jev_policy_info(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "mode": self._jev_policy.mode,
+                "min_confidence": self._jev_policy.min_confidence,
+                "run_id": self._jev_policy._run_id,
+                "entries": len(self._jev_policy.decision_log()),
+            }
 
     def navigate(self, x: float, y: float, theta: float) -> None:
         """Start following a goal in a background thread (non-blocking)."""
