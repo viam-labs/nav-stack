@@ -2413,7 +2413,10 @@ class SlamService(SLAM):
                 refine_cmd: dict = {
                     "command": "global_localize",
                     "pose": {"x": pose.x, "y": pose.y, "theta": pose.theta},
-                    "search_radius_m": float(command.get("search_radius_m", 3.0)),
+                    # Keep XY close to the manual seed. A 3 m window was sliding
+                    # ~2 m along repetitive corridor geometry to a slightly
+                    # different local max; 1 m is enough to fix heading/offset.
+                    "search_radius_m": float(command.get("search_radius_m", 1.0)),
                     "local_yaw_window_deg": float(
                         command.get("local_yaw_window_deg", 360.0)
                     ),

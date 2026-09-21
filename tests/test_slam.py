@@ -307,6 +307,7 @@ def test_set_initial_pose_refine_runs_seeded_yaw_search(tmp_path: Path):
     sent = _fake_global_localize.command
     assert sent["pose"] == {"x": 1.0, "y": 2.0, "theta": 0.5}
     assert sent["local_yaw_window_deg"] == 360.0
+    assert sent["search_radius_m"] == 1.0
     assert sent["full_map"] is False
     assert sent["auto_full_map_fallback"] is False
     assert sent["min_apply_score"] == 0.22
