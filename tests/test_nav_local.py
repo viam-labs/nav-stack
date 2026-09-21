@@ -657,9 +657,10 @@ def test_spin_gate_does_not_override_reactive_avoid():
         robot_radius_m=inscribed,
         spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
     )
-    assert progress["obstacle"] in ("avoid", "hold")
-    assert cmd.vx == 0.0
+    assert progress["obstacle"] in ("avoid", "hold", "narrow_reverse")
+    assert cmd.vx <= 0.0
     assert cmd.vtheta == pytest.approx(0.0)
+    # Either full stop (rear blocked) or reverse crawl (rear open).
     assert progress["spin_blocked"] is True
 
 

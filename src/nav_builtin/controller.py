@@ -15,6 +15,7 @@ from ..nav.simple_motion import (
     distance_m,
     forward_clearance_m,
     heading_error_rad,
+    rear_clearance_m,
     spin_clearance_m,
 )
 from ..geom import conversions as conv
@@ -704,9 +705,20 @@ def compute_path_command(
             cmd = DriveCommand(crawl, 0.0, 0.0, False)
             obstacle_state = "narrow"
         else:
-            # Squeeze / avoid / hold: crawling would drive into the obstacle;
-            # inventing a spin swings the bumper into it. Full stop.
-            cmd = DriveCommand(0.0, 0.0, 0.0, False)
+            # Squeeze / avoid / hold: spinning swings the bumper into the
+            # pinch. Prefer a short reverse when the rear is open so wait/
+            # replan is not a deadlock; otherwise full stop.
+            rear = rear_clearance_m(scan)
+            rear_need = max(0.25, float(robot_radius_m) + 0.08)
+            if math.isfinite(rear) and rear >= rear_need:
+                back = min(
+                    max(float(cfg.motion.min_linear_mps), 0.10),
+                    0.18,
+                )
+                cmd = DriveCommand(-back, 0.0, 0.0, False)
+                obstacle_state = "narrow_reverse"
+            else:
+                cmd = DriveCommand(0.0, 0.0, 0.0, False)
 
     # Costmap hard stop: lidar cone can look clear while the robot is already
     # driving into an inflated blob beside the nose (or while misaligned). If

@@ -1229,23 +1229,34 @@ class NavSupervisor:
                 }
 
                 if waiting_for_clear:
-                    # Freeze translation only — still allow rotate-to-heading so
-                    # a large bearing error can shrink while we wait.
-                    keep_yaw = (
-                        abs(cmd.vx) < 1e-6
-                        and abs(cmd.vy) < 1e-6
-                        and abs(cmd.vtheta) > 1e-6
-                    )
-                    cmd = DriveCommand(
-                        0.0, 0.0, cmd.vtheta if keep_yaw else 0.0, False
-                    )
-                    progress = {
-                        **progress,
-                        "obstacle": "wait",
-                        "local_planner": False,
-                        "cmd_vx_mps": 0.0,
-                        "cmd_vtheta_rad_s": cmd.vtheta,
-                    }
+                    # Freeze forward motion for dynamic crossers, but keep a
+                    # spin-blocked reverse crawl (otherwise avoid→spin_block→
+                    # wait deadlocks with cmd stuck at zero). Still allow
+                    # rotate-to-heading when that is the only command.
+                    if cmd.vx < -1e-6 and abs(cmd.vtheta) < 1e-6:
+                        progress = {
+                            **progress,
+                            "obstacle": "wait_reverse",
+                            "local_planner": False,
+                            "cmd_vx_mps": cmd.vx,
+                            "cmd_vtheta_rad_s": 0.0,
+                        }
+                    else:
+                        keep_yaw = (
+                            abs(cmd.vx) < 1e-6
+                            and abs(cmd.vy) < 1e-6
+                            and abs(cmd.vtheta) > 1e-6
+                        )
+                        cmd = DriveCommand(
+                            0.0, 0.0, cmd.vtheta if keep_yaw else 0.0, False
+                        )
+                        progress = {
+                            **progress,
+                            "obstacle": "wait",
+                            "local_planner": False,
+                            "cmd_vx_mps": 0.0,
+                            "cmd_vtheta_rad_s": cmd.vtheta,
+                        }
                     last_progress_at = now
                     last_progress_pose = pose
                     last_progress_dist = distance_m(pose, goal)
