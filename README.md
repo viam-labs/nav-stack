@@ -240,8 +240,9 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
 Optional TypeSafe/Jev overlay on local-block wait/peel/replan decisions:
 `builtin.nav_policy` = `heuristic` (default) | `shadow` | `jev` | `random`. Use `shadow` on
 a real robot first (logs both sides, still runs heuristics). `random` picks uniformly among
-executable actions (same gates as `jev`, no API). For `shadow`/`jev` set
-`TYPESAFE_API_KEY` or `builtin.jev_api_key`. See
+executable actions (same gates as `jev`, no API). Soft consults (`jev_soft_consult`, default
+on) also fire when path cost is elevated but not hard-blocked, with `local_geometry` gap
+widths. For `shadow`/`jev` set `TYPESAFE_API_KEY` or `builtin.jev_api_key`. See
 [`docs/navigation-docommands.md`](docs/navigation-docommands.md) “Optional Jev local-block policy”.
 
 #### MoveOnMap (Motion API)

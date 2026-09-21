@@ -9,8 +9,10 @@ Modes (``builtin.nav_policy``):
 - ``random`` — pick uniformly among currently executable actions (same
   gates as Jev); no TypeSafe call. Useful as an A/B baseline vs ``jev``.
 
-Never runs on the free-path control tick — only when the supervisor already
-sees a local block and would consult ``_local_block_action``.
+Never runs on the free-path control tick unless soft consult is enabled —
+then it may also fire when path cost is elevated but not yet hard-blocked
+(mover-ahead / early detour). Hard-block consults still own backup /
+wide_replan / abort.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ import random
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Protocol, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +54,9 @@ ACTIONS = (
     ACTION_WIDE_REPLAN,
     ACTION_ABORT,
 )
+
+CONSULT_HARD = "hard"
+CONSULT_SOFT = "soft"
 
 
 def normalize_nav_policy(raw: Any) -> str:
@@ -125,6 +130,94 @@ class LocalBlockContext:
     abort_available: bool = False
     abort_denial_reason: str = ""
     backup_max_attempts: int = 0
+    # ``hard`` = fully blocked recovery; ``soft`` = elevated path cost /
+    # mover-ahead before the hard activate threshold.
+    consult_kind: str = CONSULT_HARD
+    # Compact corridor geometry along heading (see ``corridor_gap_features``).
+    local_geometry: Optional[Mapping[str, Any]] = None
+
+
+class _CostLookup(Protocol):
+    def cost_at_world(self, x_m: float, y_m: float) -> int: ...
+
+
+def corridor_gap_features(
+    view: _CostLookup,
+    *,
+    x: float,
+    y: float,
+    theta: float,
+    ranges_m: Sequence[float] = (0.5, 1.0, 1.5, 2.0),
+    max_side_m: float = 1.5,
+    step_m: float = 0.05,
+    block_cost: int = 253,
+) -> Dict[str, Any]:
+    """Measure free half-widths along the robot heading at sample ranges.
+
+    Gives Jev a cheap local free-space sketch (gap sealed vs side pocket)
+    without shipping the whole costmap.
+    """
+    cth = math.cos(float(theta))
+    sth = math.sin(float(theta))
+    # Body left / right are +90° / −90° from heading.
+    lx, ly = -sth, cth
+    rx, ry = sth, -cth
+    step = max(0.02, float(step_m))
+    max_side = max(step, float(max_side_m))
+    samples: List[Dict[str, Any]] = []
+
+    def _half_width(ox: float, oy: float, dx: float, dy: float) -> float:
+        dist = 0.0
+        while dist + step <= max_side + 1e-9:
+            dist += step
+            if int(view.cost_at_world(ox + dx * dist, oy + dy * dist)) >= int(
+                block_cost
+            ):
+                return max(0.0, dist - step)
+        return float(max_side)
+
+    for ahead in ranges_m:
+        ax = float(x) + float(ahead) * cth
+        ay = float(y) + float(ahead) * sth
+        left = _half_width(ax, ay, lx, ly)
+        right = _half_width(ax, ay, rx, ry)
+        samples.append(
+            {
+                "ahead_m": round(float(ahead), 2),
+                "free_left_m": round(left, 3),
+                "free_right_m": round(right, 3),
+                "gap_m": round(left + right, 3),
+                "center_cost": int(view.cost_at_world(ax, ay)),
+            }
+        )
+    gaps = [float(s["gap_m"]) for s in samples] or [0.0]
+    sealed = [s for s in samples if float(s["gap_m"]) < 0.35]
+    return {
+        "samples": samples,
+        "min_gap_m": round(min(gaps), 3),
+        "min_gap_ahead_m": (
+            float(samples[gaps.index(min(gaps))]["ahead_m"]) if samples else None
+        ),
+        "sealed_count": len(sealed),
+    }
+
+
+def soft_consult_heuristic(
+    *,
+    likely_mover: bool,
+    nose_clear: bool,
+    path_ahead_cost: int,
+    soft_cost: int,
+    activate_cost: int,
+) -> str:
+    """Heuristic for soft (pre-hard-block) consults."""
+    del activate_cost
+    if likely_mover and nose_clear:
+        return ACTION_WAIT
+    if int(path_ahead_cost) >= int(soft_cost) + 40:
+        # Cost climbing toward hard block with no mover signal → early detour.
+        return ACTION_REPLAN
+    return ACTION_KEEP_DWA
 
 
 @dataclass
@@ -397,7 +490,12 @@ def build_policy_state(
     """
     stuck_keys = ("progress_m", "yaw_delta_rad", "window_s")
     state: Dict[str, Any] = {
-        "task": "mobile_robot_local_navigation_block",
+        "task": (
+            "mobile_robot_local_navigation_soft"
+            if str(ctx.consult_kind) == CONSULT_SOFT
+            else "mobile_robot_local_navigation_block"
+        ),
+        "consult_kind": str(ctx.consult_kind or CONSULT_HARD),
         "heuristic_action": ctx.heuristic_action,
         "nose_clear": ctx.nose_clear,
         "blocked_for_s": round(float(ctx.blocked_for_s), 3),
@@ -515,6 +613,8 @@ def build_policy_state(
         state["pose_xy"] = [round(ctx.pose_xy[0], 3), round(ctx.pose_xy[1], 3)]
     if ctx.goal_xy is not None:
         state["goal_xy"] = [round(ctx.goal_xy[0], 3), round(ctx.goal_xy[1], 3)]
+    if ctx.local_geometry:
+        state["local_geometry"] = dict(ctx.local_geometry)
     return state
 
 
@@ -525,19 +625,22 @@ def build_policy_questions() -> Dict[str, Any]:
     return {
         "action": Choice(
             instructions=(
-                "A mobile robot following a planned path is locally blocked. "
-                "Choose the single next action that gets it to the goal soonest "
-                "without collision. The state gives obstacle clearances, obstacle "
-                "motion history, robot displacement over the recent window, which "
-                "actions the controller has already been applying and for how "
-                "long (recent_actions), whole-run counters (run: elapsed, block "
-                "episodes, total blocked time, progress over 10 s / 30 s, "
-                "replans failed/accepted, backups used), and the outcomes of "
-                "recent global replan attempts (last_replan). backup, "
-                "wide_replan and abort are only executable when their "
-                "feasible/available flag is true. Weigh each action by whether "
-                "it is likely to change the situation given what has already "
-                "been tried."
+                "A mobile robot following a planned path needs a decision. "
+                "consult_kind=hard means it is locally blocked; soft means path "
+                "cost is rising or a mover may be ahead but it is not hard-blocked "
+                "yet. Choose the single next action that gets it to the goal "
+                "soonest without collision. The state gives obstacle clearances, "
+                "local_geometry (free left/right gap widths along heading), "
+                "obstacle motion history, robot displacement over the recent "
+                "window, which actions the controller has already been applying "
+                "and for how long (recent_actions), whole-run counters (run), and "
+                "recent global replan outcomes (last_replan). On soft consults "
+                "only wait / keep_dwa / replan are valid — use wait for temporary "
+                "movers, replan for an early detour around a sealed corridor, "
+                "keep_dwa to continue. On hard blocks, backup / wide_replan / "
+                "abort are only executable when their feasible/available flag is "
+                "true. Weigh each action by whether it is likely to change the "
+                "situation given what has already been tried."
             ),
             criteria={
                 ACTION_WAIT: "Stop and hold position",
@@ -560,21 +663,23 @@ def build_policy_questions() -> Dict[str, Any]:
         "gap_worth_trying": Noul(
             instructions=(
                 "Is it plausible the robot can inch/peel through or around the "
-                "block from here, given forward/left/right clearances and what "
-                "keep_dwa has achieved so far (recent_actions, motion_while_blocked)?"
+                "block from here, given forward/left/right clearances, "
+                "local_geometry.min_gap_m / sealed_count, and what keep_dwa has "
+                "achieved so far (recent_actions, motion_while_blocked)?"
             )
         ),
         "should_backup": Noul(
             instructions=(
                 "Would reversing a short distance and replanning from there "
                 "likely open a path that is not available from the current pose? "
-                "Only meaningful when backup.feasible is true."
+                "Only meaningful when backup.feasible is true (hard consult)."
             )
         ),
         "replan_urgency": Score(
             instructions=(
                 "How likely is a fresh global replan from the current pose to "
-                "find a usable path, given last_replan outcomes and their age?"
+                "find a usable path, given last_replan outcomes, their age, and "
+                "local_geometry (sealed gaps favor replan / wide_replan)?"
             ),
             criteria=["low", "medium", "high"],
         ),
@@ -612,8 +717,14 @@ def available_policy_actions(
     backup_feasible: bool = False,
     wide_replan_available: bool = False,
     abort_available: bool = False,
+    consult_kind: str = CONSULT_HARD,
 ) -> List[str]:
-    """Executable action set for ``random`` / Jev (same hard gates)."""
+    """Executable action set for ``random`` / Jev (same hard gates).
+
+    Soft consults only offer wait / keep_dwa / replan — no reverse or abort.
+    """
+    if str(consult_kind) == CONSULT_SOFT:
+        return [ACTION_WAIT, ACTION_KEEP_DWA, ACTION_REPLAN]
     actions = [ACTION_WAIT, ACTION_KEEP_DWA, ACTION_REPLAN]
     if backup_feasible:
         actions.append(ACTION_BACKUP)
@@ -631,12 +742,14 @@ def map_jev_to_action(
     backup_feasible: bool = False,
     wide_replan_available: bool = False,
     abort_available: bool = False,
+    consult_kind: str = CONSULT_HARD,
     **_ignored: Any,
 ) -> str:
     """Turn Jev's Choice into a supervisor action.
 
     Jev decides. Code applies only hard executability gates:
     - unknown choice → heuristic
+    - soft consult → only wait / keep_dwa / replan
     - ``backup`` when reverse is not physically feasible → heuristic (or wait)
     - ``wide_replan`` when not available (cooldown) → ``replan`` if that is
       allowed, else heuristic
@@ -650,6 +763,12 @@ def map_jev_to_action(
         else ACTION_WAIT
     )
     if action not in ACTIONS:
+        return fallback
+    if str(consult_kind) == CONSULT_SOFT and action not in (
+        ACTION_WAIT,
+        ACTION_KEEP_DWA,
+        ACTION_REPLAN,
+    ):
         return fallback
     if action == ACTION_BACKUP and not backup_feasible:
         # Never reverse into unknown rear space.
@@ -722,6 +841,10 @@ class JevNavPolicy:
         self._history.clear()
         self._applied_history.clear()
         self._last_state_key = None
+
+    def motion_snapshot(self) -> Dict[str, Any]:
+        """Obstacle-motion features over the recent history window."""
+        return obstacle_motion_features(list(self._history))
 
     def start_run(self) -> int:
         """Begin a new navigate run; clears the decision timeline for the UI."""
@@ -800,6 +923,7 @@ class JevNavPolicy:
     def _state_key(ctx: LocalBlockContext) -> tuple:
         """Coarse situation fingerprint; a change invalidates a reused answer."""
         return (
+            str(ctx.consult_kind or CONSULT_HARD),
             bool(ctx.nose_clear),
             bool(ctx.backup_feasible),
             bool(ctx.wide_replan_available),
@@ -807,6 +931,7 @@ class JevNavPolicy:
             tuple(ctx.block_reasons),
             int(ctx.failed_replan_while_blocked),
             ctx.last_replan_accepted is not None,
+            int(ctx.path_ahead_cost) // 40,
         )
 
     def clear_decision_log(self) -> None:
@@ -876,6 +1001,7 @@ class JevNavPolicy:
         run = self._run.to_dict(now)
         features = {
             **motion,
+            "consult_kind": str(ctx.consult_kind or CONSULT_HARD),
             "nose_clear": ctx.nose_clear,
             "blocked_for_s": round(float(ctx.blocked_for_s), 3),
             "path_ahead_cost": int(ctx.path_ahead_cost),
@@ -898,6 +1024,8 @@ class JevNavPolicy:
             features["left_clearance_m"] = round(float(ctx.left_clearance_m), 3)
         if ctx.right_clearance_m is not None:
             features["right_clearance_m"] = round(float(ctx.right_clearance_m), 3)
+        if ctx.local_geometry:
+            features["local_geometry"] = dict(ctx.local_geometry)
         if ctx.cmd_vx_mps is not None:
             features["cmd_vx_mps"] = round(float(ctx.cmd_vx_mps), 3)
         if ctx.cmd_vtheta_rad_s is not None:
@@ -983,6 +1111,7 @@ class JevNavPolicy:
                 backup_feasible=bool(ctx.backup_feasible),
                 wide_replan_available=bool(ctx.wide_replan_available),
                 abort_available=bool(ctx.abort_available),
+                consult_kind=str(ctx.consult_kind or CONSULT_HARD),
             )
             fallback = "" if not situation_changed else "requeried_state_change"
             if self.mode == NAV_POLICY_SHADOW:
@@ -1044,6 +1173,7 @@ class JevNavPolicy:
             backup_feasible=bool(ctx.backup_feasible),
             wide_replan_available=bool(ctx.wide_replan_available),
             abort_available=bool(ctx.abort_available),
+            consult_kind=str(ctx.consult_kind or CONSULT_HARD),
         )
         if rate_limited and not situation_changed:
             prev = self._last_decision

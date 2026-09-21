@@ -31,13 +31,18 @@ from .local_costmap import (
     reverse_backup_feasible,
 )
 from .jev_policy import (
+    CONSULT_HARD,
+    CONSULT_SOFT,
     JevNavPolicy,
     LocalBlockContext,
+    NAV_POLICY_HEURISTIC,
     ObstacleSample,
     backup_denial_reason,
     classify_block_reasons,
+    corridor_gap_features,
     nearest_scan_obstacle,
     normalize_nav_policy,
+    soft_consult_heuristic,
 )
 from .local_planner import LocalPlannerConfig
 from .planner import (
@@ -121,6 +126,11 @@ class NavSupervisor:
         self._jev_allow_abort = bool(kw.get("jev_allow_abort", True))
         self._jev_abort_min_blocked_s = max(
             0.0, float(kw.get("jev_abort_min_blocked_s", 15.0))
+        )
+        self._jev_soft_consult = bool(kw.get("jev_soft_consult", True))
+        soft_cost_raw = kw.get("jev_soft_path_cost")
+        self._jev_soft_path_cost = (
+            int(soft_cost_raw) if soft_cost_raw is not None else None
         )
         drive_timeout_streak = kw["drive_timeout_streak"]
         yaw_align_timeout_s = kw["yaw_align_timeout_s"]
@@ -1171,6 +1181,27 @@ class NavSupervisor:
                 jev_wants_backup = False
                 jev_wants_wide_replan = False
                 jev_wants_abort = False
+                soft_cost = (
+                    int(self._jev_soft_path_cost)
+                    if self._jev_soft_path_cost is not None
+                    else max(1, int(0.55 * float(self._local_planner_activate_cost)))
+                )
+                local_geometry = None
+                if local_view is not None and (
+                    local_blocked or int(path_ahead_cost) >= soft_cost
+                ):
+                    try:
+                        from .costmap import INSCRIBED as _GAP_BLOCK
+
+                        local_geometry = corridor_gap_features(
+                            local_view,
+                            x=float(pose.x),
+                            y=float(pose.y),
+                            theta=float(pose.theta),
+                            block_cost=int(_GAP_BLOCK),
+                        )
+                    except Exception:  # noqa: BLE001
+                        local_geometry = None
                 # Run-level facts for the policy (every tick, blocked or not).
                 tick_dt = (
                     max(0.0, now - last_tick_now)
@@ -1389,6 +1420,8 @@ class NavSupervisor:
                             abort_available=abort_ok,
                             abort_denial_reason=abort_denial,
                             backup_max_attempts=int(self._backup_max_attempts),
+                            consult_kind=CONSULT_HARD,
+                            local_geometry=local_geometry,
                         )
                     )
                     action = policy.applied_action
@@ -1448,6 +1481,161 @@ class NavSupervisor:
                             rotate_active = False
                         else:
                             failed_replan_while_blocked += 1
+                elif (
+                    self._jev_soft_consult
+                    and self._jev_policy.mode != NAV_POLICY_HEURISTIC
+                    and int(path_ahead_cost) >= soft_cost
+                    and local_view is not None
+                ):
+                    # Soft consult: elevated path cost / possible mover before
+                    # hard activate. Only wait / keep_dwa / replan.
+                    cooldown_ready = (
+                        now - last_local_replan_at >= self._replan_local_min_period_s
+                    )
+                    fwd_clear = (
+                        forward_clearance_m(scan, obs_cfg)
+                        if (
+                            scan is not None
+                            and obs_cfg is not None
+                            and obs_cfg.enabled
+                        )
+                        else float("inf")
+                    )
+                    near_r, near_b = nearest_scan_obstacle(scan)
+                    left_clear: Optional[float] = None
+                    right_clear: Optional[float] = None
+                    if scan is not None and obs_cfg is not None and obs_cfg.enabled:
+                        half = float(obs_cfg.front_cone_half_rad)
+                        side = float(getattr(obs_cfg, "side_cone_rad", 1.2) or 1.2)
+                        try:
+                            lc = cone_min_range(scan, half, side)
+                            rc = cone_min_range(scan, -side, -half)
+                            left_clear = (
+                                float(lc) if math.isfinite(lc) else None
+                            )
+                            right_clear = (
+                                float(rc) if math.isfinite(rc) else None
+                            )
+                        except Exception:  # noqa: BLE001
+                            left_clear = right_clear = None
+                    self._jev_policy.record_obstacle(
+                        ObstacleSample(
+                            t=now,
+                            nose_clear=nose_clear,
+                            forward_clearance_m=float(fwd_clear)
+                            if math.isfinite(fwd_clear)
+                            else 99.0,
+                            path_ahead_cost=int(path_ahead_cost),
+                            obstacle_state=str(last_obstacle_state or "soft"),
+                            nearest_range_m=near_r,
+                            nearest_bearing_rad=near_b,
+                            pose_x=float(pose.x),
+                            pose_y=float(pose.y),
+                            pose_theta=float(pose.theta),
+                        )
+                    )
+                    motion_soft = self._jev_policy.motion_snapshot()
+                    soft_heuristic = soft_consult_heuristic(
+                        likely_mover=bool(motion_soft.get("likely_mover")),
+                        nose_clear=nose_clear,
+                        path_ahead_cost=int(path_ahead_cost),
+                        soft_cost=int(soft_cost),
+                        activate_cost=int(self._local_planner_activate_cost),
+                    )
+                    remaining_m = None
+                    try:
+                        from .controller import _path_length
+                        from .path_utils import closest_point_on_path
+
+                        _, _, _, along = closest_point_on_path(pose, path)
+                        remaining_m = max(0.0, _path_length(path) - along)
+                    except Exception:  # noqa: BLE001
+                        remaining_m = None
+                    replan_info = dict(self._last_replan_info or {})
+                    replan_age: Optional[float] = (
+                        max(0.0, now - last_local_replan_at)
+                        if last_local_replan_at > 0.0 and replan_info
+                        else None
+                    )
+                    soft_policy = self._jev_policy.decide(
+                        LocalBlockContext(
+                            heuristic_action=soft_heuristic,
+                            nose_clear=nose_clear,
+                            blocked_for_s=0.0,
+                            wait_before_replan_s=wait_before_replan_s,
+                            replan_cooldown_ready=cooldown_ready,
+                            path_ahead_cost=int(path_ahead_cost),
+                            obstacle_state=str(last_obstacle_state or "soft"),
+                            forward_clearance_m=float(fwd_clear)
+                            if math.isfinite(fwd_clear)
+                            else 99.0,
+                            remaining_path_m=remaining_m,
+                            nearest_range_m=near_r,
+                            nearest_bearing_rad=near_b,
+                            pose_xy=(float(pose.x), float(pose.y)),
+                            goal_xy=(float(goal.x), float(goal.y)),
+                            pose_cost=int(pose_cost),
+                            left_clearance_m=left_clear,
+                            right_clearance_m=right_clear,
+                            cmd_vx_mps=(
+                                float(prev_cmd.vx) if prev_cmd is not None else 0.0
+                            ),
+                            cmd_vtheta_rad_s=(
+                                float(prev_cmd.vtheta)
+                                if prev_cmd is not None
+                                else 0.0
+                            ),
+                            bearing_error_rad=float(last_bearing_error_rad),
+                            local_planner_active=bool(local_planner_active),
+                            last_replan_accepted=replan_info.get("accepted"),
+                            last_replan_attempts=list(
+                                replan_info.get("attempts") or []
+                            ),
+                            last_replan_error=str(self._last_replan_error or ""),
+                            last_replan_age_s=replan_age,
+                            pose_theta=float(pose.theta),
+                            block_reasons=("soft_path_cost",),
+                            consult_kind=CONSULT_SOFT,
+                            local_geometry=local_geometry,
+                            # Soft: escalations not offered.
+                            backup_feasible=False,
+                            wide_replan_available=False,
+                            abort_available=False,
+                        )
+                    )
+                    soft_action = soft_policy.applied_action
+                    if soft_action == "wait":
+                        waiting_for_clear = True
+                    elif soft_action == "replan" and cooldown_ready:
+                        _trig = (
+                            f"soft_consult cost={path_ahead_cost} "
+                            f"nose_clear={nose_clear}"
+                        )
+                        self._stop_before_replan(_trig)
+                        new_path = self._try_replan(
+                            goal,
+                            pose,
+                            path,
+                            scan,
+                            failed_count=0,
+                            require_different=True,
+                            local_view=local_view,
+                            trigger=_trig,
+                            wide=False,
+                        )
+                        replan_finished = time.monotonic()
+                        last_local_replan_at = replan_finished
+                        last_replan = replan_finished
+                        self._jev_policy.note_replan(
+                            accepted=new_path is not None, wide=False
+                        )
+                        if new_path is not None:
+                            path = new_path
+                            self._jev_policy.clear_history()
+                            prev_local_cmd = None
+                            local_planner_active = False
+                            prev_cmd = None
+                            rotate_active = False
                 elif local_blocked_since is not None:
                     # Unblocked this tick, but keep the episode open until the
                     # robot has clearly left the block (time + distance), so a

@@ -35,7 +35,10 @@ def test_normalize_nav_policy():
 
 
 def test_available_policy_actions_respects_gates():
-    from src.nav_builtin.jev_policy import available_policy_actions
+    from src.nav_builtin.jev_policy import (
+        CONSULT_SOFT,
+        available_policy_actions,
+    )
 
     assert available_policy_actions() == [
         ACTION_WAIT,
@@ -56,6 +59,104 @@ def test_available_policy_actions_respects_gates():
         ACTION_WIDE_REPLAN,
         ACTION_ABORT,
     ]
+    soft = available_policy_actions(
+        backup_feasible=True,
+        wide_replan_available=True,
+        abort_available=True,
+        consult_kind=CONSULT_SOFT,
+    )
+    assert soft == [ACTION_WAIT, ACTION_KEEP_DWA, ACTION_REPLAN]
+
+
+def test_corridor_gap_features_open_vs_sealed():
+    from src.nav_builtin.costmap import INSCRIBED
+    from src.nav_builtin.jev_policy import corridor_gap_features
+
+    class _Open:
+        def cost_at_world(self, x_m, y_m):
+            return 0
+
+    class _Sealed:
+        def cost_at_world(self, x_m, y_m):
+            # Wall across x>=0.6, free behind the robot.
+            return INSCRIBED if x_m >= 0.6 else 0
+
+    open_g = corridor_gap_features(_Open(), x=0.0, y=0.0, theta=0.0)
+    assert open_g["min_gap_m"] >= 2.9
+    assert open_g["sealed_count"] == 0
+
+    sealed = corridor_gap_features(_Sealed(), x=0.0, y=0.0, theta=0.0)
+    assert sealed["min_gap_m"] < 0.35
+    assert sealed["sealed_count"] >= 1
+
+
+def test_soft_consult_heuristic_and_gates():
+    from src.nav_builtin.jev_policy import (
+        CONSULT_SOFT,
+        map_jev_to_action,
+        soft_consult_heuristic,
+    )
+
+    assert (
+        soft_consult_heuristic(
+            likely_mover=True,
+            nose_clear=True,
+            path_ahead_cost=120,
+            soft_cost=110,
+            activate_cost=200,
+        )
+        == ACTION_WAIT
+    )
+    assert (
+        soft_consult_heuristic(
+            likely_mover=False,
+            nose_clear=True,
+            path_ahead_cost=160,
+            soft_cost=110,
+            activate_cost=200,
+        )
+        == ACTION_REPLAN
+    )
+    assert (
+        soft_consult_heuristic(
+            likely_mover=False,
+            nose_clear=True,
+            path_ahead_cost=120,
+            soft_cost=110,
+            activate_cost=200,
+        )
+        == ACTION_KEEP_DWA
+    )
+    # Soft consult must not apply backup/abort even if Jev asks.
+    assert (
+        map_jev_to_action(
+            choice=ACTION_BACKUP,
+            heuristic_action=ACTION_KEEP_DWA,
+            backup_feasible=True,
+            consult_kind=CONSULT_SOFT,
+        )
+        == ACTION_KEEP_DWA
+    )
+    assert (
+        map_jev_to_action(
+            choice=ACTION_ABORT,
+            heuristic_action=ACTION_WAIT,
+            abort_available=True,
+            consult_kind=CONSULT_SOFT,
+        )
+        == ACTION_WAIT
+    )
+
+
+def test_builtin_nav_config_accepts_soft_consult():
+    from src.config import BuiltinNavConfig
+
+    cfg = BuiltinNavConfig.from_dict(
+        {"nav_policy": "jev", "jev_soft_consult": True, "jev_soft_path_cost": 100}
+    )
+    assert cfg.jev_soft_consult is True
+    assert cfg.jev_soft_path_cost == 100
+    assert BuiltinNavConfig.from_dict({}).jev_soft_path_cost is None
 
 
 def test_obstacle_motion_features_mover_vs_fixed():

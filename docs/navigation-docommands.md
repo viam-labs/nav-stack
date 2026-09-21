@@ -237,6 +237,8 @@ Configure under the navigation service `builtin` block (or top-level aliases whe
 | `jev_api_key` | _(env)_ | Or set `TYPESAFE_API_KEY` on the machine |
 | `jev_allow_abort` | `true` | Offer `abort` to Jev / random at all |
 | `jev_abort_min_blocked_s` | `15` | `abort` only becomes available after this much cumulative blocked time in the run |
+| `jev_soft_consult` | `true` | Also consult when path cost is elevated but not yet hard-blocked (movers / early detours). Soft actions: `wait` / `keep_dwa` / `replan` only |
+| `jev_soft_path_cost` | _(0.55 × activate)_ | Path-ahead cost that arms soft consult; default ≈ `0.55 * local_planner_activate_cost` |
 
 **Modes**
 
@@ -246,6 +248,8 @@ Configure under the navigation service `builtin` block (or top-level aliases whe
   - `wide_replan` — global replan that seals the current corridor with a footprint-wide band 3.5 m ahead and accepts up to 3× the remaining length. Available when the replan cooldown has elapsed.
   - `abort` — fail this goal now (`state: failed`, `error_msg: "aborted by nav policy: …"`) so a route loop can move on. Available only after `jev_abort_min_blocked_s` of cumulative blocked time.
 - `random` — same executable action set and safety gates as `jev`, but pick uniformly at random (no API key / TypeSafe). Good A/B baseline vs `jev`.
+
+Hard consults include `local_geometry` (free left/right gap widths at 0.5–2 m ahead). Soft consults fire before the hard activate cost so Jev can wait for movers or replan early; `consult_kind` is `soft` or `hard` in the state / decision log.
 
 A local-block **episode** now survives brief cost flicker: it only ends after the robot has been unblocked for ≥2 s *and* moved ≥0.3 m, so `blocked_for_s` and the obstacle history are not wiped every time DWA nudges the path cost under the threshold.
 

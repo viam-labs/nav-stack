@@ -532,6 +532,12 @@ class BuiltinNavConfig:
     # in the run (it is irreversible: the goal fails). 0 disables the gate.
     jev_allow_abort: bool = True
     jev_abort_min_blocked_s: float = 15.0
+    # Soft (pre-hard-block) consults when path cost is elevated or a mover
+    # may be ahead. Offers only wait / keep_dwa / replan. Default on for
+    # non-heuristic nav_policy modes.
+    jev_soft_consult: bool = True
+    # Path-ahead cost that arms soft consult. None → 0.55 × local_planner_activate_cost.
+    jev_soft_path_cost: Optional[int] = None
     # Command slew limits (the base has no onboard ramp). Requests to stop
     # translating are never slewed, so stop distances are unaffected.
     max_linear_accel_mps2: float = 0.8
@@ -567,6 +573,13 @@ class BuiltinNavConfig:
                     f"got {d.get('nav_policy')!r}"
                 )
             overrides["nav_policy"] = name
+        if "jev_soft_path_cost" in d and d.get("jev_soft_path_cost") is not None:
+            soft = int(d["jev_soft_path_cost"])
+            if soft < 0:
+                raise ValueError(
+                    f"builtin.jev_soft_path_cost must be >= 0, got {soft}"
+                )
+            overrides["jev_soft_path_cost"] = soft
         return _dataclass_from_dict(cls, d, overrides=overrides)
 
 
