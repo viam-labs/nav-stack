@@ -19,7 +19,7 @@ from ..nav.simple_motion import (
     spin_clearance_m,
 )
 from ..geom import conversions as conv
-from .local_costmap import LocalCostmapView
+from .local_costmap import LocalCostmapView, spin_disc_blocked
 from .local_planner import LocalPlannerConfig, compute_local_command
 from .path_utils import closest_point_on_path, signed_crosstrack_m
 from .types import Path2D, Pose2D
@@ -688,13 +688,23 @@ def compute_path_command(
         float(spin_radius_m) if spin_radius_m is not None else float(robot_radius_m)
     )
     spin_blocked = False
-    if (
+    scan_spin_hit = (
         scan is not None
-        and not near_goal
+        and spin_clearance_m(scan) < spin_radius + 0.05
+    )
+    cost_spin_hit = (
+        local_view is not None
+        and spin_radius > float(robot_radius_m)
+        and spin_disc_blocked(
+            local_view, current.x, current.y, spin_radius_m=spin_radius
+        )
+    )
+    if (
+        not near_goal
         and spin_radius > float(robot_radius_m)
         and abs(cmd.vx) < 0.02
         and abs(cmd.vtheta) > 0.05
-        and spin_clearance_m(scan) < spin_radius + 0.05
+        and (scan_spin_hit or cost_spin_hit)
     ):
         spin_blocked = True
         if obstacle_state in ("clear", "slow"):
@@ -708,7 +718,9 @@ def compute_path_command(
             # Squeeze / avoid / hold: spinning swings the bumper into the
             # pinch. Prefer a short reverse when the rear is open so wait/
             # replan is not a deadlock; otherwise full stop.
-            rear = rear_clearance_m(scan)
+            rear = (
+                rear_clearance_m(scan) if scan is not None else 0.0
+            )
             rear_need = max(0.25, float(robot_radius_m) + 0.08)
             if math.isfinite(rear) and rear >= rear_need:
                 back = min(
@@ -754,8 +766,18 @@ def compute_path_command(
                 # the spin disc is clear; otherwise full stop (do not invent
                 # a freer-flank spin into a shoulder obstacle).
                 keep_yaw = abs(cmd.vtheta) > 1e-6
-                if keep_yaw and scan is not None and spin_radius > float(robot_radius_m):
-                    if spin_clearance_m(scan) < spin_radius + 0.05:
+                if keep_yaw and spin_radius > float(robot_radius_m):
+                    scan_hit = (
+                        scan is not None
+                        and spin_clearance_m(scan) < spin_radius + 0.05
+                    )
+                    cost_hit = spin_disc_blocked(
+                        local_view,
+                        current.x,
+                        current.y,
+                        spin_radius_m=spin_radius,
+                    )
+                    if scan_hit or cost_hit:
                         keep_yaw = False
                         spin_blocked = True
                 if keep_yaw:

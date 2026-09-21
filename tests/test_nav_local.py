@@ -134,6 +134,112 @@ def test_local_costmap_syncs_stale_scan_pose():
     assert view.cost_at_world(2.0, 0.0) == 0
 
 
+def test_local_costmap_persists_hits_after_scan_loses_them():
+    """Low obstacles drop out of depth/lidar FOV on rotate — keep them briefly."""
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=3.0,
+            height_m=3.0,
+            resolution=0.05,
+            inflation_radius_m=0.10,
+            robot_radius_m=0.05,
+            use_global_static=False,
+            scan_persist_decay=20,
+        )
+    )
+    pose = conv.Pose2D(1.5, 1.5, 0.0)
+    n = 72
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 0.6  # ahead
+    hit = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(pose, hit)
+    assert view.cost_at_world(2.1, 1.5) > 0
+
+    clear = conv.LaserScan2D(
+        np.full(n, np.inf),
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    # Still marked after a clear scan (decayed, not wiped).
+    view2 = lc.update(pose, clear)
+    assert view2.cost_at_world(2.1, 1.5) > 0
+    # Eventually decays away.
+    for _ in range(8):
+        view2 = lc.update(pose, clear)
+    assert view2.cost_at_world(2.1, 1.5) == 0
+
+
+def test_spin_gate_uses_persisted_costmap_when_scan_is_clear():
+    """Rotate-to-heading must not swing through a just-seen, now-blind blob."""
+    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
+
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=3.0,
+            height_m=3.0,
+            resolution=0.05,
+            inflation_radius_m=0.12,
+            robot_radius_m=0.08,
+            use_global_static=False,
+            scan_persist_decay=10,
+        )
+    )
+    pose = Pose2D(1.5, 1.5, 0.0)
+    n = 72
+    ranges = np.full(n, np.inf)
+    # Mark a hit just outside the inscribed radius but inside the spin disc.
+    ranges[int((-math.pi / 2 + math.pi) / (2 * math.pi / n)) % n] = 0.35  # right
+    hit = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    lc.update(pose, hit)
+    clear = conv.LaserScan2D(
+        np.full(n, np.inf),
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    view = lc.update(pose, clear)  # scan blind; costmap still has the mark
+
+    cfg = FollowerConfig(
+        motion=SimpleMotionConfig(
+            xy_tolerance_m=0.15,
+            yaw_tolerance_rad=0.1,
+            max_linear_mps=0.4,
+            max_angular_rad_s=0.6,
+            min_linear_mps=0.05,
+            min_angular_rad_s=0.05,
+        ),
+        obstacle=ObstacleConfig(enabled=False),
+        rotate_in_place_rad=math.radians(30.0),
+    )
+    inscribed = 0.59 / 2.0
+    cmd, progress = compute_path_command(
+        pose,
+        Path2D(points=((1.5, 1.5), (1.5, 3.0)), goal_theta=math.pi / 2),
+        cfg=cfg,
+        scan=clear,
+        local_view=view,
+        robot_radius_m=inscribed,
+        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
+    )
+    assert progress["spin_blocked"] is True
+    assert abs(cmd.vtheta) < 1e-6
+
+
 def test_local_costmap_does_not_reinflate_global_static():
     """Global static in the local window must not get a second inflation pass."""
     from src.nav_builtin.costmap import INSCRIBED, build_costmap, occupancy_from_map_dict

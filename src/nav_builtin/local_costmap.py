@@ -30,6 +30,12 @@ class LocalCostmapConfig:
     # Live scan inflation is tighter than the global soft ring so sparse /
     # jittery hits don't paint a wide soft field that flips DWA left/right.
     scan_inflation_radius_m: Optional[float] = None
+    # Decay applied to previous live marks each update (0–100 occupancy).
+    # Fresh hits are 100; at the default local rate (~5 Hz) decay 12 keeps
+    # ankle/side obstacles for ~1.5 s after depth/lidar lose them — long
+    # enough that a rotate-to-heading cannot swing through a just-seen blob.
+    # 0 disables persistence (legacy clear-every-tick behaviour).
+    scan_persist_decay: int = 12
 
 
 @dataclass
@@ -84,6 +90,33 @@ class LocalCostmap:
             origin_x=self._origin_x,
             origin_y=self._origin_y,
         )
+
+    def _carry_persisted_marks(self, old_raw: np.ndarray, old_ox: float, old_oy: float) -> None:
+        """Reproject previous live hits into the recentered window with decay."""
+        decay = max(0, int(self._cfg.scan_persist_decay))
+        if decay <= 0 or old_raw.size == 0:
+            return
+        ys, xs = np.nonzero(old_raw > 0)
+        if ys.size == 0:
+            return
+        res = self._occ.resolution
+        wx = old_ox + (xs.astype(np.float64) + 0.5) * res
+        wy = old_oy + (ys.astype(np.float64) + 0.5) * res
+        cols = np.floor((wx - self._origin_x) / res).astype(np.int32)
+        rows = np.floor((wy - self._origin_y) / res).astype(np.int32)
+        inside = (rows >= 0) & (rows < self._h) & (cols >= 0) & (cols < self._w)
+        if not inside.any():
+            return
+        vals = np.maximum(0, old_raw[ys[inside], xs[inside]].astype(np.int32) - decay)
+        keep = vals > 0
+        if not keep.any():
+            return
+        rr = rows[inside][keep]
+        cc = cols[inside][keep]
+        vv = vals[keep].astype(np.int16)
+        # max so a carried mark is not overwritten by a weaker neighbour seed
+        existing = self._raw[rr, cc]
+        self._raw[rr, cc] = np.maximum(existing, vv)
 
     def _project_global_costs(
         self,
@@ -145,8 +178,11 @@ class LocalCostmap:
         global_occ: Optional[OccupancyGrid] = None,
         global_costs: Optional[np.ndarray] = None,
     ) -> LocalCostmapView:
+        old_raw = self._raw
+        old_ox, old_oy = self._origin_x, self._origin_y
         self._recenter(pose)
-        self._raw.fill(0)
+        self._raw = np.zeros((self._h, self._w), dtype=np.int16)
+        self._carry_persisted_marks(old_raw, old_ox, old_oy)
         costs = np.zeros((self._h, self._w), dtype=np.uint8)
         if (
             global_occ is not None
@@ -338,3 +374,21 @@ def footprint_collides(
             if not is_traversable(int(view.costs[rr, cc])):
                 return True
     return False
+
+
+def spin_disc_blocked(
+    view: LocalCostmapView,
+    x_m: float,
+    y_m: float,
+    *,
+    spin_radius_m: float,
+) -> bool:
+    """True when an in-place spin would sweep the corners through inflation.
+
+    Uses the local costmap (including briefly persisted live hits) so a low
+    obstacle that depth just saw — then lost after yaw — still blocks rotate-
+    to-heading. Scan-only ``spin_clearance_m`` cannot see that case.
+    """
+    return footprint_collides(
+        view, x_m, y_m, robot_radius_m=float(spin_radius_m)
+    )
