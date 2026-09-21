@@ -704,6 +704,12 @@ class BuiltinSlamEngine:
     _SMALL_CORRECTION_M = 0.15
     _SMALL_CORRECTION_RAD = math.radians(8.0)
 
+    # Continuous local refine is only trusted as drift tracking when the
+    # published pose already explains the scan. Below this, odom-only until
+    # global_localize / manual seed — otherwise the ±0.3 m window walks
+    # toward corridor twins (including while nav is suspended/paused).
+    _PRIOR_TRUST_SCORE = 0.15
+
     def _navigation_active(self) -> bool:
         """True when builtin nav has an in-flight goal (MoveOnMap / route)."""
         try:
@@ -727,18 +733,25 @@ class BuiltinSlamEngine:
             self._pose = predicted
             return False
 
+        # During MoveOnMap / routes: odom-only. Even "small" nudges walk the
+        # estimate onto corridor twins once the prior softens — that is the
+        # mid-nav teleport. Match scores stay diagnostic; global_localize
+        # / manual seed own recovery when idle.
+        if self._navigation_active():
+            self._pending_match = None
+            self._pending_count = 0
+            self._pose = predicted
+            return False
+
         dist = math.hypot(matched.x - predicted.x, matched.y - predicted.y)
         dyaw = abs(conv.normalize_angle(matched.theta - predicted.theta))
         small = dist <= self._SMALL_CORRECTION_M and dyaw <= self._SMALL_CORRECTION_RAD
-        nav_active = self._navigation_active()
         prior = float(self._last_prior_score)
+        prior_ok = math.isfinite(prior) and prior >= self._PRIOR_TRUST_SCORE
 
         if small:
-            # During nav, only track drift while the published pose still
-            # explains the scan. A bad prior + local ±0.3 m window walks the
-            # estimate toward corridor twins (~0.15–0.25 m/match) — that is
-            # the "jumped somewhere else on the map while navigating" failure.
-            if nav_active and (not math.isfinite(prior) or prior < 0.15):
+            # Bad prior while idle/paused: never creep toward twins.
+            if not prior_ok:
                 self._pending_match = None
                 self._pending_count = 0
                 self._pose = predicted
@@ -755,16 +768,13 @@ class BuiltinSlamEngine:
             )
             return True
 
-        # Large jump (competing peak / recovery): never while navigating —
-        # periodic full-map is already skipped during nav; creeping 0.25 m
-        # steps toward a twin must not replace it.
-        if nav_active:
+        # Large jump while idle: only with a trusted prior + two agreeing frames.
+        if not prior_ok:
             self._pending_match = None
             self._pending_count = 0
             self._pose = predicted
             return False
 
-        # Require two agreeing frames when idle / held.
         if self._pending_match is not None and self._poses_agree(
             matched, self._pending_match
         ):
