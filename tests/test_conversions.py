@@ -104,12 +104,12 @@ def test_merge_scans_combines_lidars():
 
 
 def test_merge_lidar_and_depth_drops_near_phantoms():
-    """Near depth that lidar contradicts must not win the forward bin."""
+    """Body-near depth that lidar contradicts must not win the forward bin."""
     n = 72
     lidar_r = np.full(n, 2.0)
     depth_r = np.full(n, np.inf)
     fwd = n // 2
-    depth_r[fwd] = 0.05  # phantom on the nose
+    depth_r[fwd] = 0.05  # phantom on the nose / mount
     lidar = conv.LaserScan2D(
         lidar_r,
         angle_min=-math.pi,
@@ -147,6 +147,26 @@ def test_merge_lidar_and_depth_drops_near_phantoms():
     )
     merged2 = conv.merge_lidar_and_depth_scans(lidar2, depth2, num_bins=n)
     assert merged2.ranges[fwd] == pytest.approx(0.30)
+    # Low obstacle lidar overshoots: depth at 0.30 m must win over lidar at 2 m
+    # (phantom window is body-near only, not the full stop bubble).
+    depth_r3 = np.full(n, np.inf)
+    depth_r3[fwd] = 0.30
+    lidar3 = conv.LaserScan2D(
+        np.full(n, 2.0),
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    depth3 = conv.LaserScan2D(
+        depth_r3,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    merged3 = conv.merge_lidar_and_depth_scans(lidar3, depth3, num_bins=n)
+    assert merged3.ranges[fwd] == pytest.approx(0.30)
 
 
 def test_pointcloud_to_scan_filters_height():

@@ -1162,14 +1162,18 @@ def merge_lidar_and_depth_scans(
     depth: LaserScan2D,
     *,
     num_bins: int = 360,
-    phantom_max_m: float = 0.45,
-    phantom_margin_m: float = 0.15,
+    phantom_max_m: float = 0.18,
+    phantom_margin_m: float = 0.12,
 ) -> LaserScan2D:
-    """Merge depth into lidar, dropping near depth hits lidar contradicts.
+    """Merge depth into lidar, dropping only body-near depth lidar contradicts.
 
     A naive min-range merge lets body/floor/mis-aimed depth phantoms win at
     ~0 m and freeze nose-clear / wait while the lidar still sees free space
     (live: fused fwd≈0 with lidar min≈0.5 m on the flank).
+
+    Only drops depth inside ``phantom_max_m`` (mount/body zone). Real close
+    obstacles lidar overshoots (ankles, thin legs at ~0.25–0.4 m) must still
+    win — a 0.45 m phantom window was discarding those (rc22 hit).
     """
     base = merge_scans([lidar], num_bins=num_bins)
     extra = merge_scans([depth], num_bins=num_bins)

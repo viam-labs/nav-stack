@@ -1229,14 +1229,15 @@ class NavSupervisor:
                     )
                 )
                 force_local = bool(local_blocked and allow_local_planner)
-                # Obstacle stop/spin/reverse must not use fused depth phantoms
-                # (live rc21: fwd≈0 while lidar nose_clear). Prefer lidar-only.
-                obstacle_scan = lidar_only if lidar_only is not None else scan
+                # Reactive stop/slow uses fused scan so depth can catch low /
+                # lidar-blind hits. Wait / nose_clear / costmap stay lidar-only
+                # (above); replan guards refuse avoid→replan death spirals when
+                # the lidar nose and path are already clear.
                 cmd, progress = compute_path_command(
                     pose,
                     path,
                     cfg=self._follower,
-                    scan=obstacle_scan,
+                    scan=scan,
                     speed_mps=self._last_cmd_vx,
                     local_view=local_view,
                     local_planner=self._local_planner if allow_local_planner else None,
