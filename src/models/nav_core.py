@@ -1698,6 +1698,18 @@ class NavServiceBase(Motion):
                     # succeeded — advance
                     break
 
+                # Between legs the robot is still and nav is idle — verify the
+                # map pose before departing. Periodic relocalize skips while a
+                # goal is active, so a multi-stop route could otherwise ride a
+                # drifted pose all the way to the next waypoint.
+                will_continue = (idx + 1 < len(waypoints)) or loop
+                if will_continue:
+                    verify = await self._verify_pose_between_route_legs()
+                    self._route_status = {
+                        **self._route_status,
+                        "pose_verify": dict(verify) if isinstance(verify, Mapping) else {"status": "unknown"},
+                    }
+
                 idx += 1
                 if idx < len(waypoints):
                     continue
@@ -1741,6 +1753,50 @@ class NavServiceBase(Motion):
                 self._route_cancel = None
             if self._route_task is asyncio.current_task():
                 self._route_task = None
+
+    async def _verify_pose_between_route_legs(self) -> Mapping:
+        """Run one SLAM localization check while stopped between route waypoints.
+
+        Uses ``check_localization`` (same path as the drift watchdog). With nav
+        idle and the robot still, a bad tick match escalates to full-map
+        recovery and may apply a trusted correction before the next leg.
+        """
+        cfg = getattr(self, "_cfg", None)
+        if cfg is None:
+            return {"status": "skipped", "reason": "no_cfg"}
+        builtin = getattr(cfg, "builtin", None)
+        if builtin is not None and not bool(getattr(builtin, "route_verify_pose", True)):
+            return {"status": "skipped", "reason": "disabled"}
+        slam_name = str(getattr(cfg, "slam_service", "") or "")
+        if not slam_name:
+            return {"status": "skipped", "reason": "no_slam_service"}
+        try:
+            from ..runtime import get_slam_service
+        except Exception:  # noqa: BLE001
+            return {"status": "skipped", "reason": "no_runtime"}
+        svc = get_slam_service(slam_name)
+        if svc is None or not hasattr(svc, "do_command"):
+            return {"status": "skipped", "reason": "slam_unavailable"}
+        try:
+            result = await svc.do_command({"command": "check_localization"})
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "error",
+                "reason": str(exc).strip() or type(exc).__name__,
+            }
+        if not isinstance(result, Mapping):
+            return {"status": "error", "reason": "bad_result"}
+        status = str(result.get("status") or "")
+        # Large jumps need a second agreeing match before apply.
+        if status == "awaiting_confirm":
+            await asyncio.sleep(0.4)
+            try:
+                result2 = await svc.do_command({"command": "check_localization"})
+            except Exception:  # noqa: BLE001
+                return dict(result)
+            if isinstance(result2, Mapping):
+                return dict(result2)
+        return dict(result)
 
     @staticmethod
     def _route_goal_matches(status: Mapping, wp: Mapping, *, tol: float = 0.05) -> bool:

@@ -520,6 +520,10 @@ class BuiltinNavConfig:
     max_linear_accel_mps2: float = 0.8
     max_linear_decel_mps2: float = 1.2
     max_angular_accel_rad_s2: float = 2.0
+    # After each route waypoint succeeds (robot still), run SLAM
+    # ``check_localization`` before departing for the next leg. Mid-nav
+    # periodic relocalize defaults off, so drift otherwise rides until idle.
+    route_verify_pose: bool = True
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":

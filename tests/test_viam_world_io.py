@@ -426,6 +426,32 @@ async def test_set_velocity_skips_duplicate_twist():
 
 
 @pytest.mark.asyncio
+async def test_set_velocity_refreshes_duplicate_before_base_watchdog():
+    """Held twists must be re-issued so the base does not coast to a stop."""
+    loop = asyncio.get_event_loop()
+    base = MagicMock()
+    base.name = "tracer"
+    base.set_velocity = AsyncMock()
+    world = ViamWorldIO(
+        slam=MagicMock(spec=["get_position", "do_command"]),
+        base=base,
+        loop=loop,
+        cameras={},
+        lidars=[],
+        base_velocity_convention="viam",
+    )
+    world._drive_refresh_s = 0.05  # noqa: SLF001
+    await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.6)
+    await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.6)
+    assert base.set_velocity.await_count == 1
+    await asyncio.sleep(0.06)
+    await asyncio.to_thread(world.set_velocity, 0.0, 0.0, 0.6)
+    assert base.set_velocity.await_count == 2
+    assert world.last_drive().get("skipped") is not True
+    assert world.drive_stats()["calls"] == 2
+
+
+@pytest.mark.asyncio
 async def test_set_velocity_coalesces_instead_of_superseding():
     """Rapid control ticks must not cancel an in-flight SetVelocity.
 

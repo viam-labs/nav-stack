@@ -153,6 +153,12 @@ class ViamWorldIO:
         # skip redundant SetVelocity when the control tick is faster than the
         # base RPC — identical cmds need not hit the module loop.
         self._last_desired_twist: Optional[tuple[float, float, float]] = None
+        # Many wheeled bases stop if SetVelocity is not refreshed (command
+        # watchdog). Skipping identical twists forever left nav advertising
+        # cmd_vtheta while the base had timed out — live: spin commanded,
+        # pose frozen, setPower still worked (rc23).
+        self._last_desired_at: float = 0.0
+        self._drive_refresh_s: float = 0.20
         self._drive_calls = 0
         self._drive_skipped = 0
         self._drive_coalesced = 0
@@ -800,15 +806,21 @@ class ViamWorldIO:
             "error": None,
         }
         desired = (vx, vy, vtheta)
-        if desired == self._last_desired_twist:
+        now = time.monotonic()
+        if (
+            desired == self._last_desired_twist
+            and (now - self._last_desired_at) < self._drive_refresh_s
+        ):
             # Control tick faster than meaningful cmd changes — don't pile
-            # identical SetVelocity RPCs onto the module loop.
+            # identical SetVelocity RPCs onto the module loop. Still refresh
+            # periodically so base command watchdogs do not coast to a stop.
             self._drive_skipped += 1
             intent["issued"] = True
             intent["skipped"] = True
             self._last_drive = dict(intent)
             return
         self._last_desired_twist = desired
+        self._last_desired_at = now
 
         def _make_coro():
             async def _issue_with_retry():
