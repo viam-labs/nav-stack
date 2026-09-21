@@ -704,6 +704,15 @@ class BuiltinSlamEngine:
     _SMALL_CORRECTION_M = 0.15
     _SMALL_CORRECTION_RAD = math.radians(8.0)
 
+    def _navigation_active(self) -> bool:
+        """True when builtin nav has an in-flight goal (MoveOnMap / route)."""
+        try:
+            from ..runtime import any_navigation_active
+
+            return bool(any_navigation_active())
+        except Exception:  # noqa: BLE001 - registry may be mid-reconfigure
+            return False
+
     def _apply_match(
         self,
         predicted: conv.Pose2D,
@@ -721,8 +730,19 @@ class BuiltinSlamEngine:
         dist = math.hypot(matched.x - predicted.x, matched.y - predicted.y)
         dyaw = abs(conv.normalize_angle(matched.theta - predicted.theta))
         small = dist <= self._SMALL_CORRECTION_M and dyaw <= self._SMALL_CORRECTION_RAD
+        nav_active = self._navigation_active()
+        prior = float(self._last_prior_score)
 
         if small:
+            # During nav, only track drift while the published pose still
+            # explains the scan. A bad prior + local ±0.3 m window walks the
+            # estimate toward corridor twins (~0.15–0.25 m/match) — that is
+            # the "jumped somewhere else on the map while navigating" failure.
+            if nav_active and (not math.isfinite(prior) or prior < 0.15):
+                self._pending_match = None
+                self._pending_count = 0
+                self._pose = predicted
+                return False
             # Continuous drift correction: no confirmation needed.
             self._pending_match = None
             self._pending_count = 0
@@ -735,7 +755,16 @@ class BuiltinSlamEngine:
             )
             return True
 
-        # Large jump (competing peak / recovery): require two agreeing frames.
+        # Large jump (competing peak / recovery): never while navigating —
+        # periodic full-map is already skipped during nav; creeping 0.25 m
+        # steps toward a twin must not replace it.
+        if nav_active:
+            self._pending_match = None
+            self._pending_count = 0
+            self._pose = predicted
+            return False
+
+        # Require two agreeing frames when idle / held.
         if self._pending_match is not None and self._poses_agree(
             matched, self._pending_match
         ):

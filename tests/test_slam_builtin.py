@@ -218,6 +218,35 @@ def test_apply_match_large_jump_requires_two_frames():
     assert engine._apply_match(engine.get_pose(), peak_b, None) is True  # noqa: SLF001
 
 
+def test_apply_match_skips_large_and_bad_prior_small_during_nav(monkeypatch):
+    """During MoveOnMap, do not walk the pose toward a competing local peak."""
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
+    )
+    engine = BuiltinSlamEngine(
+        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
+    )  # type: ignore[arg-type]
+    monkeypatch.setattr(engine, "_navigation_active", lambda: True)
+
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    large = conv.Pose2D(0.40, 0.0, 0.0)
+    # Two agreeing large frames would apply when idle — must not during nav.
+    assert engine._apply_match(predicted, large, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, large, None) is False  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.0)
+
+    # Bad prior + small nudge: odom-only (would otherwise creep every match).
+    engine._last_prior_score = -0.4  # noqa: SLF001
+    small = conv.Pose2D(0.10, 0.0, 0.0)
+    assert engine._apply_match(predicted, small, None) is False  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.0)
+
+    # Good prior + small drift: still OK during nav.
+    engine._last_prior_score = 0.45  # noqa: SLF001
+    assert engine._apply_match(predicted, small, None) is True  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.06, abs=1e-6)
+
+
 def test_predict_absolute_odom_uses_deltas_and_gates_jumps():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
