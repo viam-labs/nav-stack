@@ -23,6 +23,12 @@ from viam.services.slam import SLAM
 from viam.utils import struct_to_dict
 
 from ..config import NavConfig
+from ..nav.localize_spin_recovery import (
+    LocalizeSpinConfig,
+    LocalizeSpinRecovery,
+    localization_needs_spin,
+    localization_recovered,
+)
 from ..nav_builtin import (
     BuiltinNavHost,
     NavVizStore,
@@ -128,6 +134,10 @@ class NavigationService(NavServiceBase):
         self._framesystem_gen = 0
         self._framesystem_raw_attrs: Optional[Mapping] = None
         self._nav_host: Optional[BuiltinNavHost] = None
+        self._idle_spin_task: Optional[asyncio.Task] = None
+        self._idle_spin_gen = 0
+        self._world_io: Optional[ViamWorldIO] = None
+        self._idle_spin: Optional[LocalizeSpinRecovery] = None
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -156,6 +166,7 @@ class NavigationService(NavServiceBase):
         self, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
         self._cancel_framesystem_task()
+        self._cancel_idle_spin_task()
         attrs = struct_to_dict(config.attributes)
         cfg = NavConfig.from_dict(attrs)
         # Footprint from framesystem is applied async after reconfigure — never
@@ -180,6 +191,7 @@ class NavigationService(NavServiceBase):
         unregister_nav_host(self.name)
         self._viz = None
         self._nav_host = None
+        self._world_io = None
         if self._builtin_runtime is not None:
             try:
                 self._builtin_runtime.manager.shutdown()
@@ -214,6 +226,7 @@ class NavigationService(NavServiceBase):
             ),
             logger=lambda m: LOGGER.info(m),
         )
+        self._world_io = world
         navigator = make_builtin_navigator(
             world, cfg, logger=lambda m: LOGGER.info(m)
         )
@@ -232,6 +245,7 @@ class NavigationService(NavServiceBase):
         register_nav_host(self.name, host)
         self._refresh_zone_masks()
         self._schedule_framesystem_footprint(loop)
+        self._schedule_idle_spin_recovery(loop)
         LOGGER.info(
             f"nav-stack navigation '{self.name}' configured ({cfg.kinematics}, "
             f"nav_backend=builtin, ViamWorldIO)"
@@ -243,6 +257,109 @@ class NavigationService(NavServiceBase):
             task.cancel()
         self._framesystem_task = None
         self._framesystem_gen += 1
+
+    def _cancel_idle_spin_task(self) -> None:
+        task = self._idle_spin_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._idle_spin_task = None
+        self._idle_spin_gen += 1
+        self._idle_spin = None
+
+    def _schedule_idle_spin_recovery(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        cfg = self._cfg
+        if cfg is None or not bool(cfg.builtin.localize_spin_recovery):
+            return
+        self._idle_spin_gen += 1
+        gen = self._idle_spin_gen
+        bcfg = cfg.builtin
+        self._idle_spin = LocalizeSpinRecovery(
+            LocalizeSpinConfig(
+                enabled=True,
+                step_deg=float(bcfg.localize_spin_step_deg),
+                vel_rad_s=float(bcfg.localize_spin_vel_rad_s),
+                pause_s=float(bcfg.localize_spin_pause_s),
+                max_total_yaw_deg=float(bcfg.localize_spin_max_yaw_deg),
+                cooldown_s=float(bcfg.localize_spin_cooldown_s),
+                min_spin_clearance_m=float(bcfg.localize_spin_min_clearance_m),
+            )
+        )
+        self._idle_spin_task = loop.create_task(self._idle_spin_recovery_loop(gen))
+
+    async def _idle_spin_recovery_loop(self, gen: int) -> None:
+        """When idle and localization is lost, rotate in short steps to rematch."""
+        period_s = 0.2
+        while gen == self._idle_spin_gen:
+            try:
+                await asyncio.sleep(period_s)
+            except asyncio.CancelledError:
+                raise
+            if gen != self._idle_spin_gen:
+                return
+            cfg = self._cfg
+            world = self._world_io
+            spin = self._idle_spin
+            host = self._nav_host
+            if cfg is None or world is None or spin is None:
+                continue
+            if not bool(cfg.builtin.localize_spin_recovery):
+                continue
+            # Do not fight an active MoveOnMap / simple-nav goal.
+            try:
+                if host is not None and bool(host.nav_status().get("active")):
+                    if spin.active():
+                        spin.reset()
+                        await asyncio.to_thread(world.stop)
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            if self._simple_nav_status.get("state") == "active":
+                if spin.active():
+                    spin.reset()
+                    await asyncio.to_thread(world.stop)
+                continue
+
+            slam_rt = get_slam(cfg.slam_service)
+            check = dict(slam_rt.localization_check) if slam_rt is not None else {}
+            if spin.active():
+                if localization_recovered(check):
+                    spin.reset()
+                    await asyncio.to_thread(world.stop)
+                    continue
+            elif not localization_needs_spin(check):
+                continue
+            else:
+                spin.maybe_start(check)
+
+            pose = await asyncio.to_thread(world.get_pose)
+            if pose is None:
+                continue
+            try:
+                scan = await asyncio.to_thread(world.get_scan, 1.0)
+            except Exception:  # noqa: BLE001
+                scan = None
+            cmd = spin.tick(check=check, pose_theta=float(pose.theta), scan=scan)
+            if cmd.kick_check:
+                try:
+                    await asyncio.to_thread(world.kick_localization_check)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                if abs(cmd.vtheta) > 1e-6:
+                    await asyncio.to_thread(
+                        world.set_velocity, 0.0, 0.0, float(cmd.vtheta)
+                    )
+                elif cmd.phase in ("pausing", "blocked", "done", "cooldown"):
+                    await asyncio.to_thread(world.stop)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("idle localize spin drive failed: %s", exc)
+                spin.reset()
+                try:
+                    await asyncio.to_thread(world.stop)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _schedule_framesystem_footprint(
         self, loop: asyncio.AbstractEventLoop
@@ -301,9 +418,11 @@ class NavigationService(NavServiceBase):
     async def close(self) -> None:
         await self._cancel_simple_nav()
         self._cancel_framesystem_task()
+        self._cancel_idle_spin_task()
         unregister_nav_viz(self.name)
         unregister_nav_host(self.name)
         self._nav_host = None
+        self._world_io = None
         if self._builtin_runtime is not None:
             try:
                 self._builtin_runtime.manager.shutdown()

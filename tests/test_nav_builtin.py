@@ -1794,6 +1794,50 @@ def test_builtin_navigator_cancel_sets_status():
     assert nav.nav_status()["state"] == "canceled"
 
 
+def test_nav_spin_recovery_turns_while_localization_awaiting_confirm():
+    """Lost-loc hold may rotate in place (no translation) to help rematch."""
+    import threading
+    import time
+
+    world = _FakeWorld(Pose2D(0.2, 0.2, 0.0), _empty_map(size=80))
+    world.loc_hold = {
+        "status": "awaiting_confirm",
+        "confirm_count": 1,
+        "confirm_needed": 2,
+        "jump_shift_m": 6.0,
+        "jump_shift_deg": 66.0,
+        "previous_score": -0.3,
+    }
+    nav = BuiltinNavigator(
+        world,
+        inflation_radius_m=0.15,
+        robot_radius_m=0.05,
+        avoid_obstacles=False,
+        xy_tolerance_m=0.1,
+        timeout_s=4.0,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        localize_spin_recovery=True,
+        localize_spin_min_clearance_m=0.0,
+        localize_spin_step_deg=15.0,
+        localize_spin_vel_rad_s=0.4,
+        localize_spin_pause_s=0.2,
+    )
+
+    def _run():
+        nav.navigate(3.0, 0.2, 0.0)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    time.sleep(0.45)
+    status = nav.nav_status()
+    assert status.get("obstacle") == "loc_hold"
+    assert all(abs(vx) < 1e-9 for vx, _vy, _vth in world.cmds)
+    assert any(abs(vth) > 0.05 for _vx, _vy, vth in world.cmds)
+    nav.cancel()
+    t.join(timeout=2.0)
+
+
 def test_nav_holds_drive_while_localization_awaiting_confirm():
     """Do not crawl/turn on a disputed pose while a large jump awaits confirm."""
     import threading
@@ -1816,6 +1860,7 @@ def test_nav_holds_drive_while_localization_awaiting_confirm():
         timeout_s=4.0,
         local_costmap_enabled=False,
         local_planner_enabled=False,
+        localize_spin_recovery=False,
     )
 
     def _run():

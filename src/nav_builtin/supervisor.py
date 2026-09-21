@@ -107,6 +107,21 @@ class NavSupervisor:
         max_linear_accel_mps2 = kw["max_linear_accel_mps2"]
         max_linear_decel_mps2 = kw["max_linear_decel_mps2"]
         max_angular_accel_rad_s2 = kw["max_angular_accel_rad_s2"]
+        from ..nav.localize_spin_recovery import LocalizeSpinConfig, LocalizeSpinRecovery
+
+        self._loc_spin = LocalizeSpinRecovery(
+            LocalizeSpinConfig(
+                enabled=bool(kw.get("localize_spin_recovery", True)),
+                step_deg=float(kw.get("localize_spin_step_deg", 25.0)),
+                vel_rad_s=float(kw.get("localize_spin_vel_rad_s", 0.30)),
+                pause_s=float(kw.get("localize_spin_pause_s", 0.85)),
+                max_total_yaw_deg=float(kw.get("localize_spin_max_yaw_deg", 360.0)),
+                cooldown_s=float(kw.get("localize_spin_cooldown_s", 45.0)),
+                min_spin_clearance_m=float(
+                    kw.get("localize_spin_min_clearance_m", 0.35)
+                ),
+            )
+        )
         self._world = world
         self._inflation = inflation_radius_m
         # Driving clearance (half-width when a footprint is configured). Every
@@ -939,12 +954,47 @@ class NavSupervisor:
                     xy_ok_since = None
 
                 if holding_for_localize:
-                    # Stop once on entry — repeating SetVelocity(0) every control
-                    # tick (esp. at 20 Hz) queues behind lidar/odom RPCs and
-                    # surfaces as ``Viam IO timed out`` / stalled navigation.
+                    # Prefer short rotate→pause→rematch over sitting frozen: a
+                    # wrong heading / corridor twin often clears after a few
+                    # still scans from new angles. Matching skips while spinning.
                     if entering_loc_hold:
+                        self._loc_spin.reset()
+                        self._loc_spin.maybe_start(loc_hold)
                         self._world.stop()
                         self._note_base_stopped()
+                    elif not self._loc_spin.active():
+                        self._loc_spin.maybe_start(loc_hold)
+
+                    spin_scan = None
+                    try:
+                        spin_scan = self._world.get_scan(self._scan_max_age)
+                    except Exception:  # noqa: BLE001
+                        spin_scan = None
+                    spin_cmd = self._loc_spin.tick(
+                        check=loc_hold,
+                        pose_theta=float(pose.theta),
+                        scan=spin_scan,
+                    )
+                    if spin_cmd.kick_check:
+                        kick = getattr(self._world, "kick_localization_check", None)
+                        if callable(kick):
+                            try:
+                                kick()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    if abs(spin_cmd.vtheta) > 1e-6:
+                        self._world.set_velocity(0.0, 0.0, float(spin_cmd.vtheta))
+                        self._last_sent_cmd = DriveCommand(
+                            0.0, 0.0, float(spin_cmd.vtheta), False
+                        )
+                        self._last_sent_at = time.monotonic()
+                    elif (
+                        not entering_loc_hold
+                        and spin_cmd.phase in ("pausing", "blocked", "done")
+                    ):
+                        self._world.stop()
+                        self._note_base_stopped()
+
                     last_progress_at = now
                     last_progress_pose = pose
                     last_progress_dist = dist_goal_chk
@@ -957,7 +1007,7 @@ class NavSupervisor:
                             "local_planner": False,
                             "forward_clearance_m": None,
                             "cmd_vx_mps": 0.0,
-                            "cmd_vtheta_rad_s": 0.0,
+                            "cmd_vtheta_rad_s": float(spin_cmd.vtheta),
                             "bearing_error_rad": 0.0,
                             "distance_remaining_m": dist_goal_chk,
                             "waypoint_index": 0,
@@ -969,11 +1019,18 @@ class NavSupervisor:
                                 or loc_hold.get("jump_shift_m"),
                                 "shift_deg": loc_hold.get("shift_deg")
                                 or loc_hold.get("jump_shift_deg"),
+                                "spin_phase": spin_cmd.phase,
+                                "spin_yaw_deg": round(spin_cmd.yaw_turned_deg, 1),
+                                "spin_steps": spin_cmd.steps,
                             },
                         },
                     )
                     self._sleep_control_period(tick_started)
                     continue
+
+                # Hold cleared — drop any in-progress spin recovery.
+                if self._loc_spin.active():
+                    self._loc_spin.reset()
 
                 now = time.monotonic()
 

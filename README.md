@@ -134,6 +134,7 @@ the robot in the local costmap. Refresh rate is nav-side
 | `control_rate_hz` | Nav | Builtin nav control rate (default `10`). Local costmap refreshes separately (`builtin.local_costmap_rate_hz`, default `5`) so follower ticks stay cheap |
 | `localize_subprocess` | SLAM | Run `global_localize` / periodic relocalize scoring in a dedicated subprocess so the matcher never holds this process's GIL (default `true`). Falls back in-process on error; health in `status.localize_worker` |
 | `obstacles_only_rate_hz` | Nav | Background refresh rate for `obstacles_only` depth cams (default `5`). Control tick never awaits GetPointCloud; prefer POSIX `shm_name` for 10–20 Hz |
+| `localize_spin_recovery` | Nav (`builtin`) | When localization is lost / awaiting a large jump confirm, rotate in short steps (turn → pause → rematch) to break heading ambiguity (default `true`). Disable with `false`. |
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced map/scan tuning keys (merged into engine defaults) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level footprint / velocity limits. `robot_radius` also sizes the reactive stop: any live return inside the body-width corridor ahead (not just the ±35° cone) counts as forward clearance, and the live "path blocked" check samples a 0.10 m band around the route |

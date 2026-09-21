@@ -880,6 +880,25 @@ class ViamWorldIO:
             return None
         return hold if isinstance(hold, dict) else None
 
+    def kick_localization_check(self) -> None:
+        """Fire-and-forget one ``check_localization`` on the module event loop."""
+        slam = self._slam
+        if slam is None or not hasattr(slam, "do_command"):
+            return
+        if self._loop.is_closed():
+            return
+
+        async def _job() -> None:
+            try:
+                await slam.do_command({"command": "check_localization"})
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"kick_localization_check failed: {exc}")
+
+        try:
+            asyncio.run_coroutine_threadsafe(_job(), self._loop)
+        except Exception:  # noqa: BLE001
+            return
+
 
 def _sanitize_base_cmd(
     vx: float, vy: float, vtheta: float

@@ -73,6 +73,13 @@ def builtin_nav_runtime_kwargs(
         "max_linear_accel_mps2": bcfg.max_linear_accel_mps2,
         "max_linear_decel_mps2": bcfg.max_linear_decel_mps2,
         "max_angular_accel_rad_s2": bcfg.max_angular_accel_rad_s2,
+        "localize_spin_recovery": bool(bcfg.localize_spin_recovery),
+        "localize_spin_step_deg": float(bcfg.localize_spin_step_deg),
+        "localize_spin_vel_rad_s": float(bcfg.localize_spin_vel_rad_s),
+        "localize_spin_pause_s": float(bcfg.localize_spin_pause_s),
+        "localize_spin_max_yaw_deg": float(bcfg.localize_spin_max_yaw_deg),
+        "localize_spin_cooldown_s": float(bcfg.localize_spin_cooldown_s),
+        "localize_spin_min_clearance_m": float(bcfg.localize_spin_min_clearance_m),
     }
     kwargs.update(overrides)
     return kwargs
