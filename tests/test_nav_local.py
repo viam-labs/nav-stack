@@ -828,6 +828,60 @@ def test_spin_gate_stays_stopped_when_rear_is_blocked():
     assert cmd.vtheta == pytest.approx(0.0)
 
 
+def test_costmap_hard_stop_reverses_when_spin_disc_blocked():
+    """Forward into inscribed blob + blocked spin disc must reverse, not freeze.
+
+    Live rc14 stall: lidar nose ~0.7 m clear so reactive avoid never fired;
+    pursuit/DWA kept vx>0, skipped the vx≈0 spin-gate reverse, and the
+    costmap hard stop zeroed cmd with spin_blocked.
+    """
+    from src.nav_builtin.costmap import INSCRIBED
+    from src.nav_builtin.local_costmap import LocalCostmapView
+    from src.nav_builtin.types import OccupancyGrid
+
+    res = 0.05
+    h = w = 80
+    costs = np.zeros((h, w), dtype=np.uint8)
+    # Inscribed blob ~0.35 m ahead of pose (2,2) — inside stop distance and
+    # inside the circumscribed spin disc, but not under the robot.
+    for r in range(38, 43):
+        for c in range(45, 50):  # x ≈ 2.25–2.45
+            costs[r, c] = INSCRIBED
+    occ = OccupancyGrid(
+        grid=np.zeros((h, w), dtype=np.int16),
+        resolution=res,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    view = LocalCostmapView(costs=costs, occ=occ, origin_x=0.0, origin_y=0.0)
+    n = 72
+    # Lidar nose clear (matches live forward_clearance ~0.7); rear empty.
+    ranges = np.full(n, 3.0)
+    ranges[n // 2] = 0.70
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    inscribed = 0.59 / 2.0
+    cfg = _footprint_cfg()
+    cmd, progress = compute_path_command(
+        Pose2D(2.0, 2.0, 0.0),
+        Path2D(points=((2.0, 2.0), (3.5, 2.0)), goal_theta=0.0),
+        cfg=cfg,
+        scan=scan,
+        local_view=view,
+        robot_radius_m=inscribed,
+        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
+    )
+    assert progress["spin_blocked"] is True
+    assert progress["obstacle"] == "narrow_reverse"
+    assert cmd.vx < 0.0
+    assert cmd.vtheta == pytest.approx(0.0)
+
+
 def test_compute_path_command_stops_when_pose_already_in_lethal():
     """Off-path drift into inflation: path ahead can look clear — still stop.
 

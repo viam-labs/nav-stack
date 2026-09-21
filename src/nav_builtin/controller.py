@@ -25,6 +25,31 @@ from .path_utils import closest_point_on_path, signed_crosstrack_m
 from .types import Path2D, Pose2D
 
 
+def _rear_open_for_unstick(
+    scan: Optional[conv.LaserScan2D],
+    robot_radius_m: float,
+) -> bool:
+    """True when a short reverse is safe per the rear lidar/depth arc.
+
+    ``rear_clearance_m`` returns +inf when the rear arc has no returns (fully
+    clear). That must count as open — requiring ``isfinite`` left the robot
+    frozen in avoid+spin_block with an empty rear.
+    """
+    if scan is None:
+        return False
+    rear = rear_clearance_m(scan)
+    rear_need = max(0.25, float(robot_radius_m) + 0.08)
+    return (not math.isfinite(rear)) or rear >= rear_need
+
+
+def _narrow_reverse_command(cfg: "FollowerConfig") -> DriveCommand:
+    back = min(
+        max(float(cfg.motion.min_linear_mps), 0.10),
+        0.18,
+    )
+    return DriveCommand(-back, 0.0, 0.0, False)
+
+
 @dataclass
 class FollowerConfig:
     """Regulated Pure Pursuit (Nav2-style) for diff-drive / skid-steer.
@@ -718,24 +743,8 @@ def compute_path_command(
             # Squeeze / avoid / hold: spinning swings the bumper into the
             # pinch. Prefer a short reverse when the rear is open so wait/
             # replan is not a deadlock; otherwise full stop.
-            #
-            # ``rear_clearance_m`` returns +inf when the rear arc has no
-            # returns (fully clear). That must count as open — requiring
-            # ``isfinite`` left the robot frozen in avoid+spin_block with
-            # an empty rear (the live dock2 stall on rc13).
-            rear = (
-                rear_clearance_m(scan) if scan is not None else 0.0
-            )
-            rear_need = max(0.25, float(robot_radius_m) + 0.08)
-            rear_open = scan is not None and (
-                (not math.isfinite(rear)) or rear >= rear_need
-            )
-            if rear_open:
-                back = min(
-                    max(float(cfg.motion.min_linear_mps), 0.10),
-                    0.18,
-                )
-                cmd = DriveCommand(-back, 0.0, 0.0, False)
+            if _rear_open_for_unstick(scan, robot_radius_m):
+                cmd = _narrow_reverse_command(cfg)
                 obstacle_state = "narrow_reverse"
             else:
                 cmd = DriveCommand(0.0, 0.0, 0.0, False)
@@ -771,28 +780,29 @@ def compute_path_command(
             ahead = max_cost_along_segment(local_view, current.x, current.y, hx, hy)
             if ahead >= INSCRIBED:
                 # Freeze translation. Keep an existing yaw command only when
-                # the spin disc is clear; otherwise full stop (do not invent
-                # a freer-flank spin into a shoulder obstacle).
+                # the spin disc is clear; otherwise reverse when the rear is
+                # open (do not invent a freer-flank spin into a shoulder
+                # obstacle, and do not deadlock at cmd=0 — the rc14 live
+                # stall was forward DWA/pursuit into an inscribed blob with
+                # lidar nose clear, which skipped the vx≈0 spin-gate reverse).
                 keep_yaw = abs(cmd.vtheta) > 1e-6
-                if keep_yaw and spin_radius > float(robot_radius_m):
-                    scan_hit = (
-                        scan is not None
-                        and spin_clearance_m(scan) < spin_radius + 0.05
-                    )
-                    cost_hit = spin_disc_blocked(
-                        local_view,
-                        current.x,
-                        current.y,
-                        spin_radius_m=spin_radius,
-                    )
-                    if scan_hit or cost_hit:
-                        keep_yaw = False
-                        spin_blocked = True
+                disc_hit = bool(
+                    spin_radius > float(robot_radius_m)
+                    and (scan_spin_hit or cost_spin_hit)
+                )
+                if keep_yaw and disc_hit:
+                    keep_yaw = False
+                if disc_hit:
+                    spin_blocked = True
                 if keep_yaw:
                     cmd = DriveCommand(0.0, 0.0, cmd.vtheta, False)
+                    obstacle_state = "avoid"
+                elif disc_hit and _rear_open_for_unstick(scan, robot_radius_m):
+                    cmd = _narrow_reverse_command(cfg)
+                    obstacle_state = "narrow_reverse"
                 else:
                     cmd = DriveCommand(0.0, 0.0, 0.0, False)
-                obstacle_state = "avoid"
+                    obstacle_state = "avoid"
 
     progress = {
         "waypoint_index": idx,
