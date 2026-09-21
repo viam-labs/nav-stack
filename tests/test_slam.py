@@ -423,12 +423,15 @@ def test_run_startup_global_localize_retries_then_succeeds():
 
 
 def test_run_startup_global_localize_runs_refinement_pass():
+    from src.nav.pose_jump_gate import PoseJumpGate
+
     slam = SlamService("slam")
+    slam._pose_jump_gate = PoseJumpGate(confirm_count=1)
     slam.do_command = AsyncMock(
         side_effect=[
             {
                 "status": "matched",
-                "score": 0.56,
+                "score": 0.50,
                 "ray_mae_m": 0.50,
                 "pose": {"x": 1.0, "y": 2.0, "theta": 0.1},
             },
@@ -436,7 +439,6 @@ def test_run_startup_global_localize_runs_refinement_pass():
                 "status": "matched",
                 "score": 0.71,
                 "ray_mae_m": 0.35,
-                # Must agree with the first large-jump candidate to confirm.
                 "pose": {"x": 1.1, "y": 2.05, "theta": 0.12},
             },
             {"status": "relocalizing"},
@@ -474,13 +476,16 @@ def test_run_startup_global_localize_runs_refinement_pass():
 
 
 def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
+    from src.nav.pose_jump_gate import PoseJumpGate
+
     slam = SlamService("slam")
+    slam._pose_jump_gate = PoseJumpGate(confirm_count=1)
     slam.do_command = AsyncMock(
         side_effect=[
             {
                 "status": "matched",
-                "score": 0.58,
-                "ray_mae_m": 0.50,
+                "score": 0.68,
+                "ray_mae_m": 0.40,
                 # Small jump applies immediately; post-apply refine still runs.
                 "pose": {"x": 0.3, "y": 0.4, "theta": 0.1},
             },
