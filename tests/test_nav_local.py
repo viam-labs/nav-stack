@@ -892,6 +892,54 @@ def test_spin_gate_stays_stopped_when_rear_is_blocked():
     assert cmd.vtheta == pytest.approx(0.0)
 
 
+def test_hold_from_flank_crawls_when_nose_is_open():
+    """Flank hold during rotate-to-heading must not sit forever with fwd clear."""
+    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
+
+    n = 72
+    ranges = np.full(n, 3.0)
+    # Right flank inside stop; nose wide open (matches live rc18 hold stall).
+    ranges[int((-math.radians(50) + math.pi) / (2 * math.pi / n)) % n] = 0.25
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    cfg = FollowerConfig(
+        motion=SimpleMotionConfig(
+            xy_tolerance_m=0.15,
+            yaw_tolerance_rad=0.1,
+            max_linear_mps=0.4,
+            max_angular_rad_s=0.6,
+            min_linear_mps=0.05,
+            min_angular_rad_s=0.05,
+        ),
+        obstacle=ObstacleConfig(
+            enabled=True,
+            stop_distance_m=0.4,
+            slow_distance_m=1.0,
+            spin_collision_m=0.22,
+            side_cone_rad=math.radians(70.0),
+            front_cone_half_rad=math.radians(40.0),
+        ),
+        rotate_in_place_rad=math.radians(30.0),
+    )
+    # Large bearing → rotate-to-heading, then flank hold → crawl.
+    cmd, progress = compute_path_command(
+        Pose2D(0.0, 0.0, 0.0),
+        Path2D(points=((0.0, 0.0), (-2.0, 0.5)), goal_theta=math.pi),
+        cfg=cfg,
+        scan=scan,
+        robot_radius_m=0.295,
+        spin_radius_m=0.465,
+    )
+    assert progress["obstacle"] == "narrow"
+    assert cmd.vx > 0.0
+    assert cmd.vtheta == pytest.approx(0.0)
+
+
 def test_costmap_hard_stop_reverses_when_spin_disc_blocked():
     """Forward into inscribed blob + blocked spin disc must reverse, not freeze.
 

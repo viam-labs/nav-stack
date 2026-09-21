@@ -703,6 +703,36 @@ def compute_path_command(
             # Slow-down scaled vx; keep the arc drivable before the floor so a
             # 0.05 m/s crawl with 0.2 rad/s does not become a base-side spin.
             cmd = apply_velocity_floor(keep_arc_drivable(cmd, cfg), cfg.motion)
+        elif (
+            obstacle_state == "hold"
+            and not near_goal
+            and abs(bearing) >= cfg.rotate_exit_rad
+        ):
+            # Rotate-to-heading was zeroed by a turn-side flank inside stop
+            # distance. Sitting forever with nose open (live rc18: hold,
+            # fwd≈2 m, bearing≈±2 rad) never creates turn room — crawl if the
+            # nose is clear, else reverse. True bumper collisions (inside
+            # spin_collision_m) stay held.
+            stop_m = float(cfg.obstacle.stop_distance_m)
+            nose_m = max(0.05, float(cfg.obstacle.spin_collision_m))
+            if math.isfinite(forward_clearance) and forward_clearance > stop_m:
+                crawl = min(
+                    max(float(cfg.motion.min_linear_mps), 0.12),
+                    float(cfg.motion.max_linear_mps),
+                )
+                cmd = DriveCommand(crawl, 0.0, 0.0, False)
+                obstacle_state = "narrow"
+            elif math.isfinite(forward_clearance) and forward_clearance > nose_m:
+                rev = _try_narrow_reverse(
+                    cfg,
+                    scan,
+                    robot_radius_m,
+                    local_view=local_view,
+                    current=current,
+                )
+                if rev is not None:
+                    cmd = rev
+                    obstacle_state = "narrow_reverse"
     elif local_active:
         obstacle_state = "local_planner"
         if (
