@@ -520,15 +520,6 @@ class BuiltinNavConfig:
     max_linear_accel_mps2: float = 0.8
     max_linear_decel_mps2: float = 1.2
     max_angular_accel_rad_s2: float = 2.0
-    # When localization is lost / awaiting a large jump confirm, rotate in
-    # place in short steps (turn → pause → rematch) to break heading ambiguity.
-    localize_spin_recovery: bool = False
-    localize_spin_step_deg: float = 25.0
-    localize_spin_vel_rad_s: float = 0.30
-    localize_spin_pause_s: float = 0.85
-    localize_spin_max_yaw_deg: float = 360.0
-    localize_spin_cooldown_s: float = 45.0
-    localize_spin_min_clearance_m: float = 0.35
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":

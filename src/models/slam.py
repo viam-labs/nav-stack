@@ -1211,6 +1211,19 @@ class SlamService(SLAM):
             match_command["full_map"] = True
         match = await self._global_localize(match_command)
 
+        # If the local command auto-fell-back to a full-map search inside
+        # ``_global_localize``, treat it as full-map for ambiguity / recovery
+        # gates. Leaving match_mode as ``local`` previously skipped the
+        # ambiguous-twin refuse and let the jump gate confirm a 30 m yank.
+        if (
+            match_mode == "local"
+            and (
+                bool(match.get("fallback_used"))
+                or bool(match.get("full_map"))
+            )
+        ):
+            match_mode = "full_map_via_local_fallback"
+
         good_match, score, ray_mae = self._localization_match_quality(match, cfg)
         matched_pose = match.get("pose")
         shift_m, shift_deg = self._pose_shift_from_current(current, matched_pose)
@@ -1239,10 +1252,17 @@ class SlamService(SLAM):
 
         # Refuse auto-apply of ambiguous full-map peaks (second-best often a
         # corridor twin). Manual apply:true still bypasses via apply_override.
+        # Include fallback / full_map flags so a "local" command that escalated
+        # inside the matcher cannot sneak past this gate.
+        is_full_map_result = (
+            str(match_mode).startswith("full_map")
+            or bool(match.get("full_map"))
+            or bool(match.get("fallback_used"))
+        )
         if (
             apply_override is not True
             and bool(match.get("ambiguous"))
-            and str(match_mode).startswith("full_map")
+            and is_full_map_result
         ):
             result = {
                 "status": "ambiguous",
@@ -1265,6 +1285,9 @@ class SlamService(SLAM):
             if prior_score is not None:
                 result["previous_score"] = prior_score
                 result["previous_ray_mae_m"] = match.get("prior_ray_mae_m")
+            # Drop any in-progress large-jump confirm so a twin cannot finish
+            # confirming across cycles that alternate ambiguous / not.
+            self._pose_jump_gate.clear()
             LOGGER.warning(
                 "periodic relocalize: refusing ambiguous full-map peak "
                 "(score=%.2f second_best=%s mode=%s)",
@@ -2378,6 +2401,10 @@ class SlamService(SLAM):
         if cmd == "set_initial_pose":
             pose = self._resolve_pose(command)
             await asyncio.to_thread(mgr.set_initial_pose, pose)
+            # Manual seed wins over any in-flight large-jump confirm toward a
+            # corridor twin — otherwise the next watchdog tick can finish the
+            # confirm and yank the pose back across the map.
+            self._pose_jump_gate.clear()
             # ``refine: true`` runs a seeded scan match around the given XY with
             # a full yaw sweep — the matcher itself only searches ~±30° of
             # heading, so a seed with roughly-right XY but wrong theta can never

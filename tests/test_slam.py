@@ -1335,6 +1335,40 @@ def test_periodic_relocalize_refuses_ambiguous_full_map():
     slam.do_command.assert_not_awaited()
 
 
+def test_periodic_relocalize_refuses_ambiguous_local_fallback():
+    """Local command that auto-fell-back to full-map must still refuse twins."""
+    from src.geom.conversions import Pose2D
+
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._engine = MagicMock()
+    # Above still-bad floor so the cycle starts as a local peek.
+    slam._engine.diagnostics.return_value = {"last_match_score": 0.32}
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.55,
+            "ray_mae_m": 0.45,
+            "pose": {"x": 30.0, "y": 0.0, "theta": 0.0},
+            "ambiguous": True,
+            "second_best_score": 0.52,
+            "full_map": True,
+            "fallback_used": True,
+        }
+    )
+    slam.do_command = AsyncMock()
+    # Pretend a prior confirm was already counting toward a yank.
+    slam._pose_jump_gate.evaluate(Pose2D(0.0, 0.0, 0.0), Pose2D(30.0, 0.0, 0.0))
+    assert slam._pose_jump_gate.snapshot()["confirm_count"] == 1
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "ambiguous"
+    assert result["match_mode"] == "full_map_via_local_fallback"
+    assert result["corrected"] is False
+    assert slam._pose_jump_gate.snapshot()["confirm_count"] == 0
+    slam.do_command.assert_not_awaited()
+
+
 def test_check_localization_apply_override_forces_correction():
     slam = _relocalize_slam(periodic_relocalize_min_shift_m=5.0)  # would not drift
     slam._global_localize = AsyncMock(

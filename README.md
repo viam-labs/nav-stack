@@ -134,7 +134,6 @@ the robot in the local costmap. Refresh rate is nav-side
 | `control_rate_hz` | Nav | Builtin nav control rate (default `10`). Local costmap refreshes separately (`builtin.local_costmap_rate_hz`, default `5`) so follower ticks stay cheap |
 | `localize_subprocess` | SLAM | Run `global_localize` / periodic relocalize scoring in a dedicated subprocess so the matcher never holds this process's GIL (default `true`). Falls back in-process on error; health in `status.localize_worker` |
 | `obstacles_only_rate_hz` | Nav | Background refresh rate for `obstacles_only` depth cams (default `5`). Control tick never awaits GetPointCloud; prefer POSIX `shm_name` for 10–20 Hz |
-| `localize_spin_recovery` | Nav (`builtin`) | Optional rotate-in-place when lost (default **`false`** — a 360° lidar already has the view). Prefer the still + bad-fit full-map watchdog below. |
 | `periodic_relocalize_still_bad_score` | SLAM | While still, if tick match score ≤ this (default `0`), run full-map `global_localize` immediately instead of a local peek. |
 | `periodic_relocalize_bypass_startup_after_s` | SLAM | Cancel a stuck startup localize after this many seconds (default `90`) so the drift watchdog can recover. |
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |
