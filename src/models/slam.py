@@ -2419,7 +2419,28 @@ class SlamService(SLAM):
                     ),
                     "full_map": False,
                     "auto_full_map_fallback": False,
+                    # Manual seed refine must be willing to accept a weak-but-
+                    # better peak (corridor twins often top out ~0.3). Absolute
+                    # floors still apply via beat-prior logic in _global_localize;
+                    # also drop ambiguous refuse so a near-tie local peak can land.
+                    "min_apply_score": float(command.get("min_apply_score", 0.22)),
+                    "max_apply_ray_mae_m": float(
+                        command.get("max_apply_ray_mae_m", 1.5)
+                    ),
+                    "refuse_ambiguous": bool(command.get("refuse_ambiguous", False)),
                 }
+                # Forward optional denser-search knobs from the caller.
+                for key in (
+                    "coarse_position_step_m",
+                    "coarse_yaw_step_deg",
+                    "fine_position_step_m",
+                    "fine_yaw_step_deg",
+                    "ray_weight",
+                    "ray_refine_candidates",
+                    "ray_refine_beams",
+                ):
+                    if key in command:
+                        refine_cmd[key] = command[key]
                 result = await self._global_localize(refine_cmd)
                 return {"status": "ok", "refine": result}
             return {"status": "ok"}
@@ -2844,6 +2865,20 @@ class SlamService(SLAM):
                 apply_blocked_reason = "high_ray_mae"
             elif refuse_ambiguous and bool(getattr(result, "ambiguous", False)):
                 apply_blocked_reason = "ambiguous"
+
+        # Seeded local refine (UI auto-refine / set_initial_pose): if the match
+        # clearly beats the seed prior, apply even when below the absolute score
+        # floor. Otherwise a nearly-right XY with wrong heading stays stuck —
+        # best local peak is often ~0.30 while min_apply_score defaults to 0.35.
+        if (
+            apply_pose
+            and apply_blocked_reason == "low_score"
+            and not resolved_full_map
+            and prior_score is not None
+            and math.isfinite(float(prior_score))
+            and float(result.score) >= float(prior_score) + 0.08
+        ):
+            apply_blocked_reason = None
 
         did_apply = False
         if apply_pose and apply_blocked_reason is None:

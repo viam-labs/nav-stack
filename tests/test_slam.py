@@ -309,6 +309,9 @@ def test_set_initial_pose_refine_runs_seeded_yaw_search(tmp_path: Path):
     assert sent["local_yaw_window_deg"] == 360.0
     assert sent["full_map"] is False
     assert sent["auto_full_map_fallback"] is False
+    assert sent["min_apply_score"] == 0.22
+    assert sent["refuse_ambiguous"] is False
+    assert sent["max_apply_ray_mae_m"] == 1.5
 
 
 def test_set_initial_pose_without_refine_skips_search(tmp_path: Path):
