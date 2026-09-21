@@ -88,7 +88,7 @@ class ViamWorldIO:
         viz: Optional[NavVizStore] = None,
         shm_lidar=None,
         scan_max_age_s: float = 2.0,
-        obstacles_only_period_s: float = 0.40,
+        obstacles_only_period_s: float = 0.20,
         drive_timeout_s: float = 5.0,
         map_cache_s: float = 1.0,
         scan_bins: int = 360,
@@ -133,7 +133,7 @@ class ViamWorldIO:
         # so RealSense PCD cannot starve SetVelocity on the shared module loop.
         self._per_lidar_scan: dict[str, tuple[conv.LaserScan2D, float]] = {}
         # Depth is async + slow; keep it fresh enough that motion compensation works.
-        # Configurable via NavConfig.obstacles_only_rate_hz (default 2.5 Hz).
+        # Configurable via NavConfig.obstacles_only_rate_hz (default 5 Hz).
         self._obstacles_only_period_s = max(0.0, float(obstacles_only_period_s))
         # Beyond this pose shift, cached depth is dropped (avoids phantom obstacles).
         self._obstacles_max_shift_m = 0.30
@@ -554,8 +554,9 @@ class ViamWorldIO:
         self, raw: bytes, lidar: LidarConfig
     ) -> conv.LaserScan2D:
         pts = conv.parse_pcd(raw)
-        # Depth cams are dense; downsample so GetPointCloud doesn't starve SetVelocity.
-        max_pts = 4000 if lidar.obstacles_only else 0
+        # Depth cams are dense; crop by range/height then downsample so the
+        # gRPC path (no shm) still spends its point budget on near obstacles.
+        max_pts = 8000 if lidar.obstacles_only else 0
         pts = conv.prepare_lidar_point_cloud(
             pts,
             cloud_frame=lidar.cloud_frame,
@@ -569,6 +570,8 @@ class ViamWorldIO:
             z_min=lidar.z_min,
             z_max=lidar.z_max,
             max_points=max_pts,
+            range_min=float(lidar.min_range) if lidar.obstacles_only else 0.0,
+            range_max=float(lidar.max_range) if lidar.obstacles_only else 0.0,
         )
         return conv.points_to_scan(
             pts,

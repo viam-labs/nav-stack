@@ -1204,31 +1204,66 @@ def prepare_lidar_point_cloud(
     z_min: float = -0.2,
     z_max: float = 2.0,
     max_points: int = 0,
+    range_min: float = 0.0,
+    range_max: float = 0.0,
 ) -> np.ndarray:
-    """Optical remap → mount → height band (returns base_link XYZ)."""
+    """Optical remap → mount → height band (returns base_link XYZ).
+
+    Downsample runs **last** (after height / range gates) so a fixed point
+    budget is spent on in-band obstacle hits — not empty/far pixels. For
+    ``camera_optical`` clouds, an optional ``range_max`` also crops by optical
+    depth (Z) *before* the mount transform to keep gRPC depth paths cheap
+    without POSIX shm.
+    """
     pts = np.asarray(points, dtype=float)
     if pts.ndim == 2 and pts.size:
         # Depth cameras emit a full-frame cloud where invalid pixels are
         # (0, 0, 0) (RealSense: ~1/3 of the frame). Those would land exactly on
         # the sensor mount after the transform and paint a lethal blob on the
         # robot unless the z band happens to exclude the mount height. Drop
-        # them (and NaN/inf) before downsampling so the point budget is spent
-        # on real returns.
+        # them (and NaN/inf) before any further work.
         keep = np.isfinite(pts).all(axis=1) & np.any(pts != 0.0, axis=1)
         if not keep.all():
             pts = pts[keep]
-    if max_points > 0:
-        pts = downsample_points(pts, max_points=max_points)
     if pts.size == 0:
         return np.empty((0, 3))
+
+    # Optical Z is depth into the scene. Cropping here (before mount) drops
+    # sky / distant clutter so we never transform a full 720p cloud on the
+    # obstacles-only gRPC path.
+    if (
+        not points_in_base_link
+        and cloud_frame == "camera_optical"
+        and range_max > 0.0
+        and pts.shape[1] >= 3
+    ):
+        depth = pts[:, 2]
+        lo = max(float(range_min), 1e-3)
+        keep = (depth >= lo) & (depth <= float(range_max))
+        if not keep.all():
+            pts = pts[keep]
+        if pts.size == 0:
+            return np.empty((0, 3))
+
     if points_in_base_link:
-        return filter_points_by_z(pts, z_min, z_max)
-    if cloud_frame == "camera_optical":
-        pts = camera_optical_to_sensor_frame(pts)
-    pts = transform_lidar_mount_to_base_link(
-        pts, x=x, y=y, z=z, theta=theta, pitch=pitch, roll=roll
-    )
-    return filter_points_by_z(pts, z_min, z_max)
+        pts = filter_points_by_z(pts, z_min, z_max)
+    else:
+        if cloud_frame == "camera_optical":
+            pts = camera_optical_to_sensor_frame(pts)
+        pts = transform_lidar_mount_to_base_link(
+            pts, x=x, y=y, z=z, theta=theta, pitch=pitch, roll=roll
+        )
+        pts = filter_points_by_z(pts, z_min, z_max)
+
+    if range_max > 0.0 and pts.size and pts.shape[1] >= 2:
+        radial = np.hypot(pts[:, 0], pts[:, 1])
+        keep = (radial >= float(range_min)) & (radial <= float(range_max))
+        if not keep.all():
+            pts = pts[keep]
+
+    if max_points > 0:
+        pts = downsample_points(pts, max_points=max_points)
+    return pts
 
 
 def filter_points_by_z(

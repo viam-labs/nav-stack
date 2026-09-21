@@ -1127,9 +1127,9 @@ class NavConfig:
     control_rate_hz: float = 10.0
     # Background refresh rate for ``obstacles_only`` depth cams (Hz). Nav never
     # awaits GetPointCloud on the control tick — this only throttles the
-    # fire-and-forget refresh. Default 2.5 (~0.4 s) matches the prior hardcode.
-    # Prefer POSIX shm on the depth lidar for 10–20 Hz without loop contention.
-    obstacles_only_rate_hz: float = 2.5
+    # fire-and-forget refresh. Default 5 Hz (~0.2 s) keeps ankle-height depth
+    # obstacles fresher on the gRPC path; prefer POSIX shm for 10–20 Hz.
+    obstacles_only_rate_hz: float = 5.0
     # Reactive obstacle avoidance for simple go_to_* motion.
     simple_avoid_obstacles: bool = True
     simple_stop_distance: float = 0.4  # meters: stop forward + turn away inside this

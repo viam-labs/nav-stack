@@ -188,7 +188,7 @@ def test_prepare_lidar_point_cloud_drops_invalid_zero_and_nan_points():
     d_mount = np.hypot(out[:, 0] - mount["x"], out[:, 1] - mount["y"])
     assert np.min(d_mount) > 0.4
 
-    # Downsample budget is spent on real points, not on invalid ones.
+    # Downsample budget is spent on real in-band points (downsample is last).
     out_ds = conv.prepare_lidar_point_cloud(
         cloud,
         cloud_frame="camera_optical",
@@ -203,6 +203,39 @@ def test_prepare_lidar_point_cloud_drops_invalid_zero_and_nan_points():
     lidar = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]])
     kept = conv.prepare_lidar_point_cloud(lidar, z_min=-0.2, z_max=1.0)
     assert len(kept) == 2
+
+
+def test_prepare_lidar_point_cloud_downsamples_after_gates_keeps_near_hits():
+    """Early uniform downsample used to erase sparse near obstacles in a
+    mostly-far depth frame. Crop by optical depth + height, then downsample."""
+    mount = dict(x=0.30, y=-0.15, z=0.13, theta=0.0, pitch=0.0, roll=0.0)
+    # Far wall: many optical points at 5 m (outside max_range crop).
+    far = np.column_stack(
+        [np.linspace(-0.5, 0.5, 2000), np.full(2000, -0.2), np.full(2000, 5.0)]
+    )
+    # Near ankle-height obstacle on the right: few points at 0.6 m depth.
+    near = np.column_stack(
+        [np.full(40, 0.4), np.full(40, -0.12), np.full(40, 0.6)]
+    )
+    cloud = np.vstack([far, near, np.zeros((500, 3))])
+
+    # Old-style early downsample would almost never keep the 40 near points
+    # among 2500+ far/zeros. With range crop + late downsample they survive.
+    out = conv.prepare_lidar_point_cloud(
+        cloud,
+        cloud_frame="camera_optical",
+        z_min=0.08,
+        z_max=1.2,
+        max_points=80,
+        range_min=0.1,
+        range_max=2.0,
+        **mount,
+    )
+    assert len(out) > 0
+    assert len(out) <= 80
+    # Near hits land ~0.6 m ahead of the camera (+ mount x).
+    assert np.min(out[:, 0]) < 1.0
+    assert np.any(np.hypot(out[:, 0] - mount["x"], out[:, 1] - mount["y"]) < 1.0)
 
 
 def test_lidar_config_cloud_frame_optical():

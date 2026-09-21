@@ -89,7 +89,7 @@ RealSense / OpenCV depth clouds use **optical** axes (Z forward). Set
 ``cloud_frame: "camera_optical"`` so depth is remapped to X-forward before the
 mount and height band; without it, depth collapses into Z and paints a blob on
 the robot in the local costmap. Refresh rate is nav-side
-``obstacles_only_rate_hz`` (default `2.5`); set a POSIX ``shm_name`` (or use
+``obstacles_only_rate_hz`` (default `5`); set a POSIX ``shm_name`` (or use
 ``shm-pointcloud``) before pushing toward 10–20 Hz.
 **Tuning via Viam config (no YAML editing required):**
 
@@ -133,7 +133,7 @@ the robot in the local costmap. Refresh rate is nav-side
 | `scan_rate_hz` / `odom_rate_hz` | SLAM | Builtin SLAM tick rate is `max(scan_rate_hz, odom_rate_hz)` (default `10` each). Scan matching stays throttled (~3 Hz) separately |
 | `control_rate_hz` | Nav | Builtin nav control rate (default `10`). Local costmap refreshes separately (`builtin.local_costmap_rate_hz`, default `5`) so follower ticks stay cheap |
 | `localize_subprocess` | SLAM | Run `global_localize` / periodic relocalize scoring in a dedicated subprocess so the matcher never holds this process's GIL (default `true`). Falls back in-process on error; health in `status.localize_worker` |
-| `obstacles_only_rate_hz` | Nav | Background refresh rate for `obstacles_only` depth cams (default `2.5`). Control tick never awaits GetPointCloud; prefer POSIX `shm_name` for 10–20 Hz |
+| `obstacles_only_rate_hz` | Nav | Background refresh rate for `obstacles_only` depth cams (default `5`). Control tick never awaits GetPointCloud; prefer POSIX `shm_name` for 10–20 Hz |
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced map/scan tuning keys (merged into engine defaults) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level footprint / velocity limits. `robot_radius` also sizes the reactive stop: any live return inside the body-width corridor ahead (not just the ±35° cone) counts as forward clearance, and the live "path blocked" check samples a 0.10 m band around the route |

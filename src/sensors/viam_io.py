@@ -101,7 +101,13 @@ def build_io_provider(
                     roll=lidar_cfg.roll,
                     z_min=lidar_cfg.z_min,
                     z_max=lidar_cfg.z_max,
-                    max_points=4000 if lidar_cfg.obstacles_only else 0,
+                    max_points=8000 if lidar_cfg.obstacles_only else 0,
+                    range_min=(
+                        float(lidar_cfg.min_range) if lidar_cfg.obstacles_only else 0.0
+                    ),
+                    range_max=(
+                        float(lidar_cfg.max_range) if lidar_cfg.obstacles_only else 0.0
+                    ),
                 )
             else:
                 base_pts = pts

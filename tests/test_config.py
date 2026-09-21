@@ -439,8 +439,8 @@ def test_loop_rate_hz_config():
     )
     assert nav.control_rate_hz == pytest.approx(20.0)
     assert nav.control_period_s() == pytest.approx(0.05)
-    assert nav.obstacles_only_rate_hz == pytest.approx(2.5)
-    assert nav.obstacles_only_period_s() == pytest.approx(0.4)
+    assert nav.obstacles_only_rate_hz == pytest.approx(5.0)
+    assert nav.obstacles_only_period_s() == pytest.approx(0.2)
     assert nav.builtin.local_costmap_rate_hz == pytest.approx(5.0)
 
     fast_depth = NavConfig.from_dict(
