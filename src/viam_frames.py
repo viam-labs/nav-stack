@@ -302,24 +302,36 @@ def apply_framesystem_to_slam_cfg(
                 f"({lidar.x:.3f},{lidar.y:.3f},{lidar.z:.3f}) θ={lidar.theta:.3f}"
             )
             continue
-        # Framesystem pose is the component frame → base. Point clouds are in
-        # that same component frame, so do not also apply camera_optical remap.
-        from .config import CLOUD_FRAME_CAMERA_OPTICAL, CLOUD_FRAME_SENSOR
+        from .config import CLOUD_FRAME_CAMERA_OPTICAL
 
-        optical_note = ""
-        if lidar.cloud_frame == CLOUD_FRAME_CAMERA_OPTICAL:
-            lidar.cloud_frame = CLOUD_FRAME_SENSOR
-            optical_note = "; cloud_frame sensor (FS pose is full base transform)"
+        # Framesystem pose is the component frame → base. RealSense
+        # GetPointCloud is still camera-optical (Z forward) even when the
+        # framesystem camera frame carries a -90° roll for that optical
+        # convention. Clearing cloud_frame to ``sensor`` and then applying
+        # that roll as a body-frame mount mis-orients the cloud and z-filters
+        # away nearly every obstacle hit (live symptom: ~1 valid return).
+        # Keep ``camera_optical`` so we remap axes first; take translation +
+        # yaw from FS, but ignore FS pitch/roll (optical remap owns axes;
+        # mast tilt should be set explicitly in JSON if needed).
+        optical = lidar.cloud_frame == CLOUD_FRAME_CAMERA_OPTICAL
         lidar.x = mount.x
         lidar.y = mount.y
         lidar.z = mount.z
         lidar.theta = mount.theta
-        lidar.pitch = mount.pitch
-        lidar.roll = mount.roll
+        if optical:
+            lidar.pitch = 0.0
+            lidar.roll = 0.0
+            optical_note = (
+                "; kept camera_optical (FS pitch/roll ignored — PCD is optical)"
+            )
+        else:
+            lidar.pitch = mount.pitch
+            lidar.roll = mount.roll
+            optical_note = ""
         notes.append(
             f"lidar {lidar.name}: mount from framesystem "
             f"({mount.x:.3f},{mount.y:.3f},{mount.z:.3f}) "
-            f"θ={mount.theta:.3f} pitch={mount.pitch:.3f} roll={mount.roll:.3f}"
+            f"θ={mount.theta:.3f} pitch={lidar.pitch:.3f} roll={lidar.roll:.3f}"
             f"{optical_note}"
         )
     for line in notes:
