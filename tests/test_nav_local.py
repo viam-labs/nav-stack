@@ -763,11 +763,69 @@ def test_spin_gate_does_not_override_reactive_avoid():
         robot_radius_m=inscribed,
         spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
     )
-    assert progress["obstacle"] in ("avoid", "hold", "narrow_reverse")
-    assert cmd.vx <= 0.0
+    # Rear arc is empty (+inf clearance) → reverse crawl, not a zero deadlock.
+    assert progress["obstacle"] == "narrow_reverse"
+    assert cmd.vx < 0.0
     assert cmd.vtheta == pytest.approx(0.0)
-    # Either full stop (rear blocked) or reverse crawl (rear open).
     assert progress["spin_blocked"] is True
+
+
+def test_spin_gate_reverses_when_rear_scan_is_fully_clear():
+    """No rear returns (+inf) must still count as rear-open for unstick."""
+    inscribed = 0.59 / 2.0
+    cfg = _footprint_cfg()
+    n = 72
+    ranges = np.full(n, np.inf)
+    # Side pinch inside the spin disc; forward stop bubble; rear empty.
+    ranges[n // 2] = 0.30
+    ranges[int((-math.pi / 2 + math.pi) / (2 * math.pi / n)) % n] = 0.40
+    ranges[int((math.pi / 2 + math.pi) / (2 * math.pi / n)) % n] = 0.40
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    cmd, progress = compute_path_command(
+        Pose2D(0.0, 0.0, 0.0),
+        Path2D(points=((0.0, 0.0), (3.0, 0.0)), goal_theta=0.0),
+        cfg=cfg,
+        scan=scan,
+        robot_radius_m=inscribed,
+        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
+    )
+    assert progress["spin_blocked"] is True
+    assert progress["obstacle"] == "narrow_reverse"
+    assert cmd.vx < 0.0
+
+
+def test_spin_gate_stays_stopped_when_rear_is_blocked():
+    inscribed = 0.59 / 2.0
+    cfg = _footprint_cfg()
+    n = 72
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 0.30
+    ranges[int((-math.pi / 2 + math.pi) / (2 * math.pi / n)) % n] = 0.40
+    ranges[0] = 0.20  # rear ≈ −π
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    cmd, progress = compute_path_command(
+        Pose2D(0.0, 0.0, 0.0),
+        Path2D(points=((0.0, 0.0), (3.0, 0.0)), goal_theta=0.0),
+        cfg=cfg,
+        scan=scan,
+        robot_radius_m=inscribed,
+        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
+    )
+    assert progress["spin_blocked"] is True
+    assert cmd.vx == pytest.approx(0.0)
+    assert cmd.vtheta == pytest.approx(0.0)
 
 
 def test_compute_path_command_stops_when_pose_already_in_lethal():

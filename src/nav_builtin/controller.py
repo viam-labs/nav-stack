@@ -718,11 +718,19 @@ def compute_path_command(
             # Squeeze / avoid / hold: spinning swings the bumper into the
             # pinch. Prefer a short reverse when the rear is open so wait/
             # replan is not a deadlock; otherwise full stop.
+            #
+            # ``rear_clearance_m`` returns +inf when the rear arc has no
+            # returns (fully clear). That must count as open — requiring
+            # ``isfinite`` left the robot frozen in avoid+spin_block with
+            # an empty rear (the live dock2 stall on rc13).
             rear = (
                 rear_clearance_m(scan) if scan is not None else 0.0
             )
             rear_need = max(0.25, float(robot_radius_m) + 0.08)
-            if math.isfinite(rear) and rear >= rear_need:
+            rear_open = scan is not None and (
+                (not math.isfinite(rear)) or rear >= rear_need
+            )
+            if rear_open:
                 back = min(
                     max(float(cfg.motion.min_linear_mps), 0.10),
                     0.18,
