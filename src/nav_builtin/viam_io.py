@@ -447,7 +447,8 @@ class ViamWorldIO:
                 return provided
         if not self._lidars:
             return self._scan_cache if include_obstacles_only else None
-        scans = []
+        primary: list[conv.LaserScan2D] = []
+        depth_scans: list[conv.LaserScan2D] = []
         for lidar in self._lidars:
             # Depth (obstacles_only) is for reactive slowing — not the rolling
             # local costmap / DWA. Including it there caused phantom blobs and
@@ -461,14 +462,34 @@ class ViamWorldIO:
                 scan = self._align_obstacles_scan_to_pose(scan, pose)
                 if scan is None:
                     continue
-            scans.append(scan)
-        if not scans:
+            if lidar.obstacles_only:
+                depth_scans.append(scan)
+            else:
+                primary.append(scan)
+        if not primary and not depth_scans:
             return self._scan_cache if include_obstacles_only else None
-        merged = (
-            scans[0]
-            if len(scans) == 1
-            else conv.merge_scans(scans, self._scan_bins)
-        )
+        if not include_obstacles_only or not depth_scans:
+            merged = (
+                primary[0]
+                if len(primary) == 1
+                else conv.merge_scans(primary or depth_scans, self._scan_bins)
+            )
+        elif not primary:
+            merged = (
+                depth_scans[0]
+                if len(depth_scans) == 1
+                else conv.merge_scans(depth_scans, self._scan_bins)
+            )
+        else:
+            merged = (
+                primary[0]
+                if len(primary) == 1
+                else conv.merge_scans(primary, self._scan_bins)
+            )
+            for depth in depth_scans:
+                merged = conv.merge_lidar_and_depth_scans(
+                    merged, depth, num_bins=self._scan_bins
+                )
         if pose is not None:
             merged = conv.LaserScan2D(
                 ranges=merged.ranges,

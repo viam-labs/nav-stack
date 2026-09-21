@@ -1157,6 +1157,54 @@ def merge_scans(
     )
 
 
+def merge_lidar_and_depth_scans(
+    lidar: LaserScan2D,
+    depth: LaserScan2D,
+    *,
+    num_bins: int = 360,
+    phantom_max_m: float = 0.45,
+    phantom_margin_m: float = 0.15,
+) -> LaserScan2D:
+    """Merge depth into lidar, dropping near depth hits lidar contradicts.
+
+    A naive min-range merge lets body/floor/mis-aimed depth phantoms win at
+    ~0 m and freeze nose-clear / wait while the lidar still sees free space
+    (live: fused fwd≈0 with lidar min≈0.5 m on the flank).
+    """
+    base = merge_scans([lidar], num_bins=num_bins)
+    extra = merge_scans([depth], num_bins=num_bins)
+    n = int(len(base.ranges))
+    if n == 0 or len(extra.ranges) != n:
+        return merge_scans([lidar, depth], num_bins=num_bins)
+    out = np.asarray(base.ranges, dtype=float).copy()
+    d_ranges = np.asarray(extra.ranges, dtype=float)
+    phantom_max = float(phantom_max_m)
+    margin = float(phantom_margin_m)
+    for i in range(n):
+        d = d_ranges[i]
+        if not math.isfinite(d):
+            continue
+        L = out[i]
+        if (
+            d <= phantom_max
+            and math.isfinite(L)
+            and d < L - margin
+        ):
+            # Lidar sees much farther in this bin — treat near depth as phantom.
+            continue
+        if (not math.isfinite(L)) or d < L:
+            out[i] = d
+    return LaserScan2D(
+        out,
+        angle_min=base.angle_min,
+        angle_increment=base.angle_increment,
+        range_min=min(float(base.range_min), float(extra.range_min)),
+        range_max=max(float(base.range_max), float(extra.range_max)),
+        sensor_pose=base.sensor_pose,
+        capture_pose=base.capture_pose or extra.capture_pose,
+    )
+
+
 def camera_optical_to_sensor_frame(points: np.ndarray) -> np.ndarray:
     """Map camera optical coordinates into the lidar/sensor body frame.
 

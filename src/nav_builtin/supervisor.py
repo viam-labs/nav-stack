@@ -1099,14 +1099,24 @@ class NavSupervisor:
                 )
                 nose_clear = True
                 obs_cfg = self._follower.obstacle
-                if (
-                    scan is not None
-                    and obs_cfg is not None
-                    and obs_cfg.enabled
-                ):
-                    nose_clear = (
-                        forward_clearance_m(scan, obs_cfg) > obs_cfg.stop_distance_m
-                    )
+                if obs_cfg is not None and obs_cfg.enabled:
+                    # Wait / nose_clear must not trust depth phantoms. Fused
+                    # scan can report fwd≈0 while lidar still sees free space
+                    # (body/floor/mis-aimed camera). Use lidar-only when available.
+                    nose_scan = scan
+                    try:
+                        lidar_only = self._world.get_scan(
+                            self._scan_max_age, include_obstacles_only=False
+                        )
+                    except Exception:  # noqa: BLE001
+                        lidar_only = None
+                    if lidar_only is not None:
+                        nose_scan = lidar_only
+                    if nose_scan is not None:
+                        nose_clear = (
+                            forward_clearance_m(nose_scan, obs_cfg)
+                            > obs_cfg.stop_distance_m
+                        )
                 waiting_for_clear = False
                 if local_blocked:
                     if local_blocked_since is None:

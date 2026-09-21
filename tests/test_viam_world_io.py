@@ -690,7 +690,7 @@ def test_get_scan_can_exclude_obstacles_only_lidars():
         range_max=10.0,
     )
     depth_scan = conv.LaserScan2D(
-        ranges=np.full(8, 0.4),
+        ranges=np.full(8, 0.8),
         angle_min=-math.pi,
         angle_increment=math.pi / 4,
         range_min=0.05,
@@ -709,6 +709,27 @@ def test_get_scan_can_exclude_obstacles_only_lidars():
     full = world.get_scan(2.0, include_obstacles_only=True)
     lidar_only = world.get_scan(2.0, include_obstacles_only=False)
     assert full is not None and lidar_only is not None
-    # Full merge sees the near depth hit; lidar-only keeps the far beam.
-    assert float(np.nanmin(full.ranges)) < 0.5
+    # Real depth closer than lidar is kept; lidar-only stays far.
+    assert float(np.nanmin(full.ranges)) == pytest.approx(0.8)
     assert float(np.nanmin(lidar_only.ranges)) > 1.5
+
+    # Near depth that lidar contradicts is treated as a phantom.
+    phantom = conv.LaserScan2D(
+        ranges=np.full(8, 0.05),
+        angle_min=-math.pi,
+        angle_increment=math.pi / 4,
+        range_min=0.05,
+        range_max=10.0,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+
+    def _read_phantom(lidar, max_age_s=2.0):
+        if lidar.name == "lidar":
+            return lidar_scan
+        return phantom
+
+    world._scan_cache = None  # noqa: SLF001
+    world._read_lidar_scan_sync = MagicMock(side_effect=_read_phantom)  # noqa: SLF001
+    full_phantom = world.get_scan(2.0, include_obstacles_only=True)
+    assert full_phantom is not None
+    assert float(np.nanmin(full_phantom.ranges)) == pytest.approx(2.0)
