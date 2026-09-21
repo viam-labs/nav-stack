@@ -680,6 +680,9 @@ def compute_path_command(
     # sweeps the half-diagonal, so there are gaps the robot fits through and
     # cannot spin inside. Rather than swing the corners into the walls, keep
     # translating straight and defer the turn until there is room for it.
+    #
+    # When already avoiding / holding (nose blocked), do **not** crawl forward
+    # into the stop bubble — just freeze yaw if the spin disc is occupied.
     spin_radius = (
         float(spin_radius_m) if spin_radius_m is not None else float(robot_radius_m)
     )
@@ -690,18 +693,20 @@ def compute_path_command(
         and spin_radius > float(robot_radius_m)
         and abs(cmd.vx) < 0.02
         and abs(cmd.vtheta) > 0.05
-        # Only when nothing is close ahead: an "avoid"/"hold" spin exists
-        # precisely because translating is unsafe.
-        and obstacle_state in ("clear", "slow")
         and spin_clearance_m(scan) < spin_radius + 0.05
     ):
         spin_blocked = True
-        crawl = min(
-            max(float(cfg.motion.min_linear_mps), 0.12),
-            float(cfg.motion.max_linear_mps),
-        )
-        cmd = DriveCommand(crawl, 0.0, 0.0, False)
-        obstacle_state = "narrow"
+        if obstacle_state in ("clear", "slow"):
+            crawl = min(
+                max(float(cfg.motion.min_linear_mps), 0.12),
+                float(cfg.motion.max_linear_mps),
+            )
+            cmd = DriveCommand(crawl, 0.0, 0.0, False)
+            obstacle_state = "narrow"
+        else:
+            # Squeeze / avoid / hold: crawling would drive into the obstacle;
+            # inventing a spin swings the bumper into it. Full stop.
+            cmd = DriveCommand(0.0, 0.0, 0.0, False)
 
     # Costmap hard stop: lidar cone can look clear while the robot is already
     # driving into an inflated blob beside the nose (or while misaligned). If
@@ -712,19 +717,17 @@ def compute_path_command(
     # costs are footprint-inflated, so that means the body overlaps an
     # obstacle even if the path centerline (and lidar nose cone) still look
     # clear — the usual way we drift off-path into a blob and then stall.
+    # Never invent a spin here: rotating in-lethal was swinging the corner
+    # into the thing we already overlapped ("squeezed past then rotated in").
     if local_view is not None and dist_goal > cfg.motion.xy_tolerance_m:
         from .costmap import INSCRIBED
         from .local_costmap import max_cost_along_segment
 
         pose_cost = int(local_view.cost_at_world(current.x, current.y))
         if pose_cost >= INSCRIBED:
-            cmd = DriveCommand(0.0, 0.0, cmd.vtheta, False)
-            if abs(cmd.vtheta) < 1e-6:
-                direction = 1.0 if bearing >= 0.0 else -1.0
-                cmd = DriveCommand(
-                    0.0, 0.0, direction * cfg.motion.max_angular_rad_s, False
-                )
+            cmd = DriveCommand(0.0, 0.0, 0.0, False)
             obstacle_state = "in_lethal"
+            spin_blocked = False
         elif cmd.vx > 1e-6:
             stop_m = (
                 float(cfg.obstacle.stop_distance_m)
@@ -735,13 +738,18 @@ def compute_path_command(
             hy = current.y + math.sin(current.theta) * stop_m
             ahead = max_cost_along_segment(local_view, current.x, current.y, hx, hy)
             if ahead >= INSCRIBED:
-                cmd = DriveCommand(0.0, 0.0, cmd.vtheta, False)
-                if abs(cmd.vtheta) < 1e-6:
-                    # No yaw command: turn toward freer flank using path bearing.
-                    direction = 1.0 if bearing >= 0.0 else -1.0
-                    cmd = DriveCommand(
-                        0.0, 0.0, direction * cfg.motion.max_angular_rad_s, False
-                    )
+                # Freeze translation. Keep an existing yaw command only when
+                # the spin disc is clear; otherwise full stop (do not invent
+                # a freer-flank spin into a shoulder obstacle).
+                keep_yaw = abs(cmd.vtheta) > 1e-6
+                if keep_yaw and scan is not None and spin_radius > float(robot_radius_m):
+                    if spin_clearance_m(scan) < spin_radius + 0.05:
+                        keep_yaw = False
+                        spin_blocked = True
+                if keep_yaw:
+                    cmd = DriveCommand(0.0, 0.0, cmd.vtheta, False)
+                else:
+                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
                 obstacle_state = "avoid"
 
     progress = {

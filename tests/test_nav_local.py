@@ -629,7 +629,11 @@ def test_spin_gate_allows_rotation_once_there_is_room():
 
 
 def test_spin_gate_does_not_override_reactive_avoid():
-    """A wall inside the stop bubble must still stop and turn, not translate."""
+    """A wall inside the stop bubble must stop — and must not spin into it.
+
+    Reactive avoid used to keep turning while the spin disc was occupied,
+    which rotated the bumper into shoulder obstacles when squeezing past.
+    """
     inscribed = 0.59 / 2.0
     cfg = _footprint_cfg()
     n = 360
@@ -653,9 +657,10 @@ def test_spin_gate_does_not_override_reactive_avoid():
         robot_radius_m=inscribed,
         spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
     )
-    assert progress["obstacle"] == "avoid"
+    assert progress["obstacle"] in ("avoid", "hold")
     assert cmd.vx == 0.0
-    assert progress["spin_blocked"] is False
+    assert cmd.vtheta == pytest.approx(0.0)
+    assert progress["spin_blocked"] is True
 
 
 def test_compute_path_command_stops_when_pose_already_in_lethal():
@@ -664,6 +669,7 @@ def test_compute_path_command_stops_when_pose_already_in_lethal():
     Local costs are footprint-inflated, so an inscribed cell under the robot
     means the body already overlaps an obstacle. Pure pursuit used to keep
     translating because path_cost_ahead / the nose cone stayed clear.
+    Inventing a freer-flank spin here rotated the corner into the obstacle.
     """
     from src.nav_builtin.costmap import LETHAL
     from src.nav_builtin.local_costmap import LocalCostmapView
@@ -705,6 +711,7 @@ def test_compute_path_command_stops_when_pose_already_in_lethal():
     assert progress["obstacle"] == "in_lethal"
     assert progress["pose_cost"] >= 253
     assert cmd.vx == 0.0
+    assert cmd.vtheta == pytest.approx(0.0)
 
 
 def _slew_cfg() -> FollowerConfig:
