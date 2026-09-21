@@ -382,7 +382,11 @@ def reverse_path_clear(
     cth = math.cos(theta_rad)
     sth = math.sin(theta_rad)
     res = view.occ.resolution
-    cells = max(1, int(math.ceil(float(robot_radius_m) / res)))
+    # Costs are footprint-inflated: a point/small pad along the path is enough.
+    # Re-applying the full robot radius double-counts and refuses valid reverse
+    # between two obstacles.
+    check_r = max(res, min(0.08, 0.25 * float(robot_radius_m)))
+    cells = max(1, int(math.ceil(check_r / res)))
     r2 = cells * cells
     h, w = view.costs.shape
     x, y = float(x_m), float(y_m)
@@ -441,13 +445,20 @@ def spin_disc_blocked(
     y_m: float,
     *,
     spin_radius_m: float,
+    inscribed_radius_m: float,
 ) -> bool:
-    """True when an in-place spin would sweep the corners through inflation.
+    """True when an in-place spin would sweep through inflation.
 
-    Uses the local costmap (including briefly persisted live hits) so a low
-    obstacle that depth just saw — then lost after yaw — still blocks rotate-
-    to-heading. Scan-only ``spin_clearance_m`` cannot see that case.
+    Local costs are already footprint-inflated by ``inscribed_radius_m``, so
+    checking a disc of the full circumscribed radius would double-count and
+    falsely block squeezable gaps (live: ~1 m lidar gap looked impassable).
+    Only the *extra* radius beyond the inscribed inflation is tested.
     """
-    return footprint_collides(
-        view, x_m, y_m, robot_radius_m=float(spin_radius_m)
-    )
+    from .costmap import INSCRIBED
+
+    inscribed = max(0.0, float(inscribed_radius_m))
+    spin = max(inscribed, float(spin_radius_m))
+    extra = spin - inscribed
+    if extra <= 1e-6:
+        return int(view.cost_at_world(x_m, y_m)) >= INSCRIBED
+    return footprint_collides(view, x_m, y_m, robot_radius_m=extra)

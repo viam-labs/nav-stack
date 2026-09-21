@@ -763,7 +763,11 @@ def compute_path_command(
         local_view is not None
         and spin_radius > float(robot_radius_m)
         and spin_disc_blocked(
-            local_view, current.x, current.y, spin_radius_m=spin_radius
+            local_view,
+            current.x,
+            current.y,
+            spin_radius_m=spin_radius,
+            inscribed_radius_m=float(robot_radius_m),
         )
     )
     if (
@@ -776,9 +780,10 @@ def compute_path_command(
         spin_blocked = True
         if obstacle_state in ("clear", "slow"):
             # Scan-only pinch: translate straight until there is room to spin.
-            # Costmap disc hit means we are already overlapping / against a
-            # live blob — crawling forward then hard-stop reversing rocks
-            # (rc15 narrow ↔ narrow_reverse). Prefer a short reverse or stop.
+            # Costmap disc hit: prefer reverse only when a short reverse is
+            # actually clear; otherwise crawl if the drive corridor is open
+            # (fits-through gap). Sitting at cmd=0 with reverse refused was
+            # the rc17 "stuck between two objects" deadlock.
             if cost_spin_hit:
                 rev = _try_narrow_reverse(
                     cfg,
@@ -791,7 +796,12 @@ def compute_path_command(
                     cmd = rev
                     obstacle_state = "narrow_reverse"
                 else:
-                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                    crawl = min(
+                        max(float(cfg.motion.min_linear_mps), 0.12),
+                        float(cfg.motion.max_linear_mps),
+                    )
+                    cmd = DriveCommand(crawl, 0.0, 0.0, False)
+                    obstacle_state = "narrow"
             else:
                 crawl = min(
                     max(float(cfg.motion.min_linear_mps), 0.12),

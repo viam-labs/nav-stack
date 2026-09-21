@@ -181,13 +181,15 @@ def test_spin_gate_uses_persisted_costmap_when_scan_is_clear():
     """Rotate-to-heading must not swing through a just-seen, now-blind blob."""
     from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
 
+    inscribed = 0.59 / 2.0
+    spin_r = math.hypot(0.72 / 2.0, 0.59 / 2.0)
     lc = LocalCostmap(
         LocalCostmapConfig(
             width_m=3.0,
             height_m=3.0,
             resolution=0.05,
-            inflation_radius_m=0.12,
-            robot_radius_m=0.08,
+            inflation_radius_m=inscribed,
+            robot_radius_m=inscribed,
             use_global_static=False,
             scan_persist_decay=10,
         )
@@ -195,8 +197,8 @@ def test_spin_gate_uses_persisted_costmap_when_scan_is_clear():
     pose = Pose2D(1.5, 1.5, 0.0)
     n = 72
     ranges = np.full(n, np.inf)
-    # Mark a hit just outside the inscribed radius but inside the spin disc.
-    ranges[int((-math.pi / 2 + math.pi) / (2 * math.pi / n)) % n] = 0.35  # right
+    # Hit outside inscribed clearance but inside circumscribed spin disc.
+    ranges[int((-math.pi / 2 + math.pi) / (2 * math.pi / n)) % n] = 0.40
     hit = conv.LaserScan2D(
         ranges,
         angle_min=-math.pi,
@@ -226,7 +228,6 @@ def test_spin_gate_uses_persisted_costmap_when_scan_is_clear():
         obstacle=ObstacleConfig(enabled=False),
         rotate_in_place_rad=math.radians(30.0),
     )
-    inscribed = 0.59 / 2.0
     cmd, progress = compute_path_command(
         pose,
         Path2D(points=((1.5, 1.5), (1.5, 3.0)), goal_theta=math.pi / 2),
@@ -234,21 +235,16 @@ def test_spin_gate_uses_persisted_costmap_when_scan_is_clear():
         scan=clear,
         local_view=view,
         robot_radius_m=inscribed,
-        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
+        spin_radius_m=spin_r,
     )
     assert progress["spin_blocked"] is True
-    # Costmap disc hit + clear rear → reverse, not the old forward crawl rock.
     assert progress["obstacle"] == "narrow_reverse"
     assert cmd.vx < 0.0
     assert abs(cmd.vtheta) < 1e-6
 
 
 def test_spin_gate_does_not_crawl_forward_into_costmap_disc():
-    """clear+spin_block must not crawl when the costmap disc is occupied.
-
-    That crawl was immediately undone by the costmap hard-stop reverse,
-    producing the rc15 narrow ↔ narrow_reverse rock.
-    """
+    """clear+spin_block prefers reverse when the (extra) spin disc is occupied."""
     from src.nav_builtin.costmap import INSCRIBED
     from src.nav_builtin.local_costmap import LocalCostmapView
     from src.nav_builtin.types import OccupancyGrid
@@ -257,8 +253,10 @@ def test_spin_gate_does_not_crawl_forward_into_costmap_disc():
     res = 0.05
     h = w = 80
     costs = np.zeros((h, w), dtype=np.uint8)
-    for r in range(38, 43):
-        for c in range(45, 50):
+    # Already-inflated costs: place INSCRIBED inside the *extra* spin ring
+    # (spin − inscribed ≈ 0.17 m), to the right of pose (2,2).
+    for r in range(36, 45):  # y ≈ 1.8–2.2
+        for c in range(42, 45):  # x ≈ 2.10–2.25 → ~0.12 m ahead-right
             costs[r, c] = INSCRIBED
     view = LocalCostmapView(
         costs=costs,
@@ -908,10 +906,13 @@ def test_costmap_hard_stop_reverses_when_spin_disc_blocked():
     res = 0.05
     h = w = 80
     costs = np.zeros((h, w), dtype=np.uint8)
-    # Inscribed blob ~0.35 m ahead of pose (2,2) — inside stop distance and
-    # inside the circumscribed spin disc, but not under the robot.
+    # Ahead blob for hard-stop (inside stop distance).
     for r in range(38, 43):
         for c in range(45, 50):  # x ≈ 2.25–2.45
+            costs[r, c] = INSCRIBED
+    # Close side INSCRIBED inside the extra spin ring so disc_hit is true.
+    for r in range(36, 45):
+        for c in range(42, 45):  # ~0.12 m off to the side
             costs[r, c] = INSCRIBED
     occ = OccupancyGrid(
         grid=np.zeros((h, w), dtype=np.int16),
@@ -921,7 +922,6 @@ def test_costmap_hard_stop_reverses_when_spin_disc_blocked():
     )
     view = LocalCostmapView(costs=costs, occ=occ, origin_x=0.0, origin_y=0.0)
     n = 72
-    # Lidar nose clear (matches live forward_clearance ~0.7); rear empty.
     ranges = np.full(n, 3.0)
     ranges[n // 2] = 0.70
     scan = conv.LaserScan2D(
@@ -958,13 +958,13 @@ def test_unstick_reverse_refuses_costmap_rear_collision():
     res = 0.05
     h = w = 80
     costs = np.zeros((h, w), dtype=np.uint8)
-    # Spin disc blocked ahead/side.
-    for r in range(38, 43):
-        for c in range(45, 50):
+    # Spin disc blocked (extra ring).
+    for r in range(36, 45):
+        for c in range(42, 45):
             costs[r, c] = INSCRIBED
-    # Wall immediately behind the robot at (2,2).
-    for r in range(35, 45):
-        for c in range(25, 35):  # x ≈ 1.25–1.75
+    # Lethal/inscribed immediately on the reverse centerline (behind).
+    for r in range(38, 43):
+        for c in range(34, 38):  # x ≈ 1.7–1.9, just behind (2,2)
             costs[r, c] = INSCRIBED
     view = LocalCostmapView(
         costs=costs,
@@ -979,7 +979,7 @@ def test_unstick_reverse_refuses_costmap_rear_collision():
     )
     n = 72
     scan = conv.LaserScan2D(
-        np.full(n, 3.0),  # lidar claims everything open
+        np.full(n, 3.0),
         angle_min=-math.pi,
         angle_increment=2 * math.pi / n,
         range_min=0.05,
@@ -1008,7 +1008,9 @@ def test_unstick_reverse_refuses_costmap_rear_collision():
         spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
     )
     assert progress["spin_blocked"] is True
-    assert cmd.vx == pytest.approx(0.0)
+    # Rear blocked → must not reverse into the wall.
+    assert cmd.vx >= -1e-9
+    assert progress["obstacle"] != "narrow_reverse"
 
 
 def test_compute_path_command_stops_when_pose_already_in_lethal():
