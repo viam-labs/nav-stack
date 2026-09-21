@@ -733,12 +733,22 @@ def compute_path_command(
     ):
         spin_blocked = True
         if obstacle_state in ("clear", "slow"):
-            crawl = min(
-                max(float(cfg.motion.min_linear_mps), 0.12),
-                float(cfg.motion.max_linear_mps),
-            )
-            cmd = DriveCommand(crawl, 0.0, 0.0, False)
-            obstacle_state = "narrow"
+            # Scan-only pinch: translate straight until there is room to spin.
+            # Costmap disc hit means we are already overlapping / against a
+            # live blob — crawling forward then hard-stop reversing rocks
+            # (rc15 narrow ↔ narrow_reverse). Prefer reverse or stop.
+            if cost_spin_hit and _rear_open_for_unstick(scan, robot_radius_m):
+                cmd = _narrow_reverse_command(cfg)
+                obstacle_state = "narrow_reverse"
+            elif cost_spin_hit:
+                cmd = DriveCommand(0.0, 0.0, 0.0, False)
+            else:
+                crawl = min(
+                    max(float(cfg.motion.min_linear_mps), 0.12),
+                    float(cfg.motion.max_linear_mps),
+                )
+                cmd = DriveCommand(crawl, 0.0, 0.0, False)
+                obstacle_state = "narrow"
         else:
             # Squeeze / avoid / hold: spinning swings the bumper into the
             # pinch. Prefer a short reverse when the rear is open so wait/

@@ -1438,9 +1438,13 @@ class NavSupervisor:
                 backup_exhausted = (
                     backup_attempts >= self._backup_max_attempts and local_blocked
                 )
+                # Sign-flip rock (narrow crawl ↔ reverse) can happen with the
+                # path centerline still "clear" on costs — still force a replan.
+                spin_rock = bool(progress.get("spin_blocked")) and oscillating
                 should_replan = (replan_due or pose_jumped) and (
                     static_blocked
                     or (oscillating and local_blocked)
+                    or spin_rock
                     or backup_exhausted
                 )
                 # Periodic check said "still clear" — still advance the timer.

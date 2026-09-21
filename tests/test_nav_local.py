@@ -237,7 +237,73 @@ def test_spin_gate_uses_persisted_costmap_when_scan_is_clear():
         spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
     )
     assert progress["spin_blocked"] is True
+    # Costmap disc hit + clear rear → reverse, not the old forward crawl rock.
+    assert progress["obstacle"] == "narrow_reverse"
+    assert cmd.vx < 0.0
     assert abs(cmd.vtheta) < 1e-6
+
+
+def test_spin_gate_does_not_crawl_forward_into_costmap_disc():
+    """clear+spin_block must not crawl when the costmap disc is occupied.
+
+    That crawl was immediately undone by the costmap hard-stop reverse,
+    producing the rc15 narrow ↔ narrow_reverse rock.
+    """
+    from src.nav_builtin.costmap import INSCRIBED
+    from src.nav_builtin.local_costmap import LocalCostmapView
+    from src.nav_builtin.types import OccupancyGrid
+    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
+
+    res = 0.05
+    h = w = 80
+    costs = np.zeros((h, w), dtype=np.uint8)
+    for r in range(38, 43):
+        for c in range(45, 50):
+            costs[r, c] = INSCRIBED
+    view = LocalCostmapView(
+        costs=costs,
+        occ=OccupancyGrid(
+            grid=np.zeros((h, w), dtype=np.int16),
+            resolution=res,
+            origin_x=0.0,
+            origin_y=0.0,
+        ),
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    n = 72
+    scan = conv.LaserScan2D(
+        np.full(n, 3.0),
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    inscribed = 0.59 / 2.0
+    cfg = FollowerConfig(
+        motion=SimpleMotionConfig(
+            xy_tolerance_m=0.15,
+            yaw_tolerance_rad=0.1,
+            max_linear_mps=0.4,
+            max_angular_rad_s=0.6,
+            min_linear_mps=0.05,
+            min_angular_rad_s=0.05,
+        ),
+        obstacle=ObstacleConfig(enabled=False),
+        rotate_in_place_rad=math.radians(30.0),
+    )
+    cmd, progress = compute_path_command(
+        Pose2D(2.0, 2.0, 0.0),
+        Path2D(points=((2.0, 2.0), (2.0, 3.5)), goal_theta=math.pi / 2),
+        cfg=cfg,
+        scan=scan,
+        local_view=view,
+        robot_radius_m=inscribed,
+        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
+    )
+    assert progress["spin_blocked"] is True
+    assert progress["obstacle"] == "narrow_reverse"
+    assert cmd.vx < 0.0
 
 
 def test_local_costmap_does_not_reinflate_global_static():
