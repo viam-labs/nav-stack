@@ -42,7 +42,12 @@ async def test_verify_pose_between_route_legs_calls_slam_check(monkeypatch):
     try:
         out = await nav._verify_pose_between_route_legs()
         assert out["status"] == "ok"
-        slam.do_command.assert_awaited_with({"command": "check_localization"})
+        slam.do_command.assert_awaited_with(
+            {
+                "command": "check_localization",
+                "full_map_escalation": "still_bad",
+            }
+        )
     finally:
         unregister_slam_service("slam-test-verify")
 

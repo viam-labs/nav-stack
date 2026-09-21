@@ -704,12 +704,12 @@ def _relocalize_slam(**cfg_overrides):
     return slam
 
 
-def _run_relocalize_until_settled(slam):
+def _run_relocalize_until_settled(slam, **cycle_kwargs):
     """Run up to confirm_count cycles so large jumps can clear the gate."""
     needed = max(1, int(slam._cfg.localize_jump_confirm_count))
     result = None
     for _ in range(needed):
-        result = asyncio.run(slam._periodic_relocalize_cycle())
+        result = asyncio.run(slam._periodic_relocalize_cycle(**cycle_kwargs))
         if result.get("status") != "awaiting_confirm":
             return result
     return result
@@ -1083,6 +1083,59 @@ def test_periodic_relocalize_cycle_escalates_full_map_on_low_quality():
     ]
     assert full_cmds
     slam.do_command.assert_awaited_once()
+
+
+def test_periodic_relocalize_still_bad_skips_full_map_when_prior_ok():
+    """Route-leg policy: weak local peel must not trigger a full-map search
+    when the published pose still explains the scan."""
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._tick_match_score = MagicMock(return_value=0.6)
+
+    async def _localize(command):
+        assert not command.get("full_map")
+        return {
+            "status": "matched",
+            "score": 0.2,
+            "ray_mae_m": 1.5,
+            "prior_score": 0.55,
+            "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
+        }
+
+    slam._global_localize = AsyncMock(side_effect=_localize)
+    result = asyncio.run(
+        slam._periodic_relocalize_cycle(full_map_escalation="still_bad")
+    )
+    assert result["match_mode"] == "local"
+    assert slam._global_localize.await_count == 1
+
+
+def test_periodic_relocalize_still_bad_escalates_when_prior_bad():
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._tick_match_score = MagicMock(return_value=-0.2)
+
+    async def _localize(command):
+        if command.get("full_map"):
+            return {
+                "status": "matched",
+                "score": 0.85,
+                "ray_mae_m": 0.25,
+                "pose": {"x": 2.0, "y": 0.0, "theta": 0.0},
+            }
+        return {
+            "status": "matched",
+            "score": 0.2,
+            "ray_mae_m": 1.5,
+            "prior_score": -0.3,
+            "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
+        }
+
+    slam._global_localize = AsyncMock(side_effect=_localize)
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+    result = _run_relocalize_until_settled(
+        slam, full_map_escalation="still_bad"
+    )
+    assert result["match_mode"] == "full_map_after_still_bad"
+    assert slam._global_localize.await_count >= 2
 
 
 def test_periodic_relocalize_cycle_full_map_when_nav_recoveries_high():

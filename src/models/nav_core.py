@@ -1757,9 +1757,9 @@ class NavServiceBase(Motion):
     async def _verify_pose_between_route_legs(self) -> Mapping:
         """Run one SLAM localization check while stopped between route waypoints.
 
-        Uses ``check_localization`` (same path as the drift watchdog). With nav
-        idle and the robot still, a bad tick match escalates to full-map
-        recovery and may apply a trusted correction before the next leg.
+        Uses ``check_localization`` with ``full_map_escalation=still_bad``:
+        cheap local match first; full-map only when the published pose still
+        looks wrong after that (avoids a multi-10s pause on every mediocre leg).
         """
         cfg = getattr(self, "_cfg", None)
         if cfg is None:
@@ -1777,8 +1777,12 @@ class NavServiceBase(Motion):
         svc = get_slam_service(slam_name)
         if svc is None or not hasattr(svc, "do_command"):
             return {"status": "skipped", "reason": "slam_unavailable"}
+        check_cmd = {
+            "command": "check_localization",
+            "full_map_escalation": "still_bad",
+        }
         try:
-            result = await svc.do_command({"command": "check_localization"})
+            result = await svc.do_command(check_cmd)
         except Exception as exc:  # noqa: BLE001
             return {
                 "status": "error",
@@ -1791,7 +1795,7 @@ class NavServiceBase(Motion):
         if status == "awaiting_confirm":
             await asyncio.sleep(0.4)
             try:
-                result2 = await svc.do_command({"command": "check_localization"})
+                result2 = await svc.do_command(check_cmd)
             except Exception:  # noqa: BLE001
                 return dict(result)
             if isinstance(result2, Mapping):

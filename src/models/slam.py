@@ -1144,7 +1144,10 @@ class SlamService(SLAM):
         return None
 
     async def _periodic_relocalize_cycle(
-        self, *, apply_override: Optional[bool] = None
+        self,
+        *,
+        apply_override: Optional[bool] = None,
+        full_map_escalation: str = "low_quality",
     ) -> Mapping[str, ValueTypes]:
         """Run one drift check; correct pose when a trusted match has moved.
 
@@ -1153,7 +1156,16 @@ class SlamService(SLAM):
         or when Nav2 reports multiple recoveries on the active goal.
         While still with a bad published-pose tick score, goes straight to
         full-map — a 360° lidar already has the view; spinning does not help.
+
+        ``full_map_escalation``:
+        - ``low_quality`` (default): current watchdog — full-map after a weak
+          local match, or immediately when still-bad while idle.
+        - ``still_bad``: always try local first; full-map only when the current
+          pose still looks wrong after that (route between-leg checks).
         """
+        escalation = str(full_map_escalation or "low_quality").strip().lower()
+        if escalation not in ("low_quality", "still_bad"):
+            escalation = "low_quality"
         cfg = self._cfg
         mgr = self._manager
         if cfg is None or mgr is None:
@@ -1190,20 +1202,24 @@ class SlamService(SLAM):
 
         still_bad, tick_score = self._published_pose_is_bad(cfg)
         # Still + scan-does-not-explain-pose → full map immediately (no local
-        # peek that just reaffirms a wrong corridor cell).
+        # peek that just reaffirms a wrong corridor cell). Route-leg checks
+        # (still_bad escalation) always try local first to avoid a 40s+ pause.
         force_full_map = (
             nav_recoveries >= cfg.periodic_relocalize_nav_recoveries_threshold
-            or (still_bad and not nav_active)
+            or (still_bad and not nav_active and escalation == "low_quality")
         )
         current = mgr.get_pose_in_map()
 
         base_command: dict = {"command": "global_localize"}
         base_command.update(dict(cfg.periodic_relocalize_options))
         base_command["apply"] = False
+        if escalation == "still_bad":
+            # Do not let the local request auto-fall back into a full-map search.
+            base_command["auto_full_map_fallback"] = False
 
         match_mode = (
             "full_map_still_recovery"
-            if (still_bad and not nav_active)
+            if (still_bad and not nav_active and escalation == "low_quality")
             else ("full_map" if force_full_map else "local")
         )
         match_command = dict(base_command)
@@ -1228,12 +1244,32 @@ class SlamService(SLAM):
         matched_pose = match.get("pose")
         shift_m, shift_deg = self._pose_shift_from_current(current, matched_pose)
 
+        # After local: is the *published* pose still unexplained by the scan?
+        prior_score = match.get("prior_score")
+        pose_still_bad = bool(still_bad)
+        if prior_score is not None:
+            try:
+                pose_still_bad = float(prior_score) <= float(
+                    cfg.periodic_relocalize_still_bad_score
+                )
+            except (TypeError, ValueError):
+                pass
+
+        escalate_full = False
         if (
             not good_match
             and not force_full_map
-            and cfg.periodic_relocalize_full_map_on_low_quality
             and apply_override is not True
+            and match_mode == "local"
         ):
+            if escalation == "low_quality":
+                escalate_full = bool(cfg.periodic_relocalize_full_map_on_low_quality)
+            else:
+                # still_bad: only burn a full-map search when we are confident
+                # the current pose is wrong, not merely that a local peel was weak.
+                escalate_full = bool(pose_still_bad)
+
+        if escalate_full:
             full_command = dict(base_command)
             full_command["full_map"] = True
             full_command["auto_full_map_fallback"] = False
@@ -1248,7 +1284,11 @@ class SlamService(SLAM):
                 ray_mae = full_ray_mae
                 matched_pose = full_match.get("pose")
                 shift_m, shift_deg = self._pose_shift_from_current(current, matched_pose)
-                match_mode = "full_map_after_low_quality"
+                match_mode = (
+                    "full_map_after_still_bad"
+                    if escalation == "still_bad"
+                    else "full_map_after_low_quality"
+                )
 
         # Refuse auto-apply of ambiguous full-map peaks (second-best often a
         # corridor twin). Manual apply:true still bypasses via apply_override.
@@ -2501,11 +2541,15 @@ class SlamService(SLAM):
         if cmd == "check_localization":
             # Run one drift-watchdog cycle on demand. ``apply`` forces or
             # suppresses the correction; omit it to use the drift thresholds.
+            # ``full_map_escalation``: ``low_quality`` (default) or ``still_bad``
+            # (local first; full-map only when the published pose still looks wrong).
             apply_override = command.get("apply")
+            escalation = command.get("full_map_escalation", "low_quality")
             return await self._periodic_relocalize_cycle(
                 apply_override=(
                     None if apply_override is None else bool(apply_override)
-                )
+                ),
+                full_map_escalation=str(escalation or "low_quality"),
             )
 
         if cmd == "get_localization_check":
