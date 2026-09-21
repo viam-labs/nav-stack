@@ -282,6 +282,7 @@ def test_set_initial_pose_refine_runs_seeded_yaw_search(tmp_path: Path):
     slam._cfg = MagicMock(mode=MODE_LOCALIZING)
     mgr = MagicMock()
     slam._manager = mgr
+    slam._cancel_startup_global_localize_task = MagicMock()
 
     refine_result = {"status": "localized", "score": 0.8}
 
@@ -302,6 +303,7 @@ def test_set_initial_pose_refine_runs_seeded_yaw_search(tmp_path: Path):
     )
 
     mgr.set_initial_pose.assert_called_once()
+    slam._cancel_startup_global_localize_task.assert_called()
     assert result["status"] == "ok"
     assert result["refine"] == refine_result
     sent = _fake_global_localize.command

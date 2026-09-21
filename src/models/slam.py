@@ -1740,7 +1740,10 @@ class SlamService(SLAM):
                 return False
             score = match.get("score")
             ray_mae = match.get("ray_mae_m")
-            if score is not None and float(score) < 0.55:
+            # Corridor twins often clear 0.55 while still wrong; require a
+            # clearer peak before boot auto-apply (manual seed remains the
+            # recovery path when the map is repetitive).
+            if score is not None and float(score) < 0.65:
                 LOGGER.info(
                     "startup global_localize: skipping apply (low score=%.3f)",
                     float(score),
@@ -1749,11 +1752,26 @@ class SlamService(SLAM):
             if (
                 ray_mae is not None
                 and math.isfinite(float(ray_mae))
-                and float(ray_mae) > 0.55
+                and float(ray_mae) > 0.45
             ):
                 LOGGER.info(
                     "startup global_localize: skipping apply (ray_mae=%.3f)",
                     float(ray_mae),
+                )
+                return False
+            # Prefer a clear margin over second-best when reported.
+            second = match.get("second_best_score")
+            if (
+                score is not None
+                and second is not None
+                and math.isfinite(float(second))
+                and float(score) - float(second) < 0.08
+            ):
+                LOGGER.info(
+                    "startup global_localize: skipping apply (near-tie "
+                    "score=%.3f second_best=%.3f)",
+                    float(score),
+                    float(second),
                 )
                 return False
             mgr = self._manager
@@ -2405,6 +2423,9 @@ class SlamService(SLAM):
             # corridor twin — otherwise the next watchdog tick can finish the
             # confirm and yank the pose back across the map.
             self._pose_jump_gate.clear()
+            # Also cancel boot full-map localize: it can still finish after the
+            # user has already placed the robot and overwrite a good seed.
+            self._cancel_startup_global_localize_task()
             # ``refine: true`` runs a seeded scan match around the given XY with
             # a full yaw sweep — the matcher itself only searches ~±30° of
             # heading, so a seed with roughly-right XY but wrong theta can never
