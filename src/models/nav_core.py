@@ -1986,7 +1986,7 @@ class NavServiceBase(Motion):
             enabled=cfg.simple_avoid_obstacles,
             stop_distance_m=cfg.simple_stop_distance,
             slow_distance_m=cfg.simple_slow_distance,
-            footprint_half_width_m=cfg.inscribed_radius_m() + 0.03,
+            footprint_half_width_m=cfg.inscribed_radius_m() + 0.12,
             max_age_s=cfg.simple_scan_max_age,
         )
 

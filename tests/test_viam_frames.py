@@ -181,12 +181,13 @@ def test_apply_slam_fills_mount_when_omitted():
     cam = next(l for l in cfg2.lidars if l.name == "camera")
     assert abs(cam.x - 0.30) < 1e-9
     assert abs(cam.y - (-0.15)) < 1e-9
-    # RealSense PCD is optical even when FS carries a -90° roll; keep the
-    # optical remap and ignore FS pitch/roll so hits are not z-filtered away.
+    # RealSense PCD is optical; FS OV RPY is convention, not lens aim — keep
+    # optical remap and identity orientation (translation only from FS).
     assert cam.cloud_frame == "camera_optical"
+    assert abs(cam.theta) < 1e-9
     assert abs(cam.pitch) < 1e-9
     assert abs(cam.roll) < 1e-9
-    assert any("kept camera_optical" in n for n in notes)
+    assert any("FS orientation ignored" in n for n in notes)
 
 
 def test_apply_slam_keeps_explicit_mount():

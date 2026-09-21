@@ -244,7 +244,9 @@ class NavSupervisor:
                 ),
                 # Anything inside the body's swept corridor counts as "ahead" —
                 # the ±35° cone alone let shoulder-side bins slide past.
-                footprint_half_width_m=float(robot_radius_m) + 0.03,
+                # Padding beyond the inscribed radius covers light shoulder
+                # grazes (half-width + ~12 cm) without sealing every doorway.
+                footprint_half_width_m=float(robot_radius_m) + 0.12,
                 max_age_s=scan_max_age_s,
             )
             if avoid_obstacles

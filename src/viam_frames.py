@@ -305,33 +305,37 @@ def apply_framesystem_to_slam_cfg(
         from .config import CLOUD_FRAME_CAMERA_OPTICAL
 
         # Framesystem pose is the component frame → base. RealSense
-        # GetPointCloud is still camera-optical (Z forward) even when the
-        # framesystem camera frame carries a -90° roll for that optical
-        # convention. Clearing cloud_frame to ``sensor`` and then applying
-        # that roll as a body-frame mount mis-orients the cloud and z-filters
-        # away nearly every obstacle hit (live symptom: ~1 valid return).
-        # Keep ``camera_optical`` so we remap axes first; take translation +
-        # yaw from FS, but ignore FS pitch/roll (optical remap owns axes;
-        # mast tilt should be set explicitly in JSON if needed).
+        # GetPointCloud is still camera-optical (Z forward). The FS camera
+        # orientation is typically an optical/camera_link OV (±90° roll, and
+        # after Y-forward→ROS convert often ±90° yaw) — not the lens aim in
+        # the map. Using that RPY (with or without optical remap) paints the
+        # cloud to the robot's side/rear so ahead-right obstacles never enter
+        # the reactive corridor (live: center ray → −Y, grazes with
+        # forward_clearance still "clear").
+        # Keep ``camera_optical``; take translation from FS; ignore FS RPY
+        # (identity aim = forward-facing after optical→sensor). Side/rear
+        # mounts and mast tilt must set ``mount`` explicitly in JSON.
         optical = lidar.cloud_frame == CLOUD_FRAME_CAMERA_OPTICAL
         lidar.x = mount.x
         lidar.y = mount.y
         lidar.z = mount.z
-        lidar.theta = mount.theta
         if optical:
+            lidar.theta = 0.0
             lidar.pitch = 0.0
             lidar.roll = 0.0
             optical_note = (
-                "; kept camera_optical (FS pitch/roll ignored — PCD is optical)"
+                "; kept camera_optical (FS orientation ignored — PCD is optical; "
+                "aim via JSON mount)"
             )
         else:
+            lidar.theta = mount.theta
             lidar.pitch = mount.pitch
             lidar.roll = mount.roll
             optical_note = ""
         notes.append(
             f"lidar {lidar.name}: mount from framesystem "
-            f"({mount.x:.3f},{mount.y:.3f},{mount.z:.3f}) "
-            f"θ={mount.theta:.3f} pitch={lidar.pitch:.3f} roll={lidar.roll:.3f}"
+            f"({lidar.x:.3f},{lidar.y:.3f},{lidar.z:.3f}) "
+            f"θ={lidar.theta:.3f} pitch={lidar.pitch:.3f} roll={lidar.roll:.3f}"
             f"{optical_note}"
         )
     for line in notes:

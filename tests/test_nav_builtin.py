@@ -446,7 +446,7 @@ def test_supervisor_wires_footprint_derived_clearances():
     follower = sup._follower
     # Bumper is 0.36 m out, so stop at 0.41 — not a 0.5 m half-diagonal disc.
     assert follower.obstacle.stop_distance_m == pytest.approx(0.41)
-    assert follower.obstacle.footprint_half_width_m == pytest.approx(0.325)
+    assert follower.obstacle.footprint_half_width_m == pytest.approx(0.415)
     assert follower.wheel_half_track_m == pytest.approx(0.2655)
 
 
