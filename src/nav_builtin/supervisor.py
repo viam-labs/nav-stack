@@ -12,8 +12,8 @@ from ..nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
     SimpleMotionConfig,
+    cone_min_range,
     distance_m,
-    forward_clearance_m,
     rear_clearance_m,
 )
 from ..geom import conversions as conv
@@ -1012,41 +1012,51 @@ class NavSupervisor:
                     if scan is None and self._local_view_cache is not None:
                         local_view = self._local_view_cache
                     else:
-                        costmap_scan = scan
-                        if (
-                            costmap_scan is not None
-                            and costmap_scan.capture_pose is None
-                        ):
-                            costmap_scan = conv.LaserScan2D(
-                                ranges=costmap_scan.ranges,
-                                angle_min=costmap_scan.angle_min,
-                                angle_increment=costmap_scan.angle_increment,
-                                range_min=costmap_scan.range_min,
-                                range_max=costmap_scan.range_max,
-                                sensor_pose=costmap_scan.sensor_pose,
-                                capture_pose=pose,
+                        # Costmap must not ingest obstacles_only depth — that
+                        # contradicts viam_io's contract and paints phantom
+                        # inscribed cells (pose_cost / spin) while lidar is clear.
+                        costmap_scan = None
+                        try:
+                            costmap_scan = self._world.get_scan(
+                                self._scan_max_age, include_obstacles_only=False
                             )
-                        with self._global_cache_lock:
-                            global_occ = self._global_occ_cache
-                            global_costs = self._global_costs_cache
-                        local_view = self._local_costmap.update(
-                            pose,
-                            costmap_scan,
-                            global_occ=global_occ,
-                            global_costs=global_costs,
-                        )
-                        self._local_view_cache = local_view
-                        self._local_view_at = now
-                        self._local_costmap_updates += 1
-                        if self._local_costmap_enabled:
-                            from .costmap import local_view_viz_dict
-
-                            try:
-                                self._world.set_viz_local_costmap(
-                                    local_view_viz_dict(local_view)
+                        except Exception:  # noqa: BLE001
+                            costmap_scan = None
+                        if costmap_scan is None:
+                            # Do not fall back to fused/depth — keep last view.
+                            local_view = self._local_view_cache
+                        else:
+                            if costmap_scan.capture_pose is None:
+                                costmap_scan = conv.LaserScan2D(
+                                    ranges=costmap_scan.ranges,
+                                    angle_min=costmap_scan.angle_min,
+                                    angle_increment=costmap_scan.angle_increment,
+                                    range_min=costmap_scan.range_min,
+                                    range_max=costmap_scan.range_max,
+                                    sensor_pose=costmap_scan.sensor_pose,
+                                    capture_pose=pose,
                                 )
-                            except Exception:  # noqa: BLE001 - viz is best-effort
-                                pass
+                            with self._global_cache_lock:
+                                global_occ = self._global_occ_cache
+                                global_costs = self._global_costs_cache
+                            local_view = self._local_costmap.update(
+                                pose,
+                                costmap_scan,
+                                global_occ=global_occ,
+                                global_costs=global_costs,
+                            )
+                            self._local_view_cache = local_view
+                            self._local_view_at = now
+                            self._local_costmap_updates += 1
+                            if self._local_costmap_enabled:
+                                from .costmap import local_view_viz_dict
+
+                                try:
+                                    self._world.set_viz_local_costmap(
+                                        local_view_viz_dict(local_view)
+                                    )
+                                except Exception:  # noqa: BLE001 - viz is best-effort
+                                    pass
 
                 path_ahead_cost = 0
                 pose_cost = 0
@@ -1099,24 +1109,28 @@ class NavSupervisor:
                 )
                 nose_clear = True
                 obs_cfg = self._follower.obstacle
+                lidar_only = None
                 if obs_cfg is not None and obs_cfg.enabled:
                     # Wait / nose_clear must not trust depth phantoms. Fused
-                    # scan can report fwd≈0 while lidar still sees free space
-                    # (body/floor/mis-aimed camera). Use lidar-only when available.
-                    nose_scan = scan
+                    # scan can report fwd≈0 while lidar still sees free space.
+                    # Use the front cone on lidar-only — corridor half-width
+                    # would treat a shoulder pinch as a "person on the nose".
                     try:
                         lidar_only = self._world.get_scan(
                             self._scan_max_age, include_obstacles_only=False
                         )
                     except Exception:  # noqa: BLE001
                         lidar_only = None
-                    if lidar_only is not None:
-                        nose_scan = lidar_only
+                    nose_scan = lidar_only
                     if nose_scan is not None:
+                        half = float(obs_cfg.front_cone_half_rad)
+                        nose_range = cone_min_range(nose_scan, -half, half)
                         nose_clear = (
-                            forward_clearance_m(nose_scan, obs_cfg)
-                            > obs_cfg.stop_distance_m
+                            (not math.isfinite(nose_range))
+                            or nose_range > obs_cfg.stop_distance_m
                         )
+                    # If lidar-only is unavailable, do NOT fall back to fused
+                    # for wait policy — that reintroduces depth phantoms.
                 waiting_for_clear = False
                 if local_blocked:
                     if local_blocked_since is None:
@@ -1131,6 +1145,14 @@ class NavSupervisor:
                         wait_before_replan_s=wait_before_replan_s,
                         replan_cooldown_ready=cooldown_ready,
                     )
+                    # Contradiction: path centerline free (path_cost low) but we
+                    # still "wait for nose" — freezes forever on phantom/side
+                    # blocks while replan also fails. Prefer DWA peel instead.
+                    if (
+                        action == "wait"
+                        and path_ahead_cost < self._local_planner_activate_cost
+                    ):
+                        action = "keep_dwa"
                     if action == "wait":
                         waiting_for_clear = True
                     elif action == "replan":
@@ -1313,6 +1335,34 @@ class NavSupervisor:
                     # spin-blocked reverse crawl (otherwise avoid→spin_block→
                     # wait deadlocks with cmd stuck at zero). Still allow
                     # rotate-to-heading when that is the only command.
+                    #
+                    # If the follower did not already reverse (fused phantom
+                    # nose held it), inject reverse when spin is blocked —
+                    # wait must not contradict the spin-gate escape.
+                    if (
+                        abs(cmd.vx) < 1e-6
+                        and abs(cmd.vtheta) < 1e-6
+                        and (
+                            bool(progress.get("spin_blocked"))
+                            or progress.get("obstacle") == "in_lethal"
+                        )
+                        and local_view is not None
+                    ):
+                        from .controller import _try_narrow_reverse
+
+                        # Prefer lidar-only for reverse gate — fused depth can
+                        # invent a rear wall that keeps wait at cmd=0.
+                        rev_scan = lidar_only if lidar_only is not None else scan
+                        if rev_scan is not None:
+                            rev = _try_narrow_reverse(
+                                self._follower,
+                                rev_scan,
+                                self._robot_radius,
+                                local_view=local_view,
+                                current=pose,
+                            )
+                            if rev is not None:
+                                cmd = rev
                     if cmd.vx < -1e-6 and abs(cmd.vtheta) < 1e-6:
                         progress = {
                             **progress,

@@ -408,7 +408,11 @@ def reverse_path_clear(
                     wx = view.origin_x + (cc + 0.5) * res
                     wy = view.origin_y + (rr + 0.5) * res
                     bx = cth * (wx - start_x) + sth * (wy - start_y)
-                    if bx > 0.05:
+                    # Skip the blob under/ahead of the start pose — that is
+                    # what we are reversing *away* from. Only obstacles further
+                    # behind (outside the start footprint pad) can refuse.
+                    start_pad_m = max(0.10, 2.0 * res)
+                    if bx > 0.05 or math.hypot(wx - start_x, wy - start_y) <= start_pad_m:
                         continue
                 return False
     return True

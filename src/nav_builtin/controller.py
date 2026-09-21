@@ -873,9 +873,24 @@ def compute_path_command(
 
         pose_cost = int(local_view.cost_at_world(current.x, current.y))
         if pose_cost >= INSCRIBED:
-            cmd = DriveCommand(0.0, 0.0, 0.0, False)
-            obstacle_state = "in_lethal"
-            spin_blocked = False
+            # Contradiction with spin-gate reverse: sitting in inflation used
+            # to full-stop with no escape while path_cost_ahead stayed 0.
+            rev = _try_narrow_reverse(
+                cfg,
+                scan,
+                robot_radius_m,
+                local_view=local_view,
+                current=current,
+            )
+            if rev is not None:
+                cmd = rev
+                obstacle_state = "narrow_reverse"
+                spin_blocked = False
+            else:
+                cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                obstacle_state = "in_lethal"
+                # Keep spin_blocked so wait / recovery can still try reverse.
+                spin_blocked = True
         elif cmd.vx > 1e-6:
             stop_m = (
                 float(cfg.obstacle.stop_distance_m)

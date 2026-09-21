@@ -733,3 +733,41 @@ def test_get_scan_can_exclude_obstacles_only_lidars():
     full_phantom = world.get_scan(2.0, include_obstacles_only=True)
     assert full_phantom is not None
     assert float(np.nanmin(full_phantom.ranges)) == pytest.approx(2.0)
+
+
+def test_get_scan_lidar_only_does_not_fall_back_to_depth():
+    """include_obstacles_only=False must not return depth when lidar is silent."""
+    from src.config import LidarConfig
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[
+            LidarConfig(name="lidar", scan_source="get_laser_scan"),
+            LidarConfig(
+                name="camera", scan_source="point_cloud", obstacles_only=True
+            ),
+        ],
+    )
+    depth_scan = conv.LaserScan2D(
+        ranges=np.full(8, 0.05),
+        angle_min=-math.pi,
+        angle_increment=math.pi / 4,
+        range_min=0.05,
+        range_max=10.0,
+        capture_pose=conv.Pose2D(0.0, 0.0, 0.0),
+    )
+
+    def _read(lidar, max_age_s=2.0):
+        if lidar.name == "lidar":
+            return None
+        return depth_scan
+
+    world.get_pose = MagicMock(return_value=conv.Pose2D(0.0, 0.0, 0.0))
+    world._read_lidar_scan_sync = MagicMock(side_effect=_read)  # noqa: SLF001
+
+    assert world.get_scan(2.0, include_obstacles_only=False) is None
+    full = world.get_scan(2.0, include_obstacles_only=True)
+    assert full is not None
+    assert float(np.nanmin(full.ranges)) == pytest.approx(0.05)

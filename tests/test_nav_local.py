@@ -1061,13 +1061,14 @@ def test_unstick_reverse_refuses_costmap_rear_collision():
     assert progress["obstacle"] != "narrow_reverse"
 
 
-def test_compute_path_command_stops_when_pose_already_in_lethal():
-    """Off-path drift into inflation: path ahead can look clear — still stop.
+def test_compute_path_command_reverses_when_pose_already_in_lethal():
+    """Off-path drift into inflation: path ahead can look clear — reverse out.
 
     Local costs are footprint-inflated, so an inscribed cell under the robot
     means the body already overlaps an obstacle. Pure pursuit used to keep
     translating because path_cost_ahead / the nose cone stayed clear.
-    Inventing a freer-flank spin here rotated the corner into the obstacle.
+    Inventing a freer-flank spin here rotated the corner into the obstacle;
+    a short reverse (rear open) is the escape.
     """
     from src.nav_builtin.costmap import LETHAL
     from src.nav_builtin.local_costmap import LocalCostmapView
@@ -1076,9 +1077,52 @@ def test_compute_path_command_stops_when_pose_already_in_lethal():
     res = 0.05
     h = w = 80
     costs = np.zeros((h, w), dtype=np.uint8)
-    # Lethal under the robot at (2, 2); free corridor along +x for the path.
+    # Lethal under the robot center only; rear (−x) stays free so reverse escapes.
+    costs[40, 40] = LETHAL
+    occ = OccupancyGrid(
+        grid=np.zeros((h, w), dtype=np.int16),
+        resolution=res,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    view = LocalCostmapView(costs=costs, occ=occ, origin_x=0.0, origin_y=0.0)
+    # Wide-open lidar — nose cone would not stop us; rear is also open.
+    n = 72
+    scan = conv.LaserScan2D(
+        np.full(n, np.inf),
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    cfg = FollowerConfig()
+    cfg.obstacle = None
+    cmd, progress = compute_path_command(
+        Pose2D(2.0, 2.0, 0.0),
+        Path2D(points=((2.0, 2.0), (3.5, 2.0)), goal_theta=0.0),
+        cfg=cfg,
+        scan=scan,
+        local_view=view,
+        robot_radius_m=0.22,
+    )
+    assert progress["obstacle"] == "narrow_reverse"
+    assert progress["pose_cost"] >= 253
+    assert cmd.vx < 0.0
+    assert cmd.vtheta == pytest.approx(0.0)
+
+
+def test_compute_path_command_stops_in_lethal_when_rear_blocked():
+    """in_lethal with no reverse room: full stop, no freer-flank spin."""
+    from src.nav_builtin.costmap import LETHAL
+    from src.nav_builtin.local_costmap import LocalCostmapView
+    from src.nav_builtin.types import OccupancyGrid
+
+    res = 0.05
+    h = w = 80
+    costs = np.zeros((h, w), dtype=np.uint8)
+    # Lethal under the robot and filling the rear (+x free for the path).
     for r in range(35, 45):
-        for c in range(35, 45):
+        for c in range(20, 45):
             costs[r, c] = LETHAL
     occ = OccupancyGrid(
         grid=np.zeros((h, w), dtype=np.int16),
@@ -1087,7 +1131,6 @@ def test_compute_path_command_stops_when_pose_already_in_lethal():
         origin_y=0.0,
     )
     view = LocalCostmapView(costs=costs, occ=occ, origin_x=0.0, origin_y=0.0)
-    # Wide-open lidar — nose cone would not stop us.
     n = 72
     scan = conv.LaserScan2D(
         np.full(n, np.inf),
@@ -1107,7 +1150,7 @@ def test_compute_path_command_stops_when_pose_already_in_lethal():
         robot_radius_m=0.22,
     )
     assert progress["obstacle"] == "in_lethal"
-    assert progress["pose_cost"] >= 253
+    assert progress["spin_blocked"] is True
     assert cmd.vx == 0.0
     assert cmd.vtheta == pytest.approx(0.0)
 

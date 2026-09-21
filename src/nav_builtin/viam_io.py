@@ -469,10 +469,15 @@ class ViamWorldIO:
         if not primary and not depth_scans:
             return self._scan_cache if include_obstacles_only else None
         if not include_obstacles_only or not depth_scans:
+            if not primary:
+                # Lidar-only was requested but no primary lidar answered —
+                # never fall back to depth (that defeats include_obstacles_only=
+                # False and reintroduces phantoms into nose_clear).
+                return None
             merged = (
                 primary[0]
                 if len(primary) == 1
-                else conv.merge_scans(primary or depth_scans, self._scan_bins)
+                else conv.merge_scans(primary, self._scan_bins)
             )
         elif not primary:
             merged = (
