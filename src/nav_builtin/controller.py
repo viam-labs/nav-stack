@@ -19,7 +19,7 @@ from ..nav.simple_motion import (
     spin_clearance_m,
 )
 from ..geom import conversions as conv
-from .local_costmap import LocalCostmapView, spin_disc_blocked
+from .local_costmap import LocalCostmapView, reverse_path_clear, spin_disc_blocked
 from .local_planner import LocalPlannerConfig, compute_local_command
 from .path_utils import closest_point_on_path, signed_crosstrack_m
 from .types import Path2D, Pose2D
@@ -28,18 +28,40 @@ from .types import Path2D, Pose2D
 def _rear_open_for_unstick(
     scan: Optional[conv.LaserScan2D],
     robot_radius_m: float,
+    *,
+    local_view: Optional[LocalCostmapView] = None,
+    x_m: float = 0.0,
+    y_m: float = 0.0,
+    theta_rad: float = 0.0,
+    reverse_dist_m: float = 0.30,
 ) -> bool:
-    """True when a short reverse is safe per the rear lidar/depth arc.
+    """True when a short reverse is safe per rear scan and local costmap.
 
     ``rear_clearance_m`` returns +inf when the rear arc has no returns (fully
     clear). That must count as open — requiring ``isfinite`` left the robot
     frozen in avoid+spin_block with an empty rear.
+
+    When a local costmap is present, also require the reverse footprint path
+    to stay clear so we do not back into persisted / inflated blobs that
+    lidar is currently missing.
     """
     if scan is None:
         return False
     rear = rear_clearance_m(scan)
     rear_need = max(0.25, float(robot_radius_m) + 0.08)
-    return (not math.isfinite(rear)) or rear >= rear_need
+    if math.isfinite(rear) and rear < rear_need:
+        return False
+    if local_view is not None:
+        return reverse_path_clear(
+            local_view,
+            x_m,
+            y_m,
+            theta_rad,
+            robot_radius_m=float(robot_radius_m),
+            distance_m=float(reverse_dist_m),
+            ignore_ahead=True,
+        )
+    return True
 
 
 def _narrow_reverse_command(cfg: "FollowerConfig") -> DriveCommand:
@@ -48,6 +70,26 @@ def _narrow_reverse_command(cfg: "FollowerConfig") -> DriveCommand:
         0.18,
     )
     return DriveCommand(-back, 0.0, 0.0, False)
+
+
+def _try_narrow_reverse(
+    cfg: "FollowerConfig",
+    scan: Optional[conv.LaserScan2D],
+    robot_radius_m: float,
+    *,
+    local_view: Optional[LocalCostmapView],
+    current: Pose2D,
+) -> Optional[DriveCommand]:
+    if _rear_open_for_unstick(
+        scan,
+        robot_radius_m,
+        local_view=local_view,
+        x_m=current.x,
+        y_m=current.y,
+        theta_rad=current.theta,
+    ):
+        return _narrow_reverse_command(cfg)
+    return None
 
 
 @dataclass
@@ -736,12 +778,20 @@ def compute_path_command(
             # Scan-only pinch: translate straight until there is room to spin.
             # Costmap disc hit means we are already overlapping / against a
             # live blob — crawling forward then hard-stop reversing rocks
-            # (rc15 narrow ↔ narrow_reverse). Prefer reverse or stop.
-            if cost_spin_hit and _rear_open_for_unstick(scan, robot_radius_m):
-                cmd = _narrow_reverse_command(cfg)
-                obstacle_state = "narrow_reverse"
-            elif cost_spin_hit:
-                cmd = DriveCommand(0.0, 0.0, 0.0, False)
+            # (rc15 narrow ↔ narrow_reverse). Prefer a short reverse or stop.
+            if cost_spin_hit:
+                rev = _try_narrow_reverse(
+                    cfg,
+                    scan,
+                    robot_radius_m,
+                    local_view=local_view,
+                    current=current,
+                )
+                if rev is not None:
+                    cmd = rev
+                    obstacle_state = "narrow_reverse"
+                else:
+                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
             else:
                 crawl = min(
                     max(float(cfg.motion.min_linear_mps), 0.12),
@@ -753,8 +803,15 @@ def compute_path_command(
             # Squeeze / avoid / hold: spinning swings the bumper into the
             # pinch. Prefer a short reverse when the rear is open so wait/
             # replan is not a deadlock; otherwise full stop.
-            if _rear_open_for_unstick(scan, robot_radius_m):
-                cmd = _narrow_reverse_command(cfg)
+            rev = _try_narrow_reverse(
+                cfg,
+                scan,
+                robot_radius_m,
+                local_view=local_view,
+                current=current,
+            )
+            if rev is not None:
+                cmd = rev
                 obstacle_state = "narrow_reverse"
             else:
                 cmd = DriveCommand(0.0, 0.0, 0.0, False)
@@ -807,9 +864,20 @@ def compute_path_command(
                 if keep_yaw:
                     cmd = DriveCommand(0.0, 0.0, cmd.vtheta, False)
                     obstacle_state = "avoid"
-                elif disc_hit and _rear_open_for_unstick(scan, robot_radius_m):
-                    cmd = _narrow_reverse_command(cfg)
-                    obstacle_state = "narrow_reverse"
+                elif disc_hit:
+                    rev = _try_narrow_reverse(
+                        cfg,
+                        scan,
+                        robot_radius_m,
+                        local_view=local_view,
+                        current=current,
+                    )
+                    if rev is not None:
+                        cmd = rev
+                        obstacle_state = "narrow_reverse"
+                    else:
+                        cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                        obstacle_state = "avoid"
                 else:
                     cmd = DriveCommand(0.0, 0.0, 0.0, False)
                     obstacle_state = "avoid"

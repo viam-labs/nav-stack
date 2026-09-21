@@ -28,6 +28,7 @@ from .local_costmap import (
     LocalCostmapConfig,
     footprint_max_cost,
     reverse_backup_feasible,
+    reverse_path_clear,
 )
 from .local_planner import LocalPlannerConfig
 from .planner import (
@@ -846,6 +847,10 @@ class NavSupervisor:
             backup_start_cost = 0
             backup_attempts = 0
             backup_cooldown_until = 0.0
+            # Controller ``narrow_reverse`` is per-tick; bound it like backup so
+            # we reverse ~backup_dist then replan instead of driving forever.
+            narrow_rev_start: Optional[Pose2D] = None
+            narrow_rev_cooldown_until = 0.0
             local_blocked_since: Optional[float] = None
             last_local_replan_at = 0.0
             failed_replan_while_blocked = 0
@@ -1227,6 +1232,71 @@ class NavSupervisor:
                     ),
                     "distance_remaining_m": distance_m(pose, goal),
                 }
+
+                # Bound per-tick ``narrow_reverse``: reverse ~backup_dist, then
+                # replan. Without this the controller reverses forever while the
+                # spin disc stays occupied (rc16 nearly backed into a wall).
+                obs_state = str(progress.get("obstacle") or "")
+                if now < narrow_rev_cooldown_until and obs_state == "narrow_reverse":
+                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                    progress = {
+                        **progress,
+                        "obstacle": "narrow_reverse_hold",
+                        "local_planner": False,
+                        "cmd_vx_mps": 0.0,
+                        "cmd_vtheta_rad_s": 0.0,
+                    }
+                    narrow_rev_start = None
+                elif obs_state == "narrow_reverse" and cmd.vx < -1e-6:
+                    if narrow_rev_start is None:
+                        narrow_rev_start = pose
+                    backed_m = distance_m(pose, narrow_rev_start)
+                    remain = max(0.12, float(self._backup_dist_m) - backed_m)
+                    rear_cost_ok = True
+                    if local_view is not None:
+                        rear_cost_ok = reverse_path_clear(
+                            local_view,
+                            pose.x,
+                            pose.y,
+                            pose.theta,
+                            robot_radius_m=self._robot_radius,
+                            distance_m=remain,
+                            ignore_ahead=True,
+                        )
+                    if backed_m >= self._backup_dist_m or not rear_cost_ok:
+                        narrow_rev_start = None
+                        narrow_rev_cooldown_until = now + max(
+                            1.5, float(self._backup_cooldown_s)
+                        )
+                        self._stop_before_replan("narrow_reverse_done")
+                        new_path = self._try_replan(
+                            goal,
+                            pose,
+                            path,
+                            scan,
+                            failed_count=failed_replan_while_blocked,
+                            local_view=local_view,
+                            trigger="narrow_reverse_done",
+                        )
+                        replan_finished = time.monotonic()
+                        last_local_replan_at = replan_finished
+                        last_replan = replan_finished
+                        if new_path is not None:
+                            path = new_path
+                            last_progress_at = now
+                            local_blocked_since = None
+                            failed_replan_while_blocked = 0
+                            vx_sign_history.clear()
+                        cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                        progress = {
+                            **progress,
+                            "obstacle": "narrow_reverse_done",
+                            "local_planner": False,
+                            "cmd_vx_mps": 0.0,
+                            "cmd_vtheta_rad_s": 0.0,
+                        }
+                else:
+                    narrow_rev_start = None
 
                 if waiting_for_clear:
                     # Freeze forward motion for dynamic crossers, but keep a

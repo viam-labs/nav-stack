@@ -337,18 +337,77 @@ def reverse_backup_feasible(
     start_cost = footprint_max_cost(
         view, x_m, y_m, robot_radius_m=robot_radius_m
     )
+    if not reverse_path_clear(
+        view,
+        x_m,
+        y_m,
+        theta_rad,
+        robot_radius_m=robot_radius_m,
+        distance_m=distance_m,
+        sample_step_m=sample_step_m,
+    ):
+        return False
     step = max(float(sample_step_m), 1e-3)
     steps = max(1, int(math.ceil(float(distance_m) / step)))
     cth = math.cos(theta_rad)
     sth = math.sin(theta_rad)
-    x, y = x_m, y_m
+    x = x_m - cth * step * steps
+    y = y_m - sth * step * steps
+    end_cost = footprint_max_cost(view, x, y, robot_radius_m=robot_radius_m)
+    return end_cost < start_cost
+
+
+def reverse_path_clear(
+    view: LocalCostmapView,
+    x_m: float,
+    y_m: float,
+    theta_rad: float,
+    *,
+    robot_radius_m: float,
+    distance_m: float,
+    sample_step_m: float = 0.05,
+    ignore_ahead: bool = False,
+) -> bool:
+    """True when a straight reverse of ``distance_m`` stays footprint-clear.
+
+    Used to gate short unstick reverses: lidar rear can look open while the
+    local costmap (persisted hits / inflation) already occupies the path.
+
+    When ``ignore_ahead`` is set, inscribed cells still *in front of the start
+    pose* (the blob we are reversing away from) do not fail the check — only
+    costs in the rear half-plane relative to the start heading count.
+    """
+    step = max(float(sample_step_m), 1e-3)
+    steps = max(1, int(math.ceil(float(distance_m) / step)))
+    cth = math.cos(theta_rad)
+    sth = math.sin(theta_rad)
+    res = view.occ.resolution
+    cells = max(1, int(math.ceil(float(robot_radius_m) / res)))
+    r2 = cells * cells
+    h, w = view.costs.shape
+    x, y = float(x_m), float(y_m)
+    start_x, start_y = x, y
     for _ in range(steps):
         x -= cth * step
         y -= sth * step
-        if footprint_collides(view, x, y, robot_radius_m=robot_radius_m):
-            return False
-    end_cost = footprint_max_cost(view, x, y, robot_radius_m=robot_radius_m)
-    return end_cost < start_cost
+        row, col = view.world_to_cell(x, y)
+        for dy in range(-cells, cells + 1):
+            for dx in range(-cells, cells + 1):
+                if dx * dx + dy * dy > r2:
+                    continue
+                rr, cc = row + dy, col + dx
+                if not (0 <= rr < h and 0 <= cc < w):
+                    return False
+                if is_traversable(int(view.costs[rr, cc])):
+                    continue
+                if ignore_ahead:
+                    wx = view.origin_x + (cc + 0.5) * res
+                    wy = view.origin_y + (rr + 0.5) * res
+                    bx = cth * (wx - start_x) + sth * (wy - start_y)
+                    if bx > 0.05:
+                        continue
+                return False
+    return True
 
 
 def footprint_collides(
