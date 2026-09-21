@@ -921,13 +921,16 @@ class NavServiceBase(Motion):
                 cm = None
 
                 if use_local:
-                    local_cm = snap.get("local_costmap")
+                    # Follower only refreshes snap["local_costmap"] while a plan
+                    # is active. Prefer that live map when navigating; when idle,
+                    # never reuse a stale snap — rebuild the rolling window.
+                    local_cm = (
+                        snap.get("local_costmap") if nav_active else None
+                    )
                     if local_cm is not None and local_cm.get("grid") is not None:
                         cm = local_cm
                         layer_used = "local"
                     elif layer_req == "local":
-                        # Follower only publishes local while a plan is active.
-                        # Build/refresh a rolling window on demand for the UI.
                         idle = self._build_idle_local_costmap(
                             runtime, view, cfg
                         )
