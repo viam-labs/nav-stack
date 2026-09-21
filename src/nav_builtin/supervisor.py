@@ -1061,8 +1061,9 @@ class NavSupervisor:
                 path_ahead_cost = 0
                 pose_cost = 0
                 local_blocked = False
+                from .costmap import INSCRIBED
+
                 if local_view is not None:
-                    from .costmap import INSCRIBED
                     from .local_planner import path_cost_ahead as _path_cost_ahead
 
                     path_ahead_cost = int(
@@ -1083,10 +1084,17 @@ class NavSupervisor:
                     )
                 # Reactive avoid spinning with a clear-looking path still means
                 # the robot cannot proceed — escalate to the blocked/replan path.
+                # Exception: path centerline free + lidar nose clear — depth
+                # phantoms in the fused corridor used to force avoid→replan
+                # forever while path_cost=0 (live rc21: planning churn).
                 if (
                     last_obstacle_state == "avoid"
                     and reactive_avoid_since is not None
                     and now - reactive_avoid_since >= 0.8
+                    and (
+                        path_ahead_cost >= self._local_planner_activate_cost
+                        or pose_cost >= INSCRIBED
+                    )
                 ):
                     local_blocked = True
                     if local_blocked_since is None:
@@ -1153,6 +1161,15 @@ class NavSupervisor:
                         and path_ahead_cost < self._local_planner_activate_cost
                     ):
                         action = "keep_dwa"
+                    # Same trap for replan: pathc=0 + nose_clear + failed
+                    # "cannot reach plan start" was a stop/replan death spiral
+                    # (rc21 live). Keep peeling / reverse instead.
+                    if (
+                        action == "replan"
+                        and path_ahead_cost < self._local_planner_activate_cost
+                        and nose_clear
+                    ):
+                        action = "keep_dwa"
                     if action == "wait":
                         waiting_for_clear = True
                     elif action == "replan":
@@ -1212,11 +1229,14 @@ class NavSupervisor:
                     )
                 )
                 force_local = bool(local_blocked and allow_local_planner)
+                # Obstacle stop/spin/reverse must not use fused depth phantoms
+                # (live rc21: fwd≈0 while lidar nose_clear). Prefer lidar-only.
+                obstacle_scan = lidar_only if lidar_only is not None else scan
                 cmd, progress = compute_path_command(
                     pose,
                     path,
                     cfg=self._follower,
-                    scan=scan,
+                    scan=obstacle_scan,
                     speed_mps=self._last_cmd_vx,
                     local_view=local_view,
                     local_planner=self._local_planner if allow_local_planner else None,
@@ -1733,6 +1753,15 @@ class NavSupervisor:
                     nonlocal last_progress_bearing, last_replan
                     nonlocal last_local_replan_at, local_blocked_since, backup_attempts
                     nonlocal failed_replan_while_blocked
+                    # Path centerline free + lidar nose clear: another stop/replan
+                    # cannot help (rc21: "cannot reach plan start" forever). Let
+                    # the follower crawl/reverse on the existing path instead.
+                    if (
+                        path_ahead_cost < self._local_planner_activate_cost
+                        and nose_clear
+                    ):
+                        last_progress_at = now
+                        return False
                     _trig = f"stall:{error_msg}"
                     self._stop_before_replan(_trig)
                     new_path = self._try_replan(

@@ -842,7 +842,9 @@ def compute_path_command(
         else:
             # Squeeze / avoid / hold: spinning swings the bumper into the
             # pinch. Prefer a short reverse when the rear is open so wait/
-            # replan is not a deadlock; otherwise full stop.
+            # replan is not a deadlock; otherwise crawl when the nose cone
+            # is still open (fits-through gap — full stop here was the
+            # rc21 "spin_blocked + cmd=0" freeze with path_cost=0).
             rev = _try_narrow_reverse(
                 cfg,
                 scan,
@@ -854,7 +856,26 @@ def compute_path_command(
                 cmd = rev
                 obstacle_state = "narrow_reverse"
             else:
-                cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                nose_open = True
+                if (
+                    cfg.obstacle is not None
+                    and cfg.obstacle.enabled
+                    and scan is not None
+                ):
+                    half = float(cfg.obstacle.front_cone_half_rad)
+                    nose = cone_min_range(scan, -half, half)
+                    nose_open = (not math.isfinite(nose)) or nose > float(
+                        cfg.obstacle.stop_distance_m
+                    )
+                if nose_open:
+                    crawl = min(
+                        max(float(cfg.motion.min_linear_mps), 0.12),
+                        float(cfg.motion.max_linear_mps),
+                    )
+                    cmd = DriveCommand(crawl, 0.0, 0.0, False)
+                    obstacle_state = "narrow"
+                else:
+                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
 
     # Costmap hard stop: lidar cone can look clear while the robot is already
     # driving into an inflated blob beside the nose (or while misaligned). If
