@@ -1,6 +1,7 @@
 from pathlib import Path
 import asyncio
 import math
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1246,13 +1247,92 @@ def test_periodic_relocalize_cycle_skips_while_startup_running():
     pending = MagicMock()
     pending.done.return_value = False
     slam._startup_global_localize_task = pending
+    slam._startup_localize_started_at = time.monotonic()
     slam._global_localize = AsyncMock()
+    # No engine tick score → do not bypass yet.
+    slam._engine = None
 
     result = asyncio.run(slam._periodic_relocalize_cycle())
 
     assert result["status"] == "skipped"
     assert result["reason"] == "startup_localize_running"
     slam._global_localize.assert_not_awaited()
+
+
+def test_periodic_relocalize_bypasses_startup_when_tick_match_bad():
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    pending = MagicMock()
+    pending.done.return_value = False
+    slam._startup_global_localize_task = pending
+    slam._startup_localize_started_at = time.monotonic()
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": -0.3}
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.85,
+            "ray_mae_m": 0.2,
+            "pose": {"x": 1.5, "y": 0.0, "theta": 0.0},
+            "ambiguous": False,
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = _run_relocalize_until_settled(slam)
+
+    assert slam._startup_global_localize_task is None
+    assert result["status"] == "corrected"
+    assert result["match_mode"] == "full_map_still_recovery"
+    first = slam._global_localize.await_args_list[0].args[0]
+    assert first.get("full_map") is True
+
+
+def test_periodic_relocalize_still_bad_goes_straight_to_full_map():
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": -0.25}
+
+    async def _localize(command):
+        assert command.get("full_map") is True
+        return {
+            "status": "matched",
+            "score": 0.8,
+            "ray_mae_m": 0.2,
+            "pose": {"x": 2.0, "y": 0.0, "theta": 0.0},
+            "ambiguous": False,
+        }
+
+    slam._global_localize = AsyncMock(side_effect=_localize)
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = _run_relocalize_until_settled(slam)
+
+    assert result["match_mode"] == "full_map_still_recovery"
+    assert result["status"] == "corrected"
+    assert slam._global_localize.await_count >= 1
+
+
+def test_periodic_relocalize_refuses_ambiguous_full_map():
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": -0.4}
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.55,
+            "ray_mae_m": 0.5,
+            "pose": {"x": 3.0, "y": 0.0, "theta": 0.0},
+            "ambiguous": True,
+            "second_best_score": 0.7,
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "ambiguous"
+    assert result["corrected"] is False
+    slam.do_command.assert_not_awaited()
 
 
 def test_check_localization_apply_override_forces_correction():

@@ -89,6 +89,7 @@ class SlamService(SLAM):
         self._map_display_hold = False
         self._visible_map_generation = 0
         self._startup_global_localize_task: Optional[asyncio.Task] = None
+        self._startup_localize_started_at: Optional[float] = None
         self._periodic_relocalize_task: Optional[asyncio.Task] = None
         self._mapping_revisit_task: Optional[asyncio.Task] = None
         self._last_relocalize_check: dict = {"status": "idle"}
@@ -274,6 +275,7 @@ class SlamService(SLAM):
         if task is not None and not task.done():
             task.cancel()
         self._startup_global_localize_task = None
+        self._startup_localize_started_at = None
 
     def _cancel_periodic_relocalize_task(self) -> None:
         task = self._periodic_relocalize_task
@@ -1079,6 +1081,68 @@ class SlamService(SLAM):
         )
         return shift_m, shift_deg
 
+    def _tick_match_score(self) -> Optional[float]:
+        """Latest continuous scan-match score for the published pose, if any."""
+        engine = self._engine
+        if engine is None:
+            return None
+        try:
+            diag = engine.diagnostics()
+        except Exception:  # noqa: BLE001
+            return None
+        raw = diag.get("last_match_score")
+        if raw is None:
+            return None
+        try:
+            score = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return score if math.isfinite(score) else None
+
+    def _published_pose_is_bad(self, cfg: SlamConfig) -> tuple[bool, Optional[float]]:
+        """True when the live tick match says the published pose is wrong."""
+        score = self._tick_match_score()
+        if score is None:
+            return False, None
+        return score <= float(cfg.periodic_relocalize_still_bad_score), score
+
+    def _maybe_bypass_startup_localize(
+        self, cfg: SlamConfig
+    ) -> Optional[Mapping[str, ValueTypes]]:
+        """Cancel a stuck/long startup localize so the watchdog can recover.
+
+        Returns None when startup is not blocking. Otherwise either cancels and
+        returns None (caller proceeds) or returns a skip status dict.
+        """
+        startup = self._startup_global_localize_task
+        if startup is None or startup.done():
+            return None
+        bad, tick_score = self._published_pose_is_bad(cfg)
+        bypass_after = float(cfg.periodic_relocalize_bypass_startup_after_s)
+        started = self._startup_localize_started_at
+        age_s = (
+            (time.monotonic() - float(started)) if started is not None else None
+        )
+        timed_out = (
+            bypass_after > 0.0 and age_s is not None and age_s >= bypass_after
+        )
+        if not bad and not timed_out:
+            return {
+                "status": "skipped",
+                "reason": "startup_localize_running",
+                "startup_age_s": None if age_s is None else round(age_s, 1),
+                "tick_match_score": tick_score,
+            }
+        LOGGER.warning(
+            "bypassing startup global_localize for drift watchdog "
+            "(bad_tick=%s score=%s age_s=%s)",
+            bad,
+            tick_score,
+            None if age_s is None else round(age_s, 1),
+        )
+        self._cancel_startup_global_localize_task()
+        return None
+
     async def _periodic_relocalize_cycle(
         self, *, apply_override: Optional[bool] = None
     ) -> Mapping[str, ValueTypes]:
@@ -1087,6 +1151,8 @@ class SlamService(SLAM):
         Escalates to full-map ``global_localize`` when the local match is weak
         (the usual failure mode when manual global_localize is what fixes drift)
         or when Nav2 reports multiple recoveries on the active goal.
+        While still with a bad published-pose tick score, goes straight to
+        full-map — a 360° lidar already has the view; spinning does not help.
         """
         cfg = self._cfg
         mgr = self._manager
@@ -1096,11 +1162,10 @@ class SlamService(SLAM):
             return self._publish_relocalize_check(
                 {"status": "skipped", "reason": "not_localizing"}
             )
-        startup = self._startup_global_localize_task
-        if startup is not None and not startup.done():
-            return self._publish_relocalize_check(
-                {"status": "skipped", "reason": "startup_localize_running"}
-            )
+        if apply_override is not True:
+            blocked = self._maybe_bypass_startup_localize(cfg)
+            if blocked is not None:
+                return self._publish_relocalize_check(blocked)
 
         nav_active = self._is_navigation_active()
         if (
@@ -1123,14 +1188,24 @@ class SlamService(SLAM):
             except Exception:  # noqa: BLE001
                 nav_recoveries = 0
 
-        force_full_map = nav_recoveries >= cfg.periodic_relocalize_nav_recoveries_threshold
+        still_bad, tick_score = self._published_pose_is_bad(cfg)
+        # Still + scan-does-not-explain-pose → full map immediately (no local
+        # peek that just reaffirms a wrong corridor cell).
+        force_full_map = (
+            nav_recoveries >= cfg.periodic_relocalize_nav_recoveries_threshold
+            or (still_bad and not nav_active)
+        )
         current = mgr.get_pose_in_map()
 
         base_command: dict = {"command": "global_localize"}
         base_command.update(dict(cfg.periodic_relocalize_options))
         base_command["apply"] = False
 
-        match_mode = "full_map" if force_full_map else "local"
+        match_mode = (
+            "full_map_still_recovery"
+            if (still_bad and not nav_active)
+            else ("full_map" if force_full_map else "local")
+        )
         match_command = dict(base_command)
         if force_full_map:
             match_command["full_map"] = True
@@ -1161,6 +1236,43 @@ class SlamService(SLAM):
                 matched_pose = full_match.get("pose")
                 shift_m, shift_deg = self._pose_shift_from_current(current, matched_pose)
                 match_mode = "full_map_after_low_quality"
+
+        # Refuse auto-apply of ambiguous full-map peaks (second-best often a
+        # corridor twin). Manual apply:true still bypasses via apply_override.
+        if (
+            apply_override is not True
+            and bool(match.get("ambiguous"))
+            and str(match_mode).startswith("full_map")
+        ):
+            result = {
+                "status": "ambiguous",
+                "match_mode": match_mode,
+                "score": score,
+                "ray_mae_m": ray_mae,
+                "shift_m": None if math.isinf(shift_m) else round(shift_m, 3),
+                "shift_deg": None if math.isinf(shift_deg) else round(shift_deg, 2),
+                "good_match": good_match,
+                "drifted": True,
+                "recovery_apply": False,
+                "corrected": False,
+                "ambiguous": True,
+                "second_best_score": match.get("second_best_score"),
+                "tick_match_score": tick_score,
+                "navigation_active": nav_active,
+                "nav_recoveries": nav_recoveries,
+            }
+            prior_score = match.get("prior_score")
+            if prior_score is not None:
+                result["previous_score"] = prior_score
+                result["previous_ray_mae_m"] = match.get("prior_ray_mae_m")
+            LOGGER.warning(
+                "periodic relocalize: refusing ambiguous full-map peak "
+                "(score=%.2f second_best=%s mode=%s)",
+                score,
+                match.get("second_best_score"),
+                match_mode,
+            )
+            return self._publish_relocalize_check(result)
 
         drifted = (
             shift_m >= cfg.periodic_relocalize_min_shift_m
@@ -1198,6 +1310,7 @@ class SlamService(SLAM):
             "navigation_active": nav_active,
             "nav_recoveries": nav_recoveries,
             "corrected": False,
+            "tick_match_score": tick_score,
         }
         prior_score = match.get("prior_score")
         prior_ray_mae = match.get("prior_ray_mae_m")
@@ -1428,6 +1541,7 @@ class SlamService(SLAM):
             options.get("full_map", True),
             delay_s,
         )
+        self._startup_localize_started_at = time.monotonic()
         self._startup_global_localize_task = loop.create_task(
             self._run_startup_global_localize(
                 options,

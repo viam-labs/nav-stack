@@ -522,7 +522,7 @@ class BuiltinNavConfig:
     max_angular_accel_rad_s2: float = 2.0
     # When localization is lost / awaiting a large jump confirm, rotate in
     # place in short steps (turn → pause → rematch) to break heading ambiguity.
-    localize_spin_recovery: bool = True
+    localize_spin_recovery: bool = False
     localize_spin_step_deg: float = 25.0
     localize_spin_vel_rad_s: float = 0.30
     localize_spin_pause_s: float = 0.85
@@ -790,6 +790,14 @@ class SlamConfig:
     periodic_relocalize_nav_recoveries_threshold: int = 2
     periodic_relocalize_full_map_on_low_quality: bool = True
     periodic_relocalize_during_navigation: bool = False
+    # If startup global_localize is still running this long (s), cancel it so
+    # the drift watchdog can take over — otherwise a long refine loop leaves
+    # the robot on a bad pose with status=skipped forever. 0 disables bypass.
+    periodic_relocalize_bypass_startup_after_s: float = 90.0
+    # While still, if the continuous tick match score is at/below this, go
+    # straight to full-map global_localize (360° lidar already has the view;
+    # spinning does not help). Default 0 catches "scan does not explain pose".
+    periodic_relocalize_still_bad_score: float = 0.0
     # Run global_localize / ray scoring in a dedicated subprocess so the
     # matcher's Python loops do not hold this process's GIL (which starved the
     # nav control tick and wheel-odom reads). Falls back in-process on error.
