@@ -1599,6 +1599,36 @@ class SlamService(SLAM):
         post_apply_refine_options = dict(
             cfg.global_localize_on_start_post_apply_refine_options
         )
+        # Last-pose restore already seeds near truth — prefer a local refine
+        # instead of a full-map search that can yank a good seed.
+        restored = False
+        mgr = self._manager
+        if mgr is not None and bool(
+            getattr(cfg, "persist_pose_local_refine_on_start", True)
+        ):
+            probe = getattr(mgr, "pose_restored_from_disk", None)
+            if callable(probe):
+                try:
+                    restored = bool(probe())
+                except Exception:  # noqa: BLE001
+                    restored = False
+            if not restored:
+                try:
+                    restored = bool(
+                        (mgr.slam_diagnostics() or {}).get(
+                            "pose_restored_from_disk", False
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    restored = False
+        if restored:
+            options = dict(refine_options)
+            options.setdefault("full_map", False)
+            options.setdefault("map_source", "live")
+            LOGGER.info(
+                "startup localize using local refine around restored last pose "
+                "(full_map disabled)"
+            )
         LOGGER.info(
             "scheduling startup global_localize (full_map=%s delay=%.1fs)",
             options.get("full_map", True),

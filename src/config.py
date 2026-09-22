@@ -595,6 +595,18 @@ class SlamConfig:
     slam_backend: str = SLAM_BACKEND_BUILTIN
     maps_dir: str = "/root/.viam/nav-stack/maps"
     active_map: Optional[str] = None
+    # Write ``<map>/last_pose.json`` while running; on localizing restart, seed
+    # from it so GetPosition / odom tracking resume near where the module left
+    # off (instead of waiting at origin for full-map global_localize).
+    persist_pose: bool = True
+    # How often to flush pose to disk while tracking (s). Also flushed on
+    # set_pose / save_map / stop. 0 = only on those events (no tick writes).
+    persist_pose_interval_s: float = 1.0
+    # Ignore a saved pose older than this (s). 0 = always accept.
+    persist_pose_max_age_s: float = 0.0
+    # When a pose was restored from disk, prefer local refine on startup
+    # instead of full-map search (avoids yanking a good seed).
+    persist_pose_local_refine_on_start: bool = True
     frames: Frames = field(default_factory=Frames)
     # Builtin SLAM tick rate is ``max(scan_rate_hz, odom_rate_hz)`` (scan + odom
     # are read each tick). Defaults keep the historical ~10 Hz loop. Scan

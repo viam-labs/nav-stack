@@ -1,14 +1,20 @@
-"""Load / save map.yaml + map.pgm for builtin SLAM."""
+"""Load / save map.yaml + map.pgm (+ last_pose.json) for builtin SLAM."""
 from __future__ import annotations
 
+import json
+import math
+import time
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
+from ..geom import conversions as conv
 from ..nav.global_localize import OccupancyMap, load_occupancy_from_map_dir
 from . import occupancy as occ
 from .types import LogOddsGrid
+
+LAST_POSE_FILENAME = "last_pose.json"
 
 
 def load_log_odds(map_dir: Path) -> Optional[LogOddsGrid]:
@@ -25,6 +31,52 @@ def load_log_odds(map_dir: Path) -> Optional[LogOddsGrid]:
 
 def load_occupancy_map(map_dir: Path) -> Optional[OccupancyMap]:
     return load_occupancy_from_map_dir(map_dir)
+
+
+def last_pose_path(map_dir: Path) -> Path:
+    return Path(map_dir) / LAST_POSE_FILENAME
+
+
+def save_last_pose(map_dir: Path, pose: conv.Pose2D) -> None:
+    """Atomic write of map-frame pose so a restart can resume near here."""
+    map_dir = Path(map_dir)
+    map_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "x": float(pose.x),
+        "y": float(pose.y),
+        "theta": float(pose.theta),
+        "saved_unix": time.time(),
+    }
+    path = last_pose_path(map_dir)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_last_pose(
+    map_dir: Path, *, max_age_s: float = 0.0
+) -> Optional[conv.Pose2D]:
+    """Return the last saved pose, or None if missing/stale/corrupt.
+
+    ``max_age_s`` <= 0 disables the age gate (always accept a valid file).
+    """
+    path = last_pose_path(map_dir)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        x = float(data["x"])
+        y = float(data["y"])
+        theta = float(data["theta"])
+        if not all(math.isfinite(v) for v in (x, y, theta)):
+            return None
+        if max_age_s > 0.0:
+            saved = float(data.get("saved_unix", 0.0))
+            if saved <= 0.0 or (time.time() - saved) > max_age_s:
+                return None
+        return conv.Pose2D(x, y, theta)
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return None
 
 
 def save_occupancy(

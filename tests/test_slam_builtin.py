@@ -897,3 +897,53 @@ def test_get_odom_does_not_block_slam_tick_on_busy_loop():
         loop.call_soon_threadsafe(loop.stop)
         t.join(timeout=2.0)
         loop.close()
+
+
+def test_last_pose_roundtrip(tmp_path: Path):
+    pose = conv.Pose2D(3.25, -1.5, math.radians(42.0))
+    persistence.save_last_pose(tmp_path, pose)
+    loaded = persistence.load_last_pose(tmp_path)
+    assert loaded is not None
+    assert loaded.x == pytest.approx(3.25)
+    assert loaded.y == pytest.approx(-1.5)
+    assert loaded.theta == pytest.approx(math.radians(42.0))
+    stale = persistence.load_last_pose(tmp_path, max_age_s=1e-9)
+    assert stale is None
+
+
+def test_engine_restores_last_pose_on_localizing(tmp_path: Path):
+    store = MapStore(str(tmp_path))
+    handle = store.get_or_create_map("office")
+    store.set_active_map("office")
+    grid = occ.empty_grid(resolution=0.05, size_m=8.0)
+    grid.log_odds[40, 40] = 2.0
+    persistence.save_occupancy(handle.root, grid)
+    persistence.save_last_pose(
+        handle.root, conv.Pose2D(1.25, 2.5, math.radians(90.0))
+    )
+
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "maps_dir": str(tmp_path),
+            "mode": "localizing",
+            "persist_pose": True,
+        }
+    )
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), store, rate_hz=5.0)  # type: ignore[arg-type]
+    engine.configure_mode("localizing", handle.root)
+    pose = engine.get_pose()
+    assert pose.x == pytest.approx(1.25)
+    assert pose.y == pytest.approx(2.5)
+    assert pose.theta == pytest.approx(math.radians(90.0))
+    assert engine.pose_restored_from_disk() is True
+    assert engine.diagnostics()["seed_localize_pending"] is False
+
+    # set_pose / stop keep the file fresh for the next restart.
+    engine.set_pose(conv.Pose2D(4.0, 5.0, 0.1))
+    engine.stop()
+    again = persistence.load_last_pose(handle.root)
+    assert again is not None
+    assert again.x == pytest.approx(4.0)
+    assert again.y == pytest.approx(5.0)

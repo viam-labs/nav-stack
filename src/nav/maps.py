@@ -9,6 +9,7 @@ Layout on disk::
             map.posegraph          # optional legacy pose-graph file
             map.data               # optional legacy data file
             map.yaml / map.pgm     # occupancy grid (optional, for export)
+            last_pose.json         # last known map pose (module restart seed)
             locations.json         # named locations (scoped to this map)
             zones.json             # keepout / speed_limit zones (scoped to this map)
             routes.json            # named routes = ordered location waypoints
@@ -87,6 +88,10 @@ class MapHandle:
     def occupancy_yaml_path(self) -> Path:
         return self.root / "map.yaml"
 
+    @property
+    def last_pose_path(self) -> Path:
+        return self.root / "last_pose.json"
+
     def exists(self) -> bool:
         return self.root.is_dir()
 
@@ -107,6 +112,7 @@ class MapHandle:
             Path(str(self.serialization_stem) + ".data"),
             self.occupancy_yaml_path,
             self.root / "map.pgm",
+            self.last_pose_path,
         ):
             if path.exists():
                 path.unlink()

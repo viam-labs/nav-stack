@@ -91,6 +91,9 @@ class BuiltinSlamEngine:
         self._seed_localize_pending = cfg.mode == MODE_LOCALIZING
         self._last_seed_attempt_at = 0.0
         self._seed_min_score = 0.40
+        self._map_dir: Optional[Path] = None
+        self._pose_restored_from_disk = False
+        self._last_pose_save_at = 0.0
         self._keyframes = MapKeyframeStore(
             max_keyframes=int(cfg.builtin_mapping_keyframe_max)
         )
@@ -127,6 +130,7 @@ class BuiltinSlamEngine:
         self._log(f"builtin SLAM engine started ({self._mode})")
 
     def stop(self) -> None:
+        self._persist_pose(force=True)
         self._running = False
         thr = self._thread
         if thr is not None and thr.is_alive():
@@ -136,7 +140,10 @@ class BuiltinSlamEngine:
     def configure_mode(self, mode: str, map_dir: Optional[Path] = None) -> None:
         with self._lock:
             self._mode = mode
+            self._pose_restored_from_disk = False
+            loaded = None
             if map_dir is not None:
+                self._map_dir = Path(map_dir)
                 loaded = persistence.load_log_odds(map_dir)
                 if loaded is not None:
                     self._grid = loaded
@@ -166,12 +173,77 @@ class BuiltinSlamEngine:
                 self._last_odom_time = None
                 self._pending_match = None
                 self._pending_count = 0
-                self._log(
-                    "builtin SLAM awaiting full-map seed localize "
-                    "(will not assume start pose)"
-                )
+                restored = self._try_restore_last_pose_locked()
+                if restored is not None:
+                    self._pose = restored
+                    self._seed_localize_pending = False
+                    self._pose_restored_from_disk = True
+                    self._log(
+                        "restored last pose from disk "
+                        f"({restored.x:.2f}, {restored.y:.2f}, "
+                        f"{math.degrees(restored.theta):.1f} deg)"
+                    )
+                else:
+                    self._log(
+                        "builtin SLAM awaiting full-map seed localize "
+                        "(will not assume start pose)"
+                    )
             else:
                 self._seed_localize_pending = False
+                # Mapping with an existing map: resume near last pose if any.
+                if map_dir is not None and loaded is not None:
+                    restored = self._try_restore_last_pose_locked()
+                    if restored is not None:
+                        self._pose = restored
+                        self._pose_restored_from_disk = True
+                        self._last_odom_pose = None
+                        self._last_odom_heading = None
+                        self._last_odom_time = None
+                        self._log(
+                            "restored last pose from disk for mapping "
+                            f"({restored.x:.2f}, {restored.y:.2f}, "
+                            f"{math.degrees(restored.theta):.1f} deg)"
+                        )
+        # Notify outside the lock if we restored (listeners may call back).
+        if self._pose_restored_from_disk:
+            self._notify_pose_listeners(self.get_pose())
+
+    def _try_restore_last_pose_locked(self) -> Optional[conv.Pose2D]:
+        cfg = self._cfg
+        if not bool(getattr(cfg, "persist_pose", True)):
+            return None
+        map_dir = self._map_dir
+        if map_dir is None:
+            return None
+        max_age = float(getattr(cfg, "persist_pose_max_age_s", 0.0) or 0.0)
+        return persistence.load_last_pose(map_dir, max_age_s=max_age)
+
+    def _persist_pose(self, *, force: bool = False) -> None:
+        cfg = self._cfg
+        if not bool(getattr(cfg, "persist_pose", True)):
+            return
+        map_dir = self._map_dir
+        if map_dir is None:
+            return
+        # Do not persist an unseeded origin placeholder in localizing mode.
+        if self._mode == MODE_LOCALIZING and self._seed_localize_pending:
+            return
+        interval = float(getattr(cfg, "persist_pose_interval_s", 1.0) or 0.0)
+        now = time.monotonic()
+        if not force and interval > 0.0 and (now - self._last_pose_save_at) < interval:
+            return
+        if not force and interval <= 0.0:
+            return
+        with self._lock:
+            pose = self._pose
+        try:
+            persistence.save_last_pose(map_dir, pose)
+            self._last_pose_save_at = now
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"persist last pose failed: {exc}")
+
+    def pose_restored_from_disk(self) -> bool:
+        return bool(self._pose_restored_from_disk)
 
     def reset_map(self) -> None:
         with self._lock:
@@ -185,6 +257,15 @@ class BuiltinSlamEngine:
             self._keyframes.clear()
             self._invalidate_occ_cache()
             self._generation += 1
+            self._pose_restored_from_disk = False
+            map_dir = self._map_dir
+        if map_dir is not None:
+            path = persistence.last_pose_path(map_dir)
+            try:
+                if path.is_file():
+                    path.unlink()
+            except OSError:
+                pass
 
     def clear_obstacles(
         self, x_m: float, y_m: float, radius_m: float
@@ -229,6 +310,7 @@ class BuiltinSlamEngine:
             self._last_odom_heading = None
             self._last_odom_time = None
         self._notify_pose_listeners(pose)
+        self._persist_pose(force=True)
 
     def apply_map_pose_correction(self, matched_pose: conv.Pose2D) -> dict:
         """Correct pose drift during mapping; optionally rebuild the grid."""
@@ -284,6 +366,7 @@ class BuiltinSlamEngine:
             self._last_insert_pose = matched_pose
 
         self._notify_pose_listeners(matched_pose)
+        self._persist_pose(force=True)
         return {
             "applied": True,
             "rebuilt": rebuilt,
@@ -296,6 +379,18 @@ class BuiltinSlamEngine:
     def save_map(self, map_dir: Path) -> None:
         with self._lock:
             persistence.save_occupancy(map_dir, self._grid)
+            self._map_dir = Path(map_dir)
+            pose = self._pose
+            seed_pending = self._seed_localize_pending
+            mode = self._mode
+        if bool(getattr(self._cfg, "persist_pose", True)) and not (
+            mode == MODE_LOCALIZING and seed_pending
+        ):
+            try:
+                persistence.save_last_pose(map_dir, pose)
+                self._last_pose_save_at = time.monotonic()
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"persist last pose failed: {exc}")
 
     def _invalidate_occ_cache(self) -> None:
         self._occ_cache = None
@@ -375,6 +470,7 @@ class BuiltinSlamEngine:
                 "insert_skips_turning": self._insert_skips_turning,
                 "generation": self._generation,
                 "seed_localize_pending": self._seed_localize_pending,
+                "pose_restored_from_disk": self._pose_restored_from_disk,
                 "keyframes": len(self._keyframes),
                 "last_loop_rebuild_at": self._last_loop_rebuild_at,
             }
@@ -387,6 +483,8 @@ class BuiltinSlamEngine:
                 self._tick()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"builtin SLAM tick failed: {exc}")
+            else:
+                self._persist_pose(force=False)
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, self._period - elapsed))
 

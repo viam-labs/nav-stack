@@ -92,6 +92,9 @@ class BuiltinSlamHost:
     def get_pose_in_map(self) -> Optional[conv.Pose2D]:
         return self._engine.get_pose()
 
+    def pose_restored_from_disk(self) -> bool:
+        return self._engine.pose_restored_from_disk()
+
     def apply_map_pose_correction(self, pose: conv.Pose2D) -> Dict:
         return self._engine.apply_map_pose_correction(pose)
 
