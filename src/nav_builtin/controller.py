@@ -940,7 +940,11 @@ def compute_path_command(
                 if keep_yaw:
                     cmd = DriveCommand(0.0, 0.0, cmd.vtheta, False)
                     obstacle_state = "avoid"
-                elif disc_hit:
+                else:
+                    # Translation blocked into an inscribed blob. Prefer reverse
+                    # whenever the rear is open — not only when the spin disc
+                    # is also hit. Live rc26: aligned, disc clear, rear open,
+                    # hard-stop sat at cmd=0 forever (avoid, spin_blocked=false).
                     rev = _try_narrow_reverse(
                         cfg,
                         scan,
@@ -952,10 +956,6 @@ def compute_path_command(
                         cmd = rev
                         obstacle_state = "narrow_reverse"
                     else:
-                        # Same escape as the spin-gate: nose open → crawl
-                        # through the fit gap. Full-stopping here undid the
-                        # spin-gate crawl every tick (live rc25: avoid +
-                        # spin_blocked + pathc=0 + cmd=0 forever).
                         nose_open = True
                         if (
                             cfg.obstacle is not None
@@ -977,9 +977,6 @@ def compute_path_command(
                         else:
                             cmd = DriveCommand(0.0, 0.0, 0.0, False)
                             obstacle_state = "avoid"
-                else:
-                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
-                    obstacle_state = "avoid"
 
     progress = {
         "waypoint_index": idx,
