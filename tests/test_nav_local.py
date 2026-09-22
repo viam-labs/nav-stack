@@ -996,6 +996,86 @@ def test_costmap_hard_stop_reverses_when_spin_disc_blocked():
     assert cmd.vtheta == pytest.approx(0.0)
 
 
+def test_costmap_hard_stop_crawls_when_reverse_refused_and_nose_open():
+    """Hard-stop + spin disc + blocked rear must crawl, not freeze at cmd=0.
+
+    Live rc25: spin-gate crawled, then hard-stop re-zeroed every tick because
+    reverse was refused — avoid + spin_blocked + pathc=0 forever.
+    """
+    from src.nav_builtin.costmap import INSCRIBED
+    from src.nav_builtin.local_costmap import LocalCostmapView
+    from src.nav_builtin.types import OccupancyGrid
+    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
+
+    res = 0.05
+    h = w = 80
+    costs = np.zeros((h, w), dtype=np.uint8)
+    # Ahead blob for hard-stop.
+    for r in range(38, 43):
+        for c in range(45, 50):
+            costs[r, c] = INSCRIBED
+    # Spin disc shoulder.
+    for r in range(36, 45):
+        for c in range(42, 45):
+            costs[r, c] = INSCRIBED
+    # Rear blocked so reverse is refused.
+    for r in range(38, 43):
+        for c in range(34, 38):
+            costs[r, c] = INSCRIBED
+    view = LocalCostmapView(
+        costs=costs,
+        occ=OccupancyGrid(
+            grid=np.zeros((h, w), dtype=np.int16),
+            resolution=res,
+            origin_x=0.0,
+            origin_y=0.0,
+        ),
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    n = 72
+    ranges = np.full(n, 3.0)
+    ranges[n // 2] = 0.70  # nose open past stop
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    inscribed = 0.59 / 2.0
+    cfg = FollowerConfig(
+        motion=SimpleMotionConfig(
+            xy_tolerance_m=0.15,
+            yaw_tolerance_rad=0.1,
+            max_linear_mps=0.4,
+            max_angular_rad_s=0.6,
+            min_linear_mps=0.05,
+            min_angular_rad_s=0.05,
+        ),
+        obstacle=ObstacleConfig(
+            enabled=True,
+            stop_distance_m=0.4,
+            slow_distance_m=1.0,
+            front_cone_half_rad=math.radians(40.0),
+        ),
+        rotate_in_place_rad=math.radians(80.0),
+    )
+    cmd, progress = compute_path_command(
+        Pose2D(2.0, 2.0, 0.0),
+        Path2D(points=((2.0, 2.0), (3.5, 2.0)), goal_theta=0.0),
+        cfg=cfg,
+        scan=scan,
+        local_view=view,
+        robot_radius_m=inscribed,
+        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
+    )
+    assert progress["spin_blocked"] is True
+    assert progress["obstacle"] == "narrow"
+    assert cmd.vx > 0.0
+    assert cmd.vtheta == pytest.approx(0.0)
+
+
 def test_unstick_reverse_refuses_costmap_rear_collision():
     """Lidar rear can look open while local costs already block reverse."""
     from src.nav_builtin.costmap import INSCRIBED

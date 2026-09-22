@@ -952,8 +952,31 @@ def compute_path_command(
                         cmd = rev
                         obstacle_state = "narrow_reverse"
                     else:
-                        cmd = DriveCommand(0.0, 0.0, 0.0, False)
-                        obstacle_state = "avoid"
+                        # Same escape as the spin-gate: nose open → crawl
+                        # through the fit gap. Full-stopping here undid the
+                        # spin-gate crawl every tick (live rc25: avoid +
+                        # spin_blocked + pathc=0 + cmd=0 forever).
+                        nose_open = True
+                        if (
+                            cfg.obstacle is not None
+                            and cfg.obstacle.enabled
+                            and scan is not None
+                        ):
+                            half = float(cfg.obstacle.front_cone_half_rad)
+                            nose = cone_min_range(scan, -half, half)
+                            nose_open = (not math.isfinite(nose)) or nose > float(
+                                cfg.obstacle.stop_distance_m
+                            )
+                        if nose_open:
+                            crawl = min(
+                                max(float(cfg.motion.min_linear_mps), 0.12),
+                                float(cfg.motion.max_linear_mps),
+                            )
+                            cmd = DriveCommand(crawl, 0.0, 0.0, False)
+                            obstacle_state = "narrow"
+                        else:
+                            cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                            obstacle_state = "avoid"
                 else:
                     cmd = DriveCommand(0.0, 0.0, 0.0, False)
                     obstacle_state = "avoid"
