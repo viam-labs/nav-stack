@@ -9,10 +9,12 @@ import pytest
 from src.nav_builtin.controller import FollowerConfig, compute_path_command, lookahead_pose
 from src.nav_builtin.costmap import (
     FREE,
+    HARD_BUFFER,
     INSCRIBED,
     LETHAL,
     build_costmap,
     footprint_traversable,
+    is_hard,
     is_traversable,
     nearest_free_pose,
 )
@@ -301,6 +303,40 @@ def test_costmap_soft_outer_matches_inflation_radius():
     # Past preference band: free.
     r_far, c_far = occ.world_to_cell(cx + inflate_r + 0.45, cy)
     assert int(costs[r_far, c_far]) == FREE
+
+
+def test_costmap_hard_buffer_ring_is_blocked_and_lighter_in_viz():
+    """Body vs clearance_m are two viz rings; both stay non-traversable."""
+    from src.nav_builtin.costmap import costs_to_occupancy_viz
+
+    occ = OccupancyGrid(
+        grid=np.zeros((81, 81), dtype=np.int16),
+        resolution=0.05,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    occ.grid[40, 40] = 100
+    body_r = 0.25
+    hard_r = 0.45  # 0.20 m clearance past the body
+    costs = build_costmap(
+        occ,
+        inflation_radius_m=hard_r,
+        robot_radius_m=hard_r,
+        body_radius_m=body_r,
+        cost_scaling_factor=4.0,
+        clearance_preference_m=0.0,
+    )
+    cx, cy = 2.0, 2.0
+    r_body, c_body = occ.world_to_cell(cx + body_r * 0.4, cy)
+    r_buf, c_buf = occ.world_to_cell(cx + (body_r + hard_r) * 0.5, cy)
+    assert int(costs[r_body, c_body]) == INSCRIBED
+    assert int(costs[r_buf, c_buf]) == HARD_BUFFER
+    assert not is_traversable(int(costs[r_body, c_body]))
+    assert not is_traversable(int(costs[r_buf, c_buf]))
+    assert is_hard(int(costs[r_buf, c_buf]))
+    viz = costs_to_occupancy_viz(costs)
+    assert int(viz[r_body, c_body]) == 99
+    assert int(viz[r_buf, c_buf]) == 90
 
 
 def test_plan_respects_inflation_radius():

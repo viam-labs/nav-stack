@@ -985,6 +985,7 @@ class NavServiceBase(Motion):
                             # matches the costmap paths are actually planned on.
                             inflation_radius_m=cfg.effective_inflation_radius_m(),
                             robot_radius_m=cfg.hard_clearance_radius_m(),
+                            body_radius_m=cfg.inscribed_radius_m(),
                             cost_scaling_factor=float(
                                 cfg.builtin.cost_scaling_factor
                             ),
@@ -1109,6 +1110,7 @@ class NavServiceBase(Motion):
                         cfg.effective_local_inflation_radius_m()
                     ),
                     robot_radius_m=float(cfg.hard_clearance_radius_m()),
+                    body_radius_m=float(cfg.inscribed_radius_m()),
                     cost_scaling_factor=float(bcfg.cost_scaling_factor),
                     scan_inflation_radius_m=float(
                         cfg.effective_local_inflation_radius_m()
@@ -1138,6 +1140,7 @@ class NavServiceBase(Motion):
                         global_occ,
                         inflation_radius_m=cfg.effective_inflation_radius_m(),
                         robot_radius_m=cfg.hard_clearance_radius_m(),
+                        body_radius_m=cfg.inscribed_radius_m(),
                         cost_scaling_factor=float(bcfg.cost_scaling_factor),
                     )
                     self._idle_global_occ = global_occ

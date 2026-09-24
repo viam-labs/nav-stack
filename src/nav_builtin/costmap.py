@@ -9,9 +9,12 @@ import numpy as np
 from ..geom import conversions as conv
 from .types import OccupancyGrid
 
-# Cost layers (uint8): 0 free … 253 inscribed, 254 lethal, 255 unknown.
+# Cost layers (uint8): 0 free … 251 soft, 252 hard buffer, 253 inscribed
+# (body), 254 lethal, 255 unknown. HARD_BUFFER and INSCRIBED are both
+# non-traversable; they exist so viz can draw body vs clearance as two rings.
 LETHAL = 254
 INSCRIBED = 253
+HARD_BUFFER = 252
 UNKNOWN = 255
 FREE = 0
 
@@ -319,6 +322,7 @@ def build_costmap(
     *,
     inflation_radius_m: float,
     robot_radius_m: float = 0.0,
+    body_radius_m: Optional[float] = None,
     occupied_threshold: int = 50,
     cost_scaling_factor: float = 4.0,
     clearance_preference_m: float = 0.35,
@@ -326,12 +330,14 @@ def build_costmap(
     """Return (H, W) uint8 costmap.
 
     Occupied / unknown cells become lethal. Cells within ``robot_radius_m`` of
-    a lethal cell are inscribed (non-traversable). Between that and
-    ``max(inflation_radius_m, robot_radius_m)`` soft costs decay with clearance
-    past the inscribed radius (Nav2-style).
+    a lethal cell are a hard (non-traversable) disk. When ``body_radius_m`` is
+    set and smaller than that, the disk is split: body radius → inscribed,
+    remainder → hard buffer (same planning block, distinct viz). Between the
+    hard disk and ``max(inflation_radius_m, robot_radius_m)`` soft costs decay
+    with clearance past the hard radius (Nav2-style).
 
     Soft outer radius matches configured ``inflation_radius_m`` (clamped to at
-    least the footprint) — that is what UIs show. An additional low-cost
+    least the hard disk) — that is what UIs show. An additional low-cost
     ``clearance_preference_m`` band past inflation biases planning toward open
     space when a detour exists; it is not drawn as inflation (see
     ``costs_to_occupancy_viz``). Preference costs sit above the planner LOS soft
@@ -347,12 +353,18 @@ def build_costmap(
     costs[raw < 0] = UNKNOWN  # unknown stays unknown; planner treats as lethal
 
     res = max(float(occ.resolution), 1e-6)
-    # Hard block = footprint only. Soft halo = configured inflation radius.
+    # Hard block = body + clearance (robot_radius_m). Soft halo starts outside.
     inscribed_m = max(0.0, float(robot_radius_m))
+    if body_radius_m is None:
+        body_m = inscribed_m
+    else:
+        body_m = min(max(0.0, float(body_radius_m)), inscribed_m)
     inflate_m = max(float(inflation_radius_m), inscribed_m)
     prefer_m = max(0.0, float(clearance_preference_m))
     prefer_outer_m = inflate_m + prefer_m
     inscribed_cells = max(0, int(math.ceil(inscribed_m / res)))
+    body_cells = max(0, int(math.ceil(body_m / res)))
+    body_cells = min(body_cells, inscribed_cells)
     inflate_cells = max(
         inscribed_cells,
         max(0, int(math.ceil(inflate_m / res))),
@@ -400,18 +412,23 @@ def build_costmap(
     free = costs == FREE
     within_soft = free & (dist <= inflate_cells)
     if within_soft.any():
-        inscribed = within_soft & (dist <= inscribed_cells)
-        costs[inscribed] = INSCRIBED
-        soft = within_soft & ~inscribed
+        hard = within_soft & (dist <= inscribed_cells)
+        if hard.any():
+            body = hard & (dist <= body_cells)
+            costs[body] = INSCRIBED
+            buffer = hard & ~body
+            if buffer.any():
+                costs[buffer] = HARD_BUFFER
+        soft = within_soft & ~hard
         if soft.any():
             dist_m = dist[soft].astype(np.float64) * res
-            # Nav2-style: decay with clearance past the inscribed radius so the
+            # Nav2-style: decay with clearance past the hard radius so the
             # outer soft edge stays meaningful and paths prefer open space.
             clearance_m = np.maximum(0.0, dist_m - inscribed_m)
             soft_costs = np.rint(
-                (INSCRIBED - 1) * np.exp(-cost_scaling_factor * clearance_m)
+                (HARD_BUFFER - 1) * np.exp(-cost_scaling_factor * clearance_m)
             ).astype(np.int32)
-            costs[soft] = np.clip(soft_costs, 1, INSCRIBED - 1).astype(np.uint8)
+            costs[soft] = np.clip(soft_costs, 1, HARD_BUFFER - 1).astype(np.uint8)
 
     # Planner-only preference past inflation (not shown in costmap viz).
     if prefer_m > 1e-6 and prefer_cells > inflate_cells:
@@ -430,21 +447,32 @@ def build_costmap(
     return costs
 
 
+def is_hard(cost: int) -> bool:
+    """True for body, hard clearance, lethal, or unknown (non-traversable)."""
+    return int(cost) >= HARD_BUFFER
+
+
 def is_traversable(cost: int, *, allow_unknown: bool = False) -> bool:
     if cost >= LETHAL:
         return False
     if cost == UNKNOWN:
         return allow_unknown
-    if cost >= INSCRIBED:
+    if is_hard(cost):
         return False
     return True
+
+
+# OccupancyGrid-style values the nav-camera colours. Soft is kept at 1..80 so
+# 90 stays reserved for the hard clearance ring (distinct from optional soft).
+_VIZ_HARD_BUFFER = 90
+_VIZ_SOFT_MAX = 80
 
 
 def costs_to_occupancy_viz(costs: np.ndarray) -> np.ndarray:
     """Convert layered uint8 costs to OccupancyGrid-style int16 for nav-camera.
 
-    Nav2 / nav_view colouring expects: -1 unknown, 0 free, 1..98 inflation,
-    99 inscribed, 100 lethal.
+    Nav2 / nav_view colouring expects: -1 unknown, 0 free, 1..80 optional soft
+    inflation, 90 hard clearance buffer, 99 body/inscribed, 100 lethal.
 
     Planner-only clearance preference costs (below ``_VIZ_SOFT_MIN``) render as
     free so the UI inflation ring matches ``inflation_radius``.
@@ -455,13 +483,17 @@ def costs_to_occupancy_viz(costs: np.ndarray) -> np.ndarray:
     out[c == UNKNOWN] = -1
     out[c == LETHAL] = 100
     out[c == INSCRIBED] = 99
-    mid = (c >= _VIZ_SOFT_MIN) & (c < INSCRIBED)
+    out[c == HARD_BUFFER] = _VIZ_HARD_BUFFER
+    mid = (c >= _VIZ_SOFT_MIN) & (c < HARD_BUFFER)
     if mid.any():
-        # Map viz soft → 1..98.
+        # Map viz soft → 1..80 (leave 90 free for the hard-buffer ring).
         scaled = np.clip(
-            np.rint(c[mid].astype(np.float32) * (98.0 / float(INSCRIBED - 1))),
+            np.rint(
+                c[mid].astype(np.float32)
+                * (float(_VIZ_SOFT_MAX) / float(HARD_BUFFER - 1))
+            ),
             1,
-            98,
+            _VIZ_SOFT_MAX,
         ).astype(np.int16)
         out[mid] = scaled
     return out

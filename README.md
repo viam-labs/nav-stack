@@ -401,7 +401,7 @@ Then `npm run dev` in nav-stack-ui. Teleop `sim-base` to map, navigate with `nav
 - **robot pose + footprint** (red arrow + blue polygon) from the `map → base_link` TF;
 - **goal marker** (magenta) with a heading tick.
 
-Occupancy colouring: unknown = dark grey, free = light, obstacle inflation = grey→orange gradient, lethal/inscribed = near-black. World "up" renders as image up (image-up).
+Occupancy colouring: unknown = dark grey, free = light, optional soft inflation = grey→orange gradient, hard `clearance_m` buffer = amber, lethal/body keep-out = near-black. Both the body disk and the clearance ring are non-traversable; they are split only so a tight corridor still reads as “body fits, buffer is tight.” World "up" renders as image up (image-up).
 
 It reads directly from the running navigation service's in-process viz store (found by the `navigation` attribute), so there is no extra ROS process and no round-trip. Because it consumes only builtin nav's standard costmap/plan topics, it works with **any** SLAM backend and with either `navigation` or `navigation-external`.
 

@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from ..geom import conversions as conv
-from .costmap import FREE, INSCRIBED, LETHAL, build_costmap, is_traversable
+from .costmap import FREE, LETHAL, build_costmap, is_hard, is_traversable
 from .types import OccupancyGrid
 
 
@@ -22,6 +22,8 @@ class LocalCostmapConfig:
     # is lethal, so ``path_cost_ahead`` means "route inside a live return".
     inflation_radius_m: float = 0.0
     robot_radius_m: float = 0.22
+    # Physical body (no clearance). None = no viz split (all hard is inscribed).
+    body_radius_m: Optional[float] = None
     cost_scaling_factor: float = 4.0
     # Include static lethal/inscribed cells from the global map in the window.
     use_global_static: bool = True
@@ -212,6 +214,7 @@ class LocalCostmap:
             scan_occ,
             inflation_radius_m=scan_inflation,
             robot_radius_m=self._cfg.robot_radius_m,
+            body_radius_m=self._cfg.body_radius_m,
             cost_scaling_factor=self._cfg.cost_scaling_factor,
             # The clearance-preference band is a planner-only routing bias; it
             # has no business in the layer used for collision / DWA thresholds.
@@ -456,11 +459,9 @@ def spin_disc_blocked(
     falsely block squeezable gaps (live: ~1 m lidar gap looked impassable).
     Only the *extra* radius beyond the inscribed inflation is tested.
     """
-    from .costmap import INSCRIBED
-
     inscribed = max(0.0, float(inscribed_radius_m))
     spin = max(inscribed, float(spin_radius_m))
     extra = spin - inscribed
     if extra <= 1e-6:
-        return int(view.cost_at_world(x_m, y_m)) >= INSCRIBED
+        return is_hard(int(view.cost_at_world(x_m, y_m)))
     return footprint_collides(view, x_m, y_m, robot_radius_m=extra)

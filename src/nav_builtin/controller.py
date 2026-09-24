@@ -889,11 +889,11 @@ def compute_path_command(
     # Never invent a spin here: rotating in-lethal was swinging the corner
     # into the thing we already overlapped ("squeezed past then rotated in").
     if local_view is not None and dist_goal > cfg.motion.xy_tolerance_m:
-        from .costmap import INSCRIBED
+        from .costmap import is_hard
         from .local_costmap import max_cost_along_segment
 
         pose_cost = int(local_view.cost_at_world(current.x, current.y))
-        if pose_cost >= INSCRIBED:
+        if is_hard(pose_cost):
             # Contradiction with spin-gate reverse: sitting in inflation used
             # to full-stop with no escape while path_cost_ahead stayed 0.
             rev = _try_narrow_reverse(
@@ -921,7 +921,7 @@ def compute_path_command(
             hx = current.x + math.cos(current.theta) * stop_m
             hy = current.y + math.sin(current.theta) * stop_m
             ahead = max_cost_along_segment(local_view, current.x, current.y, hx, hy)
-            if ahead >= INSCRIBED:
+            if is_hard(ahead):
                 # Freeze translation. Keep an existing yaw command only when
                 # the spin disc is clear; otherwise reverse when the rear is
                 # open (do not invent a freer-flank spin into a shoulder

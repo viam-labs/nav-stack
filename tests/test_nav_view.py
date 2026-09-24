@@ -97,14 +97,19 @@ def test_px_len_scales_with_resolution():
 
 
 def test_colorize_value_buckets():
-    grid = np.array([[-1, 0, 50, 100]], dtype=np.int16)
+    grid = np.array([[-1, 0, 50, 90, 99, 100]], dtype=np.int16)
     rgb = _colorize(grid)
     assert tuple(rgb[0, 0]) == (70, 70, 70)  # unknown
     assert tuple(rgb[0, 1]) == (245, 245, 245)  # free
-    assert tuple(rgb[0, 3]) == (35, 35, 40)  # lethal
+    assert tuple(rgb[0, 4]) == (35, 35, 40)  # body / inscribed
+    assert tuple(rgb[0, 5]) == (35, 35, 40)  # lethal
+    # Hard clearance (90) is amber, lighter than the dark body ring.
+    buf = tuple(int(v) for v in rgb[0, 3])
+    assert buf == (200, 115, 50)
+    assert buf != (35, 35, 40)
     # inflation (50) is between the light and warm endpoints, not pure grey/black.
     mid = tuple(int(v) for v in rgb[0, 2])
-    assert mid not in ((70, 70, 70), (245, 245, 245), (35, 35, 40))
+    assert mid not in ((70, 70, 70), (245, 245, 245), (35, 35, 40), buf)
 
 
 def test_toggles_off_do_not_crash():

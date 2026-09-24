@@ -21,14 +21,17 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 # Cost values in a nav_msgs/OccupancyGrid costmap: -1 unknown, 0 free,
-# 1..98 inflation gradient, 99 inscribed, 100 lethal. A raw SLAM /map uses the
-# same convention with 100 = occupied, so the same colouring serves both.
+# 1..80 optional soft inflation, 90 hard clearance buffer, 99 body/inscribed,
+# 100 lethal. A raw SLAM /map uses 100 = occupied, so the same colouring
+# serves both.
 _INSCRIBED_COST = 99
+_HARD_BUFFER_COST = 90
 
 # Colours (RGB).
 _C_FREE = (245, 245, 245)
 _C_UNKNOWN = (70, 70, 70)
 _C_LETHAL = (35, 35, 40)
+_C_HARD_BUFFER = (200, 115, 50)
 _C_INFLATE_LO = (210, 210, 210)
 _C_INFLATE_HI = (250, 120, 60)
 _C_GLOBAL_PLAN = (40, 200, 90)
@@ -100,12 +103,14 @@ def _colorize(grid: np.ndarray) -> np.ndarray:
 
     unknown = g < 0
     lethal = g >= _INSCRIBED_COST
+    hard_buf = g == _HARD_BUFFER_COST
     free = g == 0
-    mid = ~unknown & ~lethal & ~free  # inflation gradient (1..98)
+    mid = ~unknown & ~lethal & ~hard_buf & ~free  # optional soft (1..80)
 
     rgb[free] = _C_FREE
     rgb[unknown] = _C_UNKNOWN
     rgb[lethal] = _C_LETHAL
+    rgb[hard_buf] = _C_HARD_BUFFER
     if np.any(mid):
         t = (g[mid].astype(np.float32) / float(_INSCRIBED_COST - 1)).clip(0.0, 1.0)
         for i in range(3):
@@ -273,7 +278,8 @@ def legend() -> List[Dict]:
         ("free space", "white", _C_FREE),
         ("unknown", "dark grey", _C_UNKNOWN),
         ("obstacle inflation (rising cost)", "light grey -> orange", _C_INFLATE_HI),
-        ("lethal / inscribed obstacle", "near-black", _C_LETHAL),
+        ("hard clearance buffer", "amber", _C_HARD_BUFFER),
+        ("lethal / body keep-out", "near-black", _C_LETHAL),
         ("global plan", "green", _C_GLOBAL_PLAN),
         ("local plan", "orange", _C_LOCAL_PLAN),
         ("superseded plans (oldest->faintest)", "faded grey", _C_HISTORY),

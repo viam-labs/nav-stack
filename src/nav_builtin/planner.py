@@ -13,6 +13,7 @@ from .costmap import (
     build_costmap,
     costmap_viz_dict,
     footprint_traversable,
+    is_hard,
     is_traversable,
     mark_local_costmap_on_occupancy,
     mark_path_ahead_on_occupancy,
@@ -75,7 +76,7 @@ def _cost_multiplier(cost: int) -> float:
     c = int(cost)
     if c <= 0:
         return 1.0
-    if c >= INSCRIBED:
+    if is_hard(c):
         return 1e6
     t = c / float(INSCRIBED - 1)
     # Linear + steep quadratic: outer soft ≈ 10–20×, near-inscribed ≫50×.
@@ -587,6 +588,7 @@ def connect_plan_start(
     *,
     inflation_radius_m: float,
     robot_radius_m: float,
+    body_radius_m: Optional[float] = None,
     cost_scaling_factor: float = 4.0,
     clearance_preference_m: float = 0.35,
     algorithm: str = DEFAULT_PLANNER,
@@ -613,6 +615,7 @@ def connect_plan_start(
             occ,
             inflation_radius_m=inflation_radius_m,
             robot_radius_m=robot_radius_m,
+            body_radius_m=body_radius_m,
             cost_scaling_factor=cost_scaling_factor,
             clearance_preference_m=clearance_preference_m,
         )
@@ -802,6 +805,7 @@ def plan_path(
     *,
     inflation_radius_m: float,
     robot_radius_m: float = 0.22,
+    body_radius_m: Optional[float] = None,
     cost_scaling_factor: float = 4.0,
     clearance_preference_m: float = 0.35,
     algorithm: str = DEFAULT_PLANNER,
@@ -895,6 +899,7 @@ def plan_path(
         occ,
         inflation_radius_m=inflation_radius_m,
         robot_radius_m=robot_radius_m,
+        body_radius_m=body_radius_m,
         cost_scaling_factor=cost_scaling_factor,
         clearance_preference_m=clearance_preference_m,
     )

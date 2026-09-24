@@ -159,6 +159,12 @@ class NavSupervisor:
         # Driving clearance (half-width when a footprint is configured). Every
         # costmap / path / footprint check uses this.
         self._robot_radius = robot_radius_m
+        # Physical body (no clearance). Defaults to the hard radius so callers
+        # that only override robot_radius_m keep a single-ring costmap.
+        self._body_radius = min(
+            max(0.0, float(kw.get("body_radius_m", robot_radius_m))),
+            float(robot_radius_m),
+        )
         # Rotation clearance (half-diagonal): what the body sweeps turning in
         # place. Larger than _robot_radius on a non-square robot, so it gates
         # spins without sealing gaps the robot can drive through.
@@ -216,6 +222,7 @@ class NavSupervisor:
                     resolution=local_costmap_resolution,
                     inflation_radius_m=local_inflation_radius_m,
                     robot_radius_m=robot_radius_m,
+                    body_radius_m=self._body_radius,
                     cost_scaling_factor=cost_scaling_factor,
                 )
             )
@@ -405,6 +412,7 @@ class NavSupervisor:
                     occ,
                     inflation_radius_m=self._inflation,
                     robot_radius_m=self._robot_radius,
+                    body_radius_m=self._body_radius,
                     cost_scaling_factor=self._cost_scaling,
                     clearance_preference_m=self._clearance_preference_m,
                 )
@@ -474,6 +482,7 @@ class NavSupervisor:
             goal,
             inflation_radius_m=self._inflation,
             robot_radius_m=self._robot_radius,
+            body_radius_m=self._body_radius,
             cost_scaling_factor=self._cost_scaling,
             clearance_preference_m=self._clearance_preference_m,
             algorithm=self._algorithm,
@@ -493,6 +502,7 @@ class NavSupervisor:
                 result,
                 inflation_radius_m=self._inflation,
                 robot_radius_m=self._robot_radius,
+                body_radius_m=self._body_radius,
                 cost_scaling_factor=self._cost_scaling,
                 clearance_preference_m=self._clearance_preference_m,
                 algorithm=self._algorithm,
@@ -1362,7 +1372,7 @@ class NavSupervisor:
                 path_ahead_cost = 0
                 pose_cost = 0
                 local_blocked = False
-                from .costmap import INSCRIBED
+                from .costmap import is_hard
 
                 if local_view is not None:
                     from .local_planner import path_cost_ahead as _path_cost_ahead
@@ -1381,7 +1391,7 @@ class NavSupervisor:
                     pose_cost = int(local_view.cost_at_world(pose.x, pose.y))
                     local_blocked = (
                         path_ahead_cost >= self._local_planner_activate_cost
-                        or pose_cost >= INSCRIBED
+                        or is_hard(pose_cost)
                     )
                 # Reactive avoid spinning with a clear-looking path still means
                 # the robot cannot proceed — escalate to the blocked/replan path.
@@ -1394,7 +1404,7 @@ class NavSupervisor:
                     and now - reactive_avoid_since >= 0.8
                     and (
                         path_ahead_cost >= self._local_planner_activate_cost
-                        or pose_cost >= INSCRIBED
+                        or is_hard(pose_cost)
                     )
                 ):
                     local_blocked = True
