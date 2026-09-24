@@ -57,6 +57,7 @@ class WorldIO(Protocol):
         *,
         allow_during_navigation: bool = True,
         full_map_escalation: str = "still_bad",
+        apply: Optional[bool] = None,
     ) -> Optional[dict]:
         """Optional SLAM local refine. Implementations may return None."""
         return None

@@ -525,10 +525,11 @@ class BuiltinNavConfig:
     # periodic relocalize defaults off, so drift otherwise rides until idle.
     route_verify_pose: bool = True
     # Mid-nav: when the current scan is a poor explanation of the map at the
-    # published pose, stop, run a *local* ``check_localization``, then resume
-    # or fail the goal as ``localization_lost``. Uses scan-vs-map residual, not
-    # a SLAM match score (hallways often score mediocre while the pose is fine).
-    # Does not turn on periodic relocalize during navigation.
+    # published pose, stop, run a *local* ``check_localization``, then resume.
+    # Fail as ``localization_lost`` only when the leftover residual is still
+    # severe. A small local shift that clearly beats the published pose is
+    # applied even if ``good_match`` is just shy. Uses scan-vs-map residual,
+    # not a SLAM match score. Does not turn on periodic relocalize during nav.
     nav_loc_refine_on_disagree: bool = True
     nav_loc_refine_margin_m: float = 0.8
     nav_loc_refine_map_max_m: float = 2.5

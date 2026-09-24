@@ -71,6 +71,54 @@ class LocDisagreement:
         }
 
 
+def residual_is_lost(verdict: LocDisagreement) -> bool:
+    """True when the leftover residual means the pose is really unexplained.
+
+    A thin leftover (a few far beams, one side still matching) is not enough
+    to abort a goal after a failed refine.
+    """
+    if not verdict.disagree:
+        return False
+    if verdict.compared_beams >= 10 and verdict.disagree_frac >= 0.55:
+        return True
+    return verdict.compared_beams >= 16 and verdict.disagree_frac >= 0.45
+
+
+def small_local_match_worth_applying(result: Optional[Mapping]) -> bool:
+    """A local rematch that clearly beats the published pose and is a small shift.
+
+    Used to force-apply when ``good_match`` is just shy (e.g. 0.47 vs 0.50)
+    but the prior is already bad. Never for large / ambiguous / full-map peaks.
+    """
+    if not result or result.get("corrected"):
+        return False
+    if result.get("ambiguous") or result.get("large_jump"):
+        return False
+    mode = str(result.get("match_mode") or "local")
+    if mode and not mode.startswith("local"):
+        return False
+    try:
+        shift_m = abs(float(result.get("shift_m") or 0.0))
+        shift_deg = abs(float(result.get("shift_deg") or 0.0))
+        score = float(result["score"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not math.isfinite(score):
+        return False
+    if shift_m > 0.6 or shift_deg > 30.0:
+        return False
+    if shift_m < 0.08 and shift_deg < 6.0:
+        return False
+    prev = result.get("previous_score")
+    try:
+        prev_f = float(prev) if prev is not None else None
+    except (TypeError, ValueError):
+        prev_f = None
+    if prev_f is not None and math.isfinite(prev_f):
+        return score >= prev_f + 0.15 or (prev_f < 0.20 and score >= 0.35)
+    return score >= 0.40
+
+
 def occupancy_for_consistency(
     map_or_occ: Union[OccupancyGrid, Mapping, None],
 ) -> Optional[OccupancyGrid]:

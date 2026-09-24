@@ -1326,8 +1326,9 @@ class _FakeWorld:
 
     def check_localization(self, **kwargs):
         self.loc_checks += 1
+        self.last_loc_kwargs = kwargs
         if callable(self.on_loc_check):
-            return self.on_loc_check(self)
+            return self.on_loc_check(self, **kwargs)
         return {"status": "ok", "corrected": False}
 
     def set_velocity(self, vx, vy, vtheta):
@@ -1893,7 +1894,7 @@ def test_nav_loc_refine_resumes_when_disagreement_clears():
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
     world.scan = _open_scan()
 
-    def _fix(w: _FakeWorld):
+    def _fix(w: _FakeWorld, **_kw):
         w.scan = _open_scan(0.55)
         return {"status": "ok", "corrected": True}
 
@@ -1914,3 +1915,63 @@ def test_nav_loc_refine_fails_after_two_tries():
     st = sup.status()
     assert st.state == "failed"
     assert st.error_msg == "localization_lost"
+
+
+def test_nav_loc_refine_continues_when_residual_is_thin():
+    """A 4/12 leftover is not localization_lost — keep the goal."""
+    from src.nav_builtin.loc_consistency import LocDisagreement
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    mild = LocDisagreement(
+        disagree=True,
+        reason="scan_map",
+        compared_beams=12,
+        disagree_beams=4,
+        disagree_frac=0.333,
+    )
+    sup = _loc_refine_supervisor(world)
+    calls = {"n": 0}
+
+    def _measure(_pose):
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            return mild
+        return LocDisagreement(disagree=False)
+
+    sup._measure_loc_disagreement = _measure  # noqa: SLF001
+    sup.run_goal(Pose2D(1.6, 1.0, 0.0))
+    st = sup.status()
+    assert st.state == "succeeded"
+    assert st.error_msg == ""
+    assert world.loc_checks == 2
+
+
+def test_nav_loc_refine_applies_small_improving_match():
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
+    world.scan = _open_scan()
+    applies = []
+
+    def _check(w: _FakeWorld, **kw):
+        applies.append(kw.get("apply"))
+        if kw.get("apply"):
+            w.scan = _open_scan(0.55)
+            return {"status": "ok", "corrected": True, "match_mode": "local"}
+        return {
+            "status": "nav_hold",
+            "corrected": False,
+            "good_match": False,
+            "match_mode": "local",
+            "shift_m": 0.32,
+            "shift_deg": 20.0,
+            "score": 0.47,
+            "previous_score": -0.17,
+            "large_jump": False,
+            "drifted": True,
+        }
+
+    world.on_loc_check = _check
+    sup = _loc_refine_supervisor(world)
+    sup.run_goal(Pose2D(1.6, 1.0, 0.0))
+    assert True in applies
+    assert sup.status().state == "succeeded"
+    assert sup.status().error_msg == ""

@@ -4,7 +4,12 @@ from __future__ import annotations
 import numpy as np
 
 from src.geom import conversions as conv
-from src.nav_builtin.loc_consistency import localization_looks_bad
+from src.nav_builtin.loc_consistency import (
+    LocDisagreement,
+    localization_looks_bad,
+    residual_is_lost,
+    small_local_match_worth_applying,
+)
 from src.nav_builtin.types import OccupancyGrid, Pose2D
 
 
@@ -89,3 +94,47 @@ def test_disagree_when_surrounding_room_does_not_match_scan():
     assert bad.compared_beams >= 6
     good = localization_looks_bad(pose, _open_scan(0.60), _room_occ())
     assert good.disagree is False
+
+
+def test_residual_is_lost_ignores_thin_leftover():
+    thin = LocDisagreement(
+        disagree=True,
+        compared_beams=12,
+        disagree_beams=4,
+        disagree_frac=0.333,
+    )
+    assert residual_is_lost(thin) is False
+    bad = LocDisagreement(
+        disagree=True,
+        compared_beams=12,
+        disagree_beams=8,
+        disagree_frac=0.667,
+    )
+    assert residual_is_lost(bad) is True
+
+
+def test_small_local_match_worth_applying_live_dock_case():
+    assert small_local_match_worth_applying(
+        {
+            "status": "nav_hold",
+            "corrected": False,
+            "good_match": False,
+            "match_mode": "local",
+            "shift_m": 0.32,
+            "shift_deg": 20.0,
+            "score": 0.47,
+            "previous_score": -0.17,
+            "large_jump": False,
+        }
+    )
+    assert not small_local_match_worth_applying(
+        {
+            "corrected": False,
+            "match_mode": "local",
+            "shift_m": 2.4,
+            "shift_deg": 8.0,
+            "score": 0.6,
+            "previous_score": 0.1,
+            "large_jump": True,
+        }
+    )

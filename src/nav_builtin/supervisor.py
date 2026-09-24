@@ -615,7 +615,7 @@ class NavSupervisor:
             },
         )
 
-    def _call_check_localization(self) -> Optional[dict]:
+    def _call_check_localization(self, *, apply: Optional[bool] = None) -> Optional[dict]:
         fn = getattr(self._world, "check_localization", None)
         if not callable(fn):
             return None
@@ -623,7 +623,22 @@ class NavSupervisor:
             result = fn(
                 allow_during_navigation=True,
                 full_map_escalation="still_bad",
+                apply=apply,
             )
+        except TypeError:
+            # Older WorldIO doubles without the apply kwarg.
+            try:
+                result = fn(
+                    allow_during_navigation=True,
+                    full_map_escalation="still_bad",
+                )
+            except TimeoutError:
+                return {"status": "error", "reason": "timeout"}
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "status": "error",
+                    "reason": str(exc).strip() or type(exc).__name__,
+                }
         except TimeoutError:
             return {"status": "error", "reason": "timeout"}
         except Exception as exc:  # noqa: BLE001
@@ -689,6 +704,16 @@ class NavSupervisor:
                 time.sleep(0.05)
             result = self._call_check_localization() or result
             status = str(result.get("status") or "")
+        from .loc_consistency import residual_is_lost, small_local_match_worth_applying
+
+        if small_local_match_worth_applying(result):
+            self._publish_loc_refine_progress(
+                pose, dist_goal, verdict=verdict, status="applying"
+            )
+            applied = self._call_check_localization(apply=True)
+            if applied is not None:
+                result = applied
+                status = str(result.get("status") or "")
         if status in ("skipped", "unconfigured"):
             reason = str(result.get("reason") or "")
             if reason in ("spinning", "stale_scan"):
@@ -703,27 +728,34 @@ class NavSupervisor:
                 time.monotonic() + self._nav_loc_refine_cooldown_s
             )
             if self._loc_refine_tries >= self._nav_loc_refine_max_tries:
-                self._world.stop()
-                self._set_status(
-                    state="failed",
-                    active=False,
-                    error_msg="localization_lost",
-                    pose={
-                        "x": pose_after.x,
-                        "y": pose_after.y,
-                        "theta": pose_after.theta,
-                    },
-                    progress={
-                        "obstacle": "loc_refine",
-                        "localization_refine": {
-                            "status": "failed",
-                            "try": self._loc_refine_tries,
-                            "max_tries": self._nav_loc_refine_max_tries,
-                            **after.to_dict(),
+                if residual_is_lost(after):
+                    self._world.stop()
+                    self._set_status(
+                        state="failed",
+                        active=False,
+                        error_msg="localization_lost",
+                        pose={
+                            "x": pose_after.x,
+                            "y": pose_after.y,
+                            "theta": pose_after.theta,
                         },
-                    },
+                        progress={
+                            "obstacle": "loc_refine",
+                            "localization_refine": {
+                                "status": "failed",
+                                "try": self._loc_refine_tries,
+                                "max_tries": self._nav_loc_refine_max_tries,
+                                **after.to_dict(),
+                            },
+                        },
+                    )
+                    return "fail"
+                # Thin leftover (one side still matches): keep the goal.
+                self._loc_refine_tries = 0
+                self._publish_loc_refine_progress(
+                    pose_after, dist_goal, verdict=after, status="continue"
                 )
-                return "fail"
+                return "resume"
             self._publish_loc_refine_progress(
                 pose_after, dist_goal, verdict=after, status="retry"
             )
