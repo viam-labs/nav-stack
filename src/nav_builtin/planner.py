@@ -672,41 +672,49 @@ def plan_on_costmap(
     algorithm: str = DEFAULT_PLANNER,
 ) -> PlanResult:
     t0 = time.perf_counter()
-    if robot_radius_m > 0.0:
-        # ``costs`` is already inflated by robot_radius, so the start only
-        # needs its own cell (plus one cell of slack) traversable. Checking a
-        # full robot disc here demanded 2x clearance and, next to a live
-        # obstacle, reported "start pose is in lethal" on every replan.
+    # ``costs`` are already inflated by robot_radius. Start keeps one cell of
+    # slack (so a single inscribed neighbour is not "in lethal"). Goal snaps to
+    # the nearest free cell — a second footprint disc demanded 2× clearance and
+    # rejected dock2 (0.55 m snap > 0.50 m).
+    cell_r = min(max(0.0, float(robot_radius_m)), float(occ.resolution))
+    if cell_r > 0.0:
         start_xy = nearest_free_pose(
             costs,
             occ,
             start.x,
             start.y,
-            robot_radius_m=min(float(robot_radius_m), float(occ.resolution)),
+            robot_radius_m=cell_r,
             max_radius_cells=snap_radius_cells,
         )
-        goal_xy = nearest_free_pose(
+        start_cell = (
+            occ.world_to_cell(start_xy[0], start_xy[1]) if start_xy else None
+        )
+    else:
+        start_cell = nearest_free_cell(
             costs,
-            occ,
-            goal.x,
-            goal.y,
-            robot_radius_m=robot_radius_m,
+            *occ.world_to_cell(start.x, start.y),
             max_radius_cells=snap_radius_cells,
         )
-        if start_xy is None:
-            return PlanResult(
-                feasible=False,
-                error_code=1,
-                error_msg="start pose is in lethal / unknown space",
-                planning_time_s=time.perf_counter() - t0,
+        start_xy = (
+            (start.x, start.y)
+            if start_cell == occ.world_to_cell(start.x, start.y)
+            else (
+                occ.cell_to_world(start_cell[0], start_cell[1])
+                if start_cell is not None
+                else None
             )
-        if goal_xy is None:
-            return PlanResult(
-                feasible=False,
-                error_code=2,
-                error_msg="goal pose is in lethal / unknown space",
-                planning_time_s=time.perf_counter() - t0,
-            )
+        )
+    gr, gc = occ.world_to_cell(goal.x, goal.y)
+    goal_cell = nearest_free_cell(
+        costs, gr, gc, max_radius_cells=snap_radius_cells
+    )
+    if goal_cell is None:
+        goal_xy = None
+    elif goal_cell == (gr, gc):
+        goal_xy = (goal.x, goal.y)
+    else:
+        goal_xy = occ.cell_to_world(goal_cell[0], goal_cell[1])
+    if start_xy is not None and goal_xy is not None:
         snap_m = math.hypot(goal_xy[0] - goal.x, goal_xy[1] - goal.y)
         if snap_m > max(0.0, float(max_goal_snap_m)):
             return PlanResult(
@@ -718,27 +726,6 @@ def plan_on_costmap(
                 ),
                 planning_time_s=time.perf_counter() - t0,
             )
-        start_cell = occ.world_to_cell(start_xy[0], start_xy[1])
-        goal_cell = occ.world_to_cell(goal_xy[0], goal_xy[1])
-    else:
-        sr, sc = occ.world_to_cell(start.x, start.y)
-        gr, gc = occ.world_to_cell(goal.x, goal.y)
-        start_cell = nearest_free_cell(
-            costs, sr, sc, max_radius_cells=snap_radius_cells
-        )
-        goal_cell = nearest_free_cell(
-            costs, gr, gc, max_radius_cells=snap_radius_cells
-        )
-        start_xy = (
-            occ.cell_to_world(start_cell[0], start_cell[1])
-            if start_cell is not None
-            else None
-        )
-        goal_xy = (
-            occ.cell_to_world(goal_cell[0], goal_cell[1])
-            if goal_cell is not None
-            else None
-        )
     if start_cell is None:
         return PlanResult(
             feasible=False,

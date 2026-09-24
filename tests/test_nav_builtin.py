@@ -720,6 +720,33 @@ def test_plan_rejects_large_goal_snap():
     assert "goal snap" in (bad.error_msg or "")
 
 
+def test_plan_does_not_double_inflate_goal_snap():
+    """Goal on an already-inflated map must snap by cell, not another footprint.
+
+    A dock 0.15 m from a wall is inside the hard disk (r=0.40) but only ~0.25 m
+    from the nearest free cell. Re-checking a full 0.40 m disc demanded ~0.65 m
+    of snap and rejected the plan (live: dock2, 0.55 m > 0.50 m).
+    """
+    from src.nav_builtin.planner import plan_on_costmap
+    from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+
+    grid = np.zeros((80, 80), dtype=np.int16)
+    grid[:, 0:2] = 100  # wall along x≈0
+    m = {"grid": grid, "resolution": 0.05, "origin_x": 0.0, "origin_y": 0.0}
+    occ = occupancy_from_map_dict(m)
+    robot_r = 0.40
+    costs = build_costmap(occ, inflation_radius_m=robot_r, robot_radius_m=robot_r)
+    start = Pose2D(2.0, 2.0, 0.0)
+    goal = Pose2D(0.15, 2.0, 0.0)
+    result = plan_on_costmap(
+        occ, costs, start, goal, robot_radius_m=robot_r, max_goal_snap_m=0.5
+    )
+    assert result.feasible is True
+    end = result.path.points[-1]
+    snap_m = math.hypot(end[0] - goal.x, end[1] - goal.y)
+    assert snap_m <= 0.5
+
+
 def test_path_blocked_on_costmap_matches_path_blocked():
     """Cached-costmap check must agree with a fresh inflate (control-loop path)."""
     from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict

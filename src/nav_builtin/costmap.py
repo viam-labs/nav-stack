@@ -543,18 +543,29 @@ def nearest_free_cell(
     *,
     max_radius_cells: int = 40,
 ) -> Optional[Tuple[int, int]]:
-    """Find a traversable cell near ``(row, col)`` (inclusive of itself)."""
+    """Find a traversable cell near ``(row, col)`` (inclusive of itself).
+
+    On the first ring that has a free cell, pick the Euclidean-closest one so
+    a wall-side dock snaps toward open space, not along the wall.
+    """
     h, w = costs.shape
     if 0 <= row < h and 0 <= col < w and is_traversable(int(costs[row, col])):
         return row, col
     for r in range(1, max_radius_cells + 1):
+        best: Optional[Tuple[int, int]] = None
+        best_d2 = 0
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
                 if max(abs(dy), abs(dx)) != r:
                     continue
                 yy, xx = row + dy, col + dx
                 if 0 <= yy < h and 0 <= xx < w and is_traversable(int(costs[yy, xx])):
-                    return yy, xx
+                    d2 = dy * dy + dx * dx
+                    if best is None or d2 < best_d2:
+                        best = (yy, xx)
+                        best_d2 = d2
+        if best is not None:
+            return best
     return None
 
 
