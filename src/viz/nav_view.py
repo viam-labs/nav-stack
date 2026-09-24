@@ -21,9 +21,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 # Cost values in a nav_msgs/OccupancyGrid costmap: -1 unknown, 0 free,
-# 1..80 optional soft inflation, 90 hard clearance buffer, 99 body/inscribed,
-# 100 lethal. A raw SLAM /map uses 100 = occupied, so the same colouring
-# serves both.
+# 1..80 optional soft inflation, 90 hard clearance (workspace keep-out),
+# 99 inscribed (legacy unsplit hard disk), 100 lethal. A raw SLAM /map
+# uses 100 = occupied, so the same colouring serves both.
 _INSCRIBED_COST = 99
 _HARD_BUFFER_COST = 90
 
@@ -278,8 +278,8 @@ def legend() -> List[Dict]:
         ("free space", "white", _C_FREE),
         ("unknown", "dark grey", _C_UNKNOWN),
         ("obstacle inflation (rising cost)", "light grey -> orange", _C_INFLATE_HI),
-        ("hard clearance buffer", "amber", _C_HARD_BUFFER),
-        ("lethal / body keep-out", "near-black", _C_LETHAL),
+        ("hard clearance (workspace)", "amber", _C_HARD_BUFFER),
+        ("lethal obstacle", "near-black", _C_LETHAL),
         ("global plan", "green", _C_GLOBAL_PLAN),
         ("local plan", "orange", _C_LOCAL_PLAN),
         ("superseded plans (oldest->faintest)", "faded grey", _C_HISTORY),

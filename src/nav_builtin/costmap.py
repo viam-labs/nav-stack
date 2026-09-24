@@ -330,11 +330,13 @@ def build_costmap(
     """Return (H, W) uint8 costmap.
 
     Occupied / unknown cells become lethal. Cells within ``robot_radius_m`` of
-    a lethal cell are a hard (non-traversable) disk. When ``body_radius_m`` is
-    set and smaller than that, the disk is split: body radius → inscribed,
-    remainder → hard buffer (same planning block, distinct viz). Between the
-    hard disk and ``max(inflation_radius_m, robot_radius_m)`` soft costs decay
-    with clearance past the hard radius (Nav2-style).
+    a lethal cell are a hard (non-traversable) C-space disk (body + clearance).
+    When ``body_radius_m`` is set and smaller than that, the disk is split for
+    viz only: ``clearance_m`` from the wall → hard buffer (drawn), the rest of
+    the disk → inscribed (hidden so corridors read as workspace). Both stay
+    blocked for planning. Between the hard disk and
+    ``max(inflation_radius_m, robot_radius_m)`` soft costs decay with clearance
+    past the hard radius (Nav2-style).
 
     Soft outer radius matches configured ``inflation_radius_m`` (clamped to at
     least the hard disk) — that is what UIs show. An additional low-cost
@@ -363,8 +365,6 @@ def build_costmap(
     prefer_m = max(0.0, float(clearance_preference_m))
     prefer_outer_m = inflate_m + prefer_m
     inscribed_cells = max(0, int(math.ceil(inscribed_m / res)))
-    body_cells = max(0, int(math.ceil(body_m / res)))
-    body_cells = min(body_cells, inscribed_cells)
     inflate_cells = max(
         inscribed_cells,
         max(0, int(math.ceil(inflate_m / res))),
@@ -414,11 +414,18 @@ def build_costmap(
     if within_soft.any():
         hard = within_soft & (dist <= inscribed_cells)
         if hard.any():
-            body = hard & (dist <= body_cells)
-            costs[body] = INSCRIBED
-            buffer = hard & ~body
-            if buffer.any():
-                costs[buffer] = HARD_BUFFER
+            # Workspace band = clearance past the wall (hard − body). The
+            # remaining C-space (body inflation) stays blocked but is not drawn.
+            clearance_m = max(0.0, inscribed_m - body_m)
+            clearance_cells = max(0, int(math.ceil(clearance_m / res)))
+            if clearance_m > 1e-9 and clearance_cells < inscribed_cells:
+                workspace = hard & (dist <= clearance_cells)
+                costs[workspace] = HARD_BUFFER
+                cspace = hard & ~workspace
+                if cspace.any():
+                    costs[cspace] = INSCRIBED
+            else:
+                costs[hard] = INSCRIBED
         soft = within_soft & ~hard
         if soft.any():
             dist_m = dist[soft].astype(np.float64) * res
@@ -472,7 +479,12 @@ def costs_to_occupancy_viz(costs: np.ndarray) -> np.ndarray:
     """Convert layered uint8 costs to OccupancyGrid-style int16 for nav-camera.
 
     Nav2 / nav_view colouring expects: -1 unknown, 0 free, 1..80 optional soft
-    inflation, 90 hard clearance buffer, 99 body/inscribed, 100 lethal.
+    inflation, 90 hard clearance (workspace keep-out next to walls), 99
+    inscribed (only when the hard disk was not split), 100 lethal.
+
+    The C-space body disk (``INSCRIBED`` next to a ``HARD_BUFFER`` ring) renders
+    as free so a corridor shows ``clearance_m`` of keep-out, not body+clearance.
+    Planning still treats both as blocked.
 
     Planner-only clearance preference costs (below ``_VIZ_SOFT_MIN``) render as
     free so the UI inflation ring matches ``inflation_radius``.
@@ -482,7 +494,9 @@ def costs_to_occupancy_viz(costs: np.ndarray) -> np.ndarray:
     out[c == FREE] = 0
     out[c == UNKNOWN] = -1
     out[c == LETHAL] = 100
-    out[c == INSCRIBED] = 99
+    # Hide C-space body inflation when the workspace clearance ring is present.
+    hide_cspace = bool(np.any(c == HARD_BUFFER))
+    out[c == INSCRIBED] = 0 if hide_cspace else 99
     out[c == HARD_BUFFER] = _VIZ_HARD_BUFFER
     mid = (c >= _VIZ_SOFT_MIN) & (c < HARD_BUFFER)
     if mid.any():

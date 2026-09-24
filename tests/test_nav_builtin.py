@@ -305,8 +305,8 @@ def test_costmap_soft_outer_matches_inflation_radius():
     assert int(costs[r_far, c_far]) == FREE
 
 
-def test_costmap_hard_buffer_ring_is_blocked_and_lighter_in_viz():
-    """Body vs clearance_m are two viz rings; both stay non-traversable."""
+def test_costmap_viz_shows_workspace_clearance_hides_cspace_body():
+    """Viz paints clearance_m from the wall; C-space body stay blocked but hidden."""
     from src.nav_builtin.costmap import costs_to_occupancy_viz
 
     occ = OccupancyGrid(
@@ -327,16 +327,16 @@ def test_costmap_hard_buffer_ring_is_blocked_and_lighter_in_viz():
         clearance_preference_m=0.0,
     )
     cx, cy = 2.0, 2.0
-    r_body, c_body = occ.world_to_cell(cx + body_r * 0.4, cy)
-    r_buf, c_buf = occ.world_to_cell(cx + (body_r + hard_r) * 0.5, cy)
-    assert int(costs[r_body, c_body]) == INSCRIBED
-    assert int(costs[r_buf, c_buf]) == HARD_BUFFER
-    assert not is_traversable(int(costs[r_body, c_body]))
-    assert not is_traversable(int(costs[r_buf, c_buf]))
-    assert is_hard(int(costs[r_buf, c_buf]))
+    r_clear, c_clear = occ.world_to_cell(cx + 0.10, cy)  # inside clearance_m
+    r_cspace, c_cspace = occ.world_to_cell(cx + 0.32, cy)  # body C-space only
+    assert int(costs[r_clear, c_clear]) == HARD_BUFFER
+    assert int(costs[r_cspace, c_cspace]) == INSCRIBED
+    assert not is_traversable(int(costs[r_clear, c_clear]))
+    assert not is_traversable(int(costs[r_cspace, c_cspace]))
+    assert is_hard(int(costs[r_cspace, c_cspace]))
     viz = costs_to_occupancy_viz(costs)
-    assert int(viz[r_body, c_body]) == 99
-    assert int(viz[r_buf, c_buf]) == 90
+    assert int(viz[r_clear, c_clear]) == 90
+    assert int(viz[r_cspace, c_cspace]) == 0
 
 
 def test_plan_respects_inflation_radius():
