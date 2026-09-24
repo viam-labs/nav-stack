@@ -57,7 +57,7 @@
         "robot_radius": 0.22,
         "max_vel_x": 0.4,
         "max_vel_theta": 1.0,
-        "inflation_radius": 0.45,
+        "clearance_m": 0.2,
         "xy_goal_tolerance": 0.25,
         "nav_backend": "builtin"
       }

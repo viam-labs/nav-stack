@@ -19,8 +19,9 @@ def builtin_nav_runtime_kwargs(
     bcfg = cfg.builtin
     kwargs: Dict[str, Any] = {
         "inflation_radius_m": cfg.effective_inflation_radius_m(),
-        # Driving clearance uses the half-width; rotation uses the half-diagonal.
-        "robot_radius_m": cfg.inscribed_radius_m(),
+        # Costmap inscribed radius: body + clearance_m (same for plan + local).
+        # Rotation still uses the half-diagonal (spin_radius_m).
+        "robot_radius_m": cfg.hard_clearance_radius_m(),
         "spin_radius_m": cfg.circumscribed_radius_m(),
         "nose_offset_m": cfg.nose_offset_m(),
         "wheel_half_track_m": cfg.wheel_half_track_m(),

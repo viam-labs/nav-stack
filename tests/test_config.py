@@ -536,58 +536,74 @@ def test_nav_config_top_level_goal_tolerances():
     assert nested.builtin.xy_goal_tolerance == pytest.approx(0.18)
 
 
-def test_inflation_margin_is_additive_past_the_footprint():
-    """``inflation_margin_m`` is measured past the footprint, like
-    ``clearance_preference_m`` — unlike absolute ``inflation_radius``."""
-    additive = NavConfig.from_dict(
-        {
-            "slam_service": "slam",
-            "base": "b",
-            "footprint_width_m": 0.59,
-            "footprint_length_m": 0.72,
-            "inflation_margin_m": 0.2,
-        }
-    )
-    assert additive.inscribed_radius_m() == pytest.approx(0.295)
-    assert additive.effective_inflation_radius_m() == pytest.approx(0.495)
-    assert not additive.inflation_is_noop()
-
-    # Legacy absolute key keeps its meaning.
-    absolute = NavConfig.from_dict(
-        {"slam_service": "slam", "base": "b", "inflation_radius": 0.35}
-    )
-    assert absolute.effective_inflation_radius_m() == pytest.approx(0.35)
-
-
-def test_inflation_radius_below_footprint_is_flagged_as_noop():
-    """The silent no-op that hid a missing soft ring: 0.25 under a 0.295 footprint."""
+def test_clearance_m_is_a_shared_hard_buffer_past_the_body():
+    """Global and local costmaps share body + clearance_m as the hard radius."""
     cfg = NavConfig.from_dict(
         {
             "slam_service": "slam",
             "base": "b",
             "footprint_width_m": 0.59,
             "footprint_length_m": 0.72,
-            "inflation_radius": 0.25,
         }
     )
+    assert cfg.clearance_m == pytest.approx(0.2)
+    assert cfg.inscribed_radius_m() == pytest.approx(0.295)
+    assert cfg.hard_clearance_radius_m() == pytest.approx(0.495)
+    # No extra soft → local outer radius is the hard disk.
+    assert cfg.effective_local_inflation_radius_m() == pytest.approx(0.495)
     assert cfg.inflation_is_noop()
-    # A margin fixes it; the absolute key would have to exceed 0.295.
-    fixed = NavConfig.from_dict(
+
+    none = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "robot_radius": 0.22,
+            "clearance_m": 0,
+        }
+    )
+    assert none.hard_clearance_radius_m() == pytest.approx(0.22)
+    assert none.effective_local_inflation_radius_m() == pytest.approx(0.22)
+
+    with pytest.raises(ValueError, match="clearance_m"):
+        NavConfig.from_dict(
+            {"slam_service": "slam", "base": "b", "clearance_m": -0.1}
+        )
+
+
+def test_inflation_margin_is_additive_past_hard_clearance():
+    """``inflation_margin_m`` is measured past the hard disk, not the body."""
+    additive = NavConfig.from_dict(
         {
             "slam_service": "slam",
             "base": "b",
             "footprint_width_m": 0.59,
             "footprint_length_m": 0.72,
-            "inflation_radius": 0.25,
-            "inflation_margin_m": 0.15,
+            "inflation_margin_m": 0.05,
         }
     )
-    assert not fixed.inflation_is_noop()
-    assert fixed.effective_inflation_radius_m() == pytest.approx(0.445)
+    assert additive.inscribed_radius_m() == pytest.approx(0.295)
+    assert additive.hard_clearance_radius_m() == pytest.approx(0.495)
+    assert additive.effective_inflation_radius_m() == pytest.approx(0.545)
+    assert not additive.inflation_is_noop()
+
+
+def test_removed_inflation_radius_keys_are_rejected():
+    with pytest.raises(ValueError, match="inflation_radius is removed"):
+        NavConfig.from_dict(
+            {"slam_service": "slam", "base": "b", "inflation_radius": 0.35}
+        )
+    with pytest.raises(ValueError, match="local_inflation_radius_m is removed"):
+        NavConfig.from_dict(
+            {
+                "slam_service": "slam",
+                "base": "b",
+                "builtin": {"local_inflation_radius_m": 0.4},
+            }
+        )
 
 
 def test_local_inflation_knob_reaches_the_live_scan_layer():
-    """``local_inflation_radius_m`` used to be plumbed and then ignored."""
+    """``local_inflation_margin_m`` paints a soft band past the hard disk."""
     from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
 
     cfg = NavConfig.from_dict(
@@ -598,7 +614,7 @@ def test_local_inflation_knob_reaches_the_live_scan_layer():
             "builtin": {"local_inflation_margin_m": 0.15},
         }
     )
-    assert cfg.effective_local_inflation_radius_m() == pytest.approx(0.37)
+    assert cfg.effective_local_inflation_radius_m() == pytest.approx(0.57)
 
     def _cost_at(soft_radius: float) -> int:
         lc = LocalCostmap(
@@ -730,11 +746,10 @@ def test_builtin_follower_snake_defaults():
     assert cfg.builtin.max_lookahead_m == pytest.approx(1.55)
     assert cfg.builtin.clearance_preference_m == pytest.approx(0.50)
     assert cfg.builtin.max_goal_snap_m == pytest.approx(0.5)
-    # Unset: live hits inflate to the footprint only (what the local planner has
-    # always done — the old 0.35 default was accepted and then ignored).
-    assert cfg.builtin.local_inflation_radius_m is None
+    # Unset local soft: live hits inflate to the hard clearance disk.
+    assert cfg.builtin.local_inflation_margin_m is None
     assert cfg.effective_local_inflation_radius_m() == pytest.approx(
-        cfg.inscribed_radius_m()
+        cfg.hard_clearance_radius_m()
     )
     assert cfg.builtin.smooth_sample_spacing_m == pytest.approx(0.20)
     # Partial override must not resurrect the old from_dict fallbacks.

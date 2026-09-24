@@ -18,16 +18,6 @@ def make_builtin_navigator(
     *,
     logger=None,
 ) -> BuiltinNavigator:
-    if nav_cfg.inflation_is_noop() and logger is not None:
-        inscribed = nav_cfg.inscribed_radius_m()
-        logger.warn(
-            f"inflation_radius={nav_cfg.inflation_radius:.2f} m is at or below the "
-            f"footprint clearance radius ({inscribed:.2f} m), so it adds no soft "
-            "inflation at all (it is measured from the obstacle, not added to the "
-            "footprint). Set inflation_margin_m for a band past the footprint — "
-            f"e.g. inflation_margin_m: 0.20 gives a soft ring out to "
-            f"{inscribed + 0.20:.2f} m."
-        )
     return BuiltinNavigator(world, nav_cfg, logger=logger)
 
 

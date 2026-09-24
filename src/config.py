@@ -465,7 +465,7 @@ class BuiltinNavConfig:
     # Consecutive SetVelocity timeouts before aborting the goal.
     drive_timeout_streak: int = 20
     cost_scaling_factor: float = 4.0
-    # Extra planning clearance past inflation_radius (not drawn as soft inflation).
+    # Extra planning clearance past hard+soft inflation (not drawn as soft).
     clearance_preference_m: float = 0.50
     xy_goal_tolerance: float = 0.25  # meters
     yaw_goal_tolerance: float = 0.35  # radians (~20 deg; mugger uses 0.6)
@@ -486,10 +486,7 @@ class BuiltinNavConfig:
     local_costmap_width_m: float = 4.0
     local_costmap_height_m: float = 4.0
     local_costmap_resolution: float = 0.05
-    # Soft outer radius for live scan hits. Absolute (legacy); unset means the
-    # footprint alone, which is what the local planner has always used.
-    local_inflation_radius_m: Optional[float] = None
-    # Additive band past the footprint for live hits (preferred spelling).
+    # Extra soft band past hard clearance for live scan hits. Unset: hard only.
     local_inflation_margin_m: Optional[float] = None
     # Local-window refresh rate (Hz). Independent of ``control_rate_hz`` so the
     # follower tick stays cheap; lidar is typically ~10 Hz anyway.
@@ -557,10 +554,13 @@ class BuiltinNavConfig:
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":
         if not d:
             return cls()
+        if "local_inflation_radius_m" in d:
+            raise ValueError(
+                "local_inflation_radius_m is removed; use clearance_m for the "
+                "shared hard buffer and builtin.local_inflation_margin_m for "
+                "optional extra soft on live hits"
+            )
         overrides: Dict[str, Any] = {
-            "local_inflation_radius_m": _optional_positive(
-                d.get("local_inflation_radius_m")
-            ),
             "local_inflation_margin_m": _optional_positive(
                 d.get("local_inflation_margin_m")
             ),
@@ -1167,17 +1167,17 @@ class NavConfig:
     # uses the half-width and rotation uses the half-diagonal instead.
     footprint_length_m: Optional[float] = None
     footprint_width_m: Optional[float] = None
+    # Hard buffer past the body, on each side (metres). Used as the inscribed
+    # radius for *both* the global planner costmap and the local costmap:
+    # ``inscribed_radius_m() + clearance_m``. Soft inflation (if any) starts
+    # outside this. ``0`` keeps today's body-only hard disk.
+    clearance_m: float = 0.2
     max_vel_x: float = 0.6  # m/s
     max_vel_y: float = 0.0  # m/s (omni only)
     max_vel_theta: float = 1.5  # rad/s
     acc_lim_x: float = 1.0
     acc_lim_theta: float = 2.0
-    # Absolute soft-inflation outer radius, measured from the obstacle (Nav2
-    # convention). Values at or below the footprint clearance radius add no soft
-    # band at all — a silent no-op. Prefer ``inflation_margin_m``.
-    inflation_radius: float = 0.25
-    # Soft-inflation band width *past* the footprint (additive), matching how
-    # ``clearance_preference_m`` is measured. Wins over ``inflation_radius``.
+    # Soft-inflation band width *past* the hard clearance (additive).
     inflation_margin_m: Optional[float] = None
     cmd_vel_timeout: float = 2.0  # seconds (watchdog)
     # Builtin nav control rate (Hz). Local costmap refreshes separately via
@@ -1249,13 +1249,31 @@ class NavConfig:
             overrides["obstacles_only_rate_hz"] = _positive_hz(
                 d["obstacles_only_rate_hz"], "obstacles_only_rate_hz"
             )
+        if "clearance_m" in d:
+            clearance = float(d["clearance_m"])
+            if clearance < 0.0:
+                raise ValueError(f"clearance_m must be >= 0, got {clearance}")
+            overrides["clearance_m"] = clearance
+        if "inflation_radius" in d:
+            raise ValueError(
+                "inflation_radius is removed; use clearance_m (hard buffer past "
+                "the body) and inflation_margin_m (optional soft band past that)"
+            )
         return _dataclass_from_dict(cls, d, overrides=overrides)
 
     def inscribed_radius_m(self) -> float:
-        """Clearance radius for *driving*: what has to fit through a gap."""
+        """Body half-width (or ``robot_radius``): the physical driving radius."""
         if self.footprint_width_m:
             return max(0.01, float(self.footprint_width_m) / 2.0)
         return float(self.robot_radius)
+
+    def hard_clearance_radius_m(self) -> float:
+        """Hard (inscribed) radius for global and local costmaps.
+
+        Body plus ``clearance_m`` on each side. Soft inflation, if configured,
+        starts outside this disk.
+        """
+        return self.inscribed_radius_m() + max(0.0, float(self.clearance_m))
 
     def circumscribed_radius_m(self) -> float:
         """Clearance radius for *rotating*: what the body sweeps turning in place."""
@@ -1280,28 +1298,26 @@ class NavConfig:
 
     def effective_inflation_radius_m(self) -> float:
         """Absolute soft-inflation outer radius the costmap should use."""
+        hard = self.hard_clearance_radius_m()
         if self.inflation_margin_m is not None:
-            return self.inscribed_radius_m() + float(self.inflation_margin_m)
-        return float(self.inflation_radius)
+            return hard + float(self.inflation_margin_m)
+        return hard
 
     def inflation_is_noop(self) -> bool:
-        """True when the configured inflation adds no soft band at all."""
-        return self.effective_inflation_radius_m() <= self.inscribed_radius_m() + 1e-6
+        """True when there is no soft band past hard clearance."""
+        return self.effective_inflation_radius_m() <= self.hard_clearance_radius_m() + 1e-6
 
     def effective_local_inflation_radius_m(self) -> float:
         """Absolute soft outer radius for *live* (scan) hits in the local costmap.
 
-        Defaults to the footprint alone, which is what the local planner has
-        always used: ``path_cost_ahead`` then means "the route is inside the
-        footprint of a live return", not "near one".
+        Hard disk is always ``hard_clearance_radius_m()``. Extra soft on live
+        hits only if ``local_inflation_margin_m`` is set.
         """
-        inscribed = self.inscribed_radius_m()
-        builtin = self.builtin
-        if builtin.local_inflation_margin_m is not None:
-            return inscribed + float(builtin.local_inflation_margin_m)
-        if builtin.local_inflation_radius_m is not None:
-            return max(inscribed, float(builtin.local_inflation_radius_m))
-        return inscribed
+        hard = self.hard_clearance_radius_m()
+        margin = self.builtin.local_inflation_margin_m
+        if margin is not None:
+            return hard + float(margin)
+        return hard
 
     def control_period_s(self) -> float:
         """Seconds between builtin nav control ticks."""

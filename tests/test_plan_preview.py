@@ -62,7 +62,7 @@ def test_plan_to_point_do_command_returns_path_without_navigate():
         robot_radius=0.22,
         max_vel_x=0.4,
         max_vel_theta=1.0,
-        inflation_radius=0.45,
+        clearance_m=0.2,
     )
     preview = {
         "feasible": True,
@@ -108,7 +108,7 @@ def test_execute_plan_navigates_preview_goal():
         robot_radius=0.22,
         max_vel_x=0.4,
         max_vel_theta=1.0,
-        inflation_radius=0.45,
+        clearance_m=0.2,
     )
     preview = {
         "feasible": True,
@@ -147,7 +147,7 @@ def test_move_on_map_preview_extra_does_not_navigate():
         robot_radius=0.22,
         max_vel_x=0.4,
         max_vel_theta=1.0,
-        inflation_radius=0.45,
+        clearance_m=0.2,
     )
     preview = {
         "feasible": True,

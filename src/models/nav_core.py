@@ -872,7 +872,7 @@ class NavServiceBase(Motion):
                         diam = 2.0 * float(cfg.robot_radius)
                         status["footprint_length_m"] = diam
                         status["footprint_width_m"] = diam
-                    status["robot_radius_m"] = float(cfg.inscribed_radius_m())
+                    status["robot_radius_m"] = float(cfg.hard_clearance_radius_m())
                 except Exception:  # noqa: BLE001
                     pass
                 return status
@@ -984,7 +984,7 @@ class NavServiceBase(Motion):
                             # Same radii the planner uses, so the rendered ring
                             # matches the costmap paths are actually planned on.
                             inflation_radius_m=cfg.effective_inflation_radius_m(),
-                            robot_radius_m=cfg.inscribed_radius_m(),
+                            robot_radius_m=cfg.hard_clearance_radius_m(),
                             cost_scaling_factor=float(
                                 cfg.builtin.cost_scaling_factor
                             ),
@@ -1108,7 +1108,7 @@ class NavServiceBase(Motion):
                     inflation_radius_m=float(
                         cfg.effective_local_inflation_radius_m()
                     ),
-                    robot_radius_m=float(cfg.inscribed_radius_m()),
+                    robot_radius_m=float(cfg.hard_clearance_radius_m()),
                     cost_scaling_factor=float(bcfg.cost_scaling_factor),
                     scan_inflation_radius_m=float(
                         cfg.effective_local_inflation_radius_m()
@@ -1137,7 +1137,7 @@ class NavServiceBase(Motion):
                     global_costs = build_costmap(
                         global_occ,
                         inflation_radius_m=cfg.effective_inflation_radius_m(),
-                        robot_radius_m=cfg.inscribed_radius_m(),
+                        robot_radius_m=cfg.hard_clearance_radius_m(),
                         cost_scaling_factor=float(bcfg.cost_scaling_factor),
                     )
                     self._idle_global_occ = global_occ
@@ -2046,7 +2046,7 @@ class NavServiceBase(Motion):
             enabled=cfg.simple_avoid_obstacles,
             stop_distance_m=cfg.simple_stop_distance,
             slow_distance_m=cfg.simple_slow_distance,
-            footprint_half_width_m=cfg.inscribed_radius_m() + 0.12,
+            footprint_half_width_m=cfg.hard_clearance_radius_m() + 0.12,
             max_age_s=cfg.simple_scan_max_age,
         )
 

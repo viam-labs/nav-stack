@@ -58,7 +58,7 @@ def _configured_nav(*, nav_status=None, pose=None) -> tuple[NavigationService, M
         robot_radius=0.22,
         max_vel_x=0.4,
         max_vel_theta=1.0,
-        inflation_radius=0.45,
+        clearance_m=0.2,
     )
     mgr = MagicMock()
     mgr.navigate = MagicMock()

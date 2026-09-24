@@ -141,9 +141,9 @@ the robot in the local costmap. Refresh rate is nav-side
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced map/scan tuning keys (merged into engine defaults) |
 | `robot_radius`, `max_vel_x`, … | Nav | Top-level footprint / velocity limits. `robot_radius` also sizes the reactive stop: any live return inside the body-width corridor ahead (not just the ±35° cone) counts as forward clearance, and the live "path blocked" check samples a 0.10 m band around the route |
-| `inflation_margin_m` | Nav | **Preferred way to set soft inflation.** Width of the soft-cost band measured **past the footprint** (additive), the same convention as `clearance_preference_m`. E.g. a 0.295 m footprint radius with `inflation_margin_m: 0.20` gives a soft ring out to 0.495 m |
-| `inflation_radius` | Nav | Legacy: soft-inflation outer radius measured **from the obstacle** (absolute, Nav2 convention) — *not* added to the footprint. Any value at or below the footprint clearance radius adds no soft band at all; nav logs a warning naming the `inflation_margin_m` equivalent. `inflation_margin_m` wins when both are set |
-| `local_inflation_margin_m` | Nav | Soft band past the footprint for **live scan hits** in the rolling local costmap (additive). Unset means the footprint alone, so `path_cost_ahead` means "the route is inside a live return" rather than "near one". Legacy absolute spelling: `local_inflation_radius_m` |
+| `clearance_m` | Nav | **Hard buffer past the body, on each side** (default `0.2` m). Same inscribed radius for the global planner costmap and the local costmap: half-width (or `robot_radius`) + `clearance_m`. Soft inflation, if any, starts outside this. Set `0` for a body-only hard disk |
+| `inflation_margin_m` | Nav | Optional soft-cost band **past the hard clearance** (additive). E.g. a 0.295 m half-width with `clearance_m: 0.2` and `inflation_margin_m: 0.05` is hard out to 0.495 m and soft out to 0.545 m |
+| `local_inflation_margin_m` | Nav | Extra soft band past the hard clearance for **live scan hits** in the rolling local costmap (additive). Unset means live hits are hard-clearance only |
 | `footprint_width_m`, `footprint_length_m` | Nav | **Recommended for non-square robots.** Given both, planning clearance uses the half-**width** (what must fit through a gap) while rotating in place is gated on the half-**diagonal** (what the body sweeps). A single `robot_radius` has to cover both, so it must be the half-diagonal — which seals every gap narrower than `2 × robot_radius` even where the robot easily fits (a 0.59 m-wide robot refusing an 0.84 m doorway). Also sizes the forward stop bubble from the bumper (half-length) and the skid-steer arc envelope from the track. Omit to keep the legacy single-circle behaviour |
 | `xy_goal_tolerance`, `yaw_goal_tolerance` | Nav | Goal arrival tolerances (m / rad). Also accepted under `builtin` |
 | `timeout_s` | Nav (`builtin`) | Minimum per-goal timeout (default `300`). Long routes get 3× their full-speed drive time instead (`3 × length / max_vel_x`); time stopped for localization does not count |
@@ -234,7 +234,7 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
     "footprint_length_m": 0.72,
     "max_vel_x": 0.4,
     "max_vel_theta": 1.0,
-    "inflation_radius": 0.45,
+    "clearance_m": 0.2,
     "xy_goal_tolerance": 0.25,
     "yaw_goal_tolerance": 0.35,
     "nav_backend": "builtin",
@@ -297,7 +297,7 @@ Use `viam-labs:nav-stack:navigation-external` to drive builtin navigation from *
     "lidar_odom_enabled": true,
     "robot_radius": 0.22,
     "max_vel_x": 0.4,
-    "inflation_radius": 0.45
+    "clearance_m": 0.2
   }
 }
 ```

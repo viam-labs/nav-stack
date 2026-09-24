@@ -451,6 +451,31 @@ def test_supervisor_wires_footprint_derived_clearances():
     assert follower.wheel_half_track_m == pytest.approx(0.2655)
 
 
+def test_supervisor_uses_hard_clearance_for_plan_and_local_costmap():
+    """clearance_m is the same inscribed radius on both costmaps."""
+    from src.config import NavConfig
+    from src.nav_builtin.supervisor import NavSupervisor
+
+    cfg = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "footprint_width_m": 0.59,
+            "footprint_length_m": 0.72,
+        }
+    )
+    sup = NavSupervisor(
+        _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map()),
+        cfg,
+    )
+    assert cfg.hard_clearance_radius_m() == pytest.approx(0.495)
+    assert sup._robot_radius == pytest.approx(0.495)  # noqa: SLF001
+    local = sup._local_costmap  # noqa: SLF001
+    assert local is not None
+    assert local._cfg.robot_radius_m == pytest.approx(0.495)  # noqa: SLF001
+    assert local._cfg.inflation_radius_m == pytest.approx(0.495)  # noqa: SLF001
+
+
 def test_corner_path_stays_out_of_soft_halo():
     """Repro: round a pillar tip in clear space, not through the soft glow."""
     import numpy as np

@@ -199,9 +199,7 @@ class LocalCostmap:
             origin_y=self._origin_y,
         )
         # Soft outer radius for live hits: explicit override first, else the
-        # configured inflation radius (clamped to the footprint, which is the
-        # "no soft band" default). This is the knob ``local_inflation_radius_m``
-        # feeds — it used to be accepted and then ignored entirely.
+        # configured inflation radius (clamped to the hard disk).
         scan_inflation = (
             float(self._cfg.scan_inflation_radius_m)
             if self._cfg.scan_inflation_radius_m is not None
