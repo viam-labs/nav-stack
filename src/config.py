@@ -526,10 +526,11 @@ class BuiltinNavConfig:
     route_verify_pose: bool = True
     # Mid-nav: when the current scan is a poor explanation of the map at the
     # published pose, stop, run a *local* ``check_localization``, then resume.
-    # Fail as ``localization_lost`` only when the leftover residual is still
-    # severe. A small local shift that clearly beats the published pose is
-    # applied even if ``good_match`` is just shy. Uses scan-vs-map residual,
-    # not a SLAM match score. Does not turn on periodic relocalize during nav.
+    # After two local tries, resume on the published pose — do not abort as
+    # ``localization_lost``. A small local shift that clearly beats the
+    # published pose is applied even if ``good_match`` is just shy. Uses
+    # scan-vs-map residual, not a SLAM match score. Does not turn on
+    # periodic relocalize during nav.
     nav_loc_refine_on_disagree: bool = True
     nav_loc_refine_margin_m: float = 0.8
     nav_loc_refine_map_max_m: float = 2.5
@@ -538,7 +539,7 @@ class BuiltinNavConfig:
     nav_loc_refine_min_frac: float = 0.22
     nav_loc_refine_min_beams: int = 6
     nav_loc_refine_max_tries: int = 2
-    nav_loc_refine_cooldown_s: float = 12.0
+    nav_loc_refine_cooldown_s: float = 5.0
     nav_loc_refine_period_s: float = 0.75
     # Also check after this much travel even if the period has not elapsed.
     nav_loc_refine_check_every_m: float = 2.0

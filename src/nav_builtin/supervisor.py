@@ -128,7 +128,7 @@ class NavSupervisor:
             1, int(kw.get("nav_loc_refine_max_tries", 2))
         )
         self._nav_loc_refine_cooldown_s = max(
-            0.0, float(kw.get("nav_loc_refine_cooldown_s", 12.0))
+            0.0, float(kw.get("nav_loc_refine_cooldown_s", 5.0))
         )
         self._nav_loc_refine_period_s = max(
             0.0, float(kw.get("nav_loc_refine_period_s", 0.75))
@@ -152,6 +152,7 @@ class NavSupervisor:
         self._loc_refine_cooldown_until = 0.0
         self._loc_refine_last_check = 0.0
         self._loc_refine_last_pose: Optional[Pose2D] = None
+        self._loc_refine_need_travel = False
         self._world = world
         self._inflation = inflation_radius_m
         # Driving clearance (half-width when a footprint is configured). Every
@@ -676,8 +677,9 @@ class NavSupervisor:
     ) -> Optional[str]:
         """Stop + local refine when the scan is a poor fit for the published pose.
 
-        Returns ``None`` (keep following), ``hold`` (stay stopped), ``resume``
-        (replan after a correction), or ``fail`` (goal already marked failed).
+        Returns ``None`` (keep following), ``hold`` (stay stopped), or
+        ``resume`` (replan after a correction / give-up). Does not fail the
+        goal — a leftover residual or refused yank is common in hallways.
         """
         if not self._nav_loc_refine:
             return None
@@ -687,6 +689,11 @@ class NavSupervisor:
         traveled = 0.0
         if self._loc_refine_last_pose is not None:
             traveled = distance_m(pose, self._loc_refine_last_pose)
+        if self._loc_refine_need_travel:
+            need_m = max(0.5, float(self._nav_loc_refine_check_every_m) or 2.0)
+            if traveled < need_m:
+                return None
+            self._loc_refine_need_travel = False
         due_by_time = now - self._loc_refine_last_check >= self._nav_loc_refine_period_s
         due_by_dist = (
             self._nav_loc_refine_check_every_m > 0.0
@@ -699,6 +706,7 @@ class NavSupervisor:
 
         verdict = self._measure_loc_disagreement(pose)
         if not verdict.disagree:
+            self._loc_refine_need_travel = False
             if holding:
                 self._loc_refine_tries = 0
                 return "resume"
@@ -726,7 +734,7 @@ class NavSupervisor:
                 time.sleep(0.05)
             result = self._call_check_localization() or result
             status = str(result.get("status") or "")
-        from .loc_consistency import residual_is_lost, small_local_match_worth_applying
+        from .loc_consistency import small_local_match_worth_applying
 
         if small_local_match_worth_applying(
             result,
@@ -755,30 +763,10 @@ class NavSupervisor:
                 time.monotonic() + self._nav_loc_refine_cooldown_s
             )
             if self._loc_refine_tries >= self._nav_loc_refine_max_tries:
-                if residual_is_lost(after):
-                    self._world.stop()
-                    self._set_status(
-                        state="failed",
-                        active=False,
-                        error_msg="localization_lost",
-                        pose={
-                            "x": pose_after.x,
-                            "y": pose_after.y,
-                            "theta": pose_after.theta,
-                        },
-                        progress={
-                            "obstacle": "loc_refine",
-                            "localization_refine": {
-                                "status": "failed",
-                                "try": self._loc_refine_tries,
-                                "max_tries": self._nav_loc_refine_max_tries,
-                                **after.to_dict(),
-                            },
-                        },
-                    )
-                    return "fail"
-                # Thin leftover (one side still matches): keep the goal.
+                # Keep the published pose and the goal. Hallway residuals and
+                # refused large jumps are not ``localization_lost``.
                 self._loc_refine_tries = 0
+                self._loc_refine_need_travel = True
                 self._publish_loc_refine_progress(
                     pose_after, dist_goal, verdict=after, status="continue"
                 )
@@ -789,6 +777,7 @@ class NavSupervisor:
             return "hold"
 
         self._loc_refine_tries = 0
+        self._loc_refine_need_travel = False
         self._loc_refine_cooldown_until = (
             time.monotonic() + self._nav_loc_refine_cooldown_s
         )
@@ -1079,6 +1068,7 @@ class NavSupervisor:
         self._loc_refine_cooldown_until = 0.0
         self._loc_refine_last_check = 0.0
         self._loc_refine_last_pose = None
+        self._loc_refine_need_travel = False
         goal_dict = {"x": float(goal.x), "y": float(goal.y), "theta": float(goal.theta)}
         self._set_status(
             state="active",

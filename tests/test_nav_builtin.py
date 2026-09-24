@@ -1946,15 +1946,16 @@ def test_nav_loc_refine_resumes_when_disagreement_clears():
     assert sup.status().error_msg == ""
 
 
-def test_nav_loc_refine_fails_after_two_tries():
+def test_nav_loc_refine_continues_after_two_tries():
+    """A leftover residual after two local tries must not abort the goal."""
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
     world.scan = _open_scan()
     sup = _loc_refine_supervisor(world)
     sup.run_goal(Pose2D(1.6, 1.0, 0.0))
     assert world.loc_checks == 2
     st = sup.status()
-    assert st.state == "failed"
-    assert st.error_msg == "localization_lost"
+    assert st.state == "succeeded"
+    assert st.error_msg == ""
 
 
 def test_nav_loc_refine_continues_when_residual_is_thin():
