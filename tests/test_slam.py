@@ -1281,6 +1281,37 @@ def test_periodic_relocalize_cycle_skips_during_navigation():
     slam._global_localize.assert_not_awaited()
 
 
+def test_periodic_relocalize_allow_during_navigation_stays_local():
+    """Nav refine may run while a goal is active, but must not full-map."""
+    slam = _relocalize_slam(periodic_relocalize_during_navigation=False)
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": 0.4}
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.7,
+            "ray_mae_m": 0.25,
+            "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(
+        slam._periodic_relocalize_cycle(
+            allow_during_navigation=True,
+            full_map_escalation="still_bad",
+        )
+    )
+
+    assert result.get("reason") != "navigation_active"
+    assert result["status"] != "skipped"
+    slam._global_localize.assert_awaited()
+    match_cmd = slam._global_localize.await_args.args[0]
+    assert match_cmd.get("full_map") is not True
+    assert match_cmd.get("auto_full_map_fallback") is False
+
+
 def test_is_navigation_active_sees_registered_builtin_nav_host():
     """BuiltinSlamHost always reports idle; registered nav host is the source of truth."""
     from src.runtime import any_navigation_active, register_nav_host, unregister_nav_host

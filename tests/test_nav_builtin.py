@@ -17,6 +17,7 @@ from src.nav_builtin.costmap import (
     nearest_free_pose,
 )
 from src.nav_builtin.navigator import BuiltinNavigator
+from src.nav_builtin.supervisor import NavSupervisor
 from src.nav_builtin.planner import (
     connect_plan_start,
     path_blocked,
@@ -1307,6 +1308,9 @@ class _FakeWorld:
         self.stopped = False
         self.stop_calls = 0
         self.loc_hold = None
+        self.scan = None
+        self.loc_checks = 0
+        self.on_loc_check = None
 
     def get_map(self):
         return self.map_data
@@ -1315,10 +1319,16 @@ class _FakeWorld:
         return self.pose
 
     def get_scan(self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True):
-        return None
+        return self.scan
 
     def get_localization_hold(self):
         return self.loc_hold
+
+    def check_localization(self, **kwargs):
+        self.loc_checks += 1
+        if callable(self.on_loc_check):
+            return self.on_loc_check(self)
+        return {"status": "ok", "corrected": False}
 
     def set_velocity(self, vx, vy, vtheta):
         self.cmds.append((vx, vy, vtheta))
@@ -1836,3 +1846,71 @@ def test_nav_holds_drive_while_localization_awaiting_confirm():
     nav.cancel()
     t.join(timeout=2.0)
     assert world.stopped
+
+
+def _open_scan(range_m: float = 4.0, n: int = 360) -> conv.LaserScan2D:
+    return conv.LaserScan2D(
+        ranges=np.full(n, range_m, dtype=float),
+        angle_min=-math.pi,
+        angle_increment=(2.0 * math.pi) / n,
+        range_min=0.05,
+        range_max=25.0,
+    )
+
+
+def _left_wall_map() -> dict:
+    """Free space with a wall ~0.55 m to the left of (1.0, 1.0) facing +X."""
+    grid = np.zeros((80, 80), dtype=np.int16)
+    grid[31, 10:50] = 100
+    return {
+        "grid": grid,
+        "resolution": 0.05,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+    }
+
+
+def _loc_refine_supervisor(world: _FakeWorld) -> NavSupervisor:
+    return NavSupervisor(
+        world,
+        inflation_radius_m=0.15,
+        robot_radius_m=0.08,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        xy_tolerance_m=0.15,
+        timeout_s=6.0,
+        poll_interval_s=0.02,
+        nav_loc_refine_on_disagree=True,
+        nav_loc_refine_settle_s=0.0,
+        nav_loc_refine_period_s=0.0,
+        nav_loc_refine_cooldown_s=0.0,
+        nav_loc_refine_max_tries=2,
+    )
+
+
+def test_nav_loc_refine_resumes_when_disagreement_clears():
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
+    world.scan = _open_scan()
+
+    def _fix(w: _FakeWorld):
+        w.scan = _open_scan(0.55)
+        return {"status": "ok", "corrected": True}
+
+    world.on_loc_check = _fix
+    sup = _loc_refine_supervisor(world)
+    sup.run_goal(Pose2D(1.6, 1.0, 0.0))
+    assert world.loc_checks == 1
+    assert sup.status().state == "succeeded"
+    assert sup.status().error_msg == ""
+
+
+def test_nav_loc_refine_fails_after_two_tries():
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
+    world.scan = _open_scan()
+    sup = _loc_refine_supervisor(world)
+    sup.run_goal(Pose2D(1.6, 1.0, 0.0))
+    assert world.loc_checks == 2
+    st = sup.status()
+    assert st.state == "failed"
+    assert st.error_msg == "localization_lost"

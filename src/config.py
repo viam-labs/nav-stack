@@ -524,6 +524,23 @@ class BuiltinNavConfig:
     # ``check_localization`` before departing for the next leg. Mid-nav
     # periodic relocalize defaults off, so drift otherwise rides until idle.
     route_verify_pose: bool = True
+    # Mid-nav: when the current scan is a poor explanation of the map at the
+    # published pose, stop, run a *local* ``check_localization``, then resume
+    # or fail the goal as ``localization_lost``. Uses scan-vs-map residual, not
+    # a SLAM match score (hallways often score mediocre while the pose is fine).
+    # Does not turn on periodic relocalize during navigation.
+    nav_loc_refine_on_disagree: bool = True
+    nav_loc_refine_margin_m: float = 0.8
+    nav_loc_refine_map_max_m: float = 2.5
+    # Legacy alias accepted in config; overall residual no longer uses it.
+    nav_loc_refine_lidar_min_m: float = 1.2
+    nav_loc_refine_min_frac: float = 0.30
+    nav_loc_refine_min_beams: int = 6
+    nav_loc_refine_max_tries: int = 2
+    nav_loc_refine_cooldown_s: float = 12.0
+    nav_loc_refine_period_s: float = 1.5
+    # Pause after SetVelocity(0) so yaw-rate preflight does not skip the check.
+    nav_loc_refine_settle_s: float = 0.35
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":

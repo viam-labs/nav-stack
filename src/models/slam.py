@@ -1148,6 +1148,7 @@ class SlamService(SLAM):
         *,
         apply_override: Optional[bool] = None,
         full_map_escalation: str = "low_quality",
+        allow_during_navigation: bool = False,
     ) -> Mapping[str, ValueTypes]:
         """Run one drift check; correct pose when a trusted match has moved.
 
@@ -1162,6 +1163,10 @@ class SlamService(SLAM):
           local match, or immediately when still-bad while idle.
         - ``still_bad``: always try local first; full-map only when the current
           pose still looks wrong after that (route between-leg checks).
+
+        ``allow_during_navigation``: run a local cycle while a goal is active
+        (used by builtin nav's lidar↔map refine). Does not force apply, and
+        never escalates to full-map — a hallway twin snap while driving.
         """
         escalation = str(full_map_escalation or "low_quality").strip().lower()
         if escalation not in ("low_quality", "still_bad"):
@@ -1184,6 +1189,7 @@ class SlamService(SLAM):
             apply_override is not True
             and nav_active
             and not cfg.periodic_relocalize_during_navigation
+            and not allow_during_navigation
         ):
             return self._publish_relocalize_check(
                 {"status": "skipped", "reason": "navigation_active"}
@@ -1208,6 +1214,10 @@ class SlamService(SLAM):
             nav_recoveries >= cfg.periodic_relocalize_nav_recoveries_threshold
             or (still_bad and not nav_active and escalation == "low_quality")
         )
+        # Mid-nav refine (stopped in a corridor) must stay local — a full-map
+        # search is how we snap to a twin hallway.
+        if allow_during_navigation:
+            force_full_map = False
         current = mgr.get_pose_in_map()
 
         base_command: dict = {"command": "global_localize"}
@@ -1268,6 +1278,8 @@ class SlamService(SLAM):
                 # still_bad: only burn a full-map search when we are confident
                 # the current pose is wrong, not merely that a local peel was weak.
                 escalate_full = bool(pose_still_bad)
+            if allow_during_navigation:
+                escalate_full = False
 
         if escalate_full:
             full_command = dict(base_command)
@@ -2580,6 +2592,9 @@ class SlamService(SLAM):
                     None if apply_override is None else bool(apply_override)
                 ),
                 full_map_escalation=str(escalation or "low_quality"),
+                allow_during_navigation=bool(
+                    command.get("allow_during_navigation")
+                ),
             )
 
         if cmd == "get_localization_check":

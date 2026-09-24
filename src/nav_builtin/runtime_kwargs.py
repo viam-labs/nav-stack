@@ -73,6 +73,16 @@ def builtin_nav_runtime_kwargs(
         "max_linear_accel_mps2": bcfg.max_linear_accel_mps2,
         "max_linear_decel_mps2": bcfg.max_linear_decel_mps2,
         "max_angular_accel_rad_s2": bcfg.max_angular_accel_rad_s2,
+        "nav_loc_refine_on_disagree": bcfg.nav_loc_refine_on_disagree,
+        "nav_loc_refine_margin_m": bcfg.nav_loc_refine_margin_m,
+        "nav_loc_refine_map_max_m": bcfg.nav_loc_refine_map_max_m,
+        "nav_loc_refine_lidar_min_m": bcfg.nav_loc_refine_lidar_min_m,
+        "nav_loc_refine_min_frac": bcfg.nav_loc_refine_min_frac,
+        "nav_loc_refine_min_beams": bcfg.nav_loc_refine_min_beams,
+        "nav_loc_refine_max_tries": bcfg.nav_loc_refine_max_tries,
+        "nav_loc_refine_cooldown_s": bcfg.nav_loc_refine_cooldown_s,
+        "nav_loc_refine_period_s": bcfg.nav_loc_refine_period_s,
+        "nav_loc_refine_settle_s": bcfg.nav_loc_refine_settle_s,
     }
     kwargs.update(overrides)
     return kwargs

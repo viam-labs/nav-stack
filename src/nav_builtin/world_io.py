@@ -51,3 +51,12 @@ class WorldIO(Protocol):
     def get_localization_hold(self) -> Optional[dict]:
         """If non-None, nav must stop translating (large pose jump / loc hold)."""
         return None
+
+    def check_localization(
+        self,
+        *,
+        allow_during_navigation: bool = True,
+        full_map_escalation: str = "still_bad",
+    ) -> Optional[dict]:
+        """Optional SLAM local refine. Implementations may return None."""
+        return None

@@ -108,6 +108,37 @@ class NavSupervisor:
         max_linear_accel_mps2 = kw["max_linear_accel_mps2"]
         max_linear_decel_mps2 = kw["max_linear_decel_mps2"]
         max_angular_accel_rad_s2 = kw["max_angular_accel_rad_s2"]
+        self._nav_loc_refine = bool(kw.get("nav_loc_refine_on_disagree", True))
+        self._nav_loc_refine_margin_m = max(
+            0.1, float(kw.get("nav_loc_refine_margin_m", 0.8))
+        )
+        self._nav_loc_refine_map_max_m = max(
+            0.3, float(kw.get("nav_loc_refine_map_max_m", 2.5))
+        )
+        self._nav_loc_refine_lidar_min_m = max(
+            0.2, float(kw.get("nav_loc_refine_lidar_min_m", 1.2))
+        )
+        self._nav_loc_refine_min_frac = min(
+            1.0, max(0.05, float(kw.get("nav_loc_refine_min_frac", 0.30)))
+        )
+        self._nav_loc_refine_min_beams = max(
+            1, int(kw.get("nav_loc_refine_min_beams", 6))
+        )
+        self._nav_loc_refine_max_tries = max(
+            1, int(kw.get("nav_loc_refine_max_tries", 2))
+        )
+        self._nav_loc_refine_cooldown_s = max(
+            0.0, float(kw.get("nav_loc_refine_cooldown_s", 12.0))
+        )
+        self._nav_loc_refine_period_s = max(
+            0.0, float(kw.get("nav_loc_refine_period_s", 1.5))
+        )
+        self._nav_loc_refine_settle_s = max(
+            0.0, float(kw.get("nav_loc_refine_settle_s", 0.35))
+        )
+        self._loc_refine_tries = 0
+        self._loc_refine_cooldown_until = 0.0
+        self._loc_refine_last_check = 0.0
         self._world = world
         self._inflation = inflation_radius_m
         # Driving clearance (half-width when a footprint is configured). Every
@@ -533,6 +564,180 @@ class NavSupervisor:
         self._last_sent_at = time.monotonic()
         self._last_cmd_vx = 0.0
 
+    def _loc_refine_map(self):
+        """Occupancy for scan-vs-map consistency (cached global grid when available)."""
+        with self._global_cache_lock:
+            occ = self._global_occ_cache
+        if occ is not None:
+            return occ
+        try:
+            map_data = self._world.get_map()
+        except TimeoutError:
+            return None
+        from .loc_consistency import occupancy_for_consistency
+
+        return occupancy_for_consistency(map_data)
+
+    def _lidar_scan_for_loc_refine(self):
+        try:
+            return self._world.get_scan(
+                self._scan_max_age, include_obstacles_only=False
+            )
+        except TimeoutError:
+            return None
+
+    def _publish_loc_refine_progress(
+        self,
+        pose: Pose2D,
+        dist_goal: float,
+        *,
+        verdict,
+        status: str,
+    ) -> None:
+        detail = verdict.to_dict() if verdict is not None else {}
+        self._set_status(
+            pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
+            progress={
+                "obstacle": "loc_refine",
+                "local_planner": False,
+                "forward_clearance_m": None,
+                "cmd_vx_mps": 0.0,
+                "cmd_vtheta_rad_s": 0.0,
+                "bearing_error_rad": 0.0,
+                "distance_remaining_m": dist_goal,
+                "waypoint_index": 0,
+                "localization_refine": {
+                    "status": status,
+                    "try": self._loc_refine_tries,
+                    "max_tries": self._nav_loc_refine_max_tries,
+                    **detail,
+                },
+            },
+        )
+
+    def _call_check_localization(self) -> Optional[dict]:
+        fn = getattr(self._world, "check_localization", None)
+        if not callable(fn):
+            return None
+        try:
+            result = fn(
+                allow_during_navigation=True,
+                full_map_escalation="still_bad",
+            )
+        except TimeoutError:
+            return {"status": "error", "reason": "timeout"}
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "error", "reason": str(exc).strip() or type(exc).__name__}
+        return result if isinstance(result, dict) else None
+
+    def _measure_loc_disagreement(self, pose: Pose2D):
+        from .loc_consistency import localization_looks_bad
+
+        return localization_looks_bad(
+            pose,
+            self._lidar_scan_for_loc_refine(),
+            self._loc_refine_map(),
+            margin_m=self._nav_loc_refine_margin_m,
+            map_max_m=self._nav_loc_refine_map_max_m,
+            min_frac=self._nav_loc_refine_min_frac,
+            min_beams=self._nav_loc_refine_min_beams,
+        )
+
+    def _maybe_pause_and_refine_localization(
+        self, pose: Pose2D, now: float, dist_goal: float
+    ) -> Optional[str]:
+        """Stop + local refine when the scan is a poor fit for the published pose.
+
+        Returns ``None`` (keep following), ``hold`` (stay stopped), ``resume``
+        (replan after a correction), or ``fail`` (goal already marked failed).
+        """
+        if not self._nav_loc_refine:
+            return None
+        holding = self._loc_refine_tries > 0
+        if now < self._loc_refine_cooldown_until:
+            return "hold" if holding else None
+        if now - self._loc_refine_last_check < self._nav_loc_refine_period_s:
+            return "hold" if holding else None
+        self._loc_refine_last_check = now
+
+        verdict = self._measure_loc_disagreement(pose)
+        if not verdict.disagree:
+            if holding:
+                self._loc_refine_tries = 0
+                return "resume"
+            return None
+
+        self._world.stop()
+        self._note_base_stopped()
+        self._publish_loc_refine_progress(
+            pose, dist_goal, verdict=verdict, status="pausing"
+        )
+        if self._nav_loc_refine_settle_s > 0.0:
+            time.sleep(self._nav_loc_refine_settle_s)
+
+        result = self._call_check_localization()
+        if result is None:
+            return "hold" if holding else None
+        status = str(result.get("status") or "")
+        if status == "awaiting_confirm":
+            self._publish_loc_refine_progress(
+                pose, dist_goal, verdict=verdict, status="awaiting_confirm"
+            )
+            if self._nav_loc_refine_settle_s > 0.0:
+                time.sleep(max(0.4, self._nav_loc_refine_settle_s))
+            else:
+                time.sleep(0.05)
+            result = self._call_check_localization() or result
+            status = str(result.get("status") or "")
+        if status in ("skipped", "unconfigured"):
+            reason = str(result.get("reason") or "")
+            if reason in ("spinning", "stale_scan"):
+                return "hold"
+            return "hold" if holding else None
+
+        pose_after = self._world.get_pose() or pose
+        after = self._measure_loc_disagreement(pose_after)
+        if after.disagree:
+            self._loc_refine_tries += 1
+            self._loc_refine_cooldown_until = (
+                time.monotonic() + self._nav_loc_refine_cooldown_s
+            )
+            if self._loc_refine_tries >= self._nav_loc_refine_max_tries:
+                self._world.stop()
+                self._set_status(
+                    state="failed",
+                    active=False,
+                    error_msg="localization_lost",
+                    pose={
+                        "x": pose_after.x,
+                        "y": pose_after.y,
+                        "theta": pose_after.theta,
+                    },
+                    progress={
+                        "obstacle": "loc_refine",
+                        "localization_refine": {
+                            "status": "failed",
+                            "try": self._loc_refine_tries,
+                            "max_tries": self._nav_loc_refine_max_tries,
+                            **after.to_dict(),
+                        },
+                    },
+                )
+                return "fail"
+            self._publish_loc_refine_progress(
+                pose_after, dist_goal, verdict=after, status="retry"
+            )
+            return "hold"
+
+        self._loc_refine_tries = 0
+        self._loc_refine_cooldown_until = (
+            time.monotonic() + self._nav_loc_refine_cooldown_s
+        )
+        self._publish_loc_refine_progress(
+            pose_after, dist_goal, verdict=after, status="resumed"
+        )
+        return "resume"
+
     def _rate_limited(self, cmd: DriveCommand) -> DriveCommand:
         """Slew-limit ``cmd`` against the twist already on the base.
 
@@ -811,6 +1016,9 @@ class NavSupervisor:
         self._last_replan_error = ""
         self._last_replan_trigger = ""
         self._last_replan_info = {}
+        self._loc_refine_tries = 0
+        self._loc_refine_cooldown_until = 0.0
+        self._loc_refine_last_check = 0.0
         goal_dict = {"x": float(goal.x), "y": float(goal.y), "theta": float(goal.theta)}
         self._set_status(
             state="active",
@@ -983,6 +1191,21 @@ class NavSupervisor:
                     continue
 
                 now = time.monotonic()
+                loc_outcome = self._maybe_pause_and_refine_localization(
+                    pose, now, dist_goal_chk
+                )
+                if loc_outcome == "fail":
+                    return
+                if loc_outcome in ("hold", "resume"):
+                    if loc_outcome == "resume":
+                        pending_loc_replan = True
+                    last_progress_at = now
+                    last_progress_pose = pose
+                    last_progress_dist = dist_goal_chk
+                    last_progress_bearing = float("inf")
+                    spin_stuck_since = None
+                    self._sleep_control_period(tick_started)
+                    continue
 
                 need_scan = (
                     self._follower.obstacle is not None

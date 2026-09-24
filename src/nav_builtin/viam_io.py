@@ -918,6 +918,31 @@ class ViamWorldIO:
             return None
         return hold if isinstance(hold, dict) else None
 
+    def check_localization(
+        self,
+        *,
+        allow_during_navigation: bool = True,
+        full_map_escalation: str = "still_bad",
+    ) -> Optional[dict]:
+        """Run one SLAM local refine from the nav worker thread.
+
+        ``allow_during_navigation`` bypasses the mid-nav skip without forcing
+        apply, and keeps the cycle local (no hallway full-map search).
+        """
+        slam = self._slam
+        if slam is None or not hasattr(slam, "do_command"):
+            return {"status": "unconfigured"}
+        return self._run(
+            slam.do_command(
+                {
+                    "command": "check_localization",
+                    "full_map_escalation": str(full_map_escalation or "still_bad"),
+                    "allow_during_navigation": bool(allow_during_navigation),
+                }
+            ),
+            timeout=20.0,
+        )
+
 
 def _sanitize_base_cmd(
     vx: float, vy: float, vtheta: float
