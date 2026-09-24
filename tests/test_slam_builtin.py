@@ -220,23 +220,79 @@ def test_apply_match_large_jump_requires_two_frames():
     assert engine._apply_match(engine.get_pose(), peak_b, None) is True  # noqa: SLF001
 
 
-def test_apply_match_skips_large_and_bad_prior_small_during_nav(monkeypatch):
-    """During MoveOnMap, do not walk the pose toward a competing local peak."""
+def _nav_track_engine(monkeypatch, **cfg_extra):
     cfg = SlamConfig.from_dict(
-        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
+        {
+            "base": "b",
+            "lidar": "front",
+            "maps_dir": "/tmp",
+            "mode": "localizing",
+            **cfg_extra,
+        }
     )
     engine = BuiltinSlamEngine(
         cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
     )  # type: ignore[arg-type]
     monkeypatch.setattr(engine, "_navigation_active", lambda: True)
-    engine._last_prior_score = 0.45  # noqa: SLF001 — even a good prior
+    engine._last_prior_score = 0.45  # noqa: SLF001
+    engine._last_match_score = 0.60  # noqa: SLF001
+    engine._last_yaw_rate = 0.0  # noqa: SLF001
+    engine._last_scan_age_s = 0.02  # noqa: SLF001
+    return engine
 
+
+def test_apply_match_never_jumps_during_nav(monkeypatch):
+    """During MoveOnMap, a 0.4 m peak must not apply, even twice."""
+    engine = _nav_track_engine(monkeypatch)
     predicted = conv.Pose2D(0.0, 0.0, 0.0)
     large = conv.Pose2D(0.40, 0.0, 0.0)
+    assert engine._apply_match(predicted, large, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, large, None) is False  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.0)
+
+
+def test_apply_match_nav_tracks_small_drift(monkeypatch):
+    """Good prior + good match: a small nudge applies, blended and clamped."""
+    engine = _nav_track_engine(monkeypatch)
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    small = conv.Pose2D(0.10, 0.0, math.radians(2.0))
+    assert engine._apply_match(predicted, small, None) is True  # noqa: SLF001
+    pose = engine.get_pose()
+    # alpha 0.3 * 0.10 m = 0.03 m (under the 0.05 m step clamp).
+    assert pose.x == pytest.approx(0.03, abs=1e-6)
+    assert math.degrees(pose.theta) == pytest.approx(0.6, abs=1e-6)
+    assert engine.diagnostics()["nav_track_applies"] == 1
+
+
+@pytest.mark.parametrize(
+    "attr,value",
+    [
+        ("_last_prior_score", 0.20),
+        ("_last_match_score", 0.30),
+        ("_last_yaw_rate", 0.6),
+        ("_last_scan_age_s", 0.5),
+    ],
+)
+def test_apply_match_nav_track_gates(monkeypatch, attr, value):
+    engine = _nav_track_engine(monkeypatch)
+    setattr(engine, attr, value)
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
     small = conv.Pose2D(0.10, 0.0, 0.0)
-    # Odom-only during nav: neither large nor small applies.
-    assert engine._apply_match(predicted, large, None) is False  # noqa: SLF001
-    assert engine._apply_match(predicted, large, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, small, None) is False  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.0)
+
+
+def test_apply_match_nav_track_refuses_big_yaw(monkeypatch):
+    engine = _nav_track_engine(monkeypatch)
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    twisted = conv.Pose2D(0.05, 0.0, math.radians(6.0))
+    assert engine._apply_match(predicted, twisted, None) is False  # noqa: SLF001
+
+
+def test_apply_match_nav_track_can_be_disabled(monkeypatch):
+    engine = _nav_track_engine(monkeypatch, nav_scan_track=False)
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    small = conv.Pose2D(0.10, 0.0, 0.0)
     assert engine._apply_match(predicted, small, None) is False  # noqa: SLF001
     assert engine.get_pose().x == pytest.approx(0.0)
 

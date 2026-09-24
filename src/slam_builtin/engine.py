@@ -74,6 +74,7 @@ class BuiltinSlamEngine:
         self._updates = 0
         self._match_accepts = 0
         self._match_rejects = 0
+        self._nav_track_applies = 0
         self._last_match_at = 0.0
         # Mapping inserts only after movement (or timeout).
         self._last_insert_pose: Optional[conv.Pose2D] = None
@@ -451,6 +452,7 @@ class BuiltinSlamEngine:
                 "map_updates": self._updates,
                 "match_accepts": self._match_accepts,
                 "match_rejects": self._match_rejects,
+                "nav_track_applies": self._nav_track_applies,
                 "pose": {
                     "x": self._pose.x,
                     "y": self._pose.y,
@@ -808,6 +810,39 @@ class BuiltinSlamEngine:
     # toward corridor twins (including while nav is suspended/paused).
     _PRIOR_TRUST_SCORE = 0.15
 
+    # Mid-nav drift tracking (``nav_scan_track``). Stricter than idle: the
+    # published pose must already fit the scan, the match must be good, the
+    # base must not be spinning, and each step is small and gently blended.
+    _NAV_TRACK_MAX_M = 0.15
+    _NAV_TRACK_MAX_RAD = math.radians(3.0)
+    _NAV_TRACK_MIN_PRIOR = 0.25
+    _NAV_TRACK_MIN_SCORE = 0.35
+    _NAV_TRACK_MAX_YAW_RATE = 0.35
+    _NAV_TRACK_MAX_SCAN_AGE_S = 0.25
+    _NAV_TRACK_ALPHA = 0.3
+    _NAV_TRACK_STEP_M = 0.05
+    _NAV_TRACK_STEP_RAD = math.radians(1.0)
+
+    def _nav_track_ok(self, predicted: conv.Pose2D, matched: conv.Pose2D) -> bool:
+        if not bool(getattr(self._cfg, "nav_scan_track", True)):
+            return False
+        dist = math.hypot(matched.x - predicted.x, matched.y - predicted.y)
+        dyaw = abs(conv.normalize_angle(matched.theta - predicted.theta))
+        if dist > self._NAV_TRACK_MAX_M or dyaw > self._NAV_TRACK_MAX_RAD:
+            return False
+        prior = float(self._last_prior_score)
+        score = float(self._last_match_score)
+        if not (math.isfinite(prior) and prior >= self._NAV_TRACK_MIN_PRIOR):
+            return False
+        if not (math.isfinite(score) and score >= self._NAV_TRACK_MIN_SCORE):
+            return False
+        if self._last_yaw_rate > self._NAV_TRACK_MAX_YAW_RATE:
+            return False
+        age = float(self._last_scan_age_s)
+        if math.isfinite(age) and age > self._NAV_TRACK_MAX_SCAN_AGE_S:
+            return False
+        return True
+
     def _navigation_active(self) -> bool:
         """True when builtin nav has an in-flight goal (MoveOnMap / route)."""
         try:
@@ -831,13 +866,22 @@ class BuiltinSlamEngine:
             self._pose = predicted
             return False
 
-        # During MoveOnMap / routes: odom-only. Even "small" nudges walk the
-        # estimate onto corridor twins once the prior softens — that is the
-        # mid-nav teleport. Match scores stay diagnostic; global_localize
-        # / manual seed own recovery when idle.
+        # During MoveOnMap / routes: no jumps. Unbounded nudges walk the
+        # estimate onto corridor twins once the prior softens (the mid-nav
+        # teleport), so only tightly gated drift tracking is allowed.
         if self._navigation_active():
             self._pending_match = None
             self._pending_count = 0
+            if self._nav_track_ok(predicted, matched):
+                self._pose = self._blend_pose(
+                    predicted,
+                    matched,
+                    alpha=self._NAV_TRACK_ALPHA,
+                    max_xy=self._NAV_TRACK_STEP_M,
+                    max_yaw=self._NAV_TRACK_STEP_RAD,
+                )
+                self._nav_track_applies += 1
+                return True
             self._pose = predicted
             return False
 
