@@ -29,12 +29,35 @@ from viam.resource.types import Model, ModelFamily
 from viam.spatialmath import EulerAngles
 from viam.utils import struct_to_dict
 
-from ..imu.wit_protocol import ALGORITHMS, WitError, WitSample
+from ..imu.wit_protocol import (
+    ALGORITHMS,
+    GYRO_STILL_THRESHOLD_MAX_DPS,
+    WitError,
+    WitSample,
+)
 from ..imu.wit_serial import WitSerial
 from ..lidar.serial_ports import list_candidate_serial_ports, normalize_exclude_list
 from ..shm import imushm
 
 LOGGER = getLogger(__name__)
+
+DEFAULT_GYRO_STILL_THRESHOLD_DPS = 0.05
+
+
+def _parse_gyro_still_threshold(attrs: Mapping[str, Any]) -> Optional[float]:
+    """``gyro_still_threshold_dps``: number, or ``null`` / ``"keep"`` to leave the device as-is."""
+    if "gyro_still_threshold_dps" not in attrs:
+        return DEFAULT_GYRO_STILL_THRESHOLD_DPS
+    raw = attrs.get("gyro_still_threshold_dps")
+    if raw is None or (isinstance(raw, str) and raw.strip().lower() == "keep"):
+        return None
+    dps = float(raw)
+    if not (0.0 <= dps <= GYRO_STILL_THRESHOLD_MAX_DPS):
+        raise ValueError(
+            f"wit-imu gyro_still_threshold_dps must be 0..{GYRO_STILL_THRESHOLD_MAX_DPS} "
+            "(or null to leave the device setting)"
+        )
+    return dps
 
 
 def _shm_name_for(component_name: str, explicit: Optional[str]) -> str:
@@ -74,6 +97,7 @@ class WitImu(MovementSensor):
         self._include_tty_acm = False
         self._algorithm = "6axis"
         self._zero_yaw_on_start = False
+        self._gyro_still_threshold_dps: Optional[float] = DEFAULT_GYRO_STILL_THRESHOLD_DPS
         self._config_sent = 0
         self._config_error: Optional[str] = None
         self._raw = WitSample()
@@ -106,6 +130,7 @@ class WitImu(MovementSensor):
         algo = str(attrs.get("algorithm", "6axis") or "6axis").strip().lower()
         if algo not in ALGORITHMS:
             raise ValueError(f"wit-imu algorithm must be one of {ALGORITHMS}")
+        _parse_gyro_still_threshold(attrs)
         return [], []
 
     def reconfigure(
@@ -132,6 +157,7 @@ class WitImu(MovementSensor):
         self._include_tty_acm = bool(attrs.get("include_tty_acm", False))
         self._algorithm = str(attrs.get("algorithm", "6axis") or "6axis").strip().lower()
         self._zero_yaw_on_start = bool(attrs.get("zero_yaw_on_start", False))
+        self._gyro_still_threshold_dps = _parse_gyro_still_threshold(attrs)
         self._stop.clear()
         self._open_device()
         self._configure_device()
@@ -190,15 +216,19 @@ class WitImu(MovementSensor):
             return
         try:
             self._config_sent = dev.configure(
-                self._algorithm, zero_yaw=self._zero_yaw_on_start
+                self._algorithm,
+                zero_yaw=self._zero_yaw_on_start,
+                gyro_still_threshold_dps=self._gyro_still_threshold_dps,
             )
             if self._config_sent:
                 LOGGER.info(
-                    "nav-stack wit-imu %r sent %d config cmds (algorithm=%s zero_yaw=%s)",
+                    "nav-stack wit-imu %r sent %d config cmds "
+                    "(algorithm=%s zero_yaw=%s gyro_still_threshold_dps=%s)",
                     self.name,
                     self._config_sent,
                     self._algorithm,
                     self._zero_yaw_on_start,
+                    self._gyro_still_threshold_dps,
                 )
         except Exception as exc:  # noqa: BLE001
             self._config_error = repr(exc)
@@ -435,6 +465,7 @@ class WitImu(MovementSensor):
                     "yaw_rad": self._yaw,
                     "yaw_deg": math.degrees(self._yaw),
                     "algorithm": self._algorithm,
+                    "gyro_still_threshold_dps": self._gyro_still_threshold_dps,
                     "config_cmds_sent": self._config_sent,
                     "config_error": self._config_error,
                     "raw": self._raw_dict(),

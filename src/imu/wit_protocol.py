@@ -30,8 +30,13 @@ CMD_UNLOCK = bytes((0xFF, 0xAA, 0x69, 0x88, 0xB5))
 REG_SAVE = 0x00
 REG_CALSW = 0x01
 REG_AXIS6 = 0x24  # 0 = 9-axis (mag-fused yaw), 1 = 6-axis (gyro-integrated yaw)
+# Gyro "still" threshold, units of 0.001 deg/s. Factory 0 lets the firmware's
+# auto-zero treat any steady turn as stationary: a smooth 5 deg/s turn loses
+# >90% of its yaw. 0.05 deg/s (50) keeps rest drift at zero and tracks slow turns.
+REG_GYROCALITHR = 0x61
 CALSW_ZERO_YAW = 0x04  # "Z-axis angle to zero" (6-axis mode only)
 ALGORITHMS = ("6axis", "9axis", "keep")
+GYRO_STILL_THRESHOLD_MAX_DPS = 65.535
 
 
 def cmd_set_register(reg: int, value: int) -> bytes:
@@ -40,21 +45,37 @@ def cmd_set_register(reg: int, value: int) -> bytes:
     return bytes((0xFF, 0xAA, reg & 0xFF, value & 0xFF, (value >> 8) & 0xFF))
 
 
-def config_commands(algorithm: str = "keep", *, zero_yaw: bool = False) -> list[bytes]:
+def config_commands(
+    algorithm: str = "keep",
+    *,
+    zero_yaw: bool = False,
+    gyro_still_threshold_dps: Optional[float] = None,
+) -> list[bytes]:
     """Startup command sequence (each needs ~100-200 ms spacing on the wire).
 
     Nothing is saved to flash (no ``REG_SAVE``) so the device reverts on power
     cycle; the sequence is re-sent every time the component starts.
+    ``gyro_still_threshold_dps=None`` leaves the device's threshold untouched.
     """
     if algorithm not in ALGORITHMS:
         raise WitError(f"unknown Wit algorithm {algorithm!r}; use one of {ALGORITHMS}")
+    still_raw: Optional[int] = None
+    if gyro_still_threshold_dps is not None:
+        dps = float(gyro_still_threshold_dps)
+        if not (0.0 <= dps <= GYRO_STILL_THRESHOLD_MAX_DPS):
+            raise WitError(
+                f"gyro_still_threshold_dps must be 0..{GYRO_STILL_THRESHOLD_MAX_DPS}, got {dps}"
+            )
+        still_raw = int(round(dps * 1000.0))
     out: list[bytes] = []
-    if algorithm != "keep" or zero_yaw:
+    if algorithm != "keep" or zero_yaw or still_raw is not None:
         out.append(CMD_UNLOCK)
     if algorithm == "6axis":
         out.append(cmd_set_register(REG_AXIS6, 1))
     elif algorithm == "9axis":
         out.append(cmd_set_register(REG_AXIS6, 0))
+    if still_raw is not None:
+        out.append(cmd_set_register(REG_GYROCALITHR, still_raw))
     if zero_yaw:
         out.append(cmd_set_register(REG_CALSW, CALSW_ZERO_YAW))
     return out

@@ -222,11 +222,21 @@ class WitSerial:
         if settle_s > 0:
             time.sleep(settle_s)
 
-    def configure(self, algorithm: str = "keep", *, zero_yaw: bool = False) -> int:
+    def configure(
+        self,
+        algorithm: str = "keep",
+        *,
+        zero_yaw: bool = False,
+        gyro_still_threshold_dps: Optional[float] = None,
+    ) -> int:
         """Send the startup config sequence; returns number of commands sent."""
         from .wit_protocol import config_commands
 
-        cmds = config_commands(algorithm, zero_yaw=zero_yaw)
+        cmds = config_commands(
+            algorithm,
+            zero_yaw=zero_yaw,
+            gyro_still_threshold_dps=gyro_still_threshold_dps,
+        )
         for cmd in cmds:
             self.write_command(cmd)
         return len(cmds)

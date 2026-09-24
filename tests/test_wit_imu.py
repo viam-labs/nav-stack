@@ -224,3 +224,41 @@ def test_wit_serial_configure_writes_sequence():
     n = dev.configure("6axis", zero_yaw=False)
     assert n == 2
     assert dev._ser.writes == [CMD_UNLOCK, bytes.fromhex("ffaa240100")]  # noqa: SLF001
+
+    dev._ser = _Port()  # noqa: SLF001
+    n = dev.configure("6axis", gyro_still_threshold_dps=0.05)
+    assert n == 3
+    assert dev._ser.writes[-1] == bytes.fromhex("ffaa613200")  # noqa: SLF001
+
+
+def test_config_commands_gyro_still_threshold():
+    # 0.05 deg/s -> 50 (0x0032), the WitMotion datasheet example frame.
+    assert config_commands("keep", gyro_still_threshold_dps=0.05) == [
+        CMD_UNLOCK,
+        bytes.fromhex("ffaa613200"),
+    ]
+    assert config_commands("6axis", gyro_still_threshold_dps=0.05) == [
+        CMD_UNLOCK,
+        bytes.fromhex("ffaa240100"),
+        bytes.fromhex("ffaa613200"),
+    ]
+    assert config_commands("keep", gyro_still_threshold_dps=1.0)[-1] == bytes.fromhex("ffaa61e803")
+    assert config_commands("keep", gyro_still_threshold_dps=None) == []
+    with pytest.raises(WitError):
+        config_commands("keep", gyro_still_threshold_dps=-0.1)
+    with pytest.raises(WitError):
+        config_commands("keep", gyro_still_threshold_dps=70.0)
+
+
+def test_wit_imu_gyro_still_threshold_attr():
+    from src.models.wit_imu import (
+        DEFAULT_GYRO_STILL_THRESHOLD_DPS,
+        _parse_gyro_still_threshold,
+    )
+
+    assert _parse_gyro_still_threshold({}) == DEFAULT_GYRO_STILL_THRESHOLD_DPS == 0.05
+    assert _parse_gyro_still_threshold({"gyro_still_threshold_dps": 0.2}) == 0.2
+    assert _parse_gyro_still_threshold({"gyro_still_threshold_dps": None}) is None
+    assert _parse_gyro_still_threshold({"gyro_still_threshold_dps": "keep"}) is None
+    with pytest.raises(ValueError):
+        _parse_gyro_still_threshold({"gyro_still_threshold_dps": 100})
