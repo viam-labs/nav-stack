@@ -14,6 +14,8 @@ def test_should_hold_drive_for_awaiting_confirm():
     assert not should_hold_drive_for_pose_jump({"status": "corrected"})
     assert not should_hold_drive_for_pose_jump({"status": "ok"})
     assert not should_hold_drive_for_pose_jump({"status": "low_quality"})
+    assert not should_hold_drive_for_pose_jump({"status": "refused_large"})
+    assert not should_hold_drive_for_pose_jump({"status": "soft_loc_resume"})
     assert not should_hold_drive_for_pose_jump(None)
     assert not should_hold_drive_for_pose_jump("awaiting_confirm")
 

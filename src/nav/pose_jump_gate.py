@@ -158,7 +158,8 @@ def should_hold_drive_for_pose_jump(check: Optional[object]) -> bool:
       published pose no longer explains the scan (do not keep driving)
 
     Does **not** hold for ``soft_loc_resume`` (soft quality, no large jump,
-    hold timer expired — continue on the published pose).
+    hold timer expired — continue on the published pose) or ``refused_large``
+    (mid-nav refine rejected a hallway-sized yank — keep the published pose).
     """
     if not isinstance(check, dict):
         return False

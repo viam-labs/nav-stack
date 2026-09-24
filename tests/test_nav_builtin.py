@@ -1849,6 +1849,46 @@ def test_nav_holds_drive_while_localization_awaiting_confirm():
     assert world.stopped
 
 
+def test_nav_does_not_sticky_hold_leftover_nav_hold():
+    """A refused large mid-nav jump must not sit in loc_hold forever."""
+    import threading
+    import time
+
+    world = _FakeWorld(Pose2D(0.2, 0.2, 0.0), _empty_map(size=80))
+    world.loc_hold = {
+        "status": "nav_hold",
+        "shift_m": 3.384,
+        "shift_deg": 2.0,
+        "score": 0.25,
+        "large_jump": True,
+    }
+    nav = BuiltinNavigator(
+        world,
+        inflation_radius_m=0.15,
+        robot_radius_m=0.05,
+        avoid_obstacles=False,
+        xy_tolerance_m=0.1,
+        timeout_s=4.0,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        nav_loc_refine_on_disagree=True,
+    )
+
+    def _run():
+        nav.navigate(3.0, 0.2, 0.0)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    time.sleep(0.35)
+    status = nav.nav_status()
+    assert status.get("active") is True
+    assert status.get("obstacle") != "loc_hold"
+    assert any(abs(vx) > 1e-6 or abs(vth) > 1e-6 for vx, _vy, vth in world.cmds)
+    nav.cancel()
+    t.join(timeout=2.0)
+    assert world.stopped
+
+
 def _open_scan(range_m: float = 4.0, n: int = 360) -> conv.LaserScan2D:
     return conv.LaserScan2D(
         ranges=np.full(n, range_m, dtype=float),

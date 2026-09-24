@@ -786,7 +786,8 @@ class SlamConfig:
     periodic_relocalize_nav_interval_s: float = 25.0
     # Soft loc with no large jump: hold drive briefly, then resume on the
     # published pose (odom continuity). 0 = hold until quality recovers.
-    # Large-jump holds are unchanged (awaiting_confirm / nav_hold until clear).
+    # Mid-nav refine refuses hallway-sized jumps (``refused_large``) instead
+    # of sticky ``nav_hold``. Periodic large-jump holds are unchanged.
     periodic_relocalize_soft_hold_max_s: float = 20.0
     # Skip a cycle when |yaw rate| is above this (rad/s) — spinning scans smear.
     periodic_relocalize_max_yaw_rate_rad_s: float = 0.35

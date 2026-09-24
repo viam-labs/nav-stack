@@ -1446,7 +1446,8 @@ class SlamService(SLAM):
 
         if not should_apply and apply_override is not True and not good_match:
             # During nav, do not keep driving on an untrusted pose.
-            # - Large jump + weak match → nav_hold (until confirm / better match)
+            # - Mid-nav refine + large jump → refused_large (keep published pose)
+            # - Periodic large jump + weak match → nav_hold (until confirm)
             # - Soft published pose, no jump → brief nav_hold, then resume on the
             #   published pose (odom continuity) so we do not sit forever at
             #   borderline scores like 0.49.
@@ -1470,6 +1471,27 @@ class SlamService(SLAM):
                     result["soft_loc"] = bool(soft_previous and not large_jump)
                     if prior_score is not None:
                         result["previous_ok"] = previous_ok
+                    # Mid-nav refine: a hallway-sized yank we will not apply
+                    # must not sticky-hold the base (that is the lobby pause).
+                    if (
+                        allow_during_navigation
+                        and large_jump
+                        and apply_override is not True
+                    ):
+                        self._pose_jump_gate.clear()
+                        self._soft_nav_hold_since = None
+                        self._soft_nav_hold_released = True
+                        result["status"] = "refused_large"
+                        result["corrected"] = False
+                        LOGGER.info(
+                            "periodic relocalize: refusing large mid-nav jump "
+                            "(%.2f m / %.1f deg score=%.2f); "
+                            "continuing on published pose",
+                            0.0 if math.isinf(shift_m) else shift_m,
+                            0.0 if math.isinf(shift_deg) else shift_deg,
+                            score,
+                        )
+                        return self._publish_relocalize_check(result)
                     soft_hold_max = float(cfg.periodic_relocalize_soft_hold_max_s)
                     if soft_previous and not large_jump and soft_hold_max > 0.0:
                         now = time.monotonic()
@@ -1540,6 +1562,24 @@ class SlamService(SLAM):
         self._soft_nav_hold_released = False
 
         if should_apply and isinstance(matched_pose, Mapping):
+            if (
+                allow_during_navigation
+                and large_jump
+                and apply_override is not True
+            ):
+                self._pose_jump_gate.clear()
+                result["status"] = "refused_large"
+                result["corrected"] = False
+                result["large_jump"] = True
+                LOGGER.info(
+                    "periodic relocalize: refusing large mid-nav jump "
+                    "(%.2f m / %.1f deg score=%.2f); "
+                    "continuing on published pose",
+                    0.0 if math.isinf(shift_m) else shift_m,
+                    0.0 if math.isinf(shift_deg) else shift_deg,
+                    score,
+                )
+                return self._publish_relocalize_check(result)
             candidate = self._pose_from_mapping(matched_pose)
             decision = self._confirm_pose_jump(
                 current, candidate, force=apply_override is True

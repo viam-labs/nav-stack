@@ -1312,6 +1312,75 @@ def test_periodic_relocalize_allow_during_navigation_stays_local():
     assert match_cmd.get("auto_full_map_fallback") is False
 
 
+def test_allow_during_navigation_refuses_large_jump_without_hold():
+    """A 3 m mid-nav refine peak must not sticky-hold the base."""
+    slam = _relocalize_slam(
+        periodic_relocalize_during_navigation=False,
+        periodic_relocalize_min_score=0.5,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.25,
+            "ray_mae_m": 1.26,
+            "pose": {"x": 3.38, "y": 0.0, "theta": 0.0},
+            "prior_score": -0.02,
+            "prior_ray_mae_m": 1.70,
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(
+        slam._periodic_relocalize_cycle(
+            allow_during_navigation=True,
+            full_map_escalation="still_bad",
+        )
+    )
+
+    assert result["status"] == "refused_large"
+    assert result["corrected"] is False
+    assert result["large_jump"] is True
+    slam.do_command.assert_not_awaited()
+    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+
+    assert not should_hold_drive_for_pose_jump(result)
+
+
+def test_allow_during_navigation_refuses_trusted_large_jump_without_await():
+    """A strong 3 m peak must not sit in awaiting_confirm during refine."""
+    slam = _relocalize_slam(
+        periodic_relocalize_during_navigation=False,
+        periodic_relocalize_min_score=0.5,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.72,
+            "ray_mae_m": 0.40,
+            "pose": {"x": 3.38, "y": 0.0, "theta": 0.0},
+            "prior_score": 0.20,
+            "prior_ray_mae_m": 1.20,
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(
+        slam._periodic_relocalize_cycle(
+            allow_during_navigation=True,
+            full_map_escalation="still_bad",
+        )
+    )
+
+    assert result["status"] == "refused_large"
+    assert result["corrected"] is False
+    slam.do_command.assert_not_awaited()
+    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+
+    assert not should_hold_drive_for_pose_jump(result)
+
+
 def test_is_navigation_active_sees_registered_builtin_nav_host():
     """BuiltinSlamHost always reports idle; registered nav host is the source of truth."""
     from src.runtime import any_navigation_active, register_nav_host, unregister_nav_host

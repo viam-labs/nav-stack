@@ -1214,6 +1214,14 @@ class NavSupervisor:
                     xy_ok_since = None
 
                 if holding_for_localize:
+                    hold_status = str((loc_hold or {}).get("status") or "")
+                    # A leftover mid-nav ``nav_hold`` (refused hallway yank)
+                    # must not skip refine forever. ``awaiting_confirm`` still
+                    # stops until SLAM applies or rejects.
+                    if hold_status == "nav_hold" and self._nav_loc_refine:
+                        holding_for_localize = False
+                        entering_loc_hold = False
+                if holding_for_localize:
                     # Stop once on entry — repeating SetVelocity(0) every control
                     # tick (esp. at 20 Hz) queues behind lidar/odom RPCs and
                     # surfaces as ``Viam IO timed out`` / stalled navigation.
