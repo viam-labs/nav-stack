@@ -1984,7 +1984,25 @@ def test_nav_loc_refine_continues_when_residual_is_thin():
     st = sup.status()
     assert st.state == "succeeded"
     assert st.error_msg == ""
-    assert world.loc_checks == 2
+    # Thin residual SLAM could not fix: one look, then keep driving.
+    assert world.loc_checks == 1
+
+
+def test_goal_timeout_scales_with_route_length():
+    world = _FakeWorld(Pose2D(0.0, 0.0, 0.0), _empty_map())
+    sup = NavSupervisor(world, timeout_s=300.0, max_vel_x=0.55)
+    assert sup._goal_timeout_s(10.0) == pytest.approx(300.0)  # noqa: SLF001
+    # 110 m at 0.55 m/s = 200 s of driving -> 600 s budget.
+    assert sup._goal_timeout_s(110.0) == pytest.approx(600.0)  # noqa: SLF001
+
+
+def test_loc_refine_replans_only_when_pose_moved():
+    kind = NavSupervisor._loc_refine_resume_kind  # noqa: SLF001
+    start = Pose2D(1.0, 1.0, 0.0)
+    assert kind(start, Pose2D(1.03, 1.02, 0.01)) == "continue"
+    assert kind(start, Pose2D(1.4, 1.0, 0.0)) == "resume"
+    assert kind(start, Pose2D(1.0, 1.0, math.radians(8.0))) == "resume"
+    assert kind(None, start) == "resume"
 
 
 def test_nav_loc_refine_applies_small_improving_match():

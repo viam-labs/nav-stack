@@ -152,6 +152,7 @@ class NavSupervisor:
         self._loc_refine_cooldown_until = 0.0
         self._loc_refine_last_check = 0.0
         self._loc_refine_last_pose: Optional[Pose2D] = None
+        self._loc_refine_start_pose: Optional[Pose2D] = None
         self._loc_refine_need_travel = False
         self._world = world
         self._inflation = inflation_radius_m
@@ -181,6 +182,7 @@ class NavSupervisor:
         self._algorithm = algorithm
         self._replan_period = replan_period_s
         self._timeout_s = timeout_s
+        self._max_vel_x = max(0.05, float(max_vel_x))
         self._scan_max_age = scan_max_age_s
         self._smooth_path = smooth_path
         self._smooth_spacing = smooth_sample_spacing_m
@@ -677,9 +679,10 @@ class NavSupervisor:
     ) -> Optional[str]:
         """Stop + local refine when the scan is a poor fit for the published pose.
 
-        Returns ``None`` (keep following), ``hold`` (stay stopped), or
-        ``resume`` (replan after a correction / give-up). Does not fail the
-        goal — a leftover residual or refused yank is common in hallways.
+        Returns ``None`` (keep following), ``hold`` (stay stopped),
+        ``resume`` (pose moved: replan), or ``continue`` (pose unchanged:
+        keep the current path). Does not fail the goal — a leftover residual
+        or refused yank is common in hallways.
         """
         if not self._nav_loc_refine:
             return None
@@ -709,8 +712,10 @@ class NavSupervisor:
             self._loc_refine_need_travel = False
             if holding:
                 self._loc_refine_tries = 0
-                return "resume"
+                return self._loc_refine_resume_kind(self._loc_refine_start_pose, pose)
             return None
+        if not holding:
+            self._loc_refine_start_pose = pose
 
         self._world.stop()
         self._note_base_stopped()
@@ -755,26 +760,34 @@ class NavSupervisor:
                 return "hold"
             return "hold" if holding else None
 
+        from .loc_consistency import residual_is_lost
+
         pose_after = self._world.get_pose() or pose
         after = self._measure_loc_disagreement(pose_after)
+        start = self._loc_refine_start_pose or pose
         if after.disagree:
             self._loc_refine_tries += 1
             self._loc_refine_cooldown_until = (
                 time.monotonic() + self._nav_loc_refine_cooldown_s
             )
-            if self._loc_refine_tries >= self._nav_loc_refine_max_tries:
-                # Keep the published pose and the goal. Hallway residuals and
-                # refused large jumps are not ``localization_lost``.
-                self._loc_refine_tries = 0
-                self._loc_refine_need_travel = True
+            # A second look only helps when the scan still says "lost"; a
+            # moderate residual SLAM could not fix is map change, not drift.
+            if (
+                self._loc_refine_tries < self._nav_loc_refine_max_tries
+                and residual_is_lost(after)
+            ):
                 self._publish_loc_refine_progress(
-                    pose_after, dist_goal, verdict=after, status="continue"
+                    pose_after, dist_goal, verdict=after, status="retry"
                 )
-                return "resume"
+                return "hold"
+            # Keep the published pose and the goal. Hallway residuals and
+            # refused large jumps are not ``localization_lost``.
+            self._loc_refine_tries = 0
+            self._loc_refine_need_travel = True
             self._publish_loc_refine_progress(
-                pose_after, dist_goal, verdict=after, status="retry"
+                pose_after, dist_goal, verdict=after, status="continue"
             )
-            return "hold"
+            return self._loc_refine_resume_kind(start, pose_after)
 
         self._loc_refine_tries = 0
         self._loc_refine_need_travel = False
@@ -784,7 +797,21 @@ class NavSupervisor:
         self._publish_loc_refine_progress(
             pose_after, dist_goal, verdict=after, status="resumed"
         )
-        return "resume"
+        return self._loc_refine_resume_kind(start, pose_after)
+
+    def _goal_timeout_s(self, length_m: float) -> float:
+        """``timeout_s``, or 3x the full-speed drive time for long routes."""
+        return max(float(self._timeout_s), 3.0 * max(0.0, length_m) / self._max_vel_x)
+
+    @staticmethod
+    def _loc_refine_resume_kind(before: Optional[Pose2D], after: Pose2D) -> str:
+        """``resume`` (replan) only when the refine actually moved the pose."""
+        if before is None:
+            return "resume"
+        moved = distance_m(before, after) >= 0.15 or abs(
+            conv.normalize_angle(after.theta - before.theta)
+        ) >= math.radians(5.0)
+        return "resume" if moved else "continue"
 
     def _rate_limited(self, cmd: DriveCommand) -> DriveCommand:
         """Slew-limit ``cmd`` against the twist already on the base.
@@ -1068,6 +1095,7 @@ class NavSupervisor:
         self._loc_refine_cooldown_until = 0.0
         self._loc_refine_last_check = 0.0
         self._loc_refine_last_pose = None
+        self._loc_refine_start_pose = None
         self._loc_refine_need_travel = False
         goal_dict = {"x": float(goal.x), "y": float(goal.y), "theta": float(goal.theta)}
         self._set_status(
@@ -1093,7 +1121,9 @@ class NavSupervisor:
             preview = self._publish_plan_viz(result, goal, start=None)
             self._set_status(path=preview["path"], length_m=preview["length_m"])
 
-            deadline = time.monotonic() + self._timeout_s
+            deadline = time.monotonic() + self._goal_timeout_s(
+                float(preview.get("length_m") or 0.0)
+            )
             last_replan = time.monotonic()
             last_progress_pose: Optional[Pose2D] = None
             last_progress_at = time.monotonic()
@@ -1246,6 +1276,8 @@ class NavSupervisor:
                         },
                     )
                     self._sleep_control_period(tick_started)
+                    # Localization stops do not count against the goal timeout.
+                    deadline += time.monotonic() - tick_started
                     continue
 
                 now = time.monotonic()
@@ -1254,7 +1286,7 @@ class NavSupervisor:
                 )
                 if loc_outcome == "fail":
                     return
-                if loc_outcome in ("hold", "resume"):
+                if loc_outcome in ("hold", "resume", "continue"):
                     if loc_outcome == "resume":
                         pending_loc_replan = True
                     last_progress_at = now
@@ -1263,6 +1295,7 @@ class NavSupervisor:
                     last_progress_bearing = float("inf")
                     spin_stuck_since = None
                     self._sleep_control_period(tick_started)
+                    deadline += time.monotonic() - tick_started
                     continue
 
                 need_scan = (

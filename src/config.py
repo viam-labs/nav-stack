@@ -456,6 +456,8 @@ class BuiltinNavConfig:
     min_lookahead_m: float = 1.1
     max_lookahead_m: float = 1.55
     replan_period_s: float = 1.0
+    # Minimum per-goal timeout. Long routes get 3x their full-speed drive
+    # time instead; time stopped for localization is not counted.
     timeout_s: float = 300.0
     # Base.SetVelocity wait on the shared module event loop. Mapping+SLAM can
     # briefly starve the loop; 2s was aborting goals on capable hardware.

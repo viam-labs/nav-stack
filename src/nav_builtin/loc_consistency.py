@@ -154,7 +154,7 @@ def localization_looks_bad(
     min_frac: float = 0.22,
     min_beams: int = 6,
     early_gap_m: float = 0.45,
-    early_beams: int = 4,
+    early_beams: int = 0,
 ) -> LocDisagreement:
     """True when the map near the published pose does not match the lidar.
 
@@ -228,9 +228,11 @@ def localization_looks_bad(
 
     frac = (float(bad) / float(compared)) if compared else 0.0
     trigger = compared >= int(min_beams) and frac >= float(min_frac)
-    # Catch lateral drift around 0.4–0.5 m before the whole scan looks lost.
+    # Optional: a few beams with a moderate gap. Off by default — open doors
+    # and moved furniture trip it constantly; nav_scan_track handles drift.
     if (
         not trigger
+        and int(early_beams) > 0
         and bad >= int(early_beams)
         and max_bad_gap >= float(early_gap_m)
     ):

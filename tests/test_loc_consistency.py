@@ -162,6 +162,20 @@ def test_early_gap_triggers_before_fraction_is_high():
     angles = -np.pi + np.arange(360) * (2.0 * np.pi / 360)
     wrapped = (angles - (np.pi / 2.0) + np.pi) % (2.0 * np.pi) - np.pi
     ranges[np.abs(wrapped) <= np.radians(12.0)] = 4.0
-    verdict = localization_looks_bad(pose, _scan(ranges), occ, min_frac=0.50)
+    verdict = localization_looks_bad(
+        pose, _scan(ranges), occ, min_frac=0.50, early_beams=4
+    )
     assert verdict.disagree is True
     assert verdict.disagree_frac < 0.50
+
+
+def test_early_gap_trigger_is_off_by_default():
+    """A few open-door beams must not stop nav on their own."""
+    pose = Pose2D(1.0, 1.0, 0.0)
+    occ = _room_occ()
+    ranges = np.full(360, 0.60)
+    angles = -np.pi + np.arange(360) * (2.0 * np.pi / 360)
+    wrapped = (angles - (np.pi / 2.0) + np.pi) % (2.0 * np.pi) - np.pi
+    ranges[np.abs(wrapped) <= np.radians(12.0)] = 4.0
+    verdict = localization_looks_bad(pose, _scan(ranges), occ)
+    assert verdict.disagree is False
