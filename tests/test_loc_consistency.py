@@ -127,14 +127,41 @@ def test_small_local_match_worth_applying_live_dock_case():
             "large_jump": False,
         }
     )
+    # Under the 1 m cap even if SLAM marked large_jump (0.75 m).
+    assert small_local_match_worth_applying(
+        {
+            "corrected": False,
+            "match_mode": "local",
+            "shift_m": 0.9,
+            "shift_deg": 8.0,
+            "score": 0.40,
+            "previous_score": 0.05,
+            "large_jump": True,
+        }
+    )
+    # 2.2 m / 0.17 twin — over the cap and below the score floor.
     assert not small_local_match_worth_applying(
         {
             "corrected": False,
             "match_mode": "local",
-            "shift_m": 2.4,
-            "shift_deg": 8.0,
-            "score": 0.6,
-            "previous_score": 0.1,
+            "shift_m": 2.229,
+            "shift_deg": 2.0,
+            "score": 0.166,
+            "previous_score": -0.229,
             "large_jump": True,
         }
     )
+
+
+def test_early_gap_triggers_before_fraction_is_high():
+    """A few unmatched beams with a ~0.5 m gap should refine before 22%."""
+    pose = Pose2D(1.0, 1.0, 0.0)
+    occ = _room_occ()
+    ranges = np.full(360, 0.60)
+    # Open a 25° left wedge so ~5 samples (every 5°) disagree vs the 0.6 m wall.
+    angles = -np.pi + np.arange(360) * (2.0 * np.pi / 360)
+    wrapped = (angles - (np.pi / 2.0) + np.pi) % (2.0 * np.pi) - np.pi
+    ranges[np.abs(wrapped) <= np.radians(12.0)] = 4.0
+    verdict = localization_looks_bad(pose, _scan(ranges), occ, min_frac=0.50)
+    assert verdict.disagree is True
+    assert verdict.disagree_frac < 0.50

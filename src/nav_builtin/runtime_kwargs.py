@@ -82,6 +82,10 @@ def builtin_nav_runtime_kwargs(
         "nav_loc_refine_max_tries": bcfg.nav_loc_refine_max_tries,
         "nav_loc_refine_cooldown_s": bcfg.nav_loc_refine_cooldown_s,
         "nav_loc_refine_period_s": bcfg.nav_loc_refine_period_s,
+        "nav_loc_refine_check_every_m": bcfg.nav_loc_refine_check_every_m,
+        "nav_loc_refine_apply_max_m": bcfg.nav_loc_refine_apply_max_m,
+        "nav_loc_refine_apply_max_deg": bcfg.nav_loc_refine_apply_max_deg,
+        "nav_loc_refine_apply_min_score": bcfg.nav_loc_refine_apply_min_score,
         "nav_loc_refine_settle_s": bcfg.nav_loc_refine_settle_s,
     }
     kwargs.update(overrides)

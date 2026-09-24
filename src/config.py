@@ -535,11 +535,18 @@ class BuiltinNavConfig:
     nav_loc_refine_map_max_m: float = 2.5
     # Legacy alias accepted in config; overall residual no longer uses it.
     nav_loc_refine_lidar_min_m: float = 1.2
-    nav_loc_refine_min_frac: float = 0.30
+    nav_loc_refine_min_frac: float = 0.22
     nav_loc_refine_min_beams: int = 6
     nav_loc_refine_max_tries: int = 2
     nav_loc_refine_cooldown_s: float = 12.0
-    nav_loc_refine_period_s: float = 1.5
+    nav_loc_refine_period_s: float = 0.75
+    # Also check after this much travel even if the period has not elapsed.
+    nav_loc_refine_check_every_m: float = 2.0
+    # Force-apply a local rematch up to this size when it beats the prior and
+    # clears ``apply_min_score``. 2 m / 0.17 twins stay refused.
+    nav_loc_refine_apply_max_m: float = 1.0
+    nav_loc_refine_apply_max_deg: float = 30.0
+    nav_loc_refine_apply_min_score: float = 0.35
     # Pause after SetVelocity(0) so yaw-rate preflight does not skip the check.
     nav_loc_refine_settle_s: float = 0.35
 

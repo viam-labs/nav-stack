@@ -84,15 +84,23 @@ def residual_is_lost(verdict: LocDisagreement) -> bool:
     return verdict.compared_beams >= 16 and verdict.disagree_frac >= 0.45
 
 
-def small_local_match_worth_applying(result: Optional[Mapping]) -> bool:
+def small_local_match_worth_applying(
+    result: Optional[Mapping],
+    *,
+    max_shift_m: float = 1.0,
+    max_shift_deg: float = 30.0,
+    min_score: float = 0.35,
+) -> bool:
     """A local rematch that clearly beats the published pose and is a small shift.
 
     Used to force-apply when ``good_match`` is just shy (e.g. 0.47 vs 0.50)
-    but the prior is already bad. Never for large / ambiguous / full-map peaks.
+    but the prior is already bad. Never for ambiguous / full-map peaks, or a
+    weak 2 m twin (score 0.17) even if it beats a worse prior.
+    ``large_jump`` does not block when the shift is still within the cap.
     """
     if not result or result.get("corrected"):
         return False
-    if result.get("ambiguous") or result.get("large_jump"):
+    if result.get("ambiguous"):
         return False
     mode = str(result.get("match_mode") or "local")
     if mode and not mode.startswith("local"):
@@ -105,9 +113,11 @@ def small_local_match_worth_applying(result: Optional[Mapping]) -> bool:
         return False
     if not math.isfinite(score):
         return False
-    if shift_m > 0.6 or shift_deg > 30.0:
+    if shift_m > float(max_shift_m) or shift_deg > float(max_shift_deg):
         return False
     if shift_m < 0.08 and shift_deg < 6.0:
+        return False
+    if score < float(min_score):
         return False
     prev = result.get("previous_score")
     try:
@@ -115,8 +125,8 @@ def small_local_match_worth_applying(result: Optional[Mapping]) -> bool:
     except (TypeError, ValueError):
         prev_f = None
     if prev_f is not None and math.isfinite(prev_f):
-        return score >= prev_f + 0.15 or (prev_f < 0.20 and score >= 0.35)
-    return score >= 0.40
+        return score >= prev_f + 0.15 or prev_f < 0.20
+    return True
 
 
 def occupancy_for_consistency(
@@ -141,8 +151,10 @@ def localization_looks_bad(
     *,
     margin_m: float = 0.8,
     map_max_m: float = 2.5,
-    min_frac: float = 0.30,
+    min_frac: float = 0.22,
     min_beams: int = 6,
+    early_gap_m: float = 0.45,
+    early_beams: int = 4,
 ) -> LocDisagreement:
     """True when the map near the published pose does not match the lidar.
 
@@ -166,6 +178,7 @@ def localization_looks_bad(
     step = max(1, int(round(_BEAM_STEP_RAD / inc)))
     compared = 0
     bad = 0
+    max_bad_gap = 0.0
     sector_stats: dict[str, dict] = {
         name: {
             "compared": 0,
@@ -199,6 +212,8 @@ def localization_looks_bad(
         is_bad = gap >= float(margin_m)
         if is_bad:
             bad += 1
+            if math.isfinite(gap) and gap > max_bad_gap:
+                max_bad_gap = gap
         label = _sector_label(body_ang)
         if label is None:
             continue
@@ -212,10 +227,14 @@ def localization_looks_bad(
             st["lidar_open"] = None if not math.isfinite(lidar_m) else lidar_m
 
     frac = (float(bad) / float(compared)) if compared else 0.0
-    trigger = (
-        compared >= int(min_beams)
-        and frac >= float(min_frac)
-    )
+    trigger = compared >= int(min_beams) and frac >= float(min_frac)
+    # Catch lateral drift around 0.4–0.5 m before the whole scan looks lost.
+    if (
+        not trigger
+        and bad >= int(early_beams)
+        and max_bad_gap >= float(early_gap_m)
+    ):
+        trigger = True
     sectors: list[SectorClearance] = []
     worst: Optional[SectorClearance] = None
     for name, _center in _SECTORS:

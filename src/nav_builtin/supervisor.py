@@ -119,7 +119,7 @@ class NavSupervisor:
             0.2, float(kw.get("nav_loc_refine_lidar_min_m", 1.2))
         )
         self._nav_loc_refine_min_frac = min(
-            1.0, max(0.05, float(kw.get("nav_loc_refine_min_frac", 0.30)))
+            1.0, max(0.05, float(kw.get("nav_loc_refine_min_frac", 0.22)))
         )
         self._nav_loc_refine_min_beams = max(
             1, int(kw.get("nav_loc_refine_min_beams", 6))
@@ -131,7 +131,19 @@ class NavSupervisor:
             0.0, float(kw.get("nav_loc_refine_cooldown_s", 12.0))
         )
         self._nav_loc_refine_period_s = max(
-            0.0, float(kw.get("nav_loc_refine_period_s", 1.5))
+            0.0, float(kw.get("nav_loc_refine_period_s", 0.75))
+        )
+        self._nav_loc_refine_check_every_m = max(
+            0.0, float(kw.get("nav_loc_refine_check_every_m", 2.0))
+        )
+        self._nav_loc_refine_apply_max_m = max(
+            0.2, float(kw.get("nav_loc_refine_apply_max_m", 1.0))
+        )
+        self._nav_loc_refine_apply_max_deg = max(
+            5.0, float(kw.get("nav_loc_refine_apply_max_deg", 30.0))
+        )
+        self._nav_loc_refine_apply_min_score = min(
+            1.0, max(0.0, float(kw.get("nav_loc_refine_apply_min_score", 0.35)))
         )
         self._nav_loc_refine_settle_s = max(
             0.0, float(kw.get("nav_loc_refine_settle_s", 0.35))
@@ -139,6 +151,7 @@ class NavSupervisor:
         self._loc_refine_tries = 0
         self._loc_refine_cooldown_until = 0.0
         self._loc_refine_last_check = 0.0
+        self._loc_refine_last_pose: Optional[Pose2D] = None
         self._world = world
         self._inflation = inflation_radius_m
         # Driving clearance (half-width when a footprint is configured). Every
@@ -671,9 +684,18 @@ class NavSupervisor:
         holding = self._loc_refine_tries > 0
         if now < self._loc_refine_cooldown_until:
             return "hold" if holding else None
-        if now - self._loc_refine_last_check < self._nav_loc_refine_period_s:
+        traveled = 0.0
+        if self._loc_refine_last_pose is not None:
+            traveled = distance_m(pose, self._loc_refine_last_pose)
+        due_by_time = now - self._loc_refine_last_check >= self._nav_loc_refine_period_s
+        due_by_dist = (
+            self._nav_loc_refine_check_every_m > 0.0
+            and traveled >= self._nav_loc_refine_check_every_m
+        )
+        if not due_by_time and not due_by_dist:
             return "hold" if holding else None
         self._loc_refine_last_check = now
+        self._loc_refine_last_pose = pose
 
         verdict = self._measure_loc_disagreement(pose)
         if not verdict.disagree:
@@ -706,7 +728,12 @@ class NavSupervisor:
             status = str(result.get("status") or "")
         from .loc_consistency import residual_is_lost, small_local_match_worth_applying
 
-        if small_local_match_worth_applying(result):
+        if small_local_match_worth_applying(
+            result,
+            max_shift_m=self._nav_loc_refine_apply_max_m,
+            max_shift_deg=self._nav_loc_refine_apply_max_deg,
+            min_score=self._nav_loc_refine_apply_min_score,
+        ):
             self._publish_loc_refine_progress(
                 pose, dist_goal, verdict=verdict, status="applying"
             )
@@ -1051,6 +1078,7 @@ class NavSupervisor:
         self._loc_refine_tries = 0
         self._loc_refine_cooldown_until = 0.0
         self._loc_refine_last_check = 0.0
+        self._loc_refine_last_pose = None
         goal_dict = {"x": float(goal.x), "y": float(goal.y), "theta": float(goal.theta)}
         self._set_status(
             state="active",
