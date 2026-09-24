@@ -361,6 +361,57 @@ def test_local_costmap_marks_scan_hit():
     assert view.cost_at_world(2.0, 1.0) > 0
 
 
+def test_fused_depth_hit_marks_local_costmap_and_fails_nose_clear():
+    """Depth closer than lidar (outside the body-near phantom window)
+    must paint the local costmap and fail the nose-clear gate."""
+    from src.nav.simple_motion import ObstacleConfig, cone_min_range
+
+    n = 8
+    inc = math.pi / 4.0
+    lidar = conv.LaserScan2D(
+        ranges=np.full(n, 2.0),
+        angle_min=-math.pi,
+        angle_increment=inc,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    depth_r = np.full(n, np.nan)
+    fwd = 4  # -π + 4*(π/4) = 0
+    depth_r[fwd] = 0.30  # ankles / thin legs; phantom_max is 0.18 m
+    depth = conv.LaserScan2D(
+        ranges=depth_r,
+        angle_min=-math.pi,
+        angle_increment=inc,
+        range_min=0.05,
+        range_max=4.0,
+    )
+    fused = conv.merge_lidar_and_depth_scans(lidar, depth, num_bins=n)
+    assert float(np.nanmin(fused.ranges)) == pytest.approx(0.30)
+
+    pose = Pose2D(1.0, 1.0, 0.0)
+    cfg = LocalCostmapConfig(
+        width_m=2.0,
+        height_m=2.0,
+        resolution=0.05,
+        inflation_radius_m=0.05,
+        robot_radius_m=0.05,
+        use_global_static=False,
+        scan_persist_decay=0,
+    )
+    fused_view = LocalCostmap(cfg).update(pose, fused)
+    lidar_view = LocalCostmap(cfg).update(pose, lidar)
+    assert fused_view.cost_at_world(1.30, 1.0) > 0
+    assert lidar_view.cost_at_world(1.30, 1.0) == 0
+
+    obs = ObstacleConfig()
+    half = float(obs.front_cone_half_rad)
+    stop = float(obs.stop_distance_m)
+    nose_fused = cone_min_range(fused, -half, half)
+    nose_lidar = cone_min_range(lidar, -half, half)
+    assert nose_fused <= stop
+    assert nose_lidar > stop
+
+
 def test_path_cost_ahead_centerline_allows_fit_doorway():
     """An 84 cm gap leaves ~12 cm free beside a 59 cm-wide robot after
     footprint inflation. Centerline cost must stay below the block threshold;

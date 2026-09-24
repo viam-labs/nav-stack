@@ -456,9 +456,9 @@ class ViamWorldIO:
         primary: list[conv.LaserScan2D] = []
         depth_scans: list[conv.LaserScan2D] = []
         for lidar in self._lidars:
-            # Depth (obstacles_only) is for reactive slowing — not the rolling
-            # local costmap / DWA. Including it there caused phantom blobs and
-            # left/right chatter after the depth camera was added.
+            # Depth (obstacles_only) feeds avoidance: local costmap, DWA,
+            # reactive slowing, and nose_clear. include_obstacles_only=False
+            # is loc refine only — the occupancy map was built from lidar.
             if lidar.obstacles_only and not include_obstacles_only:
                 continue
             scan = self._read_lidar_scan_sync(lidar, max_age_s=max_age_s)
@@ -477,8 +477,7 @@ class ViamWorldIO:
         if not include_obstacles_only or not depth_scans:
             if not primary:
                 # Lidar-only was requested but no primary lidar answered —
-                # never fall back to depth (that defeats include_obstacles_only=
-                # False and reintroduces phantoms into nose_clear).
+                # never fall back to depth (loc refine must not see the camera).
                 return None
             merged = (
                 primary[0]

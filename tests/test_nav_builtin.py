@@ -1309,6 +1309,8 @@ class _FakeWorld:
         self.stop_calls = 0
         self.loc_hold = None
         self.scan = None
+        self.lidar_scan = None
+        self.scan_calls = []
         self.loc_checks = 0
         self.on_loc_check = None
 
@@ -1319,6 +1321,9 @@ class _FakeWorld:
         return self.pose
 
     def get_scan(self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True):
+        self.scan_calls.append(include_obstacles_only)
+        if not include_obstacles_only and self.lidar_scan is not None:
+            return self.lidar_scan
         return self.scan
 
     def get_localization_hold(self):
@@ -1928,6 +1933,59 @@ def _loc_refine_supervisor(world: _FakeWorld) -> NavSupervisor:
         nav_loc_refine_cooldown_s=0.0,
         nav_loc_refine_max_tries=2,
     )
+
+
+def test_lidar_scan_for_loc_refine_excludes_obstacles_only():
+    """Loc refine must read lidar-only; fused depth is for avoidance."""
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map())
+    fused = _open_scan(0.3)
+    lidar = _open_scan(4.0)
+    world.scan = fused
+    world.lidar_scan = lidar
+    sup = _loc_refine_supervisor(world)
+    got = sup._lidar_scan_for_loc_refine()  # noqa: SLF001
+    assert got is lidar
+    assert world.scan_calls == [False]
+
+
+def test_follow_loop_uses_fused_scan_for_local_costmap():
+    """Follow ticks request the fused scan; depth hits reach the local costmap."""
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    n = 8
+    inc = math.pi / 4.0
+    fused_r = np.full(n, 2.0)
+    fused_r[4] = 0.30
+    world.scan = conv.LaserScan2D(
+        fused_r,
+        angle_min=-math.pi,
+        angle_increment=inc,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    world.lidar_scan = conv.LaserScan2D(
+        np.full(n, 2.0),
+        angle_min=-math.pi,
+        angle_increment=inc,
+        range_min=0.05,
+        range_max=10.0,
+    )
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.10,
+        robot_radius_m=0.05,
+        avoid_obstacles=True,
+        local_costmap_enabled=True,
+        xy_tolerance_m=0.15,
+        timeout_s=1.5,
+        poll_interval_s=0.02,
+        nav_loc_refine_on_disagree=False,
+    )
+    sup.run_goal(Pose2D(1.6, 1.0, 0.0))
+    assert world.scan_calls
+    assert all(world.scan_calls)
+    view = sup._local_view_cache  # noqa: SLF001
+    assert view is not None
+    assert view.cost_at_world(1.30, 1.0) > 0
 
 
 def test_nav_loc_refine_resumes_when_disagreement_clears():

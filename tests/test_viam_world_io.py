@@ -694,7 +694,7 @@ def test_align_obstacles_scan_small_shift_still_warps():
 
 
 def test_get_scan_can_exclude_obstacles_only_lidars():
-    """Local costmap path must not merge depth into the rolling window."""
+    """Loc refine (include_obstacles_only=False) must not merge depth."""
     from src.config import LidarConfig
 
     world = ViamWorldIO(
