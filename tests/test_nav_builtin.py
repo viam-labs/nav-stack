@@ -1565,7 +1565,7 @@ def test_try_replan_holds_detour_against_short_flip():
     assert sup._detour_ban_path is not None
     assert bool(sup._last_replan_info.get("detour_hold")) is True
 
-    # Mid-detour periodic replan offers the short corridor again — refuse.
+    # Ban is goal-lifetime, not a wall-clock timer — still refuse later.
     flip = sup._try_replan(
         goal,
         world.pose,
@@ -1577,6 +1577,66 @@ def test_try_replan_holds_detour_against_short_flip():
     )
     assert flip is None
     assert "short-flip" in (sup._last_replan_error or "")
+    assert sup._detour_ban_path is not None
+
+
+def test_try_replan_lifts_detour_ban_when_no_alternate():
+    """If the detour dies and every banned attempt fails, lift once and take short."""
+    from src.nav_builtin.controller import _path_length
+    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav_builtin.types import PlanResult
+
+    m = _empty_map(size=120, resolution=0.05)
+    world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        clearance_preference_m=0.0,
+    )
+    goal = Pose2D(5.0, 3.0, 0.0)
+    short = plan_path(
+        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert short.feasible
+    long_path = Path2D(
+        points=((1.0, 3.0), (1.0, 5.0), (5.0, 5.0), (5.0, 3.0)),
+        goal_theta=0.0,
+    )
+    assert _path_length(long_path) > _path_length(short.path) * 1.15
+
+    phase = {"n": 0}
+
+    def scripted_plan(g, start=None, scan=None, **kwargs):
+        phase["n"] += 1
+        # First call: accept long detour. Later, with ban, refuse everything
+        # (simulate detour dead); after lift, return the short corridor.
+        if sup._detour_ban_path is None and phase["n"] == 1:
+            return PlanResult(feasible=True, path=long_path)
+        if sup._detour_ban_path is not None:
+            return PlanResult(
+                feasible=False,
+                path=Path2D(points=(), goal_theta=0.0),
+                error_msg="blocked",
+            )
+        return PlanResult(feasible=True, path=short.path)
+
+    sup.plan = scripted_plan  # type: ignore[method-assign]
+    accepted = sup._try_replan(
+        goal, world.pose, short.path, None, failed_count=1, require_different=True
+    )
+    assert accepted is not None
+    assert sup._detour_ban_path is not None
+
+    rescued = sup._try_replan(
+        goal, world.pose, accepted, None, failed_count=1, require_different=True
+    )
+    assert rescued is not None
+    assert not paths_meaningfully_differ(short.path, rescued, tol_m=0.12)
+    assert sup._detour_ban_path is None
 
 
 def test_plan_path_marks_local_costmap_for_replan():

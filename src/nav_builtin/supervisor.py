@@ -257,12 +257,12 @@ class NavSupervisor:
         # Last replan diagnostics for get_status (trigger + attempt outcomes).
         self._last_replan_trigger = ""
         self._last_replan_info: dict = {}
-        # After accepting a longer detour, refuse flipping back to a much
-        # shorter route for a while (short↔long replan thrash).
-        self._detour_hold_until = 0.0
-        self._detour_min_length_m = 0.0
+        # After accepting a longer detour, ban the abandoned short corridor for
+        # the rest of this goal (not a wall-clock timer — that just delayed the
+        # short↔long flip). Lifted only if the detour itself dies and no other
+        # route works.
         self._detour_ban_path: Optional[Path2D] = None
-        self._detour_hold_s = 12.0
+        self._detour_min_length_m = 0.0
         self._detour_short_ratio = 0.75
         self._io_timeout_streak = 0
         # Control-loop soak metrics (wall-clock tick vs configured period).
@@ -969,6 +969,7 @@ class NavSupervisor:
         failed_count: int = 0,
         local_view=None,
         trigger: str = "",
+        allow_lift_ban: bool = True,
     ) -> Optional[Path2D]:
         """Replan around a live block: mild peel first, forced side via last.
 
@@ -983,9 +984,10 @@ class NavSupervisor:
         - If every attempt is same-route/infeasible, force left/right vias
           around the first blocked path sample — that is the static-box case
           where Lazy Theta* stubbornly hugs the old corridor.
-        - After accepting a longer detour, hold that commitment: keep painting
-          the abandoned short corridor and reject much-shorter candidates so
-          we do not flip short→long→short every replan.
+        - After accepting a longer detour, ban the abandoned short corridor for
+          the rest of this goal: keep painting it and reject much-shorter /
+          matching candidates. A wall-clock hold only delayed the flip; lift
+          the ban only when the detour itself is dead and nothing else works.
         """
         from .controller import _path_length
         from .local_planner import path_cost_in_local_window
@@ -993,9 +995,8 @@ class NavSupervisor:
 
         old_len = _path_length(path)
         self._last_replan_trigger = str(trigger or "")
-        now = time.monotonic()
-        hold_active = now < self._detour_hold_until and self._detour_ban_path is not None
-        # Prefer painting the abandoned short corridor while the hold is live;
+        hold_active = self._detour_ban_path is not None
+        # Prefer painting the abandoned short corridor while the ban is live;
         # otherwise only escalate to corridor paint after a failed peel.
         attempts: list[tuple[str, bool]] = [("scan+local", False)]
         if hold_active or failed_count >= 1:
@@ -1027,10 +1028,13 @@ class NavSupervisor:
         def _reject_short_flip(candidate: Path2D, new_len: float) -> Optional[str]:
             if not hold_active:
                 return None
-            if new_len < self._detour_min_length_m:
+            if (
+                self._detour_min_length_m > 0.0
+                and new_len < self._detour_min_length_m
+            ):
                 return (
                     f"short-flip hysteresis ({new_len:.1f} m < "
-                    f"{self._detour_min_length_m:.1f} m hold)"
+                    f"{self._detour_min_length_m:.1f} m ban)"
                 )
             if ban_path is not None and not paths_meaningfully_differ(
                 ban_path, candidate, tol_m=differ_tol
@@ -1039,7 +1043,7 @@ class NavSupervisor:
             return None
 
         for label, paint in attempts:
-            # During a detour hold, always seal the abandoned short corridor —
+            # During a detour ban, always seal the abandoned short corridor —
             # never the path we just committed to.
             do_paint = paint or hold_active
             paint_path = ban_path if (hold_active and ban_path is not None) else path
@@ -1108,6 +1112,25 @@ class NavSupervisor:
             else:
                 reasons.append("forced-via: none feasible")
         if best is None:
+            # Detour itself is dead: drop the corridor ban once and retry.
+            # Do NOT lift when we only rejected short-flip candidates — that is
+            # the abandoned corridor still looking open, which is the thrash.
+            ban_was_only_reason = any("short-flip" in r for r in reasons)
+            if hold_active and allow_lift_ban and not ban_was_only_reason:
+                reasons.append("detour-ban: lifting (no alternate)")
+                self._detour_ban_path = None
+                self._detour_min_length_m = 0.0
+                return self._try_replan(
+                    goal,
+                    pose,
+                    path,
+                    scan,
+                    require_different=require_different,
+                    failed_count=failed_count,
+                    local_view=local_view,
+                    trigger=trigger,
+                    allow_lift_ban=False,
+                )
             self._last_replan_error = "; ".join(reasons)
             self._last_replan_info = {
                 "trigger": self._last_replan_trigger,
@@ -1143,15 +1166,14 @@ class NavSupervisor:
         goal: Pose2D,
         pose: Pose2D,
     ) -> None:
-        """Publish a accepted replan and start short-flip hysteresis if needed."""
+        """Publish an accepted replan and ban the abandoned short corridor."""
         self._last_replan_error = ""
-        hold = time.monotonic() < self._detour_hold_until
-        # Commit to a longer / different corridor: ban flipping back to short.
+        hold = self._detour_ban_path is not None
+        # Commit to a longer / different corridor for the rest of this goal.
         if (
             new_len > old_len * 1.15
             and paths_meaningfully_differ(old_path, new_path, tol_m=0.12)
         ):
-            self._detour_hold_until = time.monotonic() + self._detour_hold_s
             self._detour_min_length_m = max(
                 new_len * self._detour_short_ratio, old_len * 1.05
             )
@@ -1175,9 +1197,8 @@ class NavSupervisor:
         self._last_replan_error = ""
         self._last_replan_trigger = ""
         self._last_replan_info = {}
-        self._detour_hold_until = 0.0
-        self._detour_min_length_m = 0.0
         self._detour_ban_path = None
+        self._detour_min_length_m = 0.0
         self._loc_refine_tries = 0
         self._loc_refine_cooldown_until = 0.0
         self._loc_refine_last_check = 0.0
