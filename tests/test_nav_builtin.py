@@ -1516,6 +1516,69 @@ def test_try_replan_falls_back_to_scan_plan_and_records_reason():
     assert "same route" in sup._last_replan_error
 
 
+def test_try_replan_holds_detour_against_short_flip():
+    """After a longer detour, refuse flipping back to the abandoned short corridor."""
+    from src.nav_builtin.controller import _path_length
+    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav_builtin.types import PlanResult
+
+    m = _empty_map(size=120, resolution=0.05)
+    world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        clearance_preference_m=0.0,
+    )
+    goal = Pose2D(5.0, 3.0, 0.0)
+    short = plan_path(
+        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert short.feasible
+    long_path = Path2D(
+        points=((1.0, 3.0), (1.0, 5.0), (5.0, 5.0), (5.0, 3.0)),
+        goal_theta=0.0,
+    )
+    assert _path_length(long_path) > _path_length(short.path) * 1.15
+    assert paths_meaningfully_differ(short.path, long_path)
+
+    def scripted_plan(g, start=None, scan=None, **kwargs):
+        if sup._detour_ban_path is None:
+            return PlanResult(feasible=True, path=long_path)
+        return PlanResult(feasible=True, path=short.path)
+
+    sup.plan = scripted_plan  # type: ignore[method-assign]
+    accepted = sup._try_replan(
+        goal,
+        world.pose,
+        short.path,
+        None,
+        failed_count=1,
+        require_different=True,
+        trigger="test-detour",
+    )
+    assert accepted is not None
+    assert paths_meaningfully_differ(short.path, accepted)
+    assert sup._detour_ban_path is not None
+    assert bool(sup._last_replan_info.get("detour_hold")) is True
+
+    # Mid-detour periodic replan offers the short corridor again — refuse.
+    flip = sup._try_replan(
+        goal,
+        world.pose,
+        accepted,
+        None,
+        failed_count=0,
+        require_different=False,
+        trigger="periodic",
+    )
+    assert flip is None
+    assert "short-flip" in (sup._last_replan_error or "")
+
+
 def test_plan_path_marks_local_costmap_for_replan():
     """Local-costmap blob must force a different global path (scan can miss it)."""
     from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
