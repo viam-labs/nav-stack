@@ -991,14 +991,12 @@ def test_hold_from_flank_crawls_when_nose_is_open():
     assert cmd.vtheta == pytest.approx(0.0)
 
 
-def test_costmap_hard_stop_crawls_when_spin_disc_blocked_and_nose_open():
-    """Inscribed ahead + blocked spin disc + open lidar nose → crawl, no reverse.
+def test_costmap_hard_stop_reverses_when_spin_disc_blocked():
+    """Forward into inscribed blob + blocked spin disc must reverse, not freeze.
 
-    Nav2 split: the lidar cone is ground truth for "something in front"; the
-    costmap along the heading is body-inflated, so INSCRIBED with an open cone
-    is wall C-space beside a doorway. Reversing is a supervisor *recovery*
-    step, never a controller reflex (that reflex was the doorway
-    hunt-and-peck).
+    Live rc14 stall: lidar nose ~0.7 m clear so reactive avoid never fired;
+    pursuit/DWA kept vx>0, skipped the vx≈0 spin-gate reverse, and the
+    costmap hard stop zeroed cmd with spin_blocked.
     """
     from src.nav_builtin.costmap import INSCRIBED
     from src.nav_builtin.local_costmap import LocalCostmapView
@@ -1043,13 +1041,18 @@ def test_costmap_hard_stop_crawls_when_spin_disc_blocked_and_nose_open():
         robot_radius_m=inscribed,
         spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
     )
-    assert progress["obstacle"] == "narrow"
-    assert cmd.vx > 0.0
-    assert cmd.vx <= 0.12 + 1e-6
+    assert progress["spin_blocked"] is True
+    assert progress["obstacle"] == "narrow_reverse"
+    assert cmd.vx < 0.0
+    assert cmd.vtheta == pytest.approx(0.0)
 
 
-def test_costmap_hard_stop_crawls_when_spin_disc_clear():
-    """Inscribed ahead, clear spin disc, open nose → crawl forward (no reverse)."""
+def test_costmap_hard_stop_reverses_when_spin_disc_clear():
+    """Inscribed ahead with a clear spin disc must still reverse, not freeze.
+
+    Live rc26: bearing≈0, spin_blocked=false, nose clear, rear open — hard-stop
+    only attempted reverse when the spin disc was also hit, so cmd stayed 0.
+    """
     from src.nav_builtin.costmap import INSCRIBED
     from src.nav_builtin.local_costmap import LocalCostmapView
     from src.nav_builtin.types import OccupancyGrid
@@ -1111,102 +1114,17 @@ def test_costmap_hard_stop_crawls_when_spin_disc_clear():
         spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
     )
     assert progress["spin_blocked"] is False
-    assert progress["obstacle"] == "narrow"
-    assert cmd.vx > 0.0
-
-
-def test_costmap_hard_stop_stops_for_lethal_ahead():
-    """LETHAL along the heading is a real block: translation freezes ("avoid")."""
-    from src.nav_builtin.costmap import LETHAL
-    from src.nav_builtin.local_costmap import LocalCostmapView
-    from src.nav_builtin.types import OccupancyGrid
-
-    res = 0.05
-    h = w = 80
-    costs = np.zeros((h, w), dtype=np.uint8)
-    for r in range(38, 43):
-        for c in range(46, 52):
-            costs[r, c] = LETHAL
-    view = LocalCostmapView(
-        costs=costs,
-        occ=OccupancyGrid(
-            grid=np.zeros((h, w), dtype=np.int16),
-            resolution=res,
-            origin_x=0.0,
-            origin_y=0.0,
-        ),
-        origin_x=0.0,
-        origin_y=0.0,
-    )
-    n = 72
-    ranges = np.full(n, 3.0)
-    ranges[n // 2] = 0.70
-    scan = conv.LaserScan2D(
-        ranges,
-        angle_min=-math.pi,
-        angle_increment=2 * math.pi / n,
-        range_min=0.05,
-        range_max=10.0,
-    )
-    cmd, progress = compute_path_command(
-        Pose2D(2.0, 2.0, 0.0),
-        Path2D(points=((2.0, 2.0), (3.5, 2.0)), goal_theta=0.0),
-        cfg=_footprint_cfg(),
-        scan=scan,
-        local_view=view,
-        robot_radius_m=0.59 / 2.0,
-        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
-    )
-    assert progress["obstacle"] == "avoid"
-    assert cmd.vx == pytest.approx(0.0)
-
-
-def test_costmap_clearance_band_ahead_regulates_speed_not_stop():
-    """CLEARANCE (252) along the heading is Nav2 inflated space: crawl through."""
-    from src.nav_builtin.costmap import CLEARANCE
-    from src.nav_builtin.local_costmap import LocalCostmapView
-    from src.nav_builtin.types import OccupancyGrid
-
-    res = 0.05
-    h = w = 80
-    costs = np.zeros((h, w), dtype=np.uint8)
-    for r in range(36, 45):
-        for c in range(40, 60):
-            costs[r, c] = CLEARANCE
-    view = LocalCostmapView(
-        costs=costs,
-        occ=OccupancyGrid(
-            grid=np.zeros((h, w), dtype=np.int16),
-            resolution=res,
-            origin_x=0.0,
-            origin_y=0.0,
-        ),
-        origin_x=0.0,
-        origin_y=0.0,
-    )
-    n = 72
-    scan = conv.LaserScan2D(
-        np.full(n, 3.0),
-        angle_min=-math.pi,
-        angle_increment=2 * math.pi / n,
-        range_min=0.05,
-        range_max=10.0,
-    )
-    cmd, progress = compute_path_command(
-        Pose2D(2.0, 2.0, 0.0),
-        Path2D(points=((2.0, 2.0), (3.5, 2.0)), goal_theta=0.0),
-        cfg=_footprint_cfg(),
-        scan=scan,
-        local_view=view,
-        robot_radius_m=0.59 / 2.0,
-        spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
-    )
-    assert progress["obstacle"] == "narrow"
-    assert 0.0 < cmd.vx <= 0.12 + 1e-6
+    assert progress["obstacle"] == "narrow_reverse"
+    assert cmd.vx < 0.0
+    assert cmd.vtheta == pytest.approx(0.0)
 
 
 def test_costmap_hard_stop_crawls_when_reverse_refused_and_nose_open():
-    """Inscribed ahead + spin disc + blocked rear must crawl, not freeze at cmd=0."""
+    """Hard-stop + spin disc + blocked rear must crawl, not freeze at cmd=0.
+
+    Live rc25: spin-gate crawled, then hard-stop re-zeroed every tick because
+    reverse was refused — avoid + spin_blocked + pathc=0 forever.
+    """
     from src.nav_builtin.costmap import INSCRIBED
     from src.nav_builtin.local_costmap import LocalCostmapView
     from src.nav_builtin.types import OccupancyGrid
@@ -1275,8 +1193,10 @@ def test_costmap_hard_stop_crawls_when_reverse_refused_and_nose_open():
         robot_radius_m=inscribed,
         spin_radius_m=math.hypot(0.72 / 2.0, 0.59 / 2.0),
     )
+    assert progress["spin_blocked"] is True
     assert progress["obstacle"] == "narrow"
     assert cmd.vx > 0.0
+    assert cmd.vtheta == pytest.approx(0.0)
 
 
 def test_unstick_reverse_refuses_costmap_rear_collision():

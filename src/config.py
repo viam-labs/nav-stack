@@ -493,10 +493,7 @@ class BuiltinNavConfig:
     local_costmap_rate_hz: float = 5.0
     local_planner_enabled: bool = True
     local_planner_sim_time_s: float = 1.5
-    # Nav2 semantics: the route is "blocked" only when its centerline enters
-    # INSCRIBED (253, body overlaps an obstacle) or LETHAL. Soft / clearance
-    # cost (<= 252) is traversable at reduced speed, never a reason to detour.
-    local_planner_activate_cost: int = 253
+    local_planner_activate_cost: int = 200
     local_planner_max_vel_x_mps: float = 0.25
     local_planner_max_vel_x_reverse_m: float = 0.15
     # Backup when local planner spins in place with clear rear space.
@@ -1173,10 +1170,10 @@ class NavConfig:
     # uses the half-width and rotation uses the half-diagonal instead.
     footprint_length_m: Optional[float] = None
     footprint_width_m: Optional[float] = None
-    # Preferred clearance past the body, on each side (metres). Nav2 semantics:
-    # the body disk is INSCRIBED (non-traversable); this ring is CLEARANCE
-    # (252) — traversable at a critical cost / crawl speed so tight doorways
-    # that fit the body stay passable. Same for global and local costmaps.
+    # Hard buffer past the body, on each side (metres). Used as the inscribed
+    # radius for *both* the global planner costmap and the local costmap:
+    # ``inscribed_radius_m() + clearance_m``. Soft inflation (if any) starts
+    # outside this. ``0`` keeps today's body-only hard disk.
     clearance_m: float = 0.2
     max_vel_x: float = 0.6  # m/s
     max_vel_y: float = 0.0  # m/s (omni only)
