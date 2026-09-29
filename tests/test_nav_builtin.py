@@ -720,6 +720,25 @@ def test_plan_rejects_large_goal_snap():
     assert "goal snap" in (bad.error_msg or "")
 
 
+def test_plan_start_snap_never_jumps_through_obstacle():
+    """Start sealed in a dead-end corridor must fail, not snap past the plug."""
+    from src.nav_builtin.planner import plan_on_costmap
+    from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+
+    grid = np.full((40, 120), 100, dtype=np.int16)
+    grid[18:23, 5:115] = 0  # 0.25 m corridor: robot centre cells are inscribed
+    grid[10:30, 50:115] = 0  # open room past the plug, within snap radius
+    grid[18:23, 40:44] = 100  # plug
+    m = {"grid": grid, "resolution": 0.05, "origin_x": 0.0, "origin_y": 0.0}
+    occ = occupancy_from_map_dict(m)
+    costs = build_costmap(occ, inflation_radius_m=0.3, robot_radius_m=0.3)
+    start = Pose2D(1.8, 1.02, 0.0)
+    goal = Pose2D(5.0, 1.02, 0.0)
+    result = plan_on_costmap(occ, costs, start, goal, robot_radius_m=0.3)
+    assert result.feasible is False
+    assert "start" in (result.error_msg or "")
+
+
 def test_plan_does_not_double_inflate_goal_snap():
     """Goal on an already-inflated map must snap by cell, not another footprint.
 

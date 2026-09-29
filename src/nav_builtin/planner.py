@@ -10,6 +10,7 @@ import numpy as np
 
 from .costmap import (
     INSCRIBED,
+    LETHAL,
     build_costmap,
     costmap_viz_dict,
     footprint_traversable,
@@ -660,6 +661,31 @@ def connect_plan_start(
     return out
 
 
+def _segment_crosses_lethal(
+    costs: np.ndarray,
+    occ: OccupancyGrid,
+    a: Tuple[float, float],
+    b: Tuple[float, float],
+) -> bool:
+    dist = math.hypot(b[0] - a[0], b[1] - a[1])
+    if dist <= float(occ.resolution):
+        return False
+    h, w = costs.shape
+    n = int(math.ceil(dist / (0.5 * float(occ.resolution))))
+    # Lethal cells the robot already stands on (a stray mark under the base)
+    # may be escaped; re-entering lethal after reaching free space may not.
+    left_start = False
+    for i in range(0, n):
+        t = i / n
+        r, c = occ.world_to_cell(a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+        lethal = 0 <= r < h and 0 <= c < w and int(costs[r, c]) == LETHAL
+        if lethal and left_start:
+            return True
+        if not lethal:
+            left_start = True
+    return False
+
+
 def plan_on_costmap(
     occ: OccupancyGrid,
     costs: np.ndarray,
@@ -704,6 +730,13 @@ def plan_on_costmap(
                 else None
             )
         )
+    if start_xy is not None and _segment_crosses_lethal(
+        costs, occ, (start.x, start.y), start_xy
+    ):
+        # Snapping out of our own inflation is fine; snapping *through* an
+        # obstacle (to the free side of a plug) is a teleport.
+        start_xy = None
+        start_cell = None
     gr, gc = occ.world_to_cell(goal.x, goal.y)
     goal_cell = nearest_free_cell(
         costs, gr, gc, max_radius_cells=snap_radius_cells
@@ -842,7 +875,14 @@ def plan_path(
             local_view,
             radius_m=hit_r,
         )
-        if blocked_path is not None and blocked_path_pose is not None:
+        # The seal is a corridor paint: a 0.35 m band on the old centerline
+        # also closes the free side when the obstacle only clips one shoulder
+        # (bin just past a doorway: every replan "no feasible path").
+        if (
+            paint_corridor
+            and blocked_path is not None
+            and blocked_path_pose is not None
+        ):
             seal_r = max(0.22, min(float(robot_radius_m) + 0.05, 0.35))
             occ = mark_path_block_from_local(
                 occ,

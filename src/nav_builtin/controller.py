@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
 
 from ..nav.simple_motion import (
@@ -19,6 +19,7 @@ from ..nav.simple_motion import (
     spin_clearance_m,
 )
 from ..geom import conversions as conv
+from .footprint_guard import FootprintGuard, obstacle_points
 from .local_costmap import LocalCostmapView, reverse_path_clear, spin_disc_blocked
 from .local_planner import LocalPlannerConfig, compute_local_command
 from .path_utils import closest_point_on_path, signed_crosstrack_m
@@ -603,6 +604,7 @@ def compute_path_command(
     rotate_active: bool = False,
     prev_cmd: Optional[DriveCommand] = None,
     force_local_planner: bool = False,
+    guard: Optional[FootprintGuard] = None,
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``.
 
@@ -612,7 +614,30 @@ def compute_path_command(
     ``force_local_planner`` lets DWA run with a large bearing error when the
     path is locally blocked — otherwise rotate-in-place spins forever while
     replans fail and the detour never starts.
+
+    With ``guard`` (the rectangular footprint), the nominal command is shaped
+    only by :class:`FootprintGuard` — the legacy lidar-cone / spin-gate /
+    centerline hard-stop layers below are skipped.
     """
+    guard_pts = None
+    tight = False
+    if guard is not None:
+        guard_pts = obstacle_points(
+            current, scan, local_view, radius_m=guard.cfg.obstacle_radius_m
+        )
+        # Tight space (body within ~20 cm of something): track the path
+        # closely. The long, deadbanded lookahead that calms open-floor
+        # jitter leaves a 10 cm offset out of every bend — the whole margin
+        # of a 0.9 m corridor for a 0.59 m robot.
+        tight = guard.clearance(current, guard_pts) < _TIGHT_CLEARANCE_M
+        if tight:
+            cfg = replace(
+                cfg,
+                lookahead_m=_TIGHT_LOOKAHEAD_M,
+                min_lookahead_m=_TIGHT_LOOKAHEAD_M,
+                max_lookahead_m=_TIGHT_LOOKAHEAD_M + 0.2,
+                crosstrack_deadband_m=0.01,
+            )
     est_speed = cfg.motion.max_linear_mps * 0.5 if speed_mps is None else speed_mps
     goal_xy = Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
     dist_goal = distance_m(current, goal_xy)
@@ -640,7 +665,8 @@ def compute_path_command(
     local_active = False
     bearing_ok = abs(bearing) <= cfg.rotate_in_place_rad or force_local_planner
     if (
-        local_view is not None
+        guard is None
+        and local_view is not None
         and local_planner is not None
         and not near_goal
         and bearing_ok
@@ -679,6 +705,47 @@ def compute_path_command(
                 prev_cmd=prev_cmd,
             )
             cmd = apply_velocity_floor(cmd, cfg.motion)
+
+    if (
+        guard is not None
+        and local_active
+        and abs(cmd.vx) < 0.02
+        and abs(cmd.vtheta) < 0.05
+        and not (is_final or near_goal)
+    ):
+        # DWA scores a circle against inflated costs; straddling a doorway
+        # it finds no sample and returns zero. The footprint guard knows the
+        # actual rectangle — hand it pursuit and let it pick the free arc.
+        cmd, rotating = pursuit_command(
+            current, target, cfg=cfg, rotate_active=rotate_active, prev_cmd=prev_cmd
+        )
+        cmd = apply_velocity_floor(cmd, cfg.motion)
+        local_active = False
+
+    if guard is not None:
+        return _guarded_command(
+            current,
+            path,
+            cmd,
+            guard=guard,
+            cfg=cfg,
+            scan=scan,
+            local_view=local_view,
+            target=target,
+            dist_goal=dist_goal,
+            local_active=local_active,
+            prev_cmd=prev_cmd,
+            pts=guard_pts,
+            meta={
+                "tight": tight,
+                "waypoint_index": idx,
+                "is_final": is_final,
+                "bearing_error_rad": bearing,
+                "crosstrack_m": crosstrack,
+                "lookahead_m": lookahead,
+                "rotate_to_heading": rotating,
+            },
+        )
 
     obstacle_state = "clear"
     forward_clearance = math.inf
@@ -1010,6 +1077,86 @@ def compute_path_command(
         "crosstrack_m": crosstrack,
         "lookahead_m": lookahead,
         "rotate_to_heading": rotating,
+        "cmd_vx_mps": cmd.vx,
+        "cmd_vy_mps": cmd.vy,
+        "cmd_vtheta_rad_s": cmd.vtheta,
+        "pose_cost": (
+            int(local_view.cost_at_world(current.x, current.y))
+            if local_view is not None
+            else None
+        ),
+    }
+    return cmd, progress
+
+
+_TIGHT_CLEARANCE_M = 0.20
+_TIGHT_LOOKAHEAD_M = 0.6
+
+# Guard outcome → progress["obstacle"] (supervisor vocabulary).
+_GUARD_STATE = {
+    "clear": "clear",
+    "slow": "slow",
+    "steer": "narrow",
+    "rotate": "avoid",
+    "blocked": "avoid",
+}
+
+
+def _guarded_command(
+    current: Pose2D,
+    path: Path2D,
+    cmd: DriveCommand,
+    *,
+    guard: FootprintGuard,
+    cfg: FollowerConfig,
+    scan: Optional[conv.LaserScan2D],
+    local_view: Optional[LocalCostmapView],
+    target: Pose2D,
+    dist_goal: float,
+    local_active: bool,
+    prev_cmd: Optional[DriveCommand],
+    pts,
+    meta: dict,
+) -> Tuple[DriveCommand, dict]:
+    obstacle_on = cfg.obstacle is not None and cfg.obstacle.enabled
+    straight = guard.free_distance(current, 0.2, 0.0, pts, 2.0)
+    forward_clearance = (
+        None if not math.isfinite(straight) else straight + guard.cfg.length_m / 2.0
+    )
+    spin_blocked = False
+    if obstacle_on and scan is None:
+        cmd = DriveCommand(0.0, 0.0, cmd.vtheta, cmd.done)
+        state = "no_scan"
+    else:
+        in_tolerance = dist_goal <= cfg.motion.xy_tolerance_m
+        prefer = 0.0
+        if prev_cmd is not None and abs(prev_cmd.vtheta) > 0.05:
+            prefer = math.copysign(1.0, prev_cmd.vtheta)
+        res = guard.guard(
+            current,
+            cmd.vx,
+            cmd.vtheta,
+            pts,
+            target=target,
+            max_dist_m=dist_goal,
+            prefer_sign=prefer,
+            allow_steer=not in_tolerance,
+        )
+        spin_blocked = res.rotation_blocked
+        state = _GUARD_STATE[res.state]
+        if local_active and state in ("clear", "slow"):
+            state = "local_planner"
+        cmd = DriveCommand(res.vx, cmd.vy, res.vtheta, cmd.done)
+    progress = {
+        **meta,
+        "local_planner": local_active,
+        "distance_remaining_m": distance_m(
+            current, Pose2D(path.points[-1][0], path.points[-1][1], 0.0)
+        ),
+        "path_length_m": _path_length(path),
+        "obstacle": state,
+        "spin_blocked": spin_blocked,
+        "forward_clearance_m": forward_clearance,
         "cmd_vx_mps": cmd.vx,
         "cmd_vy_mps": cmd.vy,
         "cmd_vtheta_rad_s": cmd.vtheta,

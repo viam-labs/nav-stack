@@ -23,6 +23,7 @@ from .controller import (
     limit_twist_rate,
     update_speed_estimate,
 )
+from .footprint_guard import FootprintGuard, GuardConfig, obstacle_points
 from .local_costmap import (
     LocalCostmap,
     LocalCostmapConfig,
@@ -42,6 +43,9 @@ from .planner import (
 from .smoother import smooth_path, smooth_plan_path
 from .types import NavStatus, Path2D, PlanResult, Pose2D
 from .world_io import WorldIO
+
+
+_BLOCKED_REPLAN_FAIL_LIMIT = 8
 
 
 class NavSupervisor:
@@ -181,6 +185,18 @@ class NavSupervisor:
             if wheel_half_track_m
             else 0.6 * float(robot_radius_m)
         )
+        # Rectangular collision guard: exact body (half-length = nose offset,
+        # half-width = body radius); clearance_m sets the keep-out padding.
+        self._guard: Optional[FootprintGuard] = None
+        if bool(kw.get("footprint_guard", True)):
+            clearance = max(0.0, float(robot_radius_m) - float(self._body_radius))
+            self._guard = FootprintGuard(
+                GuardConfig(
+                    length_m=2.0 * nose_offset,
+                    width_m=2.0 * float(self._body_radius),
+                    padding_m=min(max(clearance, 0.04), 0.08),
+                )
+            )
         self._cost_scaling = cost_scaling_factor
         self._clearance_preference_m = max(0.0, float(clearance_preference_m))
         self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
@@ -1315,6 +1331,11 @@ class NavSupervisor:
             pose_jump_replan_m = 1.5
             was_loc_holding = False
             pending_loc_replan = False
+            # Consecutive failed blocked-replans; reset only by a successful
+            # replan or real progress toward the goal (not by a one-tick
+            # local_blocked flicker).
+            blocked_fail_count = 0
+            blocked_fail_dist: Optional[float] = None
 
             while time.monotonic() < deadline:
                 tick_started = time.monotonic()
@@ -1332,6 +1353,12 @@ class NavSupervisor:
                         error_msg="map pose unavailable",
                     )
                     return
+                if (
+                    blocked_fail_dist is not None
+                    and distance_m(pose, goal) < blocked_fail_dist - 0.5
+                ):
+                    blocked_fail_count = 0
+                    blocked_fail_dist = None
 
                 self._set_status(
                     pose={"x": pose.x, "y": pose.y, "theta": pose.theta}
@@ -1521,7 +1548,27 @@ class NavSupervisor:
                 nose_clear = True
                 forward_clearance_m: Optional[float] = None
                 obs_cfg = self._follower.obstacle
-                if obs_cfg is not None and obs_cfg.enabled and scan is not None:
+                if self._guard is not None:
+                    # Nose = can the rectangle move forward at all (straight
+                    # or on some arc)? Not a padded lidar cone.
+                    guard_pts = obstacle_points(
+                        pose,
+                        scan,
+                        local_view,
+                        radius_m=self._guard.cfg.obstacle_radius_m,
+                    )
+                    straight = self._guard.free_distance(
+                        pose, 0.2, 0.0, guard_pts, 2.0
+                    )
+                    if math.isfinite(straight):
+                        forward_clearance_m = straight + self._guard.cfg.length_m / 2.0
+                    nose_clear = straight >= self._guard.cfg.alt_min_free_m or (
+                        self._guard.best_forward_arc(
+                            pose, guard_pts, None, self._guard.cfg.horizon_m, 0.0
+                        )
+                        is not None
+                    )
+                elif obs_cfg is not None and obs_cfg.enabled and scan is not None:
                     half = float(obs_cfg.front_cone_half_rad)
                     nose_range = cone_min_range(scan, -half, half)
                     if math.isfinite(nose_range):
@@ -1589,8 +1636,13 @@ class NavSupervisor:
                     if local_blocked_since is None:
                         local_blocked_since = now
                     blocked_for = now - local_blocked_since
-                    cooldown_ready = (
-                        now - last_local_replan_at >= self._replan_local_min_period_s
+                    # Exponential backoff between failed blocked-replans: each
+                    # attempt is a full-map plan, and retrying every 0.5 s
+                    # forever starved the control loop on the Pi.
+                    cooldown_ready = now - last_local_replan_at >= min(
+                        8.0,
+                        self._replan_local_min_period_s
+                        * (2.0 ** min(blocked_fail_count, 4)),
                     )
                     # How long since real motion while peeling with a clear nose.
                     peel_stuck_s = (
@@ -1661,8 +1713,29 @@ class NavSupervisor:
                             local_planner_active = False
                             prev_cmd = None
                             rotate_active = False
+                            blocked_fail_count = 0
+                            blocked_fail_dist = None
                         else:
                             failed_replan_while_blocked += 1
+                            blocked_fail_count += 1
+                            if blocked_fail_dist is None:
+                                blocked_fail_dist = distance_m(pose, goal)
+                            # Nav2 BT semantics: bounded retries, then fail —
+                            # not an infinite replan loop in front of a plug.
+                            if (
+                                blocked_fail_count >= _BLOCKED_REPLAN_FAIL_LIMIT
+                                and not nose_clear
+                            ):
+                                self._world.stop()
+                                self._set_status(
+                                    state="failed",
+                                    active=False,
+                                    error_msg=(
+                                        "path blocked: no route around obstacle "
+                                        f"({blocked_fail_count} replans failed)"
+                                    ),
+                                )
+                                return
                 else:
                     local_blocked_since = None
                     failed_replan_while_blocked = 0
@@ -1700,6 +1773,7 @@ class NavSupervisor:
                     rotate_active=rotate_active,
                     prev_cmd=prev_cmd,
                     force_local_planner=force_local,
+                    guard=self._guard,
                 )
                 rotate_active = bool(progress.get("rotate_to_heading"))
                 local_planner_active = bool(progress.get("local_planner"))
@@ -2134,7 +2208,47 @@ class NavSupervisor:
                 # source handoffs (pursuit ↔ DWA ↔ avoid ↔ post-replan resume)
                 # ramp instead of stepping. Status and stall detection below use
                 # the limited command, which is what the base actually gets.
+                pre_limit = cmd
                 cmd = self._rate_limited(cmd)
+                if self._guard is not None and not cmd.done:
+                    # Reduce-only veto on whatever is about to go to the base
+                    # (slew-limited pursuit, backup, recovery spins).
+                    veto_pts = guard_pts
+
+                    def _veto(c: DriveCommand):
+                        return self._guard.guard(
+                            pose,
+                            c.vx,
+                            c.vtheta,
+                            veto_pts,
+                            max_dist_m=distance_m(pose, goal),
+                            allow_steer=False,
+                        )
+
+                    def _reduced(c: DriveCommand, v) -> bool:
+                        return abs(v.vx) < abs(c.vx) - 1e-9 or abs(v.vtheta) < abs(
+                            c.vtheta
+                        ) - 1e-9
+
+                    veto = _veto(cmd)
+                    if _reduced(cmd, veto) and abs(pre_limit.vx) > 1e-6:
+                        # The slew limiter ramps ω slower than v, which
+                        # straightens the arc the guard approved — through a
+                        # doorway that clips the jamb. Keep the approved
+                        # curvature at the ramped speed instead.
+                        same_arc = DriveCommand(
+                            cmd.vx,
+                            cmd.vy,
+                            pre_limit.vtheta * (cmd.vx / pre_limit.vx),
+                            cmd.done,
+                        )
+                        arc_veto = _veto(same_arc)
+                        if not _reduced(same_arc, arc_veto):
+                            cmd, veto = same_arc, arc_veto
+                            self._last_sent_cmd = cmd
+                    if _reduced(cmd, veto):
+                        cmd = DriveCommand(veto.vx, cmd.vy, veto.vtheta, cmd.done)
+                        self._last_sent_cmd = cmd
                 progress = {
                     **progress,
                     "cmd_vx_mps": cmd.vx,
