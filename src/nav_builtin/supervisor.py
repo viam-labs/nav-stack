@@ -977,6 +977,7 @@ class NavSupervisor:
         local_view=None,
         trigger: str = "",
         allow_lift_ban: bool = True,
+        force_lift_short_flip: bool = False,
     ) -> Optional[Path2D]:
         """Replan around a live block: mild peel first, forced side via last.
 
@@ -1120,10 +1121,13 @@ class NavSupervisor:
                 reasons.append("forced-via: none feasible")
         if best is None:
             # Detour itself is dead: drop the corridor ban once and retry.
-            # Do NOT lift when we only rejected short-flip candidates — that is
-            # the abandoned corridor still looking open, which is the thrash.
+            # Normally do NOT lift when we only rejected short-flip candidates
+            # (that is the thrash). Exception: path is actually blocked /
+            # pose-jump recovery needs any escape (force_lift_short_flip).
             ban_was_only_reason = any("short-flip" in r for r in reasons)
-            if hold_active and allow_lift_ban and not ban_was_only_reason:
+            if hold_active and allow_lift_ban and (
+                not ban_was_only_reason or force_lift_short_flip
+            ):
                 reasons.append("detour-ban: lifting (no alternate)")
                 self._detour_ban_path = None
                 self._detour_min_length_m = 0.0
@@ -1137,6 +1141,7 @@ class NavSupervisor:
                     local_view=local_view,
                     trigger=trigger,
                     allow_lift_ban=False,
+                    force_lift_short_flip=False,
                 )
             self._last_replan_error = "; ".join(reasons)
             self._last_replan_info = {
@@ -1986,10 +1991,13 @@ class NavSupervisor:
                             from_pose=pose,
                             ahead_m=path_block_horizon_m,
                         )
-                    # Large localization corrections invalidate the old polyline;
-                    # force a replan even if the first few metres still look free.
-                    if pose_jumped:
-                        static_blocked = True
+                    # Large localization corrections used to force a replan even
+                    # when the polyline was still free — that stop+replan looped
+                    # forever under the detour ban (short-flip rejected every
+                    # shorter candidate, pending_loc_replan never cleared).
+                    # Soft loc nudge with a clear path: keep following.
+                    if pose_jumped and not static_blocked:
+                        pending_loc_replan = False
 
                 backup_exhausted = (
                     backup_attempts >= self._backup_max_attempts and local_blocked
@@ -2027,10 +2035,17 @@ class NavSupervisor:
                         failed_count=failed_replan_while_blocked if local_blocked else 0,
                         local_view=local_view,
                         trigger=_trig,
+                        # Path is actually blocked: do not let the goal-lifetime
+                        # detour ban refuse every shorter escape.
+                        allow_lift_ban=True,
+                        force_lift_short_flip=bool(static_blocked),
                     )
                     replan_finished = time.monotonic()
                     last_local_replan_at = replan_finished
                     last_replan = replan_finished
+                    # Always drop the loc-replan latch — otherwise a failed
+                    # attempt (short-flip / infeasible) stop-replans forever.
+                    pending_loc_replan = False
                     if new_path is not None:
                         path = new_path
                         last_progress_at = now
@@ -2040,7 +2055,6 @@ class NavSupervisor:
                         backup_attempts = 0
                         vx_sign_history.clear()
                         spin_stuck_since = None
-                        pending_loc_replan = False
                     elif static_blocked:
                         failed_static_replan += 1
                         clearance = progress.get("forward_clearance_m")

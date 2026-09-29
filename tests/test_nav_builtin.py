@@ -1639,6 +1639,68 @@ def test_try_replan_lifts_detour_ban_when_no_alternate():
     assert sup._detour_ban_path is None
 
 
+def test_try_replan_force_lifts_short_flip_when_path_blocked():
+    """Static/pose recovery must not stay stuck forever on the detour ban."""
+    from src.nav_builtin.controller import _path_length
+    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav_builtin.types import PlanResult
+
+    m = _empty_map(size=120, resolution=0.05)
+    world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        clearance_preference_m=0.0,
+    )
+    goal = Pose2D(5.0, 3.0, 0.0)
+    short = plan_path(
+        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert short.feasible
+    long_path = Path2D(
+        points=((1.0, 3.0), (1.0, 5.0), (5.0, 5.0), (5.0, 3.0)),
+        goal_theta=0.0,
+    )
+    assert _path_length(long_path) > _path_length(short.path) * 1.15
+
+    calls = {"n": 0}
+
+    def scripted_plan(g, start=None, scan=None, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return PlanResult(feasible=True, path=long_path)
+        return PlanResult(feasible=True, path=short.path)
+
+    sup.plan = scripted_plan  # type: ignore[method-assign]
+    accepted = sup._try_replan(
+        goal, world.pose, short.path, None, failed_count=1, require_different=True
+    )
+    assert accepted is not None and sup._detour_ban_path is not None
+
+    # Without force: short-flip keeps the ban.
+    stuck = sup._try_replan(
+        goal, world.pose, accepted, None, failed_count=0, require_different=False
+    )
+    assert stuck is None and sup._detour_ban_path is not None
+
+    # With force (static blocked recovery): lift and take the short escape.
+    rescued = sup._try_replan(
+        goal,
+        world.pose,
+        accepted,
+        None,
+        failed_count=0,
+        require_different=False,
+        force_lift_short_flip=True,
+    )
+    assert rescued is not None
+    assert not paths_meaningfully_differ(short.path, rescued, tol_m=0.12)
+
+
 def test_plan_path_marks_local_costmap_for_replan():
     """Local-costmap blob must force a different global path (scan can miss it)."""
     from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
