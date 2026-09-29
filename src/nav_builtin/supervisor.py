@@ -2200,6 +2200,14 @@ class NavSupervisor:
                 stall_scale = 2.0 if near_goal_stall else 1.0
                 if local_blocked:
                     stall_scale = max(stall_scale, 4.0)
+                # Clear-nose C-space pinch (pathc=253, local_blocked=false after
+                # rc22): slow pursuit must get the same grace or stall aborts
+                # the goal while crawling a doorway.
+                elif nose_clear and path_ahead_cost >= self._local_planner_activate_cost:
+                    from .costmap import LETHAL
+
+                    if path_ahead_cost < int(LETHAL):
+                        stall_scale = max(stall_scale, 4.0)
                 stall_limit_s = self._follower.motion.stall_timeout_s * stall_scale
                 bearing_err = abs(float(progress.get("bearing_error_rad", 0.0)))
                 spinning = (
@@ -2221,13 +2229,12 @@ class NavSupervisor:
                     nonlocal last_progress_bearing, last_replan
                     nonlocal last_local_replan_at, local_blocked_since, backup_attempts
                     nonlocal failed_replan_while_blocked
-                    # Path centerline free + lidar nose clear: another stop/replan
-                    # cannot help (rc21: "cannot reach plan start" forever). Let
-                    # the follower crawl/reverse on the existing path instead.
-                    if (
-                        path_ahead_cost < self._local_planner_activate_cost
-                        and nose_clear
-                    ):
+                    from .costmap import LETHAL
+
+                    # Clear nose + non-lethal path: C-space pinch / slow crawl.
+                    # Stop-replan cannot help and was failing goals (live rc22:
+                    # stall with pathc=253, nose_clear, local_blocked=false).
+                    if nose_clear and path_ahead_cost < int(LETHAL):
                         last_progress_at = now
                         return False
                     _trig = f"stall:{error_msg}"
