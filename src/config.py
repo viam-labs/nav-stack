@@ -507,13 +507,14 @@ class BuiltinNavConfig:
     # Wait: stop and wait for a dynamic blocker to clear before
     # the first local replan (people crossing). Same grace is used when the
     # nose is clear to prefer DWA on the short path before escalating.
-    recovery_wait_duration_s: float = 2.0
+    recovery_wait_duration_s: float = 0.5
     # Legacy grace before local replan; effective wait / DWA grace is
     # max(recovery_wait_duration_s, replan_local_blocked_time_s).
     replan_local_blocked_time_s: float = 0.3
-    # Cooldown begins when a blocking plan finishes. Give the local planner
-    # time to execute the peel instead of stop/replanning every control tick.
-    replan_local_min_period_s: float = 4.0
+    # Cooldown begins when a blocking plan finishes. Keep short so a failed
+    # replan does not freeze the robot for seconds; DWA still peels during
+    # the brief wait.
+    replan_local_min_period_s: float = 0.5
     # Command slew limits (the base has no onboard ramp). Requests to stop
     # translating are never slewed, so stop distances are unaffected.
     max_linear_accel_mps2: float = 0.8
@@ -538,7 +539,9 @@ class BuiltinNavConfig:
     nav_loc_refine_min_frac: float = 0.22
     nav_loc_refine_min_beams: int = 6
     nav_loc_refine_max_tries: int = 2
-    nav_loc_refine_cooldown_s: float = 5.0
+    # Between refine tries. Was 5 s (felt like a long mid-nav pause); 0.5 s is
+    # enough to avoid tick-rate thrash without freezing the drive.
+    nav_loc_refine_cooldown_s: float = 0.5
     nav_loc_refine_period_s: float = 0.75
     # Also check after this much travel even if the period has not elapsed.
     nav_loc_refine_check_every_m: float = 2.0
@@ -548,7 +551,7 @@ class BuiltinNavConfig:
     nav_loc_refine_apply_max_deg: float = 30.0
     nav_loc_refine_apply_min_score: float = 0.35
     # Pause after SetVelocity(0) so yaw-rate preflight does not skip the check.
-    nav_loc_refine_settle_s: float = 0.35
+    nav_loc_refine_settle_s: float = 0.5
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":

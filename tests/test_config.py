@@ -675,7 +675,7 @@ def test_nav_config_without_footprint_keeps_single_radius():
 def test_nav_local_recovery_defaults_are_cautious_not_twitchy():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
     assert cfg.builtin.local_planner_max_vel_x_mps == pytest.approx(0.25)
-    assert cfg.builtin.replan_local_min_period_s == pytest.approx(4.0)
+    assert cfg.builtin.replan_local_min_period_s == pytest.approx(0.5)
 
 
 def test_slam_config_top_level_resolution():
@@ -727,7 +727,7 @@ def test_slam_config_legacy_slam_toolbox_block_alias():
 
 def test_builtin_recovery_wait_defaults():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
-    assert cfg.builtin.recovery_wait_duration_s == pytest.approx(2.0)
+    assert cfg.builtin.recovery_wait_duration_s == pytest.approx(0.5)
     tuned = NavConfig.from_dict(
         {
             "slam_service": "slam",
