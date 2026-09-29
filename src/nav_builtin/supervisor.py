@@ -2014,12 +2014,20 @@ class NavSupervisor:
                 backup_exhausted = (
                     backup_attempts >= self._backup_max_attempts and local_blocked
                 )
-                # Sign-flip rock (narrow crawl ↔ reverse) can happen with the
-                # path centerline still "clear" on costs — still force a replan.
-                spin_rock = bool(progress.get("spin_blocked")) and oscillating
+                # Sign-flip rock (narrow crawl ↔ reverse) with a *blocked* nose
+                # still forces a replan. With a clear nose, the same forward/
+                # back jig is normal DWA peel in a tight corridor — stop-replan
+                # there was the "crazy jig then freeze" (live: oscillating=True,
+                # static_blocked=False, nose_clear). peel_stuck covers escalate.
+                osc_replan = bool(
+                    oscillating and local_blocked and not nose_clear
+                )
+                spin_rock = bool(
+                    progress.get("spin_blocked") and oscillating and not nose_clear
+                )
                 should_replan = (replan_due or pose_jumped) and (
                     static_blocked
-                    or (oscillating and local_blocked)
+                    or osc_replan
                     or spin_rock
                     or backup_exhausted
                 )
