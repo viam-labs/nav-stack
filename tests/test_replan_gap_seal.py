@@ -136,6 +136,46 @@ def test_local_block_policy_prefers_dwa_when_nose_clear():
     )
 
 
+def test_path_locally_blocked_ignores_inscribed_when_corridor_open():
+    """path_cost=253 with 1.5 m clearance must not force DWA (live spin-crawl)."""
+    # Soft / inscribed on path, clear comfortable nose → not blocked.
+    assert not NavSupervisor._path_locally_blocked(
+        path_ahead_cost=253,
+        pose_cost=0,
+        activate_cost=200,
+        nose_clear=True,
+        forward_clearance_m=1.52,
+        comfortable_clearance_m=1.0,
+    )
+    # Same cost but tight clearance → blocked (doorway peel).
+    assert NavSupervisor._path_locally_blocked(
+        path_ahead_cost=253,
+        pose_cost=0,
+        activate_cost=200,
+        nose_clear=True,
+        forward_clearance_m=0.45,
+        comfortable_clearance_m=1.0,
+    )
+    # True lethal always blocks.
+    assert NavSupervisor._path_locally_blocked(
+        path_ahead_cost=254,
+        pose_cost=0,
+        activate_cost=200,
+        nose_clear=True,
+        forward_clearance_m=2.0,
+        comfortable_clearance_m=1.0,
+    )
+    # Body already in hard cost blocks.
+    assert NavSupervisor._path_locally_blocked(
+        path_ahead_cost=0,
+        pose_cost=253,
+        activate_cost=200,
+        nose_clear=True,
+        forward_clearance_m=2.0,
+        comfortable_clearance_m=1.0,
+    )
+
+
 def test_static_plan_uses_doorway_but_scan_replan_takes_long_detour():
     """Mirrors live: plan_to_point ~4 m through gap; navigate replan ~47 m.
 

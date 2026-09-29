@@ -937,6 +937,36 @@ class NavSupervisor:
         return best[1], best[2], best[3]
 
     @staticmethod
+    def _path_locally_blocked(
+        *,
+        path_ahead_cost: int,
+        pose_cost: int,
+        activate_cost: int,
+        nose_clear: bool,
+        forward_clearance_m: Optional[float],
+        comfortable_clearance_m: float = 1.0,
+    ) -> bool:
+        """Whether the local path should force DWA / blocked recovery.
+
+        True lethal on the path, or the body already in hard cost, always
+        counts. Soft / inscribed path cost (typical wall C-space pinch) with
+        a clear nose and comfortable forward clearance must *not* — that was
+        the live spin-crawl with path_cost=253 and 1.5 m lidar open.
+        """
+        from .costmap import LETHAL, is_hard
+
+        if is_hard(pose_cost) or int(path_ahead_cost) >= int(LETHAL):
+            return True
+        if int(path_ahead_cost) < int(activate_cost):
+            return False
+        if nose_clear:
+            if forward_clearance_m is None:
+                return False
+            if float(forward_clearance_m) >= float(comfortable_clearance_m):
+                return False
+        return True
+
+    @staticmethod
     def _local_block_action(
         *,
         nose_clear: bool,
@@ -1487,8 +1517,25 @@ class NavSupervisor:
                 path_ahead_cost = 0
                 pose_cost = 0
                 local_blocked = False
-                from .costmap import is_hard
-
+                # Nose / clearance first — inscribed path cost with a clear
+                # corridor must not force DWA (see ``_path_locally_blocked``).
+                nose_clear = True
+                forward_clearance_m: Optional[float] = None
+                obs_cfg = self._follower.obstacle
+                if obs_cfg is not None and obs_cfg.enabled and scan is not None:
+                    half = float(obs_cfg.front_cone_half_rad)
+                    nose_range = cone_min_range(scan, -half, half)
+                    if math.isfinite(nose_range):
+                        forward_clearance_m = float(nose_range)
+                    nose_clear = (
+                        forward_clearance_m is None
+                        or forward_clearance_m > obs_cfg.stop_distance_m
+                    )
+                comfortable_clearance_m = 1.0
+                if obs_cfg is not None and obs_cfg.enabled:
+                    comfortable_clearance_m = max(
+                        1.0, float(obs_cfg.slow_distance_m)
+                    )
                 if local_view is not None:
                     from .local_planner import path_cost_ahead as _path_cost_ahead
 
@@ -1500,13 +1547,16 @@ class NavSupervisor:
                             lookahead_m=self._local_planner.path_clearance_lookahead_m,
                         )
                     )
-                    # Local costs are footprint-inflated: center cell >= inscribed
-                    # means the body already overlaps an obstacle, even when the
-                    # path centerline ahead is still free (off-path drift).
+                    # Local costs are footprint-inflated: hard pose cost means
+                    # the body already overlaps keep-out.
                     pose_cost = int(local_view.cost_at_world(pose.x, pose.y))
-                    local_blocked = (
-                        path_ahead_cost >= self._local_planner_activate_cost
-                        or is_hard(pose_cost)
+                    local_blocked = self._path_locally_blocked(
+                        path_ahead_cost=path_ahead_cost,
+                        pose_cost=pose_cost,
+                        activate_cost=int(self._local_planner_activate_cost),
+                        nose_clear=nose_clear,
+                        forward_clearance_m=forward_clearance_m,
+                        comfortable_clearance_m=comfortable_clearance_m,
                     )
                 # Reactive avoid spinning with a clear-looking path still means
                 # the robot cannot proceed — escalate to the blocked/replan path.
@@ -1517,9 +1567,13 @@ class NavSupervisor:
                     last_obstacle_state == "avoid"
                     and reactive_avoid_since is not None
                     and now - reactive_avoid_since >= 0.8
-                    and (
-                        path_ahead_cost >= self._local_planner_activate_cost
-                        or is_hard(pose_cost)
+                    and self._path_locally_blocked(
+                        path_ahead_cost=path_ahead_cost,
+                        pose_cost=pose_cost,
+                        activate_cost=int(self._local_planner_activate_cost),
+                        nose_clear=nose_clear,
+                        forward_clearance_m=forward_clearance_m,
+                        comfortable_clearance_m=comfortable_clearance_m,
                     )
                 ):
                     local_blocked = True
@@ -1533,27 +1587,12 @@ class NavSupervisor:
                         local_blocked_since = now
                 # Front-vs-side policy (not motion classification):
                 # - Blocked nose: brief wait (people crossing), then replan.
-                # - Clear nose + local path cost: inflation pinch / side hit —
-                #   keep the short global path and let DWA peel. Do not stop
-                #   to replan here (that was the mid-nav stutter with 1 m+
-                #   forward clearance and path_cost=253).
+                # - Clear nose + tight clearance + local path cost: DWA peel.
+                # - Clear nose + comfortable clearance: pursuit (not local_blocked).
                 wait_before_replan_s = max(
                     self._recovery_wait_duration_s,
                     self._replan_local_blocked_time_s,
                 )
-                nose_clear = True
-                obs_cfg = self._follower.obstacle
-                if obs_cfg is not None and obs_cfg.enabled and scan is not None:
-                    # Front cone on the fused scan (lidar + depth). Body-near
-                    # depth that lidar contradicts is already dropped by
-                    # merge_lidar_and_depth. Corridor half-width would treat a
-                    # shoulder pinch as a "person on the nose".
-                    half = float(obs_cfg.front_cone_half_rad)
-                    nose_range = cone_min_range(scan, -half, half)
-                    nose_clear = (
-                        (not math.isfinite(nose_range))
-                        or nose_range > obs_cfg.stop_distance_m
-                    )
                 waiting_for_clear = False
                 if local_blocked:
                     if local_blocked_since is None:
@@ -1641,9 +1680,17 @@ class NavSupervisor:
                 # clear (or after a failed detour) — otherwise we only spin in
                 # reactive avoid / sit in wait. force_local also bypasses the
                 # ±60° bearing gate so large heading error cannot block DWA.
+                # Comfortable forward clearance + soft path cost: prefer
+                # pursuit; DWA was spinning in open corridors (pathc=253).
+                comfortable_forward = bool(
+                    nose_clear
+                    and forward_clearance_m is not None
+                    and float(forward_clearance_m) >= comfortable_clearance_m
+                )
                 allow_local_planner = (
                     self._local_costmap_enabled
                     and not waiting_for_clear
+                    and not comfortable_forward
                     and (
                         not local_blocked
                         or failed_replan_while_blocked >= 1
