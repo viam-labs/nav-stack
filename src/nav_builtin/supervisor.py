@@ -947,16 +947,23 @@ class NavSupervisor:
         """Choose wait / keep_dwa / replan while the local path cost is high.
 
         ``keep_dwa``: clear forward cone — stay on the short global path and
-        peel with the local planner (fit doorway inflation pinch).
+        peel with the local planner (fit doorway / wall-inflation pinch).
+        Never escalate to a stop+replan from here while the nose is clear:
+        path cost 253 with 1+ m lidar clearance is C-space inflation, not a
+        person in front, and stopping every half-second to replan is the
+        mid-nav "pause with nothing ahead" stutter.
         ``wait``: blocked nose — freeze briefly for dynamic crossers.
-        ``replan``: grace/cooldown elapsed — escalate to a new global path.
+        ``replan``: blocked nose + grace/cooldown elapsed — new global path.
         """
+        # Clear nose: inflation pinch / side hit — DWA only. Stall / backup /
+        # static-blocked paths still escalate elsewhere if peeling fails.
+        if nose_clear:
+            return "keep_dwa"
         if blocked_for_s < wait_before_replan_s:
-            return "wait" if not nose_clear else "keep_dwa"
+            return "wait"
         if replan_cooldown_ready:
             return "replan"
-        # Still in replan cooldown: keep peeling if the nose is open, else hold.
-        return "keep_dwa" if nose_clear else "wait"
+        return "wait"
 
     def _try_replan(
         self,
@@ -1517,9 +1524,9 @@ class NavSupervisor:
                 # Front-vs-side policy (not motion classification):
                 # - Blocked nose: brief wait (people crossing), then replan.
                 # - Clear nose + local path cost: inflation pinch / side hit —
-                #   keep the short global path and let DWA peel first. Immediate
-                #   replan here was sealing fit doorways (scan paint → 40 m+
-                #   room loops). Escalate to replan only after the grace window.
+                #   keep the short global path and let DWA peel. Do not stop
+                #   to replan here (that was the mid-nav stutter with 1 m+
+                #   forward clearance and path_cost=253).
                 wait_before_replan_s = max(
                     self._recovery_wait_duration_s,
                     self._replan_local_blocked_time_s,

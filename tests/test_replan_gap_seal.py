@@ -62,7 +62,7 @@ def _frame_scan(pose: Pose2D, *, inward_m: float) -> LaserScan2D:
 
 
 def test_local_block_policy_prefers_dwa_when_nose_clear():
-    """Doorway pinch: clear nose → keep short path; blocked nose → wait."""
+    """Doorway pinch: clear nose → keep short path forever; blocked nose → wait/replan."""
     wait = 2.0
     assert (
         NavSupervisor._local_block_action(
@@ -82,7 +82,7 @@ def test_local_block_policy_prefers_dwa_when_nose_clear():
         )
         == "wait"
     )
-    # After grace, escalate either way once cooldown allows.
+    # Clear nose never escalates to stop+replan (C-space inflation stutter).
     assert (
         NavSupervisor._local_block_action(
             nose_clear=True,
@@ -90,7 +90,7 @@ def test_local_block_policy_prefers_dwa_when_nose_clear():
             wait_before_replan_s=wait,
             replan_cooldown_ready=True,
         )
-        == "replan"
+        == "keep_dwa"
     )
     assert (
         NavSupervisor._local_block_action(
@@ -101,7 +101,16 @@ def test_local_block_policy_prefers_dwa_when_nose_clear():
         )
         == "replan"
     )
-    # Cooldown not ready: keep peeling / waiting, do not replan.
+    # Blocked nose, cooldown not ready: keep waiting.
+    assert (
+        NavSupervisor._local_block_action(
+            nose_clear=False,
+            blocked_for_s=wait + 0.1,
+            wait_before_replan_s=wait,
+            replan_cooldown_ready=False,
+        )
+        == "wait"
+    )
     assert (
         NavSupervisor._local_block_action(
             nose_clear=True,
