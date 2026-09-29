@@ -111,8 +111,31 @@ class RectWorld:
         pose_noise_m: float = 0.0,
         pose_noise_rad: float = 0.0,
         seed: int = 0,
+        lidar_offset: Tuple[float, float] = (0.0, 0.0),
+        lidar_min_range_m: float = 0.0,
+        body_only_grid: Optional[np.ndarray] = None,
+        scan_latency_s: float = 0.0,
+        yaw_gain: float = 1.0,
+        rot_center_fwd_m: float = 0.0,
     ):
         self.rng = np.random.default_rng(seed)
+        # Real-robot error sources: scans stamped "now" but taken earlier, and
+        # a tracked base that under/over-rotates and pivots off-centre.
+        self.scan_latency_s = float(scan_latency_s)
+        self.yaw_gain = float(yaw_gain)
+        self.rot_center_fwd_m = float(rot_center_fwd_m)
+        self._pose_hist: List[Tuple[float, conv.Pose2D]] = []
+        # Lidar mount in the body frame (fwd, left) and the driver's min range
+        # (returns closer than this to the *lidar* are dropped).
+        self.lidar_offset = (float(lidar_offset[0]), float(lidar_offset[1]))
+        self.lidar_min_range_m = float(lidar_min_range_m)
+        # Obstacle parts the body hits but the lidar plane never sees (a table
+        # leg that angles in below lidar height).
+        self.body_only = (
+            body_only_grid >= 50
+            if body_only_grid is not None
+            else np.zeros_like(truth_grid, dtype=bool)
+        )
         self.range_noise_m = float(range_noise_m)
         self.pose_noise_m = float(pose_noise_m)
         self.pose_noise_rad = float(pose_noise_rad)
@@ -149,7 +172,7 @@ class RectWorld:
         h, w = self.truth.shape
         if (rows < 0).any() or (cols < 0).any() or (rows >= h).any() or (cols >= w).any():
             return True
-        return bool(self.truth[rows, cols].any())
+        return bool(self.truth[rows, cols].any() or self.body_only[rows, cols].any())
 
     def _update_timed(self) -> None:
         active = tuple(t0 <= self.elapsed_s < t1 for *_, t0, t1 in self.timed)
@@ -178,9 +201,14 @@ class RectWorld:
                 self.reversing_s += h
             if abs(vx) < 1e-9 and abs(vth) < 1e-9:
                 continue
-            th = self.pose.theta + vth * h
-            nx = self.pose.x + vx * math.cos(self.pose.theta + 0.5 * vth * h) * h
-            ny = self.pose.y + vx * math.sin(self.pose.theta + 0.5 * vth * h) * h
+            w = vth * self.yaw_gain
+            th = self.pose.theta + w * h
+            mid = self.pose.theta + 0.5 * w * h
+            # Pivot about a point ``rot_center_fwd_m`` ahead of the centre:
+            # the centre then moves sideways at -w * offset.
+            lat = -w * self.rot_center_fwd_m
+            nx = self.pose.x + (vx * math.cos(mid) - lat * math.sin(mid)) * h
+            ny = self.pose.y + (vx * math.sin(mid) + lat * math.cos(mid)) * h
             trial = conv.Pose2D(nx, ny, conv.normalize_angle(th))
             if self.collides(trial):
                 if not self._in_contact:
@@ -192,8 +220,29 @@ class RectWorld:
             self._in_contact = False
             self.pose = trial
         self._scan_age += dt
+        if self.scan_latency_s > 0.0:
+            self._pose_hist.append((self.elapsed_s, self.pose))
+            cutoff = self.elapsed_s - 2.0 * self.scan_latency_s - 0.1
+            while self._pose_hist and self._pose_hist[0][0] < cutoff:
+                self._pose_hist.pop(0)
+
+    def _lidar_pose(self) -> conv.Pose2D:
+        """True pose the scan is taken from (``scan_latency_s`` in the past)."""
+        if self.scan_latency_s <= 0.0 or not self._pose_hist:
+            return self.pose
+        t = self.elapsed_s - self.scan_latency_s
+        for ts, p in reversed(self._pose_hist):
+            if ts <= t:
+                return p
+        return self._pose_hist[0][1]
 
     def _raycast(self) -> np.ndarray:
+        if (
+            self.lidar_offset != (0.0, 0.0)
+            or self.lidar_min_range_m > 0.0
+            or self.scan_latency_s > 0.0
+        ):
+            return self._raycast_mounted()
         n = self.scan_bins
         ang = self.pose.theta - math.pi + np.arange(n) * (2.0 * math.pi / n)
         r = np.arange(0.02, self.range_max, RES / 2.0)
@@ -213,6 +262,47 @@ class RectWorld:
         if self.range_noise_m > 0.0:
             out[any_hit] += self.rng.normal(0.0, self.range_noise_m, int(any_hit.sum()))
         return out
+
+    def _raycast_mounted(self) -> np.ndarray:
+        """Rays from the real mount, min-range filtered, re-binned about the base
+        centre (what ``prepare_lidar_point_cloud`` + ``points_to_scan`` give)."""
+        n = 720
+        P = self._lidar_pose()
+        c, s = math.cos(P.theta), math.sin(P.theta)
+        f, l = self.lidar_offset
+        lx = P.x + c * f - s * l
+        ly = P.y + s * f + c * l
+        ang = P.theta - math.pi + np.arange(n) * (2.0 * math.pi / n)
+        r = np.arange(0.02, self.range_max, RES / 4.0)
+        xs = lx + np.cos(ang)[:, None] * r[None, :]
+        ys = ly + np.sin(ang)[:, None] * r[None, :]
+        cols = np.floor(xs / RES).astype(int)
+        rows = np.floor(ys / RES).astype(int)
+        h, w = self.truth.shape
+        inb = (rows >= 0) & (cols >= 0) & (rows < h) & (cols < w)
+        hit = np.zeros_like(inb)
+        hit[inb] = self.truth[rows[inb], cols[inb]]
+        hit |= ~inb
+        any_hit = hit.any(axis=1)
+        first = hit.argmax(axis=1)
+        rng = r[first]
+        if self.range_noise_m > 0.0:
+            rng = rng + self.rng.normal(0.0, self.range_noise_m, n)
+        keep = any_hit & (rng >= self.lidar_min_range_m)
+        wx = lx + np.cos(ang[keep]) * rng[keep]
+        wy = ly + np.sin(ang[keep]) * rng[keep]
+        dx, dy = wx - P.x, wy - P.y
+        bx = c * dx + s * dy
+        by = -s * dx + c * dy
+        scan = conv.points_to_scan(
+            np.stack([bx, by], axis=1),
+            angle_min=-math.pi,
+            angle_max=math.pi,
+            num_bins=self.scan_bins,
+            range_min=0.0,
+            range_max=self.range_max,
+        )
+        return np.asarray(scan.ranges, dtype=float)
 
     def _estimated_pose(self) -> conv.Pose2D:
         """True pose + slowly wandering localisation error (SLAM-like)."""
@@ -306,10 +396,19 @@ def run(
     nav_overrides: Optional[dict] = None,
     noise: bool = False,
     seed: int = 0,
+    lidar_offset: Tuple[float, float] = (0.0, 0.0),
+    lidar_min_range_m: float = 0.0,
+    body_only_obstacles: Sequence[Tuple[float, float, float, float]] = (),
+    scan_latency_s: float = 0.0,
+    yaw_gain: float = 1.0,
+    rot_center_fwd_m: float = 0.0,
 ) -> RunResult:
     truth = nav_grid.copy()
     for ob in extra_obstacles:
         box(truth, *ob)
+    body_only = np.zeros_like(nav_grid)
+    for ob in body_only_obstacles:
+        box(body_only, *ob)
     world = RectWorld(
         nav_grid,
         truth,
@@ -318,6 +417,12 @@ def run(
         pose_noise_m=0.02 if noise else 0.0,
         pose_noise_rad=math.radians(1.0) if noise else 0.0,
         seed=seed,
+        lidar_offset=lidar_offset,
+        lidar_min_range_m=lidar_min_range_m,
+        body_only_grid=body_only,
+        scan_latency_s=scan_latency_s,
+        yaw_gain=yaw_gain,
+        rot_center_fwd_m=rot_center_fwd_m,
     )
     world.timed = list(timed_obstacles)
     clock = FakeClock(world)

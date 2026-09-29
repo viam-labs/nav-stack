@@ -36,9 +36,11 @@ class GuardConfig:
     width_m: float
     # Keep-out past the body for planning motion (lidar noise, cell
     # quantisation, localisation). Obstacles already inside this band at the
-    # start pose may be passed alongside, but never closer than ``min_gap_m``.
+    # start pose may be passed alongside, but a motion may not bring the body
+    # more than ``near_slack_m`` closer to them, nor within ``min_gap_m``.
     padding_m: float = 0.05
     min_gap_m: float = 0.02
+    near_slack_m: float = 0.01
     # Speed regulation: allow ``v`` only while the free arc length covers
     # ``v * time_to_collision_s + stop_gap_m``.
     time_to_collision_s: float = 1.2
@@ -152,6 +154,17 @@ def _inside(poses: np.ndarray, pts: np.ndarray, hl: float, hw: float) -> np.ndar
     return (np.abs(bx) <= hl) & (np.abs(by) <= hw)
 
 
+def _rect_dist(poses: np.ndarray, pts: np.ndarray, hl: float, hw: float) -> np.ndarray:
+    """(K, N) distance from the rectangle at pose k to point n (0 inside)."""
+    dx = pts[None, :, 0] - poses[:, 0:1]
+    dy = pts[None, :, 1] - poses[:, 1:2]
+    c = np.cos(poses[:, 2:3])
+    s = np.sin(poses[:, 2:3])
+    ex = np.maximum(np.abs(c * dx + s * dy) - hl, 0.0)
+    ey = np.maximum(np.abs(-s * dx + c * dy) - hw, 0.0)
+    return np.hypot(ex, ey)
+
+
 class FootprintGuard:
     def __init__(self, cfg: GuardConfig):
         self.cfg = cfg
@@ -165,36 +178,51 @@ class FootprintGuard:
         Points inside the body itself are dropped (Nav2 footprint clearing:
         self-returns from the chassis/mast, or a stale mark we already
         occupy — a real obstacle there would already be a collision).
-        Points between the body and the padding are only checked at
-        ``min_gap_m`` so the robot can move along/away from a close wall.
+        Points between the body and the padding may be passed alongside or
+        moved away from, but not approached: each keeps a floor of its current
+        distance minus ``near_slack_m`` (never below ``min_gap_m``). A path
+        planned without an unmapped table leg otherwise converges onto it and
+        the 2 cm margin is eaten by scan latency and track slip.
         """
         p = self.cfg.padding_m
         if pts.size == 0:
-            return pts, pts
+            return pts, pts, np.empty(0)
         here = np.array([[pose.x, pose.y, pose.theta]])
         body = _inside(here, pts, self._hl, self._hw)[0]
         pts = pts[~body]
         near = _inside(here, pts, self._hl + p, self._hw + p)[0]
-        return pts[~near], pts[near]
+        near_pts = pts[near]
+        floor = np.maximum(
+            self.cfg.min_gap_m,
+            _rect_dist(here, near_pts, self._hl, self._hw)[0] - self.cfg.near_slack_m,
+        )
+        return pts[~near], near_pts, floor
 
-    def _first_hit(self, poses: np.ndarray, far: np.ndarray, near: np.ndarray) -> int:
-        """Index of the first colliding pose, or len(poses)."""
-        k = len(poses)
-        hit = np.zeros(k, dtype=bool)
-        p, g = self.cfg.padding_m, self.cfg.min_gap_m
+    def _hits(
+        self, poses: np.ndarray, far: np.ndarray, near: np.ndarray, floor: np.ndarray
+    ) -> np.ndarray:
+        hit = np.zeros(len(poses), dtype=bool)
+        p = self.cfg.padding_m
         if far.size:
             hit |= _inside(poses, far, self._hl + p, self._hw + p).any(axis=1)
         if near.size:
-            hit |= _inside(poses, near, self._hl + g, self._hw + g).any(axis=1)
-        idx = np.flatnonzero(hit)
-        return int(idx[0]) if idx.size else k
+            d = _rect_dist(poses, near, self._hl, self._hw)
+            hit |= (d < floor[None, :]).any(axis=1)
+        return hit
+
+    def _first_hit(
+        self, poses: np.ndarray, far: np.ndarray, near: np.ndarray, floor: np.ndarray
+    ) -> int:
+        """Index of the first colliding pose, or len(poses)."""
+        idx = np.flatnonzero(self._hits(poses, far, near, floor))
+        return int(idx[0]) if idx.size else len(poses)
 
     def free_distance(
         self, pose: Pose2D, v: float, w: float, pts: np.ndarray, horizon_m: float
     ) -> float:
-        far, near = self._split(pose, pts)
+        far, near, floor = self._split(pose, pts)
         poses = _arc_poses(pose, v, w, horizon_m, self.cfg.step_m)
-        k = self._first_hit(poses, far, near)
+        k = self._first_hit(poses, far, near, floor)
         if k >= len(poses):
             return math.inf
         return k * (horizon_m / len(poses))
@@ -215,7 +243,7 @@ class FootprintGuard:
         """
         step_m = self.cfg.step_m
         out = np.full(len(kappas), math.inf)
-        far, near = self._split(pose, pts)
+        far, near, floor = self._split(pose, pts)
         reach = horizon_m + math.hypot(self._hl, self._hw) + self.cfg.padding_m
         if far.size:
             d2 = (far[:, 0] - pose.x) ** 2 + (far[:, 1] - pose.y) ** 2
@@ -226,38 +254,39 @@ class FootprintGuard:
             [_arc_poses(pose, v, v * float(k), horizon_m, step_m) for k in kappas]
         )
         k = len(poses) // len(kappas)
-        p, g = self.cfg.padding_m, self.cfg.min_gap_m
-        hit = np.zeros(len(poses), dtype=bool)
-        if far.size:
-            hit |= _inside(poses, far, self._hl + p, self._hw + p).any(axis=1)
-        if near.size:
-            hit |= _inside(poses, near, self._hl + g, self._hw + g).any(axis=1)
-        hit = hit.reshape(len(kappas), k)
+        hit = self._hits(poses, far, near, floor).reshape(len(kappas), k)
         any_hit = hit.any(axis=1)
         first = hit.argmax(axis=1)
         out[any_hit] = first[any_hit] * (horizon_m / k)
         return out
 
     def free_rotation(self, pose: Pose2D, sign: float, pts: np.ndarray) -> float:
-        far, near = self._split(pose, pts)
+        far, near, floor = self._split(pose, pts)
         ang = self.cfg.rot_horizon_rad
         poses = _rot_poses(pose, sign, ang, self.cfg.rot_step_rad)
-        k = self._first_hit(poses, far, near)
+        k = self._first_hit(poses, far, near, floor)
         if k >= len(poses):
             return math.inf
         return k * (ang / len(poses))
 
     def clearance(self, pose: Pose2D, pts: np.ndarray) -> float:
         """Distance from the (unpadded) body rectangle to the nearest point."""
+        return self.nearest(pose, pts)[0]
+
+    def nearest(self, pose: Pose2D, pts: np.ndarray) -> Tuple[float, float, float]:
+        """(distance from body rectangle, body-frame x, y) of the nearest point."""
         if pts.size == 0:
-            return math.inf
+            return math.inf, math.nan, math.nan
         dx = pts[:, 0] - pose.x
         dy = pts[:, 1] - pose.y
         c, s = math.cos(pose.theta), math.sin(pose.theta)
-        bx = np.abs(c * dx + s * dy) - self._hl
-        by = np.abs(-s * dx + c * dy) - self._hw
+        fx = c * dx + s * dy
+        fy = -s * dx + c * dy
+        bx = np.abs(fx) - self._hl
+        by = np.abs(fy) - self._hw
         d = np.hypot(np.maximum(bx, 0.0), np.maximum(by, 0.0))
-        return float(d.min())
+        i = int(np.argmin(d))
+        return float(d[i]), float(fx[i]), float(fy[i])
 
     # --- policy -------------------------------------------------------
     def _regulate(self, v: float, free_m: float) -> float:

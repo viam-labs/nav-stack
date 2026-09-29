@@ -490,7 +490,7 @@ class BuiltinNavConfig:
     local_inflation_margin_m: Optional[float] = None
     # Local-window refresh rate (Hz). Independent of ``control_rate_hz`` so the
     # follower tick stays cheap; lidar is typically ~10 Hz anyway.
-    local_costmap_rate_hz: float = 5.0
+    local_costmap_rate_hz: float = 10.0
     local_planner_enabled: bool = True
     local_planner_sim_time_s: float = 1.5
     local_planner_activate_cost: int = 200
@@ -1184,7 +1184,7 @@ class NavConfig:
     inflation_margin_m: Optional[float] = None
     cmd_vel_timeout: float = 2.0  # seconds (watchdog)
     # Builtin nav control rate (Hz). Local costmap refreshes separately via
-    # ``builtin.local_costmap_rate_hz`` (default 5) so follower ticks stay cheap.
+    # ``builtin.local_costmap_rate_hz`` (default 10) so follower ticks stay cheap.
     control_rate_hz: float = 10.0
     # Background refresh rate for ``obstacles_only`` depth cams (Hz). Nav never
     # awaits GetPointCloud on the control tick — this only throttles the

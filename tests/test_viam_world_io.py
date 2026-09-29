@@ -149,7 +149,7 @@ def test_builtin_nav_host_status():
     host = BuiltinNavHost(nav, world, viz, nav_cfg=cfg)
     assert host.nav_backend() == "builtin"
     assert nav._kwargs["poll_interval_s"] == pytest.approx(0.1)  # noqa: SLF001
-    assert nav._kwargs["local_costmap_rate_hz"] == pytest.approx(5.0)  # noqa: SLF001
+    assert nav._kwargs["local_costmap_rate_hz"] == pytest.approx(10.0)  # noqa: SLF001
 
     fast = NavConfig.from_dict(
         {"slam_service": "s", "base": "b", "control_rate_hz": 20.0}
@@ -157,7 +157,7 @@ def test_builtin_nav_host_status():
     fast_nav = make_builtin_navigator(world, fast)
     assert fast_nav._kwargs["poll_interval_s"] == pytest.approx(0.05)  # noqa: SLF001
     # Local costmap rate stays independent of control rate.
-    assert fast_nav._kwargs["local_costmap_rate_hz"] == pytest.approx(5.0)  # noqa: SLF001
+    assert fast_nav._kwargs["local_costmap_rate_hz"] == pytest.approx(10.0)  # noqa: SLF001
     tuned = NavConfig.from_dict(
         {
             "slam_service": "s",

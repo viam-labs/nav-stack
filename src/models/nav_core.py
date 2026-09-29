@@ -829,6 +829,11 @@ class NavServiceBase(Motion):
             return {"status": "canceled"}
         if cmd == "test_drive":
             return await self._test_drive(command)
+        if cmd == "get_trace":
+            from ..nav_builtin.supervisor import recent_trace
+
+            seconds = float(command.get("seconds", 30.0))
+            return {"ticks": recent_trace(seconds)}
         if cmd in ("get_status", "describe_motion", "what_am_i_doing"):
             def _status():
                 status = mgr.nav_status()
@@ -945,7 +950,7 @@ class NavServiceBase(Motion):
                     cached = self._builtin_costmap_cache
                     if (
                         cached is not None
-                        and now - self._builtin_costmap_cache_at < 1.0
+                        and now - self._builtin_costmap_cache_at < 0.2
                     ):
                         return cached, layer_used
                     # Always refresh from the live SLAM/world map — never prefer
@@ -1056,7 +1061,7 @@ class NavServiceBase(Motion):
 
         now = _time.monotonic()
         cached = self._idle_local_costmap_cache
-        if cached is not None and now - self._idle_local_costmap_cache_at < 0.4:
+        if cached is not None and now - self._idle_local_costmap_cache_at < 0.2:
             return cached
 
         if not bool(getattr(cfg.builtin, "local_costmap_enabled", True)):

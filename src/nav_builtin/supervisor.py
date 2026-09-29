@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import deque
 from typing import Any, Optional
 
 from ..config import NavConfig
@@ -46,6 +47,18 @@ from .world_io import WorldIO
 
 
 _BLOCKED_REPLAN_FAIL_LIMIT = 8
+
+# Last ~60 s of guarded control ticks (20 Hz), kept across goals so a graze
+# can be inspected after the operator cancels (``get_trace`` DoCommand).
+_TRACE: "deque[dict]" = deque(maxlen=1200)
+
+
+def recent_trace(seconds: float = 30.0) -> list:
+    entries = list(_TRACE)
+    if not entries:
+        return []
+    cutoff = entries[-1]["t"] - max(0.0, float(seconds))
+    return [e for e in entries if e["t"] >= cutoff]
 
 
 class NavSupervisor:
@@ -194,7 +207,7 @@ class NavSupervisor:
                 GuardConfig(
                     length_m=2.0 * nose_offset,
                     width_m=2.0 * float(self._body_radius),
-                    padding_m=min(max(clearance, 0.04), 0.08),
+                    padding_m=min(max(clearance, 0.04), 0.15),
                 )
             )
         self._cost_scaling = cost_scaling_factor
@@ -2249,6 +2262,23 @@ class NavSupervisor:
                     if _reduced(cmd, veto):
                         cmd = DriveCommand(veto.vx, cmd.vy, veto.vtheta, cmd.done)
                         self._last_sent_cmd = cmd
+                    near_d, near_x, near_y = self._guard.nearest(pose, guard_pts)
+                    _TRACE.append(
+                        {
+                            "t": round(time.time(), 3),
+                            "x": round(pose.x, 3),
+                            "y": round(pose.y, 3),
+                            "th": round(pose.theta, 4),
+                            "vx": round(cmd.vx, 3),
+                            "w": round(cmd.vtheta, 3),
+                            "obs": progress.get("obstacle"),
+                            "near_m": round(near_d, 3) if math.isfinite(near_d) else None,
+                            "near_bx": round(near_x, 3) if math.isfinite(near_x) else None,
+                            "near_by": round(near_y, 3) if math.isfinite(near_y) else None,
+                            "pts": int(len(guard_pts)),
+                            "wp": progress.get("waypoint_index"),
+                        }
+                    )
                 progress = {
                     **progress,
                     "cmd_vx_mps": cmd.vx,

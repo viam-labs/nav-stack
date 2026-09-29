@@ -97,3 +97,25 @@ def test_low_speed_arc_survives_base_sanitizer():
     g = _guard()
     res = g.guard(O, 0.08, 0.6, np.empty((0, 2)), allow_steer=False)
     assert abs(res.vtheta) <= 0.25 + 1e-9
+
+
+def test_leg_inside_padding_may_be_passed_but_not_approached():
+    """Unmapped table leg 5 cm off the right side (inside the 10 cm band):
+    driving past is fine, curving onto it is not (live grazes, rc27)."""
+    g = FootprintGuard(GuardConfig(length_m=L, width_m=W, padding_m=0.10))
+    leg = np.array([[0.1, -(HW + 0.05)]])
+    straight = g.free_distance(O, 0.3, 0.0, leg, 0.8)
+    assert math.isinf(straight)
+    toward = g.free_distance(O, 0.3, -0.6, leg, 0.8)
+    assert toward < 0.3
+    res = g.guard(O, 0.3, -0.6, leg, allow_steer=False)
+    assert res.vx < 0.3 or abs(res.vtheta) < 0.6
+
+
+def test_turning_away_does_not_swing_tail_into_leg_beside_rear():
+    """Turning left with a leg beside the rear-right swings the tail into it."""
+    g = FootprintGuard(GuardConfig(length_m=L, width_m=W, padding_m=0.10))
+    leg = np.array([[-0.25, -(HW + 0.05)]])
+    assert math.isinf(g.free_distance(O, 0.3, 0.0, leg, 0.8))
+    assert g.free_distance(O, 0.3, 0.9, leg, 0.8) < 0.2
+    assert g.free_rotation(O, 1.0, leg) < 0.1
