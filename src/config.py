@@ -236,6 +236,10 @@ class LidarConfig:
     # ``sensor`` (X forward) collapses depth into height and paints a blob on
     # the robot in the local costmap.
     cloud_frame: str = CLOUD_FRAME_SENSOR
+    # Horizontal field of view of an ``obstacles_only`` sensor (degrees,
+    # centred on its forward axis; RealSense D4xx depth is ~87). Obstacles it
+    # saw are remembered once they leave this view until it looks again.
+    fov_deg: float = 87.0
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "LidarConfig":
@@ -284,6 +288,7 @@ class LidarConfig:
             shm_required=bool(d.get("shm_required", False)),
             obstacles_only=bool(d.get("obstacles_only", False)),
             cloud_frame=cloud_frame,
+            fov_deg=float(d.get("fov_deg", 87.0)),
         )
 
 

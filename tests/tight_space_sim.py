@@ -117,8 +117,15 @@ class RectWorld:
         scan_latency_s: float = 0.0,
         yaw_gain: float = 1.0,
         rot_center_fwd_m: float = 0.0,
+        depth_cam: Optional[Tuple[float, float, float, float, float]] = None,
     ):
         self.rng = np.random.default_rng(seed)
+        # Forward depth camera (fwd, left, hfov_deg, min_range, max_range): sees
+        # body-only parts too, but only inside its narrow field of view.
+        self.depth_cam = depth_cam
+        self._depth: Optional[conv.LaserScan2D] = None
+        self._depth_age = 1e9
+        self._depth_stamp = 0.0
         # Real-robot error sources: scans stamped "now" but taken earlier, and
         # a tracked base that under/over-rotates and pivots off-centre.
         self.scan_latency_s = float(scan_latency_s)
@@ -220,6 +227,7 @@ class RectWorld:
             self._in_contact = False
             self.pose = trial
         self._scan_age += dt
+        self._depth_age += dt
         if self.scan_latency_s > 0.0:
             self._pose_hist.append((self.elapsed_s, self.pose))
             cutoff = self.elapsed_s - 2.0 * self.scan_latency_s - 0.1
@@ -304,6 +312,57 @@ class RectWorld:
         )
         return np.asarray(scan.ranges, dtype=float)
 
+    def _depth_points(self) -> np.ndarray:
+        """Body-frame hits of the forward depth camera (truth + body-only)."""
+        f, l, fov_deg, rmin, rmax = self.depth_cam
+        P = self.pose
+        c, s = math.cos(P.theta), math.sin(P.theta)
+        cx = P.x + c * f - s * l
+        cy = P.y + s * f + c * l
+        half = math.radians(fov_deg) / 2.0
+        ang = P.theta + np.linspace(-half, half, 160)
+        r = np.arange(0.02, rmax, RES / 4.0)
+        xs = cx + np.cos(ang)[:, None] * r[None, :]
+        ys = cy + np.sin(ang)[:, None] * r[None, :]
+        cols = np.floor(xs / RES).astype(int)
+        rows = np.floor(ys / RES).astype(int)
+        h, w = self.truth.shape
+        inb = (rows >= 0) & (cols >= 0) & (rows < h) & (cols < w)
+        solid = self.truth | self.body_only
+        hit = np.zeros_like(inb)
+        hit[inb] = solid[rows[inb], cols[inb]]
+        any_hit = hit.any(axis=1)
+        rng = r[hit.argmax(axis=1)]
+        keep = any_hit & (rng >= rmin)
+        wx = cx + np.cos(ang[keep]) * rng[keep]
+        wy = cy + np.sin(ang[keep]) * rng[keep]
+        dx, dy = wx - P.x, wy - P.y
+        return np.stack([c * dx + s * dy, -s * dx + c * dy], axis=1)
+
+    def _depth_scan(self) -> Optional[conv.LaserScan2D]:
+        if self.depth_cam is None:
+            return None
+        if self._depth is None or self._depth_age >= 0.2:
+            scan = conv.points_to_scan(
+                self._depth_points(),
+                angle_min=-math.pi,
+                angle_max=math.pi,
+                num_bins=self.scan_bins,
+                range_min=0.0,
+                range_max=self.depth_cam[4],
+            )
+            self._depth = conv.LaserScan2D(
+                scan.ranges,
+                angle_min=scan.angle_min,
+                angle_increment=scan.angle_increment,
+                range_min=scan.range_min,
+                range_max=scan.range_max,
+                capture_pose=self.get_pose(),
+            )
+            self._depth_age = 0.0
+            self._depth_stamp = self.elapsed_s
+        return self._depth
+
     def _estimated_pose(self) -> conv.Pose2D:
         """True pose + slowly wandering localisation error (SLAM-like)."""
         if self.pose_noise_m <= 0.0 and self.pose_noise_rad <= 0.0:
@@ -341,7 +400,36 @@ class RectWorld:
                 capture_pose=self.get_pose(),
             )
             self._scan_age = 0.0
-        return self._scan
+        depth = self._depth_scan()
+        if depth is None or not include_obstacles_only:
+            return self._scan
+        merged = conv.merge_lidar_and_depth_scans(self._scan, depth, num_bins=self.scan_bins)
+        return conv.LaserScan2D(
+            merged.ranges,
+            angle_min=merged.angle_min,
+            angle_increment=merged.angle_increment,
+            range_min=merged.range_min,
+            range_max=merged.range_max,
+            capture_pose=self._scan.capture_pose,
+        )
+
+    def get_depth_frames(self):
+        from src.config import LidarConfig
+
+        depth = self._depth_scan()
+        if depth is None:
+            return []
+        f, l, fov_deg, rmin, rmax = self.depth_cam
+        cam = LidarConfig(
+            name="camera",
+            x=f,
+            y=l,
+            min_range=rmin,
+            max_range=rmax,
+            obstacles_only=True,
+            fov_deg=fov_deg,
+        )
+        return [(self._depth_stamp, depth, cam)]
 
     def set_velocity(self, vx: float, vy: float, vtheta: float) -> None:
         from src.nav_builtin.viam_io import _sanitize_base_cmd
@@ -402,6 +490,7 @@ def run(
     scan_latency_s: float = 0.0,
     yaw_gain: float = 1.0,
     rot_center_fwd_m: float = 0.0,
+    depth_cam: Optional[Tuple[float, float, float, float, float]] = None,
 ) -> RunResult:
     truth = nav_grid.copy()
     for ob in extra_obstacles:
@@ -423,6 +512,7 @@ def run(
         scan_latency_s=scan_latency_s,
         yaw_gain=yaw_gain,
         rot_center_fwd_m=rot_center_fwd_m,
+        depth_cam=depth_cam,
     )
     world.timed = list(timed_obstacles)
     clock = FakeClock(world)

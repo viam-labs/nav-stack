@@ -49,6 +49,10 @@ class GuardConfig:
     step_m: float = 0.025
     rot_step_rad: float = 0.04
     rot_horizon_rad: float = 0.6
+    # Keep-out for turning in place (capped by ``padding_m``). A pivot adds
+    # no travel error, and the full padding swept by the corners locks the
+    # robot facing a leg 20 cm off its nose (no way forward, no turn away).
+    rot_padding_m: float = 0.05
     obstacle_radius_m: float = 2.0
     # Alternative forward arcs when the nominal arc is blocked.
     alt_speed_mps: float = 0.13
@@ -75,15 +79,19 @@ def obstacle_points(
     local_view,
     *,
     radius_m: float,
+    extra: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """World-frame obstacle points near ``pose``.
 
     Live scan returns (exact, current) plus *static* lethal cells of the local
     view (map walls). Persisted scan marks are skipped: they are
     projected with a stale pose, smear walls a cell inward, and in a 0.9 m
-    corridor that alone reads as a collision.
+    corridor that alone reads as a collision. ``extra`` adds world points
+    kept elsewhere (depth obstacles that left the camera's view).
     """
     chunks = []
+    if extra is not None and np.size(extra):
+        chunks.append(np.asarray(extra, dtype=float).reshape(-1, 2))
     if scan is not None:
         pts = scan.to_points()
         if pts.size:
@@ -172,7 +180,7 @@ class FootprintGuard:
         self._hw = cfg.width_m / 2.0
 
     # --- primitives ---------------------------------------------------
-    def _split(self, pose: Pose2D, pts: np.ndarray):
+    def _split(self, pose: Pose2D, pts: np.ndarray, padding: Optional[float] = None):
         """Split into (far, near) points relative to the current pose.
 
         Points inside the body itself are dropped (Nav2 footprint clearing:
@@ -184,7 +192,7 @@ class FootprintGuard:
         planned without an unmapped table leg otherwise converges onto it and
         the 2 cm margin is eaten by scan latency and track slip.
         """
-        p = self.cfg.padding_m
+        p = self.cfg.padding_m if padding is None else padding
         if pts.size == 0:
             return pts, pts, np.empty(0)
         here = np.array([[pose.x, pose.y, pose.theta]])
@@ -199,10 +207,15 @@ class FootprintGuard:
         return pts[~near], near_pts, floor
 
     def _hits(
-        self, poses: np.ndarray, far: np.ndarray, near: np.ndarray, floor: np.ndarray
+        self,
+        poses: np.ndarray,
+        far: np.ndarray,
+        near: np.ndarray,
+        floor: np.ndarray,
+        padding: Optional[float] = None,
     ) -> np.ndarray:
         hit = np.zeros(len(poses), dtype=bool)
-        p = self.cfg.padding_m
+        p = self.cfg.padding_m if padding is None else padding
         if far.size:
             hit |= _inside(poses, far, self._hl + p, self._hw + p).any(axis=1)
         if near.size:
@@ -261,13 +274,14 @@ class FootprintGuard:
         return out
 
     def free_rotation(self, pose: Pose2D, sign: float, pts: np.ndarray) -> float:
-        far, near, floor = self._split(pose, pts)
+        p = min(self.cfg.rot_padding_m, self.cfg.padding_m)
+        far, near, floor = self._split(pose, pts, p)
         ang = self.cfg.rot_horizon_rad
         poses = _rot_poses(pose, sign, ang, self.cfg.rot_step_rad)
-        k = self._first_hit(poses, far, near, floor)
-        if k >= len(poses):
+        idx = np.flatnonzero(self._hits(poses, far, near, floor, p))
+        if idx.size == 0:
             return math.inf
-        return k * (ang / len(poses))
+        return int(idx[0]) * (ang / len(poses))
 
     def clearance(self, pose: Pose2D, pts: np.ndarray) -> float:
         """Distance from the (unpadded) body rectangle to the nearest point."""

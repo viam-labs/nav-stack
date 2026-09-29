@@ -516,6 +516,21 @@ class ViamWorldIO:
             self._scan_cache_pose = pose
         return merged
 
+    def get_depth_frames(self) -> list:
+        """Latest ``obstacles_only`` frames as ``(stamp, scan, lidar_cfg)``.
+
+        ``scan`` is base-frame at its own ``capture_pose`` (not warped to now)
+        so the footprint guard can remember what left the camera's view.
+        """
+        out = []
+        for lidar in self._lidars:
+            if not lidar.obstacles_only:
+                continue
+            cached = self._per_lidar_scan.get(lidar.name)
+            if cached is not None and cached[0].capture_pose is not None:
+                out.append((cached[1], cached[0], lidar))
+        return out
+
     def _map_pose_now(self) -> Optional[conv.Pose2D]:
         if self._pose_provider is not None:
             try:

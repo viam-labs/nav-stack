@@ -262,7 +262,7 @@ await nav.do_command({"command": "resume"})
 | `describe_motion` | `what_am_i_doing` | —                     | Plain-English summary fields from `summarize_nav_motion` |
 | `test_drive`      | —                 | body twist + duration | Echo of sent body / Viam SetVelocity units               |
 | `get_costmap`     | —                 | `layer`, `stride`     | Base64 costmap grid for UIs                              |
-| `get_trace`       | —                 | `seconds` (default 30) | Recent control ticks (kept across goals): pose, sent `vx`/`w`, `obs` state, nearest obstacle distance from the body (`near_m`) and its body-frame position (`near_bx`, `near_by`) |
+| `get_trace`       | —                 | `seconds` (default 30) | Recent control ticks (kept across goals): pose, sent `vx`/`w`, `obs` state, nearest obstacle distance from the body (`near_m`) and its body-frame position (`near_bx`, `near_by`), `pts` guard points, `mem` remembered depth-camera points |
 
 
 ### `get_status`

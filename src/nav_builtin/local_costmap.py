@@ -172,6 +172,12 @@ class LocalCostmap:
         inside = (rows >= 0) & (rows < self._h) & (cols >= 0) & (cols < self._w)
         self._raw[rows[inside], cols[inside]] = 100
 
+    def _mark_world(self, pts: np.ndarray) -> None:
+        cols = np.floor((pts[:, 0] - self._origin_x) / self._occ.resolution).astype(np.int32)
+        rows = np.floor((pts[:, 1] - self._origin_y) / self._occ.resolution).astype(np.int32)
+        inside = (rows >= 0) & (rows < self._h) & (cols >= 0) & (cols < self._w)
+        self._raw[rows[inside], cols[inside]] = 100
+
     def update(
         self,
         pose: conv.Pose2D,
@@ -179,6 +185,7 @@ class LocalCostmap:
         *,
         global_occ: Optional[OccupancyGrid] = None,
         global_costs: Optional[np.ndarray] = None,
+        extra_points: Optional[np.ndarray] = None,
     ) -> LocalCostmapView:
         old_raw = self._raw
         old_ox, old_oy = self._origin_x, self._origin_y
@@ -194,6 +201,8 @@ class LocalCostmap:
             costs = self._project_global_costs(global_occ, global_costs)
         if scan is not None:
             self._mark_scan(pose, scan)
+        if extra_points is not None and np.size(extra_points):
+            self._mark_world(np.asarray(extra_points, dtype=float).reshape(-1, 2))
         scan_occ = OccupancyGrid(
             grid=self._raw,
             resolution=self._occ.resolution,

@@ -24,6 +24,7 @@ from .controller import (
     limit_twist_rate,
     update_speed_estimate,
 )
+from .depth_memory import DepthObstacleMemory, depth_frames
 from .footprint_guard import FootprintGuard, GuardConfig, obstacle_points
 from .local_costmap import (
     LocalCostmap,
@@ -210,6 +211,9 @@ class NavSupervisor:
                     padding_m=min(max(clearance, 0.04), 0.15),
                 )
             )
+        self._depth_memory = DepthObstacleMemory(
+            length_m=2.0 * nose_offset, width_m=2.0 * float(self._body_radius)
+        )
         self._cost_scaling = cost_scaling_factor
         self._clearance_preference_m = max(0.0, float(clearance_preference_m))
         self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
@@ -1510,6 +1514,12 @@ class NavSupervisor:
                         scan = self._world.get_scan(self._scan_max_age)
                     except TimeoutError:
                         scan = None
+                mem_pts = None
+                if self._guard is not None:
+                    self._depth_memory.update(
+                        depth_frames(self._world), pose, time.monotonic()
+                    )
+                    mem_pts = self._depth_memory.points()
 
                 local_view = self._local_view_cache
                 if refresh_local:
@@ -1539,6 +1549,7 @@ class NavSupervisor:
                             costmap_scan,
                             global_occ=global_occ,
                             global_costs=global_costs,
+                            extra_points=mem_pts,
                         )
                         self._local_view_cache = local_view
                         self._local_view_at = now
@@ -1569,6 +1580,7 @@ class NavSupervisor:
                         scan,
                         local_view,
                         radius_m=self._guard.cfg.obstacle_radius_m,
+                        extra=mem_pts,
                     )
                     straight = self._guard.free_distance(
                         pose, 0.2, 0.0, guard_pts, 2.0
@@ -1787,6 +1799,7 @@ class NavSupervisor:
                     prev_cmd=prev_cmd,
                     force_local_planner=force_local,
                     guard=self._guard,
+                    guard_extra_pts=mem_pts,
                 )
                 rotate_active = bool(progress.get("rotate_to_heading"))
                 local_planner_active = bool(progress.get("local_planner"))
@@ -2276,6 +2289,7 @@ class NavSupervisor:
                             "near_bx": round(near_x, 3) if math.isfinite(near_x) else None,
                             "near_by": round(near_y, 3) if math.isfinite(near_y) else None,
                             "pts": int(len(guard_pts)),
+                            "mem": int(len(mem_pts)) if mem_pts is not None else 0,
                             "wp": progress.get("waypoint_index"),
                         }
                     )

@@ -5,6 +5,8 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
 
+import numpy as np
+
 from ..nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
@@ -605,6 +607,7 @@ def compute_path_command(
     prev_cmd: Optional[DriveCommand] = None,
     force_local_planner: bool = False,
     guard: Optional[FootprintGuard] = None,
+    guard_extra_pts: Optional[np.ndarray] = None,
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``.
 
@@ -623,7 +626,11 @@ def compute_path_command(
     tight = False
     if guard is not None:
         guard_pts = obstacle_points(
-            current, scan, local_view, radius_m=guard.cfg.obstacle_radius_m
+            current,
+            scan,
+            local_view,
+            radius_m=guard.cfg.obstacle_radius_m,
+            extra=guard_extra_pts,
         )
         # Tight space (body within ~20 cm of something): track the path
         # closely. The long, deadbanded lookahead that calms open-floor

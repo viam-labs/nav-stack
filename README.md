@@ -91,6 +91,14 @@ mount and height band; without it, depth collapses into Z and paints a blob on
 the robot in the local costmap. Refresh rate is nav-side
 ``obstacles_only_rate_hz`` (default `5`); set a POSIX ``shm_name`` (or use
 ``shm-pointcloud``) before pushing toward 10–20 Hz.
+
+Obstacles an `obstacles_only` camera saw are remembered (within 1.2 m, up to
+20 s) after they leave its horizontal view, e.g. the low part of a curved table
+leg beside the robot that the lidar plane misses. A point is forgotten when a
+newer frame looks at it and sees nothing, or when the body covers it. Set the
+camera's horizontal field of view with ``fov_deg`` (default `87`, RealSense
+D4xx depth).
+
 **Tuning via Viam config (no YAML editing required):**
 
 | Attribute | Service | Description |

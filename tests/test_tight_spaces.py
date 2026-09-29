@@ -13,6 +13,8 @@ default ``clearance_m`` (0.2) as well as the live tracer value (0.03).
 """
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from src.geom.conversions import Pose2D
@@ -179,6 +181,49 @@ def test_tight_space(monkeypatch, name, cond):
         # Fail on its own (bounded retries), not sit until the test cap.
         assert r.state == "failed", d
     assert r.length_flips() == 0, d
+
+
+def _curved_leg(x, y, th, gap, reach=0.08):
+    """Folding-table leg right of the route: the lidar plane sees the tube
+    ``gap`` off the flank; below it the leg bows ``reach`` closer, visible
+    only to the forward depth camera."""
+    nx, ny = math.sin(th), -math.cos(th)
+    d = sim.WIDTH / 2 + gap + 0.025
+    lx, ly = x + nx * d, y + ny * d
+    fx, fy = x + nx * (d - reach), y + ny * (d - reach)
+    tube = (lx - 0.02, ly - 0.02, lx + 0.02, ly + 0.02)
+    low = (min(lx, fx) - 0.02, min(ly, fy) - 0.02, max(lx, fx) + 0.02, max(ly, fy) + 0.02)
+    return tube, low
+
+
+@pytest.mark.parametrize(
+    "leg,max_s",
+    [
+        ((4.21, 2.03, -1.16, 0.10), 40.0),  # right turn onto the leg (live graze)
+        ((1.55, 3.0, 0.0, 0.10), 30.0),  # leg 20 cm off the nose at the start
+    ],
+)
+def test_curved_table_leg_below_lidar_plane(monkeypatch, leg, max_s):
+    """Live rc28: three grazes on a leg whose low part only the camera sees."""
+    g = sim.blank(8.0, 6.0)
+    sim.box(g, 3.0, 0.0, 3.1, 2.2)
+    tube, low = _curved_leg(*leg)
+    r = sim.run(
+        g,
+        Pose2D(1.0, 3.0, 0.0),
+        Pose2D(4.5, 1.0, -math.pi / 2),
+        extra_obstacles=[tube],
+        body_only_obstacles=[low],
+        monkeypatch=monkeypatch,
+        max_sim_s=60.0,
+        clearance_m=0.1,
+        lidar_offset=(0.24, 0.05),
+        lidar_min_range_m=0.1,
+        depth_cam=(0.30, -0.15, 87.0, 0.2, 2.0),
+    )
+    d = _detail(r)
+    assert r.contacts == 0, d
+    assert r.state == "succeeded" and r.sim_s < max_s, d
 
 
 @pytest.mark.parametrize("stand_s", [2.0, 15.0])
