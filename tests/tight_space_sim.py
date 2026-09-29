@@ -118,7 +118,12 @@ class RectWorld:
         self.pose_noise_rad = float(pose_noise_rad)
         self._pose_err = (0.0, 0.0, 0.0)
         self.nav_grid = nav_grid
-        self.truth = truth_grid >= 50
+        self._static_truth = truth_grid >= 50
+        self.truth = self._static_truth
+        self.elapsed_s = 0.0
+        # (x0, y0, x1, y1, t_on, t_off): a person stepping in and out.
+        self.timed: List[Tuple[float, float, float, float, float, float]] = []
+        self._timed_active: Tuple[bool, ...] = ()
         self.pose = pose
         self.samples = _body_samples(length, width, RES / 2.0)
         self.scan_bins = scan_bins
@@ -146,7 +151,23 @@ class RectWorld:
             return True
         return bool(self.truth[rows, cols].any())
 
+    def _update_timed(self) -> None:
+        active = tuple(t0 <= self.elapsed_s < t1 for *_, t0, t1 in self.timed)
+        if active == self._timed_active:
+            return
+        self._timed_active = active
+        truth = self._static_truth.copy()
+        for (x0, y0, x1, y1, _, _), on in zip(self.timed, active):
+            if on:
+                c0, c1 = int(math.floor(x0 / RES)), int(math.ceil(x1 / RES))
+                r0, r1 = int(math.floor(y0 / RES)), int(math.ceil(y1 / RES))
+                truth[r0:r1, c0:c1] = True
+        self.truth = truth
+        self._scan_age = 1e9
+
     def advance(self, dt: float) -> None:
+        self.elapsed_s += dt
+        self._update_timed()
         sub = 0.01
         t = 0.0
         vx, vth = self.cmd
@@ -278,6 +299,7 @@ def run(
     goal: conv.Pose2D,
     *,
     extra_obstacles: Sequence[Tuple[float, float, float, float]] = (),
+    timed_obstacles: Sequence[Tuple[float, float, float, float, float, float]] = (),
     clearance_m: float = 0.03,
     max_sim_s: float = 120.0,
     monkeypatch=None,
@@ -297,6 +319,7 @@ def run(
         pose_noise_rad=math.radians(1.0) if noise else 0.0,
         seed=seed,
     )
+    world.timed = list(timed_obstacles)
     clock = FakeClock(world)
     world.clock = clock
     fake_time = types.SimpleNamespace(

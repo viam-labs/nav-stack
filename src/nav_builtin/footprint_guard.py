@@ -77,7 +77,7 @@ def obstacle_points(
     """World-frame obstacle points near ``pose``.
 
     Live scan returns (exact, current) plus *static* lethal cells of the local
-    view (map walls / unknown). Persisted scan marks are skipped: they are
+    view (map walls). Persisted scan marks are skipped: they are
     projected with a stale pose, smear walls a cell inward, and in a 0.9 m
     corridor that alone reads as a collision.
     """
@@ -99,7 +99,11 @@ def obstacle_points(
         r0, r1 = max(0, r0), min(h, r1 + 1)
         c0, c1 = max(0, c0), min(w, c1 + 1)
         if r1 > r0 and c1 > c0:
-            lethal = costs[r0:r1, c0:c1] >= LETHAL
+            # Observed-occupied only: unknown (255) speckle on open floor is
+            # not inflated by the planner, so routes pass beside it and a
+            # guard that treated it as solid stalled there (Nav2 RPP likewise
+            # ignores NO_INFORMATION). Real unmapped obstacles come via scan.
+            lethal = costs[r0:r1, c0:c1] == LETHAL
             raw = getattr(local_view.occ, "grid", None)
             if raw is not None and np.shape(raw) == costs.shape:
                 lethal &= np.asarray(raw)[r0:r1, c0:c1] <= 0

@@ -1638,7 +1638,7 @@ class NavSupervisor:
                     blocked_for = now - local_blocked_since
                     # Exponential backoff between failed blocked-replans: each
                     # attempt is a full-map plan, and retrying every 0.5 s
-                    # forever starved the control loop on the Pi.
+                    # forever starves the control loop.
                     cooldown_ready = now - last_local_replan_at >= min(
                         8.0,
                         self._replan_local_min_period_s

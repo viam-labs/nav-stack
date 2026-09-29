@@ -50,6 +50,15 @@ def door_oblique(door_m):
     return g, Pose2D(2.0, 1.0, 0.0), Pose2D(8.0, 5.0, 0.0), [], True
 
 
+def unknown_speckle_on_route():
+    """Unobserved SLAM cells on open floor: not obstacles (live stall, rc26)."""
+    g = _room()
+    for x in (3.0, 4.5, 6.0):
+        r0, c0 = int(3.0 / sim.RES), int(x / sim.RES)
+        g[r0:r0 + 2, c0:c0 + 2] = -1
+    return g, Pose2D(1.0, 3.0, 0.0), Pose2D(8.5, 3.0, 0.0), [], True
+
+
 def door_then_bin():
     """Tight door, then a bin half-blocking the far side (the live pinch)."""
     g = _room()
@@ -101,6 +110,7 @@ SCENARIOS = {
     "door_1.00_oblique": lambda: door_oblique(1.0),
     "door_0.85_oblique": lambda: door_oblique(0.85),
     "door_then_bin": door_then_bin,
+    "unknown_speckle_on_route": unknown_speckle_on_route,
     "corridor_bend_0.9": corridor_bend,
     "gap_too_narrow": gap_too_narrow,
     "corridor_dead_end": corridor_dead_end,
@@ -116,6 +126,7 @@ NARROWEST = {
     "door_1.00_oblique": 1.0,
     "door_0.85_oblique": 0.85,
     "door_then_bin": 1.0,
+    "unknown_speckle_on_route": 3.0,
     "corridor_bend_0.9": 0.9,
     "gap_too_narrow": 0.56,
     "corridor_dead_end": 0.0,
@@ -168,3 +179,29 @@ def test_tight_space(monkeypatch, name, cond):
         # Fail on its own (bounded retries), not sit until the test cap.
         assert r.state == "failed", d
     assert r.length_flips() == 0, d
+
+
+@pytest.mark.parametrize("stand_s", [2.0, 15.0])
+def test_person_blocking_hallway_resumes_promptly(monkeypatch, stand_s):
+    """Someone steps into a 1.2 m hallway ahead, then leaves: go within ~1 s."""
+    g = sim.blank(12.0, 6.0)
+    sim.box(g, 0.0, 0.0, 12.0, 2.4)
+    sim.box(g, 0.0, 3.6, 12.0, 6.0)
+    t_on, t_off = 4.0, 4.0 + stand_s
+    r = sim.run(
+        g,
+        Pose2D(1.0, 3.0, 0.0),
+        Pose2D(10.0, 3.0, 0.0),
+        timed_obstacles=[(3.6, 2.4, 4.0, 3.6, t_on, t_off)],
+        monkeypatch=monkeypatch,
+        max_sim_s=90.0,
+    )
+    d = _detail(r)
+    assert r.contacts == 0, d
+    assert r.state == "succeeded", d
+    at_leave = next((x for t, x, *_ in r.trace if t - 1000.0 >= t_off), None)
+    moved = next(
+        (t - 1000.0 for t, x, *_ in r.trace if t - 1000.0 >= t_off and x > at_leave + 0.2),
+        None,
+    )
+    assert moved is not None and moved - t_off < 1.5, d
