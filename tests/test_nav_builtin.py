@@ -327,16 +327,20 @@ def test_costmap_viz_shows_workspace_clearance_hides_cspace_body():
         clearance_preference_m=0.0,
     )
     cx, cy = 2.0, 2.0
-    r_clear, c_clear = occ.world_to_cell(cx + 0.10, cy)  # inside clearance_m
-    r_cspace, c_cspace = occ.world_to_cell(cx + 0.32, cy)  # body C-space only
+    # Nav2 C-space semantics: robot center within body_r of the wall is a real
+    # collision (INSCRIBED, amber); the clearance_m ring past the body is a
+    # critical *soft* cost (CLEARANCE: traversable at a crawl).
+    r_body, c_body = occ.world_to_cell(cx + 0.10, cy)  # inside body radius
+    r_clear, c_clear = occ.world_to_cell(cx + 0.32, cy)  # clearance ring
+    assert int(costs[r_body, c_body]) == INSCRIBED
     assert int(costs[r_clear, c_clear]) == HARD_BUFFER
-    assert int(costs[r_cspace, c_cspace]) == INSCRIBED
-    assert not is_traversable(int(costs[r_clear, c_clear]))
-    assert not is_traversable(int(costs[r_cspace, c_cspace]))
-    assert is_hard(int(costs[r_cspace, c_cspace]))
+    assert is_traversable(int(costs[r_clear, c_clear]))
+    assert not is_hard(int(costs[r_clear, c_clear]))
+    assert not is_traversable(int(costs[r_body, c_body]))
+    assert is_hard(int(costs[r_body, c_body]))
     viz = costs_to_occupancy_viz(costs)
-    assert int(viz[r_clear, c_clear]) == 90
-    assert int(viz[r_cspace, c_cspace]) == 0
+    assert int(viz[r_body, c_body]) == 90
+    assert int(viz[r_clear, c_clear]) == 80
 
 
 def test_plan_respects_inflation_radius():

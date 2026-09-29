@@ -22,8 +22,10 @@ _DEBUG: Optional[dict] = None
 class LocalPlannerConfig:
     # Soft inflation on a mapped wall is normal — only wake DWA when the path
     # ahead is nearly blocked (live obstacle or tight squeeze).
-    activate_cost_threshold: int = 200
-    deactivate_cost_threshold: int = 120
+    # Nav2 semantics: only INSCRIBED (body overlaps obstacle) / LETHAL on the
+    # route is a block. Clearance (252) and soft cost are traversable.
+    activate_cost_threshold: int = 253
+    deactivate_cost_threshold: int = 252
     path_clearance_lookahead_m: float = 1.2
     path_weight: float = 2.0
     goal_weight: float = 1.0

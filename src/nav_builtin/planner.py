@@ -78,9 +78,13 @@ def _cost_multiplier(cost: int) -> float:
         return 1.0
     if is_hard(c):
         return 1e6
+    # Nav2 Smac-style traversal penalty: ``1 + cost_penalty·(cost/252)`` with
+    # a mild quadratic so the clearance band (252) is ~6.5× and mid soft ~3×.
+    # The previous 25t+120t² curve made a 1 m doorway cost ~150 m of open
+    # floor, so the planner took 14 m room loops over 8 m doorway routes and
+    # then flipped back once the paint faded (short↔long thrash).
     t = c / float(INSCRIBED - 1)
-    # Linear + steep quadratic: outer soft ≈ 10–20×, near-inscribed ≫50×.
-    return 1.0 + 25.0 * t + 120.0 * (t * t)
+    return 1.0 + 2.5 * t + 3.0 * (t * t)
 
 
 # Any-angle LOS / string-pull may only shortcut through near-free cells.

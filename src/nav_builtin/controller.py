@@ -603,6 +603,7 @@ def compute_path_command(
     rotate_active: bool = False,
     prev_cmd: Optional[DriveCommand] = None,
     force_local_planner: bool = False,
+    body_radius_m: Optional[float] = None,
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``.
 
@@ -797,7 +798,11 @@ def compute_path_command(
             current.x,
             current.y,
             spin_radius_m=spin_radius,
-            inscribed_radius_m=float(robot_radius_m),
+            # Local costs are inflated by the *body* disk only (Nav2
+            # inscribed); the clearance ring is soft.
+            inscribed_radius_m=float(
+                body_radius_m if body_radius_m is not None else robot_radius_m
+            ),
         )
     )
     if (
@@ -936,64 +941,49 @@ def compute_path_command(
                 stop_lim = float(cfg.obstacle.stop_distance_m)
                 slow_m = float(cfg.obstacle.slow_distance_m)
                 nose_open = (not math.isfinite(nose_m)) or nose_m > stop_lim
-            # Roomy lidar + inscribed (not lethal) along heading: C-space wall
-            # pinch. Crawl with pursuit yaw — reverse here was doorway pecking.
-            # When lidar already sees something inside slow range, keep the
-            # reverse / freeze path (real blob the costmap also marked).
-            roomy_nose = nose_open and (
-                (not math.isfinite(nose_m)) or float(nose_m) >= float(slow_m)
+            # Nav2-style split of responsibilities:
+            # - The lidar cone is ground truth for "something is actually in
+            #   front within stop distance". The costmap along the heading is
+            #   footprint-inflated, so INSCRIBED there with an open cone is
+            #   wall C-space beside the body (doorway / corridor pinch), not
+            #   a thing to stop for. Crawl with the pursuit yaw and let the
+            #   reactive slow/stop govern speed.
+            # - LETHAL along the heading, or the cone itself blocked, is a real
+            #   block: freeze translation. Reversing is *recovery* (supervisor
+            #   backup after the stuck timer), not a controller reflex — the
+            #   in-controller reverse was the doorway hunt-and-peck.
+            # - CLEARANCE (inside clearance_m of a wall, body still clear) is
+            #   Nav2 inflated space: traversable, speed regulated by cost
+            #   (RPP ``cost_scaling_dist``). Crawl, keep pursuit yaw.
+            from .costmap import is_clearance_violation
+
+            crawl = min(
+                max(float(cfg.motion.min_linear_mps), 0.12),
+                float(cfg.motion.max_linear_mps),
             )
-            if roomy_nose and is_hard(ahead) and int(ahead) < int(LETHAL):
-                crawl = min(
-                    max(float(cfg.motion.min_linear_mps), 0.12),
-                    float(cfg.motion.max_linear_mps),
-                )
+            if is_hard(ahead) and nose_open and int(ahead) < int(LETHAL):
                 cmd = DriveCommand(crawl, 0.0, cmd.vtheta, False)
                 obstacle_state = "narrow"
+            elif not is_hard(ahead) and is_clearance_violation(ahead):
+                if cmd.vx > crawl:
+                    cmd = DriveCommand(crawl, 0.0, cmd.vtheta, False)
+                obstacle_state = "narrow"
             elif is_hard(ahead):
-                # Freeze translation. Keep an existing yaw command only when
-                # the spin disc is clear; otherwise reverse when the rear is
-                # open (do not invent a freer-flank spin into a shoulder
-                # obstacle, and do not deadlock at cmd=0 — the rc14 live
-                # stall was forward DWA/pursuit into an inscribed blob with
-                # lidar nose clear, which skipped the vx≈0 spin-gate reverse).
-                keep_yaw = abs(cmd.vtheta) > 1e-6
                 disc_hit = bool(
                     spin_radius > float(robot_radius_m)
                     and (scan_spin_hit or cost_spin_hit)
                 )
-                if keep_yaw and disc_hit:
-                    keep_yaw = False
                 if disc_hit:
                     spin_blocked = True
+                # Keep a meaningful align yaw when the spin disc is clear so
+                # the robot can still turn toward the route; a ~0 yaw is a
+                # freeze, report it as such so recovery timers run.
+                keep_yaw = abs(cmd.vtheta) >= 0.08 and not disc_hit
                 if keep_yaw:
                     cmd = DriveCommand(0.0, 0.0, cmd.vtheta, False)
-                    obstacle_state = "avoid"
                 else:
-                    # Translation blocked into an inscribed blob. Prefer reverse
-                    # whenever the rear is open — not only when the spin disc
-                    # is also hit. Live rc26: aligned, disc clear, rear open,
-                    # hard-stop sat at cmd=0 forever (avoid, spin_blocked=false).
-                    rev = _try_narrow_reverse(
-                        cfg,
-                        scan,
-                        robot_radius_m,
-                        local_view=local_view,
-                        current=current,
-                    )
-                    if rev is not None:
-                        cmd = rev
-                        obstacle_state = "narrow_reverse"
-                    elif nose_open:
-                        crawl = min(
-                            max(float(cfg.motion.min_linear_mps), 0.12),
-                            float(cfg.motion.max_linear_mps),
-                        )
-                        cmd = DriveCommand(crawl, 0.0, 0.0, False)
-                        obstacle_state = "narrow"
-                    else:
-                        cmd = DriveCommand(0.0, 0.0, 0.0, False)
-                        obstacle_state = "avoid"
+                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                obstacle_state = "avoid"
 
     progress = {
         "waypoint_index": idx,

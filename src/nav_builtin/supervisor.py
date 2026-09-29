@@ -198,6 +198,7 @@ class NavSupervisor:
             enabled=local_planner_enabled,
             sim_time_s=local_planner_sim_time_s,
             activate_cost_threshold=local_planner_activate_cost,
+            deactivate_cost_threshold=max(0, int(local_planner_activate_cost) - 1),
             max_detour_forward_mps=local_planner_max_vel_x_mps,
             max_vel_x_reverse_m=local_planner_max_vel_x_reverse_m,
         )
@@ -1692,6 +1693,7 @@ class NavSupervisor:
                     local_view=local_view,
                     local_planner=self._local_planner if allow_local_planner else None,
                     robot_radius_m=self._robot_radius,
+                    body_radius_m=self._body_radius,
                     spin_radius_m=self._spin_radius,
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
                     min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
