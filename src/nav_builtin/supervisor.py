@@ -943,21 +943,26 @@ class NavSupervisor:
         blocked_for_s: float,
         wait_before_replan_s: float,
         replan_cooldown_ready: bool,
+        peel_stuck_s: float = 0.0,
+        peel_stuck_limit_s: float = 6.0,
     ) -> str:
         """Choose wait / keep_dwa / replan while the local path cost is high.
 
         ``keep_dwa``: clear forward cone — stay on the short global path and
         peel with the local planner (fit doorway / wall-inflation pinch).
-        Never escalate to a stop+replan from here while the nose is clear:
-        path cost 253 with 1+ m lidar clearance is C-space inflation, not a
-        person in front, and stopping every half-second to replan is the
-        mid-nav "pause with nothing ahead" stutter.
+        Do not stop-replan on the first clear-nose tick (that was the mid-nav
+        stutter). If peeling makes no progress for ``peel_stuck_limit_s``,
+        escalate — otherwise DWA crawls forever at path_cost=253.
         ``wait``: blocked nose — freeze briefly for dynamic crossers.
-        ``replan``: blocked nose + grace/cooldown elapsed — new global path.
+        ``replan``: blocked nose + grace, or clear-nose peel stuck.
         """
-        # Clear nose: inflation pinch / side hit — DWA only. Stall / backup /
-        # static-blocked paths still escalate elsewhere if peeling fails.
         if nose_clear:
+            if (
+                peel_stuck_limit_s > 0.0
+                and peel_stuck_s >= peel_stuck_limit_s
+                and replan_cooldown_ready
+            ):
+                return "replan"
             return "keep_dwa"
         if blocked_for_s < wait_before_replan_s:
             return "wait"
@@ -1557,11 +1562,18 @@ class NavSupervisor:
                     cooldown_ready = (
                         now - last_local_replan_at >= self._replan_local_min_period_s
                     )
+                    # How long since real motion while peeling with a clear nose.
+                    peel_stuck_s = (
+                        max(0.0, now - last_progress_at)
+                        if nose_clear
+                        else 0.0
+                    )
                     action = self._local_block_action(
                         nose_clear=nose_clear,
                         blocked_for_s=blocked_for,
                         wait_before_replan_s=wait_before_replan_s,
                         replan_cooldown_ready=cooldown_ready,
+                        peel_stuck_s=peel_stuck_s,
                     )
                     # Contradiction: path centerline free (path_cost low) but we
                     # still "wait for nose" — freezes forever on phantom/side
