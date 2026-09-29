@@ -1800,8 +1800,11 @@ def test_costmap_hard_stop_blocks_translate_into_inscribed():
         local_planner=None,
         robot_radius_m=0.08,
     )
-    assert cmd.vx <= 1e-9
-    assert progress["obstacle"] == "avoid"
+    assert cmd.vx > 0.0
+    assert progress["obstacle"] == "narrow"
+    # Roomy open lidar + inscribed ahead: crawl through C-space pinch (do not
+    # freeze — that was doorway hunt-and-peck when reverse fought pursuit).
+    assert progress.get("spin_blocked") in (False, True)
 
 
 def test_hard_stop_blocks_local_planner_into_stop_bubble():

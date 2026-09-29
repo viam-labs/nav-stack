@@ -943,27 +943,26 @@ class NavSupervisor:
         pose_cost: int,
         activate_cost: int,
         nose_clear: bool,
-        forward_clearance_m: Optional[float],
+        forward_clearance_m: Optional[float] = None,
         comfortable_clearance_m: float = 1.0,
     ) -> bool:
         """Whether the local path should force DWA / blocked recovery.
 
         True lethal on the path, or the body already in hard cost, always
-        counts. Soft / inscribed path cost (typical wall C-space pinch) with
-        a clear nose and comfortable forward clearance must *not* — that was
-        the live spin-crawl with path_cost=253 and 1.5 m lidar open.
+        counts. Soft / inscribed path cost with a clear nose must not —
+        that is C-space wall pinch, and waking DWA there is the
+        hunt-and-peck (forward/back/spin) in doorways. Pursuit + reactive
+        slow/stop handles clear-nose squeezes; DWA is for blocked nose or
+        real lethal on the route.
         """
         from .costmap import LETHAL, is_hard
 
         if is_hard(pose_cost) or int(path_ahead_cost) >= int(LETHAL):
             return True
+        if nose_clear:
+            return False
         if int(path_ahead_cost) < int(activate_cost):
             return False
-        if nose_clear:
-            if forward_clearance_m is None:
-                return False
-            if float(forward_clearance_m) >= float(comfortable_clearance_m):
-                return False
         return True
 
     @staticmethod
@@ -1518,7 +1517,7 @@ class NavSupervisor:
                 pose_cost = 0
                 local_blocked = False
                 # Nose / clearance first — inscribed path cost with a clear
-                # corridor must not force DWA (see ``_path_locally_blocked``).
+                # nose must not force DWA (hunt-and-peck in doorways).
                 nose_clear = True
                 forward_clearance_m: Optional[float] = None
                 obs_cfg = self._follower.obstacle
@@ -1530,11 +1529,6 @@ class NavSupervisor:
                     nose_clear = (
                         forward_clearance_m is None
                         or forward_clearance_m > obs_cfg.stop_distance_m
-                    )
-                comfortable_clearance_m = 1.0
-                if obs_cfg is not None and obs_cfg.enabled:
-                    comfortable_clearance_m = max(
-                        1.0, float(obs_cfg.slow_distance_m)
                     )
                 if local_view is not None:
                     from .local_planner import path_cost_ahead as _path_cost_ahead
@@ -1556,7 +1550,6 @@ class NavSupervisor:
                         activate_cost=int(self._local_planner_activate_cost),
                         nose_clear=nose_clear,
                         forward_clearance_m=forward_clearance_m,
-                        comfortable_clearance_m=comfortable_clearance_m,
                     )
                 # Reactive avoid spinning with a clear-looking path still means
                 # the robot cannot proceed — escalate to the blocked/replan path.
@@ -1573,7 +1566,6 @@ class NavSupervisor:
                         activate_cost=int(self._local_planner_activate_cost),
                         nose_clear=nose_clear,
                         forward_clearance_m=forward_clearance_m,
-                        comfortable_clearance_m=comfortable_clearance_m,
                     )
                 ):
                     local_blocked = True
@@ -1587,8 +1579,7 @@ class NavSupervisor:
                         local_blocked_since = now
                 # Front-vs-side policy (not motion classification):
                 # - Blocked nose: brief wait (people crossing), then replan.
-                # - Clear nose + tight clearance + local path cost: DWA peel.
-                # - Clear nose + comfortable clearance: pursuit (not local_blocked).
+                # - Clear nose: pursuit + reactive slow (no DWA peel).
                 wait_before_replan_s = max(
                     self._recovery_wait_duration_s,
                     self._replan_local_blocked_time_s,
@@ -1676,25 +1667,15 @@ class NavSupervisor:
                     local_blocked_since = None
                     failed_replan_while_blocked = 0
 
-                # Keep DWA available when the path is blocked but the nose is
-                # clear (or after a failed detour) — otherwise we only spin in
-                # reactive avoid / sit in wait. force_local also bypasses the
-                # ±60° bearing gate so large heading error cannot block DWA.
-                # Comfortable forward clearance + soft path cost: prefer
-                # pursuit; DWA was spinning in open corridors (pathc=253).
-                comfortable_forward = bool(
-                    nose_clear
-                    and forward_clearance_m is not None
-                    and float(forward_clearance_m) >= comfortable_clearance_m
-                )
+                # DWA only when the route is actually blocked (or after a failed
+                # detour). Clear-nose C-space pinch: pursuit + reactive slow —
+                # DWA reverse/spin samples were the doorway hunt-and-peck.
                 allow_local_planner = (
                     self._local_costmap_enabled
                     and not waiting_for_clear
-                    and not comfortable_forward
                     and (
-                        not local_blocked
+                        local_blocked
                         or failed_replan_while_blocked >= 1
-                        or nose_clear
                     )
                 )
                 force_local = bool(local_blocked and allow_local_planner)

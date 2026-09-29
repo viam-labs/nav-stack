@@ -921,7 +921,36 @@ def compute_path_command(
             hx = current.x + math.cos(current.theta) * stop_m
             hy = current.y + math.sin(current.theta) * stop_m
             ahead = max_cost_along_segment(local_view, current.x, current.y, hx, hy)
-            if is_hard(ahead):
+            from .costmap import LETHAL
+
+            nose_m = float("inf")
+            nose_open = True
+            slow_m = stop_m + 0.35
+            if (
+                cfg.obstacle is not None
+                and cfg.obstacle.enabled
+                and scan is not None
+            ):
+                half = float(cfg.obstacle.front_cone_half_rad)
+                nose_m = cone_min_range(scan, -half, half)
+                stop_lim = float(cfg.obstacle.stop_distance_m)
+                slow_m = float(cfg.obstacle.slow_distance_m)
+                nose_open = (not math.isfinite(nose_m)) or nose_m > stop_lim
+            # Roomy lidar + inscribed (not lethal) along heading: C-space wall
+            # pinch. Crawl with pursuit yaw — reverse here was doorway pecking.
+            # When lidar already sees something inside slow range, keep the
+            # reverse / freeze path (real blob the costmap also marked).
+            roomy_nose = nose_open and (
+                (not math.isfinite(nose_m)) or float(nose_m) >= float(slow_m)
+            )
+            if roomy_nose and is_hard(ahead) and int(ahead) < int(LETHAL):
+                crawl = min(
+                    max(float(cfg.motion.min_linear_mps), 0.12),
+                    float(cfg.motion.max_linear_mps),
+                )
+                cmd = DriveCommand(crawl, 0.0, cmd.vtheta, False)
+                obstacle_state = "narrow"
+            elif is_hard(ahead):
                 # Freeze translation. Keep an existing yaw command only when
                 # the spin disc is clear; otherwise reverse when the rear is
                 # open (do not invent a freer-flank spin into a shoulder
@@ -955,28 +984,16 @@ def compute_path_command(
                     if rev is not None:
                         cmd = rev
                         obstacle_state = "narrow_reverse"
+                    elif nose_open:
+                        crawl = min(
+                            max(float(cfg.motion.min_linear_mps), 0.12),
+                            float(cfg.motion.max_linear_mps),
+                        )
+                        cmd = DriveCommand(crawl, 0.0, 0.0, False)
+                        obstacle_state = "narrow"
                     else:
-                        nose_open = True
-                        if (
-                            cfg.obstacle is not None
-                            and cfg.obstacle.enabled
-                            and scan is not None
-                        ):
-                            half = float(cfg.obstacle.front_cone_half_rad)
-                            nose = cone_min_range(scan, -half, half)
-                            nose_open = (not math.isfinite(nose)) or nose > float(
-                                cfg.obstacle.stop_distance_m
-                            )
-                        if nose_open:
-                            crawl = min(
-                                max(float(cfg.motion.min_linear_mps), 0.12),
-                                float(cfg.motion.max_linear_mps),
-                            )
-                            cmd = DriveCommand(crawl, 0.0, 0.0, False)
-                            obstacle_state = "narrow"
-                        else:
-                            cmd = DriveCommand(0.0, 0.0, 0.0, False)
-                            obstacle_state = "avoid"
+                        cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                        obstacle_state = "avoid"
 
     progress = {
         "waypoint_index": idx,
