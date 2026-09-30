@@ -223,7 +223,7 @@ class BuiltinSensors:
             footprint_length_m=lidar.footprint_length_m,
             footprint_width_m=lidar.footprint_width_m,
         )
-        return conv.points_to_scan(
+        scan = conv.points_to_scan(
             pts,
             angle_min=-math.pi,
             angle_max=math.pi,
@@ -231,6 +231,11 @@ class BuiltinSensors:
             range_min=lidar.min_range,
             range_max=lidar.max_range,
         )
+        if pts.shape[0]:
+            r = np.hypot(pts[:, 0], pts[:, 1])
+            keep = (r >= lidar.min_range) & (r <= lidar.max_range)
+            scan.cloud_xy = np.ascontiguousarray(pts[keep, :2], dtype=float)
+        return scan
 
     def _try_shm_scan(
         self, lidar: LidarConfig, *, max_age_s: float

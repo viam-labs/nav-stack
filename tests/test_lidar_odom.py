@@ -145,6 +145,45 @@ def test_wheelless_cart_pose_follows_the_lidar(tmp_path, monkeypatch):
     assert diag["forward_m_s"] == pytest.approx(0.5, abs=0.15)
 
 
+_RING_ANGLES = -math.pi + (np.arange(720) + 0.5) * (2.0 * math.pi / 720)
+_BODY_RING = 0.25 * np.stack([np.cos(_RING_ANGLES), np.sin(_RING_ANGLES)], axis=1)
+
+
+def test_body_returns_are_left_out_of_matching():
+    lo = LidarOdometry()
+    assert not lo.add_keyscan(_BODY_RING, conv.Pose2D(0.0, 0.0, 0.0), force=True)
+    assert lo._prepare(_BODY_RING).shape[0] == 0  # noqa: SLF001
+
+
+class _CloudSensors(_DrivingSensors):
+    """Nearest-per-bin ranges only ever see the cart's own body; the walls
+    are only in the full cloud projection."""
+
+    def get_scan(self, max_age_s: float = 2.0, *, fresh: bool = False):
+        del max_age_s, fresh
+        p = self.true
+        c, s = math.cos(p.theta), math.sin(p.theta)
+        dx = _ROOM[:, 0] - p.x
+        dy = _ROOM[:, 1] - p.y
+        room = np.stack([c * dx + s * dy, -s * dx + c * dy], axis=1)
+        cloud = np.vstack([room, _BODY_RING])
+        scan = conv.points_to_scan(cloud, num_bins=720, range_min=0.1, range_max=15.0)
+        scan.cloud_xy = cloud
+        return scan
+
+
+def test_lidar_odometry_matches_the_full_cloud(tmp_path, monkeypatch):
+    cfg = _livox_cfg(tmp_path)
+    sensors = _CloudSensors()
+    engine = BuiltinSlamEngine(cfg, sensors, MapStore(str(tmp_path)))  # type: ignore[arg-type]
+    assert np.all(sensors.get_scan().to_points().std(axis=0) < 0.3)
+    _drive(engine, sensors, monkeypatch, speed=0.5, seconds=3.0)
+    pose = engine.get_pose()
+    assert pose.x == pytest.approx(sensors.true.x - 0.05, abs=0.06)
+    assert pose.y == pytest.approx(0.0, abs=0.05)
+    assert engine.diagnostics()["lidar_odometry"]["rejects"] == 0
+
+
 def test_wheelless_cart_back_and_forth_returns_home(tmp_path, monkeypatch):
     cfg = _livox_cfg(tmp_path)
     sensors = _DrivingSensors()

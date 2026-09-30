@@ -124,7 +124,13 @@ class LidarOdometry:
         min_inlier_ratio: float = 0.45,
         max_correction_m: float = 0.50,
         max_correction_rad: float = math.radians(15.0),
+        min_range_m: float = 0.5,
+        max_ref_points: int = 6000,
     ):
+        self._max_ref_points = int(max_ref_points)
+        # Returns off the cart's own body ride along with it and would pull
+        # every match toward "did not move".
+        self._min_range = float(min_range_m)
         self._scan_voxel = float(scan_voxel_m)
         self._voxel = float(ref_voxel_m)
         self._ref_radius = float(ref_radius_m)
@@ -157,8 +163,14 @@ class LidarOdometry:
     def has_reference(self) -> bool:
         return bool(self._keys)
 
+    def _beyond_body(self, scan_xy: np.ndarray) -> np.ndarray:
+        pts = np.asarray(scan_xy, dtype=float)
+        if pts.shape[0] == 0 or self._min_range <= 0.0:
+            return pts
+        return pts[np.hypot(pts[:, 0], pts[:, 1]) >= self._min_range]
+
     def _prepare(self, scan_xy: np.ndarray) -> np.ndarray:
-        pts = voxel_downsample(scan_xy, self._scan_voxel)
+        pts = voxel_downsample(self._beyond_body(scan_xy), self._scan_voxel)
         if self._max_points > 0 and pts.shape[0] > self._max_points:
             pick = np.linspace(0, pts.shape[0] - 1, self._max_points, dtype=np.int64)
             pts = pts[pick]
@@ -174,7 +186,7 @@ class LidarOdometry:
             turned = abs(conv.normalize_angle(pose.theta - last.theta))
             if moved < self._key_dist and turned < self._key_yaw:
                 return False
-        pts = voxel_downsample(scan_xy, self._voxel)
+        pts = voxel_downsample(self._beyond_body(scan_xy), self._voxel)
         if pts.shape[0] == 0:
             return False
         self._keys.append(_transform(pts, pose))
@@ -198,8 +210,11 @@ class LidarOdometry:
             return None
         src = self._prepare(scan_xy)
         ref = self._reference()
-        near = np.hypot(ref[:, 0] - guess.x, ref[:, 1] - guess.y) <= self._ref_radius
-        result = icp_2d(src, ref[near], guess)
+        ref = ref[np.hypot(ref[:, 0] - guess.x, ref[:, 1] - guess.y) <= self._ref_radius]
+        if self._max_ref_points > 0 and ref.shape[0] > self._max_ref_points:
+            pick = np.linspace(0, ref.shape[0] - 1, self._max_ref_points, dtype=np.int64)
+            ref = ref[pick]
+        result = icp_2d(src, ref, guess)
         if result is None or result.inlier_ratio < self._min_inlier_ratio:
             return None
         dist = math.hypot(result.pose.x - guess.x, result.pose.y - guess.y)

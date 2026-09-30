@@ -12,7 +12,7 @@ ROS2 installation. It handles:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -887,6 +887,10 @@ class LaserScan2D:
     sensor_pose: Pose2D = Pose2D(0.0, 0.0, 0.0)
     # Map pose of the robot when this scan was captured (for costmap sync).
     capture_pose: Optional[Pose2D] = None
+    # Every in-band cloud point (base_link XY) behind a 3D-lidar scan. The
+    # 720 nearest-per-bin ranges flicker between heights on a sparse
+    # non-repeating pattern; matching needs the whole projection.
+    cloud_xy: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
 
     def to_points(self) -> np.ndarray:
         """Return valid scan returns as ``(M, 2)`` XY points in the target frame."""

@@ -5,6 +5,7 @@ import math
 import threading
 import time
 from pathlib import Path
+from time import perf_counter
 from typing import Optional
 
 import numpy as np
@@ -123,6 +124,7 @@ class BuiltinSlamEngine:
         self._lo_last_rms = float("nan")
         self._lo_prev_theta: Optional[float] = None
         self._lo_turn_rate = 0.0
+        self._lo_match_ms = float("nan")
         # Signed yaw totals (rad) for comparing the gyro with the lidar on a spin.
         self._yaw_check_gyro = 0.0
         self._yaw_check_lidar = 0.0
@@ -531,6 +533,7 @@ class BuiltinSlamEngine:
                     "forward_m_s": round(self._lo_vel[0], 3),
                     "left_m_s": round(self._lo_vel[1], 3),
                     "turn_rate_deg_s": round(math.degrees(self._lo_turn_rate), 1),
+                    "last_match_ms": round(self._lo_match_ms, 1),
                     # After a spin these should agree; a large ratio means the
                     # IMU's turn-rate units are off.
                     "yaw_check": {
@@ -717,7 +720,8 @@ class BuiltinSlamEngine:
         self, scan: conv.LaserScan2D, now: float, *, gyro_rate: float = 0.0
     ) -> bool:
         """ICP this scan against recent scans and the map. True when the pose came from it."""
-        scan_xy = scan.to_points()
+        cloud = scan.cloud_xy
+        scan_xy = cloud if cloud is not None and cloud.shape[0] else scan.to_points()
         with self._lock:
             guess = self._pose
             map_pts = None
@@ -735,7 +739,9 @@ class BuiltinSlamEngine:
                 self._lo_last_at = now
                 self._lo_prev_theta = guess.theta
             return self._last_insert_pose is None
+        started = perf_counter()
         result = self._lo.match(scan_xy, guess)
+        self._lo_match_ms = (perf_counter() - started) * 1000.0
         with self._lock:
             if result is None:
                 self._lo_rejects += 1
