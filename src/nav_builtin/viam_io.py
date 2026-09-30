@@ -618,6 +618,8 @@ class ViamWorldIO:
             max_points=max_pts,
             range_min=float(lidar.min_range) if lidar.obstacles_only else 0.0,
             range_max=float(lidar.max_range) if lidar.obstacles_only else 0.0,
+            footprint_length_m=lidar.footprint_length_m,
+            footprint_width_m=lidar.footprint_width_m,
         )
         return conv.points_to_scan(
             pts,

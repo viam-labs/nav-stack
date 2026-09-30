@@ -99,6 +99,14 @@ newer frame looks at it and sees nothing, or when the body covers it. Set the
 camera's horizontal field of view with ``fov_deg`` (default `87`, RealSense
 D4xx depth).
 
+Point-cloud returns whose base-frame XY lies inside the robot's box are
+dropped (`crop_inside_footprint`, default on once a footprint is known). That
+removes a stand or mast on the chassis without a radial `min_range`, so a hit
+the same distance in front of the bumper is kept. The box comes from the base
+framesystem geometry (Viam +Y forward, +X right) or from explicit
+`footprint_length_m` / `footprint_width_m` on the SLAM service. Set
+`"crop_inside_footprint": false` to keep those returns.
+
 **Tuning via Viam config (no YAML editing required):**
 
 | Attribute | Service | Description |

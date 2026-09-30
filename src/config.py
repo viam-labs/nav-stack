@@ -240,6 +240,11 @@ class LidarConfig:
     # centred on its forward axis; RealSense D4xx depth is ~87). Obstacles it
     # saw are remembered once they leave this view until it looks again.
     fov_deg: float = 87.0
+    # Drop returns whose base_link XY is inside the robot box. Dimensions are
+    # filled from the base framesystem (0 = footprint unknown, no crop).
+    crop_inside_footprint: bool = True
+    footprint_length_m: float = 0.0
+    footprint_width_m: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "LidarConfig":
@@ -289,6 +294,7 @@ class LidarConfig:
             obstacles_only=bool(d.get("obstacles_only", False)),
             cloud_frame=cloud_frame,
             fov_deg=float(d.get("fov_deg", 87.0)),
+            crop_inside_footprint=bool(d.get("crop_inside_footprint", True)),
         )
 
 
@@ -859,6 +865,14 @@ class SlamConfig:
             "auto_full_map_fallback": True,
         }
     )
+    # Drop point-cloud hits whose base_link XY lies inside the robot box (a
+    # stand or mast on the chassis). A return the same distance in front of
+    # the body is kept. Off until a footprint is known: the base framesystem
+    # box, or explicit ``footprint_length_m`` / ``footprint_width_m`` (metres,
+    # +X forward, +Y left — Viam box Y and X).
+    crop_inside_footprint: bool = True
+    footprint_length_m: Optional[float] = None
+    footprint_width_m: Optional[float] = None
     # Builtin simulation: raycast floorplan + in-process SimSensors (see ``sim``).
     sim: SimConfig = field(default_factory=SimConfig)
 
@@ -879,6 +893,14 @@ class SlamConfig:
             else:
                 raise ValueError("at least one lidar is required ('lidars' or 'lidar')")
         lidars = [LidarConfig.from_dict(x) for x in lidars_raw]
+        crop_fp = bool(d.get("crop_inside_footprint", True))
+        fp_l = d.get("footprint_length_m")
+        fp_w = d.get("footprint_width_m")
+        if crop_fp and fp_l and fp_w:
+            for lidar in lidars:
+                if lidar.crop_inside_footprint:
+                    lidar.footprint_length_m = float(fp_l)
+                    lidar.footprint_width_m = float(fp_w)
         slam_lidars = [lidar for lidar in lidars if not lidar.obstacles_only]
         if not slam_lidars:
             raise ValueError(

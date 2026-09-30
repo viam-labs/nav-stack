@@ -220,6 +220,8 @@ class BuiltinSensors:
             z_min=lidar.z_min,
             z_max=lidar.z_max,
             max_points=max_pts,
+            footprint_length_m=lidar.footprint_length_m,
+            footprint_width_m=lidar.footprint_width_m,
         )
         return conv.points_to_scan(
             pts,

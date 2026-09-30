@@ -1258,6 +1258,8 @@ def prepare_lidar_point_cloud(
     max_points: int = 0,
     range_min: float = 0.0,
     range_max: float = 0.0,
+    footprint_length_m: float = 0.0,
+    footprint_width_m: float = 0.0,
 ) -> np.ndarray:
     """Optical remap → mount → height band (returns base_link XYZ).
 
@@ -1306,6 +1308,16 @@ def prepare_lidar_point_cloud(
             pts, x=x, y=y, z=z, theta=theta, pitch=pitch, roll=roll
         )
         pts = filter_points_by_z(pts, z_min, z_max)
+
+    # Body rectangle in base_link (+X forward, +Y left). A radial min_range
+    # cannot do this: a stand on the chassis and a real obstacle ahead of the
+    # bumper can be the same distance from the sensor.
+    fl = float(footprint_length_m)
+    fw = float(footprint_width_m)
+    if fl > 0.0 and fw > 0.0 and pts.size and pts.shape[1] >= 2:
+        inside = (np.abs(pts[:, 0]) <= fl / 2.0) & (np.abs(pts[:, 1]) <= fw / 2.0)
+        if inside.any():
+            pts = pts[~inside]
 
     if range_max > 0.0 and pts.size and pts.shape[1] >= 2:
         radial = np.hypot(pts[:, 0], pts[:, 1])

@@ -21,6 +21,7 @@ from src.viam_frames import (
     apply_framesystem_to_nav_cfg,
     apply_framesystem_to_slam_cfg,
     fetch_frame_system_config,
+    base_box_forward_lateral,
     footprint_from_base_geometry,
     pose_of_frame_in_destination,
 )
@@ -151,6 +152,34 @@ def test_footprint_from_box_uses_longer_side_as_length():
     assert abs(fp.length_m - 0.72) < 1e-9
     assert abs(fp.width_m - 0.59) < 1e-9
     assert abs(fp.inscribed_radius_m - 0.295) < 1e-9
+
+
+def test_wide_cart_box_crops_forward_not_the_longer_side():
+    """Cart is 0.50 m wide (Viam X) and 0.44 m long (Viam Y). The longer side
+    is the width; cropping that as length would eat returns in front of the nose."""
+    base = Transform(
+        reference_frame="cartbase",
+        pose_in_observer_frame=PoseInFrame(
+            reference_frame="world",
+            pose=Pose(x=0, y=0, z=0, o_x=0, o_y=0, o_z=1, theta=0),
+        ),
+        physical_object=Geometry(
+            box=RectangularPrism(dims_mm=Vector3(x=500, y=440, z=260))
+        ),
+    )
+    configs = [FrameSystemConfig(frame=base)]
+    assert base_box_forward_lateral(configs, "cartbase") == pytest.approx((0.44, 0.50))
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "cartbase",
+            "movement_sensor": "imu",
+            "lidars": [{"name": "livox-pc", "scan_source": "point_cloud"}],
+        }
+    )
+    apply_framesystem_to_slam_cfg(cfg, configs, raw_attrs={"base": "cartbase"})
+    lidar = cfg.lidars[0]
+    assert lidar.footprint_length_m == pytest.approx(0.44)
+    assert lidar.footprint_width_m == pytest.approx(0.50)
 
 
 def test_apply_slam_fills_mount_when_omitted():

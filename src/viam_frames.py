@@ -10,7 +10,7 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -231,6 +231,33 @@ def footprint_from_base_geometry(
     return FootprintBox(length_m=length_m, width_m=width_m)
 
 
+def base_box_forward_lateral(
+    configs: Sequence[Any],
+    base_name: str,
+) -> Optional[Tuple[float, float]]:
+    """``(length_m, width_m)`` of the base box in nav-stack axes.
+
+    Viam base: +Y forward, +X right, so box Y is length and box X is width.
+    A longer-side heuristic swaps those on a robot that is wider than it is
+    long, and would then crop real returns just in front of the bumper.
+    """
+    frames = _frame_entries(configs)
+    entry = frames.get(base_name)
+    if entry is None:
+        return None
+    geom = getattr(entry, "physical_object", None)
+    if geom is None or not geom.ByteSize():
+        return None
+    if geom.WhichOneof("geometry_type") != "box":
+        return None
+    dims = geom.box.dims_mm
+    lateral = abs(mm_to_m(float(dims.x)))
+    forward = abs(mm_to_m(float(dims.y)))
+    if lateral < 1e-3 or forward < 1e-3:
+        return None
+    return forward, lateral
+
+
 async def fetch_frame_system_config(
     robot, *, timeout_s: float = FRAME_SYSTEM_TIMEOUT_S
 ) -> List[Any]:
@@ -242,6 +269,40 @@ async def fetch_frame_system_config(
     """
     return list(
         await asyncio.wait_for(robot.get_frame_system_config(), timeout=timeout_s)
+    )
+
+
+def _apply_footprint_crop(cfg, configs: Sequence[Any], raw: Mapping, notes: List[str]) -> None:
+    """Stamp the base box onto each lidar so self-returns can be dropped.
+
+    Explicit ``footprint_length_m`` / ``footprint_width_m`` on the SLAM config
+    win. Otherwise the Viam base box is used (+Y forward, +X right).
+    """
+    if not bool(getattr(cfg, "crop_inside_footprint", True)):
+        notes.append("footprint crop: off")
+        return
+    explicit = ("footprint_length_m" in raw) or ("footprint_width_m" in raw)
+    length = getattr(cfg, "footprint_length_m", None)
+    width = getattr(cfg, "footprint_width_m", None)
+    if explicit and length and width:
+        source = "config"
+    else:
+        box = base_box_forward_lateral(configs, str(getattr(cfg, "base", "") or "base"))
+        if box is None:
+            notes.append("footprint crop: no base box; self-returns kept")
+            return
+        length, width = box
+        source = "framesystem"
+        cfg.footprint_length_m = float(length)
+        cfg.footprint_width_m = float(width)
+    for lidar in cfg.lidars:
+        if not lidar.crop_inside_footprint:
+            continue
+        lidar.footprint_length_m = float(length)
+        lidar.footprint_width_m = float(width)
+    notes.append(
+        f"footprint crop from {source}: L={float(length):.3f} W={float(width):.3f} "
+        "(drops returns inside the base box)"
     )
 
 
@@ -338,6 +399,7 @@ def apply_framesystem_to_slam_cfg(
             f"θ={lidar.theta:.3f} pitch={lidar.pitch:.3f} roll={lidar.roll:.3f}"
             f"{optical_note}"
         )
+    _apply_footprint_crop(cfg, configs, raw, notes)
     for line in notes:
         log.info("framesystem: %s", line)
     return cfg, notes

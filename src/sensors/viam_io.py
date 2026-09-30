@@ -108,6 +108,8 @@ def build_io_provider(
                     range_max=(
                         float(lidar_cfg.max_range) if lidar_cfg.obstacles_only else 0.0
                     ),
+                    footprint_length_m=lidar_cfg.footprint_length_m,
+                    footprint_width_m=lidar_cfg.footprint_width_m,
                 )
             else:
                 base_pts = pts
