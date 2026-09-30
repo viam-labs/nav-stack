@@ -121,6 +121,11 @@ class BuiltinSlamEngine:
         self._lo_inserts_held = 0
         self._lo_last_inlier = float("nan")
         self._lo_last_rms = float("nan")
+        self._lo_prev_theta: Optional[float] = None
+        self._lo_turn_rate = 0.0
+        # Signed yaw totals (rad) for comparing the gyro with the lidar on a spin.
+        self._yaw_check_gyro = 0.0
+        self._yaw_check_lidar = 0.0
         self._last_loop_rebuild_at = 0.0
         self._pose_jump_gate = PoseJumpGate(
             confirm_count=int(cfg.localize_jump_confirm_count),
@@ -346,6 +351,8 @@ class BuiltinSlamEngine:
         self._lo_fails = 0
         self._lo_reset_pending = True
         self._lo_map_updates = None
+        self._lo_prev_theta = None
+        self._lo_turn_rate = 0.0
 
     def apply_map_pose_correction(self, matched_pose: conv.Pose2D) -> dict:
         """Correct pose drift during mapping; optionally rebuild the grid."""
@@ -523,6 +530,13 @@ class BuiltinSlamEngine:
                     "last_rms_m": self._lo_last_rms,
                     "forward_m_s": round(self._lo_vel[0], 3),
                     "left_m_s": round(self._lo_vel[1], 3),
+                    "turn_rate_deg_s": round(math.degrees(self._lo_turn_rate), 1),
+                    # After a spin these should agree; a large ratio means the
+                    # IMU's turn-rate units are off.
+                    "yaw_check": {
+                        "gyro_deg": round(math.degrees(self._yaw_check_gyro), 1),
+                        "lidar_deg": round(math.degrees(self._yaw_check_lidar), 1),
+                    },
                 },
             }
 
@@ -613,8 +627,11 @@ class BuiltinSlamEngine:
             )
 
         lo_ok = False
+        turning = False
         if use_lo:
-            lo_ok = self._lidar_odom_step(scan, now)
+            gyro_rate = abs(float(odom.vtheta)) if odom is not None else 0.0
+            lo_ok = self._lidar_odom_step(scan, now, gyro_rate=gyro_rate)
+            turning = max(gyro_rate, self._lo_turn_rate) > self._LO_MAX_INSERT_YAW_RATE
             if lo_ok and self._mode == MODE_MAPPING:
                 # The map is being built from these poses; the grid matcher
                 # only re-checks them against themselves.
@@ -641,12 +658,7 @@ class BuiltinSlamEngine:
                 # One lidar revolution (~100 ms) is skewed by yaw_rate*0.1 s;
                 # inserting it during a fast spin paints walls as arcs.
                 self._insert_skips_turning += 1
-            elif (
-                use_lo
-                and odom is not None
-                and abs(float(odom.vtheta)) > self._LO_MAX_INSERT_YAW_RATE
-                and self._last_insert_pose is not None
-            ):
+            elif use_lo and turning and self._last_insert_pose is not None:
                 self._insert_skips_turning += 1
             elif use_lo and not lo_ok and self._last_insert_pose is not None:
                 # No scan match: the pose is a guess. Painting there doubles walls.
@@ -668,7 +680,7 @@ class BuiltinSlamEngine:
     _LO_MAX_FAILS = 10
     # Occupied cells (one hit is 0.85) also anchor matching; refreshed after
     # this many map inserts.
-    _LO_MAP_OCC_LOG_ODDS = 0.6
+    _LO_MAP_OCC_LOG_ODDS = 1.5
     _LO_MAP_REFRESH_INSERTS = 10
     # One ~100 ms Livox frame taken while turning is smeared by rate * 0.1 s;
     # above this the scan still tracks the pose but is not drawn.
@@ -701,7 +713,9 @@ class BuiltinSlamEngine:
             axis=1,
         )
 
-    def _lidar_odom_step(self, scan: conv.LaserScan2D, now: float) -> bool:
+    def _lidar_odom_step(
+        self, scan: conv.LaserScan2D, now: float, *, gyro_rate: float = 0.0
+    ) -> bool:
         """ICP this scan against recent scans and the map. True when the pose came from it."""
         scan_xy = scan.to_points()
         with self._lock:
@@ -719,6 +733,7 @@ class BuiltinSlamEngine:
             self._lo.add_keyscan(scan_xy, guess, force=True)
             with self._lock:
                 self._lo_last_at = now
+                self._lo_prev_theta = guess.theta
             return self._last_insert_pose is None
         result = self._lo.match(scan_xy, guess)
         with self._lock:
@@ -729,6 +744,8 @@ class BuiltinSlamEngine:
                     self._lo_fails = 0
                     self._lo_resets += 1
                     self._lo_vel = (0.0, 0.0)
+                    self._lo_prev_theta = self._pose.theta
+                    self._lo_turn_rate = 0.0
                     self._lo.reset()
                     self._lo.add_keyscan(scan_xy, self._pose, force=True)
                     self._log("builtin SLAM: lidar odometry lost track; restarting local map")
@@ -745,6 +762,12 @@ class BuiltinSlamEngine:
                     fwd = max(-self._LO_MAX_FORWARD_M_S, min(self._LO_MAX_FORWARD_M_S, fwd))
                     left = max(-self._LO_MAX_LATERAL_M_S, min(self._LO_MAX_LATERAL_M_S, left))
                     self._lo_vel = (fwd, left)
+            if self._lo_prev_theta is not None:
+                turned = conv.normalize_angle(pose.theta - self._lo_prev_theta)
+                self._yaw_check_lidar += turned
+                if self._lo_last_at is not None and now > self._lo_last_at:
+                    self._lo_turn_rate = abs(turned) / (now - self._lo_last_at)
+            self._lo_prev_theta = pose.theta
             self._pose = pose
             self._lo_last_at = now
             self._lo_fails = 0
@@ -752,7 +775,9 @@ class BuiltinSlamEngine:
             self._lo_last_inlier = round(result.inlier_ratio, 3)
             self._lo_last_rms = round(result.rms_m, 4)
             self._imu_forward_m_s = 0.0
-        self._lo.add_keyscan(scan_xy, pose)
+        if max(gyro_rate, self._lo_turn_rate) <= self._LO_MAX_INSERT_YAW_RATE:
+            # A frame skewed by a turn would tilt every match that uses it.
+            self._lo.add_keyscan(scan_xy, pose)
         return True
 
     def _lidar_odom_twist(self, now: float, dt: float) -> tuple[float, float]:
@@ -1294,6 +1319,8 @@ class BuiltinSlamEngine:
         ):
             dth = self._imu_yaw_delta(dth, dt)
 
+        if self._lidar_odom_active(odom):
+            self._yaw_check_gyro += float(odom.vtheta) * dt
         c = math.cos(self._pose.theta)
         s = math.sin(self._pose.theta)
         if self._lidar_odom_active(odom) and self._lidar_odom_fresh(now):

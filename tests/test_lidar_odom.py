@@ -187,6 +187,51 @@ def test_turning_scan_tracks_but_is_not_painted(tmp_path, monkeypatch):
     assert engine.diagnostics()["insert_skips_turning"] == 1
 
 
+class _SpinningSensors(_DrivingSensors):
+    def __init__(self, rate: float, gyro_scale: float = 1.0):
+        super().__init__()
+        self.rate = rate
+        self.gyro_scale = gyro_scale
+
+    def get_odom(self):
+        return conv.OdomReading(0.0, 0.0, self.rate * self.gyro_scale)
+
+
+def _spin(engine, sensors, monkeypatch, *, seconds: float):
+    monkeypatch.setattr(
+        engine_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: sensors.clock, sleep=time.sleep),
+    )
+    dt = 0.1
+    for _ in range(int(round(seconds / dt))):
+        engine._tick()  # noqa: SLF001
+        sensors.clock += dt
+        t = sensors.true
+        sensors.true = conv.Pose2D(t.x, t.y, conv.normalize_angle(t.theta + sensors.rate * dt))
+
+
+@pytest.mark.parametrize("gyro_scale", [1.0, 0.0])
+def test_spin_tracks_yaw_and_keeps_skewed_scans_out(tmp_path, monkeypatch, gyro_scale):
+    """A spin is tracked by the lidar even when the gyro reads nothing, the
+    yaw check exposes that gyro, and no mid-spin frame becomes a keyscan."""
+    cfg = _livox_cfg(tmp_path)
+    sensors = _SpinningSensors(rate=0.0)
+    engine = BuiltinSlamEngine(cfg, sensors, MapStore(str(tmp_path)))  # type: ignore[arg-type]
+    _spin(engine, sensors, monkeypatch, seconds=0.3)
+    keys_before = len(engine._lo._keys)  # noqa: SLF001
+    sensors.rate = math.radians(30.0)
+    sensors.gyro_scale = gyro_scale
+    _spin(engine, sensors, monkeypatch, seconds=2.0)
+    last_scan_theta = conv.normalize_angle(sensors.true.theta - sensors.rate * 0.1)
+    pose = engine.get_pose()
+    assert conv.normalize_angle(pose.theta - last_scan_theta) == pytest.approx(0.0, abs=math.radians(1.5))
+    check = engine.diagnostics()["lidar_odometry"]["yaw_check"]
+    assert check["lidar_deg"] == pytest.approx(57.0, abs=3.0)
+    assert check["gyro_deg"] == pytest.approx(57.0 * gyro_scale, abs=6.0)
+    assert len(engine._lo._keys) == keys_before  # noqa: SLF001
+
+
 def test_wheel_odom_never_uses_lidar_odometry(tmp_path, monkeypatch):
     """A sample with wheel speed (Tracer) keeps the wheel path."""
     cfg = _livox_cfg(tmp_path)
