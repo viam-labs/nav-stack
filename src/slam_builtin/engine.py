@@ -105,6 +105,7 @@ class BuiltinSlamEngine:
         # Forward speed (m/s) guessed from IMU accel when wheel velocity is absent.
         self._imu_forward_m_s = 0.0
         self._imu_ax_bias = None
+        self._imu_yaw_bias = None
         self._last_loop_rebuild_at = 0.0
         self._pose_jump_gate = PoseJumpGate(
             confirm_count=int(cfg.localize_jump_confirm_count),
@@ -316,6 +317,7 @@ class BuiltinSlamEngine:
             self._last_odom_time = None
             self._imu_forward_m_s = 0.0
             self._imu_ax_bias = None
+            self._imu_yaw_bias = None
         self._notify_pose_listeners(pose)
         self._persist_pose(force=True)
 
@@ -950,17 +952,37 @@ class BuiltinSlamEngine:
     # Ignore accel smaller than this so gravity leftover and sensor noise do
     # not walk the pose while the cart is sitting still.
     _ACCEL_DEADBAND_M_S2 = 0.20
-    # A constant-speed cruise has ~0 accel. Hold the speed built up during the
-    # shove, and let it fade so a bias cannot run away.
-    _ACCEL_COAST_TAU_S = 2.0
     _ACCEL_SPEED_MAX_M_S = 0.8
     # How fast a constant reading is absorbed into the baseline. A parked
     # tilt must not keep integrating; a real shove stays ahead of this.
     _ACCEL_BIAS_TAU_S = 1.5
-    # Parked Livox gyros sit a few degrees per second off zero. Integrating
-    # that, then painting a scan every second, sweeps the walls into arcs.
-    # A real turn in place is well above this.
+    # A resting gyro faster than this is a real turn. Slower rates are the
+    # IMU's zero (Wit already near 0, Livox a small bias) and do not turn.
     _YAW_STILL_RAD_S = math.radians(5.0)
+    # Seed the resting yaw rate from the first sample only when it is modest.
+    # A cart that powers on already spinning is not treated as bias.
+    _YAW_BIAS_SEED_MAX_RAD_S = math.radians(30.0)
+
+    def _imu_yaw_delta(self, dth: float, dt: float) -> float:
+        """Yaw step for an IMU-only cart.
+
+        The first modest gyro rate is that IMU's zero (a Wit sits near 0; a
+        Livox can sit on a bias). Only a change above the still threshold
+        turns the pose, so a parked cart does not rotate to a new heading.
+        """
+        rate = dth / dt if dt > 0.0 else 0.0
+        if (
+            self._imu_yaw_bias is None
+            and abs(rate) <= self._YAW_BIAS_SEED_MAX_RAD_S
+        ):
+            self._imu_yaw_bias = rate
+        bias = 0.0 if self._imu_yaw_bias is None else self._imu_yaw_bias
+        residual = rate - bias
+        if abs(residual) <= self._YAW_STILL_RAD_S:
+            if self._imu_yaw_bias is not None:
+                self._imu_yaw_bias += residual * (1.0 - math.exp(-dt / 2.0))
+            return 0.0
+        return residual * dt
 
     def _twist_with_accel_prior(
         self, odom: conv.OdomReading, dt: float
@@ -971,7 +993,9 @@ class BuiltinSlamEngine:
         and no wheel speed, a *change* in forward acceleration (``ax`` after
         the IMU mount yaw) is integrated into a short-lived forward speed.
         The steady reading, including gravity left over from a tilt, is the
-        baseline and does not move the pose. Lateral accel is ignored.
+        baseline and does not move the pose. When the reading returns to that
+        baseline the speed is dropped, so stopping does not coast. Lateral
+        accel is ignored.
         """
         vx, vy = float(odom.vx), float(odom.vy)
         if getattr(self._cfg, "imu_odom_mode", "") != IMU_ODOM_ACCEL_ONLY:
@@ -981,20 +1005,25 @@ class BuiltinSlamEngine:
         if abs(vx) > 1e-3 or abs(vy) > 1e-3:
             self._imu_forward_m_s = 0.0
             self._imu_ax_bias = None
+            self._imu_yaw_bias = None
             return vx, vy
         ax = float(odom.ax)
         if self._imu_ax_bias is None:
             self._imu_ax_bias = ax
         residual = ax - self._imu_ax_bias
-        self._imu_ax_bias += residual * (1.0 - math.exp(-dt / self._ACCEL_BIAS_TAU_S))
-        residual = ax - self._imu_ax_bias
-        speed = self._imu_forward_m_s
-        if abs(residual) >= self._ACCEL_DEADBAND_M_S2:
-            speed += residual * dt
+        if abs(residual) < self._ACCEL_DEADBAND_M_S2:
+            # Quiet: follow a slow change in the resting reading, and stop.
+            self._imu_ax_bias += residual * (
+                1.0 - math.exp(-dt / self._ACCEL_BIAS_TAU_S)
+            )
+            self._imu_forward_m_s = 0.0
+            speed = 0.0
         else:
-            speed *= math.exp(-dt / self._ACCEL_COAST_TAU_S)
-        speed = max(-self._ACCEL_SPEED_MAX_M_S, min(self._ACCEL_SPEED_MAX_M_S, speed))
-        self._imu_forward_m_s = speed
+            speed = self._imu_forward_m_s + residual * dt
+            speed = max(
+                -self._ACCEL_SPEED_MAX_M_S, min(self._ACCEL_SPEED_MAX_M_S, speed)
+            )
+            self._imu_forward_m_s = speed
         if getattr(self._cfg, "base_velocity_convention", "viam") in BASE_VELOCITY_Y_FORWARD:
             return 0.0, speed
         return speed, 0.0
@@ -1019,6 +1048,7 @@ class BuiltinSlamEngine:
             self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
             self._imu_forward_m_s = 0.0
             self._imu_ax_bias = None
+            self._imu_yaw_bias = None
             if prev is None:
                 if odom.heading_rad is not None:
                     self._last_odom_heading = odom.heading_rad
@@ -1084,9 +1114,8 @@ class BuiltinSlamEngine:
             getattr(self._cfg, "imu_odom_mode", "") == IMU_ODOM_ACCEL_ONLY
             and abs(float(odom.vx)) <= 1e-3
             and abs(float(odom.vy)) <= 1e-3
-            and abs(dth) <= self._YAW_STILL_RAD_S * dt
         ):
-            dth = 0.0
+            dth = self._imu_yaw_delta(dth, dt)
 
         vx, vy = self._twist_with_accel_prior(odom, dt)
         self._last_odom_twist = (vx, vy, odom.vtheta)

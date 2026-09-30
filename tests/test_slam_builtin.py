@@ -496,7 +496,8 @@ def test_parked_gyro_bias_does_not_spin_accel_only_pose():
 
     spin = conv.OdomReading(0.0, 0.0, math.radians(30.0), ax=0.0, ay=0.0)
     engine._pose = engine._predict(spin, t0 + 2.2)  # noqa: SLF001
-    assert engine.get_pose().theta == pytest.approx(math.radians(30.0) * 0.2, abs=1e-6)
+    # The 2°/s resting rate stays in the bias; only the extra 28°/s turns.
+    assert engine.get_pose().theta == pytest.approx(math.radians(28.0) * 0.2, abs=1e-6)
 
 
 def test_coast_mode_still_integrates_small_yaw():
@@ -539,7 +540,10 @@ def test_accel_pulse_then_coasts():
     assert posed.x > 0.01
     coast = conv.OdomReading(0.0, 0.0, 0.0, ax=0.0, ay=0.0)
     engine._pose = engine._predict(coast, t0 + 0.6)  # noqa: SLF001
-    assert engine.get_pose().x > posed.x
+    stopped = engine.get_pose()
+    assert stopped.x == pytest.approx(posed.x, abs=1e-9)
+    engine._pose = engine._predict(coast, t0 + 1.6)  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(stopped.x, abs=1e-9)
 
 
 def test_wheel_twist_ignores_accel():
