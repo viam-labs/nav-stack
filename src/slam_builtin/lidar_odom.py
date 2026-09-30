@@ -117,9 +117,9 @@ class LidarOdometry:
         scan_voxel_m: float = 0.10,
         ref_voxel_m: float = 0.08,
         ref_radius_m: float = 10.0,
-        max_keyscans: int = 30,
-        key_dist_m: float = 0.10,
-        key_yaw_rad: float = math.radians(5.0),
+        max_keyscans: int = 40,
+        key_dist_m: float = 0.15,
+        key_yaw_rad: float = math.radians(10.0),
         max_points: int = 250,
         min_inlier_ratio: float = 0.45,
         max_correction_m: float = 0.50,
@@ -136,11 +136,22 @@ class LidarOdometry:
         self._min_inlier_ratio = float(min_inlier_ratio)
         self._max_corr_m = float(max_correction_m)
         self._max_corr_rad = float(max_correction_rad)
+        self._map_pts: Optional[np.ndarray] = None
         self._ref: Optional[np.ndarray] = None
 
     def reset(self) -> None:
+        """Drop the recent keyscans. Map points stay until replaced."""
         self._keys.clear()
         self._key_pose = None
+        self._ref = None
+
+    def set_map_points(self, points: Optional[np.ndarray]) -> None:
+        """Occupied map cells (map XY). Matching against them keeps a revisit
+        on the walls already drawn after the recent keyscans have rolled off."""
+        if points is None or len(points) == 0:
+            self._map_pts = None
+        else:
+            self._map_pts = voxel_downsample(points, self._voxel)
         self._ref = None
 
     def has_reference(self) -> bool:
@@ -173,7 +184,10 @@ class LidarOdometry:
 
     def _reference(self) -> np.ndarray:
         if self._ref is None:
-            self._ref = voxel_downsample(np.vstack(list(self._keys)), self._voxel)
+            parts = [voxel_downsample(np.vstack(list(self._keys)), self._voxel)]
+            if self._map_pts is not None:
+                parts.append(self._map_pts)
+            self._ref = np.vstack(parts)
         return self._ref
 
     def match(

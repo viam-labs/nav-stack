@@ -70,6 +70,23 @@ def test_lidar_odometry_rejects_scan_that_does_not_fit():
     assert lo.match(noise, origin) is None
 
 
+def test_map_points_anchor_a_match_the_keyscans_cannot():
+    """Only a short wall is in the recent keyscans (slides along it); the map
+    has the whole room, so the offset along the wall is recovered too."""
+    lo = LidarOdometry()
+    wall = np.stack([np.arange(-1.0, 1.0, 0.02), np.full(100, 2.5)], axis=1)
+    lo.add_keyscan(wall, conv.Pose2D(0.0, 0.0, 0.0), force=True)
+    true = conv.Pose2D(0.25, 0.0, 0.0)
+    scan_xy = _scan_from(true).to_points()
+    guess = conv.Pose2D(0.0, 0.0, 0.0)
+
+    lo.set_map_points(_ROOM)
+    result = lo.match(scan_xy, guess)
+    assert result is not None
+    assert result.pose.x == pytest.approx(true.x, abs=0.03)
+    assert result.pose.y == pytest.approx(0.0, abs=0.03)
+
+
 class _DrivingSensors:
     """A cart driving along +X with an IMU that reports no linear velocity."""
 
@@ -155,6 +172,19 @@ def test_unmatched_scan_is_not_painted(tmp_path, monkeypatch):
     engine._tick()  # noqa: SLF001
     assert engine._updates == painted  # noqa: SLF001
     assert engine.diagnostics()["lidar_odometry"]["inserts_held"] == 1
+
+
+def test_turning_scan_tracks_but_is_not_painted(tmp_path, monkeypatch):
+    cfg = _livox_cfg(tmp_path)
+    sensors = _DrivingSensors()
+    engine = BuiltinSlamEngine(cfg, sensors, MapStore(str(tmp_path)))  # type: ignore[arg-type]
+    _drive(engine, sensors, monkeypatch, speed=0.0, seconds=0.3)
+    painted = engine._updates  # noqa: SLF001
+    sensors.get_odom = lambda: conv.OdomReading(0.0, 0.0, math.radians(30.0))  # type: ignore[method-assign]
+    engine._last_insert_at -= 5.0  # noqa: SLF001  heartbeat would paint
+    engine._tick()  # noqa: SLF001
+    assert engine._updates == painted  # noqa: SLF001
+    assert engine.diagnostics()["insert_skips_turning"] == 1
 
 
 def test_wheel_odom_never_uses_lidar_odometry(tmp_path, monkeypatch):

@@ -113,6 +113,7 @@ class BuiltinSlamEngine:
         self._lo_vel = (0.0, 0.0)
         self._lo_last_at: Optional[float] = None
         self._lo_reset_pending = False
+        self._lo_map_updates: Optional[int] = None
         self._lo_fails = 0
         self._lo_accepts = 0
         self._lo_rejects = 0
@@ -344,6 +345,7 @@ class BuiltinSlamEngine:
         self._lo_last_at = None
         self._lo_fails = 0
         self._lo_reset_pending = True
+        self._lo_map_updates = None
 
     def apply_map_pose_correction(self, matched_pose: conv.Pose2D) -> dict:
         """Correct pose drift during mapping; optionally rebuild the grid."""
@@ -400,6 +402,7 @@ class BuiltinSlamEngine:
             # Keyscans sit at the pre-correction poses; keep velocity, rebuild map.
             self._lo_reset_pending = True
             self._lo_last_at = None
+            self._lo_map_updates = None
 
         self._notify_pose_listeners(matched_pose)
         self._persist_pose(force=True)
@@ -638,6 +641,13 @@ class BuiltinSlamEngine:
                 # One lidar revolution (~100 ms) is skewed by yaw_rate*0.1 s;
                 # inserting it during a fast spin paints walls as arcs.
                 self._insert_skips_turning += 1
+            elif (
+                use_lo
+                and odom is not None
+                and abs(float(odom.vtheta)) > self._LO_MAX_INSERT_YAW_RATE
+                and self._last_insert_pose is not None
+            ):
+                self._insert_skips_turning += 1
             elif use_lo and not lo_ok and self._last_insert_pose is not None:
                 # No scan match: the pose is a guess. Painting there doubles walls.
                 self._lo_inserts_held += 1
@@ -656,6 +666,13 @@ class BuiltinSlamEngine:
     _LO_MAX_LATERAL_M_S = 0.3
     # Consecutive misses before the local map restarts from the current pose.
     _LO_MAX_FAILS = 10
+    # Occupied cells (one hit is 0.85) also anchor matching; refreshed after
+    # this many map inserts.
+    _LO_MAP_OCC_LOG_ODDS = 0.6
+    _LO_MAP_REFRESH_INSERTS = 10
+    # One ~100 ms Livox frame taken while turning is smeared by rate * 0.1 s;
+    # above this the scan still tracks the pose but is not drawn.
+    _LO_MAX_INSERT_YAW_RATE = math.radians(15.0)
 
     def _lidar_odom_enabled(self) -> bool:
         return bool(getattr(self._cfg, "lidar_odometry", False))
@@ -675,11 +692,29 @@ class BuiltinSlamEngine:
     def _lidar_odom_fresh(self, now: float) -> bool:
         return self._lo_last_at is not None and now - self._lo_last_at <= self._LO_FRESH_S
 
+    def _occupied_map_points_locked(self) -> np.ndarray:
+        grid = self._grid
+        rows, cols = np.nonzero(grid.log_odds > self._LO_MAP_OCC_LOG_ODDS)
+        res = grid.resolution
+        return np.stack(
+            [grid.origin_x + (cols + 0.5) * res, grid.origin_y + (rows + 0.5) * res],
+            axis=1,
+        )
+
     def _lidar_odom_step(self, scan: conv.LaserScan2D, now: float) -> bool:
-        """ICP this scan against recent scans. True when the pose came from it."""
+        """ICP this scan against recent scans and the map. True when the pose came from it."""
         scan_xy = scan.to_points()
         with self._lock:
             guess = self._pose
+            map_pts = None
+            if (
+                self._lo_map_updates is None
+                or self._updates - self._lo_map_updates >= self._LO_MAP_REFRESH_INSERTS
+            ):
+                map_pts = self._occupied_map_points_locked()
+                self._lo_map_updates = self._updates
+        if map_pts is not None:
+            self._lo.set_map_points(map_pts)
         if not self._lo.has_reference():
             self._lo.add_keyscan(scan_xy, guess, force=True)
             with self._lock:
