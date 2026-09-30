@@ -439,6 +439,28 @@ def _livox_mapping_cfg(**extra):
     return SlamConfig.from_dict(raw)
 
 
+def test_large_resting_accel_is_absorbed_and_then_stops():
+    """A Livox can sit on a constant accel larger than the deadband. That
+    must not integrate forever (the parked cart sliding backward)."""
+    cfg = _livox_mapping_cfg()
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 12.0
+    # Seed the baseline at 0, then a steady negative reading (gravity leftover).
+    rest = conv.OdomReading(0.0, 0.0, 0.0, ax=0.0, ay=0.0)
+    parked = conv.OdomReading(0.0, 0.0, 0.0, ax=-0.6, ay=0.3)
+    engine._pose = engine._predict(rest, t0)  # noqa: SLF001
+    engine._pose = engine._predict(rest, t0 + 0.2)  # noqa: SLF001
+    t = t0 + 0.2
+    for _ in range(40):
+        t += 0.2
+        engine._pose = engine._predict(parked, t)  # noqa: SLF001
+    stopped_at = engine.get_pose().x
+    engine._pose = engine._predict(parked, t + 1.0)  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(stopped_at, abs=1e-6)
+    assert engine.get_pose().y == pytest.approx(0.0, abs=1e-9)
+
+
 def test_constant_accel_is_baseline_and_does_not_walk():
     """A Livox-style IMU can sit on a constant accel (tilt / leftover
     gravity). That steady reading is the zero, so a parked cart stays put."""

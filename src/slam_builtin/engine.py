@@ -1011,11 +1011,15 @@ class BuiltinSlamEngine:
         if self._imu_ax_bias is None:
             self._imu_ax_bias = ax
         residual = ax - self._imu_ax_bias
+        # Always pull the baseline toward the reading. A resting offset bigger
+        # than the deadband (Livox tilt) must be absorbed; otherwise it is
+        # integrated forever and the parked cart slides. A short shove stays
+        # ahead of this slow follow.
+        self._imu_ax_bias += residual * (
+            1.0 - math.exp(-dt / self._ACCEL_BIAS_TAU_S)
+        )
+        residual = ax - self._imu_ax_bias
         if abs(residual) < self._ACCEL_DEADBAND_M_S2:
-            # Quiet: follow a slow change in the resting reading, and stop.
-            self._imu_ax_bias += residual * (
-                1.0 - math.exp(-dt / self._ACCEL_BIAS_TAU_S)
-            )
             self._imu_forward_m_s = 0.0
             speed = 0.0
         else:
