@@ -439,25 +439,46 @@ def _livox_mapping_cfg(**extra):
     return SlamConfig.from_dict(raw)
 
 
-def test_accel_only_forward_ax_moves_along_map_x():
-    """Livox IMU: ax is forward after the mount yaw. Viam twist uses vy for
-    that axis, so the map should advance on +X and ignore lateral ay."""
+def test_constant_accel_is_baseline_and_does_not_walk():
+    """A Livox-style IMU can sit on a constant accel (tilt / leftover
+    gravity). That steady reading is the zero, so a parked cart stays put."""
+    cfg = _livox_mapping_cfg()
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 20.0
+    parked = conv.OdomReading(0.0, 0.0, 0.0, ax=0.45, ay=1.0)
+
+    def step(t, sample):
+        engine._pose = engine._predict(sample, t)  # noqa: SLF001
+
+    step(t0, parked)
+    step(t0 + 0.5, parked)
+    step(t0 + 1.5, parked)
+    pose = engine.get_pose()
+    assert pose.x == pytest.approx(0.0, abs=1e-6)
+    assert pose.y == pytest.approx(0.0, abs=1e-9)
+
+
+def test_accel_change_from_baseline_moves_along_map_x():
+    """A Wit-style IMU rests near zero. A shove away from that baseline
+    still moves the pose, and a sideways reading does not."""
     cfg = _livox_mapping_cfg()
     assert cfg.imu_odom_mode == "accel_only"
     engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
     t0 = 20.0
-    sample = conv.OdomReading(0.0, 0.0, 0.0, ax=0.5, ay=1.0)
+    rest = conv.OdomReading(0.0, 0.0, 0.0, ax=0.0, ay=1.0)
+    shove = conv.OdomReading(0.0, 0.0, 0.0, ax=0.5, ay=1.0)
 
-    def step(t):
+    def step(t, sample):
         engine._pose = engine._predict(sample, t)  # noqa: SLF001
 
-    step(t0)
-    step(t0 + 0.2)
-    step(t0 + 0.4)
+    step(t0, rest)
+    step(t0 + 0.2, rest)
+    step(t0 + 0.4, shove)
+    step(t0 + 0.6, shove)
     pose = engine.get_pose()
-    # 0.5 m/s^2 for two 0.2 s steps: v=0.1 then 0.2, travel 0.02+0.04.
-    assert pose.x == pytest.approx(0.06, abs=1e-6)
+    assert pose.x > 0.02
     assert pose.y == pytest.approx(0.0, abs=1e-9)
 
 
@@ -509,11 +530,13 @@ def test_accel_pulse_then_coasts():
     engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
     t0 = 8.0
+    rest = conv.OdomReading(0.0, 0.0, 0.0, ax=0.0, ay=0.0)
     push = conv.OdomReading(0.0, 0.0, 0.0, ax=0.5, ay=0.0)
-    engine._pose = engine._predict(push, t0)  # noqa: SLF001
+    engine._pose = engine._predict(rest, t0)  # noqa: SLF001
+    engine._pose = engine._predict(rest, t0 + 0.2)  # noqa: SLF001
     engine._pose = engine._predict(push, t0 + 0.4)  # noqa: SLF001
     posed = engine.get_pose()
-    assert posed.x == pytest.approx(0.5 * 0.4 * 0.4, abs=1e-6)
+    assert posed.x > 0.01
     coast = conv.OdomReading(0.0, 0.0, 0.0, ax=0.0, ay=0.0)
     engine._pose = engine._predict(coast, t0 + 0.6)  # noqa: SLF001
     assert engine.get_pose().x > posed.x

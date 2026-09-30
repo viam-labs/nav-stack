@@ -104,6 +104,7 @@ class BuiltinSlamEngine:
         self._last_odom_twist = (0.0, 0.0, 0.0)
         # Forward speed (m/s) guessed from IMU accel when wheel velocity is absent.
         self._imu_forward_m_s = 0.0
+        self._imu_ax_bias = None
         self._last_loop_rebuild_at = 0.0
         self._pose_jump_gate = PoseJumpGate(
             confirm_count=int(cfg.localize_jump_confirm_count),
@@ -314,6 +315,7 @@ class BuiltinSlamEngine:
             self._last_odom_heading = None
             self._last_odom_time = None
             self._imu_forward_m_s = 0.0
+            self._imu_ax_bias = None
         self._notify_pose_listeners(pose)
         self._persist_pose(force=True)
 
@@ -952,6 +954,9 @@ class BuiltinSlamEngine:
     # shove, and let it fade so a bias cannot run away.
     _ACCEL_COAST_TAU_S = 2.0
     _ACCEL_SPEED_MAX_M_S = 0.8
+    # How fast a constant reading is absorbed into the baseline. A parked
+    # tilt must not keep integrating; a real shove stays ahead of this.
+    _ACCEL_BIAS_TAU_S = 1.5
     # Parked Livox gyros sit a few degrees per second off zero. Integrating
     # that, then painting a scan every second, sweeps the walls into arcs.
     # A real turn in place is well above this.
@@ -963,9 +968,10 @@ class BuiltinSlamEngine:
         """Body twist for one predict step.
 
         Wheel velocity is used as reported. With ``imu_odom_mode=accel_only``
-        and no wheel speed, forward acceleration (``ax`` after the IMU mount
-        yaw) is integrated into a short-lived forward speed. Lateral accel is
-        ignored. The lidar match is what keeps that guess honest.
+        and no wheel speed, a *change* in forward acceleration (``ax`` after
+        the IMU mount yaw) is integrated into a short-lived forward speed.
+        The steady reading, including gravity left over from a tilt, is the
+        baseline and does not move the pose. Lateral accel is ignored.
         """
         vx, vy = float(odom.vx), float(odom.vy)
         if getattr(self._cfg, "imu_odom_mode", "") != IMU_ODOM_ACCEL_ONLY:
@@ -974,10 +980,17 @@ class BuiltinSlamEngine:
             return vx, vy
         if abs(vx) > 1e-3 or abs(vy) > 1e-3:
             self._imu_forward_m_s = 0.0
+            self._imu_ax_bias = None
             return vx, vy
+        ax = float(odom.ax)
+        if self._imu_ax_bias is None:
+            self._imu_ax_bias = ax
+        residual = ax - self._imu_ax_bias
+        self._imu_ax_bias += residual * (1.0 - math.exp(-dt / self._ACCEL_BIAS_TAU_S))
+        residual = ax - self._imu_ax_bias
         speed = self._imu_forward_m_s
-        if abs(float(odom.ax)) >= self._ACCEL_DEADBAND_M_S2:
-            speed += float(odom.ax) * dt
+        if abs(residual) >= self._ACCEL_DEADBAND_M_S2:
+            speed += residual * dt
         else:
             speed *= math.exp(-dt / self._ACCEL_COAST_TAU_S)
         speed = max(-self._ACCEL_SPEED_MAX_M_S, min(self._ACCEL_SPEED_MAX_M_S, speed))
@@ -1005,6 +1018,7 @@ class BuiltinSlamEngine:
             self._last_odom_time = now
             self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
             self._imu_forward_m_s = 0.0
+            self._imu_ax_bias = None
             if prev is None:
                 if odom.heading_rad is not None:
                     self._last_odom_heading = odom.heading_rad
