@@ -952,6 +952,10 @@ class BuiltinSlamEngine:
     # shove, and let it fade so a bias cannot run away.
     _ACCEL_COAST_TAU_S = 2.0
     _ACCEL_SPEED_MAX_M_S = 0.8
+    # Parked Livox gyros sit a few degrees per second off zero. Integrating
+    # that, then painting a scan every second, sweeps the walls into arcs.
+    # A real turn in place is well above this.
+    _YAW_STILL_RAD_S = math.radians(5.0)
 
     def _twist_with_accel_prior(
         self, odom: conv.OdomReading, dt: float
@@ -1061,6 +1065,14 @@ class BuiltinSlamEngine:
                 if abs(heading_delta) <= math.radians(40.0):
                     dth = heading_delta
             self._last_odom_heading = odom.heading_rad
+
+        if (
+            getattr(self._cfg, "imu_odom_mode", "") == IMU_ODOM_ACCEL_ONLY
+            and abs(float(odom.vx)) <= 1e-3
+            and abs(float(odom.vy)) <= 1e-3
+            and abs(dth) <= self._YAW_STILL_RAD_S * dt
+        ):
+            dth = 0.0
 
         vx, vy = self._twist_with_accel_prior(odom, dt)
         self._last_odom_twist = (vx, vy, odom.vtheta)

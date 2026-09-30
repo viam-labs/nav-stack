@@ -461,6 +461,37 @@ def test_accel_only_forward_ax_moves_along_map_x():
     assert pose.y == pytest.approx(0.0, abs=1e-9)
 
 
+def test_parked_gyro_bias_does_not_spin_accel_only_pose():
+    """A few deg/s at rest must not walk heading. That plus the 1 s insert
+    heartbeat is what smears a still cart into arcs."""
+    cfg = _livox_mapping_cfg()
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 30.0
+    bias = conv.OdomReading(0.0, 0.0, math.radians(2.0), ax=0.0, ay=0.0)
+    engine._pose = engine._predict(bias, t0)  # noqa: SLF001
+    engine._pose = engine._predict(bias, t0 + 2.0)  # noqa: SLF001
+    assert engine.get_pose().theta == pytest.approx(0.0, abs=1e-9)
+
+    spin = conv.OdomReading(0.0, 0.0, math.radians(30.0), ax=0.0, ay=0.0)
+    engine._pose = engine._predict(spin, t0 + 2.2)  # noqa: SLF001
+    assert engine.get_pose().theta == pytest.approx(math.radians(30.0) * 0.2, abs=1e-6)
+
+
+def test_coast_mode_still_integrates_small_yaw():
+    """Wheel/laser setups keep slow gyro yaw. The still-gate is accel_only."""
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "mapping"}
+    )
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 4.0
+    sample = conv.OdomReading(0.0, 0.0, math.radians(2.0))
+    engine._pose = engine._predict(sample, t0)  # noqa: SLF001
+    engine._pose = engine._predict(sample, t0 + 0.4)  # noqa: SLF001
+    assert engine.get_pose().theta == pytest.approx(math.radians(2.0) * 0.4, abs=1e-6)
+
+
 def test_accel_below_deadband_does_not_creep():
     cfg = _livox_mapping_cfg()
     engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
