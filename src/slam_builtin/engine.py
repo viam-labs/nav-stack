@@ -25,6 +25,7 @@ from . import persistence
 from . import scan_match
 from .io_sensors import BuiltinSensors
 from .keyframes import MapKeyframeStore
+from .lidar_odom import LidarOdometry
 from .types import LogOddsGrid
 
 
@@ -106,6 +107,19 @@ class BuiltinSlamEngine:
         self._imu_forward_m_s = 0.0
         self._imu_ax_bias = None
         self._imu_yaw_bias = None
+        # Lidar odometry (wheel-less carts): body velocity (forward, left) m/s
+        # learned from successive scan matches.
+        self._lo = LidarOdometry()
+        self._lo_vel = (0.0, 0.0)
+        self._lo_last_at: Optional[float] = None
+        self._lo_reset_pending = False
+        self._lo_fails = 0
+        self._lo_accepts = 0
+        self._lo_rejects = 0
+        self._lo_resets = 0
+        self._lo_inserts_held = 0
+        self._lo_last_inlier = float("nan")
+        self._lo_last_rms = float("nan")
         self._last_loop_rebuild_at = 0.0
         self._pose_jump_gate = PoseJumpGate(
             confirm_count=int(cfg.localize_jump_confirm_count),
@@ -171,6 +185,7 @@ class BuiltinSlamEngine:
                     self._keyframes.clear()
                     self._invalidate_occ_cache()
                     self._generation += 1
+            self._reset_lidar_odom_locked()
             if mode == MODE_LOCALIZING:
                 self._seed_localize_pending = True
                 self._last_seed_attempt_at = 0.0
@@ -264,6 +279,7 @@ class BuiltinSlamEngine:
             self._invalidate_occ_cache()
             self._generation += 1
             self._pose_restored_from_disk = False
+            self._reset_lidar_odom_locked()
             map_dir = self._map_dir
         if map_dir is not None:
             path = persistence.last_pose_path(map_dir)
@@ -318,8 +334,16 @@ class BuiltinSlamEngine:
             self._imu_forward_m_s = 0.0
             self._imu_ax_bias = None
             self._imu_yaw_bias = None
+            self._reset_lidar_odom_locked()
         self._notify_pose_listeners(pose)
         self._persist_pose(force=True)
+
+    def _reset_lidar_odom_locked(self) -> None:
+        """Drop the local scan map and velocity; the loop thread rebuilds it."""
+        self._lo_vel = (0.0, 0.0)
+        self._lo_last_at = None
+        self._lo_fails = 0
+        self._lo_reset_pending = True
 
     def apply_map_pose_correction(self, matched_pose: conv.Pose2D) -> dict:
         """Correct pose drift during mapping; optionally rebuild the grid."""
@@ -373,6 +397,9 @@ class BuiltinSlamEngine:
             self._last_odom_heading = None
             self._last_odom_time = None
             self._last_insert_pose = matched_pose
+            # Keyscans sit at the pre-correction poses; keep velocity, rebuild map.
+            self._lo_reset_pending = True
+            self._lo_last_at = None
 
         self._notify_pose_listeners(matched_pose)
         self._persist_pose(force=True)
@@ -483,6 +510,17 @@ class BuiltinSlamEngine:
                 "pose_restored_from_disk": self._pose_restored_from_disk,
                 "keyframes": len(self._keyframes),
                 "last_loop_rebuild_at": self._last_loop_rebuild_at,
+                "lidar_odometry": {
+                    "enabled": self._lidar_odom_enabled(),
+                    "accepts": self._lo_accepts,
+                    "rejects": self._lo_rejects,
+                    "resets": self._lo_resets,
+                    "inserts_held": self._lo_inserts_held,
+                    "last_inlier_ratio": self._lo_last_inlier,
+                    "last_rms_m": self._lo_last_rms,
+                    "forward_m_s": round(self._lo_vel[0], 3),
+                    "left_m_s": round(self._lo_vel[1], 3),
+                },
             }
 
     # -- loop ----------------------------------------------------------------
@@ -560,12 +598,24 @@ class BuiltinSlamEngine:
             self._last_yaw_rate = yaw_rate
             if scan is None or not new_scan:
                 return
+            use_lo = self._lidar_odom_active(odom)
+            if self._lo_reset_pending:
+                self._lo_reset_pending = False
+                self._lo.reset()
             occ_map = self._occupancy_for_match()
             known = self._occ_cache_known
             run_match = (
                 known > 0.02
                 and now - self._last_match_at >= self._match_period_s
             )
+
+        lo_ok = False
+        if use_lo:
+            lo_ok = self._lidar_odom_step(scan, now)
+            if lo_ok and self._mode == MODE_MAPPING:
+                # The map is being built from these poses; the grid matcher
+                # only re-checks them against themselves.
+                run_match = False
 
         # Heavy work happens OUTSIDE the lock: matching while holding it
         # blocked every get_pose/get_map (nav planning + pose reads stalled).
@@ -588,8 +638,96 @@ class BuiltinSlamEngine:
                 # One lidar revolution (~100 ms) is skewed by yaw_rate*0.1 s;
                 # inserting it during a fast spin paints walls as arcs.
                 self._insert_skips_turning += 1
+            elif use_lo and not lo_ok and self._last_insert_pose is not None:
+                # No scan match: the pose is a guess. Painting there doubles walls.
+                self._lo_inserts_held += 1
             else:
                 self._maybe_insert_scan(scan, now)
+
+    # -- lidar odometry --------------------------------------------------------
+    # Lidar velocity is trusted this long after the last match; after that the
+    # IMU-only prediction takes over again.
+    _LO_FRESH_S = 1.5
+    # Velocity decays toward 0 once matches stop arriving.
+    _LO_DECAY_AFTER_S = 0.3
+    _LO_DECAY_TAU_S = 0.5
+    _LO_GAIN = 0.5
+    _LO_MAX_FORWARD_M_S = 1.2
+    _LO_MAX_LATERAL_M_S = 0.3
+    # Consecutive misses before the local map restarts from the current pose.
+    _LO_MAX_FAILS = 10
+
+    def _lidar_odom_enabled(self) -> bool:
+        return bool(getattr(self._cfg, "lidar_odometry", False))
+
+    def _lidar_odom_active(self, odom: Optional[conv.OdomReading]) -> bool:
+        """Only for samples without wheel speed or an odom pose (not the Tracer)."""
+        if not self._lidar_odom_enabled():
+            return False
+        if odom is None:
+            return True
+        return (
+            odom.pose is None
+            and abs(float(odom.vx)) <= 1e-3
+            and abs(float(odom.vy)) <= 1e-3
+        )
+
+    def _lidar_odom_fresh(self, now: float) -> bool:
+        return self._lo_last_at is not None and now - self._lo_last_at <= self._LO_FRESH_S
+
+    def _lidar_odom_step(self, scan: conv.LaserScan2D, now: float) -> bool:
+        """ICP this scan against recent scans. True when the pose came from it."""
+        scan_xy = scan.to_points()
+        with self._lock:
+            guess = self._pose
+        if not self._lo.has_reference():
+            self._lo.add_keyscan(scan_xy, guess, force=True)
+            with self._lock:
+                self._lo_last_at = now
+            return self._last_insert_pose is None
+        result = self._lo.match(scan_xy, guess)
+        with self._lock:
+            if result is None:
+                self._lo_rejects += 1
+                self._lo_fails += 1
+                if self._lo_fails >= self._LO_MAX_FAILS:
+                    self._lo_fails = 0
+                    self._lo_resets += 1
+                    self._lo_vel = (0.0, 0.0)
+                    self._lo.reset()
+                    self._lo.add_keyscan(scan_xy, self._pose, force=True)
+                    self._log("builtin SLAM: lidar odometry lost track; restarting local map")
+                return False
+            current = self._pose
+            pose = result.pose
+            if self._lo_last_at is not None:
+                dt = now - self._lo_last_at
+                if 0.0 < dt <= 1.0:
+                    rx, ry = pose.x - current.x, pose.y - current.y
+                    c, s = math.cos(current.theta), math.sin(current.theta)
+                    fwd = self._lo_vel[0] + self._LO_GAIN * (c * rx + s * ry) / dt
+                    left = self._lo_vel[1] + self._LO_GAIN * (-s * rx + c * ry) / dt
+                    fwd = max(-self._LO_MAX_FORWARD_M_S, min(self._LO_MAX_FORWARD_M_S, fwd))
+                    left = max(-self._LO_MAX_LATERAL_M_S, min(self._LO_MAX_LATERAL_M_S, left))
+                    self._lo_vel = (fwd, left)
+            self._pose = pose
+            self._lo_last_at = now
+            self._lo_fails = 0
+            self._lo_accepts += 1
+            self._lo_last_inlier = round(result.inlier_ratio, 3)
+            self._lo_last_rms = round(result.rms_m, 4)
+            self._imu_forward_m_s = 0.0
+        self._lo.add_keyscan(scan_xy, pose)
+        return True
+
+    def _lidar_odom_twist(self, now: float, dt: float) -> tuple[float, float]:
+        """Body (forward, left) velocity for prediction, decayed when matches stop."""
+        fwd, left = self._lo_vel
+        if self._lo_last_at is not None and now - self._lo_last_at > self._LO_DECAY_AFTER_S:
+            k = math.exp(-dt / self._LO_DECAY_TAU_S)
+            fwd, left = fwd * k, left * k
+            self._lo_vel = (fwd, left)
+        return fwd, left
 
     def _tick_sim_world(
         self,
@@ -1121,10 +1259,22 @@ class BuiltinSlamEngine:
         ):
             dth = self._imu_yaw_delta(dth, dt)
 
-        vx, vy = self._twist_with_accel_prior(odom, dt)
-        self._last_odom_twist = (vx, vy, odom.vtheta)
         c = math.cos(self._pose.theta)
         s = math.sin(self._pose.theta)
+        if self._lidar_odom_active(odom) and self._lidar_odom_fresh(now):
+            fwd, left = self._lidar_odom_twist(now, dt)
+            if getattr(self._cfg, "base_velocity_convention", "viam") in BASE_VELOCITY_Y_FORWARD:
+                self._last_odom_twist = (-left, fwd, odom.vtheta)
+            else:
+                self._last_odom_twist = (fwd, left, odom.vtheta)
+            return conv.Pose2D(
+                self._pose.x + (c * fwd - s * left) * dt,
+                self._pose.y + (s * fwd + c * left) * dt,
+                conv.normalize_angle(self._pose.theta + dth),
+            )
+
+        vx, vy = self._twist_with_accel_prior(odom, dt)
+        self._last_odom_twist = (vx, vy, odom.vtheta)
         if getattr(self._cfg, "base_velocity_convention", "viam") in BASE_VELOCITY_Y_FORWARD:
             # Sensor-native Y-forward / X-right → map (theta=0 faces +X).
             dx = (c * vy + s * vx) * dt

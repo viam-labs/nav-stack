@@ -673,6 +673,10 @@ class SlamConfig:
     # ``accel_only`` integrates only on clear forward accel (Livox carts);
     # ``coast`` keeps velocity at steady speed; ``none`` is yaw-only odom.
     imu_odom_mode: str = IMU_ODOM_COAST
+    # Builtin SLAM: track translation by ICP of every scan against recent
+    # scans, and only paint scans that matched. Defaults on with
+    # ``accel_only`` (no wheel speed); a sample with wheel speed never uses it.
+    lidar_odometry: bool = False
     # Deprecated alias for ``imu_odom_mode=none``.
     heading_only_odom: bool = False
     # Scan-to-scan lidar odometry; Livox uses loose range-flow hints only.
@@ -1120,6 +1124,9 @@ class SlamConfig:
             ),
             "scan_accumulation_s": float(d.get("scan_accumulation_s", default_accum)),
             "imu_odom_mode": imu_odom_mode,
+            "lidar_odometry": bool(
+                d.get("lidar_odometry", imu_odom_mode == IMU_ODOM_ACCEL_ONLY)
+            ),
             "heading_only_odom": heading_only_odom,
             "lidar_odom_enabled": lidar_odom_enabled,
             "lidar_odom_range_flow_only": lidar_odom_range_flow_only,
