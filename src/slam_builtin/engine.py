@@ -11,6 +11,7 @@ import numpy as np
 
 from ..config import (
     BASE_VELOCITY_Y_FORWARD,
+    IMU_ODOM_ACCEL_ONLY,
     MODE_LOCALIZING,
     MODE_MAPPING,
     SlamConfig,
@@ -101,6 +102,8 @@ class BuiltinSlamEngine:
         self._keyframe_hook = None
         self._pose_listeners: list = []
         self._last_odom_twist = (0.0, 0.0, 0.0)
+        # Forward speed (m/s) guessed from IMU accel when wheel velocity is absent.
+        self._imu_forward_m_s = 0.0
         self._last_loop_rebuild_at = 0.0
         self._pose_jump_gate = PoseJumpGate(
             confirm_count=int(cfg.localize_jump_confirm_count),
@@ -310,6 +313,7 @@ class BuiltinSlamEngine:
             self._last_odom_pose = None
             self._last_odom_heading = None
             self._last_odom_time = None
+            self._imu_forward_m_s = 0.0
         self._notify_pose_listeners(pose)
         self._persist_pose(force=True)
 
@@ -941,6 +945,43 @@ class BuiltinSlamEngine:
         self._pending_count = 2
         return True
 
+    # Ignore accel smaller than this so gravity leftover and sensor noise do
+    # not walk the pose while the cart is sitting still.
+    _ACCEL_DEADBAND_M_S2 = 0.20
+    # A constant-speed cruise has ~0 accel. Hold the speed built up during the
+    # shove, and let it fade so a bias cannot run away.
+    _ACCEL_COAST_TAU_S = 2.0
+    _ACCEL_SPEED_MAX_M_S = 0.8
+
+    def _twist_with_accel_prior(
+        self, odom: conv.OdomReading, dt: float
+    ) -> tuple[float, float]:
+        """Body twist for one predict step.
+
+        Wheel velocity is used as reported. With ``imu_odom_mode=accel_only``
+        and no wheel speed, forward acceleration (``ax`` after the IMU mount
+        yaw) is integrated into a short-lived forward speed. Lateral accel is
+        ignored. The lidar match is what keeps that guess honest.
+        """
+        vx, vy = float(odom.vx), float(odom.vy)
+        if getattr(self._cfg, "imu_odom_mode", "") != IMU_ODOM_ACCEL_ONLY:
+            return vx, vy
+        if odom.ax is None or odom.ay is None:
+            return vx, vy
+        if abs(vx) > 1e-3 or abs(vy) > 1e-3:
+            self._imu_forward_m_s = 0.0
+            return vx, vy
+        speed = self._imu_forward_m_s
+        if abs(float(odom.ax)) >= self._ACCEL_DEADBAND_M_S2:
+            speed += float(odom.ax) * dt
+        else:
+            speed *= math.exp(-dt / self._ACCEL_COAST_TAU_S)
+        speed = max(-self._ACCEL_SPEED_MAX_M_S, min(self._ACCEL_SPEED_MAX_M_S, speed))
+        self._imu_forward_m_s = speed
+        if getattr(self._cfg, "base_velocity_convention", "viam") in BASE_VELOCITY_Y_FORWARD:
+            return 0.0, speed
+        return speed, 0.0
+
     def _predict(
         self, odom: Optional[conv.OdomReading], now: float
     ) -> conv.Pose2D:
@@ -959,6 +1000,7 @@ class BuiltinSlamEngine:
             self._last_odom_pose_at = now
             self._last_odom_time = now
             self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
+            self._imu_forward_m_s = 0.0
             if prev is None:
                 if odom.heading_rad is not None:
                     self._last_odom_heading = odom.heading_rad
@@ -1020,10 +1062,10 @@ class BuiltinSlamEngine:
                     dth = heading_delta
             self._last_odom_heading = odom.heading_rad
 
-        self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
+        vx, vy = self._twist_with_accel_prior(odom, dt)
+        self._last_odom_twist = (vx, vy, odom.vtheta)
         c = math.cos(self._pose.theta)
         s = math.sin(self._pose.theta)
-        vx, vy = odom.vx, odom.vy
         if getattr(self._cfg, "base_velocity_convention", "viam") in BASE_VELOCITY_Y_FORWARD:
             # Sensor-native Y-forward / X-right → map (theta=0 faces +X).
             dx = (c * vy + s * vx) * dt

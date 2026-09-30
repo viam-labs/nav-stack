@@ -612,9 +612,13 @@ class SlamConfig:
     # turn odometry but straight-line encoder velocity is still useful.
     heading_sensor: Optional[str] = None
     # Yaw (degrees) of the movement sensor's +x axis relative to the robot's
-    # forward axis. An IMU mounted rotated -90 deg about +z (its x pointing at
-    # the robot's right side) needs -90 here so integrated accel and reported
-    # yaw line up with base_link. Applied to velocity/accel vectors and yaw.
+    # forward axis. Omitted: filled from the framesystem with the same
+    # Viam Y-forward → nav-stack X-forward conversion as a lidar mount. A
+    # Viam +90° yaw whose sensor +X already points forward becomes 0.
+    # Set explicitly to override. An IMU mounted rotated -90 deg about +z
+    # (its x pointing at the robot's right side) needs -90 here so integrated
+    # accel and reported yaw line up with base_link. Applied to velocity/accel
+    # vectors and yaw.
     movement_sensor_yaw_deg: float = 0.0
     # Set true when the movement sensor is mounted upside down (flipped about
     # x): yaw, yaw rate, and lateral accel all read with inverted sign. The

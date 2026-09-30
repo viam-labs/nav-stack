@@ -399,10 +399,95 @@ def apply_framesystem_to_slam_cfg(
             f"θ={lidar.theta:.3f} pitch={lidar.pitch:.3f} roll={lidar.roll:.3f}"
             f"{optical_note}"
         )
+    _apply_movement_sensor_yaw(
+        cfg, configs, raw, notes, y_forward_base=bool(y_forward_base)
+    )
     _apply_footprint_crop(cfg, configs, raw, notes)
     for line in notes:
         log.info("framesystem: %s", line)
     return cfg, notes
+
+
+def _apply_movement_sensor_yaw(
+    cfg,
+    configs: Sequence[Any],
+    raw: Mapping,
+    notes: List[str],
+    *,
+    y_forward_base: bool,
+) -> None:
+    """Set IMU yaw from the framesystem when JSON omitted ``movement_sensor_yaw_deg``.
+
+    Same Viam Y-forward → nav-stack X-forward conversion as a lidar mount.
+    A sensor yawed +90° on a Viam base has its +X pointing forward, so the
+    nav-stack yaw is 0 — the 90° is the axis change, not an extra twist.
+    Gyro Z is unchanged by that yaw. Linear acceleration X/Y are rotated
+    into base_link by the existing ``movement_sensor_yaw_deg`` path.
+    """
+    _apply_one_sensor_yaw(
+        cfg,
+        configs,
+        raw,
+        notes,
+        name_attr="movement_sensor",
+        yaw_attr="movement_sensor_yaw_deg",
+        y_forward_base=y_forward_base,
+    )
+    _apply_one_sensor_yaw(
+        cfg,
+        configs,
+        raw,
+        notes,
+        name_attr="heading_sensor",
+        yaw_attr="heading_sensor_yaw_deg",
+        y_forward_base=y_forward_base,
+    )
+
+
+def _apply_one_sensor_yaw(
+    cfg,
+    configs: Sequence[Any],
+    raw: Mapping,
+    notes: List[str],
+    *,
+    name_attr: str,
+    yaw_attr: str,
+    y_forward_base: bool,
+) -> None:
+    name = str(getattr(cfg, name_attr, "") or "")
+    if not name:
+        return
+    label = "movement sensor" if name_attr == "movement_sensor" else "heading sensor"
+    current = float(getattr(cfg, yaw_attr, 0.0) or 0.0)
+    if yaw_attr in raw:
+        notes.append(
+            f"{label} {name}: yaw {current:.1f}° from config (override)"
+        )
+        return
+    base_name = str(getattr(cfg, "base", "") or "base")
+    mount = pose_of_frame_in_destination(
+        configs, name, base_name, y_forward_base=y_forward_base
+    )
+    if mount is None:
+        notes.append(
+            f"{label} {name}: no framesystem frame named {name!r} "
+            f"relative to {base_name!r}; yaw stays {current:.1f}°"
+        )
+        return
+    yaw_deg = math.degrees(mount.theta)
+    if abs(yaw_deg) < 1e-4:
+        yaw_deg = 0.0
+    setattr(cfg, yaw_attr, yaw_deg)
+    tilt = ""
+    if abs(mount.pitch) > math.radians(5.0) or abs(mount.roll) > math.radians(5.0):
+        tilt = (
+            f"; pitch={math.degrees(mount.pitch):.1f}° "
+            f"roll={math.degrees(mount.roll):.1f}° not applied"
+        )
+    notes.append(
+        f"{label} {name}: yaw from framesystem {yaw_deg:.1f}° "
+        f"(sensor +X in base_link){tilt}"
+    )
 
 
 def apply_framesystem_to_nav_cfg(

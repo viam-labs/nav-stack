@@ -427,6 +427,96 @@ def test_predict_uses_heading_delta_not_absolute():
     assert abs(p1.theta - math.radians(100.0)) > 0.5
 
 
+def _livox_mapping_cfg(**extra):
+    raw = {
+        "base": "b",
+        "lidar": {"name": "livox", "scan_source": "point_cloud"},
+        "movement_sensor": "imu",
+        "maps_dir": "/tmp",
+        "mode": "mapping",
+    }
+    raw.update(extra)
+    return SlamConfig.from_dict(raw)
+
+
+def test_accel_only_forward_ax_moves_along_map_x():
+    """Livox IMU: ax is forward after the mount yaw. Viam twist uses vy for
+    that axis, so the map should advance on +X and ignore lateral ay."""
+    cfg = _livox_mapping_cfg()
+    assert cfg.imu_odom_mode == "accel_only"
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 20.0
+    sample = conv.OdomReading(0.0, 0.0, 0.0, ax=0.5, ay=1.0)
+
+    def step(t):
+        engine._pose = engine._predict(sample, t)  # noqa: SLF001
+
+    step(t0)
+    step(t0 + 0.2)
+    step(t0 + 0.4)
+    pose = engine.get_pose()
+    # 0.5 m/s^2 for two 0.2 s steps: v=0.1 then 0.2, travel 0.02+0.04.
+    assert pose.x == pytest.approx(0.06, abs=1e-6)
+    assert pose.y == pytest.approx(0.0, abs=1e-9)
+
+
+def test_accel_below_deadband_does_not_creep():
+    cfg = _livox_mapping_cfg()
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 5.0
+    sample = conv.OdomReading(0.0, 0.0, 0.0, ax=0.05, ay=0.05)
+    engine._predict(sample, t0)  # noqa: SLF001
+    pose = engine._predict(sample, t0 + 1.0)  # noqa: SLF001
+    assert pose.x == pytest.approx(0.0, abs=1e-9)
+    assert pose.y == pytest.approx(0.0, abs=1e-9)
+
+
+def test_accel_pulse_then_coasts():
+    cfg = _livox_mapping_cfg()
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 8.0
+    push = conv.OdomReading(0.0, 0.0, 0.0, ax=0.5, ay=0.0)
+    engine._pose = engine._predict(push, t0)  # noqa: SLF001
+    engine._pose = engine._predict(push, t0 + 0.4)  # noqa: SLF001
+    posed = engine.get_pose()
+    assert posed.x == pytest.approx(0.5 * 0.4 * 0.4, abs=1e-6)
+    coast = conv.OdomReading(0.0, 0.0, 0.0, ax=0.0, ay=0.0)
+    engine._pose = engine._predict(coast, t0 + 0.6)  # noqa: SLF001
+    assert engine.get_pose().x > posed.x
+
+
+def test_wheel_twist_ignores_accel():
+    """A reported linear velocity owns translation, even in accel_only mode."""
+    cfg = _livox_mapping_cfg()
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 50.0
+    wheels = conv.OdomReading(0.0, 0.5, 0.0, ax=3.0, ay=0.0)
+    engine._predict(wheels, t0)  # noqa: SLF001
+    pose = engine._predict(wheels, t0 + 0.2)  # noqa: SLF001
+    assert pose.x == pytest.approx(0.1)
+    assert pose.y == pytest.approx(0.0, abs=1e-12)
+
+
+def test_laser_odom_config_does_not_integrate_accel():
+    """Tracer-style laser SLAM defaults to coast and must not walk on accel."""
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "mapping"}
+    )
+    assert cfg.imu_odom_mode == "coast"
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 3.0
+    sample = conv.OdomReading(0.0, 0.0, 0.0, ax=1.0, ay=0.0)
+    engine._predict(sample, t0)  # noqa: SLF001
+    pose = engine._predict(sample, t0 + 0.5)  # noqa: SLF001
+    assert pose.x == pytest.approx(0.0, abs=1e-12)
+    assert pose.y == pytest.approx(0.0, abs=1e-12)
+
+
 def test_predict_viam_twist_forward_on_vy():
     """Default viam convention: body vy is forward → map +X at theta=0."""
     cfg = SlamConfig.from_dict(

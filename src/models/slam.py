@@ -305,6 +305,17 @@ class SlamService(SLAM):
             return True
         return False
 
+    def _imu_needs_framesystem(self, raw_attrs: Mapping) -> bool:
+        """True when an IMU yaw should be taken from the framesystem."""
+        cfg = self._cfg
+        if cfg is None:
+            return False
+        if cfg.movement_sensor and "movement_sensor_yaw_deg" not in raw_attrs:
+            return True
+        if cfg.heading_sensor and "heading_sensor_yaw_deg" not in raw_attrs:
+            return True
+        return False
+
     def _set_mounts_ready(self, ready: bool) -> None:
         sensors = self._builtin_sensors
         if sensors is not None:
@@ -326,7 +337,7 @@ class SlamService(SLAM):
             self._set_mounts_ready(True)
             return
         raw = self._framesystem_raw_attrs or {}
-        if not self._lidars_need_framesystem(raw):
+        if not self._lidars_need_framesystem(raw) and not self._imu_needs_framesystem(raw):
             self._set_mounts_ready(True)
             return
         self._framesystem_gen += 1

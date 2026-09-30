@@ -182,6 +182,79 @@ def test_wide_cart_box_crops_forward_not_the_longer_side():
     assert lidar.footprint_width_m == pytest.approx(0.50)
 
 
+def _cart_imu_frames(theta_deg: float) -> list:
+    base = Transform(
+        reference_frame="cartbase",
+        pose_in_observer_frame=PoseInFrame(
+            reference_frame="world",
+            pose=Pose(x=0, y=0, z=0, o_x=0, o_y=0, o_z=1, theta=0),
+        ),
+    )
+    imu = Transform(
+        reference_frame="imu",
+        pose_in_observer_frame=PoseInFrame(
+            reference_frame="cartbase",
+            pose=Pose(x=150, y=0, z=390, o_x=0, o_y=0, o_z=1, theta=theta_deg),
+        ),
+    )
+    return [FrameSystemConfig(frame=base), FrameSystemConfig(frame=imu)]
+
+
+def test_imu_yaw_from_framesystem_viam_90_is_forward():
+    """Viam +90° yaw points the IMU +X along base +Y (forward). In nav-stack
+    that is yaw 0, so forward acceleration stays on X."""
+    configs = _cart_imu_frames(90)
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "cartbase",
+            "movement_sensor": "imu",
+            "lidars": [{"name": "livox-pc", "scan_source": "point_cloud"}],
+        }
+    )
+    _, notes = apply_framesystem_to_slam_cfg(
+        cfg, configs, raw_attrs={"base": "cartbase", "movement_sensor": "imu"}
+    )
+    assert cfg.movement_sensor_yaw_deg == pytest.approx(0.0, abs=1e-6)
+    assert any("movement sensor imu: yaw from framesystem 0.0°" in n for n in notes)
+
+
+def test_imu_aligned_with_viam_base_needs_minus_90():
+    """Viam yaw 0 keeps IMU +X pointing right. Nav-stack forward is +X, so the
+    correction is -90°."""
+    configs = _cart_imu_frames(0)
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "cartbase",
+            "movement_sensor": "imu",
+            "lidars": [{"name": "livox-pc", "scan_source": "point_cloud"}],
+        }
+    )
+    apply_framesystem_to_slam_cfg(
+        cfg, configs, raw_attrs={"base": "cartbase", "movement_sensor": "imu"}
+    )
+    assert cfg.movement_sensor_yaw_deg == pytest.approx(-90.0, abs=1e-6)
+
+
+def test_explicit_movement_sensor_yaw_overrides_framesystem():
+    configs = _cart_imu_frames(0)
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "cartbase",
+            "movement_sensor": "imu",
+            "movement_sensor_yaw_deg": 15,
+            "lidars": [{"name": "livox-pc", "scan_source": "point_cloud"}],
+        }
+    )
+    raw = {
+        "base": "cartbase",
+        "movement_sensor": "imu",
+        "movement_sensor_yaw_deg": 15,
+    }
+    _, notes = apply_framesystem_to_slam_cfg(cfg, configs, raw_attrs=raw)
+    assert cfg.movement_sensor_yaw_deg == pytest.approx(15.0)
+    assert any("from config (override)" in n for n in notes)
+
+
 def test_apply_slam_fills_mount_when_omitted():
     configs = _tracer_like_frames()
     raw = {
