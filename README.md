@@ -163,13 +163,14 @@ circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
 | `periodic_relocalize_bypass_startup_after_s` | SLAM | Cancel a stuck startup localize after this many seconds (default `90`) so the drift watchdog can recover. |
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced map/scan tuning keys (merged into engine defaults) |
-| `robot_radius`, `max_vel_x`, … | Nav | Top-level footprint / velocity limits. Without a rectangular footprint, `robot_radius` sizes the collision guard's body (a `2 × robot_radius` square), and the live "path blocked" check samples a 0.10 m band around the route |
+| `max_linear_velocity` | Nav | Forward/backward speed cap in m/s (default `0.6`). This is along the base's forward axis whatever its frame convention — Viam `linear.y` on a standard Y-forward base. Every navigation command, including backups and the simple `go_to_*` commands, is clamped to it. Legacy name `max_vel_x` is still accepted; `max_linear_velocity` wins if both are set |
+| `robot_radius`, `max_vel_theta`, … | Nav | Top-level footprint / velocity limits. Without a rectangular footprint, `robot_radius` sizes the collision guard's body (a `2 × robot_radius` square), and the live "path blocked" check samples a 0.10 m band around the route |
 | `clearance_m` | Nav | **Hard buffer past the body, on each side** (default `0.2` m). Same inscribed radius for the global planner costmap and the local costmap: half-width (or `robot_radius`) + `clearance_m`. Soft inflation, if any, starts outside this. Set `0` for a body-only hard disk |
 | `inflation_margin_m` | Nav | Optional soft-cost band **past the hard clearance** (additive). E.g. a 0.295 m half-width with `clearance_m: 0.2` and `inflation_margin_m: 0.05` is hard out to 0.495 m and soft out to 0.545 m |
 | `local_inflation_margin_m` | Nav | Extra soft band past the hard clearance for **live scan hits** in the rolling local costmap (additive). Unset means live hits are hard-clearance only |
 | `footprint_width_m`, `footprint_length_m` | Nav | **Recommended for non-square robots.** Given both, planning clearance uses the half-**width** (what must fit through a gap) while rotating in place is gated on the half-**diagonal** (what the body sweeps). A single `robot_radius` has to cover both, so it must be the half-diagonal — which seals every gap narrower than `2 × robot_radius` even where the robot easily fits (a 0.59 m-wide robot refusing an 0.84 m doorway). Also sizes the skid-steer arc envelope from the track. Every command is checked by a **footprint collision guard** (Nav2 RPP/DWB-style): the exact rectangle (padded by `clearance_m`, clamped to 0.04–0.08 m) is projected along the commanded arc against live scan returns and static map walls; speed is regulated by distance-to-collision, a blocked arc is replaced by the nearest free forward arc, and rotation in place happens only when the corners' sweep is free. The guard never reverses — backing up is a supervisor recovery. Omit both to fall back to a square body of `2 × robot_radius` |
 | `xy_goal_tolerance`, `yaw_goal_tolerance` | Nav | Goal arrival tolerances (m / rad). Also accepted under `builtin` |
-| `timeout_s` | Nav (`builtin`) | Minimum per-goal timeout (default `300`). Long routes get 3× their full-speed drive time instead (`3 × length / max_vel_x`); time stopped for localization does not count |
+| `timeout_s` | Nav (`builtin`) | Minimum per-goal timeout (default `300`). Long routes get 3× their full-speed drive time instead (`3 × length / max_linear_velocity`); time stopped for localization does not count |
 | `nav_loc_refine_on_disagree` | Nav (`builtin`) | When the current lidar scan is a poor explanation of the map at the published pose, stop, run a local `check_localization`, then resume. After two tries, keep the published pose and the goal (does **not** fail as `localization_lost`). Applies a local shift up to `1.0` m / `30°` when it beats the prior and score ≥ `0.35`. Does **not** enable `periodic_relocalize_during_navigation` |
 | `nav_loc_refine_margin_m` / `_map_max_m` / `_min_frac` / `_min_beams` | Nav (`builtin`) | A beam counts when the map claims a wall within `2.5` m; it votes bad-loc when lidar is ≥ `0.8` m farther. Trigger at `22%` of those beams. A second try runs only when the residual is still severe; the path is replanned only if the refine moved the pose |
 | `nav_loc_refine_max_tries` / `_cooldown_s` / `_period_s` / `_check_every_m` | Nav (`builtin`) | Two local refine attempts (default), `0.5` s between them, check about every `0.75` s or `2` m of travel |
@@ -255,7 +256,7 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
     "robot_radius": 0.22,
     "footprint_width_m": 0.59,
     "footprint_length_m": 0.72,
-    "max_vel_x": 0.4,
+    "max_linear_velocity": 0.4,
     "max_vel_theta": 1.0,
     "clearance_m": 0.2,
     "xy_goal_tolerance": 0.25,
@@ -319,7 +320,7 @@ Use `viam-labs:nav-stack:navigation-external` to drive builtin navigation from *
     "imu_odom_mode": "accel_only",
     "lidar_odom_enabled": true,
     "robot_radius": 0.22,
-    "max_vel_x": 0.4,
+    "max_linear_velocity": 0.4,
     "clearance_m": 0.2
   }
 }

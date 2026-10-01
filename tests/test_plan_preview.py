@@ -60,7 +60,7 @@ def test_plan_to_point_do_command_returns_path_without_navigate():
         base="my-base",
         kinematics="differential",
         robot_radius=0.22,
-        max_vel_x=0.4,
+        max_linear_velocity=0.4,
         max_vel_theta=1.0,
         clearance_m=0.2,
     )
@@ -106,7 +106,7 @@ def test_execute_plan_navigates_preview_goal():
         base="my-base",
         kinematics="differential",
         robot_radius=0.22,
-        max_vel_x=0.4,
+        max_linear_velocity=0.4,
         max_vel_theta=1.0,
         clearance_m=0.2,
     )
@@ -145,7 +145,7 @@ def test_move_on_map_preview_extra_does_not_navigate():
         base="my-base",
         kinematics="differential",
         robot_radius=0.22,
-        max_vel_x=0.4,
+        max_linear_velocity=0.4,
         max_vel_theta=1.0,
         clearance_m=0.2,
     )

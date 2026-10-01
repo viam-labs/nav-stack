@@ -250,3 +250,24 @@ def test_person_blocking_hallway_resumes_promptly(monkeypatch, stand_s):
         None,
     )
     assert moved is not None and moved - t_off < 1.5, d
+
+
+@pytest.mark.parametrize("max_linear_velocity", [0.25, 1.0])
+def test_max_linear_velocity_caps_and_reaches_commanded_speed(
+    monkeypatch, max_linear_velocity
+):
+    """Every command stays at or under ``max_linear_velocity``, and the robot reaches it."""
+    grid, start, goal, extras, _ = bin_on_route()
+    r = sim.run(
+        grid,
+        start,
+        goal,
+        extra_obstacles=extras,
+        monkeypatch=monkeypatch,
+        max_sim_s=90.0,
+        nav_overrides={"max_linear_velocity": max_linear_velocity},
+    )
+    d = _detail(r)
+    assert r.state == "succeeded", d
+    peak = max(abs(vx) for *_, vx, _ in r.trace)
+    assert peak == pytest.approx(max_linear_velocity), d

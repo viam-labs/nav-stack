@@ -56,7 +56,7 @@ def _configured_nav(*, nav_status=None, pose=None) -> tuple[NavigationService, M
         base="my-base",
         kinematics="differential",
         robot_radius=0.22,
-        max_vel_x=0.4,
+        max_linear_velocity=0.4,
         max_vel_theta=1.0,
         clearance_m=0.2,
     )

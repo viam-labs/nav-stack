@@ -884,7 +884,7 @@ class NavServiceBase(Motion):
             cfg = self._require_cfg()
             return summarize_nav_motion(
                 status,
-                max_vel_x=float(cfg.max_vel_x),
+                max_vel_x=float(cfg.max_linear_velocity),
                 max_vel_theta=float(cfg.max_vel_theta),
             )
         if cmd == "get_costmap":
@@ -2008,7 +2008,7 @@ class NavServiceBase(Motion):
 
         goal = conv.Pose2D(x, y, theta)
         motion_cfg = config_from_nav(
-            max_vel_x=cfg.max_vel_x,
+            max_vel_x=cfg.max_linear_velocity,
             max_vel_theta=cfg.max_vel_theta,
             yaw_tolerance_rad=cfg.builtin.yaw_goal_tolerance,
             min_linear_mps=cfg.min_cmd_vel_x,

@@ -900,7 +900,7 @@ def test_external_nav_config_builds_bridge_and_nav():
         "lidars": [{"name": "mid360"}],
         "movement_sensor": "mid360-imu",
         "kinematics": "differential",
-        "max_vel_x": 0.5,
+        "max_linear_velocity": 0.5,
     }
     cfg = ExternalNavConfig.from_dict(d)
     # bridge SlamConfig carries the sensor deps
@@ -909,10 +909,18 @@ def test_external_nav_config_builds_bridge_and_nav():
     # nav NavConfig carries navigation behavior + the SLAM dep name
     assert cfg.nav.slam_service == "rtabmap"
     assert cfg.nav.base == "base"
-    assert cfg.nav.max_vel_x == 0.5
+    assert cfg.nav.max_linear_velocity == 0.5
     # reader flags default off (Position tar pit ignored)
     assert cfg.trust_movement_sensor_pose is False
     assert cfg.snap_heading is False
+
+
+def test_max_linear_velocity_accepts_legacy_max_vel_x():
+    base = {"slam_service": "slam", "base": "base"}
+    assert NavConfig.from_dict(base).max_linear_velocity == pytest.approx(0.6)
+    assert NavConfig.from_dict({**base, "max_vel_x": 0.3}).max_linear_velocity == 0.3
+    both = {**base, "max_vel_x": 0.3, "max_linear_velocity": 0.8}
+    assert NavConfig.from_dict(both).max_linear_velocity == 0.8
 
 
 def test_external_nav_config_required_deps_union_dedup():

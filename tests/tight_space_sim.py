@@ -534,7 +534,7 @@ def run(
             "footprint_length_m": LENGTH,
             "footprint_width_m": WIDTH,
             "clearance_m": clearance_m,
-            "max_vel_x": 0.4,
+            "max_linear_velocity": 0.4,
             "max_vel_theta": 1.0,
             **(nav_overrides or {}),
         }

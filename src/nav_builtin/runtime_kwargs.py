@@ -37,7 +37,7 @@ def builtin_nav_runtime_kwargs(
         "approach_dist_m": bcfg.approach_dist_m,
         "xy_tolerance_m": bcfg.xy_goal_tolerance,
         "yaw_tolerance_rad": bcfg.yaw_goal_tolerance,
-        "max_vel_x": cfg.max_vel_x,
+        "max_vel_x": cfg.max_linear_velocity,
         "max_vel_theta": cfg.max_vel_theta,
         "min_cmd_vel_x": cfg.min_cmd_vel_x,
         "min_cmd_vel_theta": cfg.min_cmd_vel_theta,

@@ -1287,7 +1287,9 @@ class NavConfig:
     # ``inscribed_radius_m() + clearance_m``. Soft inflation (if any) starts
     # outside this. ``0`` keeps today's body-only hard disk.
     clearance_m: float = 0.2
-    max_vel_x: float = 0.6  # m/s
+    # Forward/backward speed cap (m/s), along the base's forward axis — Viam
+    # ``linear.y`` on a Y-forward base. Legacy key: ``max_vel_x``.
+    max_linear_velocity: float = 0.6
     max_vel_y: float = 0.0  # m/s (omni only)
     max_vel_theta: float = 1.5  # rad/s
     acc_lim_x: float = 1.0
@@ -1346,6 +1348,11 @@ class NavConfig:
             # Top-level goal tolerances fill in when the nested block omits them
             # (nested wins on conflict).
             "builtin": BuiltinNavConfig.from_dict(_merge_top_level_nav_tuning(d)),
+            "max_linear_velocity": float(
+                d["max_linear_velocity"]
+                if "max_linear_velocity" in d
+                else d.get("max_vel_x", defs["max_linear_velocity"])
+            ),
             # Legacy aliases: simple_min_vel_x / simple_min_vel_theta.
             "min_cmd_vel_x": float(
                 d["min_cmd_vel_x"]
