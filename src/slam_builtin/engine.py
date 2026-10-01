@@ -87,7 +87,8 @@ class BuiltinSlamEngine:
         self._pending_count = 0
         # Cached ROS-style grid for scan matching (invalidated on map edits).
         self._occ_cache: Optional[OccupancyMap] = None
-        self._occ_cache_generation = -1
+        self._occ_cache_epoch = -1
+        self._match_epoch = 0
         self._occ_cache_known = 0.0
         # Localizing mode: do not odom-track from (0,0) until a full-map seed
         # succeeds. Without this the robot "assumes start" until the async
@@ -302,8 +303,11 @@ class BuiltinSlamEngine:
     ) -> dict:
         """Erase occupied cells in a disk (map frame meters). Builtin only."""
         with self._lock:
-            cleared = occ.clear_disk(self._grid, x_m, y_m, radius_m)
+            # Copy first: get_map reads the published array off this lock.
+            updated = occ.copy_grid(self._grid)
+            cleared = occ.clear_disk(updated, x_m, y_m, radius_m)
             if cleared:
+                self._grid = updated
                 self._invalidate_occ_cache()
                 self._generation += 1
             return {
@@ -441,25 +445,36 @@ class BuiltinSlamEngine:
                 self._log(f"persist last pose failed: {exc}")
 
     def _invalidate_occ_cache(self) -> None:
+        self._match_epoch += 1
         self._occ_cache = None
-        self._occ_cache_generation = -1
+        self._occ_cache_epoch = -1
 
     def _occupancy_for_match(self) -> OccupancyMap:
-        if (
-            self._occ_cache is not None
-            and self._occ_cache_generation == self._generation
-        ):
-            return self._occ_cache
-        int16 = occ.to_occupancy_int16(self._grid)
-        self._occ_cache = scan_match.occupancy_map_from_int16(
+        """Scan-match grid. The int16 convert runs outside the pose lock."""
+        with self._lock:
+            if (
+                self._occ_cache is not None
+                and self._occ_cache_epoch == self._match_epoch
+            ):
+                return self._occ_cache
+            grid = self._grid
+            epoch = self._match_epoch
+        int16 = occ.to_occupancy_int16(grid)
+        occ_map = scan_match.occupancy_map_from_int16(
             int16,
-            resolution=self._grid.resolution,
-            origin_x=self._grid.origin_x,
-            origin_y=self._grid.origin_y,
+            resolution=grid.resolution,
+            origin_x=grid.origin_x,
+            origin_y=grid.origin_y,
         )
-        self._occ_cache_generation = self._generation
-        self._occ_cache_known = float(np.mean(int16 >= 0))
-        return self._occ_cache
+        known = float(np.mean(int16 >= 0))
+        with self._lock:
+            if self._grid is grid and self._match_epoch == epoch:
+                self._occ_cache = occ_map
+                self._occ_cache_epoch = epoch
+                self._occ_cache_known = known
+            elif self._occ_cache is None:
+                self._occ_cache_known = known
+        return occ_map
 
     # -- queries -------------------------------------------------------------
     def get_pose(self) -> conv.Pose2D:
@@ -472,14 +487,17 @@ class BuiltinSlamEngine:
 
     def get_map(self) -> dict:
         with self._lock:
-            grid = occ.to_occupancy_int16(self._grid)
-            return {
-                "grid": grid,
-                "resolution": self._grid.resolution,
-                "origin_x": self._grid.origin_x,
-                "origin_y": self._grid.origin_y,
-                "generation": self._generation,
-            }
+            grid = self._grid
+            generation = self._generation
+        # Convert off the lock. Published grids are replaced, not mutated, so
+        # this snapshot stays stable while pose reads proceed.
+        return {
+            "grid": occ.to_occupancy_int16(grid),
+            "resolution": grid.resolution,
+            "origin_x": grid.origin_x,
+            "origin_y": grid.origin_y,
+            "generation": generation,
+        }
 
     def diagnostics(self) -> dict:
         odom_status_fn = getattr(self._sensors, "odom_status", None)
@@ -622,12 +640,13 @@ class BuiltinSlamEngine:
             if self._lo_reset_pending:
                 self._lo_reset_pending = False
                 self._lo.reset()
+            match_due = now - self._last_match_at >= self._match_period_s
+
+        occ_map = None
+        run_match = False
+        if match_due:
             occ_map = self._occupancy_for_match()
-            known = self._occ_cache_known
-            run_match = (
-                known > 0.02
-                and now - self._last_match_at >= self._match_period_s
-            )
+            run_match = self._occ_cache_known > 0.02
 
         lo_ok = False
         turning = False
@@ -829,12 +848,13 @@ class BuiltinSlamEngine:
             self._last_yaw_rate = yaw_rate
             if scan is None or not new_scan:
                 return
+            match_due = now - self._last_match_at >= self._match_period_s
+
+        occ_map = None
+        run_match = False
+        if match_due:
             occ_map = self._occupancy_for_match()
-            known = self._occ_cache_known
-            run_match = (
-                known > 0.02
-                and now - self._last_match_at >= self._match_period_s
-            )
+            run_match = self._occ_cache_known > 0.02
 
         if run_match:
             matched, score, prior_score = scan_match.refine_pose(
@@ -870,16 +890,11 @@ class BuiltinSlamEngine:
         """Full-map match once scans are available; apply if score is trusted."""
         from ..nav.global_localize import global_localize_scan
 
-        with self._lock:
-            if self._occ_cache_known < 0.02 and self._generation == 0:
-                # Map not loaded yet.
-                try:
-                    occ_map = self._occupancy_for_match()
-                except Exception:  # noqa: BLE001
-                    return False
-            else:
-                occ_map = self._occupancy_for_match()
-            known = self._occ_cache_known
+        try:
+            occ_map = self._occupancy_for_match()
+        except Exception:  # noqa: BLE001
+            return False
+        known = self._occ_cache_known
         if known < 0.02:
             return False
         try:
@@ -933,8 +948,8 @@ class BuiltinSlamEngine:
     def _maybe_insert_scan(self, scan, now: float) -> None:
         """Ray-cast into the grid only after movement or a timeout.
 
-        Bresenham inserts are Python loops; doing them at 10 Hz regardless of
-        motion burned CPU for no map benefit (same pose = same rays).
+        The paint runs off the pose lock and in numpy, so GetPosition and the
+        nav control loop are not stuck behind a Python Bresenham.
         """
         with self._lock:
             pose = self._pose
@@ -948,33 +963,40 @@ class BuiltinSlamEngine:
                     and now - self._last_insert_at < 1.0
                 ):
                     return
-            self._grid = occ.insert_scan(
-                self._grid,
-                pose.x,
-                pose.y,
-                pose.theta,
-                np.asarray(scan.ranges, dtype=float),
-                float(scan.angle_min),
-                float(scan.angle_increment),
-                range_min=float(scan.range_min),
-                range_max=float(scan.range_max)
-                if math.isfinite(scan.range_max)
-                else 30.0,
-            )
-            self._last_insert_pose = pose
+            src = self._grid
+            pose_snap = conv.Pose2D(pose.x, pose.y, pose.theta)
+        painted = occ.insert_scan(
+            occ.copy_grid(src),
+            pose_snap.x,
+            pose_snap.y,
+            pose_snap.theta,
+            np.asarray(scan.ranges, dtype=float),
+            float(scan.angle_min),
+            float(scan.angle_increment),
+            range_min=float(scan.range_min),
+            range_max=float(scan.range_max)
+            if math.isfinite(scan.range_max)
+            else 30.0,
+        )
+        hook = None
+        with self._lock:
+            # Drop the paint if clear/reset/rebuild replaced the grid mid-ray.
+            if self._grid is not src:
+                return
+            self._grid = painted
+            self._last_insert_pose = pose_snap
             self._last_insert_at = now
             self._updates += 1
-            if self._mode == MODE_MAPPING:
-                if self._keyframes.add(pose, scan):
-                    hook = self._keyframe_hook
-                    if hook is not None:
-                        try:
-                            hook(scan, [], pose)
-                        except Exception as exc:  # noqa: BLE001
-                            self._log(f"keyframe hook failed: {exc}")
+            if self._mode == MODE_MAPPING and self._keyframes.add(pose_snap, scan):
+                hook = self._keyframe_hook
             if self._updates % 20 == 0:
                 self._generation += 1
                 self._invalidate_occ_cache()
+        if hook is not None:
+            try:
+                hook(scan, [], pose_snap)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"keyframe hook failed: {exc}")
 
     def _poses_agree(self, a: conv.Pose2D, b: conv.Pose2D) -> bool:
         return (

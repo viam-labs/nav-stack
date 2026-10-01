@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
@@ -21,6 +21,16 @@ FREE_THRESH = 0.35  # P(occ) below -> 0
 def _prob_to_logodds(p: float) -> float:
     p = min(max(p, 1e-6), 1.0 - 1e-6)
     return math.log(p / (1.0 - p))
+
+
+def copy_grid(grid: LogOddsGrid) -> LogOddsGrid:
+    """Deep copy so a paint can mutate without touching the published map."""
+    return LogOddsGrid(
+        log_odds=np.array(grid.log_odds, dtype=np.float32, copy=True),
+        resolution=float(grid.resolution),
+        origin_x=float(grid.origin_x),
+        origin_y=float(grid.origin_y),
+    )
 
 
 def empty_grid(
@@ -108,29 +118,6 @@ def ensure_contains(
     )
 
 
-def _bresenham(r0: int, c0: int, r1: int, c1: int) -> list[Tuple[int, int]]:
-    """Inclusive Bresenham line of (row, col) cells."""
-    cells: list[Tuple[int, int]] = []
-    dr = abs(r1 - r0)
-    dc = abs(c1 - c0)
-    sr = 1 if r0 < r1 else -1
-    sc = 1 if c0 < c1 else -1
-    err = dr - dc
-    r, c = r0, c0
-    while True:
-        cells.append((r, c))
-        if r == r1 and c == c1:
-            break
-        e2 = 2 * err
-        if e2 > -dc:
-            err -= dc
-            r += sr
-        if e2 < dr:
-            err += dr
-            c += sc
-    return cells
-
-
 def clear_disk(
     grid: LogOddsGrid,
     x_m: float,
@@ -208,36 +195,69 @@ def insert_scan(
         pick = np.linspace(0, idx.size - 1, max_beams, dtype=np.int32)
         idx = idx[pick]
 
-    # Expand so all endpoints fit.
+    # Expand once so every endpoint fits. Per-beam growth used to copy the
+    # whole grid inside the ray loop.
     max_r = float(np.max(ranges[idx]))
     grid = ensure_contains(grid, pose_x, pose_y, margin_m=max_r + 1.0)
 
-    lo = grid.log_odds
-    h, w = lo.shape
-    for i in idx:
-        r = float(ranges[i])
-        ang = float(angle_min + i * angle_increment)
-        ca = math.cos(pose_theta + ang)
-        sa = math.sin(pose_theta + ang)
-        ex = pose_x + ca * r
-        ey = pose_y + sa * r
-        grid = ensure_contains(grid, ex, ey, margin_m=0.5)
-        lo = grid.log_odds
-        h, w = lo.shape
-
-        r0, c0 = grid.world_to_cell(pose_x, pose_y)
-        r1, c1 = grid.world_to_cell(ex, ey)
-        if not (0 <= r0 < h and 0 <= c0 < w):
-            continue
-        line = _bresenham(r0, c0, r1, c1)
-        if not line:
-            continue
-        # Free along ray (excluding endpoint).
-        for rr, cc in line[:-1]:
-            if 0 <= rr < h and 0 <= cc < w:
-                lo[rr, cc] = float(np.clip(lo[rr, cc] + L_FREE, L_MIN, L_MAX))
-        er, ec = line[-1]
-        if 0 <= er < h and 0 <= ec < w:
-            lo[er, ec] = float(np.clip(lo[er, ec] + L_OCC, L_MIN, L_MAX))
-
+    beam = idx.astype(np.float64)
+    beam_ranges = ranges[idx].astype(np.float64)
+    angles = float(angle_min) + beam * float(angle_increment)
+    ex = float(pose_x) + np.cos(float(pose_theta) + angles) * beam_ranges
+    ey = float(pose_y) + np.sin(float(pose_theta) + angles) * beam_ranges
+    res = float(grid.resolution)
+    cols1 = np.floor((ex - grid.origin_x) / res).astype(np.int32)
+    rows1 = np.floor((ey - grid.origin_y) / res).astype(np.int32)
+    row0, col0 = grid.world_to_cell(float(pose_x), float(pose_y))
+    _paint_rays(grid.log_odds, row0, col0, rows1, cols1)
     return grid
+
+
+def _paint_rays(
+    lo: np.ndarray,
+    row0: int,
+    col0: int,
+    rows1: np.ndarray,
+    cols1: np.ndarray,
+) -> None:
+    """Mark Bresenham-like rays free, and their endpoints occupied.
+
+    All beams are rasterized together so the work runs in numpy (the GIL is
+    released) instead of a Python loop over every cell.
+    """
+    n = int(rows1.shape[0])
+    if n == 0:
+        return
+    dr = rows1.astype(np.int32) - int(row0)
+    dc = cols1.astype(np.int32) - int(col0)
+    steps = np.maximum(np.abs(dr), np.abs(dc))
+    max_steps = int(steps.max())
+    h, w = lo.shape
+    if max_steps <= 0:
+        inside = (
+            (rows1 >= 0) & (rows1 < h) & (cols1 >= 0) & (cols1 < w)
+        )
+        if np.any(inside):
+            np.add.at(lo, (rows1[inside], cols1[inside]), np.float32(L_OCC))
+            np.clip(lo, L_MIN, L_MAX, out=lo)
+        return
+
+    t = np.arange(max_steps + 1, dtype=np.float64)
+    denom = np.maximum(steps, 1).astype(np.float64)
+    alpha = np.minimum(t[None, :] / denom[:, None], 1.0)
+    rr = np.rint(int(row0) + dr.astype(np.float64)[:, None] * alpha).astype(np.int32)
+    cc = np.rint(int(col0) + dc.astype(np.float64)[:, None] * alpha).astype(np.int32)
+    valid = t[None, :] <= steps.astype(np.float64)[:, None]
+    dup = (rr[:, 1:] == rr[:, :-1]) & (cc[:, 1:] == cc[:, :-1])
+    valid[:, 1:] &= ~dup
+    inside = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
+    valid &= inside
+    # Endpoint is occupied, not free — even when the last sample repeats it.
+    is_hit = (rr == rows1[:, None]) & (cc == cols1[:, None])
+    free = valid & ~is_hit
+    if np.any(free):
+        np.add.at(lo, (rr[free], cc[free]), np.float32(L_FREE))
+    hit = (rows1 >= 0) & (rows1 < h) & (cols1 >= 0) & (cols1 < w)
+    if np.any(hit):
+        np.add.at(lo, (rows1[hit], cols1[hit]), np.float32(L_OCC))
+    np.clip(lo, L_MIN, L_MAX, out=lo)
