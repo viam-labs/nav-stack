@@ -1420,6 +1420,10 @@ class _FakeWorld:
         self.scan_calls = []
         self.loc_checks = 0
         self.on_loc_check = None
+        self._slam_mode = None
+
+    def slam_mode(self):
+        return self._slam_mode
 
     def get_map(self):
         return self.map_data
@@ -2278,6 +2282,17 @@ def test_follow_loop_uses_fused_scan_for_local_costmap():
     view = sup._local_view_cache  # noqa: SLF001
     assert view is not None
     assert view.cost_at_world(1.30, 1.0) > 0
+
+
+def test_nav_loc_refine_does_not_pause_while_mapping():
+    """A partial map disagrees with the scan; do not stop to refine."""
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
+    world.scan = _open_scan()
+    world._slam_mode = "mapping"  # noqa: SLF001
+    sup = _loc_refine_supervisor(world)
+    sup.run_goal(Pose2D(1.6, 1.0, 0.0))
+    assert world.loc_checks == 0
+    assert sup.status().state == "succeeded"
 
 
 def test_nav_loc_refine_resumes_when_disagreement_clears():

@@ -2401,6 +2401,13 @@ class SlamService(SLAM):
             return conv.chunk_bytes(handle.posegraph_path.read_bytes())
         return [b""]
 
+    def slam_mode(self) -> Optional[str]:
+        """Current SLAM mode without a DoCommand round-trip."""
+        cfg = self._cfg
+        if cfg is None:
+            return None
+        return str(cfg.mode)
+
     async def get_properties(
         self, *, timeout: Optional[float] = None, **kwargs
     ) -> SLAM.Properties:

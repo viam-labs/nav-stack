@@ -935,6 +935,18 @@ class ViamWorldIO:
             return None
         return hold if isinstance(hold, dict) else None
 
+    def slam_mode(self) -> Optional[str]:
+        """``mapping`` or ``localizing`` from the in-process SLAM service."""
+        slam = self._slam
+        fn = getattr(slam, "slam_mode", None)
+        if not callable(fn):
+            return None
+        try:
+            mode = fn()
+        except Exception:  # noqa: BLE001
+            return None
+        return str(mode) if mode else None
+
     def check_localization(
         self,
         *,

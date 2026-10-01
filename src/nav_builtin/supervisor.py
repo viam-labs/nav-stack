@@ -724,6 +724,15 @@ class NavSupervisor:
             min_beams=self._nav_loc_refine_min_beams,
         )
 
+    def _slam_is_mapping(self) -> bool:
+        fn = getattr(self._world, "slam_mode", None)
+        if not callable(fn):
+            return False
+        try:
+            return str(fn() or "") == "mapping"
+        except Exception:  # noqa: BLE001 - never block drive on a mode read
+            return False
+
     def _maybe_pause_and_refine_localization(
         self, pose: Pose2D, now: float, dist_goal: float
     ) -> Optional[str]:
@@ -735,6 +744,11 @@ class NavSupervisor:
         or refused yank is common in hallways.
         """
         if not self._nav_loc_refine:
+            return None
+        # The check compares the live scan to a finished map. While mapping,
+        # new rays disagree with the partial grid and check_localization
+        # returns not_localizing, so the pause never corrects the pose.
+        if self._slam_is_mapping():
             return None
         holding = self._loc_refine_tries > 0
         if now < self._loc_refine_cooldown_until:
