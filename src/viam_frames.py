@@ -45,18 +45,6 @@ class MountPose:
         }
 
 
-@dataclass(frozen=True)
-class FootprintBox:
-    """Rectangular footprint on the floor plane (metres)."""
-
-    length_m: float  # forward
-    width_m: float  # lateral
-
-    @property
-    def inscribed_radius_m(self) -> float:
-        return min(self.length_m, self.width_m) / 2.0
-
-
 def _pose_to_matrix(pose) -> np.ndarray:
     """4×4 SE(3) from a Viam Pose (mm + OV degrees)."""
     from viam.proto.common import Orientation
@@ -202,35 +190,6 @@ def pose_of_frame_in_destination(
     return _matrix_to_mount(T)
 
 
-def footprint_from_base_geometry(
-    configs: Sequence[Any],
-    base_name: str,
-) -> Optional[FootprintBox]:
-    """Read ``geometry.box`` on the base frame.
-
-    Horizontal dims: longer side → length (forward), shorter → width (lateral).
-    That matches typical differential bases (incl. Tracer 0.72×0.59) even when
-    the configured box axes are swapped relative to Viam X-forward.
-    """
-    frames = _frame_entries(configs)
-    entry = frames.get(base_name)
-    if entry is None:
-        return None
-    geom = getattr(entry, "physical_object", None)
-    if geom is None or not geom.ByteSize():
-        return None
-    if geom.WhichOneof("geometry_type") != "box":
-        return None
-    dims = geom.box.dims_mm
-    dx = abs(mm_to_m(float(dims.x)))
-    dy = abs(mm_to_m(float(dims.y)))
-    if dx < 1e-3 or dy < 1e-3:
-        return None
-    length_m = max(dx, dy)
-    width_m = min(dx, dy)
-    return FootprintBox(length_m=length_m, width_m=width_m)
-
-
 def base_box_forward_lateral(
     configs: Sequence[Any],
     base_name: str,
@@ -272,38 +231,51 @@ async def fetch_frame_system_config(
     )
 
 
-def _apply_footprint_crop(cfg, configs: Sequence[Any], raw: Mapping, notes: List[str]) -> None:
-    """Stamp the base box onto each lidar so self-returns can be dropped.
+def resolve_base_footprint(cfg, configs: Sequence[Any], raw: Mapping):
+    """``resolve_footprint`` with the Viam base box filling unset sides."""
+    from .config import resolve_footprint
 
-    Explicit ``footprint_length_m`` / ``footprint_width_m`` on the SLAM config
-    win. Otherwise the Viam base box is used (+Y forward, +X right).
-    """
+    base_name = str(getattr(cfg, "base", "") or "base")
+    return resolve_footprint(raw, base_box_forward_lateral(configs, base_name))
+
+
+def _describe_footprint(fp) -> str:
+    if fp.is_box:
+        return f"from {fp.source}: L={fp.length_m:.3f} W={fp.width_m:.3f}"
+    if fp.radius_m is not None:
+        return f"from robot_radius: r={fp.radius_m:.3f}"
+    return "unknown (no base box, footprint_* or robot_radius)"
+
+
+def apply_framesystem_footprint_to_slam_cfg(
+    cfg,
+    configs: Sequence[Any],
+    *,
+    raw_attrs: Optional[Mapping] = None,
+    logger: Optional[logging.Logger] = None,
+) -> List[str]:
+    """Footprint crop only (no mounts), for lidars that take mounts from config."""
+    log = logger or LOGGER
+    notes: List[str] = []
+    _apply_footprint_crop(cfg, configs, raw_attrs or {}, notes)
+    for line in notes:
+        log.info("framesystem: %s", line)
+    return notes
+
+
+def _apply_footprint_crop(cfg, configs: Sequence[Any], raw: Mapping, notes: List[str]) -> None:
+    """Stamp the resolved body onto each lidar so self-returns can be dropped."""
+    from .config import stamp_lidar_footprint
+
     if not bool(getattr(cfg, "crop_inside_footprint", True)):
         notes.append("footprint crop: off")
         return
-    explicit = ("footprint_length_m" in raw) or ("footprint_width_m" in raw)
-    length = getattr(cfg, "footprint_length_m", None)
-    width = getattr(cfg, "footprint_width_m", None)
-    if explicit and length and width:
-        source = "config"
-    else:
-        box = base_box_forward_lateral(configs, str(getattr(cfg, "base", "") or "base"))
-        if box is None:
-            notes.append("footprint crop: no base box; self-returns kept")
-            return
-        length, width = box
-        source = "framesystem"
-        cfg.footprint_length_m = float(length)
-        cfg.footprint_width_m = float(width)
-    for lidar in cfg.lidars:
-        if not lidar.crop_inside_footprint:
-            continue
-        lidar.footprint_length_m = float(length)
-        lidar.footprint_width_m = float(width)
-    notes.append(
-        f"footprint crop from {source}: L={float(length):.3f} W={float(width):.3f} "
-        "(drops returns inside the base box)"
-    )
+    fp = resolve_base_footprint(cfg, configs, raw)
+    cfg.footprint_length_m = fp.length_m
+    cfg.footprint_width_m = fp.width_m
+    cfg.robot_radius = fp.radius_m
+    stamp_lidar_footprint(cfg.lidars, fp)
+    notes.append(f"footprint crop {_describe_footprint(fp)}")
 
 
 def apply_framesystem_to_slam_cfg(
@@ -497,49 +469,21 @@ def apply_framesystem_to_nav_cfg(
     raw_attrs: Optional[Mapping] = None,
     logger: Optional[logging.Logger] = None,
 ):
-    """Fill footprint from base ``geometry.box`` when JSON omitted footprint_*."""
+    """Resolve the nav footprint: config per side, else base box, else ``robot_radius``."""
     from dataclasses import replace
+
+    from .config import NavConfig, footprint_robot_radius
 
     log = logger or LOGGER
     raw = raw_attrs or {}
-    notes: List[str] = []
-    explicit = ("footprint_length_m" in raw) or ("footprint_width_m" in raw)
-    if explicit:
-        notes.append(
-            f"footprint from config "
-            f"L={cfg.footprint_length_m} W={cfg.footprint_width_m} "
-            f"r={cfg.robot_radius}"
-        )
-        log.info("framesystem: %s", notes[-1])
-        return cfg, notes
-
-    base_name = str(getattr(cfg, "base", "") or "base")
-    box = footprint_from_base_geometry(configs, base_name)
-    if box is None:
-        notes.append(
-            f"footprint: no box geometry on framesystem frame {base_name!r}; "
-            f"keeping robot_radius={cfg.robot_radius}"
-        )
-        log.info("framesystem: %s", notes[-1])
-        return cfg, notes
-
-    # Only replace robot_radius when the user did not set it explicitly — if they
-    # set radius alone (no footprint_*), keep radius but still adopt the box so
-    # length/width drive gap clearance.
-    explicit_radius = "robot_radius" in raw
-    new_radius = cfg.robot_radius if explicit_radius else box.inscribed_radius_m
+    fp = resolve_base_footprint(cfg, configs, raw)
+    default_radius = NavConfig.__dataclass_fields__["robot_radius"].default
     cfg = replace(
         cfg,
-        footprint_length_m=box.length_m,
-        footprint_width_m=box.width_m,
-        robot_radius=float(new_radius),
+        footprint_length_m=fp.length_m,
+        footprint_width_m=fp.width_m,
+        robot_radius=footprint_robot_radius(fp, default_radius),
     )
-    notes.append(
-        f"footprint from framesystem box on {base_name!r}: "
-        f"L={box.length_m:.3f} W={box.width_m:.3f} "
-        f"inscribed={box.inscribed_radius_m:.3f} "
-        f"robot_radius={cfg.robot_radius:.3f}"
-        + (" (radius kept from config)" if explicit_radius else "")
-    )
+    notes = [f"footprint {_describe_footprint(fp)} robot_radius={cfg.robot_radius:.3f}"]
     log.info("framesystem: %s", notes[-1])
     return cfg, notes

@@ -22,7 +22,6 @@ from src.viam_frames import (
     apply_framesystem_to_slam_cfg,
     fetch_frame_system_config,
     base_box_forward_lateral,
-    footprint_from_base_geometry,
     pose_of_frame_in_destination,
 )
 
@@ -145,13 +144,10 @@ def test_camera_fs_mount_round_trips_rotation():
     assert np.allclose(T_ros[:3, :3], _mount_rotation(m.theta, m.pitch, m.roll), atol=1e-9)
 
 
-def test_footprint_from_box_uses_longer_side_as_length():
-    configs = _tracer_like_frames()
-    fp = footprint_from_base_geometry(configs, "base")
-    assert fp is not None
-    assert abs(fp.length_m - 0.72) < 1e-9
-    assert abs(fp.width_m - 0.59) < 1e-9
-    assert abs(fp.inscribed_radius_m - 0.295) < 1e-9
+def test_tracer_box_reads_viam_y_as_length():
+    assert base_box_forward_lateral(_tracer_like_frames(), "base") == pytest.approx(
+        (0.72, 0.59)
+    )
 
 
 def test_wide_cart_box_crops_forward_not_the_longer_side():
@@ -331,9 +327,10 @@ def test_apply_nav_fills_footprint_from_box():
     raw = {"slam_service": "slam", "base": "base"}
     cfg = NavConfig.from_dict(raw)
     cfg2, notes = apply_framesystem_to_nav_cfg(cfg, configs, raw_attrs=raw)
-    assert any("framesystem box" in n for n in notes)
+    assert any("from framesystem" in n for n in notes)
     assert abs(cfg2.footprint_length_m - 0.72) < 1e-9
     assert abs(cfg2.footprint_width_m - 0.59) < 1e-9
+    assert cfg2.robot_radius == pytest.approx(0.295)
 
 
 def test_apply_nav_keeps_explicit_footprint():
@@ -351,6 +348,76 @@ def test_apply_nav_keeps_explicit_footprint():
     assert abs(cfg2.footprint_length_m - 0.8) < 1e-9
     assert abs(cfg2.footprint_width_m - 0.5) < 1e-9
     assert abs(cfg2.robot_radius - 0.31) < 1e-9
+
+
+def test_apply_nav_one_side_overrides_the_box():
+    raw = {"slam_service": "slam", "base": "base", "footprint_width_m": 0.65}
+    cfg2, notes = apply_framesystem_to_nav_cfg(
+        NavConfig.from_dict(raw), _tracer_like_frames(), raw_attrs=raw
+    )
+    assert cfg2.footprint_length_m == pytest.approx(0.72)
+    assert cfg2.footprint_width_m == pytest.approx(0.65)
+    assert any("length=framesystem width=config" in n for n in notes)
+
+
+@pytest.mark.parametrize("unset", [0, None])
+def test_apply_nav_zero_or_null_falls_back_to_the_box(unset):
+    raw = {
+        "slam_service": "slam",
+        "base": "base",
+        "footprint_length_m": unset,
+        "footprint_width_m": unset,
+    }
+    cfg2, _ = apply_framesystem_to_nav_cfg(
+        NavConfig.from_dict(raw), _tracer_like_frames(), raw_attrs=raw
+    )
+    assert (cfg2.footprint_length_m, cfg2.footprint_width_m) == pytest.approx((0.72, 0.59))
+
+
+def test_apply_nav_without_box_uses_robot_radius_for_the_missing_side():
+    raw = {
+        "slam_service": "slam",
+        "base": "base",
+        "footprint_length_m": 0.9,
+        "robot_radius": 0.3,
+    }
+    cfg2, _ = apply_framesystem_to_nav_cfg(NavConfig.from_dict(raw), [], raw_attrs=raw)
+    assert cfg2.footprint_length_m == pytest.approx(0.9)
+    assert cfg2.footprint_width_m == pytest.approx(0.6)
+    assert cfg2.robot_radius == pytest.approx(0.3)
+
+
+def test_apply_nav_radius_only_stays_circular():
+    raw = {"slam_service": "slam", "base": "base", "robot_radius": 0.3}
+    cfg2, _ = apply_framesystem_to_nav_cfg(NavConfig.from_dict(raw), [], raw_attrs=raw)
+    assert cfg2.footprint_length_m is None
+    assert cfg2.footprint_width_m is None
+    assert cfg2.robot_radius == pytest.approx(0.3)
+
+
+def test_slam_crop_one_side_overrides_the_box():
+    raw = {
+        "base": "base",
+        "footprint_length_m": 0.9,
+        "lidars": [{"name": "rplidar", "scan_source": "point_cloud"}],
+    }
+    cfg = SlamConfig.from_dict(raw)
+    apply_framesystem_to_slam_cfg(cfg, _tracer_like_frames(), raw_attrs=raw)
+    lidar = cfg.lidars[0]
+    assert (lidar.footprint_length_m, lidar.footprint_width_m) == pytest.approx((0.9, 0.59))
+
+
+def test_slam_crop_without_box_uses_a_robot_radius_disc():
+    raw = {
+        "base": "base",
+        "robot_radius": 0.3,
+        "lidars": [{"name": "rplidar", "scan_source": "point_cloud"}],
+    }
+    cfg = SlamConfig.from_dict(raw)
+    apply_framesystem_to_slam_cfg(cfg, [], raw_attrs=raw)
+    lidar = cfg.lidars[0]
+    assert lidar.footprint_length_m == 0.0
+    assert lidar.footprint_radius_m == pytest.approx(0.3)
 
 
 @pytest.mark.asyncio

@@ -290,6 +290,15 @@ def test_prepare_lidar_point_cloud_drops_inside_footprint_keeps_ahead():
     assert out[0, 0] == pytest.approx(0.40)
 
 
+def test_prepare_lidar_point_cloud_radius_crop_without_box():
+    pts = np.array([[0.20, 0.10, 0.4], [0.40, 0.0, 0.4]])
+    out = conv.prepare_lidar_point_cloud(
+        pts, points_in_base_link=True, z_min=0.0, z_max=2.0, footprint_radius_m=0.3
+    )
+    assert len(out) == 1
+    assert out[0, 0] == pytest.approx(0.40)
+
+
 def test_prepare_lidar_point_cloud_downsamples_after_gates_keeps_near_hits():
     """Early uniform downsample used to erase sparse near obstacles in a
     mostly-far depth frame. Crop by optical depth + height, then downsample."""

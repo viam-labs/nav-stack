@@ -222,6 +222,7 @@ class BuiltinSensors:
             max_points=max_pts,
             footprint_length_m=lidar.footprint_length_m,
             footprint_width_m=lidar.footprint_width_m,
+            footprint_radius_m=lidar.footprint_radius_m,
         )
         scan = conv.points_to_scan(
             pts,

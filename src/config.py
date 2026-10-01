@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import MISSING, dataclass, field, fields
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 DIFFERENTIAL = "differential"
 OMNI = "omni"
@@ -240,11 +240,13 @@ class LidarConfig:
     # centred on its forward axis; RealSense D4xx depth is ~87). Obstacles it
     # saw are remembered once they leave this view until it looks again.
     fov_deg: float = 87.0
-    # Drop returns whose base_link XY is inside the robot box. Dimensions are
-    # filled from the base framesystem (0 = footprint unknown, no crop).
+    # Drop returns whose base_link XY is inside the robot body: the box when
+    # known, else a ``robot_radius`` disc (0 = unknown, no crop). Stamped by
+    # ``stamp_lidar_footprint`` from config and the base framesystem.
     crop_inside_footprint: bool = True
     footprint_length_m: float = 0.0
     footprint_width_m: float = 0.0
+    footprint_radius_m: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "LidarConfig":
@@ -349,6 +351,78 @@ def _optional_positive(value) -> Optional[float]:
         return None
     parsed = float(value)
     return parsed if parsed > 0.0 else None
+
+
+@dataclass(frozen=True)
+class Footprint:
+    """Robot body on the floor (metres, +X forward). Unknown sides are ``None``."""
+
+    length_m: Optional[float] = None
+    width_m: Optional[float] = None
+    radius_m: Optional[float] = None
+    source: str = "none"
+
+    @property
+    def is_box(self) -> bool:
+        return bool(self.length_m and self.width_m)
+
+
+def resolve_footprint(
+    d: Mapping, box: Optional[Tuple[float, float]] = None
+) -> Footprint:
+    """Config ``footprint_length_m`` / ``footprint_width_m`` win per side.
+
+    ``box`` is the framesystem base box as ``(forward, lateral)`` metres and
+    fills whichever side config left unset. A side still unknown while the
+    other is known takes ``2 * robot_radius``. Absent, ``0`` and ``null`` all
+    mean "not set".
+    """
+    length = _optional_positive(d.get("footprint_length_m"))
+    width = _optional_positive(d.get("footprint_width_m"))
+    radius = _optional_positive(d.get("robot_radius"))
+    src_l = "config" if length else ""
+    src_w = "config" if width else ""
+    if box is not None:
+        if length is None:
+            length, src_l = float(box[0]), "framesystem"
+        if width is None:
+            width, src_w = float(box[1]), "framesystem"
+    if radius is not None and (length is None) != (width is None):
+        if length is None:
+            length, src_l = 2.0 * radius, "robot_radius"
+        else:
+            width, src_w = 2.0 * radius, "robot_radius"
+    if length and width:
+        source = src_l if src_l == src_w else f"length={src_l} width={src_w}"
+    elif radius is not None:
+        source = "robot_radius"
+    else:
+        source = "none"
+    return Footprint(length_m=length, width_m=width, radius_m=radius, source=source)
+
+
+def footprint_robot_radius(fp: Footprint, default: float) -> float:
+    """Nav ``robot_radius``: config, else the box's half-width, else ``default``."""
+    if fp.radius_m is not None:
+        return float(fp.radius_m)
+    if fp.is_box:
+        return min(float(fp.length_m), float(fp.width_m)) / 2.0
+    return float(default)
+
+
+def stamp_lidar_footprint(lidars: Sequence["LidarConfig"], fp: Footprint) -> None:
+    """Crop each lidar to the body box, else a ``robot_radius`` disc, else nothing."""
+    for lidar in lidars:
+        if not lidar.crop_inside_footprint:
+            continue
+        if fp.is_box:
+            lidar.footprint_length_m = float(fp.length_m)
+            lidar.footprint_width_m = float(fp.width_m)
+            lidar.footprint_radius_m = 0.0
+        else:
+            lidar.footprint_length_m = 0.0
+            lidar.footprint_width_m = 0.0
+            lidar.footprint_radius_m = float(fp.radius_m or 0.0)
 
 
 def _config_field_defaults(cls) -> Dict[str, Any]:
@@ -875,12 +949,14 @@ class SlamConfig:
     )
     # Drop point-cloud hits whose base_link XY lies inside the robot box (a
     # stand or mast on the chassis). A return the same distance in front of
-    # the body is kept. Off until a footprint is known: the base framesystem
-    # box, or explicit ``footprint_length_m`` / ``footprint_width_m`` (metres,
-    # +X forward, +Y left — Viam box Y and X).
+    # the body is kept. Off until a footprint is known. Each of
+    # ``footprint_length_m`` / ``footprint_width_m`` (metres, +X forward, +Y
+    # left) overrides that side of the base framesystem box; ``robot_radius``
+    # covers what is still unknown (see ``resolve_footprint``).
     crop_inside_footprint: bool = True
     footprint_length_m: Optional[float] = None
     footprint_width_m: Optional[float] = None
+    robot_radius: Optional[float] = None
     # Builtin simulation: raycast floorplan + in-process SimSensors (see ``sim``).
     sim: SimConfig = field(default_factory=SimConfig)
 
@@ -901,14 +977,9 @@ class SlamConfig:
             else:
                 raise ValueError("at least one lidar is required ('lidars' or 'lidar')")
         lidars = [LidarConfig.from_dict(x) for x in lidars_raw]
-        crop_fp = bool(d.get("crop_inside_footprint", True))
-        fp_l = d.get("footprint_length_m")
-        fp_w = d.get("footprint_width_m")
-        if crop_fp and fp_l and fp_w:
-            for lidar in lidars:
-                if lidar.crop_inside_footprint:
-                    lidar.footprint_length_m = float(fp_l)
-                    lidar.footprint_width_m = float(fp_w)
+        footprint = resolve_footprint(d)
+        if bool(d.get("crop_inside_footprint", True)):
+            stamp_lidar_footprint(lidars, footprint)
         slam_lidars = [lidar for lidar in lidars if not lidar.obstacles_only]
         if not slam_lidars:
             raise ValueError(
@@ -1111,6 +1182,9 @@ class SlamConfig:
         overrides: Dict[str, Any] = {
             "base": d["base"],
             "lidars": lidars,
+            "footprint_length_m": footprint.length_m,
+            "footprint_width_m": footprint.width_m,
+            "robot_radius": footprint.radius_m,
             "movement_sensor": d.get("movement_sensor"),
             "imu_shm_name": imu_shm_name,
             "heading_sensor": heading_sensor,
@@ -1258,12 +1332,14 @@ class NavConfig:
                 f"nav_backend must be {NAV_BACKEND_BUILTIN!r}, got {backend!r}"
             )
         defs = _config_field_defaults(cls)
+        footprint = resolve_footprint(d)
         overrides: Dict[str, Any] = {
             "slam_service": d["slam_service"],
             "base": d["base"],
             "kinematics": kinematics,
-            "footprint_length_m": _optional_positive(d.get("footprint_length_m")),
-            "footprint_width_m": _optional_positive(d.get("footprint_width_m")),
+            "footprint_length_m": footprint.length_m,
+            "footprint_width_m": footprint.width_m,
+            "robot_radius": footprint_robot_radius(footprint, defs["robot_radius"]),
             "inflation_margin_m": _optional_positive(d.get("inflation_margin_m")),
             "nav_backend": backend,
             # Prefer ``builtin``; accept legacy ``nav2`` block from older configs.

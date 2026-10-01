@@ -102,10 +102,17 @@ D4xx depth).
 Point-cloud returns whose base-frame XY lies inside the robot's box are
 dropped (`crop_inside_footprint`, default on once a footprint is known). That
 removes a stand or mast on the chassis without a radial `min_range`, so a hit
-the same distance in front of the bumper is kept. The box comes from the base
-framesystem geometry (Viam +Y forward, +X right) or from explicit
-`footprint_length_m` / `footprint_width_m` on the SLAM service. Set
+the same distance in front of the bumper is kept. Set
 `"crop_inside_footprint": false` to keep those returns.
+
+**Footprint resolution** (SLAM, `navigation` and `navigation-external` alike):
+the base's framesystem box geometry is read as Viam +Y forward (length), +X
+right (width). `footprint_length_m` and `footprint_width_m` are optional and
+each overrides its own side of that box, so setting only one keeps the other
+from the framesystem. A side neither sets takes `2 × robot_radius` when the
+other side is known. With no box and no `footprint_*`, navigation stays on its
+circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
+`null` mean "not set". Nav's `robot_radius` defaults to the box's half-width.
 
 **Tuning via Viam config (no YAML editing required):**
 

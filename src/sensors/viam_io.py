@@ -110,6 +110,7 @@ def build_io_provider(
                     ),
                     footprint_length_m=lidar_cfg.footprint_length_m,
                     footprint_width_m=lidar_cfg.footprint_width_m,
+                    footprint_radius_m=lidar_cfg.footprint_radius_m,
                 )
             else:
                 base_pts = pts

@@ -32,6 +32,7 @@ from ..config import (
     MODE_LOCALIZING,
     MODE_MAPPING,
     SlamConfig,
+    resolve_footprint,
 )
 from ..nav.global_localize import (
     GlobalLocalizeResult,
@@ -316,6 +317,13 @@ class SlamService(SLAM):
             return True
         return False
 
+    def _footprint_needs_framesystem(self, raw_attrs: Mapping) -> bool:
+        """True when the self-return crop is on and config leaves a side unset."""
+        cfg = self._cfg
+        if cfg is None or not cfg.crop_inside_footprint:
+            return False
+        return resolve_footprint(raw_attrs).source != "config"
+
     def _set_mounts_ready(self, ready: bool) -> None:
         sensors = self._builtin_sensors
         if sensors is not None:
@@ -337,7 +345,11 @@ class SlamService(SLAM):
             self._set_mounts_ready(True)
             return
         raw = self._framesystem_raw_attrs or {}
-        if not self._lidars_need_framesystem(raw) and not self._imu_needs_framesystem(raw):
+        if not (
+            self._lidars_need_framesystem(raw)
+            or self._imu_needs_framesystem(raw)
+            or self._footprint_needs_framesystem(raw)
+        ):
             self._set_mounts_ready(True)
             return
         self._framesystem_gen += 1

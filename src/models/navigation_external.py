@@ -38,10 +38,16 @@ from ..nav_builtin import (
 from ..shm.lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
+    get_parent_robot,
     register_nav_host,
     register_nav_viz,
     unregister_nav_host,
     unregister_nav_viz,
+)
+from ..viam_frames import (
+    apply_framesystem_footprint_to_slam_cfg,
+    apply_framesystem_to_nav_cfg,
+    fetch_frame_system_config,
 )
 from .nav_core import NavServiceBase
 
@@ -59,6 +65,8 @@ class ExternalNavigationService(NavServiceBase):
         self._runtime = None
         self._viz: Optional[NavVizStore] = None
         self._shm_lidar = ShmPointCloudClient(logger=LOGGER)
+        self._framesystem_task: Optional[asyncio.Task] = None
+        self._framesystem_gen = 0
 
     # -- registration --------------------------------------------------------
     @classmethod
@@ -81,6 +89,11 @@ class ExternalNavigationService(NavServiceBase):
         return self._runtime
 
     def _teardown(self) -> None:
+        task = self._framesystem_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._framesystem_task = None
+        self._framesystem_gen += 1
         if self._simple_nav_cancel is not None:
             self._simple_nav_cancel.set()
         unregister_nav_viz(self.name)
@@ -99,7 +112,8 @@ class ExternalNavigationService(NavServiceBase):
     def reconfigure(
         self, config: ServiceConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
-        ext = ExternalNavConfig.from_dict(struct_to_dict(config.attributes))
+        attrs = struct_to_dict(config.attributes)
+        ext = ExternalNavConfig.from_dict(attrs)
         bridge_cfg = ext.bridge
         self._cfg = ext.nav  # NavServiceBase drives nav from the NavConfig
 
@@ -120,6 +134,35 @@ class ExternalNavigationService(NavServiceBase):
         map_store.set_active_map(active)
 
         self._configure_builtin(ext, slam, cameras, map_store)
+        if get_parent_robot() is not None:
+            gen = self._framesystem_gen
+            self._framesystem_task = asyncio.get_event_loop().create_task(
+                self._apply_framesystem_footprint(gen, ext, attrs)
+            )
+
+    async def _apply_framesystem_footprint(
+        self, gen: int, ext: ExternalNavConfig, raw_attrs: Mapping
+    ) -> None:
+        robot = get_parent_robot()
+        host = self._manager
+        if robot is None or host is None:
+            return
+        try:
+            fs = await fetch_frame_system_config(robot)
+            if gen != self._framesystem_gen or self._manager is not host:
+                return
+            apply_framesystem_footprint_to_slam_cfg(
+                ext.bridge, fs, raw_attrs=raw_attrs, logger=LOGGER
+            )
+            nav_cfg, _notes = apply_framesystem_to_nav_cfg(
+                ext.nav, fs, raw_attrs=raw_attrs, logger=LOGGER
+            )
+            self._cfg = nav_cfg
+            host.set_nav_config(nav_cfg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the config footprint
+            LOGGER.warning("framesystem footprint resolve failed; using config: %s", exc)
 
     def _configure_builtin(
         self,

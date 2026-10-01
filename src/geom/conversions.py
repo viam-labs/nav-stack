@@ -1264,6 +1264,7 @@ def prepare_lidar_point_cloud(
     range_max: float = 0.0,
     footprint_length_m: float = 0.0,
     footprint_width_m: float = 0.0,
+    footprint_radius_m: float = 0.0,
 ) -> np.ndarray:
     """Optical remap → mount → height band (returns base_link XYZ).
 
@@ -1318,8 +1319,12 @@ def prepare_lidar_point_cloud(
     # bumper can be the same distance from the sensor.
     fl = float(footprint_length_m)
     fw = float(footprint_width_m)
-    if fl > 0.0 and fw > 0.0 and pts.size and pts.shape[1] >= 2:
-        inside = (np.abs(pts[:, 0]) <= fl / 2.0) & (np.abs(pts[:, 1]) <= fw / 2.0)
+    fr = float(footprint_radius_m)
+    if pts.size and pts.shape[1] >= 2 and ((fl > 0.0 and fw > 0.0) or fr > 0.0):
+        if fl > 0.0 and fw > 0.0:
+            inside = (np.abs(pts[:, 0]) <= fl / 2.0) & (np.abs(pts[:, 1]) <= fw / 2.0)
+        else:
+            inside = np.hypot(pts[:, 0], pts[:, 1]) <= fr
         if inside.any():
             pts = pts[~inside]
 
