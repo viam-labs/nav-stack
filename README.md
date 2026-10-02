@@ -99,6 +99,13 @@ newer frame looks at it and sees nothing, or when the body covers it. Set the
 camera's horizontal field of view with ``fov_deg`` (default `87`, RealSense
 D4xx depth).
 
+`avoid_obstacles_above_cart` (default `true`) remembers those same depth
+returns out to 2.5 m after they leave the *vertical* view (`vfov_deg`, default
+`58`). A later frame that still points at that spot but can no longer see that
+height does not clear them, so the cart does not drive underneath. By default
+the band is whatever the depth camera already reports, up to its ``z_max``.
+Set ``cart_height_m`` only to ignore returns at or below the top of the cart.
+
 Point-cloud returns whose base-frame XY lies inside the robot's box are
 dropped (`crop_inside_footprint`, default on once a footprint is known). That
 removes a stand or mast on the chassis without a radial `min_range`, so a hit
@@ -159,6 +166,8 @@ circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
 | `control_rate_hz` | Nav | Builtin nav control rate (default `10`). Local costmap refreshes separately (`builtin.local_costmap_rate_hz`, default `10`) so follower ticks stay cheap |
 | `localize_subprocess` | SLAM | Run `global_localize` / periodic relocalize scoring in a dedicated subprocess so the matcher never holds this process's GIL (default `true`). Falls back in-process on error; health in `status.localize_worker` |
 | `obstacles_only_rate_hz` | Nav | Background refresh rate for `obstacles_only` depth cams (default `5`). Control tick never awaits GetPointCloud; prefer POSIX `shm_name` for 10–20 Hz |
+| `avoid_obstacles_above_cart` | Nav | Remember depth returns after they leave the vertical view, and do not drive under them. Band is the camera's returns up to `z_max` (default `true`) |
+| `cart_height_m` | Nav | Optional. When set, only depth returns above this height (m, floor to the top of the cart) are remembered as overhead |
 | `periodic_relocalize_still_bad_score` | SLAM | While still, if tick match score ≤ this (default `0`), run full-map `global_localize` immediately instead of a local peek. |
 | `periodic_relocalize_bypass_startup_after_s` | SLAM | Cancel a stuck startup localize after this many seconds (default `90`) so the drift watchdog can recover. |
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |

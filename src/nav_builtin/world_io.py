@@ -62,6 +62,14 @@ class WorldIO(Protocol):
         """Optional SLAM local refine. Implementations may return None."""
         return None
 
+    def set_above_cart(self, enabled: bool, cart_height_m: Optional[float] = None) -> None:
+        """Remember depth returns that leave the vertical view. Default no-op."""
+        return None
+
+    def get_above_cart_frames(self) -> list:
+        """Overhead clouds ``(stamp, xyz_base, sensor, capture_pose)``."""
+        return []
+
     def refine_stuck_pose(self) -> Optional[dict]:
         """One small local scan match when planning cannot leave the current cell.
 

@@ -331,6 +331,7 @@ def test_apply_nav_fills_footprint_from_box():
     assert abs(cfg2.footprint_length_m - 0.72) < 1e-9
     assert abs(cfg2.footprint_width_m - 0.59) < 1e-9
     assert cfg2.robot_radius == pytest.approx(0.295)
+    assert cfg2.cart_height_m is None
 
 
 def test_apply_nav_keeps_explicit_footprint():

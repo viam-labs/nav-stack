@@ -44,6 +44,8 @@ def builtin_nav_runtime_kwargs(
         "timeout_s": bcfg.timeout_s,
         "poll_interval_s": cfg.control_period_s(),
         "avoid_obstacles": cfg.simple_avoid_obstacles,
+        "avoid_obstacles_above_cart": cfg.avoid_obstacles_above_cart,
+        "cart_height_m": cfg.cart_height_m,
         "stop_distance_m": cfg.simple_stop_distance,
         "slow_distance_m": cfg.simple_slow_distance,
         "scan_max_age_s": cfg.simple_scan_max_age,

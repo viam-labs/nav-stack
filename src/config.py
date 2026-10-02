@@ -240,6 +240,9 @@ class LidarConfig:
     # centred on its forward axis; RealSense D4xx depth is ~87). Obstacles it
     # saw are remembered once they leave this view until it looks again.
     fov_deg: float = 87.0
+    # Vertical field of view (degrees). Overhead returns leave this view as the
+    # cart approaches; RealSense D4xx depth is ~58.
+    vfov_deg: float = 58.0
     # Drop returns whose base_link XY is inside the robot body: the box when
     # known, else a ``robot_radius`` disc (0 = unknown, no crop). Stamped by
     # ``stamp_lidar_footprint`` from config and the base framesystem.
@@ -296,6 +299,7 @@ class LidarConfig:
             obstacles_only=bool(d.get("obstacles_only", False)),
             cloud_frame=cloud_frame,
             fov_deg=float(d.get("fov_deg", 87.0)),
+            vfov_deg=float(d.get("vfov_deg", 58.0)),
             crop_inside_footprint=bool(d.get("crop_inside_footprint", True)),
         )
 
@@ -1309,6 +1313,12 @@ class NavConfig:
     # fire-and-forget refresh. Default 5 Hz (~0.2 s) keeps ankle-height depth
     # obstacles fresher on the gRPC path; prefer POSIX shm for 10–20 Hz.
     obstacles_only_rate_hz: float = 5.0
+    # Remember depth returns and refuse to drive under them after they rise
+    # out of the camera's vertical view. On by default the band is whatever
+    # the depth camera already reports, up to its ``z_max``. Set
+    # ``cart_height_m`` to ignore returns at or below the top of the cart.
+    avoid_obstacles_above_cart: bool = True
+    cart_height_m: Optional[float] = None
     # Reactive obstacle avoidance for simple go_to_* motion.
     simple_avoid_obstacles: bool = True
     simple_stop_distance: float = 0.4  # meters: stop forward + turn away inside this
@@ -1376,6 +1386,17 @@ class NavConfig:
         if "obstacles_only_rate_hz" in d:
             overrides["obstacles_only_rate_hz"] = _positive_hz(
                 d["obstacles_only_rate_hz"], "obstacles_only_rate_hz"
+            )
+        if "cart_height_m" in d:
+            height = _optional_positive(d.get("cart_height_m"))
+            if d.get("cart_height_m") not in (None, 0, 0.0) and height is None:
+                raise ValueError(
+                    f"cart_height_m must be > 0, got {d.get('cart_height_m')!r}"
+                )
+            overrides["cart_height_m"] = height
+        if "avoid_obstacles_above_cart" in d:
+            overrides["avoid_obstacles_above_cart"] = bool(
+                d["avoid_obstacles_above_cart"]
             )
         if "clearance_m" in d:
             clearance = float(d["clearance_m"])

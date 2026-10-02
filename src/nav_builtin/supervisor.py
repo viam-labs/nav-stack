@@ -4,6 +4,8 @@ from __future__ import annotations
 import math
 import threading
 import time
+
+import numpy as np
 from collections import deque
 from typing import Any, Optional
 
@@ -24,6 +26,7 @@ from .controller import (
     limit_twist_rate,
     update_speed_estimate,
 )
+from .above_cart import AboveCartMemory, above_cart_frames
 from .depth_memory import DepthObstacleMemory, depth_frames
 from .footprint_guard import FootprintGuard, GuardConfig, obstacle_points
 from .local_costmap import (
@@ -219,6 +222,24 @@ class NavSupervisor:
         self._depth_memory = DepthObstacleMemory(
             length_m=2.0 * nose_offset, width_m=2.0 * float(self._body_radius)
         )
+        self._avoid_above = bool(kw.get("avoid_obstacles_above_cart", True))
+        raw_height = kw.get("cart_height_m")
+        try:
+            self._cart_height_m = float(raw_height) if raw_height else 0.0
+        except (TypeError, ValueError):
+            self._cart_height_m = 0.0
+        self._above_memory: Optional[AboveCartMemory] = None
+        if self._avoid_above:
+            # No cart height: the depth camera's own band, up to z_max.
+            self._above_memory = AboveCartMemory(
+                cart_height_m=self._cart_height_m if self._cart_height_m > 0.0 else None
+            )
+        setter = getattr(self._world, "set_above_cart", None)
+        if callable(setter):
+            setter(
+                self._above_memory is not None,
+                self._cart_height_m if self._cart_height_m > 0.0 else None,
+            )
         self._cost_scaling = cost_scaling_factor
         self._clearance_preference_m = max(0.0, float(clearance_preference_m))
         self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
@@ -1657,6 +1678,17 @@ class NavSupervisor:
                         depth_frames(self._world), pose, time.monotonic()
                     )
                     mem_pts = self._depth_memory.points()
+                if self._above_memory is not None:
+                    self._above_memory.update(
+                        above_cart_frames(self._world), pose, time.monotonic()
+                    )
+                    above_pts = self._above_memory.points()
+                    if above_pts.size:
+                        mem_pts = (
+                            above_pts
+                            if mem_pts is None or not np.size(mem_pts)
+                            else np.vstack([np.asarray(mem_pts), above_pts])
+                        )
 
                 local_view = self._local_view_cache
                 if refresh_local:
@@ -1991,6 +2023,11 @@ class NavSupervisor:
                         else {}
                     ),
                     "nose_clear": bool(nose_clear),
+                    "above_cart": (
+                        int(len(self._above_memory))
+                        if self._above_memory is not None
+                        else None
+                    ),
                     "local_replan_cooldown_s": round(
                         max(
                             0.0,

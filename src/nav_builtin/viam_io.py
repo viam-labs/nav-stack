@@ -132,6 +132,12 @@ class ViamWorldIO:
         # A fire-and-forget refresh fills this cache; the control loop only reads it
         # so RealSense PCD cannot starve SetVelocity on the shared module loop.
         self._per_lidar_scan: dict[str, tuple[conv.LaserScan2D, float]] = {}
+        # Base-frame XYZ of obstacles_only returns to remember after they leave
+        # the vertical view. ``cart_height_m`` 0 means the camera's own z band,
+        # up to ``z_max``.
+        self._above_cart_pts: dict[str, np.ndarray] = {}
+        self._above_cart_enabled = False
+        self._cart_height_m = 0.0
         # Depth is async + slow; keep it fresh enough that motion compensation works.
         # Configurable via NavConfig.obstacles_only_rate_hz (default 5 Hz).
         self._obstacles_only_period_s = max(0.0, float(obstacles_only_period_s))
@@ -516,6 +522,42 @@ class ViamWorldIO:
             self._scan_cache_pose = pose
         return merged
 
+    def set_above_cart(self, enabled: bool, cart_height_m: Optional[float] = None) -> None:
+        """Remember depth returns that leave the vertical view.
+
+        ``cart_height_m`` unset or <= 0 uses the camera's own band up to
+        ``z_max``. A positive height keeps only returns above the cart.
+        """
+        self._above_cart_enabled = bool(enabled)
+        try:
+            height = float(cart_height_m) if cart_height_m else 0.0
+        except (TypeError, ValueError):
+            height = 0.0
+        self._cart_height_m = height if self._above_cart_enabled and height > 0.0 else 0.0
+        if not self._above_cart_enabled:
+            self._above_cart_pts.clear()
+
+    def get_above_cart_frames(self) -> list:
+        """Latest overhead clouds as ``(stamp, xyz_base, lidar_cfg, capture_pose)``.
+
+        ``xyz_base`` is in the robot frame at ``capture_pose``. An empty cloud
+        is still returned so memory can drop a spot the camera can still see.
+        """
+        if not self._above_cart_enabled:
+            return []
+        out = []
+        for lidar in self._lidars:
+            if not lidar.obstacles_only:
+                continue
+            cached = self._per_lidar_scan.get(lidar.name)
+            if cached is None or cached[0].capture_pose is None:
+                continue
+            pts = self._above_cart_pts.get(lidar.name)
+            if pts is None:
+                pts = np.empty((0, 3))
+            out.append((cached[1], pts, lidar, cached[0].capture_pose))
+        return out
+
     def get_depth_frames(self) -> list:
         """Latest ``obstacles_only`` frames as ``(stamp, scan, lidar_cfg)``.
 
@@ -596,10 +638,40 @@ class ViamWorldIO:
         )
         return self._stamp_capture_pose(rebuilt, current)
 
+    def _remember_above_cart(self, raw_pts: np.ndarray, lidar: LidarConfig) -> None:
+        if not lidar.obstacles_only or not self._above_cart_enabled:
+            self._above_cart_pts.pop(lidar.name, None)
+            return
+        z_min = self._cart_height_m if self._cart_height_m > 0.0 else float(lidar.z_min)
+        if z_min >= float(lidar.z_max):
+            self._above_cart_pts[lidar.name] = np.empty((0, 3))
+            return
+        above = conv.prepare_lidar_point_cloud(
+            raw_pts,
+            cloud_frame=lidar.cloud_frame,
+            points_in_base_link=lidar.points_in_base_link,
+            x=lidar.x,
+            y=lidar.y,
+            z=lidar.z,
+            theta=lidar.theta,
+            pitch=lidar.pitch,
+            roll=lidar.roll,
+            z_min=z_min,
+            z_max=lidar.z_max,
+            max_points=2000,
+            range_min=float(lidar.min_range),
+            range_max=float(lidar.max_range),
+            footprint_length_m=lidar.footprint_length_m,
+            footprint_width_m=lidar.footprint_width_m,
+            footprint_radius_m=lidar.footprint_radius_m,
+        )
+        self._above_cart_pts[lidar.name] = above if above.size else np.empty((0, 3))
+
     def _pcd_to_scan(
         self, raw: bytes, lidar: LidarConfig
     ) -> conv.LaserScan2D:
         pts = conv.parse_pcd(raw)
+        self._remember_above_cart(pts, lidar)
         # Depth cams are dense; crop by range/height then downsample so the
         # gRPC path (no shm) still spends its point budget on near obstacles.
         max_pts = 8000 if lidar.obstacles_only else 0
