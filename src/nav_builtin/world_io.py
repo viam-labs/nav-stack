@@ -61,3 +61,11 @@ class WorldIO(Protocol):
     ) -> Optional[dict]:
         """Optional SLAM local refine. Implementations may return None."""
         return None
+
+    def refine_stuck_pose(self) -> Optional[dict]:
+        """One small local scan match when planning cannot leave the current cell.
+
+        Implementations return a dict with ``corrected`` when the pose moved.
+        Default is a no-op so a real obstacle still fails the goal.
+        """
+        return None

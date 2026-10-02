@@ -80,3 +80,68 @@ def test_force_bypasses_confirm():
     )
     assert decision.should_apply is True
     assert decision.status == "forced"
+
+
+def test_stuck_refine_applies_a_small_better_pose():
+    from src.nav.pose_jump_gate import stuck_refine_decision
+
+    assert (
+        stuck_refine_decision(
+            shift_m=0.15,
+            shift_deg=4.0,
+            score=0.55,
+            prior_score=0.20,
+            ambiguous=False,
+        )
+        == "apply"
+    )
+
+
+def test_stuck_refine_refuses_ambiguous_and_hallway_jumps():
+    from src.nav.pose_jump_gate import stuck_refine_decision
+
+    assert (
+        stuck_refine_decision(
+            shift_m=0.15,
+            shift_deg=4.0,
+            score=0.9,
+            prior_score=0.1,
+            ambiguous=True,
+        )
+        == "ambiguous"
+    )
+    assert (
+        stuck_refine_decision(
+            shift_m=18.3,
+            shift_deg=62.0,
+            score=0.65,
+            prior_score=0.2,
+            ambiguous=False,
+        )
+        == "shift_too_large"
+    )
+
+
+def test_stuck_refine_refuses_when_pose_already_fits_or_does_not_improve():
+    from src.nav.pose_jump_gate import stuck_refine_decision
+
+    assert (
+        stuck_refine_decision(
+            shift_m=0.02,
+            shift_deg=1.0,
+            score=0.8,
+            prior_score=0.4,
+            ambiguous=False,
+        )
+        == "pose_fits"
+    )
+    assert (
+        stuck_refine_decision(
+            shift_m=0.15,
+            shift_deg=2.0,
+            score=0.42,
+            prior_score=0.40,
+            ambiguous=False,
+        )
+        == "does_not_beat_prior"
+    )

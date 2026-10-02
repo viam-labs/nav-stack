@@ -971,6 +971,19 @@ class ViamWorldIO:
             cmd["apply"] = bool(apply)
         return self._run(slam.do_command(cmd), timeout=20.0)
 
+    def refine_stuck_pose(self) -> Optional[dict]:
+        """Local scan match (~1 m) while the base is stopped on an unreachable start.
+
+        Works in mapping and localizing. The match itself refuses a hallway jump.
+        """
+        slam = self._slam
+        if slam is None or not hasattr(slam, "do_command"):
+            return {"status": "unconfigured", "corrected": False}
+        return self._run(
+            slam.do_command({"command": "stuck_pose_refine"}),
+            timeout=20.0,
+        )
+
 
 def _sanitize_base_cmd(
     vx: float, vy: float, vtheta: float

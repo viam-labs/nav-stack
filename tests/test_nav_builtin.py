@@ -2492,3 +2492,136 @@ def test_nav_loc_refine_applies_small_improving_match():
     assert True in applies
     assert sup.status().state == "succeeded"
     assert sup.status().error_msg == ""
+
+
+def test_unreachable_start_refines_once_and_replans_same_corridor():
+    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav_builtin.types import Path2D
+
+    world = _FakeWorld(Pose2D(0.0, 0.0, 0.0), _empty_map())
+    sup = NavSupervisor(
+        world,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+    )
+    sup._last_replan_error = (
+        "scan+local: no feasible path; "
+        "blocked-corridor: cannot reach plan start from current pose"
+    )
+    refine_calls = {"n": 0}
+
+    def refine():
+        refine_calls["n"] += 1
+        world.pose = Pose2D(0.2, 0.0, 0.0)
+        return {
+            "status": "corrected",
+            "corrected": True,
+            "shift_m": 0.2,
+            "pose": {"x": 0.2, "y": 0.0, "theta": 0.0},
+        }
+
+    world.refine_stuck_pose = refine
+    good = Path2D(points=((0.2, 0.0), (2.0, 0.0)), goal_theta=0.0)
+    seen = {}
+
+    def fake_replan(goal, pose, path, scan, **kwargs):
+        del goal, path, scan
+        seen["pose"] = pose
+        seen["require_different"] = kwargs.get("require_different")
+        seen["failed_count"] = kwargs.get("failed_count")
+        return good
+
+    sup._try_replan = fake_replan
+    goal = Pose2D(3.0, 0.0, 0.0)
+    out = sup._recover_unreachable_start(
+        goal,
+        world.pose,
+        good,
+        None,
+        failed_count=3,
+        local_view=None,
+        trigger="local_blocked",
+    )
+    assert out is good
+    assert refine_calls["n"] == 1
+    assert seen["pose"].x == 0.2
+    assert seen["require_different"] is False
+    assert seen["failed_count"] == 0
+    assert sup._stuck_pose_refine_used is True
+
+    again = sup._recover_unreachable_start(
+        goal,
+        world.pose,
+        good,
+        None,
+        failed_count=4,
+        local_view=None,
+        trigger="local_blocked",
+    )
+    assert again is None
+    assert refine_calls["n"] == 1
+
+
+def test_unreachable_start_skips_refine_for_a_real_block():
+    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav_builtin.types import Path2D
+
+    world = _FakeWorld(Pose2D(0.0, 0.0, 0.0), _empty_map())
+    sup = NavSupervisor(
+        world,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+    )
+    sup._last_replan_error = "scan+local: no feasible path; forced-via: none feasible"
+    world.refine_stuck_pose = lambda: (_ for _ in ()).throw(AssertionError("refine"))
+    path = Path2D(points=((0.0, 0.0), (1.0, 0.0)), goal_theta=0.0)
+    assert (
+        sup._recover_unreachable_start(
+            Pose2D(2.0, 0.0, 0.0),
+            world.pose,
+            path,
+            None,
+            failed_count=1,
+            local_view=None,
+            trigger="local_blocked",
+        )
+        is None
+    )
+    assert sup._stuck_pose_refine_used is False
+
+
+def test_unreachable_start_keeps_pose_when_match_is_refused():
+    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav_builtin.types import Path2D
+
+    world = _FakeWorld(Pose2D(0.0, 0.0, 0.0), _empty_map())
+    sup = NavSupervisor(
+        world,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+    )
+    sup._last_replan_error = "start pose is in lethal / unknown space"
+    world.refine_stuck_pose = lambda: {
+        "status": "ambiguous",
+        "corrected": False,
+        "shift_m": 18.3,
+    }
+    sup._try_replan = lambda *a, **k: (_ for _ in ()).throw(AssertionError("replan"))
+    path = Path2D(points=((0.0, 0.0), (1.0, 0.0)), goal_theta=0.0)
+    assert (
+        sup._recover_unreachable_start(
+            Pose2D(2.0, 0.0, 0.0),
+            world.pose,
+            path,
+            None,
+            failed_count=1,
+            local_view=None,
+            trigger="local_blocked",
+        )
+        is None
+    )
+    assert sup._stuck_pose_refine["status"] == "ambiguous"
+    assert sup._stuck_pose_refine_used is True

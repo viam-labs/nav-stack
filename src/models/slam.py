@@ -46,6 +46,7 @@ from ..nav.pose_jump_gate import (
     JumpDecision,
     PoseJumpGate,
     candidate_beats_previous,
+    stuck_refine_decision,
 )
 from ..geom import conversions as conv
 from ..shm.lidar import ShmPointCloudClient
@@ -951,6 +952,149 @@ class SlamService(SLAM):
                 await asyncio.to_thread(library.record, band_points, record_pose)
                 out["slice_scans_recorded"] = library.scans_recorded
         return self._publish_revisit_check(out)
+
+    async def _stuck_pose_refine(self) -> Mapping[str, ValueTypes]:
+        """One local scan match around the current pose, for a stuck navigator.
+
+        Search stays inside about a meter and ±30° of heading. A better small
+        shift is applied in mapping and localizing. An ambiguous or hallway-scale
+        peak is reported and left alone. This does not run a full-map search.
+        """
+        cfg = self._cfg
+        mgr = self._manager
+        if cfg is None or mgr is None:
+            return {"status": "unconfigured", "corrected": False}
+        if cfg.mode not in (MODE_MAPPING, MODE_LOCALIZING):
+            return {
+                "status": "skipped",
+                "reason": "bad_mode",
+                "corrected": False,
+            }
+        current = mgr.get_pose_in_map()
+        if current is None:
+            return {
+                "status": "skipped",
+                "reason": "no_pose",
+                "corrected": False,
+            }
+        try:
+            occ_map, map_source = self._load_active_occupancy_map("live")
+        except Exception as exc:  # noqa: BLE001 - live map not ready
+            return {
+                "status": "skipped",
+                "reason": f"no_live_map: {exc}",
+                "corrected": False,
+            }
+        try:
+            scan = await self._read_merged_scan()
+            result = await self._localizer.run(
+                "global_localize_scan",
+                occ_map,
+                scan,
+                hint=current,
+                full_map=False,
+                search_radius_m=1.0,
+                local_yaw_window_deg=30.0,
+                coarse_position_step_m=0.2,
+                coarse_yaw_step_deg=10.0,
+                fine_position_step_m=0.05,
+                fine_yaw_step_deg=2.0,
+                fine_window_m=0.35,
+                fine_yaw_window_deg=12.0,
+                ray_refine_candidates=16,
+            )
+            prior_score, prior_ray_mae = await self._localizer.run(
+                "score_pose_with_rays",
+                occ_map,
+                scan,
+                current,
+            )
+        except Exception as exc:  # noqa: BLE001 - match must not kill navigation
+            LOGGER.warning("stuck pose refine failed: %s", exc)
+            return {
+                "status": "error",
+                "reason": str(exc).strip() or type(exc).__name__,
+                "corrected": False,
+            }
+
+        shift_m = math.hypot(result.pose.x - current.x, result.pose.y - current.y)
+        shift_deg = abs(
+            math.degrees(conv.normalize_angle(result.pose.theta - current.theta))
+        )
+        score = float(result.score)
+        ray_mae = float(result.ray_mae_m) if math.isfinite(result.ray_mae_m) else None
+        prior_f = float(prior_score) if prior_score is not None else None
+        prior_mae = (
+            float(prior_ray_mae)
+            if prior_ray_mae is not None and math.isfinite(float(prior_ray_mae))
+            else None
+        )
+        decision = stuck_refine_decision(
+            shift_m=shift_m,
+            shift_deg=shift_deg,
+            score=score,
+            prior_score=prior_f,
+            ambiguous=bool(getattr(result, "ambiguous", False)),
+            prior_ray_mae_m=prior_mae,
+            ray_mae_m=ray_mae,
+        )
+        out: dict = {
+            "status": decision,
+            "match_mode": "local",
+            "slam_mode": cfg.mode,
+            "map_source": map_source,
+            "score": round(score, 3) if math.isfinite(score) else None,
+            "prior_score": (
+                round(prior_f, 3) if prior_f is not None and math.isfinite(prior_f) else None
+            ),
+            "ray_mae_m": None if ray_mae is None else round(ray_mae, 3),
+            "shift_m": round(shift_m, 3),
+            "shift_deg": round(shift_deg, 2),
+            "ambiguous": bool(getattr(result, "ambiguous", False)),
+            "corrected": False,
+            "pose": {
+                "x": result.pose.x,
+                "y": result.pose.y,
+                "theta": result.pose.theta,
+            },
+        }
+        if decision != "apply":
+            LOGGER.info(
+                "stuck pose refine: not applying (%s) shift=%.2f m %.1f deg "
+                "score=%s prior=%s ambiguous=%s mode=%s",
+                decision,
+                shift_m,
+                shift_deg,
+                out["score"],
+                out["prior_score"],
+                out["ambiguous"],
+                cfg.mode,
+            )
+            return out
+
+        apply = getattr(mgr, "apply_map_pose_correction", None)
+        if not callable(apply):
+            out["status"] = "correction_failed"
+            out["reason"] = "no_apply"
+            return out
+        applied = await asyncio.to_thread(apply, result.pose)
+        self._pose_jump_gate.clear()
+        did = bool(isinstance(applied, Mapping) and applied.get("applied"))
+        out["corrected"] = did
+        out["status"] = "corrected" if did else "correction_failed"
+        if isinstance(applied, Mapping):
+            out["correction"] = dict(applied)
+        if did:
+            LOGGER.info(
+                "stuck pose refine: applied shift=%.2f m %.1f deg score=%s "
+                "prior=%s mode=%s",
+                shift_m,
+                shift_deg,
+                out["score"],
+                out["prior_score"],
+                cfg.mode,
+            )
+        return out
 
     def _schedule_periodic_relocalize(self, loop: asyncio.AbstractEventLoop) -> None:
         cfg = self._cfg
@@ -2669,6 +2813,11 @@ class SlamService(SLAM):
 
         if cmd == "get_localization_check":
             return dict(self._last_relocalize_check)
+
+        if cmd == "stuck_pose_refine":
+            # One ~1 m local match while navigation cannot leave its cell.
+            # Mapping and localizing both apply a small better pose. No full-map search.
+            return await self._stuck_pose_refine()
 
         if cmd == "revisit_check":
             # Mapping-mode revisit check on demand. ``apply`` forces the odom

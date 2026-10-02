@@ -295,6 +295,10 @@ class NavSupervisor:
         # Last replan diagnostics for get_status (trigger + attempt outcomes).
         self._last_replan_trigger = ""
         self._last_replan_info: dict = {}
+        # One local pose match per blocked episode when the planner cannot
+        # leave the current cell. Cleared once the nose is free again.
+        self._stuck_pose_refine_used = False
+        self._stuck_pose_refine: dict = {}
         # After accepting a longer detour, ban the abandoned short corridor for
         # the rest of this goal (not a wall-clock timer — that just delayed the
         # short↔long flip). Lifted only if the detour itself dies and no other
@@ -1327,12 +1331,88 @@ class NavSupervisor:
         preview = self._publish_plan_viz(result, goal, start=pose)
         self._set_status(path=preview["path"], length_m=preview["length_m"])
 
+    def _replan_blocked_at_start(self) -> bool:
+        err = self._last_replan_error or ""
+        return (
+            "cannot reach plan start" in err
+            or "start pose is in lethal" in err
+        )
+
+    def _refine_stuck_pose(self) -> Optional[Pose2D]:
+        """Ask SLAM for one small local match. Returns the pose when it moved."""
+        fn = getattr(self._world, "refine_stuck_pose", None)
+        if not callable(fn):
+            return None
+        try:
+            result = fn()
+        except Exception as exc:  # noqa: BLE001 - a match timeout must not kill the loop
+            self._stuck_pose_refine = {
+                "status": "error",
+                "reason": str(exc).strip() or type(exc).__name__,
+                "corrected": False,
+            }
+            return None
+        if not isinstance(result, dict):
+            self._stuck_pose_refine = {"status": "error", "corrected": False}
+            return None
+        self._stuck_pose_refine = dict(result)
+        if not result.get("corrected"):
+            return None
+        matched = result.get("pose")
+        if isinstance(matched, dict) and "x" in matched and "y" in matched:
+            try:
+                return Pose2D(
+                    float(matched["x"]),
+                    float(matched["y"]),
+                    float(matched.get("theta") or 0.0),
+                )
+            except (TypeError, ValueError):
+                pass
+        return self._world.get_pose()
+
+    def _recover_unreachable_start(
+        self,
+        goal: Pose2D,
+        pose: Pose2D,
+        path: Path2D,
+        scan: Optional[conv.LaserScan2D],
+        *,
+        failed_count: int,
+        local_view,
+        trigger: str,
+    ) -> Optional[Path2D]:
+        """Replan once from a corrected pose when the start cell is unreachable.
+
+        Only when the last replan died because the planner could not leave the
+        current cell. One attempt per blocked episode. The retry accepts the
+        same corridor: painting it blocked is what sealed the hallway.
+        """
+        del pose, failed_count
+        if self._stuck_pose_refine_used or not self._replan_blocked_at_start():
+            return None
+        self._stuck_pose_refine_used = True
+        corrected = self._refine_stuck_pose()
+        if corrected is None:
+            return None
+        return self._try_replan(
+            goal,
+            corrected,
+            path,
+            scan,
+            require_different=False,
+            failed_count=0,
+            local_view=local_view,
+            trigger=f"{trigger} after stuck_pose_refine",
+        )
+
     def run_goal(self, goal: Pose2D) -> None:
         """Plan and follow until success, failure, or cancel. Blocking."""
         self._cancel.clear()
         self._last_replan_error = ""
         self._last_replan_trigger = ""
         self._last_replan_info = {}
+        self._stuck_pose_refine_used = False
+        self._stuck_pose_refine = {}
         self._detour_ban_path = None
         self._detour_min_length_m = 0.0
         self._loc_refine_tries = 0
@@ -1783,6 +1863,21 @@ class NavSupervisor:
                         replan_finished = time.monotonic()
                         last_local_replan_at = replan_finished
                         last_replan = replan_finished
+                        if new_path is None:
+                            recovered = self._recover_unreachable_start(
+                                goal,
+                                pose,
+                                path,
+                                scan,
+                                failed_count=max(1, failed_replan_while_blocked),
+                                local_view=local_view,
+                                trigger=_trig,
+                            )
+                            if recovered is not None:
+                                new_path = recovered
+                                fresh = self._world.get_pose()
+                                if fresh is not None:
+                                    pose = fresh
                         if new_path is not None:
                             path = new_path
                             local_blocked_since = None
@@ -1810,6 +1905,12 @@ class NavSupervisor:
                                 and not nose_clear
                             ):
                                 self._world.stop()
+                                with self._status_lock:
+                                    prev_progress = dict(self._status.progress or {})
+                                if self._stuck_pose_refine:
+                                    prev_progress["stuck_pose_refine"] = dict(
+                                        self._stuck_pose_refine
+                                    )
                                 self._set_status(
                                     state="failed",
                                     active=False,
@@ -1817,11 +1918,13 @@ class NavSupervisor:
                                         "path blocked: no route around obstacle "
                                         f"({blocked_fail_count} replans failed)"
                                     ),
+                                    progress=prev_progress or None,
                                 )
                                 return
                 else:
                     local_blocked_since = None
                     failed_replan_while_blocked = 0
+                    self._stuck_pose_refine_used = False
 
                 # DWA only when the route is actually blocked (or after a failed
                 # detour). Clear-nose C-space pinch: pursuit + reactive slow —
@@ -1882,6 +1985,11 @@ class NavSupervisor:
                     "last_replan_error": self._last_replan_error,
                     "last_replan_trigger": self._last_replan_trigger,
                     "last_replan_info": dict(self._last_replan_info),
+                    **(
+                        {"stuck_pose_refine": dict(self._stuck_pose_refine)}
+                        if self._stuck_pose_refine
+                        else {}
+                    ),
                     "nose_clear": bool(nose_clear),
                     "local_replan_cooldown_s": round(
                         max(

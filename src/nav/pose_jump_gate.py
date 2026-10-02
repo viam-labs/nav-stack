@@ -166,6 +166,55 @@ def should_hold_drive_for_pose_jump(check: Optional[object]) -> bool:
     return str(check.get("status") or "") in ("awaiting_confirm", "nav_hold")
 
 
+def stuck_refine_decision(
+    *,
+    shift_m: float,
+    shift_deg: float,
+    score: float,
+    prior_score: Optional[float],
+    ambiguous: bool,
+    prior_ray_mae_m: Optional[float] = None,
+    ray_mae_m: Optional[float] = None,
+    max_shift_m: float = 1.0,
+    max_shift_deg: float = 30.0,
+) -> str:
+    """Whether a stuck-nav local match may move the published pose.
+
+    Returns ``apply`` or a refusal reason. A hallway-scale or ambiguous peak
+    stays put. A match that barely moves, or does not explain the scan better
+    than the published pose, stays put too.
+    """
+    if ambiguous:
+        return "ambiguous"
+    if (
+        not math.isfinite(shift_m)
+        or not math.isfinite(shift_deg)
+        or not math.isfinite(score)
+    ):
+        return "bad_match"
+    if shift_m > float(max_shift_m) or shift_deg > float(max_shift_deg):
+        return "shift_too_large"
+    if shift_m < 0.08 and shift_deg < 6.0:
+        return "pose_fits"
+    if score < 0.22:
+        return "low_score"
+    prior_ok = prior_score is not None and math.isfinite(float(prior_score))
+    if prior_ok:
+        if not candidate_beats_previous(
+            previous_score=float(prior_score),
+            candidate_score=score,
+            shift_m=shift_m,
+            shift_deg=shift_deg,
+            previous_ray_mae_m=prior_ray_mae_m,
+            candidate_ray_mae_m=ray_mae_m,
+        ):
+            return "does_not_beat_prior"
+        return "apply"
+    if score < 0.35:
+        return "low_score"
+    return "apply"
+
+
 def candidate_beats_previous(
     *,
     previous_score: float,
