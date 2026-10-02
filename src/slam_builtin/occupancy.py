@@ -164,6 +164,50 @@ def clear_disk(
     return cleared
 
 
+def mark_disk(
+    grid: LogOddsGrid,
+    x_m: float,
+    y_m: float,
+    radius_m: float,
+    *,
+    occupied_log_odds: Optional[float] = None,
+) -> int:
+    """Paint a disk of occupied space into the log-odds grid (mutates in place).
+
+    Returns the number of cells written. Cells outside the current grid are
+    ignored (the grid is not expanded).
+    """
+    if radius_m <= 0:
+        raise ValueError("radius_m must be > 0")
+    res = float(grid.resolution)
+    if res <= 0:
+        raise ValueError("grid resolution must be > 0")
+
+    target = float(L_MAX) if occupied_log_odds is None else float(occupied_log_odds)
+    target = float(np.clip(target, L_MIN, L_MAX))
+
+    r_cells = max(1, int(math.ceil(radius_m / res)))
+    cr, cc = grid.world_to_cell(x_m, y_m)
+    lo = grid.log_odds
+    h, w = lo.shape
+    r0 = max(0, cr - r_cells)
+    r1 = min(h - 1, cr + r_cells)
+    c0 = max(0, cc - r_cells)
+    c1 = min(w - 1, cc + r_cells)
+    if r1 < r0 or c1 < c0:
+        return 0
+
+    rows = np.arange(r0, r1 + 1, dtype=np.int32)[:, None]
+    cols = np.arange(c0, c1 + 1, dtype=np.int32)[None, :]
+    cx = grid.origin_x + (cols + 0.5) * res
+    cy = grid.origin_y + (rows + 0.5) * res
+    mask = (cx - x_m) ** 2 + (cy - y_m) ** 2 <= float(radius_m) ** 2
+    marked = int(np.count_nonzero(mask))
+    if marked:
+        lo[r0 : r1 + 1, c0 : c1 + 1][mask] = target
+    return marked
+
+
 def insert_scan(
     grid: LogOddsGrid,
     pose_x: float,

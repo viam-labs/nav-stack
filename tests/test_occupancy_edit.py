@@ -25,6 +25,16 @@ def test_clear_disk_frees_occupied_cells():
     assert not np.any(after[r - 2 : r + 3, c - 2 : c + 3] == 100)
 
 
+def test_mark_disk_occupies_free_cells():
+    grid = occ.empty_grid(resolution=0.05, size_m=4.0, origin_x=-2.0, origin_y=-2.0)
+    marked = occ.mark_disk(grid, 0.0, 0.0, 0.25)
+    assert marked > 0
+    after = occ.to_occupancy_int16(grid)
+    r, c = grid.world_to_cell(0.0, 0.0)
+    assert after[r, c] == 100
+    assert np.all(after[r - 2 : r + 3, c - 2 : c + 3] == 100)
+
+
 def test_clear_disk_rejects_non_positive_radius():
     grid = occ.empty_grid(resolution=0.05, size_m=2.0)
     try:

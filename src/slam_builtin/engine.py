@@ -319,6 +319,26 @@ class BuiltinSlamEngine:
                 "resolution": float(self._grid.resolution),
             }
 
+    def add_obstacles(
+        self, x_m: float, y_m: float, radius_m: float
+    ) -> dict:
+        """Paint occupied cells in a disk (map frame meters). Builtin only."""
+        with self._lock:
+            updated = occ.copy_grid(self._grid)
+            marked = occ.mark_disk(updated, x_m, y_m, radius_m)
+            if marked:
+                self._grid = updated
+                self._invalidate_occ_cache()
+                self._generation += 1
+            return {
+                "marked_cells": int(marked),
+                "x": float(x_m),
+                "y": float(y_m),
+                "radius_m": float(radius_m),
+                "generation": int(self._generation),
+                "resolution": float(self._grid.resolution),
+            }
+
     def set_keyframe_hook(self, hook) -> None:
         self._keyframe_hook = hook
 
