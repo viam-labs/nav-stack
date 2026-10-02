@@ -73,6 +73,17 @@ _TERMINAL_PLAN_STATES = frozenset(
 )
 
 
+def _world_is_mapping(world) -> bool:
+    """True only while the in-process SLAM service is building the map."""
+    fn = getattr(world, "slam_mode", None)
+    if not callable(fn):
+        return False
+    try:
+        return str(fn() or "") == "mapping"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _nav_status_to_plan_state(status: Mapping) -> PlanState:
     """Map bridge ``nav_status()`` into a Motion ``PlanState``."""
     if status.get("active"):
@@ -994,6 +1005,7 @@ class NavServiceBase(Motion):
                             cost_scaling_factor=float(
                                 cfg.builtin.cost_scaling_factor
                             ),
+                            mapping=_world_is_mapping(world),
                         )
                         cm = costmap_viz_dict(occ, costs)
                         self._builtin_costmap_cache = cm
@@ -1147,6 +1159,7 @@ class NavServiceBase(Motion):
                         robot_radius_m=cfg.hard_clearance_radius_m(),
                         body_radius_m=cfg.inscribed_radius_m(),
                         cost_scaling_factor=float(bcfg.cost_scaling_factor),
+                        mapping=_world_is_mapping(world),
                     )
                     self._idle_global_occ = global_occ
                     self._idle_global_costs = global_costs
@@ -1161,6 +1174,7 @@ class NavServiceBase(Motion):
                 scan,
                 global_occ=global_occ,
                 global_costs=global_costs,
+                mapping=_world_is_mapping(world),
             )
             cm = local_view_viz_dict(local_view)
         except Exception:  # noqa: BLE001

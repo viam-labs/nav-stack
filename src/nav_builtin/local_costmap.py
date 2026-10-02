@@ -186,6 +186,7 @@ class LocalCostmap:
         global_occ: Optional[OccupancyGrid] = None,
         global_costs: Optional[np.ndarray] = None,
         extra_points: Optional[np.ndarray] = None,
+        mapping: bool = False,
     ) -> LocalCostmapView:
         old_raw = self._raw
         old_ox, old_oy = self._origin_x, self._origin_y
@@ -228,6 +229,7 @@ class LocalCostmap:
             # The clearance-preference band is a planner-only routing bias; it
             # has no business in the layer used for collision / DWA thresholds.
             clearance_preference_m=0.0,
+            mapping=mapping,
         )
         costs = np.maximum(costs, scan_costs)
         occ = OccupancyGrid(

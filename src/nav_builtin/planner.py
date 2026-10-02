@@ -596,6 +596,7 @@ def connect_plan_start(
     xy_tolerance_m: float = 0.15,
     scan: Optional[conv.LaserScan2D] = None,
     local_view: Optional[LocalCostmapView] = None,
+    mapping: bool = False,
 ) -> PlanResult:
     """Prepend a feasible segment when the robot cannot reach ``path[0]`` safely.
 
@@ -619,6 +620,7 @@ def connect_plan_start(
             body_radius_m=body_radius_m,
             cost_scaling_factor=cost_scaling_factor,
             clearance_preference_m=clearance_preference_m,
+            mapping=mapping,
         )
     sx, sy = result.path.points[0]
     at_start = math.hypot(pose.x - sx, pose.y - sy) <= xy_tolerance_m
@@ -642,6 +644,7 @@ def connect_plan_start(
         scan=scan,
         scan_pose=pose if scan is not None else None,
         local_view=local_view,
+        mapping=mapping,
     )
     if not bridge.feasible:
         return PlanResult(
@@ -837,6 +840,7 @@ def plan_path(
     paint_corridor: bool = True,
     dynamic_obstacle_radius_m: float = 0.35,
     max_goal_snap_m: float = 0.5,
+    mapping: bool = False,
 ) -> PlanResult:
     """Plan from a bridge-style map dict.
 
@@ -929,6 +933,7 @@ def plan_path(
         body_radius_m=body_radius_m,
         cost_scaling_factor=cost_scaling_factor,
         clearance_preference_m=clearance_preference_m,
+        mapping=mapping,
     )
     if local_view is not None:
         costs = overlay_local_costs_on_costmap(costs, occ, local_view, min_cost=200)
@@ -956,6 +961,7 @@ def path_blocked(
     sample_step_m: float = 0.15,
     from_pose: Optional[Pose2D] = None,
     ahead_m: Optional[float] = None,
+    mapping: bool = False,
 ) -> bool:
     """True if any sample along ``path`` is non-traversable on a fresh costmap.
 
@@ -971,6 +977,7 @@ def path_blocked(
         occ,
         inflation_radius_m=inflation_radius_m,
         robot_radius_m=robot_radius_m,
+        mapping=mapping,
     )
     return path_blocked_on_costmap(
         occ,

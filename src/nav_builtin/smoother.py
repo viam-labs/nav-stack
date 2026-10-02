@@ -114,6 +114,7 @@ def smooth_plan_path(
     clearance_preference_m: float = 0.35,
     enabled: bool = True,
     sample_spacing_m: float = 0.10,
+    mapping: bool = False,
 ) -> Path2D:
     """Convenience wrapper: build costmap from map dict then smooth."""
     if not enabled:
@@ -127,6 +128,7 @@ def smooth_plan_path(
         robot_radius_m=robot_radius_m,
         cost_scaling_factor=cost_scaling_factor,
         clearance_preference_m=clearance_preference_m,
+        mapping=mapping,
     )
     return smooth_path(
         path,

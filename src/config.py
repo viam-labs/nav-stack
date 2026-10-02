@@ -630,6 +630,10 @@ class BuiltinNavConfig:
     nav_loc_refine_period_s: float = 0.75
     # Also check after this much travel even if the period has not elapsed.
     nav_loc_refine_check_every_m: float = 2.0
+    # After a check that leaves the scan disagreeing (hallway / moved
+    # furniture, not drift), wait this far before stopping again. 2 m at
+    # cruise speed was a full stop every 4–5 s.
+    nav_loc_refine_retry_travel_m: float = 8.0
     # Force-apply a local rematch up to this size when it beats the prior and
     # clears ``apply_min_score``. 2 m / 0.17 twins stay refused.
     nav_loc_refine_apply_max_m: float = 1.0

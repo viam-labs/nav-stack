@@ -154,6 +154,10 @@ class NavSupervisor:
         self._nav_loc_refine_check_every_m = max(
             0.0, float(kw.get("nav_loc_refine_check_every_m", 2.0))
         )
+        self._nav_loc_refine_retry_travel_m = max(
+            self._nav_loc_refine_check_every_m,
+            float(kw.get("nav_loc_refine_retry_travel_m", 8.0)),
+        )
         self._nav_loc_refine_apply_max_m = max(
             0.2, float(kw.get("nav_loc_refine_apply_max_m", 1.0))
         )
@@ -172,6 +176,7 @@ class NavSupervisor:
         self._loc_refine_last_pose: Optional[Pose2D] = None
         self._loc_refine_start_pose: Optional[Pose2D] = None
         self._loc_refine_need_travel = False
+        self._loc_refine_travel_need_m = 0.0
         self._world = world
         self._inflation = inflation_radius_m
         # Driving clearance (half-width when a footprint is configured). Every
@@ -455,6 +460,7 @@ class NavSupervisor:
                     body_radius_m=self._body_radius,
                     cost_scaling_factor=self._cost_scaling,
                     clearance_preference_m=self._clearance_preference_m,
+                    mapping=self._slam_is_mapping(),
                 )
                 with self._global_cache_lock:
                     self._global_occ_cache = occ
@@ -516,6 +522,7 @@ class NavSupervisor:
             return PlanResult(
                 feasible=False, error_code=6, error_msg="occupancy map unavailable"
             )
+        mapping = self._slam_is_mapping()
         result = plan_path(
             map_data,
             pose,
@@ -534,6 +541,7 @@ class NavSupervisor:
             paint_corridor=paint_corridor,
             dynamic_obstacle_radius_m=max(0.05, min(self._robot_radius, 0.12)),
             max_goal_snap_m=self._max_goal_snap_m,
+            mapping=mapping,
         )
         if result.feasible:
             result = connect_plan_start(
@@ -549,6 +557,7 @@ class NavSupervisor:
                 xy_tolerance_m=self._follower.motion.xy_tolerance_m,
                 scan=scan,
                 local_view=local_view,
+                mapping=mapping,
             )
         if result.feasible and self._smooth_path:
             if result.planning_costs is not None and result.planning_occ is not None:
@@ -573,6 +582,7 @@ class NavSupervisor:
                     clearance_preference_m=self._clearance_preference_m,
                     enabled=True,
                     sample_spacing_m=self._smooth_spacing,
+                    mapping=mapping,
                 )
             result.path = smoothed
         return result
@@ -736,12 +746,17 @@ class NavSupervisor:
     def _maybe_pause_and_refine_localization(
         self, pose: Pose2D, now: float, dist_goal: float
     ) -> Optional[str]:
-        """Stop + local refine when the scan is a poor fit for the published pose.
+        """Local refine when the scan is a poor fit for the published pose.
 
         Returns ``None`` (keep following), ``hold`` (stay stopped),
         ``resume`` (pose moved: replan), or ``continue`` (pose unchanged:
         keep the current path). Does not fail the goal — a leftover residual
         or refused yank is common in hallways.
+
+        A straight, already-moving base runs the check without stopping.
+        Stopping is for a hard turn (the scan would be rejected as spinning)
+        and for applying a pose correction. An unfixed residual waits
+        ``retry_travel_m`` before the next check.
         """
         if not self._nav_loc_refine:
             return None
@@ -757,7 +772,9 @@ class NavSupervisor:
         if self._loc_refine_last_pose is not None:
             traveled = distance_m(pose, self._loc_refine_last_pose)
         if self._loc_refine_need_travel:
-            need_m = max(0.5, float(self._nav_loc_refine_check_every_m) or 2.0)
+            need_m = self._loc_refine_travel_need_m
+            if need_m <= 0.0:
+                need_m = max(0.5, float(self._nav_loc_refine_check_every_m) or 2.0)
             if traveled < need_m:
                 return None
             self._loc_refine_need_travel = False
@@ -781,19 +798,20 @@ class NavSupervisor:
         if not holding:
             self._loc_refine_start_pose = pose
 
-        self._world.stop()
-        self._note_base_stopped()
-        self._publish_loc_refine_progress(
-            pose, dist_goal, verdict=verdict, status="pausing"
-        )
-        if self._nav_loc_refine_settle_s > 0.0:
-            time.sleep(self._nav_loc_refine_settle_s)
+        # SLAM skips the match above ~0.35 rad/s of yaw. Under that, a cruise
+        # command is a valid scan — don't halt just to ask. Stop when the
+        # base is turning hard so the settle can bring yaw down first.
+        calm = self._loc_refine_yaw_calm()
+        if not calm:
+            self._pause_for_loc_refine(pose, dist_goal, verdict, settle=True)
 
         result = self._call_check_localization()
         if result is None:
             return "hold" if holding else None
         status = str(result.get("status") or "")
         if status == "awaiting_confirm":
+            if calm:
+                self._pause_for_loc_refine(pose, dist_goal, verdict, settle=False)
             self._publish_loc_refine_progress(
                 pose, dist_goal, verdict=verdict, status="awaiting_confirm"
             )
@@ -811,6 +829,8 @@ class NavSupervisor:
             max_shift_deg=self._nav_loc_refine_apply_max_deg,
             min_score=self._nav_loc_refine_apply_min_score,
         ):
+            if calm:
+                self._pause_for_loc_refine(pose, dist_goal, verdict, settle=False)
             self._publish_loc_refine_progress(
                 pose, dist_goal, verdict=verdict, status="applying"
             )
@@ -821,6 +841,9 @@ class NavSupervisor:
         if status in ("skipped", "unconfigured"):
             reason = str(result.get("reason") or "")
             if reason in ("spinning", "stale_scan"):
+                if calm:
+                    self._world.stop()
+                    self._note_base_stopped()
                 return "hold"
             return "hold" if holding else None
 
@@ -848,6 +871,7 @@ class NavSupervisor:
             # refused large jumps are not ``localization_lost``.
             self._loc_refine_tries = 0
             self._loc_refine_need_travel = True
+            self._loc_refine_travel_need_m = self._nav_loc_refine_retry_travel_m
             self._publish_loc_refine_progress(
                 pose_after, dist_goal, verdict=after, status="continue"
             )
@@ -862,6 +886,25 @@ class NavSupervisor:
             pose_after, dist_goal, verdict=after, status="resumed"
         )
         return self._loc_refine_resume_kind(start, pose_after)
+
+    # Under SLAM's spinning skip (~0.35 rad/s). A cruise yaw is a usable scan.
+    _LOC_REFINE_CALM_YAW_RAD_S = 0.25
+
+    def _loc_refine_yaw_calm(self) -> bool:
+        """True when the last command is not a hard turn."""
+        cmd = self._last_sent_cmd
+        if cmd is None:
+            return False
+        return abs(float(cmd.vtheta)) < self._LOC_REFINE_CALM_YAW_RAD_S
+
+    def _pause_for_loc_refine(self, pose, dist_goal, verdict, *, settle: bool) -> None:
+        self._world.stop()
+        self._note_base_stopped()
+        self._publish_loc_refine_progress(
+            pose, dist_goal, verdict=verdict, status="pausing"
+        )
+        if settle and self._nav_loc_refine_settle_s > 0.0:
+            time.sleep(self._nav_loc_refine_settle_s)
 
     def _goal_timeout_s(self, length_m: float) -> float:
         """``timeout_s``, or 3x the full-speed drive time for long routes."""
@@ -1564,6 +1607,7 @@ class NavSupervisor:
                             global_occ=global_occ,
                             global_costs=global_costs,
                             extra_points=mem_pts,
+                            mapping=self._slam_is_mapping(),
                         )
                         self._local_view_cache = local_view
                         self._local_view_at = now
@@ -2144,6 +2188,7 @@ class NavSupervisor:
                             robot_radius_m=self._robot_radius,
                             from_pose=pose,
                             ahead_m=path_block_horizon_m,
+                            mapping=self._slam_is_mapping(),
                         )
                     # Large localization corrections used to force a replan even
                     # when the polyline was still free — that stop+replan looped

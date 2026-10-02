@@ -223,6 +223,28 @@ def test_mark_path_ahead_keeps_robot_footprint_free():
     assert paths_meaningfully_differ(baseline.path, replanned.path)
 
 
+def test_mapping_costmap_matches_localizing_rings():
+    """Fast mapping inflation must not change the costs localization uses."""
+    occ = OccupancyGrid(
+        grid=np.zeros((41, 41), dtype=np.int16),
+        resolution=0.05,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    occ.grid[20, 20] = 100
+    occ.grid[8, 30] = 100
+    kwargs = dict(
+        inflation_radius_m=0.40,
+        robot_radius_m=0.22,
+        body_radius_m=0.18,
+        cost_scaling_factor=4.0,
+        clearance_preference_m=0.35,
+    )
+    slow = build_costmap(occ, **kwargs, mapping=False)
+    fast = build_costmap(occ, **kwargs, mapping=True)
+    assert np.array_equal(slow, fast)
+
+
 def test_build_costmap_inflates_obstacles():
     occ = OccupancyGrid(
         grid=np.array(
@@ -2368,6 +2390,77 @@ def test_loc_refine_replans_only_when_pose_moved():
     assert kind(start, Pose2D(1.4, 1.0, 0.0)) == "resume"
     assert kind(start, Pose2D(1.0, 1.0, math.radians(8.0))) == "resume"
     assert kind(None, start) == "resume"
+
+
+def test_nav_loc_refine_does_not_stop_while_driving_straight():
+    """A cruise command can be checked without a full stop."""
+    from src.nav_builtin.controller import DriveCommand
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
+    world.scan = _open_scan()
+    sup = _loc_refine_supervisor(world)
+    sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.05, False)  # noqa: SLF001
+    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
+    )
+    assert world.loc_checks == 1
+    assert world.stop_calls == 0
+    assert out == "hold"
+
+
+def test_nav_loc_refine_stops_when_turning_hard():
+    from src.nav_builtin.controller import DriveCommand
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
+    world.scan = _open_scan()
+    sup = _loc_refine_supervisor(world)
+    sup._last_sent_cmd = DriveCommand(0.0, 0.0, 0.6, False)  # noqa: SLF001
+    sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
+    )
+    assert world.loc_checks == 1
+    assert world.stop_calls >= 1
+
+
+def test_nav_loc_refine_backs_off_after_unfixed_residual():
+    """A leftover mismatch waits several metres, not another stop at 2 m."""
+    import time
+
+    from src.nav_builtin.controller import DriveCommand
+    from src.nav_builtin.loc_consistency import LocDisagreement
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    mild = LocDisagreement(
+        disagree=True,
+        reason="scan_map",
+        compared_beams=12,
+        disagree_beams=4,
+        disagree_frac=0.333,
+    )
+    sup = _loc_refine_supervisor(world)
+    sup._measure_loc_disagreement = lambda _pose: mild  # noqa: SLF001
+    sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
+    start = Pose2D(1.0, 1.0, 0.0)
+    now = time.monotonic()
+    out = sup._maybe_pause_and_refine_localization(start, now, 10.0)  # noqa: SLF001
+    assert out == "continue"
+    assert world.loc_checks == 1
+    assert world.stop_calls == 0
+    # 2 m later is still inside the backoff.
+    again = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(3.0, 1.0, 0.0), now + 1.0, 8.0
+    )
+    assert again is None
+    assert world.loc_checks == 1
+    # Past retry_travel_m (8 m) the check runs again, still without stopping.
+    later = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(9.1, 1.0, 0.0), now + 2.0, 4.0
+    )
+    # Pose moved since the first look, so the follower replans instead of
+    # keeping the old polyline. The point is the check ran and did not stop.
+    assert later == "resume"
+    assert world.loc_checks == 2
+    assert world.stop_calls == 0
 
 
 def test_nav_loc_refine_applies_small_improving_match():
