@@ -1817,6 +1817,7 @@ class NavSupervisor:
                 # nose must not force DWA (hunt-and-peck in doorways).
                 nose_clear = True
                 forward_clearance_m: Optional[float] = None
+                guard_pts = None
                 obs_cfg = self._follower.obstacle
                 if self._guard is not None:
                     # Nose = can the rectangle move forward at all (straight
@@ -2105,11 +2106,12 @@ class NavSupervisor:
                 # Bumper against an obstacle, path itself still free: the
                 # footprint guard will not reverse, and the blocked-nose wait
                 # never starts because path cost is low. Spin is blocked, so
-                # back up while the rear is open and then turn onto the path.
+                # back up when the rectangle itself can move backward. The
+                # rear lidar cone and the inflated costmap both treat the
+                # blob an inch ahead as occupying the reverse, which left
+                # this case at cmd 0 with obstacle "avoid".
                 if (
-                    scan is not None
-                    and local_view is not None
-                    and now >= narrow_rev_cooldown_until
+                    now >= narrow_rev_cooldown_until
                     and self._bumper_spin_reverse(
                         nose_clear=nose_clear,
                         spin_blocked=bool(progress.get("spin_blocked")),
@@ -2118,17 +2120,38 @@ class NavSupervisor:
                         rear_open=True,
                     )
                 ):
-                    from .controller import _try_narrow_reverse
+                    from .controller import _narrow_reverse_command, _try_narrow_reverse
 
-                    rev = _try_narrow_reverse(
-                        self._follower,
-                        scan,
-                        self._robot_radius,
-                        local_view=local_view,
-                        current=pose,
+                    back_free = 0.0
+                    if self._guard is not None and guard_pts is not None:
+                        back_free = self._guard.free_distance(
+                            pose,
+                            -0.15,
+                            0.0,
+                            guard_pts,
+                            max(0.35, float(self._backup_dist_m)),
+                        )
+                    rectangle_clear = (
+                        not math.isfinite(back_free) or back_free >= 0.12
                     )
-                    if rev is not None:
-                        cmd = rev
+                    cone_clear = False
+                    if (
+                        not rectangle_clear
+                        and scan is not None
+                        and local_view is not None
+                    ):
+                        cone_clear = (
+                            _try_narrow_reverse(
+                                self._follower,
+                                scan,
+                                self._robot_radius,
+                                local_view=local_view,
+                                current=pose,
+                            )
+                            is not None
+                        )
+                    if rectangle_clear or cone_clear:
+                        cmd = _narrow_reverse_command(self._follower)
                         progress = {
                             **progress,
                             "obstacle": "narrow_reverse",
@@ -2166,6 +2189,21 @@ class NavSupervisor:
                             robot_radius_m=self._robot_radius,
                             distance_m=remain,
                             ignore_ahead=True,
+                        )
+                    # Inflation of the blob on the nose reaches backward
+                    # through the body and fails the costmap check while the
+                    # rectangle still has room to back away from it.
+                    if (
+                        not rear_cost_ok
+                        and self._guard is not None
+                        and guard_pts is not None
+                    ):
+                        back_free = self._guard.free_distance(
+                            pose, -0.15, 0.0, guard_pts, remain
+                        )
+                        rear_cost_ok = (
+                            not math.isfinite(back_free)
+                            or back_free >= min(remain, 0.12)
                         )
                     if backed_m >= self._backup_dist_m or not rear_cost_ok:
                         narrow_rev_start = None
