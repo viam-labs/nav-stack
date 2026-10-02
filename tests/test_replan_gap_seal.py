@@ -167,6 +167,31 @@ def test_blocked_nose_unstick_after_a_failed_replan():
     )
 
 
+def test_bumper_spin_backs_up_even_when_the_path_is_free():
+    """Inch off an obstacle, room behind, path cost still low: reverse."""
+    assert NavSupervisor._bumper_spin_reverse(
+        nose_clear=False,
+        spin_blocked=True,
+        cmd_vx=0.0,
+        cmd_vtheta=0.0,
+        rear_open=True,
+    )
+    assert not NavSupervisor._bumper_spin_reverse(
+        nose_clear=False,
+        spin_blocked=True,
+        cmd_vx=0.0,
+        cmd_vtheta=0.0,
+        rear_open=False,
+    )
+    assert not NavSupervisor._bumper_spin_reverse(
+        nose_clear=True,
+        spin_blocked=True,
+        cmd_vx=0.0,
+        cmd_vtheta=0.0,
+        rear_open=True,
+    )
+
+
 def test_path_locally_blocked_ignores_inscribed_when_corridor_open():
     """Clear nose + inscribed path cost must not force DWA (doorway pecking)."""
     # Soft / inscribed on path, clear nose → not blocked (any clearance).

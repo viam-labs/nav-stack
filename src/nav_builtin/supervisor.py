@@ -1142,6 +1142,29 @@ class NavSupervisor:
             return "turn"
         return "hold"
 
+    @staticmethod
+    def _bumper_spin_reverse(
+        *,
+        nose_clear: bool,
+        spin_blocked: bool,
+        cmd_vx: float,
+        cmd_vtheta: float,
+        rear_open: bool,
+    ) -> bool:
+        """Back up when the bumper is against an obstacle and a spin would hit it.
+
+        The path centerline can still be cheap. The footprint guard will not
+        reverse, so the cart sits at cmd 0 an inch off the obstacle with open
+        space behind it.
+        """
+        return (
+            not nose_clear
+            and bool(spin_blocked)
+            and abs(float(cmd_vx)) < 1e-6
+            and abs(float(cmd_vtheta)) < 1e-6
+            and bool(rear_open)
+        )
+
     def _abort_blocked_replans(self, count: int, *, nose_clear: bool) -> bool:
         """Fail the goal once blocked-nose replans are exhausted."""
         if count < _BLOCKED_REPLAN_FAIL_LIMIT or nose_clear:
@@ -2079,6 +2102,41 @@ class NavSupervisor:
                     "distance_remaining_m": distance_m(pose, goal),
                 }
 
+                # Bumper against an obstacle, path itself still free: the
+                # footprint guard will not reverse, and the blocked-nose wait
+                # never starts because path cost is low. Spin is blocked, so
+                # back up while the rear is open and then turn onto the path.
+                if (
+                    scan is not None
+                    and local_view is not None
+                    and now >= narrow_rev_cooldown_until
+                    and self._bumper_spin_reverse(
+                        nose_clear=nose_clear,
+                        spin_blocked=bool(progress.get("spin_blocked")),
+                        cmd_vx=cmd.vx,
+                        cmd_vtheta=cmd.vtheta,
+                        rear_open=True,
+                    )
+                ):
+                    from .controller import _try_narrow_reverse
+
+                    rev = _try_narrow_reverse(
+                        self._follower,
+                        scan,
+                        self._robot_radius,
+                        local_view=local_view,
+                        current=pose,
+                    )
+                    if rev is not None:
+                        cmd = rev
+                        progress = {
+                            **progress,
+                            "obstacle": "narrow_reverse",
+                            "local_planner": False,
+                            "cmd_vx_mps": cmd.vx,
+                            "cmd_vtheta_rad_s": 0.0,
+                        }
+
                 # Bound per-tick ``narrow_reverse``: reverse ~backup_dist, then
                 # replan. Without this the controller reverses forever while the
                 # spin disc stays occupied (rc16 nearly backed into a wall).
@@ -2820,6 +2878,14 @@ class NavSupervisor:
                     # stall with pathc=253, nose_clear, local_blocked=false).
                     if nose_clear and path_ahead_cost < int(LETHAL):
                         last_progress_at = now
+                        return False
+                    # Nose on the bumper and spin disc blocked: the escape is
+                    # reverse, not another plan of the same free corridor.
+                    if (
+                        not nose_clear
+                        and bool(progress.get("spin_blocked"))
+                        and cmd.vx < -1e-6
+                    ):
                         return False
                     _trig = f"stall:{error_msg}"
                     self._stop_before_replan(_trig)
