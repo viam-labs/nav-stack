@@ -136,6 +136,37 @@ def test_local_block_policy_prefers_dwa_when_nose_clear():
     )
 
 
+def test_blocked_nose_unstick_after_a_failed_replan():
+    """First wait holds. After a failed replan, reverse, else turn."""
+    hold = dict(failed_replans=0, nose_clear=False, rear_open=True, spin_clear=True)
+    assert NavSupervisor._blocked_nose_unstick(**hold) == "hold"
+    assert (
+        NavSupervisor._blocked_nose_unstick(
+            failed_replans=1, nose_clear=False, rear_open=True, spin_clear=False
+        )
+        == "reverse"
+    )
+    assert (
+        NavSupervisor._blocked_nose_unstick(
+            failed_replans=1, nose_clear=False, rear_open=False, spin_clear=True
+        )
+        == "turn"
+    )
+    assert (
+        NavSupervisor._blocked_nose_unstick(
+            failed_replans=2, nose_clear=False, rear_open=False, spin_clear=False
+        )
+        == "hold"
+    )
+    # A clear nose stays on the peel path.
+    assert (
+        NavSupervisor._blocked_nose_unstick(
+            failed_replans=2, nose_clear=True, rear_open=True, spin_clear=True
+        )
+        == "hold"
+    )
+
+
 def test_path_locally_blocked_ignores_inscribed_when_corridor_open():
     """Clear nose + inscribed path cost must not force DWA (doorway pecking)."""
     # Soft / inscribed on path, clear nose → not blocked (any clearance).

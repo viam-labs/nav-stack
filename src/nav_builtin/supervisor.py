@@ -18,6 +18,7 @@ from ..nav.simple_motion import (
     cone_min_range,
     distance_m,
     rear_clearance_m,
+    spin_clearance_m,
 )
 from ..geom import conversions as conv
 from .controller import (
@@ -35,6 +36,7 @@ from .local_costmap import (
     footprint_max_cost,
     reverse_backup_feasible,
     reverse_path_clear,
+    spin_disc_blocked,
 )
 from .local_planner import LocalPlannerConfig
 from .planner import (
@@ -51,6 +53,10 @@ from .world_io import WorldIO
 
 
 _BLOCKED_REPLAN_FAIL_LIMIT = 8
+# After a blocked-nose replan fails, turn this far (then replan) when the
+# rear is not open. ~46° is enough to face a different corridor.
+_NOSE_UNSTICK_YAW_RAD = 0.8
+_NOSE_UNSTICK_YAW_RATE = 0.45
 
 # Last ~60 s of guarded control ticks (20 Hz), kept across goals so a graze
 # can be inspected after the operator cancels (``get_trace`` DoCommand).
@@ -1114,6 +1120,48 @@ class NavSupervisor:
             return "replan"
         return "wait"
 
+    @staticmethod
+    def _blocked_nose_unstick(
+        *,
+        failed_replans: int,
+        nose_clear: bool,
+        rear_open: bool,
+        spin_clear: bool,
+    ) -> str:
+        """Motion while a blocked nose waits out the replan cooldown.
+
+        ``hold`` for the first wait, so a person crossing can still move.
+        After a replan fails: ``reverse`` when the rear is open, otherwise
+        ``turn`` when an in-place spin would not sweep an obstacle.
+        """
+        if nose_clear or int(failed_replans) < 1:
+            return "hold"
+        if rear_open:
+            return "reverse"
+        if spin_clear:
+            return "turn"
+        return "hold"
+
+    def _abort_blocked_replans(self, count: int, *, nose_clear: bool) -> bool:
+        """Fail the goal once blocked-nose replans are exhausted."""
+        if count < _BLOCKED_REPLAN_FAIL_LIMIT or nose_clear:
+            return False
+        self._world.stop()
+        with self._status_lock:
+            prev_progress = dict(self._status.progress or {})
+        if self._stuck_pose_refine:
+            prev_progress["stuck_pose_refine"] = dict(self._stuck_pose_refine)
+        self._set_status(
+            state="failed",
+            active=False,
+            error_msg=(
+                "path blocked: no route around obstacle "
+                f"({count} replans failed)"
+            ),
+            progress=prev_progress or None,
+        )
+        return True
+
     def _try_replan(
         self,
         goal: Pose2D,
@@ -1484,6 +1532,11 @@ class NavSupervisor:
             # we reverse ~backup_dist then replan instead of driving forever.
             narrow_rev_start: Optional[Pose2D] = None
             narrow_rev_cooldown_until = 0.0
+            # Blocked-nose unstick between replans: one reverse or turn, then
+            # a replan from the pose that motion reached.
+            nose_unstick_start: Optional[Pose2D] = None
+            nose_unstick_mode = ""
+            nose_unstick_yaw_sign = 1.0
             local_blocked_since: Optional[float] = None
             last_local_replan_at = 0.0
             failed_replan_while_blocked = 0
@@ -1925,6 +1978,8 @@ class NavSupervisor:
                             rotate_active = False
                             blocked_fail_count = 0
                             blocked_fail_dist = None
+                            nose_unstick_start = None
+                            nose_unstick_mode = ""
                         else:
                             failed_replan_while_blocked += 1
                             blocked_fail_count += 1
@@ -1932,30 +1987,15 @@ class NavSupervisor:
                                 blocked_fail_dist = distance_m(pose, goal)
                             # Nav2 BT semantics: bounded retries, then fail —
                             # not an infinite replan loop in front of a plug.
-                            if (
-                                blocked_fail_count >= _BLOCKED_REPLAN_FAIL_LIMIT
-                                and not nose_clear
+                            if self._abort_blocked_replans(
+                                blocked_fail_count, nose_clear=nose_clear
                             ):
-                                self._world.stop()
-                                with self._status_lock:
-                                    prev_progress = dict(self._status.progress or {})
-                                if self._stuck_pose_refine:
-                                    prev_progress["stuck_pose_refine"] = dict(
-                                        self._stuck_pose_refine
-                                    )
-                                self._set_status(
-                                    state="failed",
-                                    active=False,
-                                    error_msg=(
-                                        "path blocked: no route around obstacle "
-                                        f"({blocked_fail_count} replans failed)"
-                                    ),
-                                    progress=prev_progress or None,
-                                )
                                 return
                 else:
                     local_blocked_since = None
                     failed_replan_while_blocked = 0
+                    nose_unstick_start = None
+                    nose_unstick_mode = ""
                     self._stuck_pose_refine_used = False
 
                 # DWA only when the route is actually blocked (or after a failed
@@ -2137,13 +2177,194 @@ class NavSupervisor:
                             )
                             if rev is not None:
                                 cmd = rev
-                    if cmd.vx < -1e-6 and abs(cmd.vtheta) < 1e-6:
+                    # After a blocked-nose replan fails, the cooldown wait
+                    # used to sit at cmd 0 until the next attempt. Back up
+                    # when the rear is open, otherwise turn when the spin
+                    # disc is clear, then replan from that new pose.
+                    unstick_done = False
+                    if (
+                        not nose_clear
+                        and failed_replan_while_blocked >= 1
+                        and scan is not None
+                        and local_view is not None
+                        and abs(cmd.vx) < 1e-6
+                        and abs(cmd.vtheta) < 1e-6
+                    ):
+                        from .controller import _try_narrow_reverse
+
+                        rev = _try_narrow_reverse(
+                            self._follower,
+                            scan,
+                            self._robot_radius,
+                            local_view=local_view,
+                            current=pose,
+                        )
+                        spin_clear = spin_clearance_m(scan) >= self._spin_radius + 0.05
+                        if (
+                            spin_clear
+                            and self._spin_radius > self._robot_radius
+                            and spin_disc_blocked(
+                                local_view,
+                                pose.x,
+                                pose.y,
+                                spin_radius_m=self._spin_radius,
+                                inscribed_radius_m=self._robot_radius,
+                            )
+                        ):
+                            spin_clear = False
+                        choice = self._blocked_nose_unstick(
+                            failed_replans=failed_replan_while_blocked,
+                            nose_clear=nose_clear,
+                            rear_open=rev is not None,
+                            spin_clear=spin_clear,
+                        )
+                        if choice == "reverse" and rev is not None:
+                            if nose_unstick_mode != "reverse":
+                                nose_unstick_start = pose
+                                nose_unstick_mode = "reverse"
+                            cmd = rev
+                        elif choice == "turn":
+                            backed = (
+                                distance_m(pose, nose_unstick_start)
+                                if nose_unstick_mode == "reverse"
+                                and nose_unstick_start is not None
+                                else 0.0
+                            )
+                            if backed >= 0.05:
+                                unstick_done = True
+                            else:
+                                if nose_unstick_mode != "turn":
+                                    nose_unstick_start = pose
+                                    nose_unstick_mode = "turn"
+                                cmd = DriveCommand(
+                                    0.0,
+                                    0.0,
+                                    nose_unstick_yaw_sign * _NOSE_UNSTICK_YAW_RATE,
+                                    False,
+                                )
+                        elif nose_unstick_start is not None:
+                            moved = False
+                            if nose_unstick_mode == "reverse":
+                                moved = (
+                                    distance_m(pose, nose_unstick_start) >= 0.05
+                                )
+                            elif nose_unstick_mode == "turn":
+                                moved = (
+                                    abs(
+                                        conv.normalize_angle(
+                                            pose.theta - nose_unstick_start.theta
+                                        )
+                                    )
+                                    >= 0.2
+                                )
+                            if moved:
+                                unstick_done = True
+                            else:
+                                nose_unstick_start = None
+                                nose_unstick_mode = ""
+                    if (
+                        not nose_clear
+                        and failed_replan_while_blocked >= 1
+                        and cmd.vx < -1e-6
+                        and nose_unstick_mode not in ("reverse", "turn")
+                    ):
+                        nose_unstick_start = pose
+                        nose_unstick_mode = "reverse"
+                    if (
+                        not unstick_done
+                        and nose_unstick_start is not None
+                        and nose_unstick_mode == "reverse"
+                        and cmd.vx < -1e-6
+                    ):
+                        if (
+                            distance_m(pose, nose_unstick_start)
+                            >= self._backup_dist_m
+                        ):
+                            unstick_done = True
+                    elif (
+                        not unstick_done
+                        and nose_unstick_start is not None
+                        and nose_unstick_mode == "turn"
+                        and abs(cmd.vtheta) > 1e-6
+                    ):
+                        if (
+                            abs(
+                                conv.normalize_angle(
+                                    pose.theta - nose_unstick_start.theta
+                                )
+                            )
+                            >= _NOSE_UNSTICK_YAW_RAD
+                        ):
+                            unstick_done = True
+                    if unstick_done:
+                        self._stop_before_replan("blocked_nose_unstick")
+                        new_path = self._try_replan(
+                            goal,
+                            pose,
+                            path,
+                            scan,
+                            failed_count=max(1, failed_replan_while_blocked),
+                            require_different=failed_replan_while_blocked < 3,
+                            local_view=local_view,
+                            trigger="blocked_nose_unstick",
+                        )
+                        replan_finished = time.monotonic()
+                        last_local_replan_at = replan_finished
+                        last_replan = replan_finished
+                        nose_unstick_start = None
+                        nose_unstick_mode = ""
+                        if new_path is not None:
+                            path = new_path
+                            local_blocked_since = None
+                            failed_replan_while_blocked = 0
+                            backup_attempts = 0
+                            vx_sign_history.clear()
+                            spin_stuck_since = None
+                            reactive_avoid_since = None
+                            last_obstacle_state = ""
+                            prev_local_cmd = None
+                            local_planner_active = False
+                            prev_cmd = None
+                            rotate_active = False
+                            blocked_fail_count = 0
+                            blocked_fail_dist = None
+                        else:
+                            failed_replan_while_blocked += 1
+                            blocked_fail_count += 1
+                            if blocked_fail_dist is None:
+                                blocked_fail_dist = distance_m(pose, goal)
+                            if self._abort_blocked_replans(
+                                blocked_fail_count, nose_clear=nose_clear
+                            ):
+                                return
+                        cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                        progress = {
+                            **progress,
+                            "obstacle": "planning",
+                            "local_planner": False,
+                            "nose_unstick": None,
+                            "cmd_vx_mps": 0.0,
+                            "cmd_vtheta_rad_s": 0.0,
+                        }
+                    elif cmd.vx < -1e-6 and abs(cmd.vtheta) < 1e-6:
                         progress = {
                             **progress,
                             "obstacle": "wait_reverse",
                             "local_planner": False,
+                            "nose_unstick": nose_unstick_mode or None,
                             "cmd_vx_mps": cmd.vx,
                             "cmd_vtheta_rad_s": 0.0,
+                        }
+                    elif (
+                        nose_unstick_mode == "turn" and abs(cmd.vtheta) > 1e-6
+                    ):
+                        progress = {
+                            **progress,
+                            "obstacle": "wait_turn",
+                            "local_planner": False,
+                            "nose_unstick": "turn",
+                            "cmd_vx_mps": 0.0,
+                            "cmd_vtheta_rad_s": cmd.vtheta,
                         }
                     else:
                         keep_yaw = (
@@ -2158,6 +2379,7 @@ class NavSupervisor:
                             **progress,
                             "obstacle": "wait",
                             "local_planner": False,
+                            "nose_unstick": None,
                             "cmd_vx_mps": 0.0,
                             "cmd_vtheta_rad_s": cmd.vtheta,
                         }
