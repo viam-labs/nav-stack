@@ -75,6 +75,31 @@ def test_parser_orient_yaw_90_matches_wit_motion_scale():
     assert parser.sample.yaw == pytest.approx(math.radians(90.0))
 
 
+def test_parser_rejects_bad_checksum():
+    """Checksum is the low 8 bits of the first 10 wire bytes; a mismatch is not a packet."""
+    parser = WitStreamParser()
+    good = _frame(TYPE_GYRO, b"\x00" * 8)
+    bad = bytearray(good)
+    bad[9] ^= 0xFF
+    assert parser.feed(bytes(bad)) == 0
+    assert parser.sample.packets == 0
+    assert parser.sample.gyro_packets == 0
+    assert parser.feed(good) == 1
+    assert parser.sample.gyro_packets == 1
+
+
+def test_parser_rejects_lcus_ascii():
+    """An LCUS-2 ``CH1:`` / ``CH2:`` reply must not count as WitMotion frames."""
+    parser = WitStreamParser()
+    # 0x51 is a real accel type; the rest is relay text plus a sync. Checksum fails.
+    line = bytes([TYPE_ACCEL]) + b"CH1:OFF\n" + bytes([0x00, 0x55])
+    assert len(line) == 11
+    assert line[9] != ((0x55 + sum(line[:9])) & 0xFF)
+    blob = b"CH1: OFF\r\nCH2: OFF\r\n" + line + bytes([0x55]) * 4
+    assert parser.feed(blob) == 0
+    assert parser.sample.packets == 0
+
+
 def test_parser_accel_gyro_orient():
     parser = WitStreamParser()
     # Three frames: accel, gyro, orient around zero.
@@ -248,6 +273,110 @@ def test_config_commands_gyro_still_threshold():
         config_commands("keep", gyro_still_threshold_dps=-0.1)
     with pytest.raises(WitError):
         config_commands("keep", gyro_still_threshold_dps=70.0)
+
+
+def test_open_first_working_skips_lcus2_relay():
+    """A CH340 that answers CH1:/CH2: is closed and not claimed; the WIT is."""
+    import src.imu.wit_serial as wit_serial
+    from src.imu.wit_serial import WitSerial
+    from src.lidar.serial_ports import claimed_owner
+
+    relay = "/dev/serial/by-id/usb-1a86_USB_Serial-relay"
+    imu = "/dev/serial/by-id/usb-1a86_USB_Serial-imu"
+    opened = []
+
+    class FakeSerial:
+        def __init__(self, port=None, **kwargs):
+            self.port = port
+            self.baudrate = kwargs.get("baudrate")
+            self.timeout = kwargs.get("timeout")
+            self.parity = kwargs.get("parity")
+            self.stopbits = kwargs.get("stopbits")
+            self.dsrdtr = kwargs.get("dsrdtr", False)
+            self.rtscts = kwargs.get("rtscts", False)
+            self.xonxoff = kwargs.get("xonxoff", False)
+            self.exclusive = kwargs.get("exclusive")
+            self.dtr = True
+            self.rts = True
+            self.is_open = False
+            self.writes = []
+            self._buf = b""
+            self.opened_as = None
+            if port is not None:
+                self.open()
+
+        def open(self):
+            self.is_open = True
+            self.opened_as = (self.baudrate, self.dtr, self.rts)
+            opened.append(self)
+
+        def write(self, data):
+            self.writes.append(bytes(data))
+            return len(data)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.is_open = False
+
+        @property
+        def in_waiting(self):
+            return len(self._buf)
+
+        def read(self, n=1):
+            if (
+                not self._buf
+                and self.port == relay
+                and self.writes == [b"\xff"]
+            ):
+                self._buf = b"CH1: OFF\r\nCH2: OFF\r\n"
+            if not self._buf and self.port == imu and self.baudrate == 115200:
+                self._buf = b"".join(
+                    _frame(TYPE_GYRO, b"\x00" * 8) for _ in range(4)
+                )
+            chunk = self._buf[:n]
+            self._buf = self._buf[n:]
+            return chunk
+
+    saved_serial = wit_serial._pyserial
+    saved_listen = wit_serial._LCUS2_LISTEN_S
+    wit_serial._pyserial = type(
+        "M",
+        (),
+        {"Serial": FakeSerial, "PARITY_NONE": "N", "STOPBITS_ONE": 1},
+    )
+    wit_serial._LCUS2_LISTEN_S = 0.05
+    try:
+        dev = WitSerial.open_first_working([relay, imu], rounds=1)
+        try:
+            assert dev.port == imu
+            assert claimed_owner(imu) == "imu"
+            assert claimed_owner(relay) is None
+        finally:
+            dev.close()
+    finally:
+        wit_serial._pyserial = saved_serial
+        wit_serial._LCUS2_LISTEN_S = saved_listen
+
+    relay_opens = [s for s in opened if s.port == relay]
+    assert relay_opens
+    assert all(s.opened_as == (9600, False, False) for s in relay_opens)
+    assert all(s.writes == [b"\xff"] for s in relay_opens)
+    assert all(s.is_open is False for s in relay_opens)
+    assert all(s.baudrate == 9600 for s in relay_opens)
+    imu_probes = [s for s in opened if s.port == imu and s.baudrate == 9600]
+    assert imu_probes
+    assert all(s.opened_as == (9600, False, False) for s in imu_probes)
+    assert any(s.port == imu and s.baudrate == 115200 for s in opened)
+
+
+def test_lcus2_probe_constants():
+    from src.imu.wit_serial import _LCUS2_BAUD, _LCUS2_LISTEN_S, _LCUS2_QUERY
+
+    assert _LCUS2_BAUD == 9600
+    assert _LCUS2_QUERY == b"\xff"
+    assert _LCUS2_LISTEN_S == pytest.approx(0.25)
 
 
 def test_wit_imu_gyro_still_threshold_attr():

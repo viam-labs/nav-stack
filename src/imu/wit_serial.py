@@ -14,6 +14,85 @@ except ImportError:  # pragma: no cover
 
 LOGGER = logging.getLogger(__name__)
 
+# LCUS-2 USB relay uses the same WCH CH340 (1a86) as the WitMotion IMU.
+# A status query at 9600 is one 0xFF; the relay answers with both channel labels.
+_LCUS2_BAUD = 9600
+_LCUS2_QUERY = b"\xff"
+_LCUS2_LISTEN_S = 0.25
+
+
+def _reply_is_lcus2(data: bytes) -> bool:
+    return b"CH1:" in data and b"CH2:" in data
+
+
+def _port_is_lcus2_relay(port: str) -> bool:
+    """True when ``port`` answers the LCUS-2 status query.
+
+    Opens at 9600 with DTR and RTS held low (so the coils are not clicked),
+    writes one ``0xFF``, and reads for about 250 ms. The port is closed
+    before return. Open failures are not a relay match — the caller still
+    tries the normal WitMotion probe.
+    """
+    if _pyserial is None:
+        return False
+    ser = None
+    try:
+        # Set the lines before open(); pyserial otherwise asserts them high.
+        ser = _pyserial.Serial()
+        ser.baudrate = _LCUS2_BAUD
+        ser.parity = _pyserial.PARITY_NONE
+        ser.stopbits = _pyserial.STOPBITS_ONE
+        ser.timeout = 0.05
+        ser.dsrdtr = False
+        ser.rtscts = False
+        ser.xonxoff = False
+        ser.dtr = False
+        ser.rts = False
+        try:
+            ser.exclusive = True
+        except Exception:  # noqa: BLE001
+            pass
+        ser.port = port
+        ser.open()
+        ser.dtr = False
+        ser.rts = False
+        ser.write(_LCUS2_QUERY)
+        try:
+            ser.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        deadline = time.monotonic() + _LCUS2_LISTEN_S
+        buf = bytearray()
+        while time.monotonic() < deadline:
+            waiting = getattr(ser, "in_waiting", 0) or 0
+            chunk = ser.read(waiting or 64)
+            if chunk:
+                buf.extend(chunk)
+                if _reply_is_lcus2(buf):
+                    LOGGER.info(
+                        "skipping %s: LCUS-2 relay answered CH1:/CH2: at 9600",
+                        port,
+                    )
+                    return True
+            else:
+                time.sleep(0.02)
+        if _reply_is_lcus2(buf):
+            LOGGER.info(
+                "skipping %s: LCUS-2 relay answered CH1:/CH2: at 9600",
+                port,
+            )
+            return True
+        return False
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("LCUS-2 probe failed on %s", port, exc_info=True)
+        return False
+    finally:
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:  # noqa: BLE001
+                pass
+
 
 class WitSerial:
     """Reads continuous WitMotion UART frames into a ``WitSample``."""
@@ -118,7 +197,11 @@ class WitSerial:
         include_tty_acm: bool = False,
         exclude: Optional[List[str]] = None,
     ) -> "WitSerial":
-        """Try each port until WitMotion frames are seen (skips silent lidars)."""
+        """Try each port until WitMotion frames are seen.
+
+        Skips silent lidars, CP210 ports, and an LCUS-2 relay that answers
+        the 9600-baud ``0xFF`` query with ``CH1:`` and ``CH2:``.
+        """
         from ..lidar.serial_ports import (
             claim_serial_port,
             drop_claimed_by_other,
@@ -158,6 +241,11 @@ class WitSerial:
                 dev = cls(port, baudrate=baudrate, timeout_s=timeout_s)
                 try:
                     with usb_serial_open_lock():
+                        if _port_is_lcus2_relay(port):
+                            raise WitError(
+                                "LCUS-2 relay (9600 baud 0xFF query returned "
+                                "CH1: and CH2:)"
+                            )
                         dev._open_unlocked()
                     claim_serial_port("imu", port)
                     return dev

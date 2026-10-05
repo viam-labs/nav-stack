@@ -167,6 +167,13 @@ class WitStreamParser:
         typ = line[0]
         if typ not in (TYPE_ACCEL, TYPE_GYRO, TYPE_ORIENT, TYPE_MAG):
             return False
+        # On the wire a frame is ``0x55 | type | 8 data | checksum``. ReadString
+        # already consumed this frame's leading ``0x55`` as the previous
+        # delimiter, so ``line[:9]`` is the other 9 of those 10 bytes and
+        # ``line[9]`` is the checksum: low 8 bits of their sum. Reject before
+        # counting — LCUS-2 ASCII (``CH1:`` / ``CH2:``) must not become a packet.
+        if line[9] != ((SYNC + sum(line[:9])) & 0xFF):
+            return False
         # line[1:9] payload, line[9] checksum, line[10] == SYNC
         s = self.sample
         if typ == TYPE_GYRO:
