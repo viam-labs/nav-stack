@@ -71,6 +71,33 @@ def recent_trace(seconds: float = 30.0) -> list:
     return [e for e in entries if e["t"] >= cutoff]
 
 
+# Heading error must fall by this much to count the final spin as still working.
+# Smaller than yaw tolerance so jitter does not refresh the give-up clock.
+_YAW_ALIGN_PROGRESS_RAD = math.radians(6.0)
+
+
+def yaw_align_give_up(
+    now: float,
+    yaw_err_abs: float,
+    timeout_s: float,
+    best_err: Optional[float],
+    progress_at: Optional[float],
+) -> tuple[bool, Optional[float], Optional[float]]:
+    """Whether to accept XY and stop hunting final heading.
+
+    The clock runs only while a spin is not closing the heading. A rotation
+    that keeps reducing the error does not hit ``timeout_s``. Returns
+    ``(give_up, best_err, progress_at)``.
+    """
+    if best_err is None or progress_at is None:
+        return False, yaw_err_abs, now
+    if yaw_err_abs < best_err - _YAW_ALIGN_PROGRESS_RAD:
+        best_err = yaw_err_abs
+        progress_at = now
+    stalled = timeout_s > 0.0 and (now - progress_at) >= timeout_s
+    return stalled, best_err, progress_at
+
+
 class NavSupervisor:
     """Blocking control loop intended to run on a background worker thread."""
 
@@ -1571,7 +1598,8 @@ class NavSupervisor:
             prev_cmd: Optional[DriveCommand] = None
             rotate_active = False
             vx_sign_history: list[tuple[float, int]] = []
-            xy_ok_since: Optional[float] = None
+            align_best_err: Optional[float] = None
+            align_progress_at: Optional[float] = None
             last_tick_pose: Optional[Pose2D] = None
             # Only validate the next few metres — full-path static checks on
             # long goals trip on far unknown/inflation and abort immediately.
@@ -1633,28 +1661,26 @@ class NavSupervisor:
                 # Goal reached? Use the *requested* goal — path[-1] can be a
                 # free-cell snap that used to let us "succeed" a metre away.
                 dist_goal_chk = distance_m(pose, goal)
-                xy_tol = self._follower.motion.xy_tolerance_m
                 xy_ok = self._xy_at_nav_goal(pose, goal, path)
-                yaw_ok = (
-                    abs(conv.normalize_angle(pose.theta - goal.theta))
-                    <= self._follower.motion.yaw_tolerance_rad
-                )
+                yaw_err_abs = abs(conv.normalize_angle(pose.theta - goal.theta))
+                yaw_ok = yaw_err_abs <= self._follower.motion.yaw_tolerance_rad
                 now = time.monotonic()
                 if xy_ok and yaw_ok:
                     self._world.stop()
                     self._set_status(state="succeeded", active=False, error_msg="")
                     return
-                # Start the yaw give-up clock once inside XY acceptance — not only
-                # after the ~3 cm settle — so end-wiggle cannot run forever while
-                # oscillating just outside settle.
+                # Give up on final heading only when a spin inside the XY ball
+                # stops reducing the error. A rotation that is still closing
+                # the gap keeps going past the stall window.
                 if xy_ok:
-                    if xy_ok_since is None:
-                        xy_ok_since = now
-                    elif (
-                        self._yaw_align_timeout_s > 0.0
-                        and now - xy_ok_since >= self._yaw_align_timeout_s
-                    ):
-                        # Close enough in XY; final yaw will not lock cleanly.
+                    give_up, align_best_err, align_progress_at = yaw_align_give_up(
+                        now,
+                        yaw_err_abs,
+                        self._yaw_align_timeout_s,
+                        align_best_err,
+                        align_progress_at,
+                    )
+                    if give_up:
                         self._world.stop()
                         self._set_status(
                             state="succeeded",
@@ -1663,7 +1689,8 @@ class NavSupervisor:
                         )
                         return
                 else:
-                    xy_ok_since = None
+                    align_best_err = None
+                    align_progress_at = None
 
                 if holding_for_localize:
                     hold_status = str((loc_hold or {}).get("status") or "")

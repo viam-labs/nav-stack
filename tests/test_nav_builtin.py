@@ -19,7 +19,7 @@ from src.nav_builtin.costmap import (
     nearest_free_pose,
 )
 from src.nav_builtin.navigator import BuiltinNavigator
-from src.nav_builtin.supervisor import NavSupervisor
+from src.nav_builtin.supervisor import NavSupervisor, yaw_align_give_up
 from src.nav_builtin.planner import (
     connect_plan_start,
     path_blocked,
@@ -474,6 +474,36 @@ def test_half_diagonal_radius_seals_gap_the_robot_fits_through():
     assert through.feasible, through.error_msg
     # Straight through the doorway, not around either end of the wall.
     assert all(abs(p[0] - 6.0) < 1.5 for p in through.path.points)
+
+
+def test_yaw_align_give_up_waits_while_heading_is_closing():
+    give, best, at = yaw_align_give_up(0.0, 1.5, 12.0, None, None)
+    assert give is False
+    # Well past the stall window, but the spin is still reducing the error.
+    give, best, at = yaw_align_give_up(15.0, 1.2, 12.0, best, at)
+    assert give is False
+    give, best, at = yaw_align_give_up(30.0, 0.8, 12.0, best, at)
+    assert give is False
+    assert best == pytest.approx(0.8)
+
+
+def test_yaw_align_give_up_when_spin_stops_helping():
+    give, best, at = yaw_align_give_up(0.0, 1.2, 12.0, None, None)
+    # A few degrees of jitter does not refresh the clock.
+    give, best, at = yaw_align_give_up(5.0, 1.15, 12.0, best, at)
+    assert give is False
+    assert best == pytest.approx(1.2)
+    # Spinning the wrong way, then sitting there, gives up after the window.
+    give, best, at = yaw_align_give_up(6.0, 1.4, 12.0, best, at)
+    assert give is False
+    give, best, at = yaw_align_give_up(12.0, 1.4, 12.0, best, at)
+    assert give is True
+
+
+def test_yaw_align_give_up_disabled():
+    give, best, at = yaw_align_give_up(0.0, 1.0, 0.0, None, None)
+    give, _, _ = yaw_align_give_up(100.0, 1.0, 0.0, best, at)
+    assert give is False
 
 
 def test_supervisor_wires_footprint_derived_clearances():

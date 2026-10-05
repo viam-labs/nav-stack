@@ -558,8 +558,9 @@ class BuiltinNavConfig:
     clearance_preference_m: float = 0.50
     xy_goal_tolerance: float = 0.25  # meters
     yaw_goal_tolerance: float = 0.35  # radians (~20 deg; mugger uses 0.6)
-    # After XY is inside tolerance, accept the goal if final yaw still has not
-    # settled (noisy heading / goal θ far from approach). 0 disables.
+    # After XY is inside tolerance, accept the goal if the final spin stops
+    # reducing heading error for this long. A spin that is still closing the
+    # gap is not cut off. 0 disables the give-up.
     yaw_align_timeout_s: float = 12.0
     # Reject plans whose free-cell goal snap exceeds this (metres). Live scan
     # inflation used to snap the goal ~1 m away and then "succeed" there.
