@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import math
 import time
+from dataclasses import replace
 from typing import Mapping, Optional, Sequence
 
 import numpy as np
@@ -19,6 +20,22 @@ from ..config import (
 from ..geom import conversions as conv
 from ..shm import imushm
 from ..shm import pcshm
+
+
+def _abandon_future(fut: concurrent.futures.Future) -> None:
+    """Cancel a wedged RPC and swallow its result so it is not left unread."""
+
+    def _done(finished: concurrent.futures.Future) -> None:
+        try:
+            finished.result()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if fut.done():
+        _done(fut)
+    else:
+        fut.add_done_callback(_done)
+        fut.cancel()
 
 
 def _get_laser_scan_not_implemented(exc: BaseException) -> bool:
@@ -76,6 +93,16 @@ class BuiltinSensors:
         self._scan_cache_at = 0.0  # first time this exact scan content was seen
         self._scan_cache_key: Optional[int] = None
         self._scan_fetch_at = 0.0
+        # True after a fetch returned nothing. The next successful read is a
+        # new observation even if the bytes match the pre-gap cloud (drivers
+        # often replay the last frame when a camera or lidar comes back).
+        self._scan_had_gap = False
+        # Lidars whose gRPC read is still in flight. That is not a dropout.
+        self._lidar_pending: set[str] = set()
+        # One gRPC scan read per lidar. A dead camera that ignores cancel must
+        # not stack a new GetPointCloud on every tick — that wedges the module
+        # loop, so localization stays blind after the device returns.
+        self._lidar_futs: dict[str, tuple[concurrent.futures.Future, float]] = {}
         self._heading_debug: dict = {"source": "none", "heading_rad": None}
         # Gyro-integrated yaw fallback from heading_sensor AngularVelocity
         # (wit-motion exposes deg/s); used only when no absolute orientation.
@@ -130,6 +157,12 @@ class BuiltinSensors:
 
     # Do not hammer the lidar faster than it can publish a revolution.
     _SCAN_MIN_REFETCH_S = 0.04
+    # Healthy GetPointCloud returns in a few milliseconds. Don't block the
+    # SLAM tick longer than this while one read is already in flight.
+    _LIDAR_RPC_WAIT_S = 0.05
+    # Abandon a read that has not finished (dead camera / lidar). The next
+    # tick starts a fresh call instead of waiting on the wedged one.
+    _LIDAR_RPC_STUCK_S = 5.0
 
     def get_scan(
         self, max_age_s: float = 2.0, *, fresh: bool = False
@@ -171,6 +204,11 @@ class BuiltinSensors:
             if scan is not None:
                 scans.append(scan)
         if not scans:
+            # An in-flight read is not a dropout. Only a finished miss (camera
+            # down, empty cloud) should let the next identical frame count
+            # as a new observation.
+            if not self._lidar_pending:
+                self._scan_had_gap = True
             return self._stale_or_none(max_age_s, now, fresh)
         merged = (
             scans[0]
@@ -179,12 +217,26 @@ class BuiltinSensors:
         )
         key = _scan_content_key(merged)
         if cached is not None and key == self._scan_cache_key:
-            # Same lidar revolution as before: keep the object and its
-            # first-seen time (best capture-time estimate).
-            return cached if now - self._scan_cache_at <= max_age_s else None
+            age = now - self._scan_cache_at
+            if age <= max_age_s:
+                # Same revolution, still fresh: keep the object so SLAM does
+                # not match one spin's scan at every new heading.
+                self._scan_had_gap = False
+                return cached
+            if self._scan_had_gap:
+                # Dropout, then the driver replayed that cloud. It is a new
+                # observation — a distinct object so localization resumes.
+                merged = replace(merged)
+                self._scan_cache = merged
+                self._scan_cache_key = key
+                self._scan_cache_at = now
+                self._scan_had_gap = False
+                return merged
+            return None
         self._scan_cache = merged
         self._scan_cache_key = key
         self._scan_cache_at = now
+        self._scan_had_gap = False
         return merged
 
     def _stale_or_none(
@@ -267,6 +319,7 @@ class BuiltinSensors:
     def _read_lidar_scan_sync(
         self, lidar: LidarConfig, *, max_age_s: float
     ) -> Optional[conv.LaserScan2D]:
+        self._lidar_pending.discard(lidar.name)
         shm_scan = self._try_shm_scan(lidar, max_age_s=max_age_s)
         if shm_scan is not None:
             return shm_scan
@@ -275,13 +328,48 @@ class BuiltinSensors:
         cam = self._cameras.get(lidar.name)
         if cam is None:
             return None
+        return self._poll_lidar_grpc(cam, lidar)
+
+    def _poll_lidar_grpc(self, cam, lidar: LidarConfig) -> Optional[conv.LaserScan2D]:
+        """One in-flight scan RPC. A stuck call is abandoned, not piled up."""
+        name = lidar.name
+        now = time.monotonic()
+        slot = self._lidar_futs.get(name)
+        if slot is not None:
+            fut, started = slot
+            if fut.done():
+                self._lidar_futs.pop(name, None)
+                try:
+                    return fut.result()
+                except Exception:  # noqa: BLE001
+                    return None
+            if now - started <= self._LIDAR_RPC_STUCK_S:
+                self._lidar_pending.add(name)
+                return None
+            _abandon_future(fut)
+            self._lidar_futs.pop(name, None)
+            self._log(
+                f"lidar {name} scan read stuck for {now - started:.1f}s; retrying"
+            )
+        if self._loop.is_closed():
+            return None
         try:
-            return self._run(
-                self._read_lidar_scan_grpc(cam, lidar),
-                timeout=1.0,
+            fut = asyncio.run_coroutine_threadsafe(
+                self._read_lidar_scan_grpc(cam, lidar), self._loop
             )
         except Exception:  # noqa: BLE001
             return None
+        self._lidar_futs[name] = (fut, now)
+        try:
+            result = fut.result(timeout=self._LIDAR_RPC_WAIT_S)
+        except TimeoutError:
+            self._lidar_pending.add(name)
+            return None
+        except Exception:  # noqa: BLE001
+            self._lidar_futs.pop(name, None)
+            return None
+        self._lidar_futs.pop(name, None)
+        return result
 
     async def _read_lidar_scan_grpc(
         self, cam, lidar: LidarConfig

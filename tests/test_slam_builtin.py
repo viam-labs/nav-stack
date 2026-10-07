@@ -996,6 +996,139 @@ def test_builtin_sensors_get_scan_fresh_dedupes_same_revolution(monkeypatch):
     assert sensors.scan_age_s() < 0.5
 
 
+def test_builtin_sensors_get_scan_accepts_replay_after_dropout(monkeypatch):
+    """A camera that returns after a gap often replays its last cloud.
+
+    Identical bytes while the cache is still fresh stay one object (no smear).
+    After a real gap they are a new observation so localization can resume.
+    """
+    import asyncio
+    import time
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
+    sensors = BuiltinSensors(
+        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
+        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+    )
+    wall = _wall_scan(dist=3.0)
+    reads = {"n": 0}
+
+    def _read(lidar, *, max_age_s):
+        del lidar, max_age_s
+        reads["n"] += 1
+        if reads["n"] == 3:
+            return None
+        return wall
+
+    monkeypatch.setattr(sensors, "_read_lidar_scan_sync", _read)
+    monkeypatch.setattr(sensors, "_SCAN_MIN_REFETCH_S", 0.0)
+    first = sensors.get_scan(0.75, fresh=True)
+    assert first is wall
+    # Still-fresh identical cloud, no dropout: keep the same object.
+    again = sensors.get_scan(0.75, fresh=True)
+    assert again is first
+    # Dropout long enough that the cached cloud is stale.
+    sensors._scan_cache_at = time.monotonic() - 10.0  # noqa: SLF001
+    missed = sensors.get_scan(0.75, fresh=True)
+    assert missed is None
+    recovered = sensors.get_scan(0.75, fresh=True)
+    assert recovered is not None
+    assert recovered is not first
+    assert sensors.scan_age_s() < 0.5
+    # A frozen live stream (no gap) still must not be republished once stale.
+    sensors._scan_cache_at = time.monotonic() - 10.0  # noqa: SLF001
+    sensors._scan_had_gap = False  # noqa: SLF001
+    assert sensors.get_scan(0.75, fresh=True) is None
+
+
+def test_lidar_grpc_returns_a_fast_scan_on_the_same_call():
+    import asyncio
+    import threading
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
+        sensors = BuiltinSensors(
+            cfg=cfg, cameras={"front": object()}, movement_sensor=None,
+            heading_sensor=None, shm_lidar=None, loop=loop, odom_reader=None,
+        )
+        wall = _wall_scan(dist=2.5)
+
+        async def _grpc(_cam, _lidar):
+            return wall
+
+        sensors._read_lidar_scan_grpc = _grpc  # noqa: SLF001
+        got = sensors._read_lidar_scan_sync(cfg.lidars[0], max_age_s=1.0)  # noqa: SLF001
+        assert got is wall
+        assert sensors._lidar_futs == {}  # noqa: SLF001
+        assert sensors._lidar_pending == set()  # noqa: SLF001
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2.0)
+        loop.close()
+
+
+def test_lidar_grpc_does_not_pile_up_when_camera_hangs():
+    """A GetPointCloud that ignores cancel must not stack one RPC per tick.
+
+    That pile wedged the module loop, so scans never resumed after the
+    camera or lidar came back until nav-stack was restarted.
+    """
+    import asyncio
+    import threading
+    import time
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    release = threading.Event()
+    try:
+        calls = {"n": 0}
+
+        class _Cam:
+            async def get_point_cloud(self, **_kwargs):
+                calls["n"] += 1
+                await asyncio.get_running_loop().run_in_executor(None, release.wait)
+                return (b"",)
+
+        cfg = SlamConfig.from_dict(
+            {
+                "base": "b",
+                "lidars": [{"name": "front", "scan_source": "point_cloud"}],
+            }
+        )
+        sensors = BuiltinSensors(
+            cfg=cfg, cameras={"front": _Cam()}, movement_sensor=None,
+            heading_sensor=None, shm_lidar=None, loop=loop, odom_reader=None,
+        )
+        sensors._LIDAR_RPC_WAIT_S = 0.05  # noqa: SLF001
+        sensors._LIDAR_RPC_STUCK_S = 0.2  # noqa: SLF001
+        lidar = cfg.lidars[0]
+
+        t0 = time.monotonic()
+        assert sensors._read_lidar_scan_sync(lidar, max_age_s=1.0) is None  # noqa: SLF001
+        assert time.monotonic() - t0 < 0.4
+        assert sensors._read_lidar_scan_sync(lidar, max_age_s=1.0) is None  # noqa: SLF001
+        assert calls["n"] == 1
+        time.sleep(0.25)
+        assert sensors._read_lidar_scan_sync(lidar, max_age_s=1.0) is None  # noqa: SLF001
+        assert calls["n"] == 2
+    finally:
+        release.set()
+        time.sleep(0.1)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2.0)
+        loop.close()
+
+
 def test_builtin_sensors_get_scan_skips_obstacles_only(monkeypatch):
     import asyncio
 

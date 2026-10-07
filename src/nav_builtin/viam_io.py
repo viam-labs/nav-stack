@@ -26,6 +26,22 @@ from .viz_store import NavVizStore
 from .world_io import WorldIO
 
 
+def _abandon_future(fut: concurrent.futures.Future) -> None:
+    """Cancel a wedged RPC and swallow its result so it is not left unread."""
+
+    def _done(finished: concurrent.futures.Future) -> None:
+        try:
+            finished.result()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if fut.done():
+        _done(fut)
+    else:
+        fut.add_done_callback(_done)
+        fut.cancel()
+
+
 def _get_laser_scan_not_implemented(exc: BaseException) -> bool:
     if isinstance(exc, NotImplementedError):
         return True
@@ -145,6 +161,11 @@ class ViamWorldIO:
         self._obstacles_max_shift_m = 0.30
         self._obstacles_max_shift_rad = math.radians(20.0)
         self._obstacles_refresh_inflight: Set[str] = set()
+        # name -> (generation, monotonic start). A hung refresh is superseded.
+        self._obstacles_job_gen: dict[str, tuple[int, float]] = {}
+        # One gRPC scan read per lidar so a dead camera cannot stack
+        # GetPointCloud calls on the module loop until nav-stack restarts.
+        self._lidar_futs: dict[str, tuple[concurrent.futures.Future, float]] = {}
         self._last_drive: Optional[dict] = None
         self._pose_source: str = "none"
         # In-flight Base.SetVelocity future. Never cancel mid-RPC: control ticks
@@ -738,8 +759,15 @@ class ViamWorldIO:
         executor so CPU work does not freeze drive commands.
         """
         name = lidar.name
+        now = time.monotonic()
         if name in self._obstacles_refresh_inflight:
-            return
+            slot = self._obstacles_job_gen.get(name)
+            started_at = slot[1] if slot is not None else now
+            if now - started_at < 5.0:
+                return
+            # The previous GetPointCloud never finished. Let a new one run
+            # so a camera that comes back is not ignored until restart.
+            self._obstacles_refresh_inflight.discard(name)
         cached = self._per_lidar_scan.get(name)
         now = time.monotonic()
         if (
@@ -753,17 +781,26 @@ class ViamWorldIO:
         if cam is None and not lidar.shm_name:
             return
         self._obstacles_refresh_inflight.add(name)
+        prev = self._obstacles_job_gen.get(name)
+        gen = (prev[0] if prev is not None else 0) + 1
+        self._obstacles_job_gen[name] = (gen, now)
 
-        async def _job() -> None:
+        def _store(scan: conv.LaserScan2D, job_gen: int) -> None:
+            current = self._obstacles_job_gen.get(name)
+            if current is None or current[0] != job_gen:
+                return
+            self._per_lidar_scan[name] = (
+                self._stamp_capture_pose(scan, self._map_pose_now()),
+                time.monotonic(),
+            )
+
+        async def _job(job_gen: int = gen) -> None:
             try:
                 shm_scan = self._try_shm_scan(
                     lidar, max_age_s=max(2.0, self._obstacles_only_period_s * 2)
                 )
                 if shm_scan is not None:
-                    self._per_lidar_scan[name] = (
-                        self._stamp_capture_pose(shm_scan, self._map_pose_now()),
-                        time.monotonic(),
-                    )
+                    _store(shm_scan, job_gen)
                     return
                 if cam is None:
                     return
@@ -774,14 +811,13 @@ class ViamWorldIO:
                     None, lambda: self._pcd_to_scan(raw, lidar)
                 )
                 if scan is not None:
-                    self._per_lidar_scan[name] = (
-                        self._stamp_capture_pose(scan, self._map_pose_now()),
-                        time.monotonic(),
-                    )
+                    _store(scan, job_gen)
             except Exception as exc:  # noqa: BLE001
                 self._log(f"obstacles_only lidar {name} refresh failed: {exc}")
             finally:
-                self._obstacles_refresh_inflight.discard(name)
+                current = self._obstacles_job_gen.get(name)
+                if current is not None and current[0] == job_gen:
+                    self._obstacles_refresh_inflight.discard(name)
 
         try:
             asyncio.run_coroutine_threadsafe(_job(), self._loop)
@@ -808,13 +844,46 @@ class ViamWorldIO:
         cam = self._cameras.get(lidar.name)
         if cam is None:
             return None
+        return self._poll_lidar_grpc(cam, lidar)
+
+    def _poll_lidar_grpc(self, cam, lidar: LidarConfig) -> Optional[conv.LaserScan2D]:
+        """One in-flight scan RPC. A stuck call is abandoned, not piled up."""
+        name = lidar.name
+        now = time.monotonic()
+        slot = self._lidar_futs.get(name)
+        if slot is not None:
+            fut, started = slot
+            if fut.done():
+                self._lidar_futs.pop(name, None)
+                try:
+                    return fut.result()
+                except Exception:  # noqa: BLE001
+                    return None
+            if now - started <= 5.0:
+                return None
+            _abandon_future(fut)
+            self._lidar_futs.pop(name, None)
+            self._log(
+                f"lidar {name} scan read stuck for {now - started:.1f}s; retrying"
+            )
+        if self._loop.is_closed():
+            return None
         try:
-            return self._run(
-                self._read_lidar_scan_grpc(cam, lidar),
-                timeout=1.0,
+            fut = asyncio.run_coroutine_threadsafe(
+                self._read_lidar_scan_grpc(cam, lidar), self._loop
             )
         except Exception:  # noqa: BLE001
             return None
+        self._lidar_futs[name] = (fut, now)
+        try:
+            result = fut.result(timeout=0.05)
+        except TimeoutError:
+            return None
+        except Exception:  # noqa: BLE001
+            self._lidar_futs.pop(name, None)
+            return None
+        self._lidar_futs.pop(name, None)
+        return result
 
     async def _read_lidar_scan_grpc(
         self, cam, lidar: LidarConfig
