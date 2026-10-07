@@ -1,5 +1,5 @@
 # Python dependencies for the nav-stack module (builtin SLAM + nav).
-viam-sdk>=0.30.0
+viam-sdk>=0.80.0
 numpy>=1.24
 PyYAML>=6.0
 # Pillow renders the nav-camera occupancy/plan overlay to PNG.
