@@ -327,6 +327,7 @@ class NavSupervisor:
         self._global_costs_cache = None
         self._global_cache_at = 0.0
         self._global_cache_generation = None
+        self._global_cache_zone_rev = -1
         self._global_cache_lock = threading.Lock()
         self._global_refresh_inflight = False
         self._local_view_cache = None
@@ -500,17 +501,30 @@ class NavSupervisor:
                 if map_data is None:
                     return
                 generation = map_data.get("generation")
+                zone_rev = self._zone_revision()
                 with self._global_cache_lock:
                     if (
                         generation is not None
                         and generation == self._global_cache_generation
+                        and zone_rev == self._global_cache_zone_rev
                         and self._global_costs_cache is not None
                     ):
                         self._global_cache_at = time.monotonic()
                         return
                 from .costmap import build_costmap, occupancy_from_map_dict
+                from .types import OccupancyGrid
 
                 occ = occupancy_from_map_dict(map_data)
+                masks = self._zone_masks(map_data)
+                if masks is not None and masks.keepout.shape == occ.grid.shape:
+                    from ..nav.zones import apply_keepout_to_grid
+
+                    occ = OccupancyGrid(
+                        grid=apply_keepout_to_grid(occ.grid, masks.keepout),
+                        resolution=occ.resolution,
+                        origin_x=occ.origin_x,
+                        origin_y=occ.origin_y,
+                    )
                 costs = build_costmap(
                     occ,
                     inflation_radius_m=self._inflation,
@@ -524,6 +538,7 @@ class NavSupervisor:
                     self._global_occ_cache = occ
                     self._global_costs_cache = costs
                     self._global_cache_generation = generation
+                    self._global_cache_zone_rev = zone_rev
                     self._global_cache_at = time.monotonic()
                     self._global_costmap_rebuilds += 1
             except Exception:  # noqa: BLE001 - keep driving on last cache
@@ -559,6 +574,25 @@ class NavSupervisor:
             for k, v in kwargs.items():
                 setattr(self._status, k, v)
 
+    def _zone_masks(self, map_data: Optional[dict] = None):
+        """Keepout / speed masks for the active map, if zones are configured."""
+        getter = getattr(self._world, "zone_masks_for", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(map_data)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _zone_revision(self) -> int:
+        getter = getattr(self._world, "zone_mask_revision", None)
+        if not callable(getter):
+            return 0
+        try:
+            return int(getter())
+        except Exception:  # noqa: BLE001
+            return 0
+
     def plan(
         self,
         goal: Pose2D,
@@ -581,6 +615,8 @@ class NavSupervisor:
                 feasible=False, error_code=6, error_msg="occupancy map unavailable"
             )
         mapping = self._slam_is_mapping()
+        masks = self._zone_masks(map_data)
+        keepout = None if masks is None else masks.keepout
         result = plan_path(
             map_data,
             pose,
@@ -600,6 +636,7 @@ class NavSupervisor:
             dynamic_obstacle_radius_m=max(0.05, min(self._robot_radius, 0.12)),
             max_goal_snap_m=self._max_goal_snap_m,
             mapping=mapping,
+            keepout_mask=keepout,
         )
         if result.feasible:
             result = connect_plan_start(
@@ -616,6 +653,7 @@ class NavSupervisor:
                 scan=scan,
                 local_view=local_view,
                 mapping=mapping,
+                keepout_mask=keepout,
             )
         if result.feasible and self._smooth_path:
             if result.planning_costs is not None and result.planning_occ is not None:
@@ -641,6 +679,7 @@ class NavSupervisor:
                     enabled=True,
                     sample_spacing_m=self._smooth_spacing,
                     mapping=mapping,
+                    keepout_mask=keepout,
                 )
             result.path = smoothed
         return result
@@ -2671,6 +2710,8 @@ class NavSupervisor:
                         )
                     else:
                         map_data = self._world.get_map()
+                        masks = self._zone_masks(map_data)
+                        keepout = None if masks is None else masks.keepout
                         static_blocked = map_data is not None and path_blocked(
                             map_data,
                             path,
@@ -2679,6 +2720,7 @@ class NavSupervisor:
                             from_pose=pose,
                             ahead_m=path_block_horizon_m,
                             mapping=self._slam_is_mapping(),
+                            keepout_mask=keepout,
                         )
                     # Large localization corrections used to force a replan even
                     # when the polyline was still free — that stop+replan looped
@@ -3027,6 +3069,18 @@ class NavSupervisor:
                             return
 
                 try:
+                    # Cap linear speed inside speed_limit zones (percent of cmd).
+                    masks = self._zone_masks()
+                    if masks is not None:
+                        pct = masks.speed_pct_at(pose.x, pose.y)
+                        if pct is not None and pct < 100.0:
+                            scale = pct / 100.0
+                            cmd = DriveCommand(
+                                vx=cmd.vx * scale,
+                                vy=cmd.vy * scale,
+                                vtheta=cmd.vtheta,
+                                done=cmd.done,
+                            )
                     self._world.set_velocity(cmd.vx, cmd.vy, cmd.vtheta)
                     self._io_timeout_streak = 0
                 except TimeoutError:

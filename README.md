@@ -619,7 +619,9 @@ await nav.do_command({"command": "add_zone", "name": "busy-aisle",
 
 Zones CRUD: `add_zone`, `get_zone`, `list_zones`, `update_zone`, `delete_zone`,
 `delete_all_zones`. Geometry types: `circle`, `box` (optionally `rotation`),
-`polygon`. Locations, zones, and routes are stored per-map.
+`polygon`. Locations, zones, and routes are stored per-map. Keepout zones are
+obstacles for planning; speed-limit zones scale linear velocity while the robot
+is inside them.
 
 ### Map management (SLAM service)
 

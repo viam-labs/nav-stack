@@ -1,12 +1,13 @@
 """Duck-typed nav host for builtin navigation."""
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 
 from ..config import NAV_BACKEND_BUILTIN, NavConfig
 from ..geom import conversions as conv
+from ..nav.zones import Zone, ZoneMaskPublisher, ZoneMaskSet
 from .navigator import BuiltinNavigator
 from .viz_store import NavVizStore
 from .world_io import WorldIO
@@ -25,8 +26,8 @@ class BuiltinNavHost:
     """Nav surface used by ``NavServiceBase`` for builtin navigation.
 
     Implements the methods ``nav_core`` calls on ``runtime.manager`` for
-    navigate / plan / pose / scan / status. ``node`` is None (no zone filter
-    publisher).
+    navigate / plan / pose / scan / status. Zone masks are published into the
+    shared ``ZoneMaskPublisher`` consumed by the planner and controller.
     """
 
     def __init__(
@@ -42,6 +43,10 @@ class BuiltinNavHost:
         self._viz = viz
         self._nav_cfg = nav_cfg
         self.node = None
+        self._zone_masks = ZoneMaskPublisher()
+        attach = getattr(world, "attach_zone_masks", None)
+        if callable(attach):
+            attach(self._zone_masks)
 
     @property
     def viz(self) -> NavVizStore:
@@ -122,6 +127,15 @@ class BuiltinNavHost:
     def get_base_scan(self, max_age_s: float = 1.0) -> Optional[conv.LaserScan2D]:
         return self._world.get_scan(max_age_s)
 
+    def get_map(self) -> Optional[dict]:
+        return self._world.get_map()
+
+    def set_zones(self, zones: Sequence[Zone]) -> None:
+        """Replace named zones and invalidate cached rasters."""
+        self._zone_masks.set_zones(zones)
+        # Eagerly rasterize when a map is available so the next plan/tick is hot.
+        self._zone_masks.masks_for(self._world.get_map())
+
     def publish_zone_masks(
         self,
         keepout_mask: np.ndarray,
@@ -130,8 +144,12 @@ class BuiltinNavHost:
         origin_x: float,
         origin_y: float,
     ) -> None:
-        # Builtin costmap does not consume keepout/speed zone masks yet.
-        del keepout_mask, speed_mask, resolution, origin_x, origin_y
+        self._zone_masks.publish_masks(
+            keepout_mask, speed_mask, resolution, origin_x, origin_y
+        )
+
+    def zone_masks_for(self, map_data: Optional[dict] = None) -> Optional[ZoneMaskSet]:
+        return self._zone_masks.masks_for(map_data or self._world.get_map())
 
     def shutdown(self) -> None:
         try:

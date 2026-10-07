@@ -177,3 +177,51 @@ def test_zone_rasterize_polygon():
                                origin_x=0.0, origin_y=0.0)
     # All 9 cell centers (0.5/1.5/2.5) fall inside the 3x3 polygon.
     assert (mask == 100).sum() == 9
+
+
+def test_apply_keepout_and_speed_pct_at():
+    import numpy as np
+
+    grid = np.zeros((2, 2), dtype=np.int16)
+    keepout = np.array([[100, 0], [0, 0]], dtype=np.int8)
+    out = zmod.apply_keepout_to_grid(grid, keepout)
+    assert out[0, 0] == 100
+    assert out[0, 1] == 0
+
+    speed = np.array([[0, 40], [0, 0]], dtype=np.int8)
+    assert zmod.speed_pct_at(speed, 1.0, 0.0, 0.0, 1.5, 0.5) == 40.0
+    assert zmod.speed_pct_at(speed, 1.0, 0.0, 0.0, 0.5, 0.5) is None
+
+
+def test_zone_mask_publisher_rerasterizes_on_map_change():
+    import numpy as np
+
+    pub = zmod.ZoneMaskPublisher()
+    pub.set_zones(
+        [
+            zmod.Zone(
+                "k",
+                zmod.KEEPOUT,
+                {"type": "circle", "center": [0.5, 0.5], "radius": 0.4},
+            )
+        ]
+    )
+    m1 = {
+        "grid": np.zeros((2, 2), dtype=np.int16),
+        "resolution": 1.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+    }
+    masks = pub.masks_for(m1)
+    assert masks is not None
+    assert masks.keepout[0, 0] == 100
+    rev = pub.revision
+    m2 = {
+        "grid": np.zeros((4, 4), dtype=np.int16),
+        "resolution": 0.5,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+    }
+    masks2 = pub.masks_for(m2)
+    assert masks2.keepout.shape == (4, 4)
+    assert pub.revision == rev  # re-rasterize does not bump revision

@@ -120,6 +120,45 @@ def test_plan_start_next_to_live_obstacle_stays_feasible():
     assert math.hypot(sx - start.x, sy - start.y) < 0.15
 
 
+def test_plan_path_avoids_keepout_mask():
+    """Keepout cells are lethal for planning — path must detour around them."""
+    from src.nav.zones import Zone, KEEPOUT, rasterize_for_map
+
+    m = _empty_map(size=80, resolution=0.05)
+    start = Pose2D(0.5, 2.0, 0.0)
+    goal = Pose2D(3.5, 2.0, 0.0)
+    baseline = plan_path(
+        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert baseline.feasible
+    # Vertical keepout strip across the straight corridor near x=2 m.
+    zones = [
+        Zone(
+            "wall",
+            KEEPOUT,
+            {"type": "box", "center": [2.0, 2.0], "size": [0.3, 3.0]},
+        )
+    ]
+    keepout, _speed = rasterize_for_map(zones, m)
+    assert (keepout >= 100).any()
+    blocked = plan_path(
+        m,
+        start,
+        goal,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        keepout_mask=keepout,
+    )
+    assert blocked.feasible, blocked.error_msg
+    assert paths_meaningfully_differ(baseline.path, blocked.path)
+    # No path sample should sit inside the keepout disk (cell centers).
+    for x, y in blocked.path.points:
+        col = int((x - m["origin_x"]) / m["resolution"])
+        row = int((y - m["origin_y"]) / m["resolution"])
+        if 0 <= row < keepout.shape[0] and 0 <= col < keepout.shape[1]:
+            assert keepout[row, col] < 100
+
+
 def test_plan_path_marks_scan_for_dynamic_replan():
     m = _empty_map(size=60, resolution=0.05)
     start = Pose2D(0.5, 1.5, 0.0)

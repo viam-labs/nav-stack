@@ -597,6 +597,7 @@ def connect_plan_start(
     scan: Optional[conv.LaserScan2D] = None,
     local_view: Optional[LocalCostmapView] = None,
     mapping: bool = False,
+    keepout_mask: Optional[np.ndarray] = None,
 ) -> PlanResult:
     """Prepend a feasible segment when the robot cannot reach ``path[0]`` safely.
 
@@ -613,6 +614,15 @@ def connect_plan_start(
             occ = occupancy_from_map_dict(map_data)
         except (KeyError, TypeError, ValueError) as exc:
             return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
+        if keepout_mask is not None and keepout_mask.shape == occ.grid.shape:
+            from ..nav.zones import apply_keepout_to_grid
+
+            occ = OccupancyGrid(
+                grid=apply_keepout_to_grid(occ.grid, keepout_mask),
+                resolution=occ.resolution,
+                origin_x=occ.origin_x,
+                origin_y=occ.origin_y,
+            )
         costs = build_costmap(
             occ,
             inflation_radius_m=inflation_radius_m,
@@ -645,6 +655,7 @@ def connect_plan_start(
         scan_pose=pose if scan is not None else None,
         local_view=local_view,
         mapping=mapping,
+        keepout_mask=keepout_mask,
     )
     if not bridge.feasible:
         return PlanResult(
@@ -841,8 +852,12 @@ def plan_path(
     dynamic_obstacle_radius_m: float = 0.35,
     max_goal_snap_m: float = 0.5,
     mapping: bool = False,
+    keepout_mask: Optional[np.ndarray] = None,
 ) -> PlanResult:
     """Plan from a bridge-style map dict.
+
+    When ``keepout_mask`` matches the map shape, cells ≥100 are treated as
+    occupied before inflation (virtual keep-out zones).
 
     When ``scan`` is supplied, hits are marked on the map so replans can route
     around dynamic obstacles (people, chairs) not in the static SLAM map.
@@ -862,6 +877,15 @@ def plan_path(
         occ = occupancy_from_map_dict(map_data)
     except (KeyError, TypeError, ValueError) as exc:
         return PlanResult(feasible=False, error_code=4, error_msg=f"bad map: {exc}")
+    if keepout_mask is not None and keepout_mask.shape == occ.grid.shape:
+        from ..nav.zones import apply_keepout_to_grid
+
+        occ = OccupancyGrid(
+            grid=apply_keepout_to_grid(occ.grid, keepout_mask),
+            resolution=occ.resolution,
+            origin_x=occ.origin_x,
+            origin_y=occ.origin_y,
+        )
     # Paint lidar hits as occupied *cells* (small radius). build_costmap then
     # applies inflation once. Using inflation_radius here double-inflates walls
     # already on the map and can seal narrow corridors.
@@ -962,6 +986,7 @@ def path_blocked(
     from_pose: Optional[Pose2D] = None,
     ahead_m: Optional[float] = None,
     mapping: bool = False,
+    keepout_mask: Optional[np.ndarray] = None,
 ) -> bool:
     """True if any sample along ``path`` is non-traversable on a fresh costmap.
 
@@ -973,6 +998,15 @@ def path_blocked(
     if path.empty:
         return True
     occ = occupancy_from_map_dict(map_data)
+    if keepout_mask is not None and keepout_mask.shape == occ.grid.shape:
+        from ..nav.zones import apply_keepout_to_grid
+
+        occ = OccupancyGrid(
+            grid=apply_keepout_to_grid(occ.grid, keepout_mask),
+            resolution=occ.resolution,
+            origin_x=occ.origin_x,
+            origin_y=occ.origin_y,
+        )
     costs = build_costmap(
         occ,
         inflation_radius_m=inflation_radius_m,

@@ -562,21 +562,33 @@ class NavServiceBase(Motion):
 
     def _refresh_zone_masks(self) -> None:
         runtime = self._require_runtime()
-        node = getattr(runtime.manager, "node", None)
-        if node is None:
-            # Builtin host: no costmap-filter publisher.
+        mgr = runtime.manager
+        zone_list = self._zones().list()
+        # Builtin host: store geometries and (re)rasterize against the live map.
+        set_zones = getattr(mgr, "set_zones", None)
+        if callable(set_zones):
+            set_zones(zone_list)
             return
-        grid = node.get_map() if node else None
+        # Legacy path: pre-rasterize and publish OccupancyGrid-style masks.
+        grid = None
+        get_map = getattr(mgr, "get_map", None)
+        if callable(get_map):
+            grid = get_map()
+        if not grid:
+            node = getattr(mgr, "node", None)
+            if node is not None and hasattr(node, "get_map"):
+                grid = node.get_map()
         if not grid:
             LOGGER.warning("no map yet; zone masks will publish once a map is available")
             return
         h, w = grid["grid"].shape
         res = grid["resolution"]
         ox, oy = grid["origin_x"], grid["origin_y"]
-        zone_list = self._zones().list()
         keepout = zones_mod.rasterize_zones(zone_list, zones_mod.KEEPOUT, w, h, res, ox, oy)
         speed = zones_mod.rasterize_zones(zone_list, zones_mod.SPEED_LIMIT, w, h, res, ox, oy)
-        runtime.manager.publish_zone_masks(keepout, speed, res, ox, oy)
+        publish = getattr(mgr, "publish_zone_masks", None)
+        if callable(publish):
+            publish(keepout, speed, res, ox, oy)
 
     # -- DoCommand -----------------------------------------------------------
     async def do_command(
@@ -995,6 +1007,26 @@ class NavServiceBase(Motion):
                         )
 
                         occ = occupancy_from_map_dict(mp)
+                        masks = None
+                        zone_for = getattr(world, "zone_masks_for", None) if world else None
+                        if not callable(zone_for):
+                            zone_for = getattr(runtime.manager, "zone_masks_for", None)
+                        if callable(zone_for):
+                            try:
+                                masks = zone_for(mp)
+                            except Exception:  # noqa: BLE001
+                                masks = None
+                        if masks is not None and masks.keepout.shape == occ.grid.shape:
+                            from ..nav_builtin.types import OccupancyGrid
+
+                            occ = OccupancyGrid(
+                                grid=zones_mod.apply_keepout_to_grid(
+                                    occ.grid, masks.keepout
+                                ),
+                                resolution=occ.resolution,
+                                origin_x=occ.origin_x,
+                                origin_y=occ.origin_y,
+                            )
                         costs = build_costmap(
                             occ,
                             # Same radii the planner uses, so the rendered ring

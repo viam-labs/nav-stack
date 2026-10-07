@@ -122,6 +122,9 @@ await nav.do_command({"command": "list_routes"})
 
 Virtual regions on the active map. Types: `keepout`, `speed_limit` (requires `speed_pct` 1–100).
 
+- **keepout** — painted as occupied on the planning costmap; the planner routes around them.
+- **speed_limit** — while the robot is inside the zone, linear velocity is scaled to `speed_pct` percent of the commanded speed.
+
 Geometry (map frame, meters):
 
 - `{"type": "circle", "center": [x, y], "radius": r}`

@@ -138,6 +138,7 @@ class ViamWorldIO:
         self._map_provider = map_provider
         self._scan_provider = scan_provider
         self._localization_hold_provider = localization_hold_provider
+        self._zone_masks = None  # optional ZoneMaskPublisher from BuiltinNavHost
         self._skip_get_laser_scan: set[str] = set()
         self._map_cache: Optional[dict] = None
         self._map_cache_at = 0.0
@@ -336,6 +337,23 @@ class ViamWorldIO:
     def pose_source(self) -> str:
         """How the last ``get_pose`` was obtained (``in_process`` / ``get_position`` / …)."""
         return self._pose_source
+
+    def attach_zone_masks(self, publisher) -> None:
+        """Wire the host's ``ZoneMaskPublisher`` for planner / speed limits."""
+        self._zone_masks = publisher
+
+    def zone_masks_for(self, map_data: Optional[dict] = None):
+        """Rasterized keepout/speed masks for ``map_data`` (or the live map)."""
+        pub = self._zone_masks
+        if pub is None:
+            return None
+        return pub.masks_for(map_data if map_data is not None else self.get_map())
+
+    def zone_mask_revision(self) -> int:
+        pub = self._zone_masks
+        if pub is None:
+            return 0
+        return int(pub.revision)
 
     def get_map(self) -> Optional[dict]:
         now = time.monotonic()

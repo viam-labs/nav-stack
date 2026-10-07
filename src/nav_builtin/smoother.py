@@ -115,13 +115,26 @@ def smooth_plan_path(
     enabled: bool = True,
     sample_spacing_m: float = 0.10,
     mapping: bool = False,
+    keepout_mask=None,
 ) -> Path2D:
     """Convenience wrapper: build costmap from map dict then smooth."""
     if not enabled:
         return path
+    import numpy as np
+
     from .costmap import build_costmap, occupancy_from_map_dict
+    from .types import OccupancyGrid
 
     occ = occupancy_from_map_dict(map_data)
+    if keepout_mask is not None and np.asarray(keepout_mask).shape == occ.grid.shape:
+        from ..nav.zones import apply_keepout_to_grid
+
+        occ = OccupancyGrid(
+            grid=apply_keepout_to_grid(occ.grid, keepout_mask),
+            resolution=occ.resolution,
+            origin_x=occ.origin_x,
+            origin_y=occ.origin_y,
+        )
     costs = build_costmap(
         occ,
         inflation_radius_m=inflation_radius_m,

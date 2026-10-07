@@ -1,18 +1,19 @@
 """Named-zones store (CRUD) + rasterizer, scoped to a single map.
 
-Two zone types are supported, both applied via Nav2 *costmap filters*:
+Two zone types are supported:
 
-* ``keepout``     - virtual no-go regions (Nav2 ``KeepoutFilter``). Mask cells are
-                    0 (free) or 100 (keepout/lethal).
-* ``speed_limit`` - regions where the robot slows to ``speed_pct`` of max speed
-                    (Nav2 ``SpeedFilter`` with ``type: "percent"``, base 0,
-                    multiplier 1). Mask cells hold the percentage (1-100); 0 means
-                    no limit.
+* ``keepout``     - virtual no-go regions. Mask cells are 0 (free) or 100
+                    (keepout). Builtin nav paints these as occupied before
+                    costmap inflation so the planner routes around them.
+* ``speed_limit`` - regions where the robot slows to ``speed_pct`` of max speed.
+                    Mask cells hold the percentage (1-100); 0 means no limit.
+                    Builtin nav scales linear velocity by this percentage.
 
 Geometry is expressed in the map frame (meters). Supported shapes:
 
 * ``{"type": "circle", "center": [x, y], "radius": r}``
 * ``{"type": "box", "center": [x, y], "size": [w, h], "rotation": theta}``
+  (``rotation`` optional, radians counterclockwise from +x)
 * ``{"type": "polygon", "points": [[x, y], ...]}``
 
 The design leaves room for additional zone types (e.g. directional/preferred-lane)
@@ -22,9 +23,10 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -262,3 +264,134 @@ def rasterize_zones(
             sel[covered] = replace
             mask[sel] = val
     return mask.astype(np.int8)
+
+
+def rasterize_for_map(
+    zones: Sequence[Zone], map_data: dict
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Rasterize keepout and speed masks for a bridge-style map dict."""
+    grid = np.asarray(map_data["grid"])
+    height, width = int(grid.shape[0]), int(grid.shape[1])
+    res = float(map_data["resolution"])
+    ox = float(map_data["origin_x"])
+    oy = float(map_data["origin_y"])
+    keepout = rasterize_zones(zones, KEEPOUT, width, height, res, ox, oy)
+    speed = rasterize_zones(zones, SPEED_LIMIT, width, height, res, ox, oy)
+    return keepout, speed
+
+
+def apply_keepout_to_grid(grid: np.ndarray, keepout: np.ndarray) -> np.ndarray:
+    """Return a copy of ``grid`` with keepout cells marked occupied (100)."""
+    if keepout.shape != grid.shape:
+        raise ValueError(
+            f"keepout mask shape {keepout.shape} != occupancy shape {grid.shape}"
+        )
+    out = np.asarray(grid, dtype=np.int16).copy()
+    out[np.asarray(keepout) >= 100] = 100
+    return out
+
+
+def speed_pct_at(
+    speed_mask: np.ndarray,
+    resolution: float,
+    origin_x: float,
+    origin_y: float,
+    x: float,
+    y: float,
+) -> Optional[float]:
+    """Speed limit percent (1-100) at map-frame ``(x, y)``, or None if unset."""
+    col = int((float(x) - float(origin_x)) / float(resolution))
+    row = int((float(y) - float(origin_y)) / float(resolution))
+    h, w = speed_mask.shape
+    if not (0 <= row < h and 0 <= col < w):
+        return None
+    val = int(speed_mask[row, col])
+    if val <= 0:
+        return None
+    return float(max(1, min(100, val)))
+
+
+@dataclass
+class ZoneMaskSet:
+    """Rasterized keepout / speed masks aligned to one occupancy map."""
+
+    keepout: np.ndarray
+    speed: np.ndarray
+    resolution: float
+    origin_x: float
+    origin_y: float
+
+    def matches_map(self, map_data: dict) -> bool:
+        grid = np.asarray(map_data["grid"])
+        return (
+            self.keepout.shape == grid.shape
+            and self.speed.shape == grid.shape
+            and abs(self.resolution - float(map_data["resolution"])) < 1e-9
+            and abs(self.origin_x - float(map_data["origin_x"])) < 1e-9
+            and abs(self.origin_y - float(map_data["origin_y"])) < 1e-9
+        )
+
+    def speed_pct_at(self, x: float, y: float) -> Optional[float]:
+        return speed_pct_at(
+            self.speed, self.resolution, self.origin_x, self.origin_y, x, y
+        )
+
+
+class ZoneMaskPublisher:
+    """Thread-safe zone geometries + cached rasters for the active map."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._zones: List[Zone] = []
+        self._masks: Optional[ZoneMaskSet] = None
+        self._revision: int = 0
+
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    def set_zones(self, zones: Sequence[Zone]) -> None:
+        with self._lock:
+            self._zones = list(zones)
+            self._masks = None
+            self._revision += 1
+
+    def publish_masks(
+        self,
+        keepout_mask: np.ndarray,
+        speed_mask: np.ndarray,
+        resolution: float,
+        origin_x: float,
+        origin_y: float,
+    ) -> None:
+        with self._lock:
+            self._masks = ZoneMaskSet(
+                keepout=np.asarray(keepout_mask),
+                speed=np.asarray(speed_mask),
+                resolution=float(resolution),
+                origin_x=float(origin_x),
+                origin_y=float(origin_y),
+            )
+            self._revision += 1
+
+    def masks_for(self, map_data: Optional[dict]) -> Optional[ZoneMaskSet]:
+        """Return masks for ``map_data``, re-rasterizing when the map changes."""
+        if map_data is None or map_data.get("grid") is None:
+            return None
+        with self._lock:
+            if self._masks is not None and self._masks.matches_map(map_data):
+                return self._masks
+            keepout, speed = rasterize_for_map(self._zones, map_data)
+            self._masks = ZoneMaskSet(
+                keepout=keepout,
+                speed=speed,
+                resolution=float(map_data["resolution"]),
+                origin_x=float(map_data["origin_x"]),
+                origin_y=float(map_data["origin_y"]),
+            )
+            return self._masks
+
+    def zones(self) -> List[Zone]:
+        with self._lock:
+            return list(self._zones)
