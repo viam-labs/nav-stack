@@ -20,6 +20,7 @@ from ..nav.simple_motion import (
     rear_clearance_m,
     spin_clearance_m,
 )
+from ..nav.zones import apply_speed_zone_limit
 from ..geom import conversions as conv
 from .controller import (
     FollowerConfig,
@@ -592,6 +593,20 @@ class NavSupervisor:
             return int(getter())
         except Exception:  # noqa: BLE001
             return 0
+
+    def _speed_pct_at(self, pose: Pose2D) -> Optional[float]:
+        masks = self._zone_masks()
+        if masks is None:
+            return None
+        return masks.speed_pct_at(pose.x, pose.y)
+
+    def _apply_speed_zone(self, pose: Pose2D, cmd: DriveCommand) -> DriveCommand:
+        """Limit ``cmd`` inside a speed zone without causing pure-spin swing."""
+        pct = self._speed_pct_at(pose)
+        if pct is None or pct >= 100.0 or cmd.done:
+            return cmd
+        vx, vy, vtheta = apply_speed_zone_limit(cmd.vx, cmd.vy, cmd.vtheta, pct)
+        return DriveCommand(vx, vy, vtheta, cmd.done)
 
     def plan(
         self,
@@ -2884,6 +2899,9 @@ class NavSupervisor:
                             "wp": progress.get("waypoint_index"),
                         }
                     )
+                # Apply before status / lookahead feedback so the limited twist
+                # is what we report and close the loop on.
+                cmd = self._apply_speed_zone(pose, cmd)
                 progress = {
                     **progress,
                     "cmd_vx_mps": cmd.vx,
@@ -3069,18 +3087,6 @@ class NavSupervisor:
                             return
 
                 try:
-                    # Cap linear speed inside speed_limit zones (percent of cmd).
-                    masks = self._zone_masks()
-                    if masks is not None:
-                        pct = masks.speed_pct_at(pose.x, pose.y)
-                        if pct is not None and pct < 100.0:
-                            scale = pct / 100.0
-                            cmd = DriveCommand(
-                                vx=cmd.vx * scale,
-                                vy=cmd.vy * scale,
-                                vtheta=cmd.vtheta,
-                                done=cmd.done,
-                            )
                     self._world.set_velocity(cmd.vx, cmd.vy, cmd.vtheta)
                     self._io_timeout_streak = 0
                 except TimeoutError:

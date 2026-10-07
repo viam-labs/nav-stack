@@ -311,6 +311,44 @@ def speed_pct_at(
     return float(max(1, min(100, val)))
 
 
+# Must match ``ViamWorldIO._sanitize_base_cmd``: tiny vx + large ω becomes a
+# pure spin. Scaling only linear speed in a zone used to trip that and make
+# the robot swing in place when starting nav inside a speed_limit region.
+_SANITIZE_SPIN_VX_MPS = 0.12
+_SANITIZE_SPIN_W_RAD_S = 0.25
+_CRAWL_FLOOR_MPS = 0.125
+
+
+def apply_speed_zone_limit(
+    vx: float,
+    vy: float,
+    vtheta: float,
+    speed_pct: float,
+) -> Tuple[float, float, float]:
+    """Scale a body twist by ``speed_pct`` without collapsing into pure-spin.
+
+    Linear and angular are scaled together so curvature is preserved. If the
+    result would still be killed by the base sanitizer (``|vx| < 0.12`` with
+    ``|vθ| > 0.25``), raise ``|vx|`` to the crawl floor and clamp ``|vθ|``.
+    """
+    if speed_pct >= 100.0:
+        return float(vx), float(vy), float(vtheta)
+    scale = max(0.01, min(1.0, float(speed_pct) / 100.0))
+    out_vx = float(vx) * scale
+    out_vy = float(vy) * scale
+    out_w = float(vtheta) * scale
+    if (
+        abs(out_vx) > 1e-9
+        and abs(out_vx) < _SANITIZE_SPIN_VX_MPS
+        and abs(out_w) > _SANITIZE_SPIN_W_RAD_S
+    ):
+        out_vx = math.copysign(max(abs(out_vx), _CRAWL_FLOOR_MPS), out_vx)
+        out_w = math.copysign(
+            min(abs(out_w), _SANITIZE_SPIN_W_RAD_S), out_w
+        )
+    return out_vx, out_vy, out_w
+
+
 @dataclass
 class ZoneMaskSet:
     """Rasterized keepout / speed masks aligned to one occupancy map."""
