@@ -2101,6 +2101,8 @@ class NavServiceBase(Motion):
             stop_distance_m=cfg.simple_stop_distance,
             slow_distance_m=cfg.simple_slow_distance,
             footprint_half_width_m=cfg.hard_clearance_radius_m() + 0.12,
+            body_half_length_m=cfg.nose_offset_m(),
+            body_half_width_m=cfg.inscribed_radius_m(),
             max_age_s=cfg.simple_scan_max_age,
         )
 

@@ -565,6 +565,31 @@ class BuiltinNavConfig:
     # Reject plans whose free-cell goal snap exceeds this (metres). Live scan
     # inflation used to snap the goal ~1 m away and then "succeed" there.
     max_goal_snap_m: float = 0.5
+    # "Arrived nearby": when every replan fails because the *goal* is blocked
+    # (snap limit exceeded / no feasible path into the goal pocket) while the
+    # robot is within ``goal_blocked_accept_m`` of it and the start cell is
+    # free, stop after ``goal_blocked_after_s`` and finish ``succeeded`` with
+    # ``goal_blocked: true`` and ``goal_offset_m`` in status instead of
+    # replanning for minutes (live: chair on the goal, bins in the aisle).
+    # ``0`` disables.
+    goal_blocked_accept_m: float = 2.5
+    goal_blocked_after_s: float = 15.0
+    # Localization yield: when the start cell is lethal / unreachable and no
+    # progress is made for ``loc_yield_after_s``, pause the goal so SLAM sees
+    # nav as idle, ask it to check localization (large corrections need two
+    # agreeing matches), then replan from the corrected pose. Breaks the
+    # "nav holds the goal → SLAM refuses >1 m jumps → nav cannot plan"
+    # deadlock without raising the mid-nav apply cap.
+    loc_yield_enabled: bool = True
+    loc_yield_after_s: float = 8.0
+    loc_yield_wait_s: float = 8.0
+    loc_yield_cooldown_s: float = 30.0
+    loc_yield_max_per_goal: int = 3
+    # Escalation budget per replan cycle (blocked-corridor retry + forced side
+    # vias). The first attempt always runs; escalations stop once this many
+    # seconds have been spent so a cancel / control tick is not stuck behind
+    # 14 full-map plans.
+    replan_budget_s: float = 3.0
     # Final approach: cap linear speed within this distance of the goal.
     approach_dist_m: float = 0.35
     # Post-process global plans (shortcut + resample) before following.

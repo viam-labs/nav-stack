@@ -146,7 +146,12 @@ def unregister_nav_host(nav_name: str) -> None:
 
 
 def any_navigation_active() -> bool:
-    """True if any registered navigation host reports an active goal."""
+    """True if any registered navigation host reports an active goal.
+
+    A host that has paused its goal to let SLAM apply a large correction
+    (``localization_yield``) counts as idle here: SLAM's "no big jumps while
+    navigating" rule is exactly what the yield exists to lift.
+    """
     with _LOCK:
         hosts = list(_NAV_HOSTS.values())
     for host in hosts:
@@ -154,6 +159,9 @@ def any_navigation_active() -> bool:
             status = host.nav_status()
         except Exception:  # noqa: BLE001
             continue
-        if isinstance(status, dict) and status.get("active"):
-            return True
+        if not isinstance(status, dict) or not status.get("active"):
+            continue
+        if status.get("localization_yield"):
+            continue
+        return True
     return False

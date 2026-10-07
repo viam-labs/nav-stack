@@ -859,9 +859,15 @@ def compute_path_command(
         float(spin_radius_m) if spin_radius_m is not None else float(robot_radius_m)
     )
     spin_blocked = False
+    _obs = cfg.obstacle
     scan_spin_hit = (
         scan is not None
-        and spin_clearance_m(scan) < spin_radius + 0.05
+        and spin_clearance_m(
+            scan,
+            body_half_length_m=getattr(_obs, "body_half_length_m", None),
+            body_half_width_m=getattr(_obs, "body_half_width_m", None),
+        )
+        < spin_radius + 0.05
     )
     cost_spin_hit = (
         local_view is not None

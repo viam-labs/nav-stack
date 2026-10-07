@@ -160,6 +160,14 @@ class NavSupervisor:
         drive_timeout_streak = kw["drive_timeout_streak"]
         yaw_align_timeout_s = kw["yaw_align_timeout_s"]
         max_goal_snap_m = kw["max_goal_snap_m"]
+        goal_blocked_accept_m = kw.get("goal_blocked_accept_m", 2.5)
+        goal_blocked_after_s = kw.get("goal_blocked_after_s", 15.0)
+        loc_yield_enabled = kw.get("loc_yield_enabled", True)
+        loc_yield_after_s = kw.get("loc_yield_after_s", 8.0)
+        loc_yield_wait_s = kw.get("loc_yield_wait_s", 8.0)
+        loc_yield_cooldown_s = kw.get("loc_yield_cooldown_s", 30.0)
+        loc_yield_max_per_goal = kw.get("loc_yield_max_per_goal", 3)
+        replan_budget_s = kw.get("replan_budget_s", 3.0)
         max_linear_accel_mps2 = kw["max_linear_accel_mps2"]
         max_linear_decel_mps2 = kw["max_linear_decel_mps2"]
         max_angular_accel_rad_s2 = kw["max_angular_accel_rad_s2"]
@@ -278,6 +286,21 @@ class NavSupervisor:
         self._clearance_preference_m = max(0.0, float(clearance_preference_m))
         self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
         self._max_goal_snap_m = max(0.0, float(max_goal_snap_m))
+        # Goal-blocked finish ("arrived nearby") — see _maybe_finish_goal_blocked.
+        self._goal_blocked_accept_m = max(0.0, float(goal_blocked_accept_m))
+        self._goal_blocked_after_s = max(0.0, float(goal_blocked_after_s))
+        self._goal_blocked_since: Optional[float] = None
+        # Localization yield — see _maybe_yield_for_localization.
+        self._loc_yield_enabled = bool(loc_yield_enabled)
+        self._loc_yield_after_s = max(0.0, float(loc_yield_after_s))
+        self._loc_yield_wait_s = max(1.0, float(loc_yield_wait_s))
+        self._loc_yield_cooldown_s = max(0.0, float(loc_yield_cooldown_s))
+        self._loc_yield_max_per_goal = max(0, int(loc_yield_max_per_goal))
+        self._loc_yield_count = 0
+        self._loc_yield_until = 0.0
+        self._loc_yield_info: dict = {}
+        # Escalation budget per replan cycle (blocked-corridor + forced vias).
+        self._replan_budget_s = max(0.0, float(replan_budget_s))
         self._algorithm = algorithm
         self._replan_period = replan_period_s
         self._timeout_s = timeout_s
@@ -407,6 +430,10 @@ class NavSupervisor:
                 # Padding beyond the inscribed radius covers light shoulder
                 # grazes (half-width + ~12 cm) without sealing every doorway.
                 footprint_half_width_m=float(robot_radius_m) + 0.12,
+                # True body rectangle: returns inside it are contact /
+                # self-hits and must not read as "obstacle ahead".
+                body_half_length_m=float(nose_offset),
+                body_half_width_m=float(self._body_radius),
                 max_age_s=scan_max_age_s,
             )
             if avoid_obstacles
@@ -433,6 +460,9 @@ class NavSupervisor:
                 length_m=s.length_m,
                 motion=s.motion,
                 progress=dict(s.progress) if s.progress is not None else None,
+                localization_yield=bool(s.localization_yield),
+                goal_blocked=bool(s.goal_blocked),
+                goal_offset_m=s.goal_offset_m,
             )
 
     def control_stats(self) -> dict:
@@ -652,6 +682,7 @@ class NavSupervisor:
             max_goal_snap_m=self._max_goal_snap_m,
             mapping=mapping,
             keepout_mask=keepout,
+            should_abort=self._cancel.is_set,
         )
         if result.feasible:
             result = connect_plan_start(
@@ -669,6 +700,7 @@ class NavSupervisor:
                 local_view=local_view,
                 mapping=mapping,
                 keepout_mask=keepout,
+                should_abort=self._cancel.is_set,
             )
         if result.feasible and self._smooth_path:
             if result.planning_costs is not None and result.planning_occ is not None:
@@ -1090,6 +1122,8 @@ class NavSupervisor:
         remaining = max(0.5, _path_length(path))
         best: Optional[tuple[float, Path2D, PlanResult, str]] = None
         for side in (0.45, -0.45, 0.65, -0.65, 0.35, -0.35):
+            if self._cancel.is_set():
+                break
             via = Pose2D(bx + side * nx, by + side * ny, yaw)
             if local_view is not None and footprint_collides(
                 local_view,
@@ -1304,6 +1338,7 @@ class NavSupervisor:
 
         old_len = _path_length(path)
         self._last_replan_trigger = str(trigger or "")
+        t_replan0 = time.monotonic()
         hold_active = self._detour_ban_path is not None
         # Prefer painting the abandoned short corridor while the ban is live;
         # otherwise only escalate to corridor paint after a failed peel.
@@ -1352,6 +1387,18 @@ class NavSupervisor:
             return None
 
         for label, paint in attempts:
+            # A cancel must not wait behind a replan storm (live: >10 s to
+            # register while 84 planning ticks ran back to back).
+            if self._cancel.is_set():
+                reasons.append(f"{label}: skipped (cancel requested)")
+                break
+            # Escalations are bounded by a time budget; the first attempt
+            # always runs so a cheap peel is never lost.
+            if paint and (time.monotonic() - t_replan0) > self._replan_budget_s:
+                reasons.append(
+                    f"{label}: skipped (replan budget {self._replan_budget_s:.1f}s exhausted)"
+                )
+                break
             # During a detour ban, always seal the abandoned short corridor —
             # never the path we just committed to.
             do_paint = paint or hold_active
@@ -1395,7 +1442,17 @@ class NavSupervisor:
                 best = (new_len, replanned.path, replanned, label)
             if not paint and not hold_active:
                 break
-        if best is None and local_view is not None:
+        escalate_ok = (
+            not self._cancel.is_set()
+            and (time.monotonic() - t_replan0) <= self._replan_budget_s
+        )
+        if best is None and local_view is not None and not escalate_ok:
+            reasons.append(
+                "forced-via: skipped (cancel requested)"
+                if self._cancel.is_set()
+                else f"forced-via: skipped (replan budget {self._replan_budget_s:.1f}s exhausted)"
+            )
+        if best is None and local_view is not None and escalate_ok:
             forced = self._forced_side_detour(goal, pose, path, scan, local_view)
             if forced is not None:
                 new_path, result, label = forced
@@ -1426,8 +1483,11 @@ class NavSupervisor:
             # (that is the thrash). Exception: path is actually blocked /
             # pose-jump recovery needs any escape (force_lift_short_flip).
             ban_was_only_reason = any("short-flip" in r for r in reasons)
-            if hold_active and allow_lift_ban and (
-                not ban_was_only_reason or force_lift_short_flip
+            if (
+                hold_active
+                and allow_lift_ban
+                and not self._cancel.is_set()
+                and (not ban_was_only_reason or force_lift_short_flip)
             ):
                 reasons.append("detour-ban: lifting (no alternate)")
                 self._detour_ban_path = None
@@ -1481,6 +1541,7 @@ class NavSupervisor:
     ) -> None:
         """Publish an accepted replan and ban the abandoned short corridor."""
         self._last_replan_error = ""
+        self._goal_blocked_since = None
         hold = self._detour_ban_path is not None
         # Commit to a longer / different corridor for the rest of this goal.
         if (
@@ -1561,6 +1622,8 @@ class NavSupervisor:
         same corridor: painting it blocked is what sealed the hallway.
         """
         del pose, failed_count
+        if self._cancel.is_set():
+            return None
         if self._stuck_pose_refine_used or not self._replan_blocked_at_start():
             return None
         self._stuck_pose_refine_used = True
@@ -1578,9 +1641,173 @@ class NavSupervisor:
             trigger=f"{trigger} after stuck_pose_refine",
         )
 
+    # -- goal-blocked / localization-yield policies ---------------------------
+    def _replan_says_goal_blocked(self) -> bool:
+        """True when the last replan failed because the *goal* is unreachable."""
+        err = (self._last_replan_error or "").lower()
+        if not err:
+            return False
+        return (
+            "goal blocked" in err
+            or "no feasible path" in err
+            or "goal pose is in lethal" in err
+        )
+
+    def _maybe_finish_goal_blocked(
+        self, pose: Pose2D, goal: Pose2D, now: float, *, pose_cost: int
+    ) -> bool:
+        """Finish ``succeeded`` + ``goal_blocked`` when only the goal is unreachable.
+
+        The planner has no route into the goal pocket (chair on the goal, bins
+        in the aisle) while the robot itself stands on free cost within
+        ``goal_blocked_accept_m``. More replanning cannot help; stop here and
+        report ``goal_offset_m`` so the caller decides. A lethal *start* cell
+        is a localization problem and goes to the yield instead. Returns True
+        when the goal was finished (caller must return).
+        """
+        from .costmap import is_hard
+
+        if self._goal_blocked_accept_m <= 0.0:
+            return False
+        if is_hard(int(pose_cost)) or not self._replan_says_goal_blocked():
+            self._goal_blocked_since = None
+            return False
+        dist = distance_m(pose, goal)
+        if dist > self._goal_blocked_accept_m:
+            self._goal_blocked_since = None
+            return False
+        if self._goal_blocked_since is None:
+            self._goal_blocked_since = now
+            return False
+        if now - self._goal_blocked_since < self._goal_blocked_after_s:
+            return False
+        self._world.stop()
+        self._set_status(
+            state="succeeded",
+            active=False,
+            error_msg="",
+            goal_blocked=True,
+            goal_offset_m=float(dist),
+        )
+        return True
+
+    def _maybe_yield_for_localization(
+        self,
+        goal: Pose2D,
+        pose: Pose2D,
+        path: Path2D,
+        scan: Optional[conv.LaserScan2D],
+        local_view,
+        *,
+        pose_cost: int,
+        stuck_s: float,
+        trigger: str,
+    ) -> Optional[Path2D]:
+        """Pause the goal so SLAM may apply a correction nav itself refuses.
+
+        Deadlock seen live: the published pose drifted >1 m into a mapped
+        obstacle; SLAM had a good correction but refuses large jumps while a
+        goal is active; nav could not plan out of a lethal start cell; nobody
+        yielded. Here nav marks itself ``localization_yield`` (SLAM then sees
+        it as idle via ``runtime.any_navigation_active``), stops, and asks
+        SLAM to check localization up to three times — an idle-mode large jump
+        needs two agreeing matches. On a correction, replan from the fresh
+        pose (same corridor allowed). Returns the new path, or None.
+        """
+        from .costmap import is_hard
+
+        if not self._loc_yield_enabled or self._cancel.is_set():
+            return None
+        now = time.monotonic()
+        if (
+            self._loc_yield_count >= self._loc_yield_max_per_goal
+            or now < self._loc_yield_until
+        ):
+            return None
+        start_lethal = is_hard(int(pose_cost)) or self._replan_blocked_at_start()
+        if not start_lethal or stuck_s < self._loc_yield_after_s:
+            return None
+        check_fn = getattr(self._world, "check_localization", None)
+        if not callable(check_fn):
+            return None
+        self._loc_yield_count += 1
+        self._loc_yield_until = now + self._loc_yield_cooldown_s
+        self._stop_before_replan(f"loc_yield:{trigger}")
+        with self._status_lock:
+            progress = dict(self._status.progress or {})
+            progress.update(
+                obstacle="loc_yield", cmd_vx_mps=0.0, cmd_vtheta_rad_s=0.0
+            )
+            self._status.progress = progress
+            self._status.localization_yield = True
+        info: dict = {"trigger": trigger, "attempts": [], "corrected": False}
+        corrected = False
+        deadline = now + self._loc_yield_wait_s
+        try:
+            for attempt in range(1, 4):
+                if self._cancel.is_set():
+                    break
+                try:
+                    result = check_fn(
+                        allow_during_navigation=False,
+                        full_map_escalation="still_bad",
+                    )
+                except Exception as exc:  # noqa: BLE001 - a SLAM timeout must not kill the goal
+                    info["attempts"].append(
+                        {"attempt": attempt, "error": str(exc).strip()[:120]}
+                    )
+                    break
+                res = dict(result) if isinstance(result, dict) else {}
+                info["attempts"].append(
+                    {
+                        k: res.get(k)
+                        for k in ("status", "reason", "score", "shift_m", "shift_deg", "corrected")
+                    }
+                )
+                if res.get("corrected"):
+                    corrected = True
+                    break
+                if str(res.get("status") or "") not in (
+                    "awaiting_confirm",
+                    "skipped",
+                    "nav_hold",
+                    "low_quality",
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(2.0)
+        finally:
+            with self._status_lock:
+                self._status.localization_yield = False
+        info["corrected"] = corrected
+        self._loc_yield_info = info
+        if not corrected:
+            return None
+        fresh = self._world.get_pose() or pose
+        self._note_base_stopped()
+        return self._try_replan(
+            goal,
+            fresh,
+            path,
+            scan,
+            require_different=False,
+            failed_count=0,
+            local_view=local_view,
+            trigger=f"{trigger} after loc_yield",
+        )
+
     def run_goal(self, goal: Pose2D) -> None:
         """Plan and follow until success, failure, or cancel. Blocking."""
         self._cancel.clear()
+        self._goal_blocked_since = None
+        self._loc_yield_count = 0
+        self._loc_yield_until = 0.0
+        self._loc_yield_info = {}
+        with self._status_lock:
+            self._status.localization_yield = False
+            self._status.goal_blocked = False
+            self._status.goal_offset_m = None
         self._last_replan_error = ""
         self._last_replan_trigger = ""
         self._last_replan_info = {}
@@ -2068,6 +2295,29 @@ class NavSupervisor:
                                 fresh = self._world.get_pose()
                                 if fresh is not None:
                                     pose = fresh
+                        if new_path is None:
+                            # Start cell lethal + no progress: let SLAM fix the
+                            # pose, then replan from where we really are.
+                            yielded = self._maybe_yield_for_localization(
+                                goal,
+                                pose,
+                                path,
+                                scan,
+                                local_view,
+                                pose_cost=pose_cost,
+                                stuck_s=now - last_progress_at,
+                                trigger=_trig,
+                            )
+                            if yielded is not None:
+                                new_path = yielded
+                                fresh = self._world.get_pose()
+                                if fresh is not None:
+                                    pose = fresh
+                                last_progress_at = time.monotonic()
+                        if new_path is None and self._maybe_finish_goal_blocked(
+                            pose, goal, now, pose_cost=pose_cost
+                        ):
+                            return
                         if new_path is not None:
                             path = new_path
                             local_blocked_since = None
@@ -2162,6 +2412,7 @@ class NavSupervisor:
                     "last_replan_error": self._last_replan_error,
                     "last_replan_trigger": self._last_replan_trigger,
                     "last_replan_info": dict(self._last_replan_info),
+                    "loc_yield": dict(self._loc_yield_info),
                     **(
                         {"stuck_pose_refine": dict(self._stuck_pose_refine)}
                         if self._stuck_pose_refine
@@ -2376,7 +2627,14 @@ class NavSupervisor:
                             local_view=local_view,
                             current=pose,
                         )
-                        spin_clear = spin_clearance_m(scan) >= self._spin_radius + 0.05
+                        spin_clear = (
+                            spin_clearance_m(
+                                scan,
+                                body_half_length_m=self._follower.obstacle.body_half_length_m,
+                                body_half_width_m=self._follower.obstacle.body_half_width_m,
+                            )
+                            >= self._spin_radius + 0.05
+                        )
                         if (
                             spin_clear
                             and self._spin_radius > self._robot_radius
@@ -2594,7 +2852,11 @@ class NavSupervisor:
                         else 0
                     )
                     rear = (
-                        rear_clearance_m(scan)
+                        rear_clearance_m(
+                            scan,
+                            body_half_length_m=self._follower.obstacle.body_half_length_m,
+                            body_half_width_m=self._follower.obstacle.body_half_width_m,
+                        )
                         if scan is not None
                         else math.inf
                     )
@@ -2647,7 +2909,14 @@ class NavSupervisor:
                     if spin_stuck_since is None:
                         spin_stuck_since = now
                     elif now - spin_stuck_since >= self._backup_stuck_time_s:
-                        rear_ok = rear_clearance_m(scan) >= self._backup_rear_clear_m
+                        rear_ok = (
+                            rear_clearance_m(
+                                scan,
+                                body_half_length_m=self._follower.obstacle.body_half_length_m,
+                                body_half_width_m=self._follower.obstacle.body_half_width_m,
+                            )
+                            >= self._backup_rear_clear_m
+                        )
                         costmap_ok = reverse_backup_feasible(
                             local_view,
                             pose.x,
@@ -2810,6 +3079,10 @@ class NavSupervisor:
                         vx_sign_history.clear()
                         spin_stuck_since = None
                     elif static_blocked:
+                        if self._maybe_finish_goal_blocked(
+                            pose, goal, now, pose_cost=pose_cost
+                        ):
+                            return
                         failed_static_replan += 1
                         clearance = progress.get("forward_clearance_m")
                         has_room = clearance is None or float(clearance) >= 0.35
@@ -3035,6 +3308,26 @@ class NavSupervisor:
                         failed_replan_while_blocked = 0
                         backup_attempts = 0
                         return False
+                    yielded = self._maybe_yield_for_localization(
+                        goal,
+                        pose,
+                        path,
+                        scan,
+                        local_view,
+                        pose_cost=pose_cost,
+                        stuck_s=now - last_progress_at,
+                        trigger=_trig,
+                    )
+                    if yielded is not None:
+                        path = yielded
+                        last_progress_at = time.monotonic()
+                        local_blocked_since = None
+                        failed_replan_while_blocked = 0
+                        return False
+                    if self._maybe_finish_goal_blocked(
+                        pose, goal, now, pose_cost=pose_cost
+                    ):
+                        return True
                     # Still recovering: do not abort while local_blocked and
                     # we have not exhausted several forced-via attempts.
                     if local_blocked and failed_replan_while_blocked < 5:

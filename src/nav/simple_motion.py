@@ -60,6 +60,15 @@ class ObstacleConfig:
     # is only ±0.35 m), so shoulder-height bins/chairs slid past it. ``None``
     # disables; builtin nav sets robot_radius + a small margin.
     footprint_half_width_m: Optional[float] = None
+    # Physical body rectangle (half-length = nose offset, half-width = the
+    # inscribed radius). Returns that fall *inside* it are contact or
+    # self-returns, never something ahead: the corridor / arc / spin / rear
+    # measures ignore them. Live 2026-10-07: a mapped desk edge 1 cm inside
+    # the left flank read as "obstacle 8 mm ahead", forward clearance went to
+    # zero, state ``avoid``, and the robot could not move in any direction.
+    # ``None`` keeps the old behaviour (no clearing).
+    body_half_length_m: Optional[float] = None
+    body_half_width_m: Optional[float] = None
     side_cone_rad: float = math.radians(100.0)  # left/right span for turn decision
     # While spinning (vx≈0), freeze only for true nose collisions — NOT the full
     # stop_distance. Using stop_distance here froze rotate-to-heading whenever a
@@ -79,12 +88,34 @@ def normalize_angle(rad: float) -> float:
     return conv.normalize_angle(rad)
 
 
+def _body_mask(
+    x: np.ndarray,
+    y: np.ndarray,
+    half_length_m: Optional[float],
+    half_width_m: Optional[float],
+) -> np.ndarray:
+    """True for returns inside the physical body rectangle (contact / self-hit)."""
+    if (
+        half_length_m is None
+        or half_width_m is None
+        or half_length_m <= 0.0
+        or half_width_m <= 0.0
+    ):
+        return np.zeros(np.shape(x), dtype=bool)
+    return (np.abs(x) <= float(half_length_m)) & (np.abs(y) <= float(half_width_m))
+
+
 def rear_clearance_m(
     scan: conv.LaserScan2D,
     *,
     half_cone_rad: float = math.radians(60.0),
+    body_half_length_m: Optional[float] = None,
+    body_half_width_m: Optional[float] = None,
 ) -> float:
-    """Minimum range in the rear arc (scan frame, rear ≈ |bearing| > π − half)."""
+    """Minimum range in the rear arc (scan frame, rear ≈ |bearing| > π − half).
+
+    Returns inside the body rectangle are ignored when its dimensions are given.
+    """
     ranges = np.asarray(scan.ranges, dtype=float)
     n = len(ranges)
     if n == 0:
@@ -93,6 +124,10 @@ def rear_clearance_m(
     angles = np.arctan2(np.sin(angles), np.cos(angles))
     in_rear = np.abs(angles) >= (math.pi - half_cone_rad)
     valid = in_rear & np.isfinite(ranges) & (ranges >= scan.range_min)
+    if valid.any() and body_half_length_m is not None and body_half_width_m is not None:
+        x = ranges * np.cos(angles)
+        y = ranges * np.sin(angles)
+        valid &= ~_body_mask(x, y, body_half_length_m, body_half_width_m)
     if not valid.any():
         return math.inf
     return float(ranges[valid].min())
@@ -121,6 +156,9 @@ def corridor_min_range(
     scan: conv.LaserScan2D,
     half_width_m: float,
     max_forward_m: float,
+    *,
+    body_half_length_m: Optional[float] = None,
+    body_half_width_m: Optional[float] = None,
 ) -> float:
     """Nearest forward distance of any return inside the body-width corridor.
 
@@ -128,6 +166,10 @@ def corridor_min_range(
     in the scan (base_link) frame and returns the smallest ``x``; ``inf`` when
     the corridor is clear. Complements ``cone_min_range``: an angular cone
     misses obstacles at the robot's shoulders when they are close.
+
+    Returns inside the physical body rectangle (``body_half_*``) are ignored:
+    they are contact or self-returns, and counting one as "ahead" pins the
+    robot with forward clearance ≈ 0 even though the way ahead is open.
     """
     pts = scan.to_points()
     if pts.size == 0:
@@ -136,26 +178,35 @@ def corridor_min_range(
     y = pts[:, 1]
     inside = (x > 0.0) & (x <= max_forward_m) & (np.abs(y) <= half_width_m)
     inside &= np.isfinite(x) & np.isfinite(y)
+    inside &= ~_body_mask(x, y, body_half_length_m, body_half_width_m)
     if not inside.any():
         return math.inf
     return float(x[inside].min())
 
 
-def spin_clearance_m(scan: conv.LaserScan2D) -> float:
+def spin_clearance_m(
+    scan: conv.LaserScan2D,
+    *,
+    body_half_length_m: Optional[float] = None,
+    body_half_width_m: Optional[float] = None,
+) -> float:
     """Distance to the nearest return in *any* direction (rotation clearance).
 
     Turning in place sweeps a disc of the body's circumscribed radius, so the
     limiting measurement is the closest return anywhere around the robot — a
     forward cone says nothing about the corners that swing into the walls.
+    Returns inside the body rectangle are ignored when its dimensions are given.
     """
     pts = scan.to_points()
     if pts.size == 0:
         return math.inf
-    dist = np.hypot(pts[:, 0], pts[:, 1])
-    dist = dist[np.isfinite(dist)]
-    if dist.size == 0:
+    x = pts[:, 0]
+    y = pts[:, 1]
+    keep = np.isfinite(x) & np.isfinite(y)
+    keep &= ~_body_mask(x, y, body_half_length_m, body_half_width_m)
+    if not keep.any():
         return math.inf
-    return float(dist.min())
+    return float(np.hypot(x[keep], y[keep]).min())
 
 
 def arc_clearance_m(
@@ -164,6 +215,8 @@ def arc_clearance_m(
     curvature_1_m: float,
     half_width_m: float,
     max_forward_m: float,
+    body_half_length_m: Optional[float] = None,
+    body_half_width_m: Optional[float] = None,
 ) -> float:
     """Travel distance along the *commanded arc* before the body sweeps a return.
 
@@ -178,12 +231,22 @@ def arc_clearance_m(
     reach = max(0.0, float(max_forward_m))
     kappa = float(curvature_1_m)
     if abs(kappa) < 1e-3:
-        return corridor_min_range(scan, half, reach)
+        return corridor_min_range(
+            scan,
+            half,
+            reach,
+            body_half_length_m=body_half_length_m,
+            body_half_width_m=body_half_width_m,
+        )
     pts = scan.to_points()
     if pts.size == 0:
         return math.inf
     x = np.asarray(pts[:, 0], dtype=float)
     y = np.asarray(pts[:, 1], dtype=float)
+    keep = ~_body_mask(x, y, body_half_length_m, body_half_width_m)
+    x, y = x[keep], y[keep]
+    if x.size == 0:
+        return math.inf
     radius = 1.0 / kappa  # signed: positive turns left
     r_abs = abs(radius)
     # Arc centre sits at (0, radius) in the body frame; the robot starts at the
@@ -214,6 +277,8 @@ def forward_clearance_m(scan: conv.LaserScan2D, obs: ObstacleConfig) -> float:
                 scan,
                 float(obs.footprint_half_width_m),
                 float(obs.slow_distance_m),
+                body_half_length_m=obs.body_half_length_m,
+                body_half_width_m=obs.body_half_width_m,
             ),
         )
     return clearance
@@ -303,6 +368,8 @@ def apply_obstacle_avoidance(
                         curvature_1_m=cmd.vtheta / cmd.vx,
                         half_width_m=float(obs.footprint_half_width_m),
                         max_forward_m=float(obs.slow_distance_m),
+                        body_half_length_m=obs.body_half_length_m,
+                        body_half_width_m=obs.body_half_width_m,
                     ),
                     float(obs.slow_distance_m),
                 ),
