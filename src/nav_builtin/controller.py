@@ -37,6 +37,8 @@ def _rear_open_for_unstick(
     y_m: float = 0.0,
     theta_rad: float = 0.0,
     reverse_dist_m: float = 0.30,
+    body_half_length_m: Optional[float] = None,
+    body_half_width_m: Optional[float] = None,
 ) -> bool:
     """True when a short reverse is safe per rear scan and local costmap.
 
@@ -50,7 +52,11 @@ def _rear_open_for_unstick(
     """
     if scan is None:
         return False
-    rear = rear_clearance_m(scan)
+    rear = rear_clearance_m(
+        scan,
+        body_half_length_m=body_half_length_m,
+        body_half_width_m=body_half_width_m,
+    )
     rear_need = max(0.25, float(robot_radius_m) + 0.08)
     if math.isfinite(rear) and rear < rear_need:
         return False
@@ -83,6 +89,7 @@ def _try_narrow_reverse(
     local_view: Optional[LocalCostmapView],
     current: Pose2D,
 ) -> Optional[DriveCommand]:
+    _obs = cfg.obstacle
     if _rear_open_for_unstick(
         scan,
         robot_radius_m,
@@ -90,6 +97,8 @@ def _try_narrow_reverse(
         x_m=current.x,
         y_m=current.y,
         theta_rad=current.theta,
+        body_half_length_m=getattr(_obs, "body_half_length_m", None),
+        body_half_width_m=getattr(_obs, "body_half_width_m", None),
     ):
         return _narrow_reverse_command(cfg)
     return None

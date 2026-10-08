@@ -675,6 +675,10 @@ def connect_plan_start(
         should_abort=should_abort,
     )
     if not bridge.feasible:
+        if bridge.error_code == 9:
+            # Aborted by the caller's cancel: keep that verdict rather than
+            # claiming the start is unreachable.
+            return bridge
         return PlanResult(
             feasible=False,
             error_code=8,

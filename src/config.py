@@ -579,8 +579,10 @@ class BuiltinNavConfig:
     # nav as idle, ask it to check localization (large corrections need two
     # agreeing matches), then replan from the corrected pose. Breaks the
     # "nav holds the goal → SLAM refuses >1 m jumps → nav cannot plan"
-    # deadlock without raising the mid-nav apply cap.
-    loc_yield_enabled: bool = True
+    # deadlock without raising the mid-nav apply cap. Off by default until it
+    # has a live run behind it (the yield blocks the control thread for the
+    # SLAM round trips).
+    loc_yield_enabled: bool = False
     loc_yield_after_s: float = 8.0
     loc_yield_wait_s: float = 8.0
     loc_yield_cooldown_s: float = 30.0

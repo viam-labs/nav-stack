@@ -125,9 +125,10 @@ def rear_clearance_m(
     in_rear = np.abs(angles) >= (math.pi - half_cone_rad)
     valid = in_rear & np.isfinite(ranges) & (ranges >= scan.range_min)
     if valid.any() and body_half_length_m is not None and body_half_width_m is not None:
-        x = ranges * np.cos(angles)
-        y = ranges * np.sin(angles)
-        valid &= ~_body_mask(x, y, body_half_length_m, body_half_width_m)
+        idx = np.flatnonzero(valid)  # finite ranges only: no inf * cos warnings
+        x = ranges[idx] * np.cos(angles[idx])
+        y = ranges[idx] * np.sin(angles[idx])
+        valid[idx[_body_mask(x, y, body_half_length_m, body_half_width_m)]] = False
     if not valid.any():
         return math.inf
     return float(ranges[valid].min())

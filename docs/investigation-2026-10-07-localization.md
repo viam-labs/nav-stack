@@ -379,24 +379,74 @@ body coordinates **(0.008, 0.285)** every tick: 8 mm forward of centre, 1 cm
 static map cell (desk edge) overlapping the body by a centimetre after the
 run-6 fallback leg parked there. RealSense: open corridor ahead.
 
-Why it pinned: `simple_motion.corridor_min_range` counts any return with
-`0 < x ≤ slow_distance` and `|y| ≤ footprint_half_width` as "ahead", so that
-point read as an obstacle 8 mm in front → `forward_clearance_m ≈ 0` →
-reactive state `avoid` (stop forward, turn away) → the turn was vetoed by
-the neighbouring desk cells in the guard's rotation sweep → zero motion. The
-`FootprintGuard` already drops in-body points (Nav2 footprint clearing); the
-reactive layer did not. Config: `footprint_half_width_m` for the corridor is
-robot_radius + 0.12 = 0.485 m, so the corridor band is 0.19 m wider than the
-body on each side — anything beside the shoulders counts.
+Why it pinned — **corrected 2026-10-08 by the PR review.** The first
+write-up blamed `simple_motion.corridor_min_range` reading the in-body
+return as an obstacle 8 mm ahead. That is not the live code path: with the
+`FootprintGuard` on (default) `compute_path_command` returns from
+`_guarded_command` before the reactive layer runs, and all 89 `avoid` ticks
+in the run-7 log report `forward_clearance_m = 0.36` — the guard's
+`0 + length/2`, never ≈ 0. Lidar returns are also cropped to the body at
+ingestion (`prepare_lidar_point_cloud`), so the point was a static lethal
+map cell in the guard's point set, not a scan return. The real mechanism is
+the guard's near-floor rule (`footprint_guard._split` / `_hits`): points
+inside the body are dropped, but the next cell of the same desk edge sits
+2.5 cm past the nose with floor `max(min_gap 0.02, dist − slack 0.01)`, so
+every forward or rotating motion brings a corner inside that floor and is a
+hit (`rotation_blocked`, state `blocked`). Only reversing is free, and the
+backup recovery did not fire. Scratch reproduction: a 5 cm cell line 1 cm
+inside the left flank that extends past the nose → `free_distance 0`,
+`blocked`; the same line ending at the nose → `clear`.
 
-Fix (branch): `ObstacleConfig.body_half_length_m / body_half_width_m` (true
-body rectangle, set from nose offset and inscribed radius in both
-constructors); `corridor_min_range`, `arc_clearance_m`, `spin_clearance_m`,
-`rear_clearance_m` ignore returns inside it. Tests in
-`tests/test_body_clearing.py`. Config relaxations applied to tracer2a at
-20:05: `backup_speed_mps 0.2`, `backup_dist_m 0.5`, `backup_cooldown_s 1`,
-`backup_max_attempts 3`, `local_planner_max_vel_x_mps 0.35`,
-`clearance_preference_m 0.25`.
+Fix status: the branch's `ObstacleConfig.body_half_length_m /
+body_half_width_m` + in-body masking in `corridor_min_range`,
+`arc_clearance_m`, `spin_clearance_m`, `rear_clearance_m` is correct for the
+guard-off / simple go-to paths and stays, but it does **not** fix this
+incident. The guard near-floor fix is backlog item 15. Run 8 left the pinned
+pose after the reload because the process restarted at a slightly different
+pose with the relaxed backup knobs, not because of the mask. Config
+relaxations applied to tracer2a at 20:05: `backup_speed_mps 0.2`,
+`backup_dist_m 0.5`, `backup_cooldown_s 1`, `backup_max_attempts 3`,
+`local_planner_max_vel_x_mps 0.35`, `clearance_preference_m 0.25`.
+
+## PR #68 adversarial review (2026-10-08)
+
+Four independent reviewers (supervisor policies, planner/plumbing,
+body-clearing geometry, harness/tests); every finding below was re-verified
+by hand before being fixed. Regression tests: `tests/test_review_regressions.py`,
+`tests/test_route_loop_guards.py`.
+
+Confirmed and fixed on the branch:
+
+- Goal-blocked finish keyed on any `"no feasible path"`, which the
+  blocked-corridor paint produces by design → a person in a doorway 2 m from
+  the goal "succeeded" the goal after 15 s and the route layer advanced.
+  Now only goal-side verdicts count (`goal blocked`, `goal pose is in
+  lethal`), the verdict must come from a replan in the last 5 s, and moving
+  more than 0.3 m since the timer armed starts a new episode.
+- A cancel landing during the initial plan (or an Nth failed replan) ended as
+  `failed: planning aborted` and failed the whole route. `_set_status` now
+  reports `canceled` whenever the cancel event is set;
+  `connect_plan_start` keeps the abort verdict instead of relabelling it
+  "cannot reach plan start".
+- Localization yield: the 2 s inter-attempt pause ignored cancel (now
+  `cancel.wait`); default flipped to **off** until it has a live run. Each
+  SLAM round trip can still block the control thread up to the 20 s RPC
+  timeout (backlog 16).
+- Replan budget restarted on the detour-ban-lift recursion (shared now).
+- Harness: goals were sent with no localization gate and re-sent after a
+  failed check; crash exit left the goal driving; a nav-only status error
+  read as idle; a goal could be stacked on an active one; instant successes
+  were classed `never_active`. All fixed (`--min-tick-score`, unconditional
+  cancel in `finally`, `nav_idle`, `_ensure_nav_idle`, stall exemptions for
+  loc holds).
+- Body clearing: shoulder test now uses a point alongside the body so a wrong
+  half-width fails it; `_rear_open_for_unstick` passes body dims; no more
+  `inf * cos` warnings.
+
+Not a PR problem, but the cause of the 16:23 pin and the evening's lost
+heading: the tracer2a config change `nav_loc_refine_apply_max_m: 2` (default
+1.0) let nav force-apply a 1.19 m / 30° local match at score 0.32 while
+stationary. Revert to 1.0 before the next laps; the yield code replaces it.
 
 ## Incident 20:23 UTC: pinned beside kevin-desk after a forced 1.2 m loc correction (run 8)
 
@@ -618,3 +668,13 @@ Navigation (from run 8):
 14. Departure pin after a loc jump at a desk: back up when the footprint sits
     on lethal/inflated cells and replans keep succeeding without progress;
     refuse loc corrections that land the footprint in occupied cells.
+15. Footprint guard near-floor pin (run 7, real cause): a static cell just
+    past the nose gets a floor below the first motion step, so forward and
+    rotation are both hits and only reverse is free. Either exempt static map
+    cells that are within `min_gap_m` of the body at the start pose from the
+    near-floor rule (they can be passed alongside, like in-body points), or
+    make the blocked state trigger the backup recovery directly.
+16. Loc yield: bound each `check_localization` round trip to the remaining
+    `loc_yield_wait_s` (pass a timeout through `WorldIO.check_localization`)
+    and extend the goal deadline by the yield time.
+17. tracer2a: revert `nav_loc_refine_apply_max_m` to 1.0 (see review).

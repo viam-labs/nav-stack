@@ -17,7 +17,15 @@ cannot finish a leg:
 
 "Stalled" means: still active but the pose moved < ``--stall-move-m`` for
 ``--stall-s`` seconds, or the leg exceeded ``--leg-timeout-s``. Both cancel
-the goal first.
+the goal first. Time nav spends deliberately still (loc_hold / loc_refine /
+loc_yield / wait) does not count as stall.
+
+No goal is sent while SLAM's pose is untrusted (``localization_check`` status
+ambiguous / low_quality / awaiting_confirm / rejected_shift / refused_large /
+error, or tick match score below ``--min-tick-score``): the leg is refused and
+goes through recovery instead. Recovery re-sends only once the check reports
+``corrected`` / ``ok`` or the live status passes the same gate; otherwise the
+loop aborts. A goal is never sent on top of an active one.
 
 Transport loss (viam-server restart, network drop) is **not** a navigation
 failure: the runner reconnects for up to ``--reconnect-s`` and resumes the leg
@@ -75,11 +83,16 @@ class Conn:
                 pass
         self.robot = self.nav = self.slam = None
 
-    async def reconnect_until(self, timeout_s: float, log) -> bool:
-        """Rebuild the connection until nav get_status answers, or give up."""
+    async def reconnect_until(self, timeout_s: float, log, stop_requested=None) -> bool:
+        """Rebuild the connection until nav get_status answers, or give up.
+
+        ``stop_requested`` (callable -> bool) ends the wait early on Ctrl-C.
+        """
         deadline = time.monotonic() + timeout_s
         attempt = 0
         while time.monotonic() < deadline:
+            if stop_requested is not None and stop_requested():
+                return False
             attempt += 1
             try:
                 await self.connect()
@@ -107,13 +120,70 @@ class _Proxy:
         return await asyncio.wait_for(client.do_command(command, **kw), timeout=10)
 
 
+# -- pure guards (unit-tested in tests/test_route_loop_guards.py) --------------
+# ``localization_check.status`` values after which SLAM's published pose must
+# not be driven on. "skipped" / None / "ok" / "corrected" are not in the set.
+UNTRUSTED_LC_STATUS = frozenset(
+    {"ambiguous", "low_quality", "error", "awaiting_confirm", "rejected_shift", "refused_large"}
+)
+# Nav ``progress.obstacle`` states in which the robot is deliberately still.
+STALL_EXEMPT_OBS = frozenset({"loc_hold", "loc_refine", "loc_yield", "wait"})
+
+
+def localization_trusted(slam_row: dict, *, min_tick_score: float) -> tuple[bool, str]:
+    """May a goal be sent on this ``Monitor.sample()["slam"]`` row?
+
+    False when the last localization check left the pose in an untrusted
+    state, or the continuous tick match score is a finite number below
+    ``min_tick_score``. Missing fields (older module builds, no check yet)
+    are not evidence of a bad pose, so they pass.
+    """
+    status = slam_row.get("lc_status")
+    if status is not None and str(status) in UNTRUSTED_LC_STATUS:
+        return False, f"lc_status={status}"
+    score = slam_row.get("lc_tick_match_score")
+    if isinstance(score, (int, float)) and math.isfinite(score) and score < min_tick_score:
+        return False, f"tick_score={score:.2f}<{min_tick_score:.2f}"
+    return True, "ok"
+
+
+def recovery_trusted(check: Optional[dict], slam_row: dict, *, min_tick_score: float) -> tuple[bool, str]:
+    """After ``check_localization``: may the runner send again?
+
+    Trusted when the check applied a correction or came back ``ok``; otherwise
+    fall back to the live status gate (``localization_trusted``).
+    """
+    if check and (check.get("corrected") or str(check.get("status")) == "ok"):
+        return True, f"check_{check.get('status')}"
+    return localization_trusted(slam_row, min_tick_score=min_tick_score)
+
+
+def row_blind(row: dict) -> bool:
+    """Nav status is unavailable this tick: transport loss or a nav-only error.
+
+    Such a row must never classify a leg; it counts as blind time instead.
+    """
+    return bool(row.get("conn_lost")) or row.get("nav_error") is not None
+
+
+def nav_idle(row: dict) -> bool:
+    """True only when nav answered this tick and reports no active goal."""
+    return not row_blind(row) and not bool((row.get("nav") or {}).get("active"))
+
+
+def stall_exempt(nav_row: dict) -> bool:
+    """Nav is holding still on purpose (localization hold / yield / wait)."""
+    return str(nav_row.get("obstacle") or "") in STALL_EXEMPT_OBS or bool(nav_row.get("localization_yield"))
+
+
 class RouteLoop:
     def __init__(self, conn: Conn, mon: Monitor, *, events_path: Path, leg_timeout_s: float,
                  stall_s: float, stall_move_m: float, dwell_s: float,
                  first_hold_s: float, last_hold_s: float, retry_wait_s: float, reconnect_s: float,
-                 yaw_freeze_s: float = 6.0):
+                 yaw_freeze_s: float = 6.0, min_tick_score: float = 0.2):
         self.conn = conn
         self.yaw_freeze_s = yaw_freeze_s
+        self.min_tick_score = min_tick_score
         self.fatal: Optional[str] = None
         self.mon = mon
         self.events_path = events_path
@@ -154,9 +224,10 @@ class RouteLoop:
             if self._consecutive_sample_errors == 3:
                 self.event("connection_lost", nav_error=str(row.get("nav_error"))[:120])
             if self._consecutive_sample_errors >= 3:
-                ok = await self.conn.reconnect_until(self.reconnect_s, self.event)
+                ok = await self.conn.reconnect_until(self.reconnect_s, self.event, self._stop_requested)
                 if not ok:
-                    self.event("reconnect_gave_up", after_s=self.reconnect_s)
+                    if not self._stop:
+                        self.event("reconnect_gave_up", after_s=self.reconnect_s)
                     self.stop()
                 else:
                     self._consecutive_sample_errors = 0
@@ -201,10 +272,19 @@ class RouteLoop:
                     return None
                 self.event(f"{what}_transport_error", attempt=attempt, error=msg)
                 if attempt == 1:
-                    ok = await self.conn.reconnect_until(self.reconnect_s, self.event)
+                    ok = await self.conn.reconnect_until(self.reconnect_s, self.event, self._stop_requested)
                     if not ok:
                         return None
         return None
+
+    def _stop_requested(self) -> bool:
+        return self._stop
+
+    def _slam_trusted(self, row: dict, check: Optional[dict] = None) -> tuple[bool, str]:
+        """Gate a sample row; an unreadable SLAM status is not a trusted pose."""
+        if row.get("slam_error"):
+            return False, "slam_status_error"
+        return recovery_trusted(check, row["slam"], min_tick_score=self.min_tick_score)
 
     # -- goal control ------------------------------------------------------
     async def navigate(self, name: str, *, attempt: int, lap: int) -> dict:
@@ -215,6 +295,19 @@ class RouteLoop:
                "disconnected_s": 0.0}
         pre = await self.one_sample()
         leg["start_dist_m"] = self._dist_to(pre, name)
+        trusted, why = self._slam_trusted(pre)
+        if not trusted:
+            # Live 2026-10-07: goals re-sent on an untrusted pose walked the
+            # robot into a glass partition. Refuse; run() routes to recovery.
+            leg["outcome"] = "refused_localization"
+            leg["error_msg"] = why
+            leg["end"] = time.time()
+            leg["final_slam"] = pre["slam"]
+            self.event("leg_refused_localization", lap=lap, target=name, attempt=attempt, reason=why,
+                       lc=pre["slam"].get("lc_status"), tick_score=pre["slam"].get("lc_tick_match_score"),
+                       lc_score=pre["slam"].get("lc_score"))
+            self.legs.append(leg)
+            return leg
         ack = await self._send({"command": "navigate_to_location", "name": name}, "navigate")
         if ack is None:
             leg["outcome"] = "send_failed"
@@ -236,7 +329,10 @@ class RouteLoop:
         while not self._stop:
             t0 = time.monotonic()
             row = await self.one_sample()
-            if row.get("conn_lost"):
+            if row_blind(row):
+                # Transport loss, or nav get_status failed while SLAM answered:
+                # no nav fields to classify on. Blind time, not stall time.
+                await asyncio.sleep(max(0.0, self.mon.period_s - (time.monotonic() - t0)))
                 lost_s += time.monotonic() - t0
                 last_move_at = time.monotonic()  # do not count stall while blind
                 continue
@@ -283,6 +379,14 @@ class RouteLoop:
                 if leg["goal_blocked"]:
                     self.event("goal_blocked_finish", target=name, offset_m=n.get("goal_offset_m"))
                 break
+            if not seen_active and not active and str(n.get("state")) == "succeeded":
+                # Short leg: the goal finished between the ack (which sets
+                # active=True synchronously) and this first 1 Hz sample.
+                leg["outcome"] = "succeeded"
+                leg["goal_blocked"] = bool(n.get("goal_blocked"))
+                leg["goal_offset_m"] = n.get("goal_offset_m")
+                leg["end_dist_m"] = self._dist_to(row, name)
+                break
             elapsed = time.monotonic() - t_start - lost_s
             if not seen_active and elapsed > 10.0:
                 leg["outcome"] = f"never_active:{n.get('state')}"
@@ -311,7 +415,10 @@ class RouteLoop:
                         break
                 else:
                     yaw_cmd_since = None
-            stalled = active and (time.monotonic() - last_move_at) >= self.stall_s and (n.get("dist_remaining_m") or 1.0) > 0.3
+            if stall_exempt(n):
+                last_move_at = time.monotonic()  # holding still on purpose, not stuck
+            dist = n.get("dist_remaining_m")
+            stalled = active and (time.monotonic() - last_move_at) >= self.stall_s and (dist if dist is not None else 1.0) > 0.3
             if elapsed >= self.leg_timeout_s or stalled:
                 reason = "loop_timeout" if elapsed >= self.leg_timeout_s else "stalled"
                 self.event("leg_cancel", target=name, reason=reason, elapsed_s=round(elapsed, 1),
@@ -326,7 +433,8 @@ class RouteLoop:
         leg["end"] = time.time()
         leg["disconnected_s"] = round(lost_s, 1)
         post = await self.one_sample()
-        leg["end_dist_m"] = self._dist_to(post, name)
+        if leg.get("end_dist_m") is None:
+            leg["end_dist_m"] = self._dist_to(post, name)
         leg["final_status"] = post["nav"]
         leg["final_slam"] = post["slam"]
         self.event("leg_end", lap=lap, target=name, attempt=attempt, outcome=leg["outcome"],
@@ -339,42 +447,76 @@ class RouteLoop:
         self.legs.append(leg)
         return leg
 
-    async def _wait_nav_idle(self, timeout_s: float = 10.0) -> bool:
-        """SLAM skips localization checks while a goal is active; wait it out."""
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
+    async def _wait_nav_idle(self, timeout_s: float = 10.0, *, report_every_s: Optional[float] = None) -> bool:
+        """SLAM skips localization checks while a goal is active; wait it out.
+
+        A blind row (transport loss / nav-only error) is never "idle". With
+        ``report_every_s`` a ``recovery_wait_idle`` event is logged periodically.
+        """
+        t_start = time.monotonic()
+        deadline = t_start + timeout_s
+        next_report = t_start + (report_every_s or 0.0)
+        while not self._stop and time.monotonic() < deadline:
             row = await self.one_sample()
-            if not row.get("conn_lost") and not row["nav"].get("active"):
+            if nav_idle(row):
                 return True
+            if report_every_s and time.monotonic() >= next_report:
+                next_report += report_every_s
+                self.event("recovery_wait_idle", waited_s=round(time.monotonic() - t_start, 1),
+                           state=row["nav"].get("state"), obstacle=row["nav"].get("obstacle"),
+                           nav_error=(str(row["nav_error"])[:120] if row.get("nav_error") else None))
             await asyncio.sleep(0.5)
         return False
 
-    async def recover_localization(self, reason: str) -> None:
+    async def _ensure_nav_idle(self) -> bool:
+        """Never send a goal on top of an active one.
+
+        Wait briefly, then up to the leg timeout (reporting every 10 s), then
+        cancel and wait once more. False means nav never went idle.
+        """
+        if await self._wait_nav_idle():
+            return True
+        if await self._wait_nav_idle(self.leg_timeout_s, report_every_s=10.0):
+            return True
+        if self._stop:
+            return False
+        self.event("recovery_cancel_active", waited_s=round(10.0 + self.leg_timeout_s, 1))
+        await self._safe_cancel()
+        return await self._wait_nav_idle(30.0, report_every_s=10.0)
+
+    async def recover_localization(self, reason: str) -> Optional[dict]:
         """Let SLAM fix the pose while parked.
 
         Mid-nav the stack refuses corrections over 1 m. Once nav is idle a
         large jump is allowed but needs two agreeing matches, so ask up to
-        three times and stop as soon as one is applied.
+        three times and stop as soon as one is applied. Returns the last
+        ``check_localization`` result (None if none ran); sets ``self.fatal``
+        when nav never went idle.
         """
         self.event("recovery_check_localization", reason=reason)
-        if not await self._wait_nav_idle():
-            self.event("recovery_check_localization_skipped", reason="nav still active")
-        else:
-            for i in range(1, 4):
-                try:
-                    res = await self.mon.slam.do_command({"command": "check_localization"})
-                except Exception as exc:  # noqa: BLE001
-                    self.event("recovery_check_localization_failed", attempt=i, error=str(exc)[:300])
-                    break
-                self.event("recovery_check_localization_result", attempt=i,
-                           status=res.get("status"), reason=res.get("reason"), score=res.get("score"),
-                           prior_score=res.get("prior_score"), ray_mae_m=res.get("ray_mae_m"),
-                           shift_m=res.get("shift_m"), shift_deg=res.get("shift_deg"),
-                           corrected=res.get("corrected"), confirm=res.get("confirm_count"))
-                if res.get("corrected") or str(res.get("status")) not in ("awaiting_confirm", "skipped"):
-                    break
-                await asyncio.sleep(2.0)
+        if not await self._ensure_nav_idle():
+            if not self._stop:
+                self.event("recovery_check_localization_skipped", reason="nav never went idle")
+                self.fatal = "nav_never_idle"
+            return None
+        res: Optional[dict] = None
+        for i in range(1, 4):
+            try:
+                res = await self.mon.slam.do_command({"command": "check_localization"})
+            except Exception as exc:  # noqa: BLE001
+                self.event("recovery_check_localization_failed", attempt=i, error=str(exc)[:300])
+                res = None
+                break
+            self.event("recovery_check_localization_result", attempt=i,
+                       status=res.get("status"), reason=res.get("reason"), score=res.get("score"),
+                       prior_score=res.get("prior_score"), ray_mae_m=res.get("ray_mae_m"),
+                       shift_m=res.get("shift_m"), shift_deg=res.get("shift_deg"),
+                       corrected=res.get("corrected"), confirm=res.get("confirm_count"))
+            if res.get("corrected") or str(res.get("status")) not in ("awaiting_confirm", "skipped"):
+                break
+            await asyncio.sleep(2.0)
         await self.hold(self.retry_wait_s, "recovery_wait")
+        return res
 
     async def run(self, locations: list[str], laps: int) -> None:
         await self.load_locations()
@@ -392,7 +534,10 @@ class RouteLoop:
                     break
                 leg = await self.navigate(name, attempt=1, lap=lap)
                 if leg["outcome"] == "succeeded":
-                    prev_good = name
+                    if not leg.get("goal_blocked"):
+                        # A goal_blocked finish means the module declared the
+                        # target unreachable; it is no fallback point.
+                        prev_good = name
                     consecutive_failures = 0
                     await self.hold(self.dwell_s, f"dwell@{name}")
                     continue
@@ -405,10 +550,29 @@ class RouteLoop:
                     await self._safe_cancel()
                     return
                 # ---- recovery 1: localization check + retry once ----
-                await self.recover_localization(f"leg to {name} ended {leg['outcome']}")
+                # (``refused_localization`` legs land here too: no goal was sent.)
+                check = await self.recover_localization(f"leg to {name} ended {leg['outcome']}")
+                if self._stop:
+                    break
+                if self.fatal:
+                    # nav never went idle, even after cancel: do not stack goals.
+                    self.event("loop_abort", reason=self.fatal, target=name)
+                    await self._safe_cancel()
+                    return
+                post = await self.one_sample()
+                trusted, why = self._slam_trusted(post, check)
+                if not trusted:
+                    # Neither the check nor the live status vouches for the
+                    # pose: re-sending would be the glass-partition case again.
+                    self.event("loop_abort", reason="localization_untrusted", target=name, detail=why,
+                               check_status=(check or {}).get("status"),
+                               lc=post["slam"].get("lc_status"), tick_score=post["slam"].get("lc_tick_match_score"))
+                    await self._safe_cancel()
+                    return
                 leg2 = await self.navigate(name, attempt=2, lap=lap)
                 if leg2["outcome"] == "succeeded":
-                    prev_good = name
+                    if not leg2.get("goal_blocked"):
+                        prev_good = name
                     consecutive_failures = 0
                     self.event("recovery_retry_succeeded", target=name)
                     await self.hold(self.dwell_s, f"dwell@{name}")
@@ -474,6 +638,9 @@ async def main() -> int:
     ap.add_argument("--reconnect-s", type=float, default=240.0)
     ap.add_argument("--yaw-freeze-s", type=float, default=6.0,
                     help="abort when a turn is commanded but published yaw is frozen this long")
+    ap.add_argument("--min-tick-score", type=float, default=0.2,
+                    help="refuse to send a goal while SLAM's continuous tick match score is below this "
+                         "(the stack's own periodic_relocalize_still_bad_score is 0.0; live quality was ~0.45)")
     ap.add_argument("--period", type=float, default=1.0)
     ap.add_argument("--out", default=f".local/monitor/loop-{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
     args = ap.parse_args()
@@ -489,7 +656,7 @@ async def main() -> int:
         conn, mon, events_path=Path(str(out) + ".events.jsonl"), leg_timeout_s=args.leg_timeout_s,
         stall_s=args.stall_s, stall_move_m=args.stall_move_m, dwell_s=args.dwell_s,
         first_hold_s=args.first_hold_s, last_hold_s=args.last_hold_s, retry_wait_s=args.retry_wait_s,
-        reconnect_s=args.reconnect_s, yaw_freeze_s=args.yaw_freeze_s,
+        reconnect_s=args.reconnect_s, yaw_freeze_s=args.yaw_freeze_s, min_tick_score=args.min_tick_score,
     )
     ev_loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -501,8 +668,9 @@ async def main() -> int:
         runner.event("runner_crashed", error=f"{type(exc).__name__}: {str(exc)[:300]}")
     finally:
         try:
-            if runner._stop:  # noqa: SLF001 - Ctrl-C / give-up: make sure the base is stopped
-                await runner._safe_cancel()  # noqa: SLF001
+            # Always: Ctrl-C, give-up, abort or crash must leave the base
+            # stopped. nav ``cancel`` is idempotent, so a clean exit is fine.
+            await runner._safe_cancel()  # noqa: SLF001
         finally:
             summ = runner.summary()
             print("\n" + summ, flush=True)

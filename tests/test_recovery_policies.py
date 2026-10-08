@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from src import runtime
@@ -105,6 +107,7 @@ def test_goal_blocked_finishes_nearby_after_grace():
         "scan+local: goal snap 0.57 m exceeds max_goal_snap_m=0.50 (goal blocked / over-inflated)"
     )
     pose, goal = Pose2D(0.0, 0.0, 0.0), Pose2D(1.0, 0.0, 0.0)
+    sup._last_replan_at = time.monotonic()  # verdict is from this episode  # noqa: SLF001
     assert sup._maybe_finish_goal_blocked(pose, goal, 100.0, pose_cost=0) is False  # noqa: SLF001
     assert sup._maybe_finish_goal_blocked(pose, goal, 105.0, pose_cost=0) is False  # noqa: SLF001
     assert sup._maybe_finish_goal_blocked(pose, goal, 111.0, pose_cost=0) is True  # noqa: SLF001
@@ -158,7 +161,7 @@ def test_any_navigation_active_ignores_yielding_host():
 
 
 def test_loc_yield_pauses_goal_and_replans_from_corrected_pose(monkeypatch):
-    sup, world = _sup(loc_yield_after_s=1.0, loc_yield_wait_s=10.0)
+    sup, world = _sup(loc_yield_enabled=True, loc_yield_after_s=1.0, loc_yield_wait_s=10.0)
     monkeypatch.setattr(sup_mod.time, "sleep", lambda s: None)
     seen_flags: list = []
 
@@ -208,7 +211,7 @@ def test_loc_yield_pauses_goal_and_replans_from_corrected_pose(monkeypatch):
 
 
 def test_loc_yield_requires_lethal_start_and_stuck_time():
-    sup, world = _sup(loc_yield_after_s=8.0)
+    sup, world = _sup(loc_yield_enabled=True, loc_yield_after_s=8.0)
     args = (Pose2D(5, 1, 0), Pose2D(1, 1, 0), _path((1.0, 1.0), (5.0, 1.0)), None, None)
     # Free start cell: not a localization deadlock.
     assert sup._maybe_yield_for_localization(*args, pose_cost=0, stuck_s=30.0, trigger="t") is None  # noqa: SLF001
@@ -219,7 +222,7 @@ def test_loc_yield_requires_lethal_start_and_stuck_time():
 
 
 def test_loc_yield_respects_per_goal_cap_and_cooldown(monkeypatch):
-    sup, world = _sup(loc_yield_after_s=0.0, loc_yield_max_per_goal=1, loc_yield_cooldown_s=1000.0)
+    sup, world = _sup(loc_yield_enabled=True, loc_yield_after_s=0.0, loc_yield_max_per_goal=1, loc_yield_cooldown_s=1000.0)
     monkeypatch.setattr(sup_mod.time, "sleep", lambda s: None)
     world.on_loc_check = lambda w, **k: {"status": "low_quality", "corrected": False}
     args = (Pose2D(5, 1, 0), Pose2D(1, 1, 0), _path((1.0, 1.0), (5.0, 1.0)), None, None)

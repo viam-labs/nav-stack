@@ -49,10 +49,16 @@ def test_corridor_ignores_return_inside_body_but_keeps_one_ahead():
 
 
 def test_shoulder_obstacle_just_outside_body_still_counts():
-    # 2 cm outside the flank, ahead of the nose: a real shoulder graze.
-    scan = _scan([(0.45, 0.315)])
+    # 2 cm outside the flank, *alongside* the body (x inside the body length):
+    # a real shoulder graze. This is the case a wrong half-width would hide.
+    scan = _scan([(0.20, 0.315)])
     d = corridor_min_range(scan, 0.415, 1.0, body_half_length_m=HL, body_half_width_m=HW)
-    assert d == pytest.approx(0.45, abs=0.03)
+    assert d == pytest.approx(0.20, abs=0.03)
+    # With an inflated half-width (the 0.365 hard-clearance radius) it would
+    # vanish — pin that the real dims are what callers must pass.
+    assert corridor_min_range(
+        scan, 0.415, 1.0, body_half_length_m=HL, body_half_width_m=0.365
+    ) == math.inf
 
 
 def test_forward_clearance_uses_body_dims_from_config():

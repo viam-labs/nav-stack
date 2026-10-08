@@ -54,6 +54,10 @@ from .world_io import WorldIO
 
 
 _BLOCKED_REPLAN_FAIL_LIMIT = 8
+# Goal-blocked finish: the blocking verdict must come from a replan this recent,
+# and the robot moving this far since the timer was armed starts a new episode.
+_GOAL_BLOCKED_FRESH_S = 5.0
+_GOAL_BLOCKED_MOVE_RESET_M = 0.3
 # After a blocked-nose replan fails, turn this far (then replan) when the
 # rear is not open. ~46° is enough to face a different corridor.
 _NOSE_UNSTICK_YAW_RAD = 0.8
@@ -162,7 +166,7 @@ class NavSupervisor:
         max_goal_snap_m = kw["max_goal_snap_m"]
         goal_blocked_accept_m = kw.get("goal_blocked_accept_m", 2.5)
         goal_blocked_after_s = kw.get("goal_blocked_after_s", 15.0)
-        loc_yield_enabled = kw.get("loc_yield_enabled", True)
+        loc_yield_enabled = kw.get("loc_yield_enabled", False)
         loc_yield_after_s = kw.get("loc_yield_after_s", 8.0)
         loc_yield_wait_s = kw.get("loc_yield_wait_s", 8.0)
         loc_yield_cooldown_s = kw.get("loc_yield_cooldown_s", 30.0)
@@ -290,6 +294,7 @@ class NavSupervisor:
         self._goal_blocked_accept_m = max(0.0, float(goal_blocked_accept_m))
         self._goal_blocked_after_s = max(0.0, float(goal_blocked_after_s))
         self._goal_blocked_since: Optional[float] = None
+        self._goal_blocked_armed_pose: Optional[Pose2D] = None
         # Localization yield — see _maybe_yield_for_localization.
         self._loc_yield_enabled = bool(loc_yield_enabled)
         self._loc_yield_after_s = max(0.0, float(loc_yield_after_s))
@@ -371,6 +376,7 @@ class NavSupervisor:
         self._last_sent_cmd: Optional[DriveCommand] = None
         self._last_sent_at: Optional[float] = None
         self._last_replan_error = ""
+        self._last_replan_at: float = 0.0
         # Last replan diagnostics for get_status (trigger + attempt outcomes).
         self._last_replan_trigger = ""
         self._last_replan_info: dict = {}
@@ -601,6 +607,14 @@ class NavSupervisor:
         )
 
     def _set_status(self, **kwargs) -> None:
+        # A cancel that lands while a plan / replan is running surfaces from
+        # the planner as an infeasible result ("planning aborted"). Report it
+        # as ``canceled``, never ``failed``: the route layer fails the whole
+        # route on ``failed``.
+        cancel = getattr(self, "_cancel", None)
+        if kwargs.get("state") == "failed" and cancel is not None and cancel.is_set():
+            kwargs["state"] = "canceled"
+            kwargs["error_msg"] = "canceled"
         with self._status_lock:
             for k, v in kwargs.items():
                 setattr(self._status, k, v)
@@ -1313,6 +1327,7 @@ class NavSupervisor:
         trigger: str = "",
         allow_lift_ban: bool = True,
         force_lift_short_flip: bool = False,
+        _budget_t0: Optional[float] = None,
     ) -> Optional[Path2D]:
         """Replan around a live block: mild peel first, forced side via last.
 
@@ -1338,7 +1353,8 @@ class NavSupervisor:
 
         old_len = _path_length(path)
         self._last_replan_trigger = str(trigger or "")
-        t_replan0 = time.monotonic()
+        # The ban-lift recursion shares this budget; it must not restart it.
+        t_replan0 = _budget_t0 if _budget_t0 is not None else time.monotonic()
         hold_active = self._detour_ban_path is not None
         # Prefer painting the abandoned short corridor while the ban is live;
         # otherwise only escalate to corridor paint after a failed peel.
@@ -1499,12 +1515,14 @@ class NavSupervisor:
                     scan,
                     require_different=require_different,
                     failed_count=failed_count,
+                    _budget_t0=t_replan0,
                     local_view=local_view,
                     trigger=trigger,
                     allow_lift_ban=False,
                     force_lift_short_flip=False,
                 )
             self._last_replan_error = "; ".join(reasons)
+            self._last_replan_at = time.monotonic()
             self._last_replan_info = {
                 "trigger": self._last_replan_trigger,
                 "accepted": None,
@@ -1647,11 +1665,11 @@ class NavSupervisor:
         err = (self._last_replan_error or "").lower()
         if not err:
             return False
-        return (
-            "goal blocked" in err
-            or "no feasible path" in err
-            or "goal pose is in lethal" in err
-        )
+        # Only goal-side verdicts count. A plain "no feasible path" is what a
+        # sealed hallway, a boxed-in robot, or the blocked-corridor paint
+        # (which seals the robot's own corridor by design) returns, so it must
+        # never finish the goal "nearby".
+        return "goal blocked" in err or "goal pose is in lethal" in err
 
     def _maybe_finish_goal_blocked(
         self, pose: Pose2D, goal: Pose2D, now: float, *, pose_cost: int
@@ -1672,12 +1690,25 @@ class NavSupervisor:
         if is_hard(int(pose_cost)) or not self._replan_says_goal_blocked():
             self._goal_blocked_since = None
             return False
+        # The verdict must come from a replan of *this* stuck episode; a stale
+        # error string from a block minutes ago must not pre-arm the timer.
+        if time.monotonic() - self._last_replan_at > _GOAL_BLOCKED_FRESH_S:
+            self._goal_blocked_since = None
+            return False
         dist = distance_m(pose, goal)
         if dist > self._goal_blocked_accept_m:
             self._goal_blocked_since = None
             return False
-        if self._goal_blocked_since is None:
+        armed = self._goal_blocked_armed_pose
+        if (
+            self._goal_blocked_since is None
+            or armed is None
+            or distance_m(pose, armed) > _GOAL_BLOCKED_MOVE_RESET_M
+        ):
+            # (Re)arm: the robot moved on since the timer started, so this is
+            # a new episode and gets the full grace period again.
             self._goal_blocked_since = now
+            self._goal_blocked_armed_pose = pose
             return False
         if now - self._goal_blocked_since < self._goal_blocked_after_s:
             return False
@@ -1776,7 +1807,9 @@ class NavSupervisor:
                     break
                 if time.monotonic() >= deadline:
                     break
-                time.sleep(2.0)
+                # Interruptible: a cancel during the pause returns at once.
+                if self._cancel.wait(2.0):
+                    break
         finally:
             with self._status_lock:
                 self._status.localization_yield = False
@@ -1801,6 +1834,8 @@ class NavSupervisor:
         """Plan and follow until success, failure, or cancel. Blocking."""
         self._cancel.clear()
         self._goal_blocked_since = None
+        self._goal_blocked_armed_pose = None
+        self._last_replan_at = 0.0
         self._loc_yield_count = 0
         self._loc_yield_until = 0.0
         self._loc_yield_info = {}
