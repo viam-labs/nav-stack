@@ -473,6 +473,45 @@ stationary. Revert to 1.0 before the next laps; the yield code replaces it.
   in-body points the way `FootprintGuard._hits` does (`nearest()` still
   reports them, which is fine for the trace).
 
+## Run 9 (2026-10-08 12:23 local): review build, tight-space tuning
+
+Branch head `b6e14a9` reloaded 12:22 (reload_time 16:22:28Z). Loop: seanp,
+dock_test, kevin-desk x2 with the gated harness (`--min-tick-score 0.2`).
+
+- External commands during the run: `navigate` to **charge** at 12:23:31
+  (6 s before the loop's first goal) and `cancel` at 12:23:42 and 12:27:45.
+  None came from the harness (no `leg_cancel` event; the supervisor only
+  sets its cancel flag via `request_cancel`). Source unconfirmed: app,
+  delivery Slack bot, or the docking service rebuilding after the reload.
+- Blocked seanp approach (people in the corridor), 4.5 m out, 127 s with
+  zero motion: states alternated ~10 s `planning` / 8 s `wait`; backup and
+  narrow-reverse never fired. 64 of 79 replan cycles ended with
+  "blocked-corridor: skipped (replan budget 3.0s exhausted)" — one scan+local
+  plan already exceeds 3 s on this map, so the forced-via detours ran in only
+  12 cycles. The goal-blocked finish correctly did **not** fire (plain "no
+  feasible path" no longer counts; 4.5 m > `goal_blocked_accept_m`).
+- Why the unstick is slow: from the blocked-nose branch, reverse needs the
+  rear cone >= 0.445 m *and* `reverse_path_clear` in the inflated local
+  costmap; turn needs the 0.52 m spin disc clear; the main `backup` maneuver
+  only engages while DWA is active and spinning in place. In a tight spot all
+  three are vetoed by the same inflation that caused the block.
+- Why it stops at gaps it fits through: hard clearance radius = inscribed
+  0.295 + `clearance_m` 0.07 = 0.365 m, so a gap must be ~0.73 m (+ cell +
+  noise, ~0.8 m) to cost < 253 while the body is 0.59 m wide;
+  `local_planner_activate_cost` 200 then declares `local_blocked`.
+
+**Config change applied to tracer2a at 12:33 local (navigation `builtin`):**
+`replan_budget_s: 10` (was default 3.0) so the corridor paint and forced-via
+detours actually run; `backup_stuck_time_s: 1.5` (was default 3.0).
+Reversible; both are nav-only knobs.
+
+Code follow-ups (not in PR #68): (a) blocked-nose branch may use the backup
+maneuver after two failed replans regardless of DWA state; (b) judge the
+reverse with the footprint guard's rectangle sweep instead of the inflated
+costmap; (c) when the guard's straight free distance covers the gap and the
+nose cone is clear, crawl through a cost-253 corridor instead of stopping;
+(d) budget the first replan attempt separately from the escalations.
+
 ## Findings log
 
 - 2026-10-07 19:59 — **Deploy path that works:** `viam module reload-local
@@ -677,3 +716,7 @@ Navigation (from run 8):
     `loc_yield_wait_s` (pass a timeout through `WorldIO.check_localization`)
     and extend the goal deadline by the yield time.
 17. tracer2a: revert `nav_loc_refine_apply_max_m` to 1.0 (see review).
+18. Tight-space recovery (run 9): backup from the blocked-nose branch,
+    guard-based reverse check, crawl through passable cost-253 gaps, and a
+    replan budget that does not starve the escalations. Live interim:
+    `replan_budget_s 10`, `backup_stuck_time_s 1.5` on tracer2a.
