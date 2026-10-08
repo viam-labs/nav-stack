@@ -65,6 +65,9 @@ _NOSE_UNSTICK_YAW_RATE = 0.45
 # Blocked-nose unstick: the rectangle must be able to move back at least this
 # far (guard sweep) before a reverse is issued.
 _UNSTICK_REAR_MIN_M = 0.12
+# A blocked-nose episode is one spot: moving this far from where it started
+# ends it (resets the replan count and the pending unstick).
+_UNSTICK_EPISODE_MOVE_M = 0.25
 
 # Last ~60 s of guarded control ticks (20 Hz), kept across goals so a graze
 # can be inspected after the operator cancels (``get_trace`` DoCommand).
@@ -1969,6 +1972,10 @@ class NavSupervisor:
             nose_unstick_start: Optional[Pose2D] = None
             nose_unstick_mode = ""
             nose_unstick_yaw_sign = 1.0
+            # Blocked-nose episode bookkeeping (see _UNSTICK_EPISODE_MOVE_M).
+            blocked_episode_pose: Optional[Pose2D] = None
+            episode_replans = 0
+            unstick_pending = False
             local_blocked_since: Optional[float] = None
             last_local_replan_at = 0.0
             failed_replan_while_blocked = 0
@@ -2325,6 +2332,22 @@ class NavSupervisor:
                         self._replan_local_min_period_s
                         * (2.0 ** min(blocked_fail_count, 4)),
                     )
+                    # Episode = this spot. A blocked-nose replan that leaves
+                    # the robot where it was must be followed by the unstick
+                    # (reverse, then yaw away) before the next replan. With a
+                    # zero cooldown, 10 s replans ran back to back and the
+                    # unstick, which runs during the cooldown wait, never got
+                    # a tick (live 2026-10-08, seanp pocket: 5 min, no reverse).
+                    if (
+                        blocked_episode_pose is None
+                        or distance_m(pose, blocked_episode_pose)
+                        >= _UNSTICK_EPISODE_MOVE_M
+                    ):
+                        blocked_episode_pose = pose
+                        episode_replans = 0
+                        unstick_pending = False
+                    if unstick_pending and not nose_clear:
+                        cooldown_ready = False
                     # How long since real motion while peeling with a clear nose.
                     peel_stuck_s = (
                         max(0.0, now - last_progress_at)
@@ -2381,6 +2404,10 @@ class NavSupervisor:
                         replan_finished = time.monotonic()
                         last_local_replan_at = replan_finished
                         last_replan = replan_finished
+                        episode_replans += 1
+                        # Whatever the planner said, the robot is still here
+                        # with a blocked nose: back out before trying again.
+                        unstick_pending = not nose_clear
                         if new_path is None:
                             recovered = self._recover_unreachable_start(
                                 goal,
@@ -2713,7 +2740,7 @@ class NavSupervisor:
                     unstick_done = False
                     if (
                         not nose_clear
-                        and failed_replan_while_blocked >= 1
+                        and (failed_replan_while_blocked >= 1 or unstick_pending)
                         and scan is not None
                         and local_view is not None
                         and abs(cmd.vx) < 1e-6
@@ -2755,11 +2782,18 @@ class NavSupervisor:
                                 unstick_done = True
                         else:
                             choice = self._blocked_nose_unstick(
-                                failed_replans=failed_replan_while_blocked,
+                                failed_replans=max(
+                                    failed_replan_while_blocked,
+                                    1 if unstick_pending else 0,
+                                ),
                                 nose_clear=nose_clear,
                                 rear_open=rear_open and rev is not None,
                                 spin_clear=spin_clear,
                             )
+                            if choice == "hold":
+                                # Neither reverse nor turn is possible here:
+                                # do not hold the replan hostage.
+                                unstick_pending = False
                             if choice == "reverse":
                                 nose_unstick_start = pose
                                 nose_unstick_mode = "reverse"
@@ -2778,7 +2812,7 @@ class NavSupervisor:
                                 )
                     if (
                         not nose_clear
-                        and failed_replan_while_blocked >= 1
+                        and (failed_replan_while_blocked >= 1 or unstick_pending)
                         and cmd.vx < -1e-6
                         and nose_unstick_mode not in ("reverse", "turn")
                     ):
@@ -2830,6 +2864,7 @@ class NavSupervisor:
                         ):
                             unstick_done = True
                     if unstick_done:
+                        unstick_pending = False
                         self._stop_before_replan("blocked_nose_unstick")
                         new_path = self._try_replan(
                             goal,
