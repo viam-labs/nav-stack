@@ -82,6 +82,10 @@ class NavStatus:
     motion: str = "builtin"
     # Live follower diagnostics (obstacle / cmd / bearing) while active.
     progress: Optional[dict] = None
+    # Set with ``state == "succeeded"`` when the goal itself was blocked and
+    # the robot stopped at the nearest reachable point ``goal_offset_m`` away.
+    goal_blocked: bool = False
+    goal_offset_m: Optional[float] = None
 
     def to_dict(self) -> dict:
         out = {
@@ -92,7 +96,10 @@ class NavStatus:
             "motion": self.motion,
             "error_msg": self.error_msg,
             "length_m": self.length_m,
+            "goal_blocked": bool(self.goal_blocked),
         }
+        if self.goal_offset_m is not None:
+            out["goal_offset_m"] = round(float(self.goal_offset_m), 3)
         if self.path is not None:
             out["path"] = list(self.path)
         if self.progress is not None:

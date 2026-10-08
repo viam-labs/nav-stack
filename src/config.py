@@ -565,6 +565,15 @@ class BuiltinNavConfig:
     # Reject plans whose free-cell goal snap exceeds this (metres). Live scan
     # inflation used to snap the goal ~1 m away and then "succeed" there.
     max_goal_snap_m: float = 0.5
+    # "Arrived nearby": when every replan fails because the *goal* is blocked
+    # (snap limit exceeded / no feasible path into the goal pocket) while the
+    # robot is within ``goal_blocked_accept_m`` of it and the start cell is
+    # free, stop after ``goal_blocked_after_s`` and finish ``succeeded`` with
+    # ``goal_blocked: true`` and ``goal_offset_m`` in status instead of
+    # replanning for minutes (live: chair on the goal, bins in the aisle).
+    # ``0`` (the default) disables it.
+    goal_blocked_accept_m: float = 0.0
+    goal_blocked_after_s: float = 15.0
     # Final approach: cap linear speed within this distance of the goal.
     approach_dist_m: float = 0.35
     # Post-process global plans (shortcut + resample) before following.

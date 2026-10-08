@@ -54,6 +54,10 @@ from .world_io import WorldIO
 
 
 _BLOCKED_REPLAN_FAIL_LIMIT = 8
+# Goal-blocked finish: the blocking verdict must come from a replan this recent,
+# and the robot moving this far since the timer was armed starts a new episode.
+_GOAL_BLOCKED_FRESH_S = 5.0
+_GOAL_BLOCKED_MOVE_RESET_M = 0.3
 # After a blocked-nose replan fails, turn this far (then replan) when the
 # rear is not open. ~46° is enough to face a different corridor.
 _NOSE_UNSTICK_YAW_RAD = 0.8
@@ -160,6 +164,8 @@ class NavSupervisor:
         drive_timeout_streak = kw["drive_timeout_streak"]
         yaw_align_timeout_s = kw["yaw_align_timeout_s"]
         max_goal_snap_m = kw["max_goal_snap_m"]
+        goal_blocked_accept_m = kw.get("goal_blocked_accept_m", 0.0)
+        goal_blocked_after_s = kw.get("goal_blocked_after_s", 15.0)
         max_linear_accel_mps2 = kw["max_linear_accel_mps2"]
         max_linear_decel_mps2 = kw["max_linear_decel_mps2"]
         max_angular_accel_rad_s2 = kw["max_angular_accel_rad_s2"]
@@ -278,6 +284,11 @@ class NavSupervisor:
         self._clearance_preference_m = max(0.0, float(clearance_preference_m))
         self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
         self._max_goal_snap_m = max(0.0, float(max_goal_snap_m))
+        # Goal-blocked finish ("arrived nearby") — see _maybe_finish_goal_blocked.
+        self._goal_blocked_accept_m = max(0.0, float(goal_blocked_accept_m))
+        self._goal_blocked_after_s = max(0.0, float(goal_blocked_after_s))
+        self._goal_blocked_since: Optional[float] = None
+        self._goal_blocked_armed_pose: Optional[Pose2D] = None
         self._algorithm = algorithm
         self._replan_period = replan_period_s
         self._timeout_s = timeout_s
@@ -348,6 +359,7 @@ class NavSupervisor:
         self._last_sent_cmd: Optional[DriveCommand] = None
         self._last_sent_at: Optional[float] = None
         self._last_replan_error = ""
+        self._last_replan_at: float = 0.0
         # Last replan diagnostics for get_status (trigger + attempt outcomes).
         self._last_replan_trigger = ""
         self._last_replan_info: dict = {}
@@ -433,6 +445,8 @@ class NavSupervisor:
                 length_m=s.length_m,
                 motion=s.motion,
                 progress=dict(s.progress) if s.progress is not None else None,
+                goal_blocked=bool(s.goal_blocked),
+                goal_offset_m=s.goal_offset_m,
             )
 
     def control_stats(self) -> dict:
@@ -1445,6 +1459,7 @@ class NavSupervisor:
                     force_lift_short_flip=False,
                 )
             self._last_replan_error = "; ".join(reasons)
+            self._last_replan_at = time.monotonic()
             self._last_replan_info = {
                 "trigger": self._last_replan_trigger,
                 "accepted": None,
@@ -1481,6 +1496,7 @@ class NavSupervisor:
     ) -> None:
         """Publish an accepted replan and ban the abandoned short corridor."""
         self._last_replan_error = ""
+        self._goal_blocked_since = None
         hold = self._detour_ban_path is not None
         # Commit to a longer / different corridor for the rest of this goal.
         if (
@@ -1578,9 +1594,78 @@ class NavSupervisor:
             trigger=f"{trigger} after stuck_pose_refine",
         )
 
+    # -- goal-blocked finish ----------------------------------------------------
+    def _replan_says_goal_blocked(self) -> bool:
+        """True when the last replan failed because the *goal* is unreachable."""
+        err = (self._last_replan_error or "").lower()
+        if not err:
+            return False
+        # Only goal-side verdicts count. A plain "no feasible path" is what a
+        # sealed hallway, a boxed-in robot, or the blocked-corridor paint
+        # (which seals the robot's own corridor by design) returns, so it must
+        # never finish the goal "nearby".
+        return "goal blocked" in err or "goal pose is in lethal" in err
+
+    def _maybe_finish_goal_blocked(
+        self, pose: Pose2D, goal: Pose2D, now: float, *, pose_cost: int
+    ) -> bool:
+        """Finish ``succeeded`` + ``goal_blocked`` when only the goal is unreachable.
+
+        The planner has no route into the goal pocket (chair on the goal, bins
+        in the aisle) while the robot itself stands on free cost within
+        ``goal_blocked_accept_m``. More replanning cannot help; stop here and
+        report ``goal_offset_m`` so the caller decides. A lethal *start* cell
+        is a localization problem, not a blocked goal. Returns True when the
+        goal was finished (caller must return).
+        """
+        from .costmap import is_hard
+
+        if self._goal_blocked_accept_m <= 0.0:
+            return False
+        if is_hard(int(pose_cost)) or not self._replan_says_goal_blocked():
+            self._goal_blocked_since = None
+            return False
+        # The verdict must come from a replan of *this* stuck episode; a stale
+        # error string from a block minutes ago must not pre-arm the timer.
+        if time.monotonic() - self._last_replan_at > _GOAL_BLOCKED_FRESH_S:
+            self._goal_blocked_since = None
+            return False
+        dist = distance_m(pose, goal)
+        if dist > self._goal_blocked_accept_m:
+            self._goal_blocked_since = None
+            return False
+        armed = self._goal_blocked_armed_pose
+        if (
+            self._goal_blocked_since is None
+            or armed is None
+            or distance_m(pose, armed) > _GOAL_BLOCKED_MOVE_RESET_M
+        ):
+            # (Re)arm: the robot moved on since the timer started, so this is
+            # a new episode and gets the full grace period again.
+            self._goal_blocked_since = now
+            self._goal_blocked_armed_pose = pose
+            return False
+        if now - self._goal_blocked_since < self._goal_blocked_after_s:
+            return False
+        self._world.stop()
+        self._set_status(
+            state="succeeded",
+            active=False,
+            error_msg="",
+            goal_blocked=True,
+            goal_offset_m=float(dist),
+        )
+        return True
+
     def run_goal(self, goal: Pose2D) -> None:
         """Plan and follow until success, failure, or cancel. Blocking."""
         self._cancel.clear()
+        self._goal_blocked_since = None
+        self._goal_blocked_armed_pose = None
+        self._last_replan_at = 0.0
+        with self._status_lock:
+            self._status.goal_blocked = False
+            self._status.goal_offset_m = None
         self._last_replan_error = ""
         self._last_replan_trigger = ""
         self._last_replan_info = {}
@@ -2068,6 +2153,10 @@ class NavSupervisor:
                                 fresh = self._world.get_pose()
                                 if fresh is not None:
                                     pose = fresh
+                        if new_path is None and self._maybe_finish_goal_blocked(
+                            pose, goal, now, pose_cost=pose_cost
+                        ):
+                            return
                         if new_path is not None:
                             path = new_path
                             local_blocked_since = None
@@ -2810,6 +2899,10 @@ class NavSupervisor:
                         vx_sign_history.clear()
                         spin_stuck_since = None
                     elif static_blocked:
+                        if self._maybe_finish_goal_blocked(
+                            pose, goal, now, pose_cost=pose_cost
+                        ):
+                            return
                         failed_static_replan += 1
                         clearance = progress.get("forward_clearance_m")
                         has_room = clearance is None or float(clearance) >= 0.35
@@ -3035,6 +3128,10 @@ class NavSupervisor:
                         failed_replan_while_blocked = 0
                         backup_attempts = 0
                         return False
+                    if self._maybe_finish_goal_blocked(
+                        pose, goal, now, pose_cost=pose_cost
+                    ):
+                        return True
                     # Still recovering: do not abort while local_blocked and
                     # we have not exhausted several forced-via attempts.
                     if local_blocked and failed_replan_while_blocked < 5:

@@ -270,6 +270,8 @@ await nav.do_command({"command": "resume"})
 
 ### `get_status`
 
+Also: `goal_blocked` (bool) and `goal_offset_m` (metres, only present once set) when a goal finished `succeeded` at the nearest reachable point because the goal itself was unreachable (opt-in via `goal_blocked_accept_m`; off by default).
+
 Includes (among other fields): `state`, `active`, `motion`, `goal`, `pose`, progress / error fields from the follower, `simple_nav`, `route`, `localization_check`, `suspended` / `suspended_goal`, footprint (`footprint_length_m`, `footprint_width_m`, `robot_radius_m`), and when available drive / control-loop stats (`last_drive`, `drive`, `control_loop`, `pose_source`, `nav_backend`).
 
 ### `test_drive`
