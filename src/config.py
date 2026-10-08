@@ -621,6 +621,11 @@ class BuiltinNavConfig:
     backup_rear_clear_m: float = 0.45
     backup_max_attempts: int = 1
     backup_cooldown_s: float = 4.0
+    # Blocked-nose unstick: after backing up ``backup_dist_m`` (or when the
+    # rear closes), yaw this far (radians) away from the nearest obstacle
+    # before replanning so the next plan does not route through the same
+    # corner. ``0`` disables the turn.
+    unstick_yaw_rad: float = 0.8
     # Wait: stop and wait for a dynamic blocker to clear before
     # the first local replan (people crossing). Same grace is used when the
     # nose is clear to prefer DWA on the short path before escalating.

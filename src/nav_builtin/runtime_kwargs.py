@@ -69,6 +69,7 @@ def builtin_nav_runtime_kwargs(
         "backup_rear_clear_m": bcfg.backup_rear_clear_m,
         "backup_max_attempts": bcfg.backup_max_attempts,
         "backup_cooldown_s": bcfg.backup_cooldown_s,
+        "unstick_yaw_rad": bcfg.unstick_yaw_rad,
         "recovery_wait_duration_s": bcfg.recovery_wait_duration_s,
         "replan_local_blocked_time_s": bcfg.replan_local_blocked_time_s,
         "replan_local_min_period_s": bcfg.replan_local_min_period_s,

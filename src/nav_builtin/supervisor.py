@@ -60,8 +60,11 @@ _GOAL_BLOCKED_FRESH_S = 5.0
 _GOAL_BLOCKED_MOVE_RESET_M = 0.3
 # After a blocked-nose replan fails, turn this far (then replan) when the
 # rear is not open. ~46° is enough to face a different corridor.
-_NOSE_UNSTICK_YAW_RAD = 0.8
+_NOSE_UNSTICK_YAW_RAD = 0.8  # default for the unstick_yaw_rad knob
 _NOSE_UNSTICK_YAW_RATE = 0.45
+# Blocked-nose unstick: the rectangle must be able to move back at least this
+# far (guard sweep) before a reverse is issued.
+_UNSTICK_REAR_MIN_M = 0.12
 
 # Last ~60 s of guarded control ticks (20 Hz), kept across goals so a graze
 # can be inspected after the operator cancels (``get_trace`` DoCommand).
@@ -324,6 +327,9 @@ class NavSupervisor:
         )
         self._backup_enabled = backup_enabled
         self._backup_stuck_time_s = backup_stuck_time_s
+        self._unstick_yaw_rad = max(
+            0.0, float(kw.get("unstick_yaw_rad", _NOSE_UNSTICK_YAW_RAD))
+        )
         self._backup_dist_m = backup_dist_m
         self._backup_speed_mps = backup_speed_mps
         self._backup_rear_clear_m = backup_rear_clear_m
@@ -1266,6 +1272,70 @@ class NavSupervisor:
         if spin_clear:
             return "turn"
         return "hold"
+
+    # -- blocked-nose unstick helpers -------------------------------------
+    def _unstick_rear_open(self, pose: Pose2D, scan, local_view, guard_pts):
+        """``(rear_open, reverse_cmd)`` for the blocked-nose unstick.
+
+        Judged with the footprint guard's rectangle sweep backward when the
+        guard is on. The 120 deg rear cone and the inflated local costmap both
+        veto reversing out of exactly the desk pockets this exists for: the
+        desk just left sits inside the cone and its inflation reaches under
+        the body (live 2026-10-08: 84 s wedged on a desk corner, no reverse,
+        8 replans through the same corner). Falls back to the cone + costmap
+        check without a guard.
+        """
+        from .controller import _narrow_reverse_command, _try_narrow_reverse
+
+        if self._guard is not None and guard_pts is not None and np.size(guard_pts):
+            horizon = max(0.35, float(self._backup_dist_m))
+            back_free = self._guard.free_distance(pose, -0.15, 0.0, guard_pts, horizon)
+            if not math.isfinite(back_free) or back_free >= _UNSTICK_REAR_MIN_M:
+                return True, _narrow_reverse_command(self._follower)
+            return False, None
+        if scan is None or local_view is None:
+            return False, None
+        rev = _try_narrow_reverse(
+            self._follower,
+            scan,
+            self._robot_radius,
+            local_view=local_view,
+            current=pose,
+        )
+        return rev is not None, rev
+
+    def _unstick_spin_clear(self, scan, local_view, pose: Pose2D) -> bool:
+        """In-place turn would not sweep an obstacle (lidar disc + costmap)."""
+        if scan is None:
+            return False
+        spin_clear = spin_clearance_m(scan) >= self._spin_radius + 0.05
+        if (
+            spin_clear
+            and local_view is not None
+            and self._spin_radius > self._robot_radius
+            and spin_disc_blocked(
+                local_view,
+                pose.x,
+                pose.y,
+                spin_radius_m=self._spin_radius,
+                inscribed_radius_m=self._robot_radius,
+            )
+        ):
+            spin_clear = False
+        return spin_clear
+
+    def _unstick_yaw_sign(self, pose: Pose2D, guard_pts, scan) -> float:
+        """Yaw away from the nearest obstacle: ``-1`` (right) when it is on the left."""
+        if self._guard is not None and guard_pts is not None and np.size(guard_pts):
+            _, _, ny = self._guard.nearest(pose, guard_pts)
+            if math.isfinite(ny) and abs(ny) > 1e-3:
+                return -1.0 if ny > 0.0 else 1.0
+        if scan is not None:
+            left = cone_min_range(scan, 0.0, math.pi / 2.0)
+            right = cone_min_range(scan, -math.pi / 2.0, 0.0)
+            if left < right:
+                return -1.0
+        return 1.0
 
     @staticmethod
     def _bumper_spin_reverse(
@@ -2649,78 +2719,63 @@ class NavSupervisor:
                         and abs(cmd.vx) < 1e-6
                         and abs(cmd.vtheta) < 1e-6
                     ):
-                        from .controller import _try_narrow_reverse
-
-                        rev = _try_narrow_reverse(
-                            self._follower,
-                            scan,
-                            self._robot_radius,
-                            local_view=local_view,
-                            current=pose,
+                        rear_open, rev = self._unstick_rear_open(
+                            pose, scan, local_view, guard_pts
                         )
-                        spin_clear = spin_clearance_m(scan) >= self._spin_radius + 0.05
-                        if (
-                            spin_clear
-                            and self._spin_radius > self._robot_radius
-                            and spin_disc_blocked(
-                                local_view,
-                                pose.x,
-                                pose.y,
-                                spin_radius_m=self._spin_radius,
-                                inscribed_radius_m=self._robot_radius,
-                            )
-                        ):
-                            spin_clear = False
-                        choice = self._blocked_nose_unstick(
-                            failed_replans=failed_replan_while_blocked,
-                            nose_clear=nose_clear,
-                            rear_open=rev is not None,
-                            spin_clear=spin_clear,
+                        spin_clear = self._unstick_spin_clear(scan, local_view, pose)
+                        turn_cmd = DriveCommand(
+                            0.0, 0.0, nose_unstick_yaw_sign * _NOSE_UNSTICK_YAW_RATE, False
                         )
-                        if choice == "reverse" and rev is not None:
-                            if nose_unstick_mode != "reverse":
+                        if nose_unstick_mode == "reverse":
+                            # Keep backing until backup_dist_m (completion is
+                            # tracked below). If the rear closes first, yaw
+                            # away while the disc is free, else replan here.
+                            if rear_open and rev is not None:
+                                cmd = rev
+                            elif spin_clear and self._unstick_yaw_rad > 0.0:
+                                nose_unstick_yaw_sign = self._unstick_yaw_sign(
+                                    pose, guard_pts, scan
+                                )
                                 nose_unstick_start = pose
-                                nose_unstick_mode = "reverse"
-                            cmd = rev
-                        elif choice == "turn":
-                            backed = (
-                                distance_m(pose, nose_unstick_start)
-                                if nose_unstick_mode == "reverse"
-                                and nose_unstick_start is not None
-                                else 0.0
-                            )
-                            if backed >= 0.05:
-                                unstick_done = True
-                            else:
-                                if nose_unstick_mode != "turn":
-                                    nose_unstick_start = pose
-                                    nose_unstick_mode = "turn"
+                                nose_unstick_mode = "turn"
                                 cmd = DriveCommand(
                                     0.0,
                                     0.0,
                                     nose_unstick_yaw_sign * _NOSE_UNSTICK_YAW_RATE,
                                     False,
                                 )
-                        elif nose_unstick_start is not None:
-                            moved = False
-                            if nose_unstick_mode == "reverse":
-                                moved = (
-                                    distance_m(pose, nose_unstick_start) >= 0.05
-                                )
-                            elif nose_unstick_mode == "turn":
-                                moved = (
-                                    abs(
-                                        conv.normalize_angle(
-                                            pose.theta - nose_unstick_start.theta
-                                        )
-                                    )
-                                    >= 0.2
-                                )
-                            if moved:
-                                unstick_done = True
                             else:
-                                nose_unstick_start = None
-                                nose_unstick_mode = ""
+                                unstick_done = True
+                        elif nose_unstick_mode == "turn":
+                            # Keep turning through unstick_yaw_rad (completion
+                            # tracked below) while the spin disc stays free.
+                            if spin_clear:
+                                cmd = turn_cmd
+                            else:
+                                unstick_done = True
+                        else:
+                            choice = self._blocked_nose_unstick(
+                                failed_replans=failed_replan_while_blocked,
+                                nose_clear=nose_clear,
+                                rear_open=rear_open and rev is not None,
+                                spin_clear=spin_clear,
+                            )
+                            if choice == "reverse":
+                                nose_unstick_start = pose
+                                nose_unstick_mode = "reverse"
+                                cmd = rev
+                            elif choice == "turn" and self._unstick_yaw_rad > 0.0:
+                                nose_unstick_yaw_sign = self._unstick_yaw_sign(
+                                    pose, guard_pts, scan
+                                )
+                                nose_unstick_start = pose
+                                nose_unstick_mode = "turn"
+                                cmd = DriveCommand(
+                                    0.0,
+                                    0.0,
+                                    nose_unstick_yaw_sign * _NOSE_UNSTICK_YAW_RATE,
+                                    False,
+                                )
                     if (
                         not nose_clear
                         and failed_replan_while_blocked >= 1
@@ -2739,7 +2794,26 @@ class NavSupervisor:
                             distance_m(pose, nose_unstick_start)
                             >= self._backup_dist_m
                         ):
-                            unstick_done = True
+                            # Backed far enough. Yaw away from the obstacle
+                            # before replanning when the disc is free, so the
+                            # next plan does not route through the same corner.
+                            if (
+                                self._unstick_yaw_rad > 0.0
+                                and self._unstick_spin_clear(scan, local_view, pose)
+                            ):
+                                nose_unstick_yaw_sign = self._unstick_yaw_sign(
+                                    pose, guard_pts, scan
+                                )
+                                nose_unstick_start = pose
+                                nose_unstick_mode = "turn"
+                                cmd = DriveCommand(
+                                    0.0,
+                                    0.0,
+                                    nose_unstick_yaw_sign * _NOSE_UNSTICK_YAW_RATE,
+                                    False,
+                                )
+                            else:
+                                unstick_done = True
                     elif (
                         not unstick_done
                         and nose_unstick_start is not None
@@ -2752,7 +2826,7 @@ class NavSupervisor:
                                     pose.theta - nose_unstick_start.theta
                                 )
                             )
-                            >= _NOSE_UNSTICK_YAW_RAD
+                            >= self._unstick_yaw_rad
                         ):
                             unstick_done = True
                     if unstick_done:
