@@ -608,6 +608,47 @@ class NavSupervisor:
         vx, vy, vtheta = apply_speed_zone_limit(cmd.vx, cmd.vy, cmd.vtheta, pct)
         return DriveCommand(vx, vy, vtheta, cmd.done)
 
+    def _scan_with_depth_memory(
+        self, scan: Optional[conv.LaserScan2D], pose: Pose2D
+    ) -> Optional[conv.LaserScan2D]:
+        """Fold remembered depth-camera points into the scan a plan paints.
+
+        The footprint guard and the local costmap already see them, but a
+        global replan paints only the lidar scan, so an unmapped low obstacle
+        the lidar plane misses never reaches the planner (live 2026-10-08: a
+        pallet; every replan returned the same route through it, the guard
+        refused, and the robot looped reverse / forward / rotate at 0.3 s).
+        """
+        memory = getattr(self, "_depth_memory", None)
+        mem = memory.points() if memory is not None else None
+        if mem is None or not np.size(mem):
+            return scan
+        c, s = math.cos(pose.theta), math.sin(pose.theta)
+        dx, dy = mem[:, 0] - pose.x, mem[:, 1] - pose.y
+        local = np.column_stack([c * dx + s * dy, -s * dx + c * dy])
+        if scan is None:
+            pts, n_bins, range_max = local, 720, 10.0
+        else:
+            pts = np.vstack([scan.to_points(), local])
+            n_bins = int(len(scan.ranges)) if len(scan.ranges) else 720
+            range_max = float(scan.range_max)
+        return conv.points_to_scan(
+            pts,
+            angle_min=-math.pi,
+            angle_max=math.pi,
+            num_bins=max(n_bins, 8),
+            range_min=0.0,
+            range_max=range_max,
+        )
+
+    def _unstick_turn_sign(self, pose: Pose2D, guard_pts) -> float:
+        """Turn toward the freer side (+1 = CCW); was a constant +1."""
+        if self._guard is None or guard_pts is None or not np.size(guard_pts):
+            return 1.0
+        ccw = self._guard.free_rotation(pose, 1.0, guard_pts)
+        cw = self._guard.free_rotation(pose, -1.0, guard_pts)
+        return 1.0 if ccw >= cw else -1.0
+
     def plan(
         self,
         goal: Pose2D,
@@ -632,6 +673,7 @@ class NavSupervisor:
         mapping = self._slam_is_mapping()
         masks = self._zone_masks(map_data)
         keepout = None if masks is None else masks.keepout
+        scan = self._scan_with_depth_memory(scan, pose)
         result = plan_path(
             map_data,
             pose,
@@ -2255,7 +2297,9 @@ class NavSupervisor:
                         "cmd_vtheta_rad_s": 0.0,
                     }
                     narrow_rev_start = None
-                elif obs_state == "narrow_reverse" and cmd.vx < -1e-6:
+                elif narrow_rev_start is not None or (
+                    obs_state == "narrow_reverse" and cmd.vx < -1e-6
+                ):
                     if narrow_rev_start is None:
                         narrow_rev_start = pose
                     backed_m = distance_m(pose, narrow_rev_start)
@@ -2286,6 +2330,25 @@ class NavSupervisor:
                             not math.isfinite(back_free)
                             or back_free >= min(remain, 0.12)
                         )
+                    if obs_state != "narrow_reverse" and (
+                        backed_m < self._backup_dist_m and rear_cost_ok
+                    ):
+                        # Commit to the started reverse. After ~3 cm a forward
+                        # arc reads as "nose clear" and pursuit used to take
+                        # over and drive straight back into the obstacle
+                        # (live 2026-10-08: 0.3 s reverse / forward / rotate
+                        # loop against a pallet). Keep backing to backup_dist_m
+                        # or until the rear closes, then replan.
+                        from .controller import _narrow_reverse_command
+
+                        cmd = _narrow_reverse_command(self._follower)
+                        progress = {
+                            **progress,
+                            "obstacle": "narrow_reverse",
+                            "local_planner": False,
+                            "cmd_vx_mps": cmd.vx,
+                            "cmd_vtheta_rad_s": 0.0,
+                        }
                     if backed_m >= self._backup_dist_m or not rear_cost_ok:
                         narrow_rev_start = None
                         narrow_rev_cooldown_until = now + max(
@@ -2413,6 +2476,9 @@ class NavSupervisor:
                                 if nose_unstick_mode != "turn":
                                     nose_unstick_start = pose
                                     nose_unstick_mode = "turn"
+                                    nose_unstick_yaw_sign = self._unstick_turn_sign(
+                                        pose, guard_pts
+                                    )
                                 cmd = DriveCommand(
                                     0.0,
                                     0.0,
