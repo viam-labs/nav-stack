@@ -313,10 +313,16 @@ def _reconstruct(came_from: dict, goal: Cell) -> List[Cell]:
     return path
 
 
+# Search loops poll ``should_abort`` every this many pops. Cheap enough to be
+# invisible, frequent enough that a cancel lands within a few ms.
+_ABORT_POLL_EVERY = 2048
+
+
 def _astar(
     costs: np.ndarray,
     start: Cell,
     goal: Cell,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> Optional[List[Cell]]:
     h, w = costs.shape
     if not is_traversable(int(costs[start])) or not is_traversable(int(costs[goal])):
@@ -328,9 +334,13 @@ def _astar(
     came_from: dict = {}
     heapq.heappush(open_heap, (_heuristic(start, goal), counter, start))
     closed = set()
+    pops = 0
 
     while open_heap:
         _, _, current = heapq.heappop(open_heap)
+        pops += 1
+        if should_abort is not None and pops % _ABORT_POLL_EVERY == 0 and should_abort():
+            return None
         if current in closed:
             continue
         if current == goal:
@@ -361,6 +371,7 @@ def _lazy_theta_star(
     costs: np.ndarray,
     start: Cell,
     goal: Cell,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> Optional[List[Cell]]:
     """Lazy Theta* (Nash et al.): any-angle paths with deferred LOS checks."""
     h, w = costs.shape
@@ -374,6 +385,7 @@ def _lazy_theta_star(
     heapq.heappush(open_heap, (_heuristic(start, goal), counter, start))
     closed: set = set()
     in_open: set = {start}
+    pops = 0
 
     def _set_vertex(s: Cell) -> None:
         """Validate (or repair) the lazy parent assumption when expanding ``s``."""
@@ -433,6 +445,9 @@ def _lazy_theta_star(
 
     while open_heap:
         _, _, s = heapq.heappop(open_heap)
+        pops += 1
+        if should_abort is not None and pops % _ABORT_POLL_EVERY == 0 and should_abort():
+            return None
         if s not in in_open:
             continue
         in_open.discard(s)
@@ -482,7 +497,7 @@ def _simplify(cells: List[Cell]) -> List[Cell]:
     return out
 
 
-def _search(algorithm: str) -> Callable[[np.ndarray, Cell, Cell], Optional[List[Cell]]]:
+def _search(algorithm: str) -> Callable[..., Optional[List[Cell]]]:
     algo = normalize_planner(algorithm)
     if algo == PLANNER_LAZY_THETA:
         return _lazy_theta_star
@@ -598,6 +613,7 @@ def connect_plan_start(
     local_view: Optional[LocalCostmapView] = None,
     mapping: bool = False,
     keepout_mask: Optional[np.ndarray] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> PlanResult:
     """Prepend a feasible segment when the robot cannot reach ``path[0]`` safely.
 
@@ -656,8 +672,13 @@ def connect_plan_start(
         local_view=local_view,
         mapping=mapping,
         keepout_mask=keepout_mask,
+        should_abort=should_abort,
     )
     if not bridge.feasible:
+        if bridge.error_code == 9:
+            # Aborted by the caller's cancel: keep that verdict rather than
+            # claiming the start is unreachable.
+            return bridge
         return PlanResult(
             feasible=False,
             error_code=8,
@@ -710,7 +731,14 @@ def plan_on_costmap(
     max_goal_snap_m: float = 0.5,
     robot_radius_m: float = 0.22,
     algorithm: str = DEFAULT_PLANNER,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> PlanResult:
+    """Plan on an already-inflated costmap.
+
+    ``should_abort`` is polled inside the search; when it returns True the
+    plan ends early with ``error_code=9`` so a cancel is not stuck behind a
+    full-map expansion.
+    """
     t0 = time.perf_counter()
     # ``costs`` are already inflated by robot_radius. Start keeps one cell of
     # slack (so a single inscribed neighbour is not "in lethal"). Goal snaps to
@@ -798,8 +826,15 @@ def plan_on_costmap(
             planning_time_s=time.perf_counter() - t0,
         )
 
-    cells = search(costs, start_cell, goal_cell)
+    cells = search(costs, start_cell, goal_cell, should_abort=should_abort)
     if not cells:
+        if should_abort is not None and should_abort():
+            return PlanResult(
+                feasible=False,
+                error_code=9,
+                error_msg="planning aborted",
+                planning_time_s=time.perf_counter() - t0,
+            )
         return PlanResult(
             feasible=False,
             error_code=3,
@@ -853,6 +888,7 @@ def plan_path(
     max_goal_snap_m: float = 0.5,
     mapping: bool = False,
     keepout_mask: Optional[np.ndarray] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> PlanResult:
     """Plan from a bridge-style map dict.
 
@@ -969,6 +1005,7 @@ def plan_path(
         algorithm=algorithm,
         robot_radius_m=robot_radius_m,
         max_goal_snap_m=max_goal_snap_m,
+        should_abort=should_abort,
     )
     result.costmap_viz = costmap_viz_dict(occ, costs)
     result.planning_costs = costs
