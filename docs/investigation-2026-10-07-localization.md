@@ -397,15 +397,15 @@ backup recovery did not fire. Scratch reproduction: a 5 cm cell line 1 cm
 inside the left flank that extends past the nose → `free_distance 0`,
 `blocked`; the same line ending at the nose → `clear`.
 
-Fix status: the branch's `ObstacleConfig.body_half_length_m /
-body_half_width_m` + in-body masking in `corridor_min_range`,
-`arc_clearance_m`, `spin_clearance_m`, `rear_clearance_m` is correct for the
-guard-off / simple go-to paths and stays, but it does **not** fix this
-incident. The guard near-floor fix is backlog item 15. Run 8 left the pinned
-pose after the reload because the process restarted at a slightly different
-pose with the relaxed backup knobs, not because of the mask. Config
-relaxations applied to tracer2a at 20:05: `backup_speed_mps 0.2`,
-`backup_dist_m 0.5`, `backup_cooldown_s 1`, `backup_max_attempts 3`,
+Fix status: the branch briefly carried in-body masking for the reactive
+layer (`corridor_min_range` and friends). It was dropped from PR #68 after
+the review because that layer does not run with the guard on, so it could
+not fix this incident; if the simple go-to path ever shows the symptom it
+can return together with the guard fix (backlog item 15). Run 8 left the
+pinned pose after the reload because the process restarted at a slightly
+different pose with the relaxed backup knobs. Config relaxations applied to
+tracer2a at 20:05: `backup_speed_mps 0.2`, `backup_dist_m 0.5`,
+`backup_cooldown_s 1`, `backup_max_attempts 3`,
 `local_planner_max_vel_x_mps 0.35`, `clearance_preference_m 0.25`.
 
 ## PR #68 adversarial review (2026-10-08)
@@ -439,9 +439,8 @@ Confirmed and fixed on the branch:
   were classed `never_active`. All fixed (`--min-tick-score`, unconditional
   cancel in `finally`, `nav_idle`, `_ensure_nav_idle`, stall exemptions for
   loc holds).
-- Body clearing: shoulder test now uses a point alongside the body so a wrong
-  half-width fails it; `_rear_open_for_unstick` passes body dims; no more
-  `inf * cos` warnings.
+- Body clearing (reactive-layer in-body masking) removed from the PR: dead
+  code on the guard path, no live evidence on the paths where it runs.
 
 Not a PR problem, but the cause of the 16:23 pin and the evening's lost
 heading: the tracer2a config change `nav_loc_refine_apply_max_m: 2` (default

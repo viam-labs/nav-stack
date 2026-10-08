@@ -436,10 +436,6 @@ class NavSupervisor:
                 # Padding beyond the inscribed radius covers light shoulder
                 # grazes (half-width + ~12 cm) without sealing every doorway.
                 footprint_half_width_m=float(robot_radius_m) + 0.12,
-                # True body rectangle: returns inside it are contact /
-                # self-hits and must not read as "obstacle ahead".
-                body_half_length_m=float(nose_offset),
-                body_half_width_m=float(self._body_radius),
                 max_age_s=scan_max_age_s,
             )
             if avoid_obstacles
@@ -2662,14 +2658,7 @@ class NavSupervisor:
                             local_view=local_view,
                             current=pose,
                         )
-                        spin_clear = (
-                            spin_clearance_m(
-                                scan,
-                                body_half_length_m=self._follower.obstacle.body_half_length_m,
-                                body_half_width_m=self._follower.obstacle.body_half_width_m,
-                            )
-                            >= self._spin_radius + 0.05
-                        )
+                        spin_clear = spin_clearance_m(scan) >= self._spin_radius + 0.05
                         if (
                             spin_clear
                             and self._spin_radius > self._robot_radius
@@ -2887,11 +2876,7 @@ class NavSupervisor:
                         else 0
                     )
                     rear = (
-                        rear_clearance_m(
-                            scan,
-                            body_half_length_m=self._follower.obstacle.body_half_length_m,
-                            body_half_width_m=self._follower.obstacle.body_half_width_m,
-                        )
+                        rear_clearance_m(scan)
                         if scan is not None
                         else math.inf
                     )
@@ -2944,14 +2929,7 @@ class NavSupervisor:
                     if spin_stuck_since is None:
                         spin_stuck_since = now
                     elif now - spin_stuck_since >= self._backup_stuck_time_s:
-                        rear_ok = (
-                            rear_clearance_m(
-                                scan,
-                                body_half_length_m=self._follower.obstacle.body_half_length_m,
-                                body_half_width_m=self._follower.obstacle.body_half_width_m,
-                            )
-                            >= self._backup_rear_clear_m
-                        )
+                        rear_ok = rear_clearance_m(scan) >= self._backup_rear_clear_m
                         costmap_ok = reverse_backup_feasible(
                             local_view,
                             pose.x,
