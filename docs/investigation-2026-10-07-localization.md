@@ -512,6 +512,44 @@ costmap; (c) when the guard's straight free distance covers the gap and the
 nose cone is clear, crawl through a cost-253 corridor instead of stopping;
 (d) budget the first replan attempt separately from the escalations.
 
+## Runs 10-11 (2026-10-08 13:03-13:18 local): unstick builds
+
+Build `315a6ae` (guard-sweep reverse, yaw away) then `d63a72a` (unstick
+before the next replan). Both loops cancelled/aborted early; no lap completed.
+
+- **External cancels again.** seanp attempt 1 of run 11 flipped to
+  `canceled` at 13:15:36 (140 s in) with no harness `leg_cancel` and no other
+  navigate in the robot log. Third time across runs 9 and 11. Source still
+  unconfirmed; find it before unattended runs.
+- **Why the first unstick build never reversed at seanp (run 10, 5 min, loop
+  timeout):** with the nose blocked the local replan cooldown was 0 and each
+  replan took 5-10 s, so the control thread was always inside `_try_replan`;
+  the unstick lives in the cooldown wait and never got a tick. Fixed in
+  `d63a72a`: a replan that leaves the robot in place with a blocked nose sets
+  `unstick_pending`, which holds the next replan until the reverse + yaw has
+  run (or reported impossible). Run 11 then showed one reverse and a 90 deg
+  yaw in the pocket, still interleaved with 5-10 s replans.
+- **Reactive wedge (run 11, 2 min, no motion):** rear-left corner 9 cm off
+  the desk row, guard `avoid`, nose blocked, spin blocked, path cost 32 — the
+  costmap-driven blocked branch (and its unstick) never engages below
+  `local_planner_activate_cost`, and the bumper reverse did not fire. Both
+  dock_test attempts stalled without moving; loop aborted. Fix (uncommitted
+  at the time of the stop): the reactive `avoid` wedge arms the same
+  unstick after `backup_stuck_time_s`; the unstick overrides the follower
+  command while pending; abandoned only after the nose has read clear for
+  0.5 s; at most `backup_max_attempts` rounds per 2 m area, then the normal
+  bounded-retry backoff decides. Tight-space simulations (dead end, person in
+  hallway for 2 s / 15 s) pin the timing.
+- **Planning time is the remaining cost.** 105 of 140 one-second samples in
+  the run 11 seanp approach were `planning`; a "no feasible path" verdict
+  floods the 2.1 M-cell grid and takes 5-10 s on the robot. Per-attempt
+  planning times are now appended to the replan reasons; a search budget in
+  the planner is the next lever (backlog 19).
+- Trace now carries `rear_free_m` (guard sweep backward), `spin_blocked`
+  and the unstick state, so the next wedge can be read from `get_trace`.
+
+Robot left idle at 13:18 (goal cancelled); teammates took the robot after.
+
 ## Findings log
 
 - 2026-10-07 19:59 — **Deploy path that works:** `viam module reload-local
@@ -720,3 +758,10 @@ Navigation (from run 8):
     guard-based reverse check, crawl through passable cost-253 gaps, and a
     replan budget that does not starve the escalations. Live interim:
     `replan_budget_s 10`, `backup_stuck_time_s 1.5` on tracer2a.
+19. Planner search budget: bound the expansion count (or plan within a
+    window around start/goal) so "no feasible path" returns in < 1 s instead
+    of flooding the map; use the new per-attempt timings in the replan
+    reasons to size it.
+20. Crawl through passable cost-253 gaps when the guard's straight free
+    distance covers the gap and the nose cone is clear (the "it fits but
+    stops" case), instead of stop-replanning.

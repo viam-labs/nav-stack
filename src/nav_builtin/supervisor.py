@@ -68,6 +68,12 @@ _UNSTICK_REAR_MIN_M = 0.12
 # A blocked-nose episode is one spot: moving this far from where it started
 # ends it (resets the replan count and the pending unstick).
 _UNSTICK_EPISODE_MOVE_M = 0.25
+# Reverse-and-yaw rounds are counted per area this wide; after
+# backup_max_attempts rounds the next blocked replan fails the goal.
+_UNSTICK_REGION_M = 2.0
+# A running or pending unstick is abandoned once the nose has read clear
+# this long and the follower can move (a noisy single-tick clear is not).
+_UNSTICK_ABANDON_CLEAR_S = 0.5
 
 # Last ~60 s of guarded control ticks (20 Hz), kept across goals so a graze
 # can be inspected after the operator cancels (``get_trace`` DoCommand).
@@ -1498,7 +1504,10 @@ class NavSupervisor:
                 paint_corridor=do_paint,
             )
             if not replanned.feasible:
-                reasons.append(f"{label}: {replanned.error_msg or 'infeasible'}")
+                reasons.append(
+                    f"{label}: {replanned.error_msg or 'infeasible'} "
+                    f"({float(getattr(replanned, 'planning_time_s', 0.0) or 0.0):.1f}s)"
+                )
                 continue
             if require_different and not paths_meaningfully_differ(
                 path, replanned.path, tol_m=differ_tol
@@ -1976,6 +1985,9 @@ class NavSupervisor:
             blocked_episode_pose: Optional[Pose2D] = None
             episode_replans = 0
             unstick_pending = False
+            unstick_rounds = 0
+            unstick_region_pose: Optional[Pose2D] = None
+            nose_clear_since: Optional[float] = None
             local_blocked_since: Optional[float] = None
             last_local_replan_at = 0.0
             failed_replan_while_blocked = 0
@@ -2265,6 +2277,11 @@ class NavSupervisor:
                         forward_clearance_m is None
                         or forward_clearance_m > obs_cfg.stop_distance_m
                     )
+                if nose_clear:
+                    if nose_clear_since is None:
+                        nose_clear_since = now
+                else:
+                    nose_clear_since = None
                 if local_view is not None:
                     from .local_planner import path_cost_ahead as _path_cost_ahead
 
@@ -2347,7 +2364,14 @@ class NavSupervisor:
                         episode_replans = 0
                         unstick_pending = False
                     if unstick_pending and not nose_clear:
-                        cooldown_ready = False
+                        if scan is not None and local_view is not None:
+                            # Hold the replan: the unstick runs in the wait
+                            # state below and releases this itself.
+                            cooldown_ready = False
+                        else:
+                            # The unstick cannot run without a scan and a
+                            # local costmap; never hold the replan hostage.
+                            unstick_pending = False
                     # How long since real motion while peeling with a clear nose.
                     peel_stuck_s = (
                         max(0.0, now - last_progress_at)
@@ -2407,7 +2431,15 @@ class NavSupervisor:
                         episode_replans += 1
                         # Whatever the planner said, the robot is still here
                         # with a blocked nose: back out before trying again.
-                        unstick_pending = not nose_clear
+                        # Not for a brief crosser: the block must have lasted
+                        # backup_stuck_time_s (a person stepping through
+                        # resolves itself faster than a reverse + yaw).
+                        unstick_pending = (
+                            not nose_clear
+                            and local_blocked_since is not None
+                            and now - local_blocked_since >= self._backup_stuck_time_s
+                            and unstick_rounds < self._backup_max_attempts
+                        )
                         if new_path is None:
                             recovered = self._recover_unreachable_start(
                                 goal,
@@ -2530,6 +2562,21 @@ class NavSupervisor:
                         reactive_avoid_since = now
                 else:
                     reactive_avoid_since = None
+                # Reactive wedge: guard says blocked ahead and no spin, path
+                # cost low so the costmap branch never engages, cmd stuck at
+                # zero (live 2026-10-08: 2 min against a desk row, no reverse).
+                # Arm the same reverse-then-yaw unstick the blocked branch uses.
+                if (
+                    obs_state == "avoid"
+                    and not nose_clear
+                    and reactive_avoid_since is not None
+                    and now - reactive_avoid_since >= self._backup_stuck_time_s
+                    and abs(cmd.vx) < 1e-6
+                    and abs(cmd.vtheta) < 1e-6
+                    and nose_unstick_mode == ""
+                    and unstick_rounds < self._backup_max_attempts
+                ):
+                    unstick_pending = True
                 last_obstacle_state = obs_state
                 progress = {
                     **progress,
@@ -2700,7 +2747,7 @@ class NavSupervisor:
                 else:
                     narrow_rev_start = None
 
-                if waiting_for_clear:
+                if waiting_for_clear or unstick_pending or nose_unstick_mode:
                     # Freeze forward motion for dynamic crossers, but keep a
                     # spin-blocked reverse crawl (otherwise avoid→spin_block→
                     # wait deadlocks with cmd stuck at zero). Still allow
@@ -2738,13 +2785,29 @@ class NavSupervisor:
                     # when the rear is open, otherwise turn when the spin
                     # disc is clear, then replan from that new pose.
                     unstick_done = False
+                    # A pending or running unstick is abandoned when the nose
+                    # reads clear and the follower can move (the crosser left):
+                    # progress beats a maneuver.
                     if (
-                        not nose_clear
+                        (unstick_pending or nose_unstick_mode)
+                        and nose_clear
+                        and nose_clear_since is not None
+                        and now - nose_clear_since >= _UNSTICK_ABANDON_CLEAR_S
+                        and (abs(cmd.vx) > 1e-6 or abs(cmd.vtheta) > 1e-6)
+                    ):
+                        unstick_pending = False
+                        nose_unstick_mode = ""
+                        nose_unstick_start = None
+                    if (
+                        (not nose_clear or nose_unstick_mode)
                         and (failed_replan_while_blocked >= 1 or unstick_pending)
                         and scan is not None
                         and local_view is not None
-                        and abs(cmd.vx) < 1e-6
-                        and abs(cmd.vtheta) < 1e-6
+                        and (
+                            (abs(cmd.vx) < 1e-6 and abs(cmd.vtheta) < 1e-6)
+                            or unstick_pending
+                            or nose_unstick_mode
+                        )
                     ):
                         rear_open, rev = self._unstick_rear_open(
                             pose, scan, local_view, guard_pts
@@ -2771,15 +2834,32 @@ class NavSupervisor:
                                     nose_unstick_yaw_sign * _NOSE_UNSTICK_YAW_RATE,
                                     False,
                                 )
-                            else:
+                            elif (
+                                nose_unstick_start is not None
+                                and distance_m(pose, nose_unstick_start) >= 0.05
+                            ):
                                 unstick_done = True
+                            else:
+                                # Could not move at all: no replan from the
+                                # same pose, let the cooldown backoff decide.
+                                nose_unstick_mode = ""
+                                nose_unstick_start = None
+                                unstick_pending = False
+                                unstick_rounds = max(0, unstick_rounds - 1)
                         elif nose_unstick_mode == "turn":
                             # Keep turning through unstick_yaw_rad (completion
                             # tracked below) while the spin disc stays free.
                             if spin_clear:
                                 cmd = turn_cmd
-                            else:
+                            elif nose_unstick_start is not None and abs(
+                                conv.normalize_angle(pose.theta - nose_unstick_start.theta)
+                            ) >= 0.1:
                                 unstick_done = True
+                            else:
+                                nose_unstick_mode = ""
+                                nose_unstick_start = None
+                                unstick_pending = False
+                                unstick_rounds = max(0, unstick_rounds - 1)
                         else:
                             choice = self._blocked_nose_unstick(
                                 failed_replans=max(
@@ -2794,6 +2874,15 @@ class NavSupervisor:
                                 # Neither reverse nor turn is possible here:
                                 # do not hold the replan hostage.
                                 unstick_pending = False
+                            if choice in ("reverse", "turn"):
+                                if (
+                                    unstick_region_pose is None
+                                    or distance_m(pose, unstick_region_pose)
+                                    > _UNSTICK_REGION_M
+                                ):
+                                    unstick_region_pose = pose
+                                    unstick_rounds = 0
+                                unstick_rounds += 1
                             if choice == "reverse":
                                 nose_unstick_start = pose
                                 nose_unstick_mode = "reverse"
@@ -3277,8 +3366,16 @@ class NavSupervisor:
                         cmd = DriveCommand(veto.vx, cmd.vy, veto.vtheta, cmd.done)
                         self._last_sent_cmd = cmd
                     near_d, near_x, near_y = self._guard.nearest(pose, guard_pts)
+                    rear_free = self._guard.free_distance(
+                        pose, -0.15, 0.0, guard_pts, max(0.35, float(self._backup_dist_m))
+                    )
                     _TRACE.append(
                         {
+                            "rear_free_m": (
+                                round(rear_free, 3) if math.isfinite(rear_free) else None
+                            ),
+                            "spin_blocked": bool(progress.get("spin_blocked")),
+                            "unstick": nose_unstick_mode or ("pending" if unstick_pending else None),
                             "t": round(time.time(), 3),
                             "x": round(pose.x, 3),
                             "y": round(pose.y, 3),
