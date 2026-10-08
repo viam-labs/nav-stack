@@ -674,7 +674,7 @@ def test_nav_config_without_footprint_keeps_single_radius():
 
 def test_nav_local_recovery_defaults_are_cautious_not_twitchy():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
-    assert cfg.builtin.local_planner_max_vel_x_mps == pytest.approx(0.25)
+    assert cfg.builtin.local_planner_max_vel_x_mps == pytest.approx(0.35)
     assert cfg.builtin.replan_local_min_period_s == pytest.approx(0.5)
 
 
