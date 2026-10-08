@@ -571,6 +571,14 @@ class NavSupervisor:
         )
 
     def _set_status(self, **kwargs) -> None:
+        # A cancel that lands while a plan / replan is running surfaces from
+        # the planner as an infeasible result ("planning aborted"). Report it
+        # as ``canceled``, never ``failed``: the route layer fails the whole
+        # route on ``failed``.
+        cancel = getattr(self, "_cancel", None)
+        if kwargs.get("state") == "failed" and cancel is not None and cancel.is_set():
+            kwargs["state"] = "canceled"
+            kwargs["error_msg"] = "canceled"
         with self._status_lock:
             for k, v in kwargs.items():
                 setattr(self._status, k, v)
@@ -652,6 +660,7 @@ class NavSupervisor:
             max_goal_snap_m=self._max_goal_snap_m,
             mapping=mapping,
             keepout_mask=keepout,
+            should_abort=self._cancel.is_set,
         )
         if result.feasible:
             result = connect_plan_start(
@@ -669,6 +678,7 @@ class NavSupervisor:
                 local_view=local_view,
                 mapping=mapping,
                 keepout_mask=keepout,
+                should_abort=self._cancel.is_set,
             )
         if result.feasible and self._smooth_path:
             if result.planning_costs is not None and result.planning_occ is not None:
@@ -1090,6 +1100,8 @@ class NavSupervisor:
         remaining = max(0.5, _path_length(path))
         best: Optional[tuple[float, Path2D, PlanResult, str]] = None
         for side in (0.45, -0.45, 0.65, -0.65, 0.35, -0.35):
+            if self._cancel.is_set():
+                break
             via = Pose2D(bx + side * nx, by + side * ny, yaw)
             if local_view is not None and footprint_collides(
                 local_view,
@@ -1352,6 +1364,11 @@ class NavSupervisor:
             return None
 
         for label, paint in attempts:
+            # A cancel must not wait behind a replan storm (live: >10 s to
+            # register while 84 planning ticks ran back to back).
+            if self._cancel.is_set():
+                reasons.append(f"{label}: skipped (cancel requested)")
+                break
             # During a detour ban, always seal the abandoned short corridor —
             # never the path we just committed to.
             do_paint = paint or hold_active
@@ -1395,7 +1412,9 @@ class NavSupervisor:
                 best = (new_len, replanned.path, replanned, label)
             if not paint and not hold_active:
                 break
-        if best is None and local_view is not None:
+        if best is None and local_view is not None and self._cancel.is_set():
+            reasons.append("forced-via: skipped (cancel requested)")
+        elif best is None and local_view is not None:
             forced = self._forced_side_detour(goal, pose, path, scan, local_view)
             if forced is not None:
                 new_path, result, label = forced
@@ -1426,8 +1445,11 @@ class NavSupervisor:
             # (that is the thrash). Exception: path is actually blocked /
             # pose-jump recovery needs any escape (force_lift_short_flip).
             ban_was_only_reason = any("short-flip" in r for r in reasons)
-            if hold_active and allow_lift_ban and (
-                not ban_was_only_reason or force_lift_short_flip
+            if (
+                hold_active
+                and allow_lift_ban
+                and not self._cancel.is_set()
+                and (not ban_was_only_reason or force_lift_short_flip)
             ):
                 reasons.append("detour-ban: lifting (no alternate)")
                 self._detour_ban_path = None
@@ -1561,6 +1583,8 @@ class NavSupervisor:
         same corridor: painting it blocked is what sealed the hallway.
         """
         del pose, failed_count
+        if self._cancel.is_set():
+            return None
         if self._stuck_pose_refine_used or not self._replan_blocked_at_start():
             return None
         self._stuck_pose_refine_used = True
