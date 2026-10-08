@@ -584,13 +584,13 @@ class BuiltinNavConfig:
     local_planner_enabled: bool = True
     local_planner_sim_time_s: float = 1.5
     local_planner_activate_cost: int = 200
-    local_planner_max_vel_x_mps: float = 0.35
+    local_planner_max_vel_x_mps: float = 0.25
     local_planner_max_vel_x_reverse_m: float = 0.15
     # Backup when local planner spins in place with clear rear space.
     backup_enabled: bool = True
     backup_stuck_time_s: float = 3.0
     backup_dist_m: float = 0.5
-    backup_speed_mps: float = 0.2
+    backup_speed_mps: float = 0.12
     backup_rear_clear_m: float = 0.45
     backup_max_attempts: int = 3
     backup_cooldown_s: float = 1.0
