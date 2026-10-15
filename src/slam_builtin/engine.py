@@ -24,8 +24,9 @@ from ..geom import conversions as conv
 from . import occupancy as occ
 from . import persistence
 from . import scan_match
+from . import loop_closure
+from . import pose_graph as pg
 from .io_sensors import BuiltinSensors
-from .keyframes import MapKeyframeStore
 from .lidar_odom import LidarOdometry
 from .types import LogOddsGrid
 
@@ -99,9 +100,44 @@ class BuiltinSlamEngine:
         self._map_dir: Optional[Path] = None
         self._pose_restored_from_disk = False
         self._last_pose_save_at = 0.0
-        self._keyframes = MapKeyframeStore(
-            max_keyframes=int(cfg.builtin_mapping_keyframe_max)
+        self._graph = pg.PoseGraph(
+            max_nodes=int(cfg.builtin_mapping_keyframe_max),
+            node_spacing_m=float(cfg.builtin_loop_node_spacing_m),
+            node_spacing_deg=float(cfg.builtin_loop_node_spacing_deg),
+            scans_per_node=int(cfg.builtin_loop_scans_per_node),
         )
+        # Map loaded when mapping resumed on it; renders start from it.
+        self._graph_base: Optional[LogOddsGrid] = None
+        # Manual erase/paint edits, replayed onto every re-rendered grid.
+        self._grid_edits: list = []
+        # One optimize + re-render at a time (worker, revisit, DoCommand).
+        self._graph_job = threading.Lock()
+        self._graph_revision = 0
+        # Bumped whenever the pose jumps frame (correction / set_pose) so an
+        # in-flight match computed in the old frame is not applied.
+        self._pose_epoch = 0
+        self._loop_params = loop_closure.LoopClosureParams(
+            min_travel_gap_m=float(cfg.builtin_loop_min_travel_m),
+            search_radius_m=float(cfg.builtin_loop_search_radius_m),
+            window_m=float(cfg.builtin_loop_search_window_m),
+            window_deg=float(cfg.builtin_loop_search_window_deg),
+            min_score=float(cfg.builtin_loop_min_score),
+        )
+        self._loop_event = threading.Event()
+        self._loop_thread: Optional[threading.Thread] = None
+        self._loop_last_attempt_at = 0.0
+        self._loop_pending: Optional[tuple] = None
+        self._loop_full_logged = False
+        self._loop_stats: dict = {
+            "attempts": 0,
+            "closures": 0,
+            "optimizations": 0,
+            "rejected_inconsistent": 0,
+            "reasons": {},
+            "last": None,
+            "last_optimize_ms": None,
+            "last_render_ms": None,
+        }
         self._keyframe_hook = None
         self._pose_listeners: list = []
         self._last_odom_twist = (0.0, 0.0, 0.0)
@@ -156,15 +192,23 @@ class BuiltinSlamEngine:
             daemon=True,
         )
         self._thread.start()
+        self._loop_thread = threading.Thread(
+            target=self._loop_closure_worker,
+            name="builtin-slam-loop",
+            daemon=True,
+        )
+        self._loop_thread.start()
         self._log(f"builtin SLAM engine started ({self._mode})")
 
     def stop(self) -> None:
         self._persist_pose(force=True)
         self._running = False
-        thr = self._thread
-        if thr is not None and thr.is_alive():
-            thr.join(timeout=2.0)
+        self._loop_event.set()
+        for thr in (self._thread, self._loop_thread):
+            if thr is not None and thr.is_alive():
+                thr.join(timeout=2.0)
         self._thread = None
+        self._loop_thread = None
 
     def configure_mode(self, mode: str, map_dir: Optional[Path] = None) -> None:
         with self._lock:
@@ -191,9 +235,9 @@ class BuiltinSlamEngine:
                     self._pose = conv.Pose2D(0.0, 0.0, 0.0)
                     self._last_odom_pose = None
                     self._last_odom_heading = None
-                    self._keyframes.clear()
                     self._invalidate_occ_cache()
                     self._generation += 1
+            self._reset_graph_locked()
             self._reset_lidar_odom_locked()
             if mode == MODE_LOCALIZING:
                 self._seed_localize_pending = True
@@ -284,7 +328,8 @@ class BuiltinSlamEngine:
             self._last_odom_pose = None
             self._last_odom_heading = None
             self._last_insert_pose = None
-            self._keyframes.clear()
+            self._reset_graph_locked()
+            self._pose_epoch += 1
             self._invalidate_occ_cache()
             self._generation += 1
             self._pose_restored_from_disk = False
@@ -307,6 +352,7 @@ class BuiltinSlamEngine:
             updated = occ.copy_grid(self._grid)
             cleared = occ.clear_disk(updated, x_m, y_m, radius_m)
             if cleared:
+                self._grid_edits.append(("clear", float(x_m), float(y_m), float(radius_m)))
                 self._grid = updated
                 self._invalidate_occ_cache()
                 self._generation += 1
@@ -327,6 +373,7 @@ class BuiltinSlamEngine:
             updated = occ.copy_grid(self._grid)
             marked = occ.mark_disk(updated, x_m, y_m, radius_m)
             if marked:
+                self._grid_edits.append(("mark", float(x_m), float(y_m), float(radius_m)))
                 self._grid = updated
                 self._invalidate_occ_cache()
                 self._generation += 1
@@ -355,7 +402,10 @@ class BuiltinSlamEngine:
 
     def set_pose(self, pose: conv.Pose2D) -> None:
         with self._lock:
+            if self._mode == MODE_MAPPING:
+                self._graph.rebase(pg.world_correction(self._pose, pose))
             self._pose = pose
+            self._pose_epoch += 1
             self._pending_match = None
             self._pending_count = 0
             # External relocalize / startup global_localize counts as seeded.
@@ -380,8 +430,55 @@ class BuiltinSlamEngine:
         self._lo_prev_theta = None
         self._lo_turn_rate = 0.0
 
+    def _set_corrected_pose_locked(self, pose: conv.Pose2D) -> None:
+        self._pose = pose
+        self._pose_epoch += 1
+        self._pending_match = None
+        self._pending_count = 0
+        self._seed_localize_pending = False
+        self._last_odom_pose = None
+        self._last_odom_heading = None
+        self._last_odom_time = None
+        self._last_insert_pose = pose
+        self._last_tick_pose = pose
+        # Keyscans sit at the pre-correction poses; keep velocity, rebuild map.
+        self._lo_reset_pending = True
+        self._lo_last_at = None
+        self._lo_map_updates = None
+
+    def _reset_graph_locked(self) -> None:
+        self._graph.clear()
+        self._grid_edits = []
+        self._loop_pending = None
+        self._loop_full_logged = False
+        self._graph_revision += 1
+        observed = bool(np.any(np.abs(self._grid.log_odds) > 0.05))
+        self._graph_base = (
+            occ.copy_grid(self._grid)
+            if self._mode == MODE_MAPPING and observed
+            else None
+        )
+
+    def _replay_grid_edits_locked(self, grid: LogOddsGrid) -> None:
+        for kind, x, y, r in self._grid_edits:
+            if kind == "clear":
+                occ.clear_disk(grid, x, y, r)
+            else:
+                occ.mark_disk(grid, x, y, r)
+
+    # Corrections up to this yaw are spread along the loop by the pose graph;
+    # bigger ones (yaw flip, far relocalize) shift the trailing path rigidly.
+    _GRAPH_CORRECTION_MAX_DEG = 30.0
+    _REVISIT_EDGE_SIGMA_M = 0.05
+    _REVISIT_EDGE_SIGMA_DEG = 1.0
+    # A new loop edge still this far off after optimizing disagrees with the
+    # rest of the graph (likely a false match) and is dropped.
+    _LOOP_MAX_CHI2 = 25.0
+    _LOOP_REBUILD_MIN_M = 0.08
+    _LOOP_REBUILD_MIN_DEG = 1.0
+
     def apply_map_pose_correction(self, matched_pose: conv.Pose2D) -> dict:
-        """Correct pose drift during mapping; optionally rebuild the grid."""
+        """Correct pose drift during mapping; re-render the grid from the graph."""
         cfg = self._cfg
         with self._lock:
             current = self._pose
@@ -393,60 +490,286 @@ class BuiltinSlamEngine:
                     conv.normalize_angle(matched_pose.theta - current.theta)
                 )
             )
-            rebuilt = False
-            keyframes_used = len(self._keyframes)
-            min_shift_m = float(cfg.mapping_revisit_min_shift_m)
-            min_shift_deg = float(cfg.mapping_revisit_min_shift_deg)
+            scans_used = self._graph.scan_count()
             should_rebuild = (
                 self._mode == MODE_MAPPING
                 and cfg.builtin_rebuild_map_on_revisit
-                and keyframes_used > 0
+                and len(self._graph) > 0
                 and (
-                    shift_m >= min_shift_m or shift_deg >= min_shift_deg
+                    shift_m >= float(cfg.mapping_revisit_min_shift_m)
+                    or shift_deg >= float(cfg.mapping_revisit_min_shift_deg)
                 )
             )
-            if should_rebuild:
-                delta = conv.compose_poses(
-                    conv.invert_pose(current), matched_pose
-                )
-                anchor = self._keyframes.find_loop_anchor(matched_pose)
-                self._keyframes.apply_pose_delta_from(anchor + 1, delta)
-                self._grid = self._keyframes.rebuild_grid(
-                    resolution=self._grid.resolution
-                )
-                self._generation += 1
-                self._invalidate_occ_cache()
-                self._last_loop_rebuild_at = time.monotonic()
-                rebuilt = True
-                self._log(
-                    "builtin SLAM loop closure: rebuilt map from "
-                    f"{keyframes_used} keyframes (anchor={anchor}) "
-                    f"(shift={shift_m:.2f} m, {shift_deg:.1f} deg)"
-                )
-
-            self._pose = matched_pose
-            self._pending_match = None
-            self._pending_count = 0
-            self._seed_localize_pending = False
-            self._last_odom_pose = None
-            self._last_odom_heading = None
-            self._last_odom_time = None
-            self._last_insert_pose = matched_pose
-            # Keyscans sit at the pre-correction poses; keep velocity, rebuild map.
-            self._lo_reset_pending = True
-            self._lo_last_at = None
-            self._lo_map_updates = None
-
-        self._notify_pose_listeners(matched_pose)
-        self._persist_pose(force=True)
-        return {
+            if not should_rebuild:
+                self._set_corrected_pose_locked(matched_pose)
+        out = {
             "applied": True,
-            "rebuilt": rebuilt,
-            "keyframes": keyframes_used,
+            "rebuilt": False,
+            "keyframes": scans_used,
             "shift_m": round(shift_m, 3),
             "shift_deg": round(shift_deg, 2),
             "slam_backend": "builtin",
         }
+        if not should_rebuild:
+            self._notify_pose_listeners(matched_pose)
+            self._persist_pose(force=True)
+            return out
+
+        with self._graph_job:
+            with self._lock:
+                corr = pg.world_correction(self._pose, matched_pose)
+                cur = len(self._graph) - 1
+                target = conv.compose_poses(corr, self._graph.nodes[cur].pose)
+                anchor = self._graph.nearest_old_node(
+                    target,
+                    min_travel_gap_m=self._loop_params.min_travel_gap_m,
+                    radius_m=3.0,
+                )
+                if anchor is None:
+                    anchor = self._graph.earliest_node_near(target)
+                plausible = (
+                    shift_m <= float(cfg.mapping_revisit_max_shift_m)
+                    and shift_deg <= self._GRAPH_CORRECTION_MAX_DEG
+                )
+                if plausible and anchor is not None and anchor < cur:
+                    self._graph.add_edge(
+                        pg.GraphEdge(
+                            anchor,
+                            cur,
+                            conv.compose_poses(
+                                conv.invert_pose(self._graph.nodes[anchor].pose), target
+                            ),
+                            pg.info_from_sigmas(
+                                self._REVISIT_EDGE_SIGMA_M,
+                                math.radians(self._REVISIT_EDGE_SIGMA_DEG),
+                            ),
+                            loop=True,
+                        )
+                    )
+                    method, first_free, live = "pose_graph", anchor + 1, None
+                else:
+                    start = anchor + 1 if anchor is not None else 0
+                    self._graph.apply_world_correction_from(start, corr)
+                    method, first_free, live = "rigid", None, corr
+            result = self._optimize_and_render(first_free, live_correction=live)
+        out.update(result)
+        out["method"] = method
+        out["anchor"] = anchor
+        out["rebuilt"] = result.get("status") == "rebuilt"
+        self._log(
+            f"builtin SLAM revisit correction ({method}, anchor={anchor}): "
+            f"{result.get('status')} shift={shift_m:.2f} m {shift_deg:.1f} deg"
+        )
+        return out
+
+    def optimize_pose_graph(self) -> dict:
+        """Optimize the whole mapping pose graph and re-render the grid."""
+        with self._lock:
+            if self._mode != MODE_MAPPING or len(self._graph) < 2:
+                return {"status": "skipped", "nodes": len(self._graph)}
+        with self._graph_job:
+            return self._optimize_and_render(1)
+
+    def _optimize_and_render(
+        self,
+        first_free: Optional[int],
+        *,
+        new_edges: Optional[list] = None,
+        live_correction: Optional[conv.Pose2D] = None,
+    ) -> dict:
+        """Optimize (unless ``first_free`` is None), re-render, swap. Holds ``_graph_job``."""
+        with self._lock:
+            snap = self._graph.snapshot()
+            base = self._graph_base
+            res = self._grid.resolution
+            revision = self._graph_revision
+        n = len(snap)
+        poses = snap.poses
+        info: dict = {"nodes": n, "edges": len(snap.edges)}
+        if first_free is not None and n > 1:
+            window = max(1, int(self._cfg.builtin_loop_max_window_nodes))
+            ff = max(1, int(first_free), n - window)
+            started = perf_counter()
+            res_opt = pg.optimize(snap.poses, snap.edges, first_free=ff)
+            ms = (perf_counter() - started) * 1000.0
+            self._loop_stats["optimizations"] += 1
+            self._loop_stats["last_optimize_ms"] = round(ms, 1)
+            info.update(
+                free_nodes=res_opt.free_nodes,
+                iterations=res_opt.iterations,
+                chi2_before=round(res_opt.chi2_before, 2),
+                chi2_after=round(res_opt.chi2_after, 2),
+                optimize_ms=round(ms, 1),
+            )
+            if new_edges:
+                worst = max(pg.edge_chi2(res_opt.poses, e) for e in new_edges)
+                info["loop_chi2"] = round(worst, 2)
+                if worst > self._LOOP_MAX_CHI2:
+                    with self._lock:
+                        self._graph.edges = [
+                            e for e in self._graph.edges
+                            if not any(e is x for x in new_edges)
+                        ]
+                    self._loop_stats["rejected_inconsistent"] += 1
+                    info["status"] = "rejected_inconsistent"
+                    return info
+            poses = res_opt.poses
+        started = perf_counter()
+        grid = pg.render_grid(snap, resolution=res, poses=poses, base=base)
+        render_ms = (perf_counter() - started) * 1000.0
+        self._loop_stats["last_render_ms"] = round(render_ms, 1)
+        info["render_ms"] = round(render_ms, 1)
+        with self._lock:
+            if self._graph_revision != revision:
+                info["status"] = "aborted"
+                return info
+            tail = self._graph.apply_poses(snap, poses)
+            # Inserts that landed while optimizing/rendering.
+            for pose, s in self._graph.scans_after(snap.last_seq):
+                grid = pg.paint_scan(grid, pose, s)
+            self._replay_grid_edits_locked(grid)
+            self._grid = grid
+            self._generation += 1
+            self._invalidate_occ_cache()
+            self._last_loop_rebuild_at = time.monotonic()
+            corr = live_correction if live_correction is not None else tail
+            new_pose = conv.compose_poses(corr, self._pose)
+            self._set_corrected_pose_locked(new_pose)
+            self._graph_revision += 1
+        info["status"] = "rebuilt"
+        info["live_correction"] = {
+            "x": round(corr.x, 3),
+            "y": round(corr.y, 3),
+            "theta_deg": round(math.degrees(corr.theta), 2),
+        }
+        self._notify_pose_listeners(new_pose)
+        self._persist_pose(force=True)
+        return info
+
+    # -- automatic loop closure ---------------------------------------------
+    def _loop_closure_enabled(self) -> bool:
+        return (
+            bool(getattr(self._cfg, "builtin_loop_closure", True))
+            and self._mode == MODE_MAPPING
+            and getattr(self._sensors, "world", None) is None
+        )
+
+    def _loop_closure_worker(self) -> None:
+        while self._running:
+            self._loop_event.wait(timeout=1.0)
+            self._loop_event.clear()
+            if not self._running:
+                break
+            try:
+                self.run_loop_closure()
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"builtin SLAM loop closure failed: {exc}")
+
+    @staticmethod
+    def _loop_edge(
+        snap: pg.GraphSnapshot, cur: int, match: loop_closure.LoopMatch
+    ) -> pg.GraphEdge:
+        # Match covariance is map-frame; edge errors are in the matched pose frame.
+        c, s = math.cos(match.pose.theta), math.sin(match.pose.theta)
+        rot = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
+        info = np.linalg.inv(rot @ match.cov @ rot.T)
+        if match.anchor is None:
+            return pg.GraphEdge(pg.PRIOR_NODE, cur, match.pose, info, loop=True)
+        rel = conv.compose_poses(conv.invert_pose(snap.pose(match.anchor)), match.pose)
+        return pg.GraphEdge(match.anchor, cur, rel, info, loop=True)
+
+    @staticmethod
+    def _corrections_agree(a: conv.Pose2D, b: conv.Pose2D, at: conv.Pose2D) -> bool:
+        pa = conv.compose_poses(a, at)
+        pb = conv.compose_poses(b, at)
+        return (
+            math.hypot(pa.x - pb.x, pa.y - pb.y) <= 0.15
+            and abs(conv.normalize_angle(pa.theta - pb.theta)) <= math.radians(2.0)
+        )
+
+    def run_loop_closure(self) -> dict:
+        """One detection pass on the newest keyframe; closes after two agree."""
+        if not self._loop_closure_enabled():
+            return {"status": "disabled"}
+        if not self._graph_job.acquire(blocking=False):
+            return {"status": "busy"}
+        try:
+            with self._lock:
+                self._loop_last_attempt_at = time.monotonic()
+                if self._graph.full:
+                    if not self._loop_full_logged:
+                        self._loop_full_logged = True
+                        self._log(
+                            "builtin SLAM loop closure off for this session: "
+                            f"{len(self._graph)} keyframes "
+                            "(builtin_mapping_keyframe_max)"
+                        )
+                    return {"status": "graph_full"}
+                snap = self._graph.snapshot()
+                base = self._graph_base
+                res = self._grid.resolution
+                revision = self._graph_revision
+            match, reason = loop_closure.detect(
+                snap, self._loop_params, resolution=res, base=base
+            )
+            stats = self._loop_stats
+            stats["attempts"] += 1
+            stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+            if reason != "ok" or match is None:
+                self._loop_pending = None
+                return {"status": reason}
+            cur = len(snap) - 1
+            prior = snap.pose(cur)
+            corr = pg.world_correction(prior, match.pose)
+            edge = self._loop_edge(snap, cur, match)
+            pending = self._loop_pending
+            if (
+                pending is None
+                or pending[0] != revision
+                or pending[1] == cur
+                or not self._corrections_agree(pending[2], corr, prior)
+            ):
+                self._loop_pending = (revision, cur, corr, edge)
+                return {"status": "pending"}
+            self._loop_pending = None
+            edges = [pending[3], edge]
+            with self._lock:
+                if self._graph_revision != revision:
+                    return {"status": "aborted"}
+                for e in edges:
+                    self._graph.add_edge(e)
+            shift_m = math.hypot(match.pose.x - prior.x, match.pose.y - prior.y)
+            shift_deg = abs(math.degrees(conv.normalize_angle(match.pose.theta - prior.theta)))
+            stats["closures"] += 1
+            stats["last"] = {
+                "at": time.time(),
+                "node": cur,
+                "anchor": match.anchor,
+                "gap_m": round(match.gap_m, 2),
+                "score": round(match.fit, 3),
+                "prior_score": round(match.prior_fit, 3),
+                "overlap": round(match.overlap, 3),
+                "shift_m": round(shift_m, 3),
+                "shift_deg": round(shift_deg, 2),
+            }
+            if shift_m < self._LOOP_REBUILD_MIN_M and shift_deg < self._LOOP_REBUILD_MIN_DEG:
+                # Matcher-quantization sized: keep the edge for the next
+                # optimization but skip a full re-render now.
+                return {"status": "constrained", **stats["last"]}
+            anchors = [e.i for e in edges if e.i >= 0]
+            first_free = min(anchors) + 1 if anchors else 1
+            result = self._optimize_and_render(first_free, new_edges=edges)
+            stats["last"]["result"] = result.get("status")
+            self._log(
+                "builtin SLAM loop closure: "
+                f"{result.get('status')} node={cur} anchor={match.anchor} "
+                f"gap={match.gap_m:.1f} m shift={shift_m:.2f} m {shift_deg:.1f} deg "
+                f"score={match.fit:.2f} (prior {match.prior_fit:.2f}) "
+                f"opt={result.get('optimize_ms')} ms render={result.get('render_ms')} ms"
+            )
+            return {**stats["last"], **result}
+        finally:
+            self._graph_job.release()
 
     def save_map(self, map_dir: Path) -> None:
         with self._lock:
@@ -558,8 +881,24 @@ class BuiltinSlamEngine:
                 "generation": self._generation,
                 "seed_localize_pending": self._seed_localize_pending,
                 "pose_restored_from_disk": self._pose_restored_from_disk,
-                "keyframes": len(self._keyframes),
+                "keyframes": self._graph.scan_count(),
                 "last_loop_rebuild_at": self._last_loop_rebuild_at,
+                "loop_closure": {
+                    "enabled": self._loop_closure_enabled(),
+                    "nodes": len(self._graph),
+                    "edges": len(self._graph.edges),
+                    "loop_edges": self._graph.loop_edge_count(),
+                    "graph_full": self._graph.full,
+                    "pending": self._loop_pending is not None,
+                    "attempts": self._loop_stats["attempts"],
+                    "closures": self._loop_stats["closures"],
+                    "optimizations": self._loop_stats["optimizations"],
+                    "rejected_inconsistent": self._loop_stats["rejected_inconsistent"],
+                    "reasons": dict(self._loop_stats["reasons"]),
+                    "last": self._loop_stats["last"],
+                    "last_optimize_ms": self._loop_stats["last_optimize_ms"],
+                    "last_render_ms": self._loop_stats["last_render_ms"],
+                },
                 "lidar_odometry": {
                     "enabled": self._lidar_odom_enabled(),
                     "accepts": self._lo_accepts,
@@ -661,6 +1000,7 @@ class BuiltinSlamEngine:
                 self._lo_reset_pending = False
                 self._lo.reset()
             match_due = now - self._last_match_at >= self._match_period_s
+            epoch = self._pose_epoch
 
         occ_map = None
         run_match = False
@@ -689,6 +1029,9 @@ class BuiltinSlamEngine:
                 self._last_match_at = now
                 self._last_match_score = score
                 self._last_prior_score = prior_score
+                if self._pose_epoch != epoch:
+                    # Pose moved frame (loop closure) mid-match.
+                    return
                 applied = self._apply_match(self._pose, matched, odom)
                 if matched is not None and applied:
                     self._match_accepts += 1
@@ -696,6 +1039,9 @@ class BuiltinSlamEngine:
                     self._match_rejects += 1
 
         if self._mode == MODE_MAPPING:
+            with self._lock:
+                if self._pose_epoch != epoch:
+                    return
             if yaw_rate > self._MAX_INSERT_YAW_RATE:
                 # One lidar revolution (~100 ms) is skewed by yaw_rate*0.1 s;
                 # inserting it during a fast spin paints walls as arcs.
@@ -763,6 +1109,7 @@ class BuiltinSlamEngine:
         scan_xy = cloud if cloud is not None and cloud.shape[0] else scan.to_points()
         with self._lock:
             guess = self._pose
+            epoch = self._pose_epoch
             map_pts = None
             if (
                 self._lo_map_updates is None
@@ -782,6 +1129,8 @@ class BuiltinSlamEngine:
         result = self._lo.match(scan_xy, guess)
         self._lo_match_ms = (perf_counter() - started) * 1000.0
         with self._lock:
+            if self._pose_epoch != epoch:
+                return False
             if result is None:
                 self._lo_rejects += 1
                 self._lo_fails += 1
@@ -1007,8 +1356,17 @@ class BuiltinSlamEngine:
             self._last_insert_pose = pose_snap
             self._last_insert_at = now
             self._updates += 1
-            if self._mode == MODE_MAPPING and self._keyframes.add(pose_snap, scan):
+            if self._mode == MODE_MAPPING:
                 hook = self._keyframe_hook
+                nodes = len(self._graph)
+                self._graph.add_scan(pose_snap, scan)
+                if (
+                    len(self._graph) > nodes
+                    and self._loop_closure_enabled()
+                    and now - self._loop_last_attempt_at
+                    >= float(self._cfg.builtin_loop_check_interval_s)
+                ):
+                    self._loop_event.set()
             if self._updates % 20 == 0:
                 self._generation += 1
                 self._invalidate_occ_cache()

@@ -64,11 +64,9 @@ class BuiltinSlamHost:
 
     def optimize_pose_graph(self, map_stem: Path) -> Dict:
         del map_stem
-        return {
-            "status": "unsupported",
-            "slam_backend": SLAM_BACKEND_BUILTIN,
-            "detail": "builtin SLAM has no pose-graph optimizer",
-        }
+        out = dict(self._engine.optimize_pose_graph())
+        out["slam_backend"] = SLAM_BACKEND_BUILTIN
+        return out
 
     def set_initial_pose(self, pose: conv.Pose2D) -> None:
         self._engine.set_pose(pose)

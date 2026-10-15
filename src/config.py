@@ -829,10 +829,30 @@ class SlamConfig:
     mapping_revisit_keyframe_max: int = 250
     mapping_revisit_keyframe_match_tol_m: float = 0.3
     mapping_revisit_keyframe_min_score: float = 0.55
-    # Builtin SLAM: rebuild the occupancy grid from stored scan keyframes when
+    # Builtin SLAM: rebuild the occupancy grid from the keyframe pose graph when
     # mapping_revisit corrects pose drift (eliminates duplicate corridor smear).
     builtin_rebuild_map_on_revisit: bool = True
-    builtin_mapping_keyframe_max: int = 500
+    # Pose-graph keyframe nodes kept per mapping session (~node_spacing_m
+    # apart). Past this, loop closure stops for the session; the map is kept.
+    builtin_mapping_keyframe_max: int = 2000
+    # Builtin SLAM automatic loop closure while mapping: match recent scans
+    # against a submap of older keyframes only (not the live grid, which
+    # already holds the drifted copy), add a pose-graph edge, optimize, and
+    # re-render the map from the corrected keyframes.
+    builtin_loop_closure: bool = True
+    builtin_loop_node_spacing_m: float = 0.5
+    builtin_loop_node_spacing_deg: float = 20.0
+    builtin_loop_scans_per_node: int = 2
+    # Path length that must separate a keyframe from the robot before it
+    # counts as "old" geometry for loop detection.
+    builtin_loop_min_travel_m: float = 6.0
+    builtin_loop_search_radius_m: float = 4.0
+    builtin_loop_search_window_m: float = 1.5
+    builtin_loop_search_window_deg: float = 15.0
+    builtin_loop_min_score: float = 0.55
+    builtin_loop_check_interval_s: float = 2.0
+    # Newest nodes moved by one optimization (older ones stay fixed).
+    builtin_loop_max_window_nodes: int = 900
     # Allow mapping revisit / loop-closure corrections while the robot is
     # moving. Default on for continuous-scan backends (builtin); off when
     # map_when_still is on, where odom TF shifts mid-hop are unsafe.

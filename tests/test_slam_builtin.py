@@ -697,32 +697,91 @@ def test_engine_set_pose_and_get_map(tmp_path: Path):
     assert diag["slam_backend"] == "builtin"
 
 
-def test_map_keyframe_store_rebuild_after_pose_delta():
-    from src.slam_builtin.keyframes import MapKeyframeStore
+def test_pose_graph_render_after_world_correction():
+    from src.slam_builtin import pose_graph as pg
 
-    store = MapKeyframeStore(max_keyframes=10)
-    scan = conv.LaserScan2D(
-        np.array([2.0]),
-        0.0,
-        0.0,
-        0.1,
-        10.0,
-    )
-    store.add(conv.Pose2D(0.0, 0.0, 0.0), scan)
-    grid_ok = store.rebuild_grid(resolution=0.05)
+    graph = pg.PoseGraph(node_spacing_m=0.4)
+    scan = conv.LaserScan2D(np.array([2.0]), 0.0, 0.0, 0.1, 10.0)
+    graph.add_scan(conv.Pose2D(0.0, 0.0, 0.0), scan)
+    grid_ok = pg.render_grid(graph.snapshot(), resolution=0.05)
     row, col = grid_ok.world_to_cell(2.0, 0.0)
-    int16_ok = occ.to_occupancy_int16(grid_ok)
-    assert int16_ok[row, col] == 100
+    assert occ.to_occupancy_int16(grid_ok)[row, col] == 100
 
-    anchor = store.find_loop_anchor(conv.Pose2D(0.0, 0.0, 0.0))
+    anchor = graph.earliest_node_near(conv.Pose2D(0.0, 0.0, 0.0))
     assert anchor == 0
     # Drifted leg after the anchor is corrected; anchor keyframe stays fixed.
-    store.add(conv.Pose2D(0.0, 0.5, 0.0), scan)
-    store.apply_pose_delta_from(anchor + 1, conv.Pose2D(0.0, -0.5, 0.0))
-    grid_fixed = store.rebuild_grid(resolution=0.05)
+    graph.add_scan(conv.Pose2D(0.0, 0.5, 0.0), scan)
+    assert len(graph) == 2
+    graph.apply_world_correction_from(anchor + 1, conv.Pose2D(0.0, -0.5, 0.0))
+    grid_fixed = pg.render_grid(graph.snapshot(), resolution=0.05)
     row_f, col_f = grid_fixed.world_to_cell(2.0, 0.0)
-    int16_fixed = occ.to_occupancy_int16(grid_fixed)
-    assert int16_fixed[row_f, col_f] == 100
+    assert occ.to_occupancy_int16(grid_fixed)[row_f, col_f] == 100
+    row_g, col_g = grid_fixed.world_to_cell(2.0, 0.5)
+    assert occ.to_occupancy_int16(grid_fixed)[row_g, col_g] != 100
+
+
+def test_pose_graph_world_correction_is_map_frame():
+    """A rotated keyframe moves by the same map-frame shift as the others."""
+    from src.slam_builtin import pose_graph as pg
+
+    graph = pg.PoseGraph(node_spacing_m=0.4)
+    scan = conv.LaserScan2D(np.array([2.0]), 0.0, 0.0, 0.1, 10.0)
+    graph.add_scan(conv.Pose2D(0.0, 0.0, 0.0), scan)
+    graph.add_scan(conv.Pose2D(1.0, 0.0, math.pi / 2), scan)
+    graph.apply_world_correction_from(0, conv.Pose2D(0.0, -0.5, 0.0))
+    assert graph.nodes[0].pose.y == pytest.approx(-0.5)
+    assert graph.nodes[1].pose.x == pytest.approx(1.0)
+    assert graph.nodes[1].pose.y == pytest.approx(-0.5)
+
+
+def test_pose_graph_optimize_spreads_loop_error():
+    """Square loop with a heading drift: the loop edge pulls the end home and
+    the error is spread along the chain instead of jumping the last node."""
+    from src.slam_builtin import pose_graph as pg
+
+    true = []
+    for side in range(4):
+        for k in range(5):
+            ang = side * math.pi / 2
+            base = [(0, 0), (5, 0), (5, 5), (0, 5)][side]
+            true.append(
+                conv.Pose2D(
+                    base[0] + math.cos(ang) * k,
+                    base[1] + math.sin(ang) * k,
+                    ang,
+                )
+            )
+    true.append(conv.Pose2D(0.0, 0.0, 2 * math.pi))
+    # Odometry with a small yaw bias per step.
+    bias = math.radians(1.0)
+    est = [true[0]]
+    edges = []
+    for i in range(1, len(true)):
+        rel = conv.compose_poses(conv.invert_pose(true[i - 1]), true[i])
+        drifted = conv.Pose2D(rel.x, rel.y, rel.theta + bias)
+        est.append(conv.compose_poses(est[-1], drifted))
+        edges.append(pg.GraphEdge(i - 1, i, drifted, pg.odometry_info(drifted)))
+    end_err = math.hypot(est[-1].x, est[-1].y)
+    assert end_err > 1.0
+    edges.append(
+        pg.GraphEdge(
+            0,
+            len(true) - 1,
+            conv.Pose2D(0.0, 0.0, 0.0),
+            pg.info_from_sigmas(0.03, math.radians(0.5)),
+            loop=True,
+        )
+    )
+    poses = np.array([[p.x, p.y, p.theta] for p in est])
+    result = pg.optimize(poses, edges, first_free=1)
+    assert result.chi2_after < result.chi2_before
+    final = result.poses[-1]
+    assert math.hypot(final[0], final[1]) < 0.1
+    errs = [
+        math.hypot(result.poses[i, 0] - true[i].x, result.poses[i, 1] - true[i].y)
+        for i in range(len(true))
+    ]
+    assert max(errs) < 0.5
 
 
 def test_apply_map_pose_correction_rebuilds_grid():
@@ -754,7 +813,7 @@ def test_apply_map_pose_correction_rebuilds_grid():
             range_min=0.1,
             range_max=10.0,
         )
-        engine._keyframes.add(conv.Pose2D(0.0, 0.0, 0.0), scan)
+        engine._graph.add_scan(conv.Pose2D(0.0, 0.0, 0.0), scan)  # noqa: SLF001
         engine._pose = conv.Pose2D(0.0, 0.5, 0.0)
 
     result = host.apply_map_pose_correction(conv.Pose2D(0.0, 0.0, 0.0))
