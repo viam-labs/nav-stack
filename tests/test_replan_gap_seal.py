@@ -178,6 +178,13 @@ def test_sub_deadband_reverse_is_lifted_to_backup_speed():
     # A real stop stays stopped. A forward crawl into the bumper is not sped up.
     assert sup._lift_sub_deadband(DriveCommand(0.0, 0.0, 0.0, False)).vx == 0.0
     assert sup._lift_sub_deadband(DriveCommand(0.015, 0.0, 0.025, False)).vx == 0.0
+    sup._guard = type("G", (), {"cfg": type("C", (), {"length_m": 0.72})()})()
+    # 0.13 m/s with a yaw the base drops, bumper already touching: turn.
+    turned = sup._lift_sub_deadband(
+        DriveCommand(0.13, 0.0, 0.0325, False), forward_clearance_m=0.36
+    )
+    assert turned.vx == 0.0
+    assert abs(turned.vtheta - 0.4) < 1e-9
 
 
 def test_undrivable_nose_turns_or_backs_up():

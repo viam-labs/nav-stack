@@ -635,18 +635,37 @@ class NavSupervisor:
             return None
         return masks.speed_pct_at(pose.x, pose.y)
 
-    def _lift_sub_deadband(self, cmd: DriveCommand) -> DriveCommand:
+    def _lift_sub_deadband(
+        self, cmd: DriveCommand, forward_clearance_m: Optional[float] = None
+    ) -> DriveCommand:
         """Make a nonzero twist survive ``_sanitize_base_cmd``.
 
         A reverse of a few cm/s is what the cart was publishing while
         ``last_drive`` stayed zero. Raise that reverse to the backup speed.
         A tiny forward command into a blocked nose is a stop, not a crawl.
+        A forward arc whose yaw the base will drop is a straight drive into
+        the bumper — turn in place instead.
         """
         from .footprint_guard import (
             BASE_ANG_EPS_RAD_S,
             BASE_LIN_EPS_MPS,
             twist_reaches_base,
         )
+
+        if (
+            not cmd.done
+            and cmd.vx > BASE_LIN_EPS_MPS
+            and 0.0 < abs(cmd.vtheta) < BASE_ANG_EPS_RAD_S
+            and self._guard is not None
+            and forward_clearance_m is not None
+            and forward_clearance_m
+            <= self._guard.cfg.length_m / 2.0 + 0.08
+        ):
+            lifted = DriveCommand(
+                0.0, 0.0, math.copysign(0.4, cmd.vtheta), False
+            )
+            self._last_sent_cmd = lifted
+            return lifted
 
         if cmd.done or twist_reaches_base(cmd.vx, cmd.vtheta):
             return cmd
@@ -3307,13 +3326,23 @@ class NavSupervisor:
                                 from .controller import _narrow_reverse_command
 
                                 cmd = _narrow_reverse_command(self._follower)
+                                # Pure reverse rocks straight into the same
+                                # bumper. Yaw toward the path while backing;
+                                # keep |w| <= 0.25 so the base does not drop vx.
+                                if abs(bearing) >= math.radians(12.0):
+                                    cmd = DriveCommand(
+                                        cmd.vx,
+                                        0.0,
+                                        math.copysign(0.20, bearing),
+                                        False,
+                                    )
                                 self._last_sent_cmd = cmd
                                 progress = {
                                     **progress,
                                     "obstacle": "narrow_reverse",
                                     "local_planner": False,
                                     "cmd_vx_mps": cmd.vx,
-                                    "cmd_vtheta_rad_s": 0.0,
+                                    "cmd_vtheta_rad_s": cmd.vtheta,
                                 }
                         elif nose_clear:
                             deadband_rev_start = None
@@ -3371,7 +3400,9 @@ class NavSupervisor:
                 # Apply before status / lookahead feedback so the limited twist
                 # is what we report and close the loop on.
                 cmd = self._apply_speed_zone(pose, cmd)
-                cmd = self._lift_sub_deadband(cmd)
+                cmd = self._lift_sub_deadband(
+                    cmd, progress.get("forward_clearance_m")
+                )
                 progress = {
                     **progress,
                     "cmd_vx_mps": cmd.vx,

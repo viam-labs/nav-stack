@@ -63,6 +63,21 @@ def test_doorway_jambs_beside_body_do_not_block():
     assert res.vx == pytest.approx(0.3) and res.state == "clear"
 
 
+def test_bumper_contact_does_not_drive_straight():
+    """A steer whose yaw the base drops is a straight push into the bumper.
+
+    Turn in place instead when that sweep is free.
+    """
+    g = _guard()
+    # Just off the front-left of the nose: straight is blocked, spin is not.
+    blob = np.array([[HL + 0.06, 0.12]])
+    res = g.guard(
+        O, 0.3, 0.0, blob, target=Pose2D(1.0, -0.8, 0.0), allow_steer=True
+    )
+    assert not (res.vx > 0.05 and abs(res.vtheta) < 0.08)
+    assert abs(res.vtheta) >= 0.08
+
+
 def test_shoulder_obstacle_inside_body_width_blocks():
     """The rc24 bin: at the shoulder, lidar cone ahead empty, body would hit it."""
     g = _guard()

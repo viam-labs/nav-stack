@@ -435,7 +435,12 @@ class FootprintGuard:
             if prefer_sign and kappa * prefer_sign < 0:
                 score += 0.15
             if score < best_score:
-                best_score = score
                 v_ok = max(0.05, min(v, self._regulate(v, free)))
-                best = (*self._drivable(v_ok, w * v_ok / v), free)
+                v_cmd, w_cmd = self._drivable(v_ok, w * v_ok / v)
+                # |w| under the base deadband is deleted, so this arc is
+                # driven straight. Do not offer it as a way around a bumper.
+                if 0.0 < abs(w_cmd) < BASE_ANG_EPS_RAD_S:
+                    continue
+                best_score = score
+                best = (v_cmd, w_cmd, free)
         return best
