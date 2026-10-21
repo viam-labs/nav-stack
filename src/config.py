@@ -940,12 +940,19 @@ class SlamConfig:
     periodic_relocalize_min_shift_deg: float = 10.0
     # Large automatic pose jumps (periodic relocalize, mapping revisit, seed /
     # startup localize) must agree across N matches before apply. Manual
-    # ``relocalize`` and ``apply: true`` bypass this gate.
+    # ``relocalize`` and idle ``apply: true`` bypass this gate. Mid-nav
+    # force-apply is still capped by ``localize_mid_nav_apply_max_*`` so a
+    # refine re-match cannot teleport the cart into a wall.
     localize_jump_confirm_count: int = 2
     localize_jump_agree_m: float = 0.4
     localize_jump_agree_deg: float = 15.0
     localize_jump_large_m: float = 0.75
     localize_jump_large_deg: float = 25.0
+    # While a goal is active, never apply (even with ``apply: true``) a jump
+    # past this size. Matches ``nav_loc_refine_apply_max_*`` — hallway-scale
+    # snaps stay ``refused_large`` so nav can stop / refine / abort instead.
+    localize_mid_nav_apply_max_m: float = 1.0
+    localize_mid_nav_apply_max_deg: float = 30.0
     # When navigation reports this many recoveries on the active goal, skip the
     # cheap local match and run full-map global_localize immediately.
     periodic_relocalize_nav_recoveries_threshold: int = 2

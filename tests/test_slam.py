@@ -1550,3 +1550,73 @@ def test_check_localization_apply_override_forces_correction():
     assert result["corrected"] is True
     relocalize_cmd = slam.do_command.await_args.args[0]
     assert relocalize_cmd["command"] == "relocalize"
+
+
+def test_mid_nav_apply_override_refuses_teleport_past_cap():
+    """Loc-refine apply:true must not force a >1 m mid-drive teleport."""
+    slam = _relocalize_slam(
+        periodic_relocalize_during_navigation=False,
+        periodic_relocalize_min_score=0.5,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.55,
+            "ray_mae_m": 0.80,
+            # Live dock wall-hit case: probe looked applyable, re-match yanked 1.7 m.
+            "pose": {"x": 1.665, "y": 0.0, "theta": 0.0},
+            "prior_score": -0.24,
+            "prior_ray_mae_m": 2.4,
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(
+        slam._periodic_relocalize_cycle(
+            apply_override=True,
+            allow_during_navigation=True,
+            full_map_escalation="still_bad",
+        )
+    )
+
+    assert result["status"] == "refused_large"
+    assert result["corrected"] is False
+    assert result["large_jump"] is True
+    assert result.get("jump_status") != "forced"
+    slam.do_command.assert_not_awaited()
+    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+
+    assert not should_hold_drive_for_pose_jump(result)
+
+
+def test_mid_nav_apply_override_still_allows_within_cap():
+    """Force-apply under the mid-nav cap remains how loc_refine corrects drift."""
+    slam = _relocalize_slam(
+        periodic_relocalize_during_navigation=False,
+        periodic_relocalize_min_score=0.5,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.47,
+            "ray_mae_m": 0.70,
+            "pose": {"x": 0.55, "y": 0.0, "theta": 0.0},
+            "prior_score": -0.10,
+            "prior_ray_mae_m": 1.5,
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = asyncio.run(
+        slam._periodic_relocalize_cycle(
+            apply_override=True,
+            allow_during_navigation=True,
+            full_map_escalation="still_bad",
+        )
+    )
+
+    assert result["corrected"] is True
+    assert result.get("jump_status") == "forced"
+    slam.do_command.assert_awaited()

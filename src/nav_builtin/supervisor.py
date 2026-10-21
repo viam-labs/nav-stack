@@ -865,10 +865,12 @@ class NavSupervisor:
         keep the current path). Does not fail the goal — a leftover residual
         or refused yank is common in hallways.
 
-        A straight, already-moving base runs the check without stopping.
-        Stopping is for a hard turn (the scan would be rejected as spinning)
-        and for applying a pose correction. An unfixed residual waits
-        ``retry_travel_m`` before the next check.
+        A straight, already-moving base may run a *mild* check without
+        stopping. Severe disagreement (high ``disagree_frac`` / negative
+        match scores) always stops — that is the "drive until refine" wall
+        case. Stopping is also required for a hard turn and for applying a
+        pose correction. An unfixed *thin* residual waits ``retry_travel_m``
+        before the next check; a still-lost pose keeps refusing forward.
         """
         if not self._nav_loc_refine:
             return None
@@ -900,6 +902,12 @@ class NavSupervisor:
         self._loc_refine_last_check = now
         self._loc_refine_last_pose = pose
 
+        from .loc_consistency import (
+            loc_blocks_forward,
+            residual_is_lost,
+            small_local_match_worth_applying,
+        )
+
         verdict = self._measure_loc_disagreement(pose)
         if not verdict.disagree:
             self._loc_refine_need_travel = False
@@ -910,12 +918,12 @@ class NavSupervisor:
         if not holding:
             self._loc_refine_start_pose = pose
 
-        # SLAM skips the match above ~0.35 rad/s of yaw. Under that, a cruise
-        # command is a valid scan — don't halt just to ask. Stop when the
-        # base is turning hard so the settle can bring yaw down first.
+        # SLAM skips the match above ~0.35 rad/s of yaw. Under that, a mild
+        # cruise check is fine. Severe unexplained pose always stops first.
         calm = self._loc_refine_yaw_calm()
-        if not calm:
-            self._pause_for_loc_refine(pose, dist_goal, verdict, settle=True)
+        severe = loc_blocks_forward(verdict)
+        if not calm or severe:
+            self._pause_for_loc_refine(pose, dist_goal, verdict, settle=not calm)
 
         result = self._call_check_localization()
         if result is None:
@@ -933,7 +941,6 @@ class NavSupervisor:
                 time.sleep(0.05)
             result = self._call_check_localization() or result
             status = str(result.get("status") or "")
-        from .loc_consistency import small_local_match_worth_applying
 
         if small_local_match_worth_applying(
             result,
@@ -959,18 +966,36 @@ class NavSupervisor:
                 return "hold"
             return "hold" if holding else None
 
-        from .loc_consistency import residual_is_lost
-
         pose_after = self._world.get_pose() or pose
         after = self._measure_loc_disagreement(pose_after)
         start = self._loc_refine_start_pose or pose
+        block_forward = loc_blocks_forward(after, result)
+        if block_forward:
+            self._loc_refine_tries += 1
+            self._loc_refine_cooldown_until = (
+                time.monotonic() + self._nav_loc_refine_cooldown_s
+            )
+            # Refuse forward while the pose is still unexplained (or a mid-nav
+            # yank was refused). Do not resume and "drive until" the next
+            # refine — that is how a bad estimate walks into a wall.
+            if calm or not severe:
+                self._pause_for_loc_refine(pose_after, dist_goal, after, settle=False)
+            # Keep re-checking while stopped; do not burn the try budget into
+            # an 8 m drive-on. Not ``localization_lost``.
+            if self._loc_refine_tries >= self._nav_loc_refine_max_tries:
+                self._loc_refine_tries = 0
+            self._loc_refine_need_travel = False
+            self._publish_loc_refine_progress(
+                pose_after, dist_goal, verdict=after, status="hold_bad_loc"
+            )
+            return "hold"
         if after.disagree:
             self._loc_refine_tries += 1
             self._loc_refine_cooldown_until = (
                 time.monotonic() + self._nav_loc_refine_cooldown_s
             )
-            # A second look only helps when the scan still says "lost"; a
-            # moderate residual SLAM could not fix is map change, not drift.
+            # Thin leftover: one more look only when residual_is_lost; else
+            # keep the goal and wait until travel clears the backoff.
             if (
                 self._loc_refine_tries < self._nav_loc_refine_max_tries
                 and residual_is_lost(after)
@@ -979,8 +1004,6 @@ class NavSupervisor:
                     pose_after, dist_goal, verdict=after, status="retry"
                 )
                 return "hold"
-            # Keep the published pose and the goal. Hallway residuals and
-            # refused large jumps are not ``localization_lost``.
             self._loc_refine_tries = 0
             self._loc_refine_need_travel = True
             self._loc_refine_travel_need_m = self._nav_loc_refine_retry_travel_m

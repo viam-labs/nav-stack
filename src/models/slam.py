@@ -1152,6 +1152,35 @@ class SlamService(SLAM):
             current = conv.Pose2D(0.0, 0.0, 0.0)
         return self._pose_jump_gate.evaluate(current, candidate, force=force)
 
+    def _should_refuse_mid_nav_jump(
+        self,
+        *,
+        nav_active: bool,
+        allow_during_navigation: bool,
+        apply_override: Optional[bool],
+        shift_m: float,
+        shift_deg: float,
+        large_jump: bool,
+        cfg: SlamConfig,
+    ) -> bool:
+        """True when a mid-drive pose yank must stay ``refused_large``.
+
+        Loc-refine may probe a ≤1 m match then re-match with ``apply: true``
+        and see a hallway-scale twin. Never force-apply past the mid-nav cap
+        while a goal is active — that teleport is what drives into walls.
+        """
+        mid_nav = bool(nav_active or allow_during_navigation)
+        if not mid_nav:
+            return False
+        if math.isinf(shift_m) or math.isinf(shift_deg):
+            return True
+        max_m = max(0.2, float(cfg.localize_mid_nav_apply_max_m))
+        max_deg = max(5.0, float(cfg.localize_mid_nav_apply_max_deg))
+        if apply_override is True:
+            return float(shift_m) > max_m or float(shift_deg) > max_deg
+        # Probe / auto mid-nav refine: refuse hallway-sized jumps (no sticky hold).
+        return bool(allow_during_navigation and large_jump)
+
     def _jump_decision_dict(self, decision: JumpDecision) -> dict:
         return {
             "jump_status": decision.status,
@@ -1640,16 +1669,21 @@ class SlamService(SLAM):
                         result["previous_ok"] = previous_ok
                     # Mid-nav refine: a hallway-sized yank we will not apply
                     # must not sticky-hold the base (that is the lobby pause).
-                    if (
-                        allow_during_navigation
-                        and large_jump
-                        and apply_override is not True
+                    if self._should_refuse_mid_nav_jump(
+                        nav_active=nav_active,
+                        allow_during_navigation=allow_during_navigation,
+                        apply_override=apply_override,
+                        shift_m=shift_m,
+                        shift_deg=shift_deg,
+                        large_jump=large_jump,
+                        cfg=cfg,
                     ):
                         self._pose_jump_gate.clear()
                         self._soft_nav_hold_since = None
                         self._soft_nav_hold_released = True
                         result["status"] = "refused_large"
                         result["corrected"] = False
+                        result["large_jump"] = True
                         LOGGER.info(
                             "periodic relocalize: refusing large mid-nav jump "
                             "(%.2f m / %.1f deg score=%.2f); "
@@ -1729,10 +1763,14 @@ class SlamService(SLAM):
         self._soft_nav_hold_released = False
 
         if should_apply and isinstance(matched_pose, Mapping):
-            if (
-                allow_during_navigation
-                and large_jump
-                and apply_override is not True
+            if self._should_refuse_mid_nav_jump(
+                nav_active=nav_active,
+                allow_during_navigation=allow_during_navigation,
+                apply_override=apply_override,
+                shift_m=shift_m,
+                shift_deg=shift_deg,
+                large_jump=large_jump,
+                cfg=cfg,
             ):
                 self._pose_jump_gate.clear()
                 result["status"] = "refused_large"
@@ -1740,11 +1778,12 @@ class SlamService(SLAM):
                 result["large_jump"] = True
                 LOGGER.info(
                     "periodic relocalize: refusing large mid-nav jump "
-                    "(%.2f m / %.1f deg score=%.2f); "
+                    "(%.2f m / %.1f deg score=%.2f apply=%s); "
                     "continuing on published pose",
                     0.0 if math.isinf(shift_m) else shift_m,
                     0.0 if math.isinf(shift_deg) else shift_deg,
                     score,
+                    apply_override,
                 )
                 return self._publish_relocalize_check(result)
             candidate = self._pose_from_mapping(matched_pose)

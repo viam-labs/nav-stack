@@ -4,7 +4,9 @@ Tick-level builtin scan matching already requires agreeing frames for big
 corrections. Async paths (periodic relocalize, mapping revisit, seed /
 startup localize) historically applied a single match — including weak
 full-map peaks that yank the robot metres away. This gate is the shared
-policy for those paths; manual ``relocalize`` / ``apply=true`` bypasses it.
+policy for those paths; idle manual ``relocalize`` / ``apply=true`` bypasses
+it. Mid-nav force-apply is capped separately (see Slam
+``localize_mid_nav_apply_max_*``) so a refine cannot teleport past ~1 m.
 """
 from __future__ import annotations
 

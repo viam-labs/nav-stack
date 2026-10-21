@@ -2402,16 +2402,27 @@ def test_nav_loc_refine_resumes_when_disagreement_clears():
     assert sup.status().error_msg == ""
 
 
-def test_nav_loc_refine_continues_after_two_tries():
-    """A leftover residual after two local tries must not abort the goal."""
+def test_nav_loc_refine_holds_when_residual_stays_lost():
+    """Severe unexplained pose refuses forward; does not abort as lost."""
+    import threading
+    import time
+
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
     world.scan = _open_scan()
     sup = _loc_refine_supervisor(world)
-    sup.run_goal(Pose2D(1.6, 1.0, 0.0))
-    assert world.loc_checks == 2
+    t = threading.Thread(target=sup.run_goal, args=(Pose2D(1.6, 1.0, 0.0),), daemon=True)
+    t.start()
+    deadline = time.time() + 2.0
+    while time.time() < deadline and world.loc_checks < 1:
+        time.sleep(0.02)
+    assert world.loc_checks >= 1
+    assert world.stop_calls >= 1
+    # Still active / holding — not localization_lost, not driving to success.
     st = sup.status()
-    assert st.state == "succeeded"
-    assert st.error_msg == ""
+    assert st.error_msg != "localization_lost"
+    assert st.state != "succeeded"
+    sup.request_cancel()
+    t.join(timeout=2.0)
 
 
 def test_nav_loc_refine_continues_when_residual_is_thin():
@@ -2461,28 +2472,131 @@ def test_loc_refine_replans_only_when_pose_moved():
     assert kind(None, start) == "resume"
 
 
-def test_nav_loc_refine_does_not_stop_while_driving_straight():
-    """A cruise command can be checked without a full stop."""
+def test_nav_loc_refine_does_not_stop_while_driving_straight_mild():
+    """A mild cruise residual can be checked without a full stop."""
     from src.nav_builtin.controller import DriveCommand
+    from src.nav_builtin.loc_consistency import LocDisagreement
 
-    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
-    world.scan = _open_scan()
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    mild = LocDisagreement(
+        disagree=True,
+        reason="scan_map",
+        compared_beams=12,
+        disagree_beams=4,
+        disagree_frac=0.333,
+    )
+    world.on_loc_check = lambda _w, **_kw: {
+        "status": "ok",
+        "corrected": False,
+        "match_mode": "local",
+        "score": 0.55,
+        "previous_score": 0.40,
+        "shift_m": 0.05,
+        "shift_deg": 2.0,
+    }
+    # Pre-check and post-check both mild → thin leftover → continue.
     sup = _loc_refine_supervisor(world)
+    sup._measure_loc_disagreement = lambda _pose: mild  # noqa: SLF001
     sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.05, False)  # noqa: SLF001
     out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
         Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
     )
     assert world.loc_checks == 1
     assert world.stop_calls == 0
-    assert out == "hold"
+    assert out == "continue"
 
 
-def test_nav_loc_refine_stops_when_turning_hard():
+def test_nav_loc_refine_stops_when_loc_is_severely_bad():
+    """High disagree_frac must stop even on a calm cruise command."""
     from src.nav_builtin.controller import DriveCommand
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
     world.scan = _open_scan()
+    world.on_loc_check = lambda _w, **_kw: {
+        "status": "ok",
+        "corrected": False,
+        "match_mode": "local",
+        "score": 0.10,
+        "previous_score": -0.24,
+        "tick_match_score": -0.04,
+        "shift_m": 1.665,
+        "shift_deg": 4.0,
+        "large_jump": True,
+    }
     sup = _loc_refine_supervisor(world)
+    sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.05, False)  # noqa: SLF001
+    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
+    )
+    assert world.loc_checks >= 1
+    assert world.stop_calls >= 1
+    assert out == "hold"
+
+
+def test_nav_loc_refine_holds_after_refused_large_jump():
+    """A refused mid-nav teleport must not resume forward motion."""
+    from src.nav_builtin.controller import DriveCommand
+    from src.nav_builtin.loc_consistency import LocDisagreement
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    mild = LocDisagreement(
+        disagree=True,
+        reason="scan_map",
+        compared_beams=12,
+        disagree_beams=4,
+        disagree_frac=0.333,
+    )
+    world.on_loc_check = lambda _w, **_kw: {
+        "status": "refused_large",
+        "corrected": False,
+        "match_mode": "local",
+        "score": 0.55,
+        "previous_score": 0.20,
+        "shift_m": 1.665,
+        "shift_deg": 4.0,
+        "large_jump": True,
+    }
+    sup = _loc_refine_supervisor(world)
+    sup._measure_loc_disagreement = lambda _pose: mild  # noqa: SLF001
+    sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
+    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
+    )
+    assert out == "hold"
+    assert world.stop_calls >= 1
+    assert sup._loc_refine_need_travel is False  # noqa: SLF001
+
+
+def test_nav_loc_refine_stops_when_turning_hard():
+    from src.nav_builtin.controller import DriveCommand
+    from src.nav_builtin.loc_consistency import LocDisagreement
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    mild = LocDisagreement(
+        disagree=True,
+        reason="scan_map",
+        compared_beams=12,
+        disagree_beams=4,
+        disagree_frac=0.333,
+    )
+    world.on_loc_check = lambda _w, **_kw: {
+        "status": "ok",
+        "corrected": False,
+        "match_mode": "local",
+        "score": 0.55,
+        "previous_score": 0.40,
+        "shift_m": 0.05,
+        "shift_deg": 2.0,
+    }
+    measures = [mild, LocDisagreement(disagree=False)]
+
+    def _measure_seq(_pose):
+        if measures:
+            return measures.pop(0)
+        return LocDisagreement(disagree=False)
+
+    sup = _loc_refine_supervisor(world)
+    sup._measure_loc_disagreement = _measure_seq  # noqa: SLF001
     sup._last_sent_cmd = DriveCommand(0.0, 0.0, 0.6, False)  # noqa: SLF001
     sup._maybe_pause_and_refine_localization(  # noqa: SLF001
         Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
@@ -2506,7 +2620,17 @@ def test_nav_loc_refine_backs_off_after_unfixed_residual():
         disagree_beams=4,
         disagree_frac=0.333,
     )
+    world.on_loc_check = lambda _w, **_kw: {
+        "status": "ok",
+        "corrected": False,
+        "match_mode": "local",
+        "score": 0.55,
+        "previous_score": 0.40,
+        "shift_m": 0.05,
+        "shift_deg": 2.0,
+    }
     sup = _loc_refine_supervisor(world)
+    # Pre-check and post-check stay mild (thin leftover → travel backoff).
     sup._measure_loc_disagreement = lambda _pose: mild  # noqa: SLF001
     sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
     start = Pose2D(1.0, 1.0, 0.0)

@@ -84,6 +84,49 @@ def residual_is_lost(verdict: LocDisagreement) -> bool:
     return verdict.compared_beams >= 16 and verdict.disagree_frac >= 0.45
 
 
+def match_scores_say_lost(result: Optional[Mapping]) -> bool:
+    """True when SLAM says the published pose does not explain the scan.
+
+    Negative ``previous_score`` / ``tick_match_score`` is the live wall-hit
+    signature — keep refusing forward even if the beam residual is borderline.
+    """
+    if not isinstance(result, Mapping):
+        return False
+    for key in ("previous_score", "tick_match_score"):
+        raw = result.get(key)
+        if raw is None:
+            continue
+        try:
+            score = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(score) and score < 0.0:
+            return True
+    return False
+
+
+def loc_blocks_forward(
+    verdict: LocDisagreement,
+    result: Optional[Mapping] = None,
+) -> bool:
+    """Refuse forward motion: scan badly unexplained or match scores negative.
+
+    Mild hallway leftovers may keep driving after a refine. This bar is for
+    the ``disagree_frac`` / negative-score state that previously drove until
+    the next refine and into a wall.
+    """
+    if match_scores_say_lost(result):
+        return True
+    if str((result or {}).get("status") or "") == "refused_large":
+        return True
+    if not verdict.disagree:
+        return False
+    # Catch the live ~0.53 case just under residual_is_lost's 0.55 bar.
+    if verdict.compared_beams >= 8 and verdict.disagree_frac >= 0.50:
+        return True
+    return residual_is_lost(verdict)
+
+
 def small_local_match_worth_applying(
     result: Optional[Mapping],
     *,

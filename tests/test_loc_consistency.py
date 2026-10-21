@@ -6,7 +6,9 @@ import numpy as np
 from src.geom import conversions as conv
 from src.nav_builtin.loc_consistency import (
     LocDisagreement,
+    loc_blocks_forward,
     localization_looks_bad,
+    match_scores_say_lost,
     residual_is_lost,
     small_local_match_worth_applying,
 )
@@ -111,6 +113,37 @@ def test_residual_is_lost_ignores_thin_leftover():
         disagree_frac=0.667,
     )
     assert residual_is_lost(bad) is True
+
+
+def test_loc_blocks_forward_live_wall_case():
+    """~53% disagree + negative scores must refuse forward motion."""
+    # Under residual_is_lost's 0.55 / 16-beam bars, but still "this bad".
+    live = LocDisagreement(
+        disagree=True,
+        compared_beams=12,
+        disagree_beams=6,
+        disagree_frac=0.529,
+    )
+    assert residual_is_lost(live) is False
+    assert loc_blocks_forward(live) is True
+    assert match_scores_say_lost(
+        {"previous_score": -0.24, "tick_match_score": -0.04}
+    )
+    assert loc_blocks_forward(
+        LocDisagreement(disagree=False),
+        {"status": "ok", "previous_score": -0.1},
+    )
+    assert loc_blocks_forward(
+        LocDisagreement(disagree=False),
+        {"status": "refused_large"},
+    )
+    thin = LocDisagreement(
+        disagree=True,
+        compared_beams=12,
+        disagree_beams=4,
+        disagree_frac=0.333,
+    )
+    assert loc_blocks_forward(thin) is False
 
 
 def test_small_local_match_worth_applying_live_dock_case():
