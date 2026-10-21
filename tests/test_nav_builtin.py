@@ -2590,10 +2590,9 @@ def test_nav_loc_refine_holds_when_residual_stays_lost():
         time.sleep(0.02)
     assert world.loc_checks >= 1
     assert world.stop_calls >= 1
-    # Still active / holding — not localization_lost, not driving to success.
+    # Must not abort as lost. After one recovery it drives again.
     st = sup.status()
     assert st.error_msg != "localization_lost"
-    assert st.state != "succeeded"
     sup.request_cancel()
     t.join(timeout=2.0)
 
@@ -2740,11 +2739,13 @@ def test_nav_loc_refine_stops_when_loc_is_severely_bad():
     out = _settle_loc_refine(sup, Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0)
     assert world.loc_checks >= 1
     assert world.stop_calls >= 1
-    assert out == "hold"
+    # Stopped for the check, then released to drive once recovery cannot fix it.
+    assert out == "continue"
+    assert sup._loc_refine_need_travel is True  # noqa: SLF001
 
 
 def test_nav_loc_refine_holds_after_refused_large_jump():
-    """A refused mid-nav teleport must not resume forward motion."""
+    """A refused jump is not applied, but the cart drives on and rechecks later."""
     from src.nav_builtin.controller import DriveCommand
     from src.nav_builtin.loc_consistency import LocDisagreement
 
@@ -2771,9 +2772,10 @@ def test_nav_loc_refine_holds_after_refused_large_jump():
     sup._measure_loc_disagreement = lambda _pose: severe  # noqa: SLF001
     sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
     out = _settle_loc_refine(sup, Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0)
-    assert out == "hold"
+    assert out == "continue"
+    assert world.pose.x == pytest.approx(1.0)
     assert world.stop_calls >= 1
-    assert sup._loc_refine_need_travel is False  # noqa: SLF001
+    assert sup._loc_refine_need_travel is True  # noqa: SLF001
     assert sup._loc_refine_recovery_used is True  # noqa: SLF001
     # Local + one stopped recovery.
     assert world.loc_checks >= 2

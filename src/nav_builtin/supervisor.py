@@ -1149,20 +1149,22 @@ class NavSupervisor:
             return self._launch_loc_check("recovery", stopped_recovery=True)
 
         if block_forward:
-            self._loc_refine_tries += 1
+            # Recovery already ran (or this result is the recovery). Do not
+            # park for the rest of the goal: a refused jump is not applied,
+            # but staying stopped cannot improve the match. Drive with
+            # avoidance and look again after ``retry_travel_m``.
+            self._loc_refine_tries = 0
+            self._loc_refine_force_stop = False
+            self._loc_refine_need_travel = True
+            self._loc_refine_travel_need_m = self._nav_loc_refine_retry_travel_m
+            self._loc_refine_clear_streak = 0
             self._loc_refine_cooldown_until = (
                 time.monotonic() + self._nav_loc_refine_cooldown_s
             )
-            if calm or not severe:
-                self._loc_refine_force_stop = True
-                self._pause_for_loc_refine(pose_after, dist_goal, after, settle=False)
-            if self._loc_refine_tries >= self._nav_loc_refine_max_tries:
-                self._loc_refine_tries = max(1, self._nav_loc_refine_max_tries)
-            self._loc_refine_need_travel = False
             self._publish_loc_refine_progress(
-                pose_after, dist_goal, verdict=after, status="hold_bad_loc"
+                pose_after, dist_goal, verdict=after, status="continue_unfixed"
             )
-            return "hold"
+            return self._loc_refine_resume_kind(start, pose_after)
         if after.disagree:
             self._loc_refine_tries += 1
             self._loc_refine_cooldown_until = (
