@@ -2723,6 +2723,44 @@ def test_nav_loc_refine_holds_after_refused_large_jump():
     assert world.loc_checks >= 2
 
 
+def test_nav_loc_refine_continues_when_slam_trusts_pose():
+    """Beam residual high but SLAM good_match + shift 0 → resume, don't park."""
+    from src.nav_builtin.controller import DriveCommand
+    from src.nav_builtin.loc_consistency import LocDisagreement
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    residual = LocDisagreement(
+        disagree=True,
+        reason="scan_map",
+        compared_beams=45,
+        disagree_beams=26,
+        disagree_frac=0.578,
+    )
+    world.on_loc_check = lambda _w, **_kw: {
+        "status": "ok",
+        "corrected": False,
+        "good_match": True,
+        "match_mode": "local",
+        "score": 0.66,
+        "previous_score": 0.66,
+        "tick_match_score": 0.70,
+        "shift_m": 0.0,
+        "shift_deg": 0.0,
+        "ray_mae_m": 0.63,
+        "drifted": False,
+    }
+    sup = _loc_refine_supervisor(world)
+    sup._measure_loc_disagreement = lambda _pose: residual  # noqa: SLF001
+    sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
+    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
+    )
+    assert out == "continue"
+    assert sup._loc_refine_need_travel is True  # noqa: SLF001
+    # Must not burn a recovery attempt or stick in hold_bad_loc.
+    assert sup._loc_refine_recovery_used is False  # noqa: SLF001
+
+
 def test_nav_loc_refine_recovers_once_then_resumes():
     """Stopped recovery that corrects the pose should resume the goal."""
     from src.nav_builtin.controller import DriveCommand
