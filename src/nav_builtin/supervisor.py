@@ -1305,14 +1305,17 @@ class NavSupervisor:
     ) -> str:
         """Choose wait / keep_dwa / replan while the local path cost is high.
 
-        ``keep_dwa``: clear forward cone — stay on the short global path and
-        peel with the local planner (fit doorway / wall-inflation pinch).
-        Do not stop-replan on the first clear-nose tick (that was the mid-nav
-        stutter). If peeling makes no progress for ``peel_stuck_limit_s``,
-        escalate — otherwise DWA crawls forever at path_cost=253.
-        ``wait``: blocked nose — freeze briefly for dynamic crossers.
-        ``replan``: blocked nose + grace, or clear-nose peel stuck.
+        ``wait``: freeze for dynamic crossers (person in front for a second).
+        Applies for the grace window even if the nose just cleared — leftover
+        lethal in the costmap must not immediately DWA hunt-and-peck / spin.
+        ``keep_dwa``: after grace, clear forward cone — stay on the short
+        global path and peel (doorway / static blob). If peeling makes no
+        progress for ``peel_stuck_limit_s``, escalate.
+        ``replan``: grace elapsed + blocked nose, or clear-nose peel stuck.
         """
+        # People crossing: stop first. Resume on the same path when clear.
+        if blocked_for_s < wait_before_replan_s:
+            return "wait"
         if nose_clear:
             if (
                 peel_stuck_limit_s > 0.0
@@ -1321,8 +1324,6 @@ class NavSupervisor:
             ):
                 return "replan"
             return "keep_dwa"
-        if blocked_for_s < wait_before_replan_s:
-            return "wait"
         if replan_cooldown_ready:
             return "replan"
         return "wait"
@@ -2165,8 +2166,8 @@ class NavSupervisor:
                     if local_blocked_since is None:
                         local_blocked_since = now
                 # Front-vs-side policy (not motion classification):
-                # - Blocked nose: brief wait (people crossing), then replan.
-                # - Clear nose: pursuit + reactive slow (no DWA peel).
+                # - Recent block: wait (people crossing) — resume if clear.
+                # - After grace, blocked nose → replan; clear nose → DWA peel.
                 wait_before_replan_s = max(
                     self._recovery_wait_duration_s,
                     self._replan_local_blocked_time_s,

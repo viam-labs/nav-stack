@@ -61,9 +61,10 @@ def _frame_scan(pose: Pose2D, *, inward_m: float) -> LaserScan2D:
     )
 
 
-def test_local_block_policy_prefers_dwa_when_nose_clear():
-    """Doorway pinch: clear nose → DWA; escalate only if peel makes no progress."""
+def test_local_block_policy_waits_before_dwa_or_replan():
+    """Brief blockers pause; DWA only after grace; escalate if peel stuck."""
     wait = 2.0
+    # Person in front (or just stepped aside with costmap leftover): wait.
     assert (
         NavSupervisor._local_block_action(
             nose_clear=True,
@@ -71,7 +72,7 @@ def test_local_block_policy_prefers_dwa_when_nose_clear():
             wait_before_replan_s=wait,
             replan_cooldown_ready=True,
         )
-        == "keep_dwa"
+        == "wait"
     )
     assert (
         NavSupervisor._local_block_action(
@@ -82,7 +83,7 @@ def test_local_block_policy_prefers_dwa_when_nose_clear():
         )
         == "wait"
     )
-    # Clear nose still peels after grace — no immediate stop-replan stutter.
+    # After grace, clear nose peels — no immediate stop-replan stutter.
     assert (
         NavSupervisor._local_block_action(
             nose_clear=True,

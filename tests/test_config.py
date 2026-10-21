@@ -727,7 +727,7 @@ def test_slam_config_legacy_slam_toolbox_block_alias():
 
 def test_builtin_recovery_wait_defaults():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
-    assert cfg.builtin.recovery_wait_duration_s == pytest.approx(0.5)
+    assert cfg.builtin.recovery_wait_duration_s == pytest.approx(2.0)
     tuned = NavConfig.from_dict(
         {
             "slam_service": "slam",
