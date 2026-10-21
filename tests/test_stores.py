@@ -34,6 +34,14 @@ def test_location_invalid_name(tmp_path):
         store.add("bad/name", 0, 0)
 
 
+def test_location_allows_dot_and_at(tmp_path):
+    store = LocationStore(tmp_path / "loc.json")
+    store.add("matt.vella@viam.com", 1.0, 2.0, 0.0)
+    assert store.get("matt.vella@viam.com").x == 1.0
+    store.add("desk.3", 0.5, 0.5)
+    assert "desk.3" in {loc.name for loc in store.list()}
+
+
 # -- routes ------------------------------------------------------------------
 def test_route_and_waypoint_crud(tmp_path):
     store = RouteStore(tmp_path / "routes.json")
