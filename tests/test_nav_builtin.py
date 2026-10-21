@@ -2455,6 +2455,27 @@ def _left_wall_map() -> dict:
     }
 
 
+def _settle_loc_refine(sup, pose, now, dist, rounds=8):
+    """Run the non-blocking refine until the background match is consumed."""
+    out = None
+    t = now
+    for _ in range(rounds):
+        out = sup._maybe_pause_and_refine_localization(pose, t, dist)  # noqa: SLF001
+        job = sup._loc_job  # noqa: SLF001
+        if job is not None and job.is_alive():
+            job.join(timeout=2.0)
+            t += 0.05
+            continue
+        if sup._loc_phase == "settling":  # noqa: SLF001
+            t = sup._loc_settle_until + 0.01  # noqa: SLF001
+            continue
+        if sup._loc_phase == "checking":  # noqa: SLF001
+            t += 0.05
+            continue
+        return out
+    return out
+
+
 def _loc_refine_supervisor(world: _FakeWorld) -> NavSupervisor:
     return NavSupervisor(
         world,
@@ -2624,6 +2645,47 @@ def test_loc_refine_replans_only_when_pose_moved():
     assert kind(None, start) == "resume"
 
 
+def test_loc_check_returns_before_a_slow_match():
+    """A slow check_localization must not stall the caller (the OA loop)."""
+    import threading
+    import time
+
+    from src.nav_builtin.controller import DriveCommand
+    from src.nav_builtin.loc_consistency import LocDisagreement
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    started = threading.Event()
+    release = threading.Event()
+
+    def _slow(_w, **_kw):
+        started.set()
+        assert release.wait(2.0)
+        return {"status": "ok", "corrected": False, "good_match": True, "score": 0.6,
+                "shift_m": 0.0, "shift_deg": 0.0}
+
+    world.on_loc_check = _slow
+    mild = LocDisagreement(
+        disagree=True, reason="scan_map", compared_beams=12,
+        disagree_beams=4, disagree_frac=0.333,
+    )
+    sup = _loc_refine_supervisor(world)
+    sup._measure_loc_disagreement = lambda _pose: mild  # noqa: SLF001
+    sup._last_sent_cmd = DriveCommand(0.4, 0.0, 0.0, False)  # noqa: SLF001
+    t0 = time.monotonic()
+    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
+    )
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.3
+    assert out is None
+    assert started.wait(1.0)
+    assert world.stop_calls == 0
+    release.set()
+    job = sup._loc_job  # noqa: SLF001
+    if job is not None:
+        job.join(timeout=2.0)
+
+
 def test_nav_loc_refine_does_not_stop_while_driving_straight_mild():
     """A mild cruise residual can be checked without a full stop."""
     from src.nav_builtin.controller import DriveCommand
@@ -2650,9 +2712,7 @@ def test_nav_loc_refine_does_not_stop_while_driving_straight_mild():
     sup = _loc_refine_supervisor(world)
     sup._measure_loc_disagreement = lambda _pose: mild  # noqa: SLF001
     sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.05, False)  # noqa: SLF001
-    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
-        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
-    )
+    out = _settle_loc_refine(sup, Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0)
     assert world.loc_checks == 1
     assert world.stop_calls == 0
     assert out == "continue"
@@ -2677,9 +2737,7 @@ def test_nav_loc_refine_stops_when_loc_is_severely_bad():
     }
     sup = _loc_refine_supervisor(world)
     sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.05, False)  # noqa: SLF001
-    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
-        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
-    )
+    out = _settle_loc_refine(sup, Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0)
     assert world.loc_checks >= 1
     assert world.stop_calls >= 1
     assert out == "hold"
@@ -2712,9 +2770,7 @@ def test_nav_loc_refine_holds_after_refused_large_jump():
     sup = _loc_refine_supervisor(world)
     sup._measure_loc_disagreement = lambda _pose: severe  # noqa: SLF001
     sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
-    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
-        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
-    )
+    out = _settle_loc_refine(sup, Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0)
     assert out == "hold"
     assert world.stop_calls >= 1
     assert sup._loc_refine_need_travel is False  # noqa: SLF001
@@ -2752,9 +2808,7 @@ def test_nav_loc_refine_continues_when_slam_trusts_pose():
     sup = _loc_refine_supervisor(world)
     sup._measure_loc_disagreement = lambda _pose: residual  # noqa: SLF001
     sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
-    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
-        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
-    )
+    out = _settle_loc_refine(sup, Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0)
     assert out == "continue"
     assert sup._loc_refine_need_travel is True  # noqa: SLF001
     # Must not burn a recovery attempt or stick in hold_bad_loc.
@@ -2814,9 +2868,7 @@ def test_nav_loc_refine_recovers_once_then_resumes():
     sup = _loc_refine_supervisor(world)
     sup._measure_loc_disagreement = _measure  # noqa: SLF001
     sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
-    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
-        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
-    )
+    out = _settle_loc_refine(sup, Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0)
     assert out == "resume"
     assert recovery_calls["n"] == 1
     assert world.pose.x == pytest.approx(1.4)
@@ -2853,9 +2905,7 @@ def test_nav_loc_refine_stops_when_turning_hard():
     sup = _loc_refine_supervisor(world)
     sup._measure_loc_disagreement = _measure_seq  # noqa: SLF001
     sup._last_sent_cmd = DriveCommand(0.0, 0.0, 0.6, False)  # noqa: SLF001
-    sup._maybe_pause_and_refine_localization(  # noqa: SLF001
-        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
-    )
+    _settle_loc_refine(sup, Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0)
     assert world.loc_checks == 1
     assert world.stop_calls >= 1
 
@@ -2890,7 +2940,7 @@ def test_nav_loc_refine_backs_off_after_unfixed_residual():
     sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
     start = Pose2D(1.0, 1.0, 0.0)
     now = time.monotonic()
-    out = sup._maybe_pause_and_refine_localization(start, now, 10.0)  # noqa: SLF001
+    out = _settle_loc_refine(sup, start, now, 10.0)
     assert out == "continue"
     assert world.loc_checks == 1
     assert world.stop_calls == 0
@@ -2901,9 +2951,7 @@ def test_nav_loc_refine_backs_off_after_unfixed_residual():
     assert again is None
     assert world.loc_checks == 1
     # Past retry_travel_m (8 m) the check runs again, still without stopping.
-    later = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
-        Pose2D(9.1, 1.0, 0.0), now + 2.0, 4.0
-    )
+    later = _settle_loc_refine(sup, Pose2D(9.1, 1.0, 0.0), now + 2.0, 4.0)
     # Pose moved since the first look, so the follower replans instead of
     # keeping the old polyline. The point is the check ran and did not stop.
     assert later == "resume"

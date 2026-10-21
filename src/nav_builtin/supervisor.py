@@ -224,6 +224,22 @@ class NavSupervisor:
         # Require consecutive clear checks before resuming from hold_bad_loc.
         self._loc_refine_clear_streak = 0
         self._loc_refine_clear_needed = 2
+        # Localization matches run off the control thread. The follow loop
+        # only starts them and polls; it never waits, so obstacle avoidance
+        # keeps ticking while SLAM is matching.
+        self._loc_phase = "idle"
+        self._loc_step = ""
+        self._loc_job: Optional[threading.Thread] = None
+        self._loc_job_done: Optional[threading.Event] = None
+        self._loc_job_result: Optional[dict] = None
+        self._loc_job_gen = 0
+        self._loc_settle_until = 0.0
+        self._loc_next_step = ""
+        self._loc_next_kwargs: dict = {}
+        self._loc_refine_force_stop = False
+        self._loc_probe_severe = False
+        self._loc_probe_calm = False
+        self._loc_verdict = None
         self._world = world
         self._inflation = inflation_radius_m
         # Driving clearance (half-width when a footprint is configured). Every
@@ -872,6 +888,57 @@ class NavSupervisor:
             return {"status": "error", "reason": str(exc).strip() or type(exc).__name__}
         return result if isinstance(result, dict) else None
 
+    def _launch_loc_check(self, step: str, **kwargs: Any) -> str:
+        """Start a localization match without waiting for it."""
+        self._loc_step = step
+        self._loc_job_gen += 1
+        gen = self._loc_job_gen
+        done = threading.Event()
+        self._loc_job_done = done
+        self._loc_job_result = None
+
+        def _run() -> None:
+            try:
+                result = self._call_check_localization(**kwargs)
+            except Exception as exc:  # noqa: BLE001 - worker must not die silently
+                result = {
+                    "status": "error",
+                    "reason": str(exc).strip() or type(exc).__name__,
+                }
+            if gen != self._loc_job_gen:
+                return
+            self._loc_job_result = result if isinstance(result, dict) else None
+            done.set()
+
+        self._loc_phase = "checking"
+        job = threading.Thread(target=_run, name="loc-refine", daemon=True)
+        self._loc_job = job
+        job.start()
+        return "hold" if self._loc_refine_force_stop else None
+
+    def _take_loc_check_result(self) -> Optional[dict]:
+        """Return a finished match, or None if it is still running."""
+        done = self._loc_job_done
+        if self._loc_phase != "checking" or done is None or not done.is_set():
+            return None
+        result = self._loc_job_result
+        self._loc_phase = "idle"
+        self._loc_job = None
+        self._loc_job_done = None
+        self._loc_job_result = None
+        return result
+
+    def _schedule_loc_check(self, step: str, **kwargs: Any) -> str:
+        """Run ``step`` after the settle window, without sleeping here."""
+        self._loc_next_step = step
+        self._loc_next_kwargs = dict(kwargs)
+        wait = float(self._nav_loc_refine_settle_s)
+        if wait <= 0.0:
+            return self._launch_loc_check(step, **kwargs)
+        self._loc_settle_until = time.monotonic() + wait
+        self._loc_phase = "settling"
+        return "hold"
+
     def _measure_loc_disagreement(self, pose: Pose2D):
         from .loc_consistency import localization_looks_bad
 
@@ -899,20 +966,32 @@ class NavSupervisor:
     ) -> Optional[str]:
         """Local refine when the scan is a poor fit for the published pose.
 
-        Returns ``None`` (keep following), ``hold`` (stay stopped),
+        Returns ``None`` (keep following), ``hold`` (command zero this tick),
         ``resume`` (pose moved: replan), or ``continue`` (pose unchanged:
         keep the current path). Does not fail the goal — a leftover residual
         or refused yank is common in hallways.
 
-        A straight, already-moving base may run a *mild* check without
-        stopping. Severe disagreement (high ``disagree_frac`` / negative
-        match scores) always stops — that is the "drive until refine" wall
-        case. Stopping is also required for a hard turn and for applying a
-        pose correction. An unfixed *thin* residual waits ``retry_travel_m``
+        The match itself never runs here. A straight, already-moving base may
+        *start* a mild check without stopping; obstacle avoidance keeps
+        commanding while that match runs. Severe disagreement always stops.
+        Stopping is also required for a hard turn and for applying a pose
+        correction. An unfixed *thin* residual waits ``retry_travel_m``
         before the next check; a still-lost pose keeps refusing forward.
         """
         if not self._nav_loc_refine:
             return None
+        if self._loc_phase == "checking":
+            result = self._take_loc_check_result()
+            if result is None:
+                return "hold" if self._loc_refine_force_stop else None
+            return self._loc_refine_consume(pose, now, dist_goal, result)
+        if self._loc_phase == "settling":
+            if now < self._loc_settle_until:
+                return "hold"
+            self._loc_phase = "idle"
+            return self._launch_loc_check(
+                self._loc_next_step, **self._loc_next_kwargs
+            )
         # The check compares the live scan to a finished map. While mapping,
         # new rays disagree with the partial grid and check_localization
         # returns not_localizing, so the pause never corrects the pose.
@@ -972,106 +1051,111 @@ class NavSupervisor:
         # cruise check is fine. Severe unexplained pose always stops first.
         calm = self._loc_refine_yaw_calm()
         severe = loc_blocks_forward(verdict)
-        if not calm or severe:
-            self._pause_for_loc_refine(pose, dist_goal, verdict, settle=not calm)
+        self._loc_probe_calm = calm
+        self._loc_probe_severe = severe
+        self._loc_verdict = verdict
+        self._loc_refine_force_stop = bool(severe or not calm)
+        if self._loc_refine_force_stop:
+            self._pause_for_loc_refine(pose, dist_goal, verdict, settle=False)
+        # Hard yaw: wait out the settle window before matching, but do not
+        # sleep on this thread. Mild or already-stopped checks start now.
+        if not calm and self._nav_loc_refine_settle_s > 0.0:
+            return self._schedule_loc_check("probe")
+        return self._launch_loc_check("probe")
 
-        result = self._call_check_localization()
+    def _loc_refine_consume(
+        self, pose: Pose2D, now: float, dist_goal: float, result: Optional[dict]
+    ) -> Optional[str]:
+        """Apply one finished match and maybe start the next. Never blocks."""
+        from .loc_consistency import (
+            loc_blocks_forward,
+            residual_is_lost,
+            slam_pose_is_trusted,
+            small_local_match_worth_applying,
+        )
+
+        step = self._loc_step
+        verdict = self._loc_verdict
+        calm = self._loc_probe_calm
+        severe = self._loc_probe_severe
         if result is None:
-            return "hold" if holding else None
+            return "hold" if self._loc_refine_tries > 0 else None
         status = str(result.get("status") or "")
-        if status == "awaiting_confirm":
-            if calm:
+        if (
+            status == "awaiting_confirm"
+            and step in ("probe", "recovery")
+        ):
+            self._loc_refine_force_stop = True
+            if calm or step == "recovery":
                 self._pause_for_loc_refine(pose, dist_goal, verdict, settle=False)
             self._publish_loc_refine_progress(
                 pose, dist_goal, verdict=verdict, status="awaiting_confirm"
             )
-            if self._nav_loc_refine_settle_s > 0.0:
-                time.sleep(max(0.4, self._nav_loc_refine_settle_s))
-            else:
-                time.sleep(0.05)
-            result = self._call_check_localization() or result
-            status = str(result.get("status") or "")
+            nxt = "confirm" if step == "probe" else "recovery_confirm"
+            kwargs = {"stopped_recovery": True} if step == "recovery" else {}
+            return self._schedule_loc_check(nxt, **kwargs)
 
-        if small_local_match_worth_applying(
+        if step in ("probe", "confirm") and small_local_match_worth_applying(
             result,
             max_shift_m=self._nav_loc_refine_apply_max_m,
             max_shift_deg=self._nav_loc_refine_apply_max_deg,
             min_score=self._nav_loc_refine_apply_min_score,
         ):
+            self._loc_refine_force_stop = True
             if calm:
                 self._pause_for_loc_refine(pose, dist_goal, verdict, settle=False)
             self._publish_loc_refine_progress(
                 pose, dist_goal, verdict=verdict, status="applying"
             )
-            applied = self._call_check_localization(apply=True)
-            if applied is not None:
-                result = applied
-                status = str(result.get("status") or "")
-        if status in ("skipped", "unconfigured"):
+            return self._launch_loc_check("apply", apply=True)
+
+        if step == "recovery" and (
+            status not in ("corrected", "ok") or not result.get("corrected")
+        ) and bool(result.get("good_match")):
+            return self._launch_loc_check(
+                "recovery_apply", apply=True, stopped_recovery=True
+            )
+
+        if status in ("skipped", "unconfigured") and step in (
+            "probe",
+            "confirm",
+            "apply",
+        ):
             reason = str(result.get("reason") or "")
             if reason in ("spinning", "stale_scan"):
                 if calm:
+                    self._loc_refine_force_stop = True
                     self._world.stop()
                     self._note_base_stopped()
                 return "hold"
-            return "hold" if holding else None
+            return "hold" if self._loc_refine_tries > 0 else None
 
         pose_after = self._world.get_pose() or pose
         after = self._measure_loc_disagreement(pose_after)
         start = self._loc_refine_start_pose or pose
         block_forward = loc_blocks_forward(after, result)
+        if (
+            block_forward
+            and not self._loc_refine_recovery_used
+            and step not in ("recovery", "recovery_confirm", "recovery_apply")
+        ):
+            if calm or not severe:
+                self._loc_refine_force_stop = True
+                self._pause_for_loc_refine(pose_after, dist_goal, after, settle=False)
+            self._loc_refine_recovery_used = True
+            self._publish_loc_refine_progress(
+                pose_after, dist_goal, verdict=after, status="recovering"
+            )
+            return self._launch_loc_check("recovery", stopped_recovery=True)
+
         if block_forward:
             self._loc_refine_tries += 1
             self._loc_refine_cooldown_until = (
                 time.monotonic() + self._nav_loc_refine_cooldown_s
             )
-            # Refuse forward while the pose is still unexplained (or a mid-nav
-            # yank was refused). Do not resume and "drive until" the next
-            # refine — that is how a bad estimate walks into a wall.
             if calm or not severe:
+                self._loc_refine_force_stop = True
                 self._pause_for_loc_refine(pose_after, dist_goal, after, settle=False)
-            # One stopped recovery: widen search / allow a trusted larger apply
-            # so we fix once and keep going instead of stop/go forever.
-            if not self._loc_refine_recovery_used:
-                self._loc_refine_recovery_used = True
-                self._publish_loc_refine_progress(
-                    pose_after, dist_goal, verdict=after, status="recovering"
-                )
-                recovered = self._call_check_localization(stopped_recovery=True)
-                if recovered is not None:
-                    result = recovered
-                    status = str(result.get("status") or "")
-                    if status == "awaiting_confirm":
-                        time.sleep(max(0.4, self._nav_loc_refine_settle_s or 0.4))
-                        recovered = (
-                            self._call_check_localization(stopped_recovery=True)
-                            or recovered
-                        )
-                        result = recovered
-                        status = str(result.get("status") or "")
-                    # Probe may leave a trusted large match unapplied — force once.
-                    if (
-                        status not in ("corrected", "ok")
-                        or not result.get("corrected")
-                    ) and bool(result.get("good_match")):
-                        applied = self._call_check_localization(
-                            apply=True, stopped_recovery=True
-                        )
-                        if applied is not None:
-                            result = applied
-                            status = str(result.get("status") or "")
-                pose_after = self._world.get_pose() or pose_after
-                after = self._measure_loc_disagreement(pose_after)
-                if not loc_blocks_forward(after, result) and result.get("corrected"):
-                    self._loc_refine_tries = 0
-                    self._loc_refine_need_travel = False
-                    self._loc_refine_clear_streak = 0
-                    self._publish_loc_refine_progress(
-                        pose_after, dist_goal, verdict=after, status="recovered"
-                    )
-                    return self._loc_refine_resume_kind(start, pose_after)
-            # Keep re-checking while stopped; do not burn the try budget into
-            # an 8 m drive-on. Not ``localization_lost``.
             if self._loc_refine_tries >= self._nav_loc_refine_max_tries:
                 self._loc_refine_tries = max(1, self._nav_loc_refine_max_tries)
             self._loc_refine_need_travel = False
@@ -1084,9 +1168,7 @@ class NavSupervisor:
             self._loc_refine_cooldown_until = (
                 time.monotonic() + self._nav_loc_refine_cooldown_s
             )
-            # SLAM already trusts this pose (good match, ~0 shift) — leftover
-            # beams are map change / open space, not lost loc. Resume with
-            # travel backoff instead of parking forever on hold_bad_loc.
+            self._loc_refine_force_stop = False
             if slam_pose_is_trusted(result):
                 self._loc_refine_tries = 0
                 self._loc_refine_need_travel = True
@@ -1096,12 +1178,11 @@ class NavSupervisor:
                     pose_after, dist_goal, verdict=after, status="continue_trusted"
                 )
                 return self._loc_refine_resume_kind(start, pose_after)
-            # Thin leftover: one more look only when residual_is_lost; else
-            # keep the goal and wait until travel clears the backoff.
             if (
                 self._loc_refine_tries < self._nav_loc_refine_max_tries
                 and residual_is_lost(after)
             ):
+                self._loc_refine_force_stop = True
                 self._publish_loc_refine_progress(
                     pose_after, dist_goal, verdict=after, status="retry"
                 )
@@ -1117,11 +1198,13 @@ class NavSupervisor:
         self._loc_refine_tries = 0
         self._loc_refine_need_travel = False
         self._loc_refine_clear_streak = 0
+        self._loc_refine_force_stop = False
         self._loc_refine_cooldown_until = (
             time.monotonic() + self._nav_loc_refine_cooldown_s
         )
+        status_name = "recovered" if step.startswith("recovery") else "resumed"
         self._publish_loc_refine_progress(
-            pose_after, dist_goal, verdict=after, status="resumed"
+            pose_after, dist_goal, verdict=after, status=status_name
         )
         return self._loc_refine_resume_kind(start, pose_after)
 
@@ -1141,8 +1224,8 @@ class NavSupervisor:
         self._publish_loc_refine_progress(
             pose, dist_goal, verdict=verdict, status="pausing"
         )
-        if settle and self._nav_loc_refine_settle_s > 0.0:
-            time.sleep(self._nav_loc_refine_settle_s)
+        # Settle is a deadline polled by the control loop. Sleeping here used
+        # to freeze obstacle avoidance for the whole pause.
 
     def _goal_timeout_s(self, length_m: float) -> float:
         """``timeout_s``, or 3x the full-speed drive time for long routes."""
@@ -1782,6 +1865,9 @@ class NavSupervisor:
         self._loc_refine_need_travel = False
         self._loc_refine_recovery_used = False
         self._loc_refine_clear_streak = 0
+        self._loc_job_gen += 1
+        self._loc_phase = "idle"
+        self._loc_refine_force_stop = False
         goal_dict = {"x": float(goal.x), "y": float(goal.y), "theta": float(goal.theta)}
         self._set_status(
             state="active",
@@ -1860,6 +1946,7 @@ class NavSupervisor:
 
             while time.monotonic() < deadline:
                 tick_started = time.monotonic()
+                loc_hold_motion = False
                 if self._cancel.is_set():
                     self._world.stop()
                     self._set_status(state="canceled", active=False, error_msg="canceled")
@@ -1942,18 +2029,21 @@ class NavSupervisor:
                     if hold_status == "nav_hold" and self._nav_loc_refine:
                         holding_for_localize = False
                         entering_loc_hold = False
+                # Localization never skips the rest of the tick. A match runs
+                # on its own thread; this loop still reads the scan, runs
+                # obstacle avoidance, and sends a command every period.
+                loc_hold_motion = False
                 if holding_for_localize:
-                    # Stop once on entry — repeating SetVelocity(0) every control
-                    # tick (esp. at 20 Hz) queues behind lidar/odom RPCs and
-                    # surfaces as ``Viam IO timed out`` / stalled navigation.
                     if entering_loc_hold:
                         self._world.stop()
                         self._note_base_stopped()
+                    loc_hold_motion = True
                     last_progress_at = now
                     last_progress_pose = pose
                     last_progress_dist = dist_goal_chk
                     last_progress_bearing = float("inf")
                     spin_stuck_since = None
+                    deadline += time.monotonic() - tick_started
                     self._set_status(
                         pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
                         progress={
@@ -1976,28 +2066,26 @@ class NavSupervisor:
                             },
                         },
                     )
-                    self._sleep_control_period(tick_started)
-                    # Localization stops do not count against the goal timeout.
-                    deadline += time.monotonic() - tick_started
-                    continue
-
-                now = time.monotonic()
-                loc_outcome = self._maybe_pause_and_refine_localization(
-                    pose, now, dist_goal_chk
-                )
-                if loc_outcome == "fail":
-                    return
-                if loc_outcome in ("hold", "resume", "continue"):
+                else:
+                    now = time.monotonic()
+                    loc_outcome = self._maybe_pause_and_refine_localization(
+                        pose, now, dist_goal_chk
+                    )
+                    if loc_outcome == "fail":
+                        return
                     if loc_outcome == "resume":
                         pending_loc_replan = True
-                    last_progress_at = now
-                    last_progress_pose = pose
-                    last_progress_dist = dist_goal_chk
-                    last_progress_bearing = float("inf")
-                    spin_stuck_since = None
-                    self._sleep_control_period(tick_started)
-                    deadline += time.monotonic() - tick_started
-                    continue
+                    if loc_outcome == "hold":
+                        loc_hold_motion = True
+                        last_progress_at = now
+                        last_progress_pose = pose
+                        last_progress_dist = dist_goal_chk
+                        last_progress_bearing = float("inf")
+                        spin_stuck_since = None
+                    # Time spent waiting on localization does not count
+                    # against the goal timeout.
+                    if loc_outcome in ("hold", "resume", "continue"):
+                        deadline += time.monotonic() - tick_started
 
                 need_scan = (
                     self._follower.obstacle is not None
@@ -3028,6 +3116,10 @@ class NavSupervisor:
                 # source handoffs (pursuit ↔ DWA ↔ avoid ↔ post-replan resume)
                 # ramp instead of stepping. Status and stall detection below use
                 # the limited command, which is what the base actually gets.
+                # A localization hold still ran avoidance above; the command
+                # that leaves this tick is zero so a latched speed cannot coast.
+                if loc_hold_motion:
+                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
                 pre_limit = cmd
                 cmd = self._rate_limited(cmd)
                 if self._guard is not None and not cmd.done:
