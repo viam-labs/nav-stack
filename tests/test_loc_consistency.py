@@ -10,6 +10,7 @@ from src.nav_builtin.loc_consistency import (
     localization_looks_bad,
     match_scores_say_lost,
     residual_is_lost,
+    slam_pose_is_trusted,
     small_local_match_worth_applying,
 )
 from src.nav_builtin.types import OccupancyGrid, Pose2D
@@ -144,6 +145,33 @@ def test_loc_blocks_forward_live_wall_case():
         disagree_frac=0.333,
     )
     assert loc_blocks_forward(thin) is False
+
+
+def test_trusted_slam_pose_does_not_block_on_beam_residual():
+    """Live stuck case: good_match + shift 0 must not permanent-hold."""
+    residual = LocDisagreement(
+        disagree=True,
+        compared_beams=45,
+        disagree_beams=26,
+        disagree_frac=0.578,
+    )
+    trusted = {
+        "status": "ok",
+        "corrected": False,
+        "good_match": True,
+        "score": 0.66,
+        "previous_score": 0.66,
+        "tick_match_score": 0.70,
+        "shift_m": 0.0,
+        "shift_deg": 0.0,
+        "ray_mae_m": 0.63,
+    }
+    assert slam_pose_is_trusted(trusted) is True
+    assert loc_blocks_forward(residual, trusted) is False
+    # Negative prior still blocks even with a decent candidate score.
+    assert slam_pose_is_trusted(
+        {**trusted, "previous_score": -0.1, "good_match": True}
+    ) is False
 
 
 def test_small_local_match_worth_applying_live_dock_case():

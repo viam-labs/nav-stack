@@ -72,6 +72,11 @@ def builtin_nav_runtime_kwargs(
         "recovery_wait_duration_s": bcfg.recovery_wait_duration_s,
         "replan_local_blocked_time_s": bcfg.replan_local_blocked_time_s,
         "replan_local_min_period_s": bcfg.replan_local_min_period_s,
+        "replan_max_early_detour_ratio": bcfg.replan_max_early_detour_ratio,
+        "replan_allow_long_detour_after_fails": (
+            bcfg.replan_allow_long_detour_after_fails
+        ),
+        "detour_short_flip_budget": bcfg.detour_short_flip_budget,
         "drive_timeout_streak": bcfg.drive_timeout_streak,
         "yaw_align_timeout_s": bcfg.yaw_align_timeout_s,
         "max_goal_snap_m": bcfg.max_goal_snap_m,

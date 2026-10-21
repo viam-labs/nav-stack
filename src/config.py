@@ -605,6 +605,16 @@ class BuiltinNavConfig:
     # replan does not freeze the robot for seconds; DWA still peels during
     # the brief wait.
     replan_local_min_period_s: float = 0.5
+    # Early blocked-replans: refuse a candidate longer than this × remaining
+    # path length so a brief person-block does not take a room-scale loop.
+    # After ``replan_allow_long_detour_after_fails`` failed blocked-replans,
+    # longer detours are allowed (true static blockage).
+    replan_max_early_detour_ratio: float = 1.75
+    replan_allow_long_detour_after_fails: int = 2
+    # After committing a longer detour, allow this many flips back to a shorter
+    # clear corridor per goal (person blocking the long path). Further flips
+    # stay banned until the detour itself dies / force-lift.
+    detour_short_flip_budget: int = 2
     # Command slew limits (the base has no onboard ramp). Requests to stop
     # translating are never slewed, so stop distances are unaffected.
     max_linear_accel_mps2: float = 0.8

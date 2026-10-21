@@ -1631,7 +1631,7 @@ def test_try_replan_falls_back_to_scan_plan_and_records_reason():
 
 
 def test_try_replan_holds_detour_against_short_flip():
-    """After a longer detour, refuse flipping back to the abandoned short corridor."""
+    """With flip budget spent, refuse flipping back to the abandoned short corridor."""
     from src.nav_builtin.controller import _path_length
     from src.nav_builtin.supervisor import NavSupervisor
     from src.nav_builtin.types import PlanResult
@@ -1646,6 +1646,7 @@ def test_try_replan_holds_detour_against_short_flip():
         local_costmap_enabled=False,
         local_planner_enabled=False,
         clearance_preference_m=0.0,
+        detour_short_flip_budget=0,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
     short = plan_path(
@@ -1670,7 +1671,7 @@ def test_try_replan_holds_detour_against_short_flip():
         world.pose,
         short.path,
         None,
-        failed_count=1,
+        failed_count=2,
         require_different=True,
         trigger="test-detour",
     )
@@ -1679,7 +1680,7 @@ def test_try_replan_holds_detour_against_short_flip():
     assert sup._detour_ban_path is not None
     assert bool(sup._last_replan_info.get("detour_hold")) is True
 
-    # Ban is goal-lifetime, not a wall-clock timer — still refuse later.
+    # Budget is 0 — refuse flipping back to the short corridor.
     flip = sup._try_replan(
         goal,
         world.pose,
@@ -1694,8 +1695,8 @@ def test_try_replan_holds_detour_against_short_flip():
     assert sup._detour_ban_path is not None
 
 
-def test_try_replan_lifts_detour_ban_when_no_alternate():
-    """If the detour dies and every banned attempt fails, lift once and take short."""
+def test_try_replan_rejects_too_long_early_detour():
+    """First blocked-replans must not accept a room-scale loop."""
     from src.nav_builtin.controller import _path_length
     from src.nav_builtin.supervisor import NavSupervisor
     from src.nav_builtin.types import PlanResult
@@ -1710,6 +1711,155 @@ def test_try_replan_lifts_detour_ban_when_no_alternate():
         local_costmap_enabled=False,
         local_planner_enabled=False,
         clearance_preference_m=0.0,
+        replan_max_early_detour_ratio=1.75,
+        replan_allow_long_detour_after_fails=2,
+    )
+    goal = Pose2D(5.0, 3.0, 0.0)
+    short = plan_path(
+        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert short.feasible
+    # ~3× remaining — must be refused on early attempts.
+    long_path = Path2D(
+        points=((1.0, 3.0), (1.0, 8.0), (5.0, 8.0), (5.0, 3.0)),
+        goal_theta=0.0,
+    )
+    assert _path_length(long_path) > _path_length(short.path) * 1.75
+
+    def scripted_plan(g, start=None, scan=None, **kwargs):
+        return PlanResult(feasible=True, path=long_path)
+
+    sup.plan = scripted_plan  # type: ignore[method-assign]
+    rejected = sup._try_replan(
+        goal,
+        world.pose,
+        short.path,
+        None,
+        failed_count=1,
+        require_different=True,
+        trigger="local_blocked",
+    )
+    assert rejected is None
+    assert "too long early" in (sup._last_replan_error or "")
+
+    # After enough failed blocked-replans, the same long path is allowed.
+    accepted = sup._try_replan(
+        goal,
+        world.pose,
+        short.path,
+        None,
+        failed_count=2,
+        require_different=True,
+        trigger="local_blocked",
+    )
+    assert accepted is not None
+    assert paths_meaningfully_differ(short.path, accepted)
+    assert sup._detour_ban_path is not None
+
+
+def test_try_replan_allows_budgeted_short_flip():
+    """Spend flip budget to return to a clear short corridor, then refuse thrash."""
+    from src.nav_builtin.controller import _path_length
+    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav_builtin.types import PlanResult
+
+    m = _empty_map(size=120, resolution=0.05)
+    world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        clearance_preference_m=0.0,
+        detour_short_flip_budget=2,
+    )
+    goal = Pose2D(5.0, 3.0, 0.0)
+    short = plan_path(
+        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
+    )
+    assert short.feasible
+    long_path = Path2D(
+        points=((1.0, 3.0), (1.0, 5.0), (5.0, 5.0), (5.0, 3.0)),
+        goal_theta=0.0,
+    )
+    assert _path_length(long_path) > _path_length(short.path) * 1.15
+
+    mode = {"give": "long"}
+
+    def scripted_plan(g, start=None, scan=None, **kwargs):
+        if mode["give"] == "long":
+            return PlanResult(feasible=True, path=long_path)
+        return PlanResult(feasible=True, path=short.path)
+
+    sup.plan = scripted_plan  # type: ignore[method-assign]
+
+    def take_long():
+        mode["give"] = "long"
+        return sup._try_replan(
+            goal,
+            world.pose,
+            short.path,
+            None,
+            failed_count=2,
+            require_different=True,
+        )
+
+    def take_short(from_path):
+        mode["give"] = "short"
+        return sup._try_replan(
+            goal,
+            world.pose,
+            from_path,
+            None,
+            failed_count=0,
+            require_different=False,
+        )
+
+    first = take_long()
+    assert first is not None and sup._detour_ban_path is not None
+    assert sup._detour_short_flips_left == 2
+
+    flip1 = take_short(first)
+    assert flip1 is not None
+    assert not paths_meaningfully_differ(short.path, flip1, tol_m=0.12)
+    assert sup._detour_ban_path is None
+    assert sup._detour_short_flips_left == 1
+    assert bool(sup._last_replan_info.get("short_flip")) is True
+
+    second = take_long()
+    assert second is not None and sup._detour_ban_path is not None
+    flip2 = take_short(second)
+    assert flip2 is not None
+    assert sup._detour_short_flips_left == 0
+
+    third = take_long()
+    assert third is not None and sup._detour_ban_path is not None
+    refused = take_short(third)
+    assert refused is None
+    assert "short-flip" in (sup._last_replan_error or "")
+    assert sup._detour_ban_path is not None
+
+
+def test_try_replan_lifts_detour_ban_when_no_alternate():
+    """If the detour dies and every banned attempt fails, lift once and take short."""
+    from src.nav_builtin.controller import _path_length
+    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav_builtin.types import PlanResult
+
+    m = _empty_map(size=120, resolution=0.05)
+    world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
+    # No budgeted flips — exercise the "detour dead → lift" path only.
+    sup = NavSupervisor(
+        world,
+        inflation_radius_m=0.25,
+        robot_radius_m=0.22,
+        avoid_obstacles=False,
+        local_costmap_enabled=False,
+        local_planner_enabled=False,
+        clearance_preference_m=0.0,
+        detour_short_flip_budget=0,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
     short = plan_path(
@@ -1740,7 +1890,7 @@ def test_try_replan_lifts_detour_ban_when_no_alternate():
 
     sup.plan = scripted_plan  # type: ignore[method-assign]
     accepted = sup._try_replan(
-        goal, world.pose, short.path, None, failed_count=1, require_different=True
+        goal, world.pose, short.path, None, failed_count=2, require_different=True
     )
     assert accepted is not None
     assert sup._detour_ban_path is not None
@@ -1761,6 +1911,7 @@ def test_try_replan_force_lifts_short_flip_when_path_blocked():
 
     m = _empty_map(size=120, resolution=0.05)
     world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
+    # Budget spent so only force_lift can escape.
     sup = NavSupervisor(
         world,
         inflation_radius_m=0.25,
@@ -1769,6 +1920,7 @@ def test_try_replan_force_lifts_short_flip_when_path_blocked():
         local_costmap_enabled=False,
         local_planner_enabled=False,
         clearance_preference_m=0.0,
+        detour_short_flip_budget=0,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
     short = plan_path(
@@ -1791,7 +1943,7 @@ def test_try_replan_force_lifts_short_flip_when_path_blocked():
 
     sup.plan = scripted_plan  # type: ignore[method-assign]
     accepted = sup._try_replan(
-        goal, world.pose, short.path, None, failed_count=1, require_different=True
+        goal, world.pose, short.path, None, failed_count=2, require_different=True
     )
     assert accepted is not None and sup._detour_ban_path is not None
 

@@ -105,6 +105,44 @@ def match_scores_say_lost(result: Optional[Mapping]) -> bool:
     return False
 
 
+def slam_pose_is_trusted(result: Optional[Mapping]) -> bool:
+    """True when SLAM says the published pose already fits — nothing to apply.
+
+    Live stuck case: beam residual still high (map walls lidar does not see)
+    while ``check_localization`` returns ``ok`` / ``good_match`` with shift 0
+    and score ~0.66. Holding forever there parks the goal; treat as map change
+    and let nav continue with the travel backoff instead.
+    """
+    if not isinstance(result, Mapping):
+        return False
+    status = str(result.get("status") or "")
+    if status in (
+        "refused_large",
+        "nav_hold",
+        "ambiguous",
+        "low_quality",
+        "error",
+        "awaiting_confirm",
+    ):
+        return False
+    if match_scores_say_lost(result):
+        return False
+    if not bool(result.get("good_match")):
+        return False
+    try:
+        score = float(result.get("score"))
+        shift_m = abs(float(result.get("shift_m") or 0.0))
+        shift_deg = abs(float(result.get("shift_deg") or 0.0))
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(score) or score < 0.50:
+        return False
+    if not math.isfinite(shift_m) or not math.isfinite(shift_deg):
+        return False
+    # Already at the peak (or only a trivial nudge left).
+    return shift_m <= 0.25 and shift_deg <= 15.0
+
+
 def loc_blocks_forward(
     verdict: LocDisagreement,
     result: Optional[Mapping] = None,
@@ -117,7 +155,12 @@ def loc_blocks_forward(
 
     A successful correction clears the score gate — ``previous_score`` is the
     pre-apply prior and stays negative even when the new pose is fine.
+
+    When SLAM already trusts the published pose (good match, ~0 shift), beam
+    leftover alone must not permanent-hold — that is map change, not lost loc.
     """
+    if slam_pose_is_trusted(result):
+        return False
     if isinstance(result, Mapping) and result.get("corrected"):
         # Pose already moved; only the post-apply residual can block.
         if not verdict.disagree:

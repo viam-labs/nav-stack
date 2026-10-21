@@ -157,6 +157,11 @@ class NavSupervisor:
         recovery_wait_duration_s = kw["recovery_wait_duration_s"]
         replan_local_blocked_time_s = kw["replan_local_blocked_time_s"]
         replan_local_min_period_s = kw["replan_local_min_period_s"]
+        replan_max_early_detour_ratio = kw["replan_max_early_detour_ratio"]
+        replan_allow_long_detour_after_fails = kw[
+            "replan_allow_long_detour_after_fails"
+        ]
+        detour_short_flip_budget = kw["detour_short_flip_budget"]
         drive_timeout_streak = kw["drive_timeout_streak"]
         yaw_align_timeout_s = kw["yaw_align_timeout_s"]
         max_goal_snap_m = kw["max_goal_snap_m"]
@@ -311,6 +316,13 @@ class NavSupervisor:
         self._replan_local_min_period_s = max(
             0.1, float(replan_local_min_period_s)
         )
+        self._replan_max_early_detour_ratio = max(
+            1.0, float(replan_max_early_detour_ratio)
+        )
+        self._replan_allow_long_detour_after_fails = max(
+            0, int(replan_allow_long_detour_after_fails)
+        )
+        self._detour_short_flip_budget = max(0, int(detour_short_flip_budget))
         self._local_planner_activate_cost = local_planner_activate_cost
         self._local_costmap = (
             LocalCostmap(
@@ -360,13 +372,15 @@ class NavSupervisor:
         # leave the current cell. Cleared once the nose is free again.
         self._stuck_pose_refine_used = False
         self._stuck_pose_refine: dict = {}
-        # After accepting a longer detour, ban the abandoned short corridor for
-        # the rest of this goal (not a wall-clock timer — that just delayed the
-        # short↔long flip). Lifted only if the detour itself dies and no other
-        # route works.
+        # After accepting a longer detour, ban the abandoned short corridor so
+        # we don't thrash short↔long. A small per-goal budget allows flipping
+        # back when the short corridor looks clear again (e.g. person left /
+        # blocked the long path). After the budget is spent, lift only if the
+        # detour itself dies and no other route works.
         self._detour_ban_path: Optional[Path2D] = None
         self._detour_min_length_m = 0.0
         self._detour_short_ratio = 0.75
+        self._detour_short_flips_left = self._detour_short_flip_budget
         self._io_timeout_streak = 0
         # Control-loop soak metrics (wall-clock tick vs configured period).
         self._control_ticks = 0
@@ -930,6 +944,7 @@ class NavSupervisor:
         from .loc_consistency import (
             loc_blocks_forward,
             residual_is_lost,
+            slam_pose_is_trusted,
             small_local_match_worth_applying,
         )
 
@@ -1069,6 +1084,18 @@ class NavSupervisor:
             self._loc_refine_cooldown_until = (
                 time.monotonic() + self._nav_loc_refine_cooldown_s
             )
+            # SLAM already trusts this pose (good match, ~0 shift) — leftover
+            # beams are map change / open space, not lost loc. Resume with
+            # travel backoff instead of parking forever on hold_bad_loc.
+            if slam_pose_is_trusted(result):
+                self._loc_refine_tries = 0
+                self._loc_refine_need_travel = True
+                self._loc_refine_travel_need_m = self._nav_loc_refine_retry_travel_m
+                self._loc_refine_clear_streak = 0
+                self._publish_loc_refine_progress(
+                    pose_after, dist_goal, verdict=after, status="continue_trusted"
+                )
+                return self._loc_refine_resume_kind(start, pose_after)
             # Thin leftover: one more look only when residual_is_lost; else
             # keep the goal and wait until travel clears the backoff.
             if (
@@ -1387,15 +1414,19 @@ class NavSupervisor:
           ``same route``).
         - Reject any candidate whose in-window local path cost is still at or
           above the activate threshold (peeling past one blob into another).
-        - Cap length at ~1.8× remaining on the blocked-corridor attempt so we
-          don't take room-scale loops when a milder peel already exists.
+        - On early blocked-replans, refuse candidates longer than
+          ``replan_max_early_detour_ratio`` × remaining so a brief person-block
+          keeps waiting / local peel instead of a room-scale loop. After enough
+          failed replans (or force-lift), longer detours are allowed.
+        - Cap length on the blocked-corridor attempt when a milder peel already
+          exists so we prefer the peel.
         - If every attempt is same-route/infeasible, force left/right vias
           around the first blocked path sample — that is the static-box case
           where Lazy Theta* stubbornly hugs the old corridor.
-        - After accepting a longer detour, ban the abandoned short corridor for
-          the rest of this goal: keep painting it and reject much-shorter /
-          matching candidates. A wall-clock hold only delayed the flip; lift
-          the ban only when the detour itself is dead and nothing else works.
+        - After accepting a longer detour, ban the abandoned short corridor:
+          keep painting it and reject much-shorter / matching candidates.
+          A small per-goal short-flip budget allows returning to a clear short
+          corridor a few times; after that, lift only when the detour is dead.
         """
         from .controller import _path_length
         from .local_planner import path_cost_in_local_window
@@ -1417,6 +1448,13 @@ class NavSupervisor:
         block_cost = int(self._local_planner_activate_cost)
         footprint_skip = max(0.05, float(self._robot_radius))
         ban_path = self._detour_ban_path if hold_active else None
+        early_ratio = float(self._replan_max_early_detour_ratio)
+        allow_long = (
+            hold_active
+            or force_lift_short_flip
+            or failed_count >= self._replan_allow_long_detour_after_fails
+        )
+        early_limit = remaining * early_ratio
 
         def _still_local_blocked(candidate: Path2D) -> Optional[int]:
             if local_view is None:
@@ -1436,18 +1474,39 @@ class NavSupervisor:
         def _reject_short_flip(candidate: Path2D, new_len: float) -> Optional[str]:
             if not hold_active:
                 return None
+            reason: Optional[str] = None
             if (
                 self._detour_min_length_m > 0.0
                 and new_len < self._detour_min_length_m
             ):
-                return (
+                reason = (
                     f"short-flip hysteresis ({new_len:.1f} m < "
                     f"{self._detour_min_length_m:.1f} m ban)"
                 )
-            if ban_path is not None and not paths_meaningfully_differ(
+            elif ban_path is not None and not paths_meaningfully_differ(
                 ban_path, candidate, tol_m=differ_tol
             ):
-                return "short-flip hysteresis (matches abandoned corridor)"
+                reason = "short-flip hysteresis (matches abandoned corridor)"
+            if reason is None:
+                return None
+            # Candidate already passed local-blocked → short corridor looks
+            # clear. Spend one budgeted flip instead of staying on the long path.
+            if self._detour_short_flips_left > 0:
+                return None
+            return reason
+
+        def _reject_too_long(new_len: float, *, paint: bool) -> Optional[str]:
+            if not allow_long and new_len > early_limit:
+                return (
+                    f"too long early ({new_len:.1f} m > {early_limit:.1f} m; "
+                    f"fail={failed_count}/"
+                    f"{self._replan_allow_long_detour_after_fails})"
+                )
+            # Prefer a milder peel when one already exists.
+            if paint and best is not None and new_len > early_limit:
+                return (
+                    f"too long ({new_len:.1f} m > {early_limit:.1f} m)"
+                )
             return None
 
         for label, paint in attempts:
@@ -1485,10 +1544,9 @@ class NavSupervisor:
             if flip is not None:
                 reasons.append(f"{label}: {flip}")
                 continue
-            if paint and new_len > remaining * 1.8 and best is not None:
-                reasons.append(
-                    f"{label}: too long ({new_len:.1f} m > {remaining * 1.8:.1f} m)"
-                )
+            too_long = _reject_too_long(new_len, paint=paint)
+            if too_long is not None:
+                reasons.append(f"{label}: {too_long}")
                 continue
             if best is None or new_len < best[0]:
                 best = (new_len, replanned.path, replanned, label)
@@ -1509,14 +1567,18 @@ class NavSupervisor:
                     if flip is not None:
                         reasons.append(f"{label}: {flip}")
                     else:
-                        self._commit_replan_path(
-                            path, new_path, new_len, old_len, label, reasons,
-                            require_different=require_different,
-                            result=result,
-                            goal=goal,
-                            pose=pose,
-                        )
-                        return new_path
+                        too_long = _reject_too_long(new_len, paint=False)
+                        if too_long is not None:
+                            reasons.append(f"{label}: {too_long}")
+                        else:
+                            self._commit_replan_path(
+                                path, new_path, new_len, old_len, label, reasons,
+                                require_different=require_different,
+                                result=result,
+                                goal=goal,
+                                pose=pose,
+                            )
+                            return new_path
             else:
                 reasons.append("forced-via: none feasible")
         if best is None:
@@ -1578,12 +1640,33 @@ class NavSupervisor:
         goal: Pose2D,
         pose: Pose2D,
     ) -> None:
-        """Publish an accepted replan and ban the abandoned short corridor."""
+        """Publish an accepted replan and update detour ban / short-flip budget."""
         self._last_replan_error = ""
         hold = self._detour_ban_path is not None
-        # Commit to a longer / different corridor for the rest of this goal.
+        short_flip = False
+        if hold:
+            matches_ban = (
+                self._detour_ban_path is not None
+                and not paths_meaningfully_differ(
+                    self._detour_ban_path, new_path, tol_m=0.12
+                )
+            )
+            under_min = (
+                self._detour_min_length_m > 0.0
+                and new_len < self._detour_min_length_m
+            )
+            if matches_ban or under_min:
+                # Budgeted return to the abandoned short corridor.
+                short_flip = True
+                if self._detour_short_flips_left > 0:
+                    self._detour_short_flips_left -= 1
+                self._detour_ban_path = None
+                self._detour_min_length_m = 0.0
+                hold = False
+        # Commit to a longer / different corridor (ban abandoned short path).
         if (
-            new_len > old_len * 1.15
+            not short_flip
+            and new_len > old_len * 1.15
             and paths_meaningfully_differ(old_path, new_path, tol_m=0.12)
         ):
             self._detour_min_length_m = max(
@@ -1598,6 +1681,8 @@ class NavSupervisor:
             "new_length_m": round(new_len, 3),
             "require_different": bool(require_different),
             "detour_hold": bool(hold),
+            "short_flip": bool(short_flip),
+            "short_flips_left": int(self._detour_short_flips_left),
             "attempts": list(reasons),
         }
         preview = self._publish_plan_viz(result, goal, start=pose)
@@ -1687,6 +1772,7 @@ class NavSupervisor:
         self._stuck_pose_refine = {}
         self._detour_ban_path = None
         self._detour_min_length_m = 0.0
+        self._detour_short_flips_left = self._detour_short_flip_budget
         self._loc_refine_tries = 0
         self._loc_refine_cooldown_until = 0.0
         self._loc_refine_last_check = 0.0
