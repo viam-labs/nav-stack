@@ -201,30 +201,42 @@ def test_apply_keepout_and_speed_pct_at():
     assert zmod.speed_pct_at(speed, 1.0, 0.0, 0.0, 0.5, 0.5) is None
 
 
-def test_apply_speed_zone_limit_preserves_curvature_and_avoids_spin():
-    """Linear-only scaling used to trip the base sanitizer into pure spin."""
+def test_apply_speed_zone_limit_caps_only_above_zone_max():
+    """A zone caps linear speed. Slower commands, and yaw, are not scaled."""
     from src.nav_builtin.viam_io import _sanitize_base_cmd
 
-    # Typical pursuit arc inside a 30% zone.
-    vx, vy, w = zmod.apply_speed_zone_limit(0.30, 0.0, 0.50, 30.0)
-    assert abs(vx - 0.09) < 1e-9
-    assert abs(w - 0.15) < 1e-9  # ω scaled with vx (kappa preserved)
+    # 30% of 0.50 m/s is 0.15. 0.30 is over the cap; yaw stays.
+    vx, vy, w = zmod.apply_speed_zone_limit(
+        0.30, 0.0, 0.50, 30.0, max_linear_mps=0.50
+    )
+    assert abs(vx - 0.15) < 1e-9
+    assert w == 0.50
     sx, _, sw = _sanitize_base_cmd(vx, vy, w)
-    assert sx != 0.0  # must still translate
+    assert sx != 0.0
 
-    # Aggressive turn that would still be spin-killed after equal scale.
-    vx, vy, w = zmod.apply_speed_zone_limit(0.20, 0.0, 1.0, 30.0)
-    # 0.06 + 0.30 → repair to crawl floor + ω clamp
+    # Already under the cap: reverse and its yaw are untouched.
+    vx, vy, w = zmod.apply_speed_zone_limit(
+        -0.10, 0.0, 0.20, 30.0, max_linear_mps=0.50
+    )
+    assert vx == -0.10
+    assert w == 0.20
+
+    # Cap below the spin threshold with a hard yaw: stay a translating command.
+    vx, vy, w = zmod.apply_speed_zone_limit(
+        0.40, 0.0, 1.0, 20.0, max_linear_mps=0.50
+    )
     assert abs(vx) >= 0.125
     assert abs(w) <= 0.25
     sx, _, sw = _sanitize_base_cmd(vx, vy, w)
     assert sx != 0.0
     assert abs(sw) > 0.0
 
-    # Pure spin: angular slows, no fake vx injected.
-    vx, vy, w = zmod.apply_speed_zone_limit(0.0, 0.0, 0.8, 30.0)
+    # Pure spin is not a linear overspeed.
+    vx, vy, w = zmod.apply_speed_zone_limit(
+        0.0, 0.0, 0.8, 30.0, max_linear_mps=0.50
+    )
     assert vx == 0.0
-    assert abs(w - 0.24) < 1e-9
+    assert w == 0.8
 
 
 def test_zone_mask_publisher_rerasterizes_on_map_change():

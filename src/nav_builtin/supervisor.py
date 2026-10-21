@@ -635,12 +635,51 @@ class NavSupervisor:
             return None
         return masks.speed_pct_at(pose.x, pose.y)
 
+    def _lift_sub_deadband(self, cmd: DriveCommand) -> DriveCommand:
+        """Make a nonzero twist survive ``_sanitize_base_cmd``.
+
+        A reverse of a few cm/s is what the cart was publishing while
+        ``last_drive`` stayed zero. Raise that reverse to the backup speed.
+        A tiny forward command into a blocked nose is a stop, not a crawl.
+        """
+        from .footprint_guard import (
+            BASE_ANG_EPS_RAD_S,
+            BASE_LIN_EPS_MPS,
+            twist_reaches_base,
+        )
+
+        if cmd.done or twist_reaches_base(cmd.vx, cmd.vtheta):
+            return cmd
+        if abs(cmd.vx) < 1e-6 and abs(cmd.vtheta) < 1e-6:
+            return cmd
+        if cmd.vx > 1e-6:
+            lifted = DriveCommand(0.0, 0.0, 0.0, False)
+        elif cmd.vx < -1e-6:
+            lifted = DriveCommand(
+                -max(0.10, abs(cmd.vx), BASE_LIN_EPS_MPS), 0.0, 0.0, False
+            )
+        else:
+            lifted = DriveCommand(
+                0.0,
+                0.0,
+                math.copysign(max(BASE_ANG_EPS_RAD_S, abs(cmd.vtheta)), cmd.vtheta),
+                False,
+            )
+        self._last_sent_cmd = lifted
+        return lifted
+
     def _apply_speed_zone(self, pose: Pose2D, cmd: DriveCommand) -> DriveCommand:
-        """Limit ``cmd`` inside a speed zone without causing pure-spin swing."""
+        """Cap linear speed at the zone maximum. Slower commands pass through."""
         pct = self._speed_pct_at(pose)
         if pct is None or pct >= 100.0 or cmd.done:
             return cmd
-        vx, vy, vtheta = apply_speed_zone_limit(cmd.vx, cmd.vy, cmd.vtheta, pct)
+        vx, vy, vtheta = apply_speed_zone_limit(
+            cmd.vx,
+            cmd.vy,
+            cmd.vtheta,
+            pct,
+            max_linear_mps=self._max_vel_x,
+        )
         return DriveCommand(vx, vy, vtheta, cmd.done)
 
     def plan(
@@ -3213,7 +3252,7 @@ class NavSupervisor:
                                 max(0.35, float(self._backup_dist_m)),
                             )
                             rear_open = (
-                                not math.isfinite(back_free) or back_free >= 0.12
+                                not math.isfinite(back_free) or back_free >= 0.05
                             )
                             sign = 1.0 if bearing >= 0.0 else -1.0
                             if abs(bearing) > 1e-3:
@@ -3332,6 +3371,7 @@ class NavSupervisor:
                 # Apply before status / lookahead feedback so the limited twist
                 # is what we report and close the loop on.
                 cmd = self._apply_speed_zone(pose, cmd)
+                cmd = self._lift_sub_deadband(cmd)
                 progress = {
                     **progress,
                     "cmd_vx_mps": cmd.vx,

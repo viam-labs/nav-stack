@@ -1366,6 +1366,18 @@ def _slew_cfg() -> FollowerConfig:
     return cfg
 
 
+def test_slew_limit_first_reverse_step_clears_base_deadband():
+    """A replan stop restarts the ramp. The first step must still move the base."""
+    from src.nav_builtin.controller import limit_twist_rate
+
+    cfg = _slew_cfg()
+    cfg.max_linear_accel_mps2 = 0.5
+    out = limit_twist_rate(
+        DriveCommand(-0.10, 0.0, 0.0, False), None, cfg=cfg, dt_s=0.05
+    )
+    assert out.vx <= -0.05
+
+
 def test_slew_limit_ramps_forward_speed_from_rest():
     """No instant step from standstill to cruise (the visible jerk)."""
     from src.nav_builtin.controller import limit_twist_rate

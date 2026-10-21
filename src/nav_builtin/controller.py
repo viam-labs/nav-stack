@@ -405,6 +405,11 @@ def limit_twist_rate(
             cfg.max_linear_accel_mps2 if speeding_up else cfg.max_linear_decel_mps2
         )
         vx = prev_vx + max(-max_dv, min(max_dv, target_vx - prev_vx))
+        # The first step off zero is often ~accel·period (0.04 m/s), which the
+        # base sanitizer drops. A replan stop resets the ramp every attempt,
+        # so the cart never leaves the bumper. Jump to a speed the base keeps.
+        if 0.0 < abs(vx) < 0.05 <= abs(target_vx):
+            vx = math.copysign(0.05, target_vx)
         # Preserve the requested arc while the speed ramps.
         w = target_w * (vx / target_vx)
     max_dw = dt * float(cfg.max_angular_accel_rad_s2)

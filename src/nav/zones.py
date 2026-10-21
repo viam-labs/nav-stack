@@ -5,9 +5,10 @@ Two zone types are supported:
 * ``keepout``     - virtual no-go regions. Mask cells are 0 (free) or 100
                     (keepout). Builtin nav paints these as occupied before
                     costmap inflation so the planner routes around them.
-* ``speed_limit`` - regions where the robot slows to ``speed_pct`` of max speed.
-                    Mask cells hold the percentage (1-100); 0 means no limit.
-                    Builtin nav scales linear velocity by this percentage.
+* ``speed_limit`` - regions where linear speed is capped at ``speed_pct`` of
+                    max speed. Mask cells hold the percentage (1-100); 0 means
+                    no limit. Commands already under that cap are left alone,
+                    including yaw.
 
 Geometry is expressed in the map frame (meters). Supported shapes:
 
@@ -324,19 +325,28 @@ def apply_speed_zone_limit(
     vy: float,
     vtheta: float,
     speed_pct: float,
+    *,
+    max_linear_mps: float,
 ) -> Tuple[float, float, float]:
-    """Scale a body twist by ``speed_pct`` without collapsing into pure-spin.
+    """Cap linear speed at ``speed_pct`` of ``max_linear_mps``.
 
-    Linear and angular are scaled together so curvature is preserved. If the
-    result would still be killed by the base sanitizer (``|vx| < 0.12`` with
+    A command already at or under that cap is unchanged, including yaw.
+    Only the linear part of a faster command is reduced. If the capped
+    twist would be rejected as a pure spin (``|vx| < 0.12`` with
     ``|vθ| > 0.25``), raise ``|vx|`` to the crawl floor and clamp ``|vθ|``.
     """
     if speed_pct >= 100.0:
         return float(vx), float(vy), float(vtheta)
-    scale = max(0.01, min(1.0, float(speed_pct) / 100.0))
+    pct = max(0.01, min(1.0, float(speed_pct) / 100.0))
+    # Never cap below the speed the base will actually execute.
+    cap = max(0.05, float(max_linear_mps) * pct)
+    lin = math.hypot(float(vx), float(vy))
+    if lin <= cap:
+        return float(vx), float(vy), float(vtheta)
+    scale = cap / lin
     out_vx = float(vx) * scale
     out_vy = float(vy) * scale
-    out_w = float(vtheta) * scale
+    out_w = float(vtheta)
     if (
         abs(out_vx) > 1e-9
         and abs(out_vx) < _SANITIZE_SPIN_VX_MPS

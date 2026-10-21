@@ -168,6 +168,18 @@ def test_blocked_nose_unstick_after_a_failed_replan():
     )
 
 
+def test_sub_deadband_reverse_is_lifted_to_backup_speed():
+    from src.nav.simple_motion import DriveCommand
+
+    sup = NavSupervisor.__new__(NavSupervisor)
+    sup._last_sent_cmd = None
+    lifted = sup._lift_sub_deadband(DriveCommand(-0.03, 0.0, 0.0, False))
+    assert lifted.vx <= -0.10
+    # A real stop stays stopped. A forward crawl into the bumper is not sped up.
+    assert sup._lift_sub_deadband(DriveCommand(0.0, 0.0, 0.0, False)).vx == 0.0
+    assert sup._lift_sub_deadband(DriveCommand(0.015, 0.0, 0.025, False)).vx == 0.0
+
+
 def test_undrivable_nose_turns_or_backs_up():
     """A crawl under the base deadband must not count as driving."""
     rec = NavSupervisor._undrivable_nose_recovery
