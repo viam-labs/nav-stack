@@ -1458,6 +1458,35 @@ class NavSupervisor:
             and bool(rear_open)
         )
 
+    @staticmethod
+    def _undrivable_nose_recovery(
+        *,
+        nose_clear: bool,
+        waiting: bool,
+        vx: float,
+        vtheta: float,
+        rear_open: bool,
+        spin_clear: bool,
+        bearing_rad: float,
+    ) -> Optional[str]:
+        """Motion when the only forward command would be dropped by the base.
+
+        ``turn`` when a yaw toward the path is clear. ``reverse`` when the
+        rectangle can back off the bumper. ``None`` while a person-crossing
+        wait is still in its grace, or when neither escape is open.
+        """
+        from .footprint_guard import twist_reaches_base
+
+        if nose_clear or waiting or twist_reaches_base(vx, vtheta):
+            return None
+        if spin_clear and abs(float(bearing_rad)) >= math.radians(12.0):
+            return "turn"
+        if rear_open:
+            return "reverse"
+        if spin_clear:
+            return "turn"
+        return None
+
     def _abort_blocked_replans(self, count: int, *, nose_clear: bool) -> bool:
         """Fail the goal once blocked-nose replans are exhausted."""
         if count < _BLOCKED_REPLAN_FAIL_LIMIT or nose_clear:
@@ -1912,6 +1941,11 @@ class NavSupervisor:
             # we reverse ~backup_dist then replan instead of driving forever.
             narrow_rev_start: Optional[Pose2D] = None
             narrow_rev_cooldown_until = 0.0
+            # Sub-deadband forward crawl (base drops it). Reverse or yaw from
+            # these poses, then replan — don't reset them when the guard
+            # reports "slow" again next tick.
+            deadband_rev_start: Optional[Pose2D] = None
+            deadband_turn_start: Optional[Pose2D] = None
             # Blocked-nose unstick between replans: one reverse or turn, then
             # a replan from the pose that motion reached.
             nose_unstick_start: Optional[Pose2D] = None
@@ -3163,6 +3197,120 @@ class NavSupervisor:
                     if _reduced(cmd, veto):
                         cmd = DriveCommand(veto.vx, cmd.vy, veto.vtheta, cmd.done)
                         self._last_sent_cmd = cmd
+                    # The veto can leave a crawl the base sanitizer turns into
+                    # a stop. That never ramps, so the bumper stays put. Yaw
+                    # onto the path when the sweep is free; otherwise back up.
+                    if not loc_hold_motion and not cmd.done and now >= narrow_rev_cooldown_until:
+                        bearing = float(progress.get("bearing_error_rad") or 0.0)
+                        rear_open = False
+                        spin_clear = False
+                        if guard_pts is not None:
+                            back_free = self._guard.free_distance(
+                                pose,
+                                -0.15,
+                                0.0,
+                                guard_pts,
+                                max(0.35, float(self._backup_dist_m)),
+                            )
+                            rear_open = (
+                                not math.isfinite(back_free) or back_free >= 0.12
+                            )
+                            sign = 1.0 if bearing >= 0.0 else -1.0
+                            if abs(bearing) > 1e-3:
+                                spin_clear = (
+                                    self._guard.free_rotation(pose, sign, guard_pts)
+                                    >= self._guard.cfg.rot_horizon_rad * 0.5
+                                )
+                        choice = self._undrivable_nose_recovery(
+                            nose_clear=nose_clear,
+                            waiting=waiting_for_clear,
+                            vx=cmd.vx,
+                            vtheta=cmd.vtheta,
+                            rear_open=rear_open,
+                            spin_clear=spin_clear,
+                            bearing_rad=bearing,
+                        )
+                        finished_escape = False
+                        if choice == "turn":
+                            deadband_rev_start = None
+                            if deadband_turn_start is None:
+                                deadband_turn_start = pose
+                            turned = abs(
+                                conv.normalize_angle(
+                                    pose.theta - deadband_turn_start.theta
+                                )
+                            )
+                            if turned >= _NOSE_UNSTICK_YAW_RAD:
+                                finished_escape = True
+                                deadband_turn_start = None
+                            else:
+                                cmd = DriveCommand(
+                                    0.0,
+                                    0.0,
+                                    math.copysign(_NOSE_UNSTICK_YAW_RATE, bearing or 1.0),
+                                    False,
+                                )
+                                self._last_sent_cmd = cmd
+                                progress = {
+                                    **progress,
+                                    "obstacle": "avoid",
+                                    "cmd_vx_mps": 0.0,
+                                    "cmd_vtheta_rad_s": cmd.vtheta,
+                                }
+                        elif choice == "reverse":
+                            deadband_turn_start = None
+                            if deadband_rev_start is None:
+                                deadband_rev_start = pose
+                            if distance_m(pose, deadband_rev_start) >= self._backup_dist_m:
+                                finished_escape = True
+                                deadband_rev_start = None
+                            else:
+                                from .controller import _narrow_reverse_command
+
+                                cmd = _narrow_reverse_command(self._follower)
+                                self._last_sent_cmd = cmd
+                                progress = {
+                                    **progress,
+                                    "obstacle": "narrow_reverse",
+                                    "local_planner": False,
+                                    "cmd_vx_mps": cmd.vx,
+                                    "cmd_vtheta_rad_s": 0.0,
+                                }
+                        elif nose_clear:
+                            deadband_rev_start = None
+                            deadband_turn_start = None
+                        if finished_escape:
+                            narrow_rev_cooldown_until = now + max(
+                                1.5, float(self._backup_cooldown_s)
+                            )
+                            self._stop_before_replan("undrivable_nose")
+                            new_path = self._try_replan(
+                                goal,
+                                pose,
+                                path,
+                                scan,
+                                failed_count=failed_replan_while_blocked,
+                                local_view=local_view,
+                                trigger="undrivable_nose",
+                            )
+                            replan_finished = time.monotonic()
+                            last_local_replan_at = replan_finished
+                            last_replan = replan_finished
+                            if new_path is not None:
+                                path = new_path
+                                last_progress_at = now
+                                local_blocked_since = None
+                                failed_replan_while_blocked = 0
+                                vx_sign_history.clear()
+                            cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                            self._last_sent_cmd = cmd
+                            progress = {
+                                **progress,
+                                "obstacle": "narrow_reverse_done",
+                                "local_planner": False,
+                                "cmd_vx_mps": 0.0,
+                                "cmd_vtheta_rad_s": 0.0,
+                            }
                     near_d, near_x, near_y = self._guard.nearest(pose, guard_pts)
                     _TRACE.append(
                         {

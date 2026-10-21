@@ -73,6 +73,17 @@ class GuardResult:
     rotation_blocked: bool
 
 
+# Match ``ViamWorldIO._sanitize_base_cmd``. A slower twist is sent as a full
+# stop, so reporting it as "slow" parks the cart against the bumper.
+BASE_LIN_EPS_MPS = 0.05
+BASE_ANG_EPS_RAD_S = 0.08
+
+
+def twist_reaches_base(vx: float, vtheta: float) -> bool:
+    """False when the base driver will drop both axes."""
+    return abs(vx) >= BASE_LIN_EPS_MPS or abs(vtheta) >= BASE_ANG_EPS_RAD_S
+
+
 def obstacle_points(
     pose: Pose2D,
     scan: Optional[conv.LaserScan2D],
@@ -360,11 +371,13 @@ class FootprintGuard:
             )
             if alt is not None and alt[2] > free + 0.2:
                 return GuardResult(alt[0], alt[1], "steer", alt[2], False)
-        if v_ok >= min(abs(vx), 0.05) and free >= min(need, horizon):
+        if v_ok >= min(abs(vx), BASE_LIN_EPS_MPS) and free >= min(need, horizon):
             scale = v_ok / abs(vx)
             v, w = self._drivable(math.copysign(v_ok, vx), vtheta * scale)
-            state = "clear" if scale >= 0.999 else "slow"
-            return GuardResult(v, w, state, free, False)
+            # A crawl under the base deadband arrives as zero and never ramps.
+            if twist_reaches_base(v, w):
+                state = "clear" if scale >= 0.999 else "slow"
+                return GuardResult(v, w, state, free, False)
         if vx > 0.0 and allow_steer:
             alt = self.best_forward_arc(pose, pts, target, horizon, prefer_sign)
             if alt is not None:
@@ -373,7 +386,8 @@ class FootprintGuard:
             if v_ok >= 0.03:
                 scale = v_ok / abs(vx)
                 v, w = self._drivable(math.copysign(v_ok, vx), vtheta * scale)
-                return GuardResult(v, w, "slow", free, False)
+                if twist_reaches_base(v, w):
+                    return GuardResult(v, w, "slow", free, False)
             # Nothing forward: rotate toward the target only if the sweep is free.
             if target is not None:
                 bearing = conv.normalize_angle(

@@ -168,6 +168,63 @@ def test_blocked_nose_unstick_after_a_failed_replan():
     )
 
 
+def test_undrivable_nose_turns_or_backs_up():
+    """A crawl under the base deadband must not count as driving."""
+    rec = NavSupervisor._undrivable_nose_recovery
+    # Person-crossing grace: stay put.
+    assert (
+        rec(
+            nose_clear=False,
+            waiting=True,
+            vx=0.015,
+            vtheta=0.025,
+            rear_open=True,
+            spin_clear=True,
+            bearing_rad=0.7,
+        )
+        is None
+    )
+    # Heading off the path and the sweep is free: yaw, don't creep.
+    assert (
+        rec(
+            nose_clear=False,
+            waiting=False,
+            vx=0.015,
+            vtheta=0.025,
+            rear_open=True,
+            spin_clear=True,
+            bearing_rad=0.73,
+        )
+        == "turn"
+    )
+    # Spin would hit, rear is open: back off the bumper.
+    assert (
+        rec(
+            nose_clear=False,
+            waiting=False,
+            vx=0.015,
+            vtheta=0.025,
+            rear_open=True,
+            spin_clear=False,
+            bearing_rad=0.73,
+        )
+        == "reverse"
+    )
+    # A command the base will actually drive is left alone.
+    assert (
+        rec(
+            nose_clear=False,
+            waiting=False,
+            vx=0.12,
+            vtheta=0.1,
+            rear_open=True,
+            spin_clear=True,
+            bearing_rad=0.73,
+        )
+        is None
+    )
+
+
 def test_bumper_spin_backs_up_even_when_the_path_is_free():
     """Inch off an obstacle, room behind, path cost still low: reverse."""
     assert NavSupervisor._bumper_spin_reverse(

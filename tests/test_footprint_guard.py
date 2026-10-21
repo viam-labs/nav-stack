@@ -25,6 +25,21 @@ def _wall(x0, y0, x1, y1, step=0.02) -> np.ndarray:
 O = Pose2D(0.0, 0.0, 0.0)
 
 
+def test_sub_deadband_crawl_is_not_sent():
+    """A 1.5 cm/s crawl is a stop on the base. Don't report it as motion."""
+    g = _guard()
+    far = _wall(4.0, -0.3, 4.0, 0.3)
+    res = g.guard(O, 0.015, 0.025, far, allow_steer=False)
+    assert res.vx == 0.0 and res.vtheta == 0.0
+    assert res.state == "blocked"
+    # Room ahead and a target off-axis: steer or yaw at a rate the base accepts.
+    aimed = g.guard(
+        O, 0.015, 0.025, far, target=Pose2D(1.0, 1.0, 0.0), allow_steer=True
+    )
+    assert aimed.state in ("steer", "rotate")
+    assert abs(aimed.vx) >= 0.05 or abs(aimed.vtheta) >= 0.08
+
+
 def test_obstacle_ahead_regulates_speed_to_a_stop():
     g = _guard()
     pts = _wall(HL + 0.5, -0.3, HL + 0.5, 0.3)
