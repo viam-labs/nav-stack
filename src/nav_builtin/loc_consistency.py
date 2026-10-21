@@ -114,7 +114,17 @@ def loc_blocks_forward(
     Mild hallway leftovers may keep driving after a refine. This bar is for
     the ``disagree_frac`` / negative-score state that previously drove until
     the next refine and into a wall.
+
+    A successful correction clears the score gate — ``previous_score`` is the
+    pre-apply prior and stays negative even when the new pose is fine.
     """
+    if isinstance(result, Mapping) and result.get("corrected"):
+        # Pose already moved; only the post-apply residual can block.
+        if not verdict.disagree:
+            return False
+        if verdict.compared_beams >= 8 and verdict.disagree_frac >= 0.50:
+            return True
+        return residual_is_lost(verdict)
     if match_scores_say_lost(result):
         return True
     if str((result or {}).get("status") or "") == "refused_large":

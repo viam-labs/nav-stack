@@ -1112,11 +1112,14 @@ class ViamWorldIO:
         allow_during_navigation: bool = True,
         full_map_escalation: str = "still_bad",
         apply: Optional[bool] = None,
+        stopped_recovery: bool = False,
     ) -> Optional[dict]:
         """Run one SLAM local refine from the nav worker thread.
 
         ``allow_during_navigation`` bypasses the mid-nav skip without forcing
         apply, and keeps the cycle local (no hallway full-map search).
+        ``stopped_recovery`` widens the search / allows a trusted larger apply
+        while the base is already halted for bad loc.
         """
         slam = self._slam
         if slam is None or not hasattr(slam, "do_command"):
@@ -1125,10 +1128,13 @@ class ViamWorldIO:
             "command": "check_localization",
             "full_map_escalation": str(full_map_escalation or "still_bad"),
             "allow_during_navigation": bool(allow_during_navigation),
+            "stopped_recovery": bool(stopped_recovery),
         }
         if apply is not None:
             cmd["apply"] = bool(apply)
-        return self._run(slam.do_command(cmd), timeout=20.0)
+        # Full-map recovery can take longer than a local peel.
+        timeout = 45.0 if stopped_recovery else 20.0
+        return self._run(slam.do_command(cmd), timeout=timeout)
 
     def refine_stuck_pose(self) -> Optional[dict]:
         """Local scan match (~1 m) while the base is stopped on an unreachable start.

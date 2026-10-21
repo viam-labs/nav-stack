@@ -1620,3 +1620,69 @@ def test_mid_nav_apply_override_still_allows_within_cap():
     assert result["corrected"] is True
     assert result.get("jump_status") == "forced"
     slam.do_command.assert_awaited()
+
+
+def test_stopped_recovery_applies_trusted_large_jump_once():
+    """While halted for bad loc, a good 2.1 m match may apply so nav can continue."""
+    slam = _relocalize_slam(
+        periodic_relocalize_during_navigation=False,
+        periodic_relocalize_min_score=0.5,
+        periodic_relocalize_max_ray_mae_m=1.0,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.72,
+            "ray_mae_m": 0.40,
+            "pose": {"x": 2.10, "y": 0.0, "theta": 0.0},
+            "prior_score": -0.11,
+            "prior_ray_mae_m": 1.45,
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = asyncio.run(
+        slam._periodic_relocalize_cycle(
+            allow_during_navigation=True,
+            stopped_recovery=True,
+            full_map_escalation="still_bad",
+        )
+    )
+
+    assert result["corrected"] is True
+    assert result.get("jump_status") == "forced"
+    slam.do_command.assert_awaited()
+
+
+def test_stopped_recovery_still_refuses_weak_large_jump():
+    """Stopped recovery must not force-apply a weak 2 m twin."""
+    slam = _relocalize_slam(
+        periodic_relocalize_during_navigation=False,
+        periodic_relocalize_min_score=0.5,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.29,
+            "ray_mae_m": 2.48,
+            "pose": {"x": 2.13, "y": 0.0, "theta": 1.5},
+            "prior_score": -0.11,
+            "prior_ray_mae_m": 1.45,
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(
+        slam._periodic_relocalize_cycle(
+            apply_override=True,
+            allow_during_navigation=True,
+            stopped_recovery=True,
+            full_map_escalation="still_bad",
+        )
+    )
+
+    assert result["status"] == "refused_large"
+    assert result["corrected"] is False
+    slam.do_command.assert_not_awaited()

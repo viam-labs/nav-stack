@@ -214,6 +214,11 @@ class NavSupervisor:
         self._loc_refine_start_pose: Optional[Pose2D] = None
         self._loc_refine_need_travel = False
         self._loc_refine_travel_need_m = 0.0
+        # One stopped recovery attempt per goal (wider/trusted re-localize).
+        self._loc_refine_recovery_used = False
+        # Require consecutive clear checks before resuming from hold_bad_loc.
+        self._loc_refine_clear_streak = 0
+        self._loc_refine_clear_needed = 2
         self._world = world
         self._inflation = inflation_radius_m
         # Driving clearance (half-width when a footprint is configured). Every
@@ -803,7 +808,12 @@ class NavSupervisor:
             },
         )
 
-    def _call_check_localization(self, *, apply: Optional[bool] = None) -> Optional[dict]:
+    def _call_check_localization(
+        self,
+        *,
+        apply: Optional[bool] = None,
+        stopped_recovery: bool = False,
+    ) -> Optional[dict]:
         fn = getattr(self._world, "check_localization", None)
         if not callable(fn):
             return None
@@ -812,14 +822,29 @@ class NavSupervisor:
                 allow_during_navigation=True,
                 full_map_escalation="still_bad",
                 apply=apply,
+                stopped_recovery=bool(stopped_recovery),
             )
         except TypeError:
-            # Older WorldIO doubles without the apply kwarg.
+            # Older WorldIO doubles without the newer kwargs.
             try:
                 result = fn(
                     allow_during_navigation=True,
                     full_map_escalation="still_bad",
+                    apply=apply,
                 )
+            except TypeError:
+                try:
+                    result = fn(
+                        allow_during_navigation=True,
+                        full_map_escalation="still_bad",
+                    )
+                except TimeoutError:
+                    return {"status": "error", "reason": "timeout"}
+                except Exception as exc:  # noqa: BLE001
+                    return {
+                        "status": "error",
+                        "reason": str(exc).strip() or type(exc).__name__,
+                    }
             except TimeoutError:
                 return {"status": "error", "reason": "timeout"}
             except Exception as exc:  # noqa: BLE001
@@ -912,9 +937,19 @@ class NavSupervisor:
         if not verdict.disagree:
             self._loc_refine_need_travel = False
             if holding:
+                # Anti-thrash: one fleeting clear frame must not resume drive.
+                self._loc_refine_clear_streak += 1
+                if self._loc_refine_clear_streak < self._loc_refine_clear_needed:
+                    self._publish_loc_refine_progress(
+                        pose, dist_goal, verdict=verdict, status="clearing"
+                    )
+                    return "hold"
+                self._loc_refine_clear_streak = 0
                 self._loc_refine_tries = 0
                 return self._loc_refine_resume_kind(self._loc_refine_start_pose, pose)
+            self._loc_refine_clear_streak = 0
             return None
+        self._loc_refine_clear_streak = 0
         if not holding:
             self._loc_refine_start_pose = pose
 
@@ -980,10 +1015,50 @@ class NavSupervisor:
             # refine — that is how a bad estimate walks into a wall.
             if calm or not severe:
                 self._pause_for_loc_refine(pose_after, dist_goal, after, settle=False)
+            # One stopped recovery: widen search / allow a trusted larger apply
+            # so we fix once and keep going instead of stop/go forever.
+            if not self._loc_refine_recovery_used:
+                self._loc_refine_recovery_used = True
+                self._publish_loc_refine_progress(
+                    pose_after, dist_goal, verdict=after, status="recovering"
+                )
+                recovered = self._call_check_localization(stopped_recovery=True)
+                if recovered is not None:
+                    result = recovered
+                    status = str(result.get("status") or "")
+                    if status == "awaiting_confirm":
+                        time.sleep(max(0.4, self._nav_loc_refine_settle_s or 0.4))
+                        recovered = (
+                            self._call_check_localization(stopped_recovery=True)
+                            or recovered
+                        )
+                        result = recovered
+                        status = str(result.get("status") or "")
+                    # Probe may leave a trusted large match unapplied — force once.
+                    if (
+                        status not in ("corrected", "ok")
+                        or not result.get("corrected")
+                    ) and bool(result.get("good_match")):
+                        applied = self._call_check_localization(
+                            apply=True, stopped_recovery=True
+                        )
+                        if applied is not None:
+                            result = applied
+                            status = str(result.get("status") or "")
+                pose_after = self._world.get_pose() or pose_after
+                after = self._measure_loc_disagreement(pose_after)
+                if not loc_blocks_forward(after, result) and result.get("corrected"):
+                    self._loc_refine_tries = 0
+                    self._loc_refine_need_travel = False
+                    self._loc_refine_clear_streak = 0
+                    self._publish_loc_refine_progress(
+                        pose_after, dist_goal, verdict=after, status="recovered"
+                    )
+                    return self._loc_refine_resume_kind(start, pose_after)
             # Keep re-checking while stopped; do not burn the try budget into
             # an 8 m drive-on. Not ``localization_lost``.
             if self._loc_refine_tries >= self._nav_loc_refine_max_tries:
-                self._loc_refine_tries = 0
+                self._loc_refine_tries = max(1, self._nav_loc_refine_max_tries)
             self._loc_refine_need_travel = False
             self._publish_loc_refine_progress(
                 pose_after, dist_goal, verdict=after, status="hold_bad_loc"
@@ -1014,6 +1089,7 @@ class NavSupervisor:
 
         self._loc_refine_tries = 0
         self._loc_refine_need_travel = False
+        self._loc_refine_clear_streak = 0
         self._loc_refine_cooldown_until = (
             time.monotonic() + self._nav_loc_refine_cooldown_s
         )
@@ -1617,6 +1693,8 @@ class NavSupervisor:
         self._loc_refine_last_pose = None
         self._loc_refine_start_pose = None
         self._loc_refine_need_travel = False
+        self._loc_refine_recovery_used = False
+        self._loc_refine_clear_streak = 0
         goal_dict = {"x": float(goal.x), "y": float(goal.y), "theta": float(goal.theta)}
         self._set_status(
             state="active",

@@ -2539,25 +2539,26 @@ def test_nav_loc_refine_holds_after_refused_large_jump():
     from src.nav_builtin.loc_consistency import LocDisagreement
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
-    mild = LocDisagreement(
+    severe = LocDisagreement(
         disagree=True,
         reason="scan_map",
         compared_beams=12,
-        disagree_beams=4,
-        disagree_frac=0.333,
+        disagree_beams=7,
+        disagree_frac=0.58,
     )
     world.on_loc_check = lambda _w, **_kw: {
         "status": "refused_large",
         "corrected": False,
+        "good_match": False,
         "match_mode": "local",
-        "score": 0.55,
-        "previous_score": 0.20,
+        "score": 0.29,
+        "previous_score": -0.11,
         "shift_m": 1.665,
         "shift_deg": 4.0,
         "large_jump": True,
     }
     sup = _loc_refine_supervisor(world)
-    sup._measure_loc_disagreement = lambda _pose: mild  # noqa: SLF001
+    sup._measure_loc_disagreement = lambda _pose: severe  # noqa: SLF001
     sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
     out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
         Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
@@ -2565,6 +2566,70 @@ def test_nav_loc_refine_holds_after_refused_large_jump():
     assert out == "hold"
     assert world.stop_calls >= 1
     assert sup._loc_refine_need_travel is False  # noqa: SLF001
+    assert sup._loc_refine_recovery_used is True  # noqa: SLF001
+    # Local + one stopped recovery.
+    assert world.loc_checks >= 2
+
+
+def test_nav_loc_refine_recovers_once_then_resumes():
+    """Stopped recovery that corrects the pose should resume the goal."""
+    from src.nav_builtin.controller import DriveCommand
+    from src.nav_builtin.loc_consistency import LocDisagreement
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    severe = LocDisagreement(
+        disagree=True,
+        reason="scan_map",
+        compared_beams=12,
+        disagree_beams=7,
+        disagree_frac=0.58,
+    )
+    clear = LocDisagreement(disagree=False)
+    recovery_calls = {"n": 0}
+
+    def _check(_w, **kw):
+        if kw.get("stopped_recovery"):
+            recovery_calls["n"] += 1
+            world.pose = Pose2D(1.4, 1.0, 0.0)
+            return {
+                "status": "corrected",
+                "corrected": True,
+                "good_match": True,
+                "match_mode": "local",
+                "score": 0.72,
+                "previous_score": -0.1,
+                "shift_m": 0.4,
+                "shift_deg": 5.0,
+            }
+        return {
+            "status": "refused_large",
+            "corrected": False,
+            "good_match": False,
+            "match_mode": "local",
+            "score": 0.29,
+            "previous_score": -0.1,
+            "shift_m": 2.1,
+            "shift_deg": 40.0,
+            "large_jump": True,
+        }
+
+    measures = [severe, severe, clear]  # pre, post-local, post-recovery
+
+    def _measure(_pose):
+        if measures:
+            return measures.pop(0)
+        return clear
+
+    world.on_loc_check = _check
+    sup = _loc_refine_supervisor(world)
+    sup._measure_loc_disagreement = _measure  # noqa: SLF001
+    sup._last_sent_cmd = DriveCommand(0.3, 0.0, 0.0, False)  # noqa: SLF001
+    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
+    )
+    assert out == "resume"
+    assert recovery_calls["n"] == 1
+    assert world.pose.x == pytest.approx(1.4)
 
 
 def test_nav_loc_refine_stops_when_turning_hard():

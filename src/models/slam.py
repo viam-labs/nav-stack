@@ -1162,18 +1162,32 @@ class SlamService(SLAM):
         shift_deg: float,
         large_jump: bool,
         cfg: SlamConfig,
+        stopped_recovery: bool = False,
+        good_match: bool = False,
+        score: float = float("-inf"),
     ) -> bool:
         """True when a mid-drive pose yank must stay ``refused_large``.
 
         Loc-refine may probe a ≤1 m match then re-match with ``apply: true``
         and see a hallway-scale twin. Never force-apply past the mid-nav cap
         while a goal is active — that teleport is what drives into walls.
+
+        ``stopped_recovery`` is the one exception: base already halted for bad
+        loc, so a *trusted* larger match may apply once and let nav continue.
         """
         mid_nav = bool(nav_active or allow_during_navigation)
         if not mid_nav:
             return False
         if math.isinf(shift_m) or math.isinf(shift_deg):
             return True
+        if stopped_recovery:
+            trusted = bool(good_match)
+            if not trusted and apply_override is True and math.isfinite(float(score)):
+                trusted = float(score) >= float(cfg.localize_stopped_recovery_min_score)
+            if trusted:
+                max_m = max(0.5, float(cfg.localize_stopped_recovery_max_m))
+                max_deg = max(10.0, float(cfg.localize_stopped_recovery_max_deg))
+                return float(shift_m) > max_m or float(shift_deg) > max_deg
         max_m = max(0.2, float(cfg.localize_mid_nav_apply_max_m))
         max_deg = max(5.0, float(cfg.localize_mid_nav_apply_max_deg))
         if apply_override is True:
@@ -1345,6 +1359,7 @@ class SlamService(SLAM):
         apply_override: Optional[bool] = None,
         full_map_escalation: str = "low_quality",
         allow_during_navigation: bool = False,
+        stopped_recovery: bool = False,
     ) -> Mapping[str, ValueTypes]:
         """Run one drift check; correct pose when a trusted match has moved.
 
@@ -1363,6 +1378,10 @@ class SlamService(SLAM):
         ``allow_during_navigation``: run a local cycle while a goal is active
         (used by builtin nav's lidar↔map refine). Does not force apply, and
         never escalates to full-map — a hallway twin snap while driving.
+
+        ``stopped_recovery``: base already halted for bad loc. Widen the local
+        search, allow full-map when the published pose is still wrong, and
+        permit a larger *trusted* apply so nav can fix once and continue.
         """
         escalation = str(full_map_escalation or "low_quality").strip().lower()
         if escalation not in ("low_quality", "still_bad"):
@@ -1386,6 +1405,7 @@ class SlamService(SLAM):
             and nav_active
             and not cfg.periodic_relocalize_during_navigation
             and not allow_during_navigation
+            and not stopped_recovery
         ):
             return self._publish_relocalize_check(
                 {"status": "skipped", "reason": "navigation_active"}
@@ -1411,17 +1431,31 @@ class SlamService(SLAM):
             or (still_bad and not nav_active and escalation == "low_quality")
         )
         # Mid-nav refine (stopped in a corridor) must stay local — a full-map
-        # search is how we snap to a twin hallway.
-        if allow_during_navigation:
+        # search is how we snap to a twin hallway. Stopped recovery may escalate.
+        if allow_during_navigation and not stopped_recovery:
             force_full_map = False
         current = mgr.get_pose_in_map()
 
         base_command: dict = {"command": "global_localize"}
         base_command.update(dict(cfg.periodic_relocalize_options))
         base_command["apply"] = False
-        if escalation == "still_bad":
+        if escalation == "still_bad" and not stopped_recovery:
             # Do not let the local request auto-fall back into a full-map search.
             base_command["auto_full_map_fallback"] = False
+        if stopped_recovery:
+            # Wider local window while halted — still prefer local before full-map.
+            try:
+                base_command["search_radius_m"] = max(
+                    6.0, float(base_command.get("search_radius_m") or 0.0)
+                )
+            except (TypeError, ValueError):
+                base_command["search_radius_m"] = 6.0
+            try:
+                base_command["local_yaw_window_deg"] = max(
+                    120.0, float(base_command.get("local_yaw_window_deg") or 0.0)
+                )
+            except (TypeError, ValueError):
+                base_command["local_yaw_window_deg"] = 120.0
 
         match_mode = (
             "full_map_still_recovery"
@@ -1474,7 +1508,8 @@ class SlamService(SLAM):
                 # still_bad: only burn a full-map search when we are confident
                 # the current pose is wrong, not merely that a local peel was weak.
                 escalate_full = bool(pose_still_bad)
-            if allow_during_navigation:
+            # Driving refine stays local. Stopped recovery may escalate once.
+            if allow_during_navigation and not stopped_recovery:
                 escalate_full = False
 
         if escalate_full:
@@ -1677,6 +1712,9 @@ class SlamService(SLAM):
                         shift_deg=shift_deg,
                         large_jump=large_jump,
                         cfg=cfg,
+                        stopped_recovery=stopped_recovery,
+                        good_match=good_match,
+                        score=float(score),
                     ):
                         self._pose_jump_gate.clear()
                         self._soft_nav_hold_since = None
@@ -1684,6 +1722,7 @@ class SlamService(SLAM):
                         result["status"] = "refused_large"
                         result["corrected"] = False
                         result["large_jump"] = True
+                        result["stopped_recovery"] = bool(stopped_recovery)
                         LOGGER.info(
                             "periodic relocalize: refusing large mid-nav jump "
                             "(%.2f m / %.1f deg score=%.2f); "
@@ -1771,24 +1810,34 @@ class SlamService(SLAM):
                 shift_deg=shift_deg,
                 large_jump=large_jump,
                 cfg=cfg,
+                stopped_recovery=stopped_recovery,
+                good_match=good_match,
+                score=float(score),
             ):
                 self._pose_jump_gate.clear()
                 result["status"] = "refused_large"
                 result["corrected"] = False
                 result["large_jump"] = True
+                result["stopped_recovery"] = bool(stopped_recovery)
                 LOGGER.info(
                     "periodic relocalize: refusing large mid-nav jump "
-                    "(%.2f m / %.1f deg score=%.2f apply=%s); "
+                    "(%.2f m / %.1f deg score=%.2f apply=%s recovery=%s); "
                     "continuing on published pose",
                     0.0 if math.isinf(shift_m) else shift_m,
                     0.0 if math.isinf(shift_deg) else shift_deg,
                     score,
                     apply_override,
+                    stopped_recovery,
                 )
                 return self._publish_relocalize_check(result)
             candidate = self._pose_from_mapping(matched_pose)
+            # Stopped recovery: a trusted large match may apply once without
+            # waiting for a second agreeing frame (base is already halted).
+            force_jump = apply_override is True or (
+                stopped_recovery and good_match and large_jump
+            )
             decision = self._confirm_pose_jump(
-                current, candidate, force=apply_override is True
+                current, candidate, force=force_jump
             )
             result.update(self._jump_decision_dict(decision))
             if not decision.should_apply:
@@ -2838,6 +2887,8 @@ class SlamService(SLAM):
             # suppresses the correction; omit it to use the drift thresholds.
             # ``full_map_escalation``: ``low_quality`` (default) or ``still_bad``
             # (local first; full-map only when the published pose still looks wrong).
+            # ``stopped_recovery``: nav already halted for bad loc — wider search
+            # and a larger trusted apply so the goal can continue.
             apply_override = command.get("apply")
             escalation = command.get("full_map_escalation", "low_quality")
             return await self._periodic_relocalize_cycle(
@@ -2848,6 +2899,7 @@ class SlamService(SLAM):
                 allow_during_navigation=bool(
                     command.get("allow_during_navigation")
                 ),
+                stopped_recovery=bool(command.get("stopped_recovery")),
             )
 
         if cmd == "get_localization_check":

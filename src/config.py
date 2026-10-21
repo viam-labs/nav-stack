@@ -953,6 +953,12 @@ class SlamConfig:
     # snaps stay ``refused_large`` so nav can stop / refine / abort instead.
     localize_mid_nav_apply_max_m: float = 1.0
     localize_mid_nav_apply_max_deg: float = 30.0
+    # One stopped recovery (base already halted for bad loc) may apply a larger
+    # *trusted* match so nav can fix once and keep going instead of stop/go.
+    # Weak / ambiguous peaks still stay refused.
+    localize_stopped_recovery_max_m: float = 3.0
+    localize_stopped_recovery_max_deg: float = 90.0
+    localize_stopped_recovery_min_score: float = 0.45
     # When navigation reports this many recoveries on the active goal, skip the
     # cheap local match and run full-map global_localize immediately.
     periodic_relocalize_nav_recoveries_threshold: int = 2
