@@ -1448,7 +1448,14 @@ def test_periodic_relocalize_bypasses_startup_when_tick_match_bad():
     assert result["status"] == "corrected"
     assert result["match_mode"] == "full_map_still_recovery"
     first = slam._global_localize.await_args_list[0].args[0]
-    assert first.get("full_map") is True
+    # A 1 m parked refine runs first. This peak is 1.5 m away, so the cycle
+    # still falls through to the full-map recovery.
+    assert first.get("full_map") is not True
+    assert first.get("search_radius_m") == 1.0
+    assert any(
+        call.args[0].get("full_map") is True
+        for call in slam._global_localize.await_args_list
+    )
 
 
 def test_periodic_relocalize_still_bad_goes_straight_to_full_map():
@@ -1457,7 +1464,16 @@ def test_periodic_relocalize_still_bad_goes_straight_to_full_map():
     slam._engine.diagnostics.return_value = {"last_match_score": -0.25}
 
     async def _localize(command):
-        assert command.get("full_map") is True
+        if not command.get("full_map"):
+            assert command.get("search_radius_m") == 1.0
+            return {
+                "status": "matched",
+                "score": 0.1,
+                "ray_mae_m": 2.0,
+                "prior_score": -0.4,
+                "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
+                "ambiguous": False,
+            }
         return {
             "status": "matched",
             "score": 0.8,
@@ -1474,6 +1490,42 @@ def test_periodic_relocalize_still_bad_goes_straight_to_full_map():
     assert result["match_mode"] == "full_map_still_recovery"
     assert result["status"] == "corrected"
     assert slam._global_localize.await_count >= 1
+
+
+def test_periodic_relocalize_parked_applies_button_style_local_match():
+    """A parked hallway slip the button would take is applied without a full-map search."""
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": 0.12}
+
+    async def _localize(command):
+        assert command.get("full_map") is not True
+        assert command.get("search_radius_m") == 1.0
+        assert command.get("auto_full_map_fallback") is False
+        return {
+            "status": "matched",
+            "score": 0.51,
+            "ray_mae_m": 1.05,
+            "prior_score": -0.44,
+            "prior_ray_mae_m": 1.67,
+            "pose": {"x": 0.08, "y": -0.96, "theta": -0.28},
+            "ambiguous": False,
+            "second_best_score": 0.42,
+        }
+
+    slam._global_localize = AsyncMock(side_effect=_localize)
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = _run_relocalize_until_settled(slam)
+
+    assert result["status"] == "corrected"
+    assert result["match_mode"] == "local_parked"
+    assert result["corrected"] is True
+    assert slam._global_localize.await_count == slam._cfg.localize_jump_confirm_count
+    cmd = slam.do_command.await_args.args[0]
+    assert cmd["pose"]["x"] == pytest.approx(0.08)
+    assert cmd["pose"]["y"] == pytest.approx(-0.96)
+    assert cmd["pose"]["theta"] == pytest.approx(-0.28)
 
 
 def test_periodic_relocalize_refuses_ambiguous_full_map():

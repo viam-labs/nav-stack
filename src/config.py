@@ -987,6 +987,15 @@ class SlamConfig:
     # straight to full-map global_localize (360° lidar already has the view;
     # spinning does not help). Default 0 catches "scan does not explain pose".
     periodic_relocalize_still_bad_score: float = 0.0
+    # While parked and the published pose does not explain the scan, try the
+    # UI auto-refine window before a full-map search. Same 1 m radius and
+    # apply floors as ``set_initial_pose`` refine. Yaw stays inside ±45° so
+    # an unattended cycle cannot lock the opposite heading.
+    periodic_relocalize_parked_radius_m: float = 1.0
+    periodic_relocalize_parked_yaw_window_deg: float = 90.0
+    periodic_relocalize_parked_min_score: float = 0.22
+    periodic_relocalize_parked_max_ray_mae_m: float = 1.5
+    periodic_relocalize_parked_max_deg: float = 45.0
     # Run global_localize / ray scoring in a dedicated subprocess so the
     # matcher's Python loops do not hold this process's GIL (which starved the
     # nav control tick and wheel-odom reads). Falls back in-process on error.
