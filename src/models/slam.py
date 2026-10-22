@@ -49,6 +49,7 @@ from ..nav.pose_jump_gate import (
     stuck_refine_decision,
 )
 from ..geom import conversions as conv
+from ..slam_builtin.scan_match import lateral_correction_pose
 from ..shm.lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
@@ -1830,6 +1831,54 @@ class SlamService(SLAM):
                     stopped_recovery,
                 )
                 return self._publish_relocalize_check(result)
+            # Driving refine keeps the sideways part of a local peak and drops
+            # a slide along the hall or a heading change. Stopped recovery
+            # may still apply a larger trusted match.
+            if (
+                allow_during_navigation
+                and not stopped_recovery
+                and current is not None
+                and str(match_mode).startswith("local")
+            ):
+                raw = self._pose_from_mapping(matched_pose)
+                lateral = lateral_correction_pose(current, raw)
+                if lateral is None:
+                    self._pose_jump_gate.clear()
+                    result["status"] = "refused_along"
+                    result["corrected"] = False
+                    result["lateral_only"] = False
+                    LOGGER.info(
+                        "periodic relocalize: refusing mid-nav match that is "
+                        "not a sideways hallway correction "
+                        "(%.2f m / %.1f deg score=%.2f)",
+                        0.0 if math.isinf(shift_m) else shift_m,
+                        0.0 if math.isinf(shift_deg) else shift_deg,
+                        score,
+                    )
+                    return self._publish_relocalize_check(result)
+                matched_pose = {
+                    "x": lateral.x,
+                    "y": lateral.y,
+                    "theta": lateral.theta,
+                }
+                shift_m, shift_deg = self._pose_shift_from_current(
+                    current, matched_pose
+                )
+                result["shift_m"] = (
+                    None if math.isinf(shift_m) else round(shift_m, 3)
+                )
+                result["shift_deg"] = (
+                    None if math.isinf(shift_deg) else round(shift_deg, 2)
+                )
+                result["lateral_only"] = True
+                large_jump = (
+                    (not math.isinf(shift_m) and shift_m >= cfg.localize_jump_large_m)
+                    or (
+                        not math.isinf(shift_deg)
+                        and shift_deg >= cfg.localize_jump_large_deg
+                    )
+                )
+                result["large_jump"] = bool(large_jump)
             candidate = self._pose_from_mapping(matched_pose)
             # Stopped recovery: a trusted large match may apply once without
             # waiting for a second agreeing frame (base is already halted).

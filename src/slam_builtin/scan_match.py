@@ -112,6 +112,53 @@ def _candidate_scores(
     return scores
 
 
+def shift_axes(
+    current: conv.Pose2D, matched: conv.Pose2D
+) -> Tuple[float, float, float]:
+    """``(along_m, cross_m, dyaw_rad)`` of ``matched`` in ``current``'s frame.
+
+    Along is forward (heading). Cross is left. A straight hallway constrains
+    cross and leaves along repetitive, so callers can keep one and drop the other.
+    """
+    dx = matched.x - current.x
+    dy = matched.y - current.y
+    c = math.cos(current.theta)
+    s = math.sin(current.theta)
+    along = c * dx + s * dy
+    cross = -s * dx + c * dy
+    dyaw = conv.normalize_angle(matched.theta - current.theta)
+    return along, cross, dyaw
+
+
+def lateral_correction_pose(
+    current: conv.Pose2D,
+    matched: conv.Pose2D,
+    *,
+    max_along_m: float = 0.15,
+    max_cross_m: float = 0.80,
+    max_yaw_rad: float = math.radians(8.0),
+    min_cross_m: float = 0.08,
+) -> Optional[conv.Pose2D]:
+    """Pose that moves ``current`` sideways toward ``matched``.
+
+    ``None`` when the peak slides along the hall, turns more than a few
+    degrees, or jumps farther than one hallway width. Heading and the
+    along-hall coordinate stay at ``current``; only the cross-track term moves.
+    """
+    along, cross, dyaw = shift_axes(current, matched)
+    if abs(along) > max_along_m or abs(cross) > max_cross_m or abs(dyaw) > max_yaw_rad:
+        return None
+    if abs(cross) < min_cross_m:
+        return None
+    c = math.cos(current.theta)
+    s = math.sin(current.theta)
+    return conv.Pose2D(
+        current.x - s * cross,
+        current.y + c * cross,
+        current.theta,
+    )
+
+
 def refine_pose(
     occ_map: OccupancyMap,
     scan: conv.LaserScan2D,
@@ -124,11 +171,17 @@ def refine_pose(
     inflate_cells: int = 2,
     min_score: float = 0.08,
     max_scan_points: int = 120,
+    along_half_m: Optional[float] = None,
+    cross_half_m: Optional[float] = None,
 ) -> Tuple[Optional[conv.Pose2D], float, float]:
     """Search a local window around ``prior``.
 
     Returns ``(pose_or_none, best_score, prior_score)``. Rejects candidates that
     do not beat the prior by a distance-weighted margin (anti-oscillation).
+
+    ``along_half_m`` and ``cross_half_m`` search in the prior heading frame
+    instead of a square. Cross is the wide axis so a straight-hall drift stays
+    visible; along stays short so the search cannot slide down the hall.
     """
     scan_xy = scan_endpoints_base_link(scan)
     if scan_xy.shape[0] < 20:
@@ -150,18 +203,27 @@ def refine_pose(
         )[0]
     )
 
-    # Shrink the search a little when already well aligned (alias guard), but
-    # never below the drift odom can plausibly accumulate between matches —
-    # a 0.15 m window could no longer contain the true pose once drift
-    # exceeded it, so the tracker locked onto its own drifted estimate.
-    if prior_score >= 0.35:
+    # Shrink the square search a little when already well aligned (alias
+    # guard). An explicit along/cross window is the caller's: shrinking the
+    # cross axis is how a hallway drift larger than 0.2 m became invisible.
+    anisotropic = along_half_m is not None and cross_half_m is not None
+    if prior_score >= 0.35 and not anisotropic:
         xy_half_m = min(xy_half_m, 0.20)
         yaw_half_deg = min(yaw_half_deg, 8.0)
 
-    offsets = np.arange(-xy_half_m, xy_half_m + 1e-9, xy_step_m)
-    ox, oy = np.meshgrid(offsets, offsets)
-    cand_x = prior.x + ox.ravel()
-    cand_y = prior.y + oy.ravel()
+    if anisotropic:
+        along_offsets = np.arange(-float(along_half_m), float(along_half_m) + 1e-9, xy_step_m)
+        cross_offsets = np.arange(-float(cross_half_m), float(cross_half_m) + 1e-9, xy_step_m)
+        aa, cc = np.meshgrid(along_offsets, cross_offsets)
+        cth = math.cos(prior.theta)
+        sth = math.sin(prior.theta)
+        cand_x = prior.x + cth * aa.ravel() - sth * cc.ravel()
+        cand_y = prior.y + sth * aa.ravel() + cth * cc.ravel()
+    else:
+        offsets = np.arange(-xy_half_m, xy_half_m + 1e-9, xy_step_m)
+        ox, oy = np.meshgrid(offsets, offsets)
+        cand_x = prior.x + ox.ravel()
+        cand_y = prior.y + oy.ravel()
 
     yaw_half = math.radians(yaw_half_deg)
     yaw_step = math.radians(yaw_step_deg)

@@ -289,6 +289,53 @@ def test_apply_match_nav_track_refuses_big_yaw(monkeypatch):
     assert engine._apply_match(predicted, twisted, None) is False  # noqa: SLF001
 
 
+def test_apply_match_nav_steps_sideways_after_two_frames(monkeypatch):
+    """A hallway offset past 0.15 m steps sideways once a second scan agrees."""
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = 0.05  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    side = conv.Pose2D(0.05, 0.50, math.radians(4.0))
+    assert engine._apply_match(predicted, side, None) is False  # noqa: SLF001
+    assert engine.get_pose().y == pytest.approx(0.0)
+    # The cart moved along the hall between scans. Agreement is the sideways
+    # offset, so the step still applies.
+    moved = conv.Pose2D(0.20, 0.0, 0.0)
+    side_moved = conv.Pose2D(0.25, 0.48, math.radians(3.0))
+    assert engine._apply_match(moved, side_moved, None) is True  # noqa: SLF001
+    pose = engine.get_pose()
+    # Cross 0.48, alpha 0.3 → 0.144, clamped to the 0.10 m lateral step.
+    # Along-hall motion and the yaw are not applied.
+    assert pose.y == pytest.approx(0.10, abs=1e-6)
+    assert pose.x == pytest.approx(0.20, abs=1e-6)
+    assert pose.theta == pytest.approx(0.0, abs=1e-6)
+
+
+def test_apply_match_nav_refuses_sideways_peak_that_slides_along_hall(monkeypatch):
+    engine = _nav_track_engine(monkeypatch)
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    slid = conv.Pose2D(0.40, 0.50, 0.0)
+    assert engine._apply_match(predicted, slid, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, slid, None) is False  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.0)
+    assert engine.get_pose().y == pytest.approx(0.0)
+
+
+def test_lateral_correction_pose_keeps_heading_and_along_track():
+    from src.slam_builtin.scan_match import lateral_correction_pose
+
+    current = conv.Pose2D(1.0, 2.0, 0.0)
+    side = lateral_correction_pose(current, conv.Pose2D(1.10, 2.40, 0.1))
+    assert side is not None
+    assert side.x == pytest.approx(1.0)
+    assert side.y == pytest.approx(2.40)
+    assert side.theta == pytest.approx(0.0)
+    assert lateral_correction_pose(current, conv.Pose2D(1.50, 2.10, 0.0)) is None
+    assert (
+        lateral_correction_pose(current, conv.Pose2D(1.0, 2.40, math.radians(20)))
+        is None
+    )
+
+
 def test_apply_match_nav_track_can_be_disabled(monkeypatch):
     engine = _nav_track_engine(monkeypatch, nav_scan_track=False)
     predicted = conv.Pose2D(0.0, 0.0, 0.0)

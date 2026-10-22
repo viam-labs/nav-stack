@@ -1590,8 +1590,8 @@ def test_mid_nav_apply_override_refuses_teleport_past_cap():
     assert not should_hold_drive_for_pose_jump(result)
 
 
-def test_mid_nav_apply_override_still_allows_within_cap():
-    """Force-apply under the mid-nav cap remains how loc_refine corrects drift."""
+def test_mid_nav_apply_override_refuses_along_hall_slide():
+    """A sub-cap slide down the hall is not applied while a goal is active."""
     slam = _relocalize_slam(
         periodic_relocalize_during_navigation=False,
         periodic_relocalize_min_score=0.5,
@@ -1617,9 +1617,44 @@ def test_mid_nav_apply_override_still_allows_within_cap():
         )
     )
 
+    assert result["status"] == "refused_along"
+    assert result["corrected"] is False
+    slam.do_command.assert_not_awaited()
+
+
+def test_mid_nav_apply_override_applies_sideways_correction():
+    """A sideways peak under the hall cap is applied, heading left alone."""
+    slam = _relocalize_slam(
+        periodic_relocalize_during_navigation=False,
+        periodic_relocalize_min_score=0.5,
+    )
+    slam._is_navigation_active = MagicMock(return_value=True)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.47,
+            "ray_mae_m": 0.70,
+            "pose": {"x": 0.05, "y": 0.55, "theta": 0.05},
+            "prior_score": -0.10,
+            "prior_ray_mae_m": 1.5,
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = asyncio.run(
+        slam._periodic_relocalize_cycle(
+            apply_override=True,
+            allow_during_navigation=True,
+            full_map_escalation="still_bad",
+        )
+    )
+
     assert result["corrected"] is True
-    assert result.get("jump_status") == "forced"
-    slam.do_command.assert_awaited()
+    assert result.get("lateral_only") is True
+    cmd = slam.do_command.await_args.args[0]
+    assert cmd["pose"]["x"] == pytest.approx(0.0)
+    assert cmd["pose"]["y"] == pytest.approx(0.55)
+    assert cmd["pose"]["theta"] == pytest.approx(0.0)
 
 
 def test_stopped_recovery_applies_trusted_large_jump_once():

@@ -196,6 +196,8 @@ def small_local_match_worth_applying(
     """
     if not result or result.get("corrected"):
         return False
+    if str(result.get("status") or "") in ("refused_along", "refused_large"):
+        return False
     if result.get("ambiguous"):
         return False
     mode = str(result.get("match_mode") or "local")
