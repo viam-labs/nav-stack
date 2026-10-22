@@ -1636,6 +1636,11 @@ class BuiltinSlamEngine:
             return 0.0, speed
         return speed, 0.0
 
+    # Matches ``TypedMovementSensorOdom.MAX_HOLD_GAP_S``. Past this the reader stops
+    # inventing motion from the last twist, so a stalled read cannot justify
+    # more yaw than that hold either.
+    _ODOM_YAW_HOLD_MAX_S = 3.0
+
     def _predict(
         self, odom: Optional[conv.OdomReading], now: float
     ) -> conv.Pose2D:
@@ -1653,6 +1658,9 @@ class BuiltinSlamEngine:
             self._last_odom_pose = odom.pose
             self._last_odom_pose_at = now
             self._last_odom_time = now
+            # Rate from the sample before this one: the turn already underway.
+            # This sample's own vtheta can arrive with a heading snap.
+            prev_yaw_rate = abs(float(self._last_odom_twist[2]))
             self._last_odom_twist = (odom.vx, odom.vy, odom.vtheta)
             self._imu_forward_m_s = 0.0
             self._imu_ax_bias = None
@@ -1676,12 +1684,16 @@ class BuiltinSlamEngine:
                 self._last_odom_heading = odom.heading_rad
             else:
                 self._last_odom_heading = odom.pose.theta
-            # Gate implausible jumps (heading snap, odom reset). A wheel sample
-            # that arrives after a read gap legitimately carries the whole
-            # gap's travel (reader zero-order hold), so scale with elapsed time.
+            # Gate implausible jumps (heading snap, odom reset). Translation
+            # scales with the gap because the reader zero-order-holds the last
+            # twist across it. Yaw does not: the most a missed sample can
+            # honestly contain is the turn already underway, and only for as
+            # long as that hold lasts. A parked cart cannot absorb a
+            # magnetometer flip just because the read was late.
             gap_s = (now - prev_at) if prev_at is not None else 0.0
             max_xy = max(0.5, 0.6 * gap_s)
-            max_yaw = max(math.radians(40.0), math.radians(60.0) * gap_s)
+            yaw_hold_s = min(max(gap_s, 0.0), self._ODOM_YAW_HOLD_MAX_S)
+            max_yaw = max(math.radians(40.0), prev_yaw_rate * yaw_hold_s)
             if (
                 math.hypot(delta.x, delta.y) > max_xy
                 or abs(delta.theta) > max_yaw

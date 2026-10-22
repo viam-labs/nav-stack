@@ -641,6 +641,128 @@ def test_predict_pose_plus_heading_uses_heading_delta_for_yaw():
     assert pose.theta == pytest.approx(math.radians(15.0), abs=1e-6)
 
 
+def test_odom_yaw_hold_matches_reader():
+    from src.odom.source import TypedMovementSensorOdom
+
+    assert (
+        BuiltinSlamEngine._ODOM_YAW_HOLD_MAX_S
+        == TypedMovementSensorOdom.MAX_HOLD_GAP_S
+    )
+
+
+def test_predict_rejects_parked_heading_flip_after_long_gap():
+    """A magnetometer step of 180° while stopped is not map yaw, at any gap."""
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
+    )
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 1000.0
+    engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0, 0.0, 0.0, pose=conv.Pose2D(1.0, 2.0, 0.2), heading_rad=0.2
+        ),
+        t0,
+    )
+    flipped = conv.normalize_angle(0.2 + math.pi)
+    pose = engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0,
+            0.0,
+            0.0,
+            pose=conv.Pose2D(1.0, 2.0, flipped),
+            heading_rad=flipped,
+        ),
+        t0 + 30.0,
+    )
+    assert pose.theta == pytest.approx(0.0, abs=1e-6)
+    # The rejected snap is absorbed into the odom baseline, so the same
+    # heading on the next tick does not rotate the map either.
+    pose = engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0,
+            0.0,
+            0.0,
+            pose=conv.Pose2D(1.0, 2.0, flipped),
+            heading_rad=flipped,
+        ),
+        t0 + 30.1,
+    )
+    assert pose.theta == pytest.approx(0.0, abs=1e-6)
+
+
+def test_predict_accepts_yaw_the_prior_rate_can_explain():
+    """A late sample may carry the spin already underway, and no more than the hold."""
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
+    )
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 50.0
+    rate = 1.2
+    engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0, 0.0, rate, pose=conv.Pose2D(0.0, 0.0, 0.0), heading_rad=0.0
+        ),
+        t0,
+    )
+    turned = 1.0  # rad, within 1.2 rad/s over 1 s, and past the 40° floor
+    pose = engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0,
+            0.0,
+            rate,
+            pose=conv.Pose2D(0.0, 0.0, turned),
+            heading_rad=turned,
+        ),
+        t0 + 1.0,
+    )
+    assert pose.theta == pytest.approx(turned, abs=1e-6)
+
+    # A slower prior rate cannot explain a large step, even after a long stall.
+    # 0.3 rad/s held for the reader's 3 s is 0.9 rad; 1.2 rad is past that.
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    slow = 0.3
+    t1 = 80.0
+    engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0, 0.0, slow, pose=conv.Pose2D(0.0, 0.0, 0.0), heading_rad=0.0
+        ),
+        t1,
+    )
+    pose = engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0,
+            0.0,
+            slow,
+            pose=conv.Pose2D(0.0, 0.0, 1.2),
+            heading_rad=1.2,
+        ),
+        t1 + 10.0,
+    )
+    assert pose.theta == pytest.approx(0.0, abs=1e-6)
+
+    # Within the 3 s hold (0.8 < 0.3 * 3), the same long gap is applied.
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0, 0.0, slow, pose=conv.Pose2D(0.0, 0.0, 0.0), heading_rad=0.0
+        ),
+        t1,
+    )
+    pose = engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0,
+            0.0,
+            slow,
+            pose=conv.Pose2D(0.0, 0.0, 0.8),
+            heading_rad=0.8,
+        ),
+        t1 + 10.0,
+    )
+    assert pose.theta == pytest.approx(0.8, abs=1e-6)
+
+
 class _FakeSensors:
     def __init__(self, scan=None, odom=None):
         self._scan = scan
