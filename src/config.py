@@ -980,9 +980,10 @@ class SlamConfig:
     # stop-and-refine. Large jumps stay refused during nav.
     nav_scan_track: bool = True
     # If startup global_localize is still running this long (s), cancel it so
-    # the drift watchdog can take over — otherwise a long refine loop leaves
-    # the robot on a bad pose with status=skipped forever. 0 disables bypass.
-    periodic_relocalize_bypass_startup_after_s: float = 90.0
+    # the drift watchdog can take over. A restored-pose startup that already
+    # has a weak scan score is released sooner (see the local grace in
+    # ``_maybe_bypass_startup_localize``). 0 disables the hard cap.
+    periodic_relocalize_bypass_startup_after_s: float = 45.0
     # While still, if the continuous tick match score is at/below this, go
     # straight to full-map global_localize (360° lidar already has the view;
     # spinning does not help). Default 0 catches "scan does not explain pose".

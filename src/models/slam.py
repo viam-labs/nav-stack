@@ -93,6 +93,7 @@ class SlamService(SLAM):
         self._visible_map_generation = 0
         self._startup_global_localize_task: Optional[asyncio.Task] = None
         self._startup_localize_started_at: Optional[float] = None
+        self._startup_localize_local = False
         self._periodic_relocalize_task: Optional[asyncio.Task] = None
         self._mapping_revisit_task: Optional[asyncio.Task] = None
         self._last_relocalize_check: dict = {"status": "idle"}
@@ -1385,7 +1386,22 @@ class SlamService(SLAM):
         timed_out = (
             bypass_after > 0.0 and age_s is not None and age_s >= bypass_after
         )
-        if not bad and not timed_out:
+        # A restored-pose startup searches locally. Once that has had time for
+        # one match, a score under the trusted bar should not keep the parked
+        # check waiting through the rest of the refine loop. 0.007 was just
+        # above the "still bad" line and therefore waited out the whole cap.
+        soft = (
+            tick_score is not None
+            and tick_score < float(cfg.periodic_relocalize_min_score)
+        )
+        local_grace_s = 15.0
+        early = (
+            self._startup_localize_local
+            and (bad or soft)
+            and age_s is not None
+            and age_s >= local_grace_s
+        )
+        if not bad and not timed_out and not early:
             return {
                 "status": "skipped",
                 "reason": "startup_localize_running",
@@ -2133,6 +2149,7 @@ class SlamService(SLAM):
             options.get("full_map", True),
             delay_s,
         )
+        self._startup_localize_local = not bool(options.get("full_map", True))
         self._startup_localize_started_at = time.monotonic()
         self._startup_global_localize_task = loop.create_task(
             self._run_startup_global_localize(
@@ -2254,6 +2271,89 @@ class SlamService(SLAM):
             )
         return False
 
+    async def _startup_apply_parked_refine(self) -> bool:
+        """Apply one parked auto-refine while startup is still the local search.
+
+        Returns True when the pose was moved. A match the button would refuse
+        returns False so the wider startup search can still run.
+        """
+        cfg = self._cfg
+        mgr = self._manager
+        if cfg is None or mgr is None:
+            return False
+        needed = max(1, int(cfg.localize_jump_confirm_count))
+        for _ in range(needed):
+            if self._is_navigation_active():
+                return False
+            result = await self.do_command(
+                {
+                    "command": "global_localize",
+                    "apply": False,
+                    "full_map": False,
+                    "auto_full_map_fallback": False,
+                    "map_source": "live",
+                    "search_radius_m": float(cfg.periodic_relocalize_parked_radius_m),
+                    "local_yaw_window_deg": float(
+                        cfg.periodic_relocalize_parked_yaw_window_deg
+                    ),
+                }
+            )
+            if not isinstance(result, Mapping):
+                return False
+            pose_map = result.get("pose")
+            if not isinstance(pose_map, Mapping):
+                return False
+            current = mgr.get_pose_in_map()
+            shift_m, shift_deg = self._pose_shift_from_current(current, pose_map)
+            if not self._parked_refine_worth_applying(
+                cfg, result, shift_m, shift_deg
+            ):
+                LOGGER.info(
+                    "startup parked refine: not an auto-refine match "
+                    "(score=%s ray_mae=%s shift=%.2f m / %.1f deg)",
+                    result.get("score"),
+                    result.get("ray_mae_m"),
+                    0.0 if math.isinf(shift_m) else shift_m,
+                    0.0 if math.isinf(shift_deg) else shift_deg,
+                )
+                return False
+            candidate = self._pose_from_mapping(pose_map)
+            decision = self._confirm_pose_jump(current, candidate, force=False)
+            if not decision.should_apply:
+                LOGGER.info(
+                    "startup parked refine: %.2f m / %.1f deg awaiting "
+                    "confirm %d/%d",
+                    decision.shift_m,
+                    decision.shift_deg,
+                    decision.confirm_count,
+                    decision.confirm_needed,
+                )
+                continue
+            await self.do_command(
+                {
+                    "command": "relocalize",
+                    "pose": {
+                        "x": float(pose_map.get("x", 0.0)),
+                        "y": float(pose_map.get("y", 0.0)),
+                        "theta": float(pose_map.get("theta", 0.0)),
+                    },
+                    "position_variance_m2": 0.25,
+                    "yaw_variance_rad2": 0.06853891945200942,
+                }
+            )
+            LOGGER.info(
+                "startup parked refine applied (%.2f, %.2f, %.2f) "
+                "shift=%.2f m score=%s ray_mae=%s",
+                candidate.x,
+                candidate.y,
+                candidate.theta,
+                decision.shift_m,
+                result.get("score"),
+                result.get("ray_mae_m"),
+            )
+            return True
+        return False
+
     async def _run_startup_global_localize(
         self,
         options: Mapping[str, ValueTypes],
@@ -2291,6 +2391,12 @@ class SlamService(SLAM):
         }
         command.update(dict(options))
         command["apply"] = False
+        # Restored last pose: try the same 1 m window as the parked auto-refine
+        # before the wider startup search. The wider search is what marked this
+        # hallway slip ambiguous and then spent minutes refusing it.
+        if not bool(command.get("full_map", True)):
+            if await self._startup_apply_parked_refine():
+                return
         best_result: Optional[Mapping[str, ValueTypes]] = None
         applied = False
 

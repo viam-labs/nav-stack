@@ -554,6 +554,78 @@ def test_startup_localize_readiness_times_out():
     assert ready is False
 
 
+def test_startup_local_refine_applies_parked_match_before_wide_search():
+    """A restored pose uses the 1 m auto-refine and does not wait on the wide search."""
+    slam = _relocalize_slam()
+    match = {
+        "status": "matched",
+        "score": 0.51,
+        "ray_mae_m": 1.05,
+        "prior_score": -0.44,
+        "pose": {"x": 0.08, "y": -0.96, "theta": -0.28},
+        "ambiguous": False,
+        "second_best_score": 0.42,
+    }
+    slam.do_command = AsyncMock(
+        side_effect=[match, match, {"status": "relocalizing"}]
+    )
+    slam._wait_for_startup_localize_ready = AsyncMock(return_value=True)
+
+    asyncio.run(
+        slam._run_startup_global_localize(
+            {"full_map": False, "search_radius_m": 6.0},
+            delay_s=0.0,
+            max_attempts=3,
+            retry_delay_s=0.0,
+            run_refine_pass=True,
+            refine_max_passes=3,
+            run_post_apply_refine=False,
+        )
+    )
+
+    cmds = [c.args[0] for c in slam.do_command.await_args_list]
+    assert len(cmds) == 3
+    assert cmds[0]["search_radius_m"] == 1.0
+    assert cmds[0]["full_map"] is False
+    assert cmds[0]["auto_full_map_fallback"] is False
+    assert cmds[1]["search_radius_m"] == 1.0
+    assert cmds[2]["command"] == "relocalize"
+    assert cmds[2]["pose"]["y"] == pytest.approx(-0.96)
+
+
+def test_startup_bypass_releases_local_search_when_score_is_soft():
+    slam = _relocalize_slam()
+    pending = MagicMock()
+    pending.done.return_value = False
+    slam._startup_global_localize_task = pending
+    slam._startup_localize_local = True
+    slam._startup_localize_started_at = time.monotonic() - 16.0
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": 0.007}
+    slam._cancel_startup_global_localize_task = MagicMock()
+
+    blocked = slam._maybe_bypass_startup_localize(slam._cfg)
+
+    assert blocked is None
+    slam._cancel_startup_global_localize_task.assert_called_once()
+
+
+def test_startup_bypass_waits_out_the_first_local_match():
+    slam = _relocalize_slam()
+    pending = MagicMock()
+    pending.done.return_value = False
+    slam._startup_global_localize_task = pending
+    slam._startup_localize_local = True
+    slam._startup_localize_started_at = time.monotonic() - 5.0
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": 0.007}
+
+    blocked = slam._maybe_bypass_startup_localize(slam._cfg)
+
+    assert blocked is not None
+    assert blocked["reason"] == "startup_localize_running"
+
+
 def test_run_startup_global_localize_skips_when_navigation_active():
     slam = SlamService("slam")
     slam._manager = MagicMock()
