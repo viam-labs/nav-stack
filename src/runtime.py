@@ -147,6 +147,12 @@ def unregister_nav_host(nav_name: str) -> None:
 
 def any_navigation_active() -> bool:
     """True if any registered navigation host reports an active goal."""
+    status = active_navigation_status()
+    return bool(status and status.get("active"))
+
+
+def active_navigation_status() -> Optional[dict]:
+    """Status dict from the first navigation host that has an active goal."""
     with _LOCK:
         hosts = list(_NAV_HOSTS.values())
     for host in hosts:
@@ -155,5 +161,5 @@ def any_navigation_active() -> bool:
         except Exception:  # noqa: BLE001
             continue
         if isinstance(status, dict) and status.get("active"):
-            return True
-    return False
+            return status
+    return None

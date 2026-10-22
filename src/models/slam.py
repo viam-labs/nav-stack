@@ -53,6 +53,7 @@ from ..slam_builtin.scan_match import lateral_correction_pose
 from ..shm.lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
+    active_navigation_status,
     any_navigation_active,
     get_parent_robot,
     register_slam,
@@ -75,6 +76,13 @@ RELOCALIZE_POSITION_VARIANCE_M2 = 4.0
 RELOCALIZE_YAW_VARIANCE_RAD2 = (math.pi / 4) ** 2
 
 
+# A goal can fail for no progress in ~8 s. Notice a stop well before that,
+# but ignore a single zero sample between commands.
+_NAV_STOPPED_BEFORE_CHECK_S = 2.0
+_NAV_STOPPED_LIN_MPS = 0.05
+_NAV_STOPPED_YAW_RAD_S = 0.08
+
+
 class SlamService(SLAM):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "nav-stack"), "slam")
 
@@ -95,6 +103,7 @@ class SlamService(SLAM):
         self._startup_localize_started_at: Optional[float] = None
         self._startup_localize_local = False
         self._periodic_relocalize_task: Optional[asyncio.Task] = None
+        self._nav_stopped_since: Optional[float] = None
         self._mapping_revisit_task: Optional[asyncio.Task] = None
         self._last_relocalize_check: dict = {"status": "idle"}
         self._last_revisit_check: dict = {"status": "idle"}
@@ -1120,20 +1129,85 @@ class SlamService(SLAM):
         slide with no recovery. Uses a cheap local match each cycle, escalating
         to full-map global_localize (like a manual command) when the local match
         is untrusted or Nav2 is struggling with recoveries.
+
+        While a goal is active the match stays off, unless the base has been
+        sitting still. A stall can fail the goal in about 8 s, so that case is
+        polled quickly and then uses the parked check.
         """
         while True:
             cfg = self._cfg
+            nav = cfg is not None and self._is_navigation_active()
+            during = bool(cfg and cfg.periodic_relocalize_during_navigation)
+            if nav and not during:
+                if not self._base_is_stopped():
+                    self._nav_stopped_since = None
+                    await asyncio.sleep(1.0)
+                    continue
+                now = time.monotonic()
+                if self._nav_stopped_since is None:
+                    self._nav_stopped_since = now
+                if now - float(self._nav_stopped_since) < _NAV_STOPPED_BEFORE_CHECK_S:
+                    await asyncio.sleep(0.5)
+                    continue
+                self._nav_stopped_since = None
+                await self._relocalize_cycle_guarded()
+                await asyncio.sleep(interval_s)
+                continue
+            self._nav_stopped_since = None
             sleep_s = interval_s
-            if cfg is not None and self._is_navigation_active():
+            if nav and cfg is not None:
                 sleep_s = max(1.0, float(cfg.periodic_relocalize_nav_interval_s))
             await asyncio.sleep(sleep_s)
-            try:
-                await self._periodic_relocalize_cycle()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - watchdog must survive hiccups
-                LOGGER.warning("periodic relocalize cycle failed: %s", exc)
-                self._publish_relocalize_check({"status": "error", "error": str(exc)})
+            await self._relocalize_cycle_guarded()
+
+    async def _relocalize_cycle_guarded(self) -> None:
+        try:
+            await self._periodic_relocalize_cycle()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - watchdog must survive hiccups
+            LOGGER.warning("periodic relocalize cycle failed: %s", exc)
+            self._publish_relocalize_check({"status": "error", "error": str(exc)})
+
+    def _base_is_stopped(self) -> bool:
+        """True when odom, or the active goal's command, says the base is still.
+
+        Unknown motion is not stopped: a missing sample must not start a
+        localize while the cart might be driving.
+        """
+        lin: Optional[float] = None
+        yaw: Optional[float] = None
+        mgr = self._manager
+        try:
+            node = getattr(mgr, "node", None) if mgr is not None else None
+            status_fn = getattr(node, "slam_bridge_status", None) if node else None
+            if callable(status_fn):
+                vel = (status_fn() or {}).get("odom_velocity") or {}
+                if vel:
+                    lin = math.hypot(
+                        float(vel.get("vx", 0.0)), float(vel.get("vy", 0.0))
+                    )
+                    yaw = abs(float(vel.get("vtheta", 0.0)))
+        except Exception:  # noqa: BLE001
+            lin, yaw = None, None
+        if lin is None and yaw is None:
+            status = active_navigation_status()
+            if isinstance(status, dict):
+                try:
+                    lin = math.hypot(
+                        float(status.get("cmd_vx_mps", 0.0)),
+                        float(status.get("cmd_vy_mps", 0.0)),
+                    )
+                    yaw = abs(float(status.get("cmd_vtheta_rad_s", 0.0)))
+                except (TypeError, ValueError):
+                    return False
+            else:
+                return False
+        if lin is None:
+            lin = 0.0
+        if yaw is None:
+            yaw = 0.0
+        return lin < _NAV_STOPPED_LIN_MPS and yaw < _NAV_STOPPED_YAW_RAD_S
 
     def _pose_from_mapping(self, pose: Mapping) -> conv.Pose2D:
         return conv.Pose2D(
@@ -1465,9 +1539,14 @@ class SlamService(SLAM):
                 return self._publish_relocalize_check(blocked)
 
         nav_active = self._is_navigation_active()
+        # A goal that is active but not moving is the parked case: the stall
+        # that just failed eliot never got a check because this skip fired
+        # the whole time. Driving stays skipped.
+        nav_stopped = bool(nav_active and self._base_is_stopped())
+        driving = bool(nav_active and not nav_stopped)
         if (
             apply_override is not True
-            and nav_active
+            and driving
             and not cfg.periodic_relocalize_during_navigation
             and not allow_during_navigation
             and not stopped_recovery
@@ -1502,7 +1581,7 @@ class SlamService(SLAM):
             and tick_score < float(cfg.periodic_relocalize_min_score)
         )
         parked_button = (
-            not nav_active
+            not driving
             and escalation == "low_quality"
             and not stopped_recovery
             and apply_override is not True
@@ -1513,7 +1592,7 @@ class SlamService(SLAM):
             nav_recoveries >= cfg.periodic_relocalize_nav_recoveries_threshold
             or (
                 still_bad
-                and not nav_active
+                and not driving
                 and escalation == "low_quality"
                 and not parked_button
             )
@@ -1550,7 +1629,7 @@ class SlamService(SLAM):
             if parked_button
             else (
                 "full_map_still_recovery"
-                if (still_bad and not nav_active and escalation == "low_quality")
+                if (still_bad and not driving and escalation == "low_quality")
                 else ("full_map" if force_full_map else "local")
             )
         )
@@ -1843,7 +1922,7 @@ class SlamService(SLAM):
             #   published pose (odom continuity) so we do not sit forever at
             #   borderline scores like 0.49.
             # - Weak candidate while published pose is still a good_match → keep going
-            if nav_active:
+            if driving:
                 previous_ok = False
                 if prior_score is not None and math.isfinite(float(prior_score)):
                     # Use the *good_match* bars, not the lower recovery floor —

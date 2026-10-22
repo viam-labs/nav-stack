@@ -1353,6 +1353,57 @@ def test_periodic_relocalize_cycle_skips_during_navigation():
     slam._global_localize.assert_not_awaited()
 
 
+def _stopped_odom(slam, *, vx: float, vtheta: float = 0.0) -> None:
+    slam._manager.node = MagicMock()
+    slam._manager.node.slam_bridge_status.return_value = {
+        "odom_velocity": {"vx": vx, "vy": 0.0, "vtheta": vtheta}
+    }
+
+
+def test_periodic_relocalize_runs_when_nav_active_but_stopped():
+    """A stuck goal gets the parked check instead of skipping until it fails."""
+    slam = _relocalize_slam(periodic_relocalize_during_navigation=False)
+    slam._is_navigation_active = MagicMock(return_value=True)
+    _stopped_odom(slam, vx=0.0)
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": -0.03}
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.1,
+            "ray_mae_m": 2.0,
+            "pose": {"x": 0.2, "y": 0.0, "theta": 0.0},
+            "prior_score": -0.03,
+            "ambiguous": False,
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result.get("reason") != "navigation_active"
+    first = slam._global_localize.await_args_list[0].args[0]
+    assert first["search_radius_m"] == 1.0
+    assert first["full_map"] is False
+    assert any(
+        bool(c.args[0].get("full_map"))
+        for c in slam._global_localize.await_args_list[1:]
+    )
+
+
+def test_periodic_relocalize_still_skips_while_the_goal_is_moving():
+    slam = _relocalize_slam(periodic_relocalize_during_navigation=False)
+    slam._is_navigation_active = MagicMock(return_value=True)
+    _stopped_odom(slam, vx=0.4)
+    slam._global_localize = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "navigation_active"
+    slam._global_localize.assert_not_awaited()
+
+
 def test_periodic_relocalize_allow_during_navigation_stays_local():
     """Nav refine may run while a goal is active, but must not full-map."""
     slam = _relocalize_slam(periodic_relocalize_during_navigation=False)
