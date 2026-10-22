@@ -135,15 +135,17 @@ def lateral_correction_pose(
     matched: conv.Pose2D,
     *,
     max_along_m: float = 0.15,
-    max_cross_m: float = 0.80,
-    max_yaw_rad: float = math.radians(8.0),
+    max_cross_m: float = 1.20,
+    max_yaw_rad: float = math.radians(20.0),
     min_cross_m: float = 0.08,
 ) -> Optional[conv.Pose2D]:
     """Pose that moves ``current`` sideways toward ``matched``.
 
-    ``None`` when the peak slides along the hall, turns more than a few
-    degrees, or jumps farther than one hallway width. Heading and the
-    along-hall coordinate stay at ``current``; only the cross-track term moves.
+    ``None`` when the peak slides along the hall, turns far enough to be a
+    different corridor, or jumps past the far wall of this one. Heading and
+    the along-hall coordinate stay at ``current``; only the cross-track term
+    moves. A modest heading error (the slip that walks a skid-steer into the
+    wall) does not veto the sideways step.
     """
     along, cross, dyaw = shift_axes(current, matched)
     if abs(along) > max_along_m or abs(cross) > max_cross_m or abs(dyaw) > max_yaw_rad:

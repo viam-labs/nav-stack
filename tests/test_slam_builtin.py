@@ -286,7 +286,62 @@ def test_apply_match_nav_track_refuses_big_yaw(monkeypatch):
     engine = _nav_track_engine(monkeypatch)
     predicted = conv.Pose2D(0.0, 0.0, 0.0)
     twisted = conv.Pose2D(0.05, 0.0, math.radians(6.0))
+    # One frame only arms the heading bleed.
     assert engine._apply_match(predicted, twisted, None) is False  # noqa: SLF001
+    assert engine.get_pose().theta == pytest.approx(0.0)
+
+
+def test_apply_match_nav_bleeds_heading_after_two_frames(monkeypatch):
+    """A few degrees of hallway heading error turns, and does not slide along."""
+    engine = _nav_track_engine(monkeypatch)
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    twisted = conv.Pose2D(0.05, 0.0, math.radians(6.0))
+    assert engine._apply_match(predicted, twisted, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, twisted, None) is True  # noqa: SLF001
+    pose = engine.get_pose()
+    assert pose.x == pytest.approx(0.0)
+    assert pose.y == pytest.approx(0.0)
+    assert pose.theta == pytest.approx(math.radians(3.0), abs=1e-6)
+
+
+def test_apply_match_nav_steps_meter_scale_hallway_slip(monkeypatch):
+    """The paused-cart case: ~1 m to the side, 16°, prior already lost."""
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.44  # noqa: SLF001
+    engine._last_match_score = 0.22  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    slipped = conv.Pose2D(0.02, -0.96, math.radians(-16.0))
+    assert engine._apply_match(predicted, slipped, None) is False  # noqa: SLF001
+    moved = conv.Pose2D(0.20, 0.0, 0.0)
+    slipped_moved = conv.Pose2D(0.22, -0.94, math.radians(-15.0))
+    assert engine._apply_match(moved, slipped_moved, None) is True  # noqa: SLF001
+    pose = engine.get_pose()
+    assert pose.x == pytest.approx(0.20, abs=1e-6)
+    assert pose.y == pytest.approx(-0.10, abs=1e-6)
+    assert pose.theta == pytest.approx(math.radians(-3.0), abs=1e-6)
+
+
+def test_apply_match_nav_refuses_weak_hallway_peak(monkeypatch):
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.44  # noqa: SLF001
+    engine._last_match_score = 0.12  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    slipped = conv.Pose2D(0.02, -0.96, math.radians(-16.0))
+    assert engine._apply_match(predicted, slipped, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, slipped, None) is False  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.0)
+    assert engine.get_pose().y == pytest.approx(0.0)
+
+
+def test_apply_match_nav_refuses_heading_flip(monkeypatch):
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.44  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    flipped = conv.Pose2D(0.02, -0.40, math.radians(25.0))
+    assert engine._apply_match(predicted, flipped, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, flipped, None) is False  # noqa: SLF001
+    assert engine.get_pose().theta == pytest.approx(0.0)
+    assert engine.get_pose().y == pytest.approx(0.0)
 
 
 def test_apply_match_nav_steps_sideways_after_two_frames(monkeypatch):
@@ -304,10 +359,10 @@ def test_apply_match_nav_steps_sideways_after_two_frames(monkeypatch):
     assert engine._apply_match(moved, side_moved, None) is True  # noqa: SLF001
     pose = engine.get_pose()
     # Cross 0.48, alpha 0.3 → 0.144, clamped to the 0.10 m lateral step.
-    # Along-hall motion and the yaw are not applied.
+    # Along-hall motion is not applied. Heading bleeds one 3° step.
     assert pose.y == pytest.approx(0.10, abs=1e-6)
     assert pose.x == pytest.approx(0.20, abs=1e-6)
-    assert pose.theta == pytest.approx(0.0, abs=1e-6)
+    assert pose.theta == pytest.approx(math.radians(3.0), abs=1e-6)
 
 
 def test_apply_match_nav_refuses_sideways_peak_that_slides_along_hall(monkeypatch):
@@ -329,9 +384,23 @@ def test_lateral_correction_pose_keeps_heading_and_along_track():
     assert side.x == pytest.approx(1.0)
     assert side.y == pytest.approx(2.40)
     assert side.theta == pytest.approx(0.0)
+    # The hallway slip: about a meter to the side and 16° of heading, almost
+    # no motion along the hall. The sideways part is kept; heading is not.
+    slipped = lateral_correction_pose(
+        conv.Pose2D(0.0, 0.0, 0.0),
+        conv.Pose2D(0.02, -0.96, math.radians(-16.0)),
+    )
+    assert slipped is not None
+    assert slipped.x == pytest.approx(0.0)
+    assert slipped.y == pytest.approx(-0.96)
+    assert slipped.theta == pytest.approx(0.0)
     assert lateral_correction_pose(current, conv.Pose2D(1.50, 2.10, 0.0)) is None
     assert (
-        lateral_correction_pose(current, conv.Pose2D(1.0, 2.40, math.radians(20)))
+        lateral_correction_pose(current, conv.Pose2D(1.0, 3.30, 0.0))
+        is None
+    )
+    assert (
+        lateral_correction_pose(current, conv.Pose2D(1.0, 2.40, math.radians(25)))
         is None
     )
 

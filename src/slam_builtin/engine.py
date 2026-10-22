@@ -86,6 +86,7 @@ class BuiltinSlamEngine:
         # Anti-oscillation: require two agreeing frames before applying a jump.
         self._pending_match: Optional[conv.Pose2D] = None
         self._lateral_pending_cross: Optional[float] = None
+        self._lateral_pending_yaw: Optional[float] = None
         self._pending_count = 0
         # Cached ROS-style grid for scan matching (invalidated on map edits).
         self._occ_cache: Optional[OccupancyMap] = None
@@ -410,6 +411,7 @@ class BuiltinSlamEngine:
             self._pending_match = None
             self._pending_count = 0
             self._lateral_pending_cross = None
+            self._lateral_pending_yaw = None
             # External relocalize / startup global_localize counts as seeded.
             self._seed_localize_pending = False
             self._last_odom_pose = None
@@ -438,6 +440,7 @@ class BuiltinSlamEngine:
         self._pending_match = None
         self._pending_count = 0
         self._lateral_pending_cross = None
+        self._lateral_pending_yaw = None
         self._seed_localize_pending = False
         self._last_odom_pose = None
         self._last_odom_heading = None
@@ -1038,7 +1041,7 @@ class BuiltinSlamEngine:
                     predicted,
                     along_half_m=self._NAV_TRACK_MAX_M,
                     cross_half_m=self._NAV_LATERAL_MAX_M,
-                    yaw_half_deg=8.0,
+                    yaw_half_deg=math.degrees(self._NAV_LATERAL_MAX_RAD),
                 )
             else:
                 matched, score, prior_score = scan_match.refine_pose(
@@ -1445,14 +1448,21 @@ class BuiltinSlamEngine:
     # published pose must already fit the scan, the match must be good, the
     # base must not be spinning, and each step is small and gently blended.
     # Along-hall motion stays inside ``_NAV_TRACK_MAX_M``. Cross-track may be
-    # larger (``_NAV_LATERAL_MAX_M``): the walls make that axis observable,
-    # and a square 0.15 m cap is what let a hallway drift grow until only a
-    # manual refine could see it.
+    # larger (``_NAV_LATERAL_MAX_M``): the walls make that axis observable.
+    # A skid-steer can slip about a meter and 15° before the bumper meets the
+    # wall; a tighter window made that pose invisible and the heading error
+    # vetoed the sideways step. Heading is bled a few degrees at a time.
     _NAV_TRACK_MAX_M = 0.15
     _NAV_TRACK_MAX_RAD = math.radians(3.0)
-    _NAV_LATERAL_MAX_M = 0.80
-    _NAV_LATERAL_MAX_RAD = math.radians(8.0)
+    _NAV_LATERAL_MAX_M = 1.20
+    _NAV_LATERAL_MAX_RAD = math.radians(20.0)
     _NAV_LATERAL_STEP_M = 0.10
+    _NAV_LATERAL_YAW_STEP = math.radians(3.0)
+    _NAV_LATERAL_YAW_AGREE = math.radians(4.0)
+    # Absolute score floor once the published pose no longer explains the scan.
+    # The in-window leftover on a drifted hall is about 0.12; a real wall
+    # alignment has to clear this.
+    _NAV_LATERAL_MIN_SCORE = 0.20
     _NAV_TRACK_MIN_PRIOR = 0.25
     _NAV_TRACK_MIN_SCORE = 0.35
     _NAV_TRACK_MAX_YAW_RATE = 0.35
@@ -1461,7 +1471,7 @@ class BuiltinSlamEngine:
     _NAV_TRACK_STEP_M = 0.05
     _NAV_TRACK_STEP_RAD = math.radians(1.0)
 
-    def _nav_track_fresh(self) -> bool:
+    def _nav_scan_calm(self) -> bool:
         if not bool(getattr(self._cfg, "nav_scan_track", True)):
             return False
         if self._last_yaw_rate > self._NAV_TRACK_MAX_YAW_RATE:
@@ -1469,8 +1479,25 @@ class BuiltinSlamEngine:
         age = float(self._last_scan_age_s)
         if math.isfinite(age) and age > self._NAV_TRACK_MAX_SCAN_AGE_S:
             return False
+        return True
+
+    def _nav_track_fresh(self) -> bool:
+        if not self._nav_scan_calm():
+            return False
         score = float(self._last_match_score)
         return math.isfinite(score) and score >= self._NAV_TRACK_MIN_SCORE
+
+    def _nav_lateral_score_ok(self) -> bool:
+        """Sideways recovery may use a lower score once the prior is lost."""
+        if not self._nav_scan_calm():
+            return False
+        score = float(self._last_match_score)
+        if not math.isfinite(score):
+            return False
+        prior = float(self._last_prior_score)
+        if math.isfinite(prior) and prior >= self._NAV_TRACK_MIN_PRIOR:
+            return score >= self._NAV_TRACK_MIN_SCORE
+        return score >= self._NAV_LATERAL_MIN_SCORE
 
     def _nav_track_ok(self, predicted: conv.Pose2D, matched: conv.Pose2D) -> bool:
         """Small drift: the published pose already explains the scan."""
@@ -1485,21 +1512,24 @@ class BuiltinSlamEngine:
         return math.isfinite(prior) and prior >= self._NAV_TRACK_MIN_PRIOR
 
     def _nav_lateral_ok(self, predicted: conv.Pose2D, matched: conv.Pose2D) -> bool:
-        """Sideways hallway correction. Along-hall and heading stay put.
+        """Sideways hallway correction, plus a small heading bleed.
 
-        The prior is allowed to be bad: that is the drifted pose. The match
-        still has to clear the score floor (``refine_pose`` already required
-        it to beat the prior). One frame only arms the correction; the next
-        agreeing frame takes a small step.
+        The prior is allowed to be bad: that is the drifted pose. Along-hall
+        stays put. A heading error up to ``_NAV_LATERAL_MAX_RAD`` does not
+        veto the step; each apply only turns a few degrees. One frame only
+        arms the correction; the next agreeing frame takes a small step.
         """
-        if not self._nav_track_fresh():
+        if not self._nav_lateral_score_ok():
             return False
         along, cross, dyaw = scan_match.shift_axes(predicted, matched)
         if abs(along) > self._NAV_TRACK_MAX_M or abs(dyaw) > self._NAV_LATERAL_MAX_RAD:
             return False
-        if abs(cross) <= self._NAV_TRACK_MAX_M or abs(cross) > self._NAV_LATERAL_MAX_M:
+        if abs(cross) > self._NAV_LATERAL_MAX_M:
             return False
-        return True
+        # The small-drift path already covers a tight, well-scored pose.
+        return (
+            abs(cross) > self._NAV_TRACK_MAX_M or abs(dyaw) > self._NAV_TRACK_MAX_RAD
+        )
 
     def _navigation_active(self) -> bool:
         """True when builtin nav has an in-flight goal (MoveOnMap / route)."""
@@ -1533,6 +1563,7 @@ class BuiltinSlamEngine:
             self._pending_count = 0
             if self._nav_track_ok(predicted, matched):
                 self._lateral_pending_cross = None
+                self._lateral_pending_yaw = None
                 self._pose = self._blend_pose(
                     predicted,
                     matched,
@@ -1543,38 +1574,56 @@ class BuiltinSlamEngine:
                 self._nav_track_applies += 1
                 return True
             if self._nav_lateral_ok(predicted, matched):
-                _along, cross, _dyaw = scan_match.shift_axes(predicted, matched)
-                # Agree on the sideways offset, not the map point. The cart
-                # moves between scans, so the world target moves with it.
+                _along, cross, dyaw = scan_match.shift_axes(predicted, matched)
+                # Agree on the sideways offset and the heading error, not the
+                # map point. The cart moves between scans, so the world target
+                # moves with it.
                 agreed = (
                     self._lateral_pending_cross is not None
+                    and self._lateral_pending_yaw is not None
                     and abs(cross - self._lateral_pending_cross) <= 0.08
+                    and abs(conv.normalize_angle(dyaw - self._lateral_pending_yaw))
+                    <= self._NAV_LATERAL_YAW_AGREE
                 )
                 self._lateral_pending_cross = cross
+                self._lateral_pending_yaw = dyaw
                 if not agreed:
                     self._pose = predicted
                     return False
-                target = scan_match.lateral_correction_pose(
-                    predicted,
-                    matched,
-                    max_along_m=self._NAV_TRACK_MAX_M,
-                    max_cross_m=self._NAV_LATERAL_MAX_M,
-                    max_yaw_rad=self._NAV_LATERAL_MAX_RAD,
-                    min_cross_m=self._NAV_TRACK_MAX_M,
-                )
-                if target is None:
-                    self._pose = predicted
-                    return False
-                self._pose = self._blend_pose(
+                if abs(cross) > self._NAV_TRACK_MAX_M:
+                    target = scan_match.lateral_correction_pose(
+                        predicted,
+                        matched,
+                        max_along_m=self._NAV_TRACK_MAX_M,
+                        max_cross_m=self._NAV_LATERAL_MAX_M,
+                        max_yaw_rad=self._NAV_LATERAL_MAX_RAD,
+                        min_cross_m=self._NAV_TRACK_MAX_M,
+                    )
+                    if target is None:
+                        self._pose = predicted
+                        return False
+                else:
+                    target = predicted
+                pose = self._blend_pose(
                     predicted,
                     target,
                     alpha=self._NAV_TRACK_ALPHA,
                     max_xy=self._NAV_LATERAL_STEP_M,
-                    max_yaw=self._NAV_TRACK_STEP_RAD,
+                    max_yaw=0.0,
+                )
+                yaw_step = max(
+                    -self._NAV_LATERAL_YAW_STEP,
+                    min(self._NAV_LATERAL_YAW_STEP, dyaw),
+                )
+                self._pose = conv.Pose2D(
+                    pose.x,
+                    pose.y,
+                    conv.normalize_angle(predicted.theta + yaw_step),
                 )
                 self._nav_track_applies += 1
                 return True
             self._lateral_pending_cross = None
+            self._lateral_pending_yaw = None
             self._pose = predicted
             return False
 
