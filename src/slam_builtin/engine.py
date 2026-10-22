@@ -1035,13 +1035,24 @@ class BuiltinSlamEngine:
                 getattr(self._cfg, "nav_scan_track", True)
             )
             if nav_track:
+                prior_now = float(self._last_prior_score)
+                lost = (
+                    math.isfinite(prior_now)
+                    and prior_now < self._NAV_TRACK_MIN_PRIOR
+                )
                 matched, score, prior_score = scan_match.refine_pose(
                     occ_map,
                     scan,
                     predicted,
-                    along_half_m=self._NAV_TRACK_MAX_M,
+                    along_half_m=(
+                        self._NAV_LOST_ALONG_M if lost else self._NAV_TRACK_MAX_M
+                    ),
                     cross_half_m=self._NAV_LATERAL_MAX_M,
-                    yaw_half_deg=math.degrees(self._NAV_LATERAL_MAX_RAD),
+                    yaw_half_deg=math.degrees(
+                        self._NAV_LOST_YAW_RAD
+                        if lost
+                        else self._NAV_LATERAL_MAX_RAD
+                    ),
                 )
             else:
                 matched, score, prior_score = scan_match.refine_pose(
@@ -1456,6 +1467,13 @@ class BuiltinSlamEngine:
     _NAV_TRACK_MAX_RAD = math.radians(3.0)
     _NAV_LATERAL_MAX_M = 1.20
     _NAV_LATERAL_MAX_RAD = math.radians(20.0)
+    # Once the published pose no longer explains the scan, a heading error
+    # projects the sideways slip into the along-hall axis. The tight 0.15 m /
+    # 20° gate then refuses the only peak that points at the wall (live: 0.63 m
+    # along, 0.73 m cross, 27°). Search far enough to see it, still refuse a
+    # pure slide down the corridor, and still apply only a small step.
+    _NAV_LOST_ALONG_M = 0.80
+    _NAV_LOST_YAW_RAD = math.radians(35.0)
     _NAV_LATERAL_STEP_M = 0.10
     _NAV_LATERAL_YAW_STEP = math.radians(3.0)
     _NAV_LATERAL_YAW_AGREE = math.radians(4.0)
@@ -1522,10 +1540,20 @@ class BuiltinSlamEngine:
         if not self._nav_lateral_score_ok():
             return False
         along, cross, dyaw = scan_match.shift_axes(predicted, matched)
-        if abs(along) > self._NAV_TRACK_MAX_M or abs(dyaw) > self._NAV_LATERAL_MAX_RAD:
+        prior = float(self._last_prior_score)
+        lost = math.isfinite(prior) and prior < self._NAV_TRACK_MIN_PRIOR
+        along_cap = self._NAV_LOST_ALONG_M if lost else self._NAV_TRACK_MAX_M
+        yaw_cap = self._NAV_LOST_YAW_RAD if lost else self._NAV_LATERAL_MAX_RAD
+        if abs(along) > along_cap or abs(dyaw) > yaw_cap:
             return False
         if abs(cross) > self._NAV_LATERAL_MAX_M:
             return False
+        # A lost heading makes a sideways slip look like along-hall motion.
+        # Keep that case. A real slide down the corridor, with almost no
+        # cross-track and almost no yaw, stays refused.
+        if lost and abs(along) > self._NAV_TRACK_MAX_M:
+            if abs(cross) < 0.25 and abs(dyaw) < math.radians(10.0):
+                return False
         # The small-drift path already covers a tight, well-scored pose.
         return (
             abs(cross) > self._NAV_TRACK_MAX_M or abs(dyaw) > self._NAV_TRACK_MAX_RAD
@@ -1574,7 +1602,7 @@ class BuiltinSlamEngine:
                 self._nav_track_applies += 1
                 return True
             if self._nav_lateral_ok(predicted, matched):
-                _along, cross, dyaw = scan_match.shift_axes(predicted, matched)
+                along, cross, dyaw = scan_match.shift_axes(predicted, matched)
                 # Agree on the sideways offset and the heading error, not the
                 # map point. The cart moves between scans, so the world target
                 # moves with it.
@@ -1591,12 +1619,20 @@ class BuiltinSlamEngine:
                     self._pose = predicted
                     return False
                 if abs(cross) > self._NAV_TRACK_MAX_M:
+                    along_cap = self._NAV_TRACK_MAX_M
+                    yaw_cap = self._NAV_LATERAL_MAX_RAD
+                    if (
+                        abs(along) > self._NAV_TRACK_MAX_M
+                        or abs(dyaw) > self._NAV_LATERAL_MAX_RAD
+                    ):
+                        along_cap = self._NAV_LOST_ALONG_M
+                        yaw_cap = self._NAV_LOST_YAW_RAD
                     target = scan_match.lateral_correction_pose(
                         predicted,
                         matched,
-                        max_along_m=self._NAV_TRACK_MAX_M,
+                        max_along_m=along_cap,
                         max_cross_m=self._NAV_LATERAL_MAX_M,
-                        max_yaw_rad=self._NAV_LATERAL_MAX_RAD,
+                        max_yaw_rad=yaw_cap,
                         min_cross_m=self._NAV_TRACK_MAX_M,
                     )
                     if target is None:

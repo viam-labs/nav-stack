@@ -333,11 +333,46 @@ def test_apply_match_nav_refuses_weak_hallway_peak(monkeypatch):
     assert engine.get_pose().y == pytest.approx(0.0)
 
 
+def test_apply_match_nav_steps_lost_pose_past_along_gate(monkeypatch):
+    """Heading error looks like along-hall motion; still step cross and yaw.
+
+    Live corner: 0.63 m along, 0.73 m cross, 27°. The tight gate refused it,
+    so the pose stayed on the plan until the bumper.
+    """
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.46  # noqa: SLF001
+    engine._last_match_score = 0.24  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    slipped = conv.Pose2D(-0.63, 0.73, math.radians(27.0))
+    assert engine._apply_match(predicted, slipped, None) is False  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.0)
+    moved = conv.Pose2D(0.20, 0.0, 0.0)
+    slipped_moved = conv.Pose2D(-0.43, 0.73, math.radians(27.0))
+    assert engine._apply_match(moved, slipped_moved, None) is True  # noqa: SLF001
+    pose = engine.get_pose()
+    # Along-hall component is not applied. Cross steps 0.10 m, yaw 3°.
+    assert pose.x == pytest.approx(0.20, abs=1e-6)
+    assert pose.y == pytest.approx(0.10, abs=1e-6)
+    assert pose.theta == pytest.approx(math.radians(3.0), abs=1e-6)
+
+
+def test_apply_match_nav_refuses_lost_pose_that_only_slides_along(monkeypatch):
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.46  # noqa: SLF001
+    engine._last_match_score = 0.24  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    slid = conv.Pose2D(0.60, 0.05, math.radians(2.0))
+    assert engine._apply_match(predicted, slid, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, slid, None) is False  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.0)
+    assert engine.get_pose().y == pytest.approx(0.0)
+
+
 def test_apply_match_nav_refuses_heading_flip(monkeypatch):
     engine = _nav_track_engine(monkeypatch)
     engine._last_prior_score = -0.44  # noqa: SLF001
     predicted = conv.Pose2D(0.0, 0.0, 0.0)
-    flipped = conv.Pose2D(0.02, -0.40, math.radians(25.0))
+    flipped = conv.Pose2D(0.02, -0.40, math.radians(40.0))
     assert engine._apply_match(predicted, flipped, None) is False  # noqa: SLF001
     assert engine._apply_match(predicted, flipped, None) is False  # noqa: SLF001
     assert engine.get_pose().theta == pytest.approx(0.0)
