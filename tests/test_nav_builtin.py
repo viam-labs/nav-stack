@@ -1025,9 +1025,13 @@ def test_pursuit_is_geometric_omega_scales_with_speed():
 
     current = Pose2D(0.0, 0.0, 0.0)
     target = Pose2D(0.6, 0.1, 0.0)  # gentle: κ = 2·0.1/0.37 ≈ 0.54 (r ≈ 1.85 m)
+    # Short horizon so the bearing-rate cap does not bind; this test is the
+    # geometric ω = v·κ scaling.
     fast = FollowerConfig()
+    fast.lookahead_time_s = 0.2
     fast.motion.max_linear_mps = 0.6
     slow = FollowerConfig()
+    slow.lookahead_time_s = 0.2
     slow.motion.max_linear_mps = 0.3
     cmd_f, rot_f = pursuit_command(current, target, cfg=fast)
     cmd_s, rot_s = pursuit_command(current, target, cfg=slow)
@@ -1043,6 +1047,7 @@ def test_pursuit_regulates_speed_by_curvature():
     from src.nav_builtin.controller import pursuit_command
 
     cfg = FollowerConfig()
+    cfg.lookahead_time_s = 0.2  # bearing-rate cap off; this test is r/r_min
     cfg.motion.max_linear_mps = 0.6
     current = Pose2D(0.0, 0.0, 0.0)
     # 40° bearing at L=0.5 → κ = 2 sin(40°)/0.5 ≈ 2.57 → r ≈ 0.39 m < 0.7.
@@ -1053,6 +1058,48 @@ def test_pursuit_regulates_speed_by_curvature():
     assert cmd.vtheta > 0.0
     # Still a drivable arc for the Viam base sanitizer (not a spin).
     assert cmd.vx >= 0.12
+
+
+def test_pursuit_shallow_bend_does_not_yaw_at_min_radius():
+    """A hallway bend must not get the tightest arc, then a spin.
+
+    Curvature regulation locks ω at v_cruise/r_min for every arc sharper than
+    0.7 m. On the cart that was 0.714 rad/s, which carried a ~14° path bend
+    about 70° past the heading and tripped rotate-to-heading three times.
+    """
+    from src.nav_builtin.controller import DriveCommand, pursuit_command
+
+    cfg = FollowerConfig()
+    cfg.motion.max_linear_mps = 0.5
+    horizon_s = max(0.4, cfg.lookahead_time_s * 0.5)
+    current = Pose2D(0.0, 0.0, 0.0)
+
+    def _carrot(deg: float, dist_m: float) -> Pose2D:
+        a = math.radians(deg)
+        return Pose2D(dist_m * math.cos(a), dist_m * math.sin(a), 0.0)
+
+    gentle, rotating = pursuit_command(current, _carrot(14.0, 1.2), cfg=cfg)
+    assert not rotating
+    assert gentle.vx == pytest.approx(0.5, abs=0.05)
+    assert abs(gentle.vtheta) <= abs(math.radians(14.0)) / horizon_s + 1e-6
+    assert abs(gentle.vtheta) < 0.25
+
+    # Tight-lookahead carrot (~45° at 0.6 m) used to saturate at r_min.
+    steep, rotating = pursuit_command(current, _carrot(-45.0, 0.6), cfg=cfg)
+    assert not rotating
+    assert steep.vx > 0.2
+    assert steep.vtheta < 0.0
+    assert abs(steep.vtheta) <= abs(math.radians(45.0)) / horizon_s + 1e-6
+    assert steep.vx / abs(steep.vtheta) > cfg.effective_min_turn_radius_m()
+
+    # A saturated arc the other way must not keep yawing once the carrot is left.
+    saturated = DriveCommand(0.30, 0.0, -0.714, False)
+    recovered, rotating = pursuit_command(
+        current, _carrot(14.0, 1.2), cfg=cfg, prev_cmd=saturated
+    )
+    assert not rotating
+    assert recovered.vtheta >= 0.0
+    assert abs(recovered.vtheta) <= abs(math.radians(14.0)) / horizon_s + 1e-6
 
 
 def test_pursuit_corrects_crosstrack_toward_path():

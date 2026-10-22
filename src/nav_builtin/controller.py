@@ -480,11 +480,27 @@ def pursuit_command(
         a = min(1.0, max(0.05, float(cfg.curvature_smoothing)))
         kappa = a * kappa + (1.0 - a) * prev_kappa
     # Skid-steer cannot drive arcs tighter than min_turn_radius while
-    # translating (inner wheel → 0 → base rejects → spin). Widen the arc; the
-    # bearing then grows and rotate-to-heading takes over if really needed.
+    # translating (inner wheel → 0 → base rejects → spin). Widen the arc.
     kappa_max = 1.0 / cfg.effective_min_turn_radius_m()
     if abs(kappa) > kappa_max:
         kappa = math.copysign(kappa_max, kappa)
+    # Curvature regulation slows v by r/r_min and therefore locks ω at
+    # v_cruise/r_min (~0.7 rad/s here) for every tighter arc. Nav2 does the
+    # same, and only stops to spin once the carrot bearing exceeds
+    # rotate_to_heading_min_angle. Holding that ω on a shallow hallway bend
+    # yaws through the path and trips our rotate-to-heading. While
+    # translating, close the current bearing over about half a lookahead
+    # time instead of outrunning it. Rotate-in-place still handles a carrot
+    # past ``rotate_in_place_rad``.
+    horizon_s = max(0.4, float(cfg.lookahead_time_s) * 0.5)
+    w_track = abs(alpha) / horizon_s
+    if max_linear > 1e-6:
+        kappa_cap = w_track / max_linear
+        # Also drop a smoothed turn that has already passed the carrot.
+        # Keeping that sign is how one saturated arc becomes the spin back.
+        if abs(kappa) > kappa_cap or alpha * kappa < 0.0:
+            sign = math.copysign(1.0, alpha if abs(alpha) > 1e-6 else kappa)
+            kappa = sign * min(abs(kappa), kappa_cap)
 
     v = max_linear
     if abs(kappa) > 1e-6:
