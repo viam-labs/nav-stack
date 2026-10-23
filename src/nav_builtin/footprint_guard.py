@@ -102,8 +102,8 @@ def open_corridor_yaw(
     leaves at least ``min_travel_m`` of travel. Circular costmap inflation
     misses this: a cart can snake through a gap the inscribed circle cannot.
 
-    Returns the open heading closest to ``prefer_rad`` (the bearing to the
-    goal), or None when nothing within ``max_yaw_rad`` qualifies. The caller
+    Returns the open heading closest to ``prefer_rad`` (the bearing along the
+    path), or None when nothing within ``max_yaw_rad`` qualifies. The caller
     yaws in place to that heading, then plans again.
     """
     if half_length_m <= 0.0 or half_width_m <= 0.0 or step_rad <= 0.0:

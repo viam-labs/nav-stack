@@ -25,6 +25,7 @@ from ..geom import conversions as conv
 from .controller import (
     FollowerConfig,
     compute_path_command,
+    lookahead_pose,
     limit_twist_rate,
     update_speed_estimate,
 )
@@ -64,9 +65,11 @@ _BLOCKED_REPLAN_FAIL_LIMIT = 8
 _NOSE_UNSTICK_YAW_RAD = 0.8
 _NOSE_UNSTICK_YAW_RATE = 0.45
 # Nose blocked, but some heading within 90° has a clear body-width corridor
-# on the raw scan. Yaw in place onto the one nearest the goal, then plan.
-# Driving an arc while still aimed at the obstacle clips the nose.
-_CORRIDOR_ALIGN_RAD = math.radians(8.0)
+# on the raw scan. Yaw in place onto the one nearest the path, then plan.
+# The straight-line goal can sit behind the obstacle while the route is open
+# the other way. Any residual heading is a spin, not an arc: creeping while
+# still aimed at the obstacle is what the footprint guard then zeroes.
+_CORRIDOR_ALIGN_RAD = math.radians(3.0)
 _CORRIDOR_MIN_TRAVEL_M = 0.8
 _CORRIDOR_MAX_YAW_RAD = math.radians(90.0)
 _CORRIDOR_DRIVE_MPS = 0.15
@@ -1515,8 +1518,13 @@ class NavSupervisor:
         pose: Pose2D,
         scan: conv.LaserScan2D,
         goal: Pose2D,
+        path: Optional[Path2D] = None,
     ) -> Optional[float]:
         """Yaw (rad, +CCW) onto a scan corridor the rectangle can enter.
+
+        Prefers the path lookahead. The straight-line goal can point through
+        the obstacle while the route is open the other way, and a few degrees
+        toward that goal used to beat a wide opening on the path.
 
         None when no heading within 90° of the nose has ``_CORRIDOR_MIN_TRAVEL_M``
         of body-width clearance, or the rectangle cannot spin onto it. Uses
@@ -1529,9 +1537,7 @@ class NavSupervisor:
         body = scan.to_points()
         if body.size == 0:
             return None
-        bearing = conv.normalize_angle(
-            math.atan2(goal.y - pose.y, goal.x - pose.x) - pose.theta
-        )
+        bearing = self._corridor_prefer_rad(pose, goal, path)
         yaw = open_corridor_yaw(
             body,
             half_length_m=guard._hl,
@@ -1556,6 +1562,32 @@ class NavSupervisor:
         if free + 1e-3 < need:
             return None
         return float(yaw)
+
+    def _corridor_prefer_rad(
+        self,
+        pose: Pose2D,
+        goal: Pose2D,
+        path: Optional[Path2D],
+    ) -> float:
+        """Body-frame bearing of the route, else the straight-line goal."""
+        follower = getattr(self, "_follower", None)
+        if (
+            path is not None
+            and follower is not None
+            and len(path.points) >= 2
+        ):
+            target, _, _ = lookahead_pose(
+                pose,
+                path,
+                lookahead_m=float(follower.lookahead_m),
+                waypoint_tolerance_m=float(follower.waypoint_tolerance_m),
+            )
+            return conv.normalize_angle(
+                math.atan2(target.y - pose.y, target.x - pose.x) - pose.theta
+            )
+        return conv.normalize_angle(
+            math.atan2(goal.y - pose.y, goal.x - pose.x) - pose.theta
+        )
 
     @staticmethod
     def _bumper_spin_reverse(
@@ -2473,7 +2505,9 @@ class NavSupervisor:
                         and self._guard is not None
                         and blocked_for >= wait_before_replan_s
                     ):
-                        corridor_yaw = self._corridor_escape_yaw(pose, scan, goal)
+                        corridor_yaw = self._corridor_escape_yaw(
+                            pose, scan, goal, path
+                        )
                     # Still aimed at the obstacle: yaw onto the open heading
                     # before another plan from this pose. An arc here clips.
                     if (
@@ -3318,17 +3352,16 @@ class NavSupervisor:
                             "cmd_vtheta_rad_s": w,
                         }
                     elif cmd.vx < 0.05:
-                        w = 0.0
-                        if abs(corridor_yaw) >= math.radians(3.0):
-                            w = math.copysign(0.15, corridor_yaw)
-                        cmd = DriveCommand(_CORRIDOR_DRIVE_MPS, 0.0, w, False)
+                        # Already on the open heading. Drive straight; a yaw
+                        # here is an arc and the guard zeroes it against the nose.
+                        cmd = DriveCommand(_CORRIDOR_DRIVE_MPS, 0.0, 0.0, False)
                         progress = {
                             **progress,
                             "obstacle": "corridor",
                             "local_planner": False,
                             "corridor_yaw_rad": round(float(corridor_yaw), 3),
                             "cmd_vx_mps": cmd.vx,
-                            "cmd_vtheta_rad_s": w,
+                            "cmd_vtheta_rad_s": 0.0,
                         }
                 if loc_hold_motion:
                     cmd = DriveCommand(0.0, 0.0, 0.0, False)

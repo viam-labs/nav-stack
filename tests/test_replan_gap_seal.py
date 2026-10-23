@@ -200,6 +200,42 @@ def test_corridor_escape_yaw_turns_ccw_on_the_raw_scan():
     assert yaw is not None and yaw > math.radians(25.0)
 
 
+def test_corridor_escape_yaw_follows_the_path_not_the_goal():
+    """A wide opening on the route beats a notch toward the straight-line goal."""
+    from src.geom.conversions import points_to_scan
+    from src.nav_builtin.controller import FollowerConfig
+    from src.nav_builtin.footprint_guard import FootprintGuard, GuardConfig
+    from src.nav_builtin.types import Path2D
+
+    xs = np.linspace(0.56, 0.77, 16)
+    ys = np.linspace(-0.18, -0.01, 12)
+    xx, yy = np.meshgrid(xs, ys)
+    cluster = np.stack([xx.ravel(), yy.ravel()], axis=1)
+    angs = np.radians(np.arange(70, 110, 3))
+    left = np.stack([0.9 * np.cos(angs), 0.9 * np.sin(angs)], axis=1)
+    scan = points_to_scan(np.vstack([cluster, left]), range_min=0.05, range_max=8.0)
+    scan.capture_pose = Pose2D(0.0, 0.0, 0.0)
+    sup = NavSupervisor.__new__(NavSupervisor)
+    sup._guard = FootprintGuard(
+        GuardConfig(length_m=0.72, width_m=0.59, padding_m=0.07)
+    )
+    sup._follower = FollowerConfig()
+    pose = Pose2D(0.0, 0.0, 0.0)
+    goal = Pose2D(math.cos(math.radians(46.0)), math.sin(math.radians(46.0)), 0.0)
+    toward_goal = sup._corridor_escape_yaw(pose, scan, goal)
+    assert toward_goal is not None and toward_goal > math.radians(25.0)
+    heading = math.radians(-40.0)
+    path = Path2D(
+        points=(
+            (0.0, 0.0),
+            (3.0 * math.cos(heading), 3.0 * math.sin(heading)),
+            (6.0 * math.cos(heading), 6.0 * math.sin(heading)),
+        )
+    )
+    toward_path = sup._corridor_escape_yaw(pose, scan, goal, path)
+    assert toward_path is not None and toward_path < math.radians(-25.0)
+
+
 def test_sub_deadband_reverse_is_lifted_to_backup_speed():
     from src.nav.simple_motion import DriveCommand
 
