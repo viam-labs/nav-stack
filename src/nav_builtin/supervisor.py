@@ -1549,7 +1549,10 @@ class NavSupervisor:
             radius_m=guard.cfg.obstacle_radius_m,
         )
         free = guard.free_rotation(pose, math.copysign(1.0, yaw), world)
-        need = min(abs(yaw), guard.cfg.rot_horizon_rad)
+        # The next slice of the sweep has to be clear. Requiring the whole
+        # target up front refuses a notch whose first degrees clip padding;
+        # each tick rechecks and stops when the rectangle meets a return.
+        need = min(abs(yaw), max(guard.cfg.rot_step_rad * 2.0, 0.12))
         if free + 1e-3 < need:
             return None
         return float(yaw)
@@ -2777,32 +2780,6 @@ class NavSupervisor:
                 else:
                     narrow_rev_start = None
 
-                if corridor_yaw is not None and not loc_hold_motion:
-                    nose_unstick_yaw_sign = math.copysign(1.0, corridor_yaw)
-                    if abs(corridor_yaw) >= _CORRIDOR_ALIGN_RAD:
-                        w = math.copysign(_NOSE_UNSTICK_YAW_RATE, corridor_yaw)
-                        cmd = DriveCommand(0.0, 0.0, w, False)
-                        progress = {
-                            **progress,
-                            "obstacle": "yaw_open",
-                            "local_planner": False,
-                            "corridor_yaw_rad": round(float(corridor_yaw), 3),
-                            "cmd_vx_mps": 0.0,
-                            "cmd_vtheta_rad_s": w,
-                        }
-                    elif cmd.vx < 0.05:
-                        w = 0.0
-                        if abs(corridor_yaw) >= math.radians(3.0):
-                            w = math.copysign(0.15, corridor_yaw)
-                        cmd = DriveCommand(_CORRIDOR_DRIVE_MPS, 0.0, w, False)
-                        progress = {
-                            **progress,
-                            "obstacle": "corridor",
-                            "local_planner": False,
-                            "corridor_yaw_rad": round(float(corridor_yaw), 3),
-                            "cmd_vx_mps": cmd.vx,
-                            "cmd_vtheta_rad_s": w,
-                        }
                 if waiting_for_clear:
                     # Freeze forward motion for dynamic crossers, but keep a
                     # spin-blocked reverse crawl (otherwise avoid→spin_block→
@@ -3325,6 +3302,34 @@ class NavSupervisor:
                 # the limited command, which is what the base actually gets.
                 # A localization hold still ran avoidance above; the command
                 # that leaves this tick is zero so a latched speed cannot coast.
+                # Applied after the blocked-nose wait, which otherwise relabels
+                # this yaw as "wait" and the inflated spin disc then zeroes it.
+                if corridor_yaw is not None and not loc_hold_motion:
+                    nose_unstick_yaw_sign = math.copysign(1.0, corridor_yaw)
+                    if abs(corridor_yaw) >= _CORRIDOR_ALIGN_RAD:
+                        w = math.copysign(_NOSE_UNSTICK_YAW_RATE, corridor_yaw)
+                        cmd = DriveCommand(0.0, 0.0, w, False)
+                        progress = {
+                            **progress,
+                            "obstacle": "yaw_open",
+                            "local_planner": False,
+                            "corridor_yaw_rad": round(float(corridor_yaw), 3),
+                            "cmd_vx_mps": 0.0,
+                            "cmd_vtheta_rad_s": w,
+                        }
+                    elif cmd.vx < 0.05:
+                        w = 0.0
+                        if abs(corridor_yaw) >= math.radians(3.0):
+                            w = math.copysign(0.15, corridor_yaw)
+                        cmd = DriveCommand(_CORRIDOR_DRIVE_MPS, 0.0, w, False)
+                        progress = {
+                            **progress,
+                            "obstacle": "corridor",
+                            "local_planner": False,
+                            "corridor_yaw_rad": round(float(corridor_yaw), 3),
+                            "cmd_vx_mps": cmd.vx,
+                            "cmd_vtheta_rad_s": w,
+                        }
                 if loc_hold_motion:
                     cmd = DriveCommand(0.0, 0.0, 0.0, False)
                 pre_limit = cmd
