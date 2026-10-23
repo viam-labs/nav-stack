@@ -2029,7 +2029,9 @@ class NavSupervisor:
             # Abort only when the route stays blocked *and* lidar is not clear.
             # Clearance + stall/timeout still end hopeless runs.
             static_replan_fail_limit = 5
-            pose_jump_replan_m = 1.5
+            # Parked and stopped-goal checks apply up to 1 m. A 1.5 m bar
+            # left that correction on the old path (the corner slip was 0.98 m).
+            pose_jump_replan_m = 0.5
             was_loc_holding = False
             pending_loc_replan = False
             # Consecutive failed blocked-replans; reset only by a successful

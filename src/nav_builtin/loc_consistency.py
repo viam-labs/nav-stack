@@ -84,6 +84,20 @@ def residual_is_lost(verdict: LocDisagreement) -> bool:
     return verdict.compared_beams >= 16 and verdict.disagree_frac >= 0.45
 
 
+def _tick_score_recovered(result: Optional[Mapping]) -> bool:
+    """True when the live scan-match score is no longer negative."""
+    if not isinstance(result, Mapping):
+        return False
+    raw = result.get("tick_match_score")
+    if raw is None:
+        return False
+    try:
+        score = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(score) and score >= 0.0
+
+
 def match_scores_say_lost(result: Optional[Mapping]) -> bool:
     """True when SLAM says the published pose does not explain the scan.
 
@@ -168,7 +182,9 @@ def loc_blocks_forward(
         if verdict.compared_beams >= 8 and verdict.disagree_frac >= 0.50:
             return True
         return residual_is_lost(verdict)
-    if match_scores_say_lost(result):
+    # A negative previous_score is the pre-check prior. Once the live tick
+    # score has recovered, that stale number must not keep the wheels stopped.
+    if match_scores_say_lost(result) and not _tick_score_recovered(result):
         return True
     if str((result or {}).get("status") or "") == "refused_large":
         return True

@@ -134,6 +134,15 @@ def test_loc_blocks_forward_live_wall_case():
         LocDisagreement(disagree=False),
         {"status": "ok", "previous_score": -0.1},
     )
+    # Live tick recovered; the stale negative prior must not keep holding.
+    assert loc_blocks_forward(
+        LocDisagreement(disagree=False),
+        {
+            "status": "refused_along",
+            "previous_score": -0.03,
+            "tick_match_score": 0.37,
+        },
+    ) is False
     assert loc_blocks_forward(
         LocDisagreement(disagree=False),
         {"status": "refused_large"},

@@ -1615,6 +1615,52 @@ def test_periodic_relocalize_still_bad_goes_straight_to_full_map():
     assert slam._global_localize.await_count >= 1
 
 
+def test_periodic_relocalize_confirms_lost_sideways_jump_in_one_cycle():
+    """A stopped sideways slip is confirmed immediately, not 20 s later."""
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": -0.07}
+    match = {
+        "status": "matched",
+        "score": 0.24,
+        "ray_mae_m": 1.38,
+        "prior_score": -0.46,
+        "pose": {"x": -0.63, "y": 0.73, "theta": math.radians(27.0)},
+        "ambiguous": False,
+    }
+    slam._global_localize = AsyncMock(return_value=match)
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "corrected"
+    assert slam._global_localize.await_count == 2
+    assert slam.do_command.await_count == 1
+
+
+def test_periodic_relocalize_does_not_fast_confirm_an_along_hall_slide():
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": -0.07}
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.30,
+            "ray_mae_m": 1.0,
+            "prior_score": -0.40,
+            "pose": {"x": 0.90, "y": 0.0, "theta": 0.0},
+            "ambiguous": False,
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "awaiting_confirm"
+    assert slam._global_localize.await_count == 1
+    slam.do_command.assert_not_awaited()
+
+
 def test_periodic_relocalize_parked_applies_button_style_local_match():
     """A parked hallway slip the button would take is applied without a full-map search."""
     slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
