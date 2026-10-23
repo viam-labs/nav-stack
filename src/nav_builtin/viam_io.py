@@ -518,7 +518,16 @@ class ViamWorldIO:
             else:
                 primary.append(scan)
         if not primary and not depth_scans:
-            return self._scan_cache if include_obstacles_only else None
+            # A missed read may reuse the last scan only while it is still
+            # inside max_age. Returning it forever is how a dead lidar kept
+            # reporting 0.485 m of clearance while the body drove into the wall.
+            if (
+                include_obstacles_only
+                and self._scan_cache is not None
+                and (max_age_s <= 0.0 or now - self._scan_cache_at <= max_age_s)
+            ):
+                return self._scan_cache
+            return None
         if not include_obstacles_only or not depth_scans:
             if not primary:
                 # Lidar-only was requested but no primary lidar answered —
@@ -850,7 +859,12 @@ class ViamWorldIO:
             # on RealSense GetPointCloud (that was starving SetVelocity → stall).
             self._kick_obstacles_only_refresh(lidar)
             cached = self._per_lidar_scan.get(lidar.name)
-            return cached[0] if cached is not None else None
+            if cached is None:
+                return None
+            scan, stamp = cached
+            if max_age_s > 0.0 and time.monotonic() - float(stamp) > max_age_s:
+                return None
+            return scan
 
         # Prefer POSIX shm (memcpy) so the 10 Hz control loop never blocks on
         # gRPC GetPointCloud — that lag was causing no_scan spin / circles.

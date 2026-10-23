@@ -797,3 +797,25 @@ def test_get_scan_lidar_only_does_not_fall_back_to_depth():
     full = world.get_scan(2.0, include_obstacles_only=True)
     assert full is not None
     assert float(np.nanmin(full.ranges)) == pytest.approx(0.05)
+
+
+def test_get_scan_drops_cache_when_lidar_frames_stop():
+    """A dead lidar must not keep serving the last ranges forever."""
+    from src.config import LidarConfig
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[LidarConfig(name="lidar", scan_source="get_laser_scan")],
+    )
+    old = conv.points_to_scan(np.array([[2.0, 0.0]]), num_bins=16)
+    world._scan_cache = old  # noqa: SLF001
+    world._scan_cache_at = time.monotonic() - 10.0  # noqa: SLF001
+    world._read_lidar_scan_sync = MagicMock(return_value=None)  # noqa: SLF001
+
+    assert world.get_scan(2.0) is None
+
+    world._scan_cache_at = time.monotonic()  # noqa: SLF001
+    held = world.get_scan(2.0)
+    assert held is old

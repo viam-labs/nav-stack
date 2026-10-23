@@ -1153,7 +1153,9 @@ def _guarded_command(
     )
     spin_blocked = False
     if obstacle_on and scan is None:
-        cmd = DriveCommand(0.0, 0.0, cmd.vtheta, cmd.done)
+        # No fresh ranges: do not keep the last yaw. A frozen scan plus a
+        # spin is how the corner of the footprint meets the wall.
+        cmd = DriveCommand(0.0, 0.0, 0.0, cmd.done)
         state = "no_scan"
     else:
         in_tolerance = dist_goal <= cfg.motion.xy_tolerance_m

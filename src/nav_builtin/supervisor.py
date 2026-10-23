@@ -3436,9 +3436,10 @@ class NavSupervisor:
                     },
                 )
                 if progress.get("obstacle") == "no_scan":
-                    # Fail closed: stop forward; brief wait then continue.
-                    self._world.set_velocity(0.0, 0.0, cmd.vtheta)
-                    self._last_sent_cmd = DriveCommand(0.0, 0.0, cmd.vtheta, False)
+                    # No fresh lidar frame: stop translation and yaw. The last
+                    # scan must not be driven or spun on.
+                    self._world.set_velocity(0.0, 0.0, 0.0)
+                    self._last_sent_cmd = DriveCommand(0.0, 0.0, 0.0, False)
                     self._last_sent_at = time.monotonic()
                     self._sleep_control_period(tick_started)
                     continue
