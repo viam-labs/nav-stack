@@ -76,6 +76,7 @@ class RPLidarShm(Camera):
         self._max_reconnect_backoff_s = 15.0
         self._max_publish_gap_s = 5.0
         self._stall_thread: Optional[threading.Thread] = None
+        self._stall_poll_s = 1.0
         self._serial_exclude: list[str] = []
         self._serial_chip: Optional[str] = None
         self._include_tty_acm = False
@@ -84,9 +85,25 @@ class RPLidarShm(Camera):
         """Long enough for scan loop to exit reconnect backoff and UART reads."""
         return self._max_reconnect_backoff_s + self._timeout_s + self._motor_warmup_s + 5.0
 
+    def _mark_scan_progress(self) -> None:
+        self._scan_loop_progress_wall = time.monotonic()
+
     def _wait_backoff(self, backoff: float) -> bool:
-        """Wait up to ``backoff`` seconds; return True when ``_stop`` is set."""
-        return self._stop.wait(backoff)
+        """Wait up to ``backoff`` seconds; return True when ``_stop`` is set.
+
+        The wait itself is progress. Leaving the progress stamp frozen makes
+        the stall watchdog treat a deliberate reconnect delay as a hung read.
+        """
+        deadline = time.monotonic() + max(0.0, backoff)
+        while True:
+            if self._stop.is_set():
+                return True
+            self._mark_scan_progress()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._stop.wait(min(1.0, remaining)):
+                return True
 
     @classmethod
     def new(
@@ -268,7 +285,7 @@ class RPLidarShm(Camera):
         backoff = self._reconnect_backoff_s
         try:
             while not self._stop.is_set():
-                self._scan_loop_progress_wall = time.monotonic()
+                self._mark_scan_progress()
                 device = self._device
                 if device is None:
                     self._stall_abort.clear()
@@ -280,13 +297,16 @@ class RPLidarShm(Camera):
                     backoff = self._reconnect_backoff_s
                     device = self._device
                 discarded = 0
+                # This attempt's clock starts here, after reconnect. The last
+                # publish may already be minutes old; that is why we are here.
+                self._mark_scan_progress()
                 self._stall_abort.clear()
                 try:
                     for measurements in device.iter_scans(
                         max_stall_s=self._max_publish_gap_s,
                         abort_check=self._stall_abort.is_set,
                     ):
-                        self._scan_loop_progress_wall = time.monotonic()
+                        self._mark_scan_progress()
                         if self._stop.is_set():
                             return
                         if discarded < self._warmup_scans:
@@ -325,6 +345,7 @@ class RPLidarShm(Camera):
     def _try_reconnect(self, backoff_s: float) -> bool:
         if self._stop.is_set():
             return False
+        self._mark_scan_progress()
         try:
             self._open_device()
         except Exception as exc:  # noqa: BLE001
@@ -348,33 +369,46 @@ class RPLidarShm(Camera):
         return True
 
     def _stall_watchdog(self) -> None:
-        """Abort hung scans on the single scan thread; never spawn a second thread."""
-        kick_after = max(self._max_publish_gap_s * 2.0, 10.0)
-        while not self._stop.wait(1.0):
-            gap = self._max_publish_gap_s
-            if gap <= 0:
-                continue
-            last = self._last_publish_wall
-            if last is None:
-                continue
-            age = time.monotonic() - last
-            if age <= gap:
-                continue
-            progress = self._scan_loop_progress_wall
-            progress_age = (time.monotonic() - progress) if progress is not None else age
-            if age >= kick_after and progress_age >= gap:
-                self._kick_scan_loop(f"publish stalled {age:.1f}s")
-                continue
-            if self._stall_abort.is_set():
-                continue
-            LOGGER.warning(
-                "rplidar %r publish stalled %.1fs (> %.1fs); aborting scan loop",
-                self.name,
-                age,
-                gap,
-            )
-            self._last_error = f"publish stalled {age:.1f}s"
-            self._stall_abort.set()
+        """Abort a read that has stopped making progress.
+
+        Never spawn a second scan thread. A reconnect is progress: the last
+        publish stays old until the new revolution is written, and aborting
+        on that timestamp cancels every retry.
+        """
+        while not self._stop.is_set():
+            self._stall_watchdog_tick()
+            if self._stop.wait(self._stall_poll_s):
+                return
+
+    def _stall_watchdog_tick(self) -> None:
+        gap = self._max_publish_gap_s
+        if gap <= 0:
+            return
+        last = self._last_publish_wall
+        if last is None:
+            return
+        now = time.monotonic()
+        age = now - last
+        if age <= gap:
+            return
+        progress = self._scan_loop_progress_wall
+        progress_age = (now - progress) if progress is not None else age
+        if progress_age < gap:
+            return
+        kick_after = max(gap * 2.0, 10.0)
+        if age >= kick_after:
+            self._kick_scan_loop(f"publish stalled {age:.1f}s")
+            return
+        if self._stall_abort.is_set():
+            return
+        LOGGER.warning(
+            "rplidar %r publish stalled %.1fs (> %.1fs); aborting scan loop",
+            self.name,
+            age,
+            gap,
+        )
+        self._last_error = f"publish stalled {age:.1f}s"
+        self._stall_abort.set()
 
     async def get_images(self, *, extra=None, timeout=None, **kwargs):
         raise NotImplementedError("rplidar does not support get_images; use get_point_cloud")

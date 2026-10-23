@@ -356,6 +356,136 @@ def test_stall_watchdog_signals_abort_without_closing_device():
         watchdog.join(timeout=2.0)
 
 
+def test_stall_watchdog_leaves_a_live_retry_alone():
+    """An old publish must not abort the attempt that is replacing it."""
+    pytest.importorskip("viam")
+    import threading
+
+    from src.models.rplidar_shm import RPLidarShm
+
+    cam = RPLidarShm("lidar")
+    cam._stop = threading.Event()
+    cam._max_publish_gap_s = 0.2
+    cam._last_publish_wall = time.monotonic() - 30.0
+    cam._scan_loop_progress_wall = time.monotonic()
+    fake = MagicMock()
+    fake.baudrate = 115200
+    cam._device = fake
+
+    cam._stall_watchdog_tick()
+
+    assert not cam._stall_abort.is_set()
+    assert cam._kick_count == 0
+    assert cam._device is fake
+    fake.stop.assert_not_called()
+    fake.close.assert_not_called()
+
+
+def test_stall_watchdog_kicks_a_read_that_stopped_moving():
+    pytest.importorskip("viam")
+    import threading
+
+    from src.models.rplidar_shm import RPLidarShm
+
+    cam = RPLidarShm("lidar")
+    cam._stop = threading.Event()
+    cam._max_publish_gap_s = 0.2
+    cam._last_publish_wall = time.monotonic() - 30.0
+    cam._scan_loop_progress_wall = time.monotonic() - 30.0
+    fake = MagicMock()
+    fake.baudrate = 115200
+    cam._device = fake
+
+    cam._stall_watchdog_tick()
+
+    assert cam._kick_count == 1
+    assert cam._stall_abort.is_set()
+    assert cam._device is None
+    fake.close.assert_called_once()
+
+
+def test_scan_loop_publishes_again_while_watchdog_sees_an_old_frame():
+    """The retry that follows a sync timeout has to be allowed to finish."""
+    pytest.importorskip("viam")
+    import threading
+
+    from src.models.rplidar_shm import RPLidarShm
+
+    class RetryDevice:
+        def __init__(self, owner):
+            self.owner = owner
+            self.calls = 0
+            self.port = "/dev/fake"
+            self.baudrate = 115200
+            self.info = {"model": proto.MODEL_A1}
+
+        def iter_scans(self, **kwargs):
+            self.calls += 1
+            abort_check = kwargs.get("abort_check")
+            if self.calls == 1:
+                yield _circle_scan()
+                raise proto.RPLidarError("dense capsule sync timed out")
+            # The scan loop just stamped this attempt. Age the previous
+            # publish the way a multi-minute outage looks, then take longer
+            # than one watchdog tick to produce the next revolution.
+            self.owner._last_publish_wall = time.monotonic() - 30.0
+            deadline = time.monotonic() + 0.35
+            while time.monotonic() < deadline:
+                if abort_check is not None and abort_check():
+                    raise proto.RPLidarError("scan aborted")
+                time.sleep(0.02)
+            yield _circle_scan()
+            while not self.owner._stop.is_set():
+                if abort_check is not None and abort_check():
+                    raise proto.RPLidarError("scan aborted")
+                yield _circle_scan()
+                time.sleep(0.02)
+
+        def stop(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    cam = RPLidarShm("lidar")
+    cam._warmup_scans = 0
+    cam._max_publish_gap_s = 0.5
+    cam._stall_poll_s = 0.05
+    cam._reconnect_backoff_s = 0.02
+    cam._max_reconnect_backoff_s = 0.05
+    cam._timeout_s = 0.05
+    cam._motor_warmup_s = 0.0
+    cam._shm_name = "/viam-pc-retry"
+    cam._shm = pcshm.open_writer(cam._shm_name)
+    fake = RetryDevice(cam)
+
+    def fake_open():
+        cam._device = fake
+        cam._info = dict(fake.info)
+
+    cam._open_device = fake_open  # type: ignore[method-assign]
+    fake_open()
+    scan_thread = threading.Thread(target=cam._scan_loop, daemon=True)
+    watchdog = threading.Thread(target=cam._stall_watchdog, daemon=True)
+    scan_thread.start()
+    watchdog.start()
+    deadline = time.monotonic() + 2.0
+    try:
+        while time.monotonic() < deadline:
+            if fake.calls >= 2 and cam._scans >= 2:
+                break
+            time.sleep(0.02)
+        assert fake.calls >= 2
+        assert cam._scans >= 2
+        assert cam._kick_count == 0
+    finally:
+        cam._stop.set()
+        cam._stall_abort.set()
+        scan_thread.join(timeout=2.0)
+        watchdog.join(timeout=2.0)
+        cam.close_sync()
+
+
 def test_kick_scan_loop_closes_device_without_spawning_thread():
     pytest.importorskip("viam")
     import threading
