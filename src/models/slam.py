@@ -1624,21 +1624,30 @@ class SlamService(SLAM):
             nav_recoveries >= cfg.periodic_relocalize_nav_recoveries_threshold
             or (
                 still_bad
-                and not driving
+                and not nav_active
                 and escalation == "low_quality"
                 and not parked_button
             )
         )
-        # Mid-nav refine (stopped in a corridor) must stay local — a full-map
-        # search is how we snap to a twin hallway. Stopped recovery may escalate.
-        if allow_during_navigation and not stopped_recovery:
+        # A goal that has not started moving is still a goal. Full-map runs
+        # while idle; the start of nav only gets a local search. A full-map
+        # pass here is the 15–20 s pause before the first command. Many
+        # recoveries on an already-failing goal, and stopped recovery after a
+        # local check failed, may still search the whole map.
+        if (
+            nav_active
+            and not stopped_recovery
+            and nav_recoveries < cfg.periodic_relocalize_nav_recoveries_threshold
+        ):
             force_full_map = False
         current = mgr.get_pose_in_map()
 
         base_command: dict = {"command": "global_localize"}
         base_command.update(dict(cfg.periodic_relocalize_options))
         base_command["apply"] = False
-        if escalation == "still_bad" and not stopped_recovery:
+        if (escalation == "still_bad" and not stopped_recovery) or (
+            nav_active and not stopped_recovery
+        ):
             # Do not let the local request auto-fall back into a full-map search.
             base_command["auto_full_map_fallback"] = False
         if stopped_recovery:
@@ -1714,9 +1723,11 @@ class SlamService(SLAM):
             )
             if parked_hit:
                 match_mode = "local_parked"
-            elif still_bad:
-                # The 1 m window had nothing the button would keep. Fall
-                # through to the full-map recovery this cycle used to run first.
+            elif still_bad and not nav_active:
+                # Idle only. The 1 m window had nothing the button would keep.
+                # Fall through to the full-map recovery this cycle used to run
+                # first. An active goal, even one that has not moved yet, stays
+                # on the local result.
                 full_command = dict(base_command)
                 full_command["apply"] = False
                 full_command["full_map"] = True
@@ -1778,8 +1789,10 @@ class SlamService(SLAM):
                 # still_bad: only burn a full-map search when we are confident
                 # the current pose is wrong, not merely that a local peel was weak.
                 escalate_full = bool(pose_still_bad)
-            # Driving refine stays local. Stopped recovery may escalate once.
-            if allow_during_navigation and not stopped_recovery:
+            # An active goal stays local, including the stopped moment before
+            # the first command. Idle low-quality matches still escalate.
+            # Stopped recovery may escalate once.
+            if nav_active and not stopped_recovery:
                 escalate_full = False
 
         if escalate_full:

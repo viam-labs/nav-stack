@@ -1385,9 +1385,11 @@ def test_periodic_relocalize_runs_when_nav_active_but_stopped():
     first = slam._global_localize.await_args_list[0].args[0]
     assert first["search_radius_m"] == 1.0
     assert first["full_map"] is False
-    assert any(
+    assert first["auto_full_map_fallback"] is False
+    # Full-map waits until the goal is idle. A stopped start only searches locally.
+    assert not any(
         bool(c.args[0].get("full_map"))
-        for c in slam._global_localize.await_args_list[1:]
+        for c in slam._global_localize.await_args_list
     )
 
 
