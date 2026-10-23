@@ -84,6 +84,63 @@ def twist_reaches_base(vx: float, vtheta: float) -> bool:
     return abs(vx) >= BASE_LIN_EPS_MPS or abs(vtheta) >= BASE_ANG_EPS_RAD_S
 
 
+def open_corridor_yaw(
+    body_xy: np.ndarray,
+    *,
+    half_length_m: float,
+    half_width_m: float,
+    prefer_rad: float = 0.0,
+    min_travel_m: float = 0.8,
+    max_yaw_rad: float = math.pi / 2.0,
+    step_rad: float = math.radians(2.0),
+    horizon_m: float = 4.0,
+) -> Optional[float]:
+    """Signed yaw (rad, +CCW) onto a heading whose body corridor is open.
+
+    ``body_xy`` is in the base frame (+X forward, +Y left). A heading is open
+    when the nearest return inside the rectangle's width, ahead of the nose,
+    leaves at least ``min_travel_m`` of travel. Circular costmap inflation
+    misses this: a cart can snake through a gap the inscribed circle cannot.
+
+    Returns the open heading closest to ``prefer_rad`` (the bearing to the
+    goal), or None when nothing within ``max_yaw_rad`` qualifies. The caller
+    yaws in place to that heading, then plans again.
+    """
+    if half_length_m <= 0.0 or half_width_m <= 0.0 or step_rad <= 0.0:
+        return None
+    pts = np.asarray(body_xy, dtype=float)
+    if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] < 2:
+        return None
+    pts = pts[:, :2]
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if pts.shape[0] == 0:
+        return None
+    n = int(math.floor(float(max_yaw_rad) / step_rad))
+    if n < 1:
+        return None
+    yaws = np.linspace(-n * step_rad, n * step_rad, 2 * n + 1)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    c = np.cos(yaws)[:, None]
+    s = np.sin(yaws)[:, None]
+    # +yaw is CCW: rotate the cloud by -yaw into the candidate heading frame.
+    xr = c * x + s * y
+    yr = -s * x + c * y
+    in_corr = (
+        (xr > half_length_m)
+        & (xr < half_length_m + horizon_m)
+        & (np.abs(yr) <= half_width_m)
+    )
+    nearest = np.where(in_corr, xr, np.inf).min(axis=1)
+    travel = np.where(np.isfinite(nearest), nearest - half_length_m, horizon_m)
+    ok = np.flatnonzero(travel >= min_travel_m)
+    if ok.size == 0:
+        return None
+    err = np.abs(yaws[ok] - float(prefer_rad))
+    best = ok[np.lexsort((-travel[ok], err))][0]
+    return float(yaws[best])
+
+
 def obstacle_points(
     pose: Pose2D,
     scan: Optional[conv.LaserScan2D],

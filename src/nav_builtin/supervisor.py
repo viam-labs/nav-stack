@@ -30,7 +30,12 @@ from .controller import (
 )
 from .above_cart import AboveCartMemory, above_cart_frames
 from .depth_memory import DepthObstacleMemory, depth_frames
-from .footprint_guard import FootprintGuard, GuardConfig, obstacle_points
+from .footprint_guard import (
+    FootprintGuard,
+    GuardConfig,
+    obstacle_points,
+    open_corridor_yaw,
+)
 from .local_costmap import (
     LocalCostmap,
     LocalCostmapConfig,
@@ -58,6 +63,13 @@ _BLOCKED_REPLAN_FAIL_LIMIT = 8
 # rear is not open. ~46° is enough to face a different corridor.
 _NOSE_UNSTICK_YAW_RAD = 0.8
 _NOSE_UNSTICK_YAW_RATE = 0.45
+# Nose blocked, but some heading within 90° has a clear body-width corridor
+# on the raw scan. Yaw in place onto the one nearest the goal, then plan.
+# Driving an arc while still aimed at the obstacle clips the nose.
+_CORRIDOR_ALIGN_RAD = math.radians(8.0)
+_CORRIDOR_MIN_TRAVEL_M = 0.8
+_CORRIDOR_MAX_YAW_RAD = math.radians(90.0)
+_CORRIDOR_DRIVE_MPS = 0.15
 
 # Last ~60 s of guarded control ticks (20 Hz), kept across goals so a graze
 # can be inspected after the operator cancels (``get_trace`` DoCommand).
@@ -1478,20 +1490,69 @@ class NavSupervisor:
         nose_clear: bool,
         rear_open: bool,
         spin_clear: bool,
+        heading_open: bool = False,
     ) -> str:
         """Motion while a blocked nose waits out the replan cooldown.
 
         ``hold`` for the first wait, so a person crossing can still move.
-        After a replan fails: ``reverse`` when the rear is open, otherwise
-        ``turn`` when an in-place spin would not sweep an obstacle.
+        After a replan fails: turn toward a heading the rectangle can drive
+        when ``heading_open`` (raw scan, not the inflated spin disc).
+        Otherwise ``reverse`` when the rear is open, else ``turn`` when an
+        in-place spin would not sweep an obstacle.
         """
         if nose_clear or int(failed_replans) < 1:
             return "hold"
+        if heading_open:
+            return "turn"
         if rear_open:
             return "reverse"
         if spin_clear:
             return "turn"
         return "hold"
+
+    def _corridor_escape_yaw(
+        self,
+        pose: Pose2D,
+        scan: conv.LaserScan2D,
+        goal: Pose2D,
+    ) -> Optional[float]:
+        """Yaw (rad, +CCW) onto a scan corridor the rectangle can enter.
+
+        None when no heading within 90° of the nose has ``_CORRIDOR_MIN_TRAVEL_M``
+        of body-width clearance, or the rectangle cannot spin onto it. Uses
+        raw returns, so inflated costmap cells cannot veto a geometrically
+        clear turn.
+        """
+        guard = self._guard
+        if guard is None:
+            return None
+        body = scan.to_points()
+        if body.size == 0:
+            return None
+        bearing = conv.normalize_angle(
+            math.atan2(goal.y - pose.y, goal.x - pose.x) - pose.theta
+        )
+        yaw = open_corridor_yaw(
+            body,
+            half_length_m=guard._hl,
+            half_width_m=guard._hw + guard.cfg.padding_m,
+            prefer_rad=bearing,
+            min_travel_m=_CORRIDOR_MIN_TRAVEL_M,
+            max_yaw_rad=_CORRIDOR_MAX_YAW_RAD,
+        )
+        if yaw is None or abs(yaw) < 1e-3:
+            return yaw
+        world = obstacle_points(
+            pose,
+            scan,
+            None,
+            radius_m=guard.cfg.obstacle_radius_m,
+        )
+        free = guard.free_rotation(pose, math.copysign(1.0, yaw), world)
+        need = min(abs(yaw), guard.cfg.rot_horizon_rad)
+        if free + 1e-3 < need:
+            return None
+        return float(yaw)
 
     @staticmethod
     def _bumper_spin_reverse(
@@ -2357,6 +2418,9 @@ class NavSupervisor:
                     self._replan_local_blocked_time_s,
                 )
                 waiting_for_clear = False
+                # Signed yaw onto a raw-scan corridor, when the nose is blocked
+                # but a nearby heading (toward the goal) is wide enough to drive.
+                corridor_yaw: Optional[float] = None
                 if local_blocked:
                     if local_blocked_since is None:
                         local_blocked_since = now
@@ -2399,6 +2463,22 @@ class NavSupervisor:
                         and nose_clear
                     ):
                         action = "keep_dwa"
+                    if (
+                        not nose_clear
+                        and not loc_hold_motion
+                        and scan is not None
+                        and self._guard is not None
+                        and blocked_for >= wait_before_replan_s
+                    ):
+                        corridor_yaw = self._corridor_escape_yaw(pose, scan, goal)
+                    # Still aimed at the obstacle: yaw onto the open heading
+                    # before another plan from this pose. An arc here clips.
+                    if (
+                        corridor_yaw is not None
+                        and abs(corridor_yaw) >= _CORRIDOR_ALIGN_RAD
+                        and action == "replan"
+                    ):
+                        action = "wait"
                     if action == "wait":
                         waiting_for_clear = True
                     elif action == "replan":
@@ -2457,6 +2537,7 @@ class NavSupervisor:
                             blocked_fail_dist = None
                             nose_unstick_start = None
                             nose_unstick_mode = ""
+                            corridor_yaw = None
                         else:
                             failed_replan_while_blocked += 1
                             blocked_fail_count += 1
@@ -2464,7 +2545,10 @@ class NavSupervisor:
                                 blocked_fail_dist = distance_m(pose, goal)
                             # Nav2 BT semantics: bounded retries, then fail —
                             # not an infinite replan loop in front of a plug.
-                            if self._abort_blocked_replans(
+                            # An open scan corridor is a way through the
+                            # inflation the planner just refused; yaw or creep
+                            # it instead of failing the goal.
+                            if corridor_yaw is None and self._abort_blocked_replans(
                                 blocked_fail_count, nose_clear=nose_clear
                             ):
                                 return
@@ -2693,6 +2777,32 @@ class NavSupervisor:
                 else:
                     narrow_rev_start = None
 
+                if corridor_yaw is not None and not loc_hold_motion:
+                    nose_unstick_yaw_sign = math.copysign(1.0, corridor_yaw)
+                    if abs(corridor_yaw) >= _CORRIDOR_ALIGN_RAD:
+                        w = math.copysign(_NOSE_UNSTICK_YAW_RATE, corridor_yaw)
+                        cmd = DriveCommand(0.0, 0.0, w, False)
+                        progress = {
+                            **progress,
+                            "obstacle": "yaw_open",
+                            "local_planner": False,
+                            "corridor_yaw_rad": round(float(corridor_yaw), 3),
+                            "cmd_vx_mps": 0.0,
+                            "cmd_vtheta_rad_s": w,
+                        }
+                    elif cmd.vx < 0.05:
+                        w = 0.0
+                        if abs(corridor_yaw) >= math.radians(3.0):
+                            w = math.copysign(0.15, corridor_yaw)
+                        cmd = DriveCommand(_CORRIDOR_DRIVE_MPS, 0.0, w, False)
+                        progress = {
+                            **progress,
+                            "obstacle": "corridor",
+                            "local_planner": False,
+                            "corridor_yaw_rad": round(float(corridor_yaw), 3),
+                            "cmd_vx_mps": cmd.vx,
+                            "cmd_vtheta_rad_s": w,
+                        }
                 if waiting_for_clear:
                     # Freeze forward motion for dynamic crossers, but keep a
                     # spin-blocked reverse crawl (otherwise avoid→spin_block→
@@ -2766,6 +2876,7 @@ class NavSupervisor:
                             nose_clear=nose_clear,
                             rear_open=rev is not None,
                             spin_clear=spin_clear,
+                            heading_open=corridor_yaw is not None,
                         )
                         if choice == "reverse" and rev is not None:
                             if nose_unstick_mode != "reverse":
@@ -2882,7 +2993,7 @@ class NavSupervisor:
                             blocked_fail_count += 1
                             if blocked_fail_dist is None:
                                 blocked_fail_dist = distance_m(pose, goal)
-                            if self._abort_blocked_replans(
+                            if corridor_yaw is None and self._abort_blocked_replans(
                                 blocked_fail_count, nose_clear=nose_clear
                             ):
                                 return
@@ -3222,6 +3333,19 @@ class NavSupervisor:
                     # Reduce-only veto on whatever is about to go to the base
                     # (slew-limited pursuit, backup, recovery spins).
                     veto_pts = guard_pts
+                    if (
+                        progress.get("obstacle") in ("yaw_open", "corridor")
+                        and scan is not None
+                    ):
+                        # Inflation of the blob on the nose fills the spin disc
+                        # even when the rectangle can rotate and then drive.
+                        # Judge this escape against the raw scan.
+                        veto_pts = obstacle_points(
+                            pose,
+                            scan,
+                            None,
+                            radius_m=self._guard.cfg.obstacle_radius_m,
+                        )
 
                     def _veto(c: DriveCommand):
                         return self._guard.guard(
@@ -3281,15 +3405,18 @@ class NavSupervisor:
                                     self._guard.free_rotation(pose, sign, guard_pts)
                                     >= self._guard.cfg.rot_horizon_rad * 0.5
                                 )
-                        choice = self._undrivable_nose_recovery(
-                            nose_clear=nose_clear,
-                            waiting=waiting_for_clear,
-                            vx=cmd.vx,
-                            vtheta=cmd.vtheta,
-                            rear_open=rear_open,
-                            spin_clear=spin_clear,
-                            bearing_rad=bearing,
-                        )
+                        if progress.get("obstacle") in ("yaw_open", "corridor"):
+                            choice = None
+                        else:
+                            choice = self._undrivable_nose_recovery(
+                                nose_clear=nose_clear,
+                                waiting=waiting_for_clear,
+                                vx=cmd.vx,
+                                vtheta=cmd.vtheta,
+                                rear_open=rear_open,
+                                spin_clear=spin_clear,
+                                bearing_rad=bearing,
+                            )
                         finished_escape = False
                         if choice == "turn":
                             deadband_rev_start = None
@@ -3429,6 +3556,7 @@ class NavSupervisor:
                             "cmd_vx_mps",
                             "cmd_vtheta_rad_s",
                             "bearing_error_rad",
+                            "corridor_yaw_rad",
                             "distance_remaining_m",
                             "waypoint_index",
                         )

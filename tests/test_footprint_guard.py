@@ -6,7 +6,11 @@ import math
 import numpy as np
 import pytest
 
-from src.nav_builtin.footprint_guard import FootprintGuard, GuardConfig
+from src.nav_builtin.footprint_guard import (
+    FootprintGuard,
+    GuardConfig,
+    open_corridor_yaw,
+)
 from src.nav_builtin.types import Pose2D
 
 L, W = 0.72, 0.59
@@ -140,6 +144,68 @@ def test_leg_inside_padding_may_be_passed_but_not_approached():
     assert toward < 0.3
     res = g.guard(O, 0.3, -0.6, leg, allow_steer=False)
     assert res.vx < 0.3 or abs(res.vtheta) < 0.6
+
+
+def _nose_cluster() -> np.ndarray:
+    """Blob ~20 cm past the nose, slightly right of center (live F4 pose)."""
+    xs = np.linspace(0.56, 0.77, 16)
+    ys = np.linspace(-0.18, -0.01, 12)
+    xx, yy = np.meshgrid(xs, ys)
+    cluster = np.stack([xx.ravel(), yy.ravel()], axis=1)
+    angs = np.radians(np.arange(70, 110, 3))
+    left = np.stack([0.9 * np.cos(angs), 0.9 * np.sin(angs)], axis=1)
+    return np.vstack([cluster, left])
+
+
+def test_open_corridor_yaw_aims_ccw_through_the_notch():
+    """Straight is blocked. The open heading nearest the goal is counter-clockwise."""
+    pts = _nose_cluster()
+    hl, hw = 0.36, 0.365
+    # 0° travel is ~0.2 m, so the search must leave the blocked heading.
+    aimed = open_corridor_yaw(
+        pts,
+        half_length_m=hl,
+        half_width_m=hw,
+        prefer_rad=0.0,
+        min_travel_m=0.8,
+    )
+    assert aimed is not None and aimed > math.radians(20)
+    prefer = math.radians(46.0)
+    yaw = open_corridor_yaw(
+        pts,
+        half_length_m=hl,
+        half_width_m=hw,
+        prefer_rad=prefer,
+        min_travel_m=0.8,
+    )
+    assert yaw is not None
+    assert abs(yaw - prefer) < math.radians(8)
+    mirrored = pts.copy()
+    mirrored[:, 1] *= -1.0
+    other = open_corridor_yaw(
+        mirrored,
+        half_length_m=hl,
+        half_width_m=hw,
+        prefer_rad=-prefer,
+        min_travel_m=0.8,
+    )
+    assert other is not None and other < 0
+    assert abs(other + prefer) < math.radians(8)
+
+
+def test_open_corridor_yaw_none_when_every_heading_is_short():
+    angs = np.linspace(-math.pi, math.pi, 80, endpoint=False)
+    ring = np.stack([0.7 * np.cos(angs), 0.7 * np.sin(angs)], axis=1)
+    assert (
+        open_corridor_yaw(
+            ring,
+            half_length_m=0.36,
+            half_width_m=0.365,
+            prefer_rad=math.radians(46),
+            min_travel_m=0.8,
+        )
+        is None
+    )
 
 
 def test_turning_away_does_not_swing_tail_into_leg_beside_rear():

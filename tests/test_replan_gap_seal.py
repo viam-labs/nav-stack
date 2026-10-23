@@ -166,6 +166,38 @@ def test_blocked_nose_unstick_after_a_failed_replan():
         )
         == "hold"
     )
+    # An open scan heading wins over reverse, even when the inflated spin
+    # disc says the turn is blocked.
+    assert (
+        NavSupervisor._blocked_nose_unstick(
+            failed_replans=1,
+            nose_clear=False,
+            rear_open=True,
+            spin_clear=False,
+            heading_open=True,
+        )
+        == "turn"
+    )
+
+
+def test_corridor_escape_yaw_turns_ccw_on_the_raw_scan():
+    """The inflated spin disc is not consulted. A clear rectangle may yaw."""
+    from src.geom.conversions import points_to_scan
+    from src.nav_builtin.footprint_guard import FootprintGuard, GuardConfig
+
+    xs = np.linspace(0.56, 0.77, 16)
+    ys = np.linspace(-0.18, -0.01, 12)
+    xx, yy = np.meshgrid(xs, ys)
+    pts = np.stack([xx.ravel(), yy.ravel()], axis=1)
+    scan = points_to_scan(pts, range_min=0.05, range_max=8.0)
+    scan.capture_pose = Pose2D(0.0, 0.0, 0.0)
+    sup = NavSupervisor.__new__(NavSupervisor)
+    sup._guard = FootprintGuard(
+        GuardConfig(length_m=0.72, width_m=0.59, padding_m=0.07)
+    )
+    goal = Pose2D(math.cos(math.radians(46.0)), math.sin(math.radians(46.0)), 0.0)
+    yaw = sup._corridor_escape_yaw(Pose2D(0.0, 0.0, 0.0), scan, goal)
+    assert yaw is not None and yaw > math.radians(25.0)
 
 
 def test_sub_deadband_reverse_is_lifted_to_backup_speed():
