@@ -4,6 +4,7 @@ Also documents the runtime policy: with a clear nose, the supervisor keeps the
 short path and peels with DWA for a grace window before escalating to replan
 (so scan-paint room loops are not the first response).
 """
+
 from __future__ import annotations
 
 import math
@@ -411,7 +412,10 @@ def test_static_plan_uses_doorway_but_scan_replan_takes_long_detour():
     assert static.feasible
     static_pts = static.path.points
     static_len = sum(
-        math.hypot(static_pts[i + 1][0] - static_pts[i][0], static_pts[i + 1][1] - static_pts[i][1])
+        math.hypot(
+            static_pts[i + 1][0] - static_pts[i][0],
+            static_pts[i + 1][1] - static_pts[i][1],
+        )
         for i in range(len(static_pts) - 1)
     )
     assert static_len < 5.0

@@ -3,6 +3,7 @@
 Builtin occupancy SLAM on any Viam base. Exposes the standard Viam SLAM service
 API plus map-management / mode / initial-pose commands through ``DoCommand``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -184,9 +185,7 @@ class SlamService(SLAM):
             self._movement_sensor = (
                 cast(
                     MovementSensor,
-                    dependencies[
-                        MovementSensor.get_resource_name(cfg.movement_sensor)
-                    ],
+                    dependencies[MovementSensor.get_resource_name(cfg.movement_sensor)],
                 )
                 if cfg.movement_sensor
                 else None
@@ -194,9 +193,7 @@ class SlamService(SLAM):
             self._heading_sensor = (
                 cast(
                     MovementSensor,
-                    dependencies[
-                        MovementSensor.get_resource_name(cfg.heading_sensor)
-                    ],
+                    dependencies[MovementSensor.get_resource_name(cfg.heading_sensor)],
                 )
                 if cfg.heading_sensor
                 else None
@@ -250,9 +247,7 @@ class SlamService(SLAM):
             # SimWorld is ground truth: SLAM pose tracks the body each tick.
             # Do not teleport the body when localize jumps the estimate —
             # that caused OOB freezes and big visible jumps.
-            seed = conv.Pose2D(
-                cfg.sim.seed_x, cfg.sim.seed_y, cfg.sim.seed_theta
-            )
+            seed = conv.Pose2D(cfg.sim.seed_x, cfg.sim.seed_y, cfg.sim.seed_theta)
             self._engine.set_pose(seed)
         self._manager = BuiltinSlamHost(self._engine)
         self._manager.start()
@@ -370,9 +365,7 @@ class SlamService(SLAM):
             self._apply_framesystem_mounts(gen, raw)
         )
 
-    async def _apply_framesystem_mounts(
-        self, gen: int, raw_attrs: Mapping
-    ) -> None:
+    async def _apply_framesystem_mounts(self, gen: int, raw_attrs: Mapping) -> None:
         if gen != self._framesystem_gen:
             return
         robot = get_parent_robot()
@@ -393,9 +386,7 @@ class SlamService(SLAM):
         if gen != self._framesystem_gen or self._cfg is not cfg:
             return
         try:
-            apply_framesystem_to_slam_cfg(
-                cfg, fs, raw_attrs=raw_attrs, logger=LOGGER
-            )
+            apply_framesystem_to_slam_cfg(cfg, fs, raw_attrs=raw_attrs, logger=LOGGER)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning(
                 "framesystem mount apply failed; using config mounts: %s", exc
@@ -421,11 +412,7 @@ class SlamService(SLAM):
 
     def _schedule_mapping_revisit(self, loop: asyncio.AbstractEventLoop) -> None:
         cfg = self._cfg
-        if (
-            cfg is None
-            or cfg.mode != MODE_MAPPING
-            or not cfg.mapping_revisit_check
-        ):
+        if cfg is None or cfg.mode != MODE_MAPPING or not cfg.mapping_revisit_check:
             return
         self._mapping_revisit_task = loop.create_task(
             self._run_mapping_revisit(
@@ -545,9 +532,7 @@ class SlamService(SLAM):
             len(store),
         )
 
-    def _get_slice_library(
-        self, cfg: SlamConfig
-    ) -> Optional[slice_match.SliceLibrary]:
+    def _get_slice_library(self, cfg: SlamConfig) -> Optional[slice_match.SliceLibrary]:
         """Lazily build the per-session multi-height slice library."""
         if not cfg.mapping_revisit_slice_verify:
             return None
@@ -624,9 +609,7 @@ class SlamService(SLAM):
         except Exception:  # noqa: BLE001
             bridge_status = {}
         vel = bridge_status.get("odom_velocity") or {}
-        linear_speed = math.hypot(
-            float(vel.get("vx", 0.0)), float(vel.get("vy", 0.0))
-        )
+        linear_speed = math.hypot(float(vel.get("vx", 0.0)), float(vel.get("vy", 0.0)))
         yaw_rate = abs(float(vel.get("vtheta", 0.0)))
         moving = (
             linear_speed >= cfg.map_when_still_linear_speed_m_s
@@ -686,9 +669,7 @@ class SlamService(SLAM):
         if not good:
             match_mode = "wide"
             wide = await _match(cfg.mapping_revisit_wide_radius_m, 180.0, False)
-            wide_good, wide_score, wide_ray_mae = self._revisit_match_quality(
-                wide, cfg
-            )
+            wide_good, wide_score, wide_ray_mae = self._revisit_match_quality(wide, cfg)
             tiers_tried.append({"tier": "wide", "score": round(wide_score, 3)})
             if wide_good or wide_score > score:
                 result, good, score, ray_mae = wide, wide_good, wide_score, wide_ray_mae
@@ -725,16 +706,12 @@ class SlamService(SLAM):
                         search_radius_m=radius,
                     )
 
-            kf = await asyncio.to_thread(
-                _kf_match, cfg.mapping_revisit_wide_radius_m
-            )
+            kf = await asyncio.to_thread(_kf_match, cfg.mapping_revisit_wide_radius_m)
             scope = "near"
             if kf is None or kf.score < cfg.mapping_revisit_keyframe_min_score:
                 kf_all = await asyncio.to_thread(_kf_match, None)
                 scope = "all"
-                if kf_all is not None and (
-                    kf is None or kf_all.score > kf.score
-                ):
+                if kf_all is not None and (kf is None or kf_all.score > kf.score):
                     kf = kf_all
             if kf is not None:
                 tiers_tried.append(
@@ -776,13 +753,9 @@ class SlamService(SLAM):
                         ray_mae_m=yaw_probe.ray_mae_m,
                     )
                     match_mode = "keyframe"
-                    good = (
-                        kf.score >= cfg.mapping_revisit_keyframe_min_score
-                        and (
-                            not math.isfinite(yaw_probe.ray_mae_m)
-                            or yaw_probe.ray_mae_m
-                            <= cfg.mapping_revisit_max_ray_mae_m
-                        )
+                    good = kf.score >= cfg.mapping_revisit_keyframe_min_score and (
+                        not math.isfinite(yaw_probe.ray_mae_m)
+                        or yaw_probe.ray_mae_m <= cfg.mapping_revisit_max_ray_mae_m
                     )
                     score = float(kf.score)
                     ray_mae = (
@@ -817,9 +790,7 @@ class SlamService(SLAM):
                 pose=chosen_pose,
                 ray_mae_m=chosen_mae,
             )
-            ray_mae = (
-                float(chosen_mae) if math.isfinite(chosen_mae) else None
-            )
+            ray_mae = float(chosen_mae) if math.isfinite(chosen_mae) else None
             good = score >= cfg.mapping_revisit_keyframe_min_score and (
                 ray_mae is None or ray_mae <= cfg.mapping_revisit_max_ray_mae_m
             )
@@ -893,9 +864,7 @@ class SlamService(SLAM):
         # height bands we have reference geometry for (recorded from earlier
         # trusted pause scans). An explicit apply_override skips the veto.
         if should_apply and drifted and library is not None:
-            verdict = await asyncio.to_thread(
-                library.verify, band_points, result.pose
-            )
+            verdict = await asyncio.to_thread(library.verify, band_points, result.pose)
             out["slice_verify"] = verdict
             if verdict.get("pass") is False and apply_override is not True:
                 out["status"] = "slice_verify_failed"
@@ -1056,7 +1025,9 @@ class SlamService(SLAM):
             "map_source": map_source,
             "score": round(score, 3) if math.isfinite(score) else None,
             "prior_score": (
-                round(prior_f, 3) if prior_f is not None and math.isfinite(prior_f) else None
+                round(prior_f, 3)
+                if prior_f is not None and math.isfinite(prior_f)
+                else None
             ),
             "ray_mae_m": None if ray_mae is None else round(ray_mae, 3),
             "shift_m": round(shift_m, 3),
@@ -1109,11 +1080,7 @@ class SlamService(SLAM):
 
     def _schedule_periodic_relocalize(self, loop: asyncio.AbstractEventLoop) -> None:
         cfg = self._cfg
-        if (
-            cfg is None
-            or cfg.mode != MODE_LOCALIZING
-            or not cfg.periodic_relocalize
-        ):
+        if cfg is None or cfg.mode != MODE_LOCALIZING or not cfg.periodic_relocalize:
             return
         self._periodic_relocalize_task = loop.create_task(
             self._run_periodic_relocalize(
@@ -1316,7 +1283,9 @@ class SlamService(SLAM):
             score = float(match.get("score", float("-inf")))
         except (TypeError, ValueError):
             return False
-        if not math.isfinite(score) or score < float(cfg.periodic_relocalize_parked_min_score):
+        if not math.isfinite(score) or score < float(
+            cfg.periodic_relocalize_parked_min_score
+        ):
             return False
         ray_raw = match.get("ray_mae_m")
         if ray_raw is not None:
@@ -1324,11 +1293,17 @@ class SlamService(SLAM):
                 ray = float(ray_raw)
             except (TypeError, ValueError):
                 return False
-            if math.isfinite(ray) and ray > float(cfg.periodic_relocalize_parked_max_ray_mae_m):
+            if math.isfinite(ray) and ray > float(
+                cfg.periodic_relocalize_parked_max_ray_mae_m
+            ):
                 return False
-        if math.isinf(shift_m) or shift_m > float(cfg.periodic_relocalize_parked_radius_m):
+        if math.isinf(shift_m) or shift_m > float(
+            cfg.periodic_relocalize_parked_radius_m
+        ):
             return False
-        if math.isinf(shift_deg) or shift_deg > float(cfg.periodic_relocalize_parked_max_deg):
+        if math.isinf(shift_deg) or shift_deg > float(
+            cfg.periodic_relocalize_parked_max_deg
+        ):
             return False
         if shift_m < float(cfg.periodic_relocalize_min_shift_m) and (
             shift_deg < float(cfg.periodic_relocalize_min_shift_deg)
@@ -1369,9 +1344,7 @@ class SlamService(SLAM):
                 if age_raw is not None:
                     scan_age = float(age_raw)
                 if yaw_rate <= 1e-9:
-                    yaw_rate = abs(
-                        math.radians(float(diag.get("yaw_rate_deg_s", 0.0)))
-                    )
+                    yaw_rate = abs(math.radians(float(diag.get("yaw_rate_deg_s", 0.0))))
         except Exception:  # noqa: BLE001
             pass
 
@@ -1486,19 +1459,14 @@ class SlamService(SLAM):
         bad, tick_score = self._published_pose_is_bad(cfg)
         bypass_after = float(cfg.periodic_relocalize_bypass_startup_after_s)
         started = self._startup_localize_started_at
-        age_s = (
-            (time.monotonic() - float(started)) if started is not None else None
-        )
-        timed_out = (
-            bypass_after > 0.0 and age_s is not None and age_s >= bypass_after
-        )
+        age_s = (time.monotonic() - float(started)) if started is not None else None
+        timed_out = bypass_after > 0.0 and age_s is not None and age_s >= bypass_after
         # A restored-pose startup searches locally. Once that has had time for
         # one match, a score under the trusted bar should not keep the parked
         # check waiting through the rest of the refine loop. 0.007 was just
         # above the "still bad" line and therefore waited out the whole cap.
-        soft = (
-            tick_score is not None
-            and tick_score < float(cfg.periodic_relocalize_min_score)
+        soft = tick_score is not None and tick_score < float(
+            cfg.periodic_relocalize_min_score
         )
         local_grace_s = 15.0
         early = (
@@ -1608,9 +1576,8 @@ class SlamService(SLAM):
         # "still bad", but they are also not a pose the button would leave
         # alone. Try the 1 m window whenever the parked score is under the
         # trusted-match bar.
-        parked_soft = (
-            tick_score is not None
-            and tick_score < float(cfg.periodic_relocalize_min_score)
+        parked_soft = tick_score is not None and tick_score < float(
+            cfg.periodic_relocalize_min_score
         )
         parked_button = (
             not driving
@@ -1692,12 +1659,8 @@ class SlamService(SLAM):
         # ``_global_localize``, treat it as full-map for ambiguity / recovery
         # gates. Leaving match_mode as ``local`` previously skipped the
         # ambiguous-twin refuse and let the jump gate confirm a 30 m yank.
-        if (
-            match_mode == "local"
-            and (
-                bool(match.get("fallback_used"))
-                or bool(match.get("full_map"))
-            )
+        if match_mode == "local" and (
+            bool(match.get("fallback_used")) or bool(match.get("full_map"))
         ):
             match_mode = "full_map_via_local_fallback"
 
@@ -1809,7 +1772,9 @@ class SlamService(SLAM):
                 score = full_score
                 ray_mae = full_ray_mae
                 matched_pose = full_match.get("pose")
-                shift_m, shift_deg = self._pose_shift_from_current(current, matched_pose)
+                shift_m, shift_deg = self._pose_shift_from_current(
+                    current, matched_pose
+                )
                 match_mode = (
                     "full_map_after_still_bad"
                     if escalation == "still_bad"
@@ -1875,16 +1840,11 @@ class SlamService(SLAM):
         # full-map match was correct (and manual apply fixed it) but ray_mae was
         # above periodic_relocalize_max_ray_mae_m so good_match was False.
         recovery_apply = (
-            full_map_recovery
-            and score >= cfg.periodic_relocalize_recovery_min_score
+            full_map_recovery and score >= cfg.periodic_relocalize_recovery_min_score
         )
         should_apply = apply_override is True or (
             apply_override is None
-            and (
-                recovery_apply
-                or (good_match and drifted)
-                or parked_hit
-            )
+            and (recovery_apply or (good_match and drifted) or parked_hit)
         )
 
         result: dict = {
@@ -1909,27 +1869,23 @@ class SlamService(SLAM):
             result["previous_ray_mae_m"] = prior_ray_mae
 
         large_jump = (
-            (not math.isinf(shift_m) and shift_m >= cfg.localize_jump_large_m)
-            or (
-                not math.isinf(shift_deg)
-                and shift_deg >= cfg.localize_jump_large_deg
-            )
-        )
+            not math.isinf(shift_m) and shift_m >= cfg.localize_jump_large_m
+        ) or (not math.isinf(shift_deg) and shift_deg >= cfg.localize_jump_large_deg)
         prefer_previous = False
-        if (
-            large_jump
-            and prior_score is not None
-            and math.isfinite(float(prior_score))
-        ):
+        if large_jump and prior_score is not None and math.isfinite(float(prior_score)):
             # Only treat "still at previous" when the prior itself is plausible —
             # two equally bad scores must not resume driving (nav_hold instead).
-            previous_ok = float(prior_score) >= cfg.periodic_relocalize_recovery_min_score
+            previous_ok = (
+                float(prior_score) >= cfg.periodic_relocalize_recovery_min_score
+            )
             if (
                 not previous_ok
                 and prior_ray_mae is not None
                 and math.isfinite(float(prior_ray_mae))
             ):
-                previous_ok = float(prior_ray_mae) <= cfg.periodic_relocalize_max_ray_mae_m
+                previous_ok = (
+                    float(prior_ray_mae) <= cfg.periodic_relocalize_max_ray_mae_m
+                )
             prefer_previous = previous_ok and not candidate_beats_previous(
                 previous_score=float(prior_score),
                 candidate_score=float(score),
@@ -1973,7 +1929,9 @@ class SlamService(SLAM):
                     # Use the *good_match* bars, not the lower recovery floor —
                     # recovery is for applying a full-map fix, not for deciding
                     # that it is safe to keep driving.
-                    previous_ok = float(prior_score) >= cfg.periodic_relocalize_min_score
+                    previous_ok = (
+                        float(prior_score) >= cfg.periodic_relocalize_min_score
+                    )
                     if previous_ok and prior_ray_mae is not None:
                         previous_ok = (
                             math.isfinite(float(prior_ray_mae))
@@ -2147,19 +2105,16 @@ class SlamService(SLAM):
                 shift_m, shift_deg = self._pose_shift_from_current(
                     current, matched_pose
                 )
-                result["shift_m"] = (
-                    None if math.isinf(shift_m) else round(shift_m, 3)
-                )
+                result["shift_m"] = None if math.isinf(shift_m) else round(shift_m, 3)
                 result["shift_deg"] = (
                     None if math.isinf(shift_deg) else round(shift_deg, 2)
                 )
                 result["lateral_only"] = True
                 large_jump = (
-                    (not math.isinf(shift_m) and shift_m >= cfg.localize_jump_large_m)
-                    or (
-                        not math.isinf(shift_deg)
-                        and shift_deg >= cfg.localize_jump_large_deg
-                    )
+                    not math.isinf(shift_m) and shift_m >= cfg.localize_jump_large_m
+                ) or (
+                    not math.isinf(shift_deg)
+                    and shift_deg >= cfg.localize_jump_large_deg
                 )
                 result["large_jump"] = bool(large_jump)
             candidate = self._pose_from_mapping(matched_pose)
@@ -2168,9 +2123,7 @@ class SlamService(SLAM):
             force_jump = apply_override is True or (
                 stopped_recovery and good_match and large_jump
             )
-            decision = self._confirm_pose_jump(
-                current, candidate, force=force_jump
-            )
+            decision = self._confirm_pose_jump(current, candidate, force=force_jump)
             # A stopped cart used to wait for the next 20 s watchdog tick
             # before the second sample, holding the wheels at the bumper.
             # When the pose is already lost and the peak is sideways, take
@@ -2207,9 +2160,7 @@ class SlamService(SLAM):
                     )
                     prior_score = nxt_prior
                     candidate = self._pose_from_mapping(matched_pose)
-                    decision = self._confirm_pose_jump(
-                        current, candidate, force=False
-                    )
+                    decision = self._confirm_pose_jump(current, candidate, force=False)
                     if decision.should_apply:
                         break
             result.update(self._jump_decision_dict(decision))
@@ -2265,7 +2216,9 @@ class SlamService(SLAM):
 
         return self._publish_relocalize_check(result)
 
-    def _schedule_startup_global_localize(self, loop: asyncio.AbstractEventLoop) -> None:
+    def _schedule_startup_global_localize(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> None:
         cfg = self._cfg
         if (
             cfg is None
@@ -2324,14 +2277,18 @@ class SlamService(SLAM):
                     0.0, float(cfg.global_localize_on_start_readiness_timeout_s)
                 ),
                 run_refine_pass=bool(cfg.global_localize_on_start_refine),
-                refine_delay_s=max(0.0, float(cfg.global_localize_on_start_refine_delay_s)),
+                refine_delay_s=max(
+                    0.0, float(cfg.global_localize_on_start_refine_delay_s)
+                ),
                 refine_max_passes=max(
                     0, int(cfg.global_localize_on_start_refine_max_passes)
                 ),
                 target_score=float(cfg.global_localize_on_start_target_score),
                 target_ray_mae_m=float(cfg.global_localize_on_start_target_ray_mae_m),
                 refine_options=refine_options,
-                run_post_apply_refine=bool(cfg.global_localize_on_start_post_apply_refine),
+                run_post_apply_refine=bool(
+                    cfg.global_localize_on_start_post_apply_refine
+                ),
                 post_apply_refine_delay_s=max(
                     0.0, float(cfg.global_localize_on_start_post_apply_refine_delay_s)
                 ),
@@ -2470,9 +2427,7 @@ class SlamService(SLAM):
                 return False
             current = mgr.get_pose_in_map()
             shift_m, shift_deg = self._pose_shift_from_current(current, pose_map)
-            if not self._parked_refine_worth_applying(
-                cfg, result, shift_m, shift_deg
-            ):
+            if not self._parked_refine_worth_applying(cfg, result, shift_m, shift_deg):
                 LOGGER.info(
                     "startup parked refine: not an auto-refine match "
                     "(score=%s ray_mae=%s shift=%.2f m / %.1f deg)",
@@ -2486,8 +2441,7 @@ class SlamService(SLAM):
             decision = self._confirm_pose_jump(current, candidate, force=False)
             if not decision.should_apply:
                 LOGGER.info(
-                    "startup parked refine: %.2f m / %.1f deg awaiting "
-                    "confirm %d/%d",
+                    "startup parked refine: %.2f m / %.1f deg awaiting confirm %d/%d",
                     decision.shift_m,
                     decision.shift_deg,
                     decision.confirm_count,
@@ -2620,8 +2574,7 @@ class SlamService(SLAM):
             decision = self._confirm_pose_jump(current, candidate, force=False)
             if not decision.should_apply:
                 LOGGER.info(
-                    "startup global_localize: large jump %.2f m awaiting "
-                    "confirm %d/%d",
+                    "startup global_localize: large jump %.2f m awaiting confirm %d/%d",
                     decision.shift_m,
                     decision.confirm_count,
                     decision.confirm_needed,
@@ -2685,9 +2638,7 @@ class SlamService(SLAM):
                         if refine_options:
                             refine_command.update(dict(refine_options))
                         best_pose = (
-                            best_result.get("pose")
-                            if best_result is not None
-                            else None
+                            best_result.get("pose") if best_result is not None else None
                         )
                         if isinstance(best_pose, Mapping):
                             refine_command["pose"] = {
@@ -2696,10 +2647,9 @@ class SlamService(SLAM):
                                 "theta": float(best_pose.get("theta", 0.0)),
                             }
                         refine_result = await self.do_command(refine_command)
-                        if (
-                            self._startup_global_localize_quality(refine_result)
-                            > self._startup_global_localize_quality(best_result)
-                        ):
+                        if self._startup_global_localize_quality(
+                            refine_result
+                        ) > self._startup_global_localize_quality(best_result):
                             best_result = refine_result
                         LOGGER.info(
                             "startup global_localize refinement pass %d/%d: "
@@ -2915,9 +2865,7 @@ class SlamService(SLAM):
                 # SimSensors has get_scan only (no Viam Camera / _read_lidar_scan_sync).
                 read_sync = getattr(sensors, "_read_lidar_scan_sync", None)
                 if read_sync is not None:
-                    scan = await asyncio.to_thread(
-                        read_sync, lidar, max_age_s=2.0
-                    )
+                    scan = await asyncio.to_thread(read_sync, lidar, max_age_s=2.0)
                 else:
                     scan = await asyncio.to_thread(sensors.get_scan, 2.0)
                 if scan is None:
@@ -2928,9 +2876,7 @@ class SlamService(SLAM):
                         for r in scan.ranges
                         if math.isfinite(r)
                         and r >= scan.range_min
-                        and (
-                            not math.isfinite(scan.range_max) or r <= scan.range_max
-                        )
+                        and (not math.isfinite(scan.range_max) or r <= scan.range_max)
                     )
                     forward = conv.forward_sector_min_range(
                         scan, half_width_rad=math.radians(15.0)
@@ -3066,12 +3012,14 @@ class SlamService(SLAM):
         x_mm, y_mm, z_mm, o_x, o_y, o_z, theta_deg = conv.pose2d_to_viam_slam_pose(
             pose2d, yaw_offset_deg=offset
         )
-        return Pose(
-            x=x_mm, y=y_mm, z=z_mm, o_x=o_x, o_y=o_y, o_z=o_z, theta=theta_deg
-        )
+        return Pose(x=x_mm, y=y_mm, z=z_mm, o_x=o_x, o_y=o_y, o_z=o_z, theta=theta_deg)
 
     async def get_point_cloud_map(
-        self, return_edited_map: bool = False, *, timeout: Optional[float] = None, **kwargs
+        self,
+        return_edited_map: bool = False,
+        *,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> List[bytes]:
         if self._map_display_hold:
             return [conv.points_to_pcd(np.empty((0, 3)))]
@@ -3088,7 +3036,9 @@ class SlamService(SLAM):
         self, *, timeout: Optional[float] = None, **kwargs
     ) -> List[bytes]:
         if self._map_display_hold or not self._map_grid_visible(
-            self._manager.node.get_map() if self._manager and self._manager.node else None
+            self._manager.node.get_map()
+            if self._manager and self._manager.node
+            else None
         ):
             return [b""]
         handle = self._map_store.active_handle() if self._map_store else None
@@ -3122,7 +3072,11 @@ class SlamService(SLAM):
 
     # -- DoCommand -----------------------------------------------------------
     async def do_command(
-        self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None, **kwargs
+        self,
+        command: Mapping[str, ValueTypes],
+        *,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> Mapping[str, ValueTypes]:
         cmd = command.get("command")
         store = self._map_store
@@ -3158,9 +3112,7 @@ class SlamService(SLAM):
 
             status = await asyncio.to_thread(_status)
             status["mode"] = self._cfg.mode if self._cfg else None
-            status["slam_backend"] = (
-                self._cfg.slam_backend if self._cfg else None
-            )
+            status["slam_backend"] = self._cfg.slam_backend if self._cfg else None
             status["localize_worker"] = dict(self._localizer.stats)
             status["active_map"] = store.get_active_map_name()
             if self._cfg is not None:
@@ -3359,9 +3311,7 @@ class SlamService(SLAM):
                     None if apply_override is None else bool(apply_override)
                 ),
                 full_map_escalation=str(escalation or "low_quality"),
-                allow_during_navigation=bool(
-                    command.get("allow_during_navigation")
-                ),
+                allow_during_navigation=bool(command.get("allow_during_navigation")),
                 stopped_recovery=bool(command.get("stopped_recovery")),
             )
 
@@ -3416,7 +3366,12 @@ class SlamService(SLAM):
             finally:
                 self._end_map_reset()
             return {"status": "cleared", "map": handle.name, "mode": MODE_MAPPING}
-        if cmd in ("clear_obstacles", "erase_obstacles", "add_obstacles", "mark_obstacles"):
+        if cmd in (
+            "clear_obstacles",
+            "erase_obstacles",
+            "add_obstacles",
+            "mark_obstacles",
+        ):
             adding = cmd in ("add_obstacles", "mark_obstacles")
             # Paint free or occupied space into the live occupancy grid (builtin SLAM).
             x = command.get("x")
@@ -3475,9 +3430,7 @@ class SlamService(SLAM):
             try:
                 store.delete_map(name)
                 if was_live:
-                    resolution = (
-                        self._cfg.map.resolution if self._cfg else 0.05
-                    )
+                    resolution = self._cfg.map.resolution if self._cfg else 0.05
                     store.get_or_create_map(name, resolution=resolution)
                     store.set_active_map(name)
                     if self._cfg is not None:
@@ -3493,7 +3446,9 @@ class SlamService(SLAM):
                 "status": "deleted",
                 "map": name,
                 "active_map": store.get_active_map_name(),
-                "mode": MODE_MAPPING if was_live else (self._cfg.mode if self._cfg else None),
+                "mode": MODE_MAPPING
+                if was_live
+                else (self._cfg.mode if self._cfg else None),
             }
 
         raise ValueError(f"unknown command: {cmd!r}")
@@ -3574,7 +3529,9 @@ class SlamService(SLAM):
                             for acc, cur in zip(band_points, sliced)
                         ]
                     continue
-            if points.sensor_scan is not None and conv.scan_has_returns(points.sensor_scan):
+            if points.sensor_scan is not None and conv.scan_has_returns(
+                points.sensor_scan
+            ):
                 scan = points.sensor_scan
                 if lidar.x or lidar.y or lidar.theta:
                     scan = conv.LaserScan2D(
@@ -3650,7 +3607,9 @@ class SlamService(SLAM):
         apply_pose = command.get("apply", True) is not False
         auto_full_map_fallback = bool(command.get("auto_full_map_fallback", True))
         fallback_score_threshold = float(command.get("fallback_score_threshold", 0.42))
-        fallback_hit_rate_threshold = float(command.get("fallback_hit_rate_threshold", 0.6))
+        fallback_hit_rate_threshold = float(
+            command.get("fallback_hit_rate_threshold", 0.6)
+        )
 
         loop = asyncio.get_running_loop()
 

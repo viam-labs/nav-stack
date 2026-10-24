@@ -4,6 +4,7 @@ Viam frames use millimetres and orientation-vector degrees; nav-stack mounts use
 metres and yaw/pitch/roll radians. Config JSON still wins when ``mount`` or
 footprint fields are set explicitly.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -159,7 +160,9 @@ def pose_of_frame_in_destination(
     seen = set()
     while cur != destination:
         if cur in seen:
-            LOGGER.warning("framesystem cycle while resolving %s → %s", frame_name, destination)
+            LOGGER.warning(
+                "framesystem cycle while resolving %s → %s", frame_name, destination
+            )
             return None
         seen.add(cur)
         entry = frames.get(cur)
@@ -183,7 +186,9 @@ def pose_of_frame_in_destination(
         T = parent_T_cur @ T
         cur = parent
         if len(seen) > 64:
-            LOGGER.warning("framesystem chain too deep for %s → %s", frame_name, destination)
+            LOGGER.warning(
+                "framesystem chain too deep for %s → %s", frame_name, destination
+            )
             return None
     if y_forward_base:
         T = _viam_y_forward_base_to_ros(T)
@@ -263,7 +268,9 @@ def apply_framesystem_footprint_to_slam_cfg(
     return notes
 
 
-def _apply_footprint_crop(cfg, configs: Sequence[Any], raw: Mapping, notes: List[str]) -> None:
+def _apply_footprint_crop(
+    cfg, configs: Sequence[Any], raw: Mapping, notes: List[str]
+) -> None:
     """Stamp the resolved body onto each lidar so self-returns can be dropped."""
     from .config import stamp_lidar_footprint
 
@@ -432,9 +439,7 @@ def _apply_one_sensor_yaw(
     label = "movement sensor" if name_attr == "movement_sensor" else "heading sensor"
     current = float(getattr(cfg, yaw_attr, 0.0) or 0.0)
     if yaw_attr in raw:
-        notes.append(
-            f"{label} {name}: yaw {current:.1f}° from config (override)"
-        )
+        notes.append(f"{label} {name}: yaw {current:.1f}° from config (override)")
         return
     base_name = str(getattr(cfg, "base", "") or "base")
     mount = pose_of_frame_in_destination(

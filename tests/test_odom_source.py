@@ -69,7 +69,10 @@ class FakeMovementSensor:
     async def get_orientation(self, **kw):
         self._count("get_orientation")
         return Orientation(
-            o_x=self._orient[0], o_y=self._orient[1], o_z=self._orient[2], theta=self._orient[3]
+            o_x=self._orient[0],
+            o_y=self._orient[1],
+            o_z=self._orient[2],
+            theta=self._orient[3],
         )
 
     async def get_position(self, **kw):
@@ -84,6 +87,7 @@ class FakeMovementSensor:
         self._count("get_readings")
         # No euler block by default — forces GetOrientation path (OV).
         return {}
+
 
 def _read(sensor, cfg=None):
     reader = TypedMovementSensorOdom(sensor, cfg)

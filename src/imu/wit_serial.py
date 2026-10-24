@@ -1,4 +1,5 @@
 """Serial session for a WitMotion IMU."""
+
 from __future__ import annotations
 
 import logging

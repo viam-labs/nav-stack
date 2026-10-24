@@ -1,4 +1,5 @@
 """Ground-truth 2D world for builtin simulation (raycast lidar + kinematics)."""
+
 from __future__ import annotations
 
 import json

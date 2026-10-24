@@ -1,4 +1,5 @@
 """Sync lidar + odom reads for the builtin SLAM engine (no ROS)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -302,9 +303,7 @@ class BuiltinSensors:
             max_age_s=age_limit if age_limit > 0 else None,
         )
         if got is None:
-            stats = self._shm.status().get(
-                pcshm.normalize_name(lidar.shm_name), {}
-            )
+            stats = self._shm.status().get(pcshm.normalize_name(lidar.shm_name), {})
             detail = stats.get("last_error") or "no complete frame"
             if lidar.shm_required or _shm_error_is_stale(detail):
                 self._log(
@@ -443,7 +442,11 @@ class BuiltinSensors:
             return None
         now = time.monotonic()
         fut = self._odom_fut
-        if fut is not None and not fut.done() and now - self._odom_fut_at > self._ODOM_STUCK_S:
+        if (
+            fut is not None
+            and not fut.done()
+            and now - self._odom_fut_at > self._ODOM_STUCK_S
+        ):
             fut.cancel()
             self._odom_timeouts += 1
             fut = None

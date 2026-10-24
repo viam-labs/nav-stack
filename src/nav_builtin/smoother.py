@@ -1,4 +1,5 @@
 """Post-process global plans for the builtin path follower."""
+
 from __future__ import annotations
 
 import math

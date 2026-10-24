@@ -1,4 +1,5 @@
 """Builtin SLAM automatic loop closure: drifted loop → no doubled walls."""
+
 from __future__ import annotations
 
 import math
@@ -45,9 +46,17 @@ def _truth_world() -> np.ndarray:
 
     outline(-1.0, -1.0, 17.0, 13.0)
     outline(3.0, 3.0, 13.0, 9.0)
-    for (x, y) in [
-        (5.0, -0.6), (9.0, 2.5), (11.5, -0.4), (15.6, 4.0), (14.2, 7.5),
-        (13.6, 11.8), (8.0, 12.5), (4.5, 9.6), (-0.4, 7.0), (2.4, 4.8),
+    for x, y in [
+        (5.0, -0.6),
+        (9.0, 2.5),
+        (11.5, -0.4),
+        (15.6, 4.0),
+        (14.2, 7.5),
+        (13.6, 11.8),
+        (8.0, 12.5),
+        (4.5, 9.6),
+        (-0.4, 7.0),
+        (2.4, 4.8),
         (0.2, 2.6),
     ]:
         box(x - 0.15, y - 0.15, x + 0.15, y + 0.15)
@@ -77,13 +86,18 @@ def _path():
     for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
         target = math.atan2(y1 - y0, x1 - x0)
         while abs(conv.normalize_angle(target - th)) > 1e-6:
-            step = max(-math.radians(5), min(math.radians(5), conv.normalize_angle(target - th)))
+            step = max(
+                -math.radians(5),
+                min(math.radians(5), conv.normalize_angle(target - th)),
+            )
             th = conv.normalize_angle(th + step)
             poses.append(conv.Pose2D(x0, y0, th))
         d = math.hypot(x1 - x0, y1 - y0)
         k = int(round(d / 0.1))
         for i in range(1, k + 1):
-            poses.append(conv.Pose2D(x0 + (x1 - x0) * i / k, y0 + (y1 - y0) * i / k, th))
+            poses.append(
+                conv.Pose2D(x0 + (x1 - x0) * i / k, y0 + (y1 - y0) * i / k, th)
+            )
     return poses
 
 
@@ -174,10 +188,15 @@ def test_featureless_corridor_out_and_back_does_not_snap_along_axis():
     box(31 - RES, -1, 31, 1)
     poses = [conv.Pose2D(0.5 + 0.1 * i, 0.0, 0.0) for i in range(280)]
     x = poses[-1].x
-    poses += [conv.Pose2D(x, 0.0, conv.normalize_angle(math.radians(5 * k))) for k in range(1, 37)]
+    poses += [
+        conv.Pose2D(x, 0.0, conv.normalize_angle(math.radians(5 * k)))
+        for k in range(1, 37)
+    ]
     poses += [conv.Pose2D(x - 0.1 * i, 0.0, math.pi) for i in range(1, 270)]
 
-    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "mapping"})
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "mapping"}
+    )
     engine = BuiltinSlamEngine(cfg, _Sensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     engine._pose = poses[0]  # noqa: SLF001
     now = 0.0
@@ -185,7 +204,8 @@ def test_featureless_corridor_out_and_back_does_not_snap_along_axis():
         rel = conv.compose_poses(conv.invert_pose(prev), cur)
         with engine._lock:  # noqa: SLF001
             engine._pose = conv.compose_poses(  # noqa: SLF001
-                engine._pose, conv.Pose2D(rel.x, rel.y, rel.theta * 1.02)  # noqa: SLF001
+                engine._pose,
+                conv.Pose2D(rel.x, rel.y, rel.theta * 1.02),  # noqa: SLF001
             )
         now += 0.2
         nodes = len(engine._graph)  # noqa: SLF001

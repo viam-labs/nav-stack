@@ -4,6 +4,7 @@ Registers the nav-stack resource models with the Viam module server.
 
 Builtin SLAM + builtin navigation only.
 """
+
 from __future__ import annotations
 
 import asyncio

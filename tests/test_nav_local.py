@@ -1,4 +1,5 @@
 """Tests for path smoother, local costmap, and local planner."""
+
 from __future__ import annotations
 
 import math
@@ -306,7 +307,11 @@ def test_spin_gate_does_not_crawl_forward_into_costmap_disc():
 
 def test_local_costmap_does_not_reinflate_global_static():
     """Global static in the local window must not get a second inflation pass."""
-    from src.nav_builtin.costmap import INSCRIBED, build_costmap, occupancy_from_map_dict
+    from src.nav_builtin.costmap import (
+        INSCRIBED,
+        build_costmap,
+        occupancy_from_map_dict,
+    )
 
     m = _empty_map(size=60, resolution=0.05)
     occ = occupancy_from_map_dict(m)
@@ -353,7 +358,17 @@ def test_local_costmap_marks_scan_hit():
         range_min=0.05,
         range_max=10.0,
         ranges=np.array(
-            [1.0, math.inf, math.inf, math.inf, math.inf, math.inf, math.inf, math.inf, math.inf]
+            [
+                1.0,
+                math.inf,
+                math.inf,
+                math.inf,
+                math.inf,
+                math.inf,
+                math.inf,
+                math.inf,
+                math.inf,
+            ]
         ),
     )
     view = lc.update(pose, scan)
@@ -459,9 +474,7 @@ def test_path_cost_ahead_centerline_allows_fit_doorway():
     fat_disc = path_cost_ahead(pose, path, view, lookahead_m=1.2, margin_m=0.18)
     assert centerline < 200, f"centerline sealed doorway: cost={centerline}"
     assert fat_disc >= 200, "regression: fat disc should still over-clear"
-    assert not path_blocked_local(
-        pose, path, view, cost_threshold=200, lookahead_m=1.2
-    )
+    assert not path_blocked_local(pose, path, view, cost_threshold=200, lookahead_m=1.2)
     assert not should_use_local_planner(
         pose, path, view, LocalPlannerConfig(enabled=True)
     )
@@ -500,9 +513,7 @@ def test_path_cost_ahead_flags_obstacle_on_centerline():
     path = Path2D(points=[(1.5, 1.5), (2.2, 1.5), (2.7, 1.5)], goal_theta=0.0)
 
     assert path_cost_ahead(pose, path, view, lookahead_m=1.2) >= 200
-    assert path_blocked_local(
-        pose, path, view, cost_threshold=200, lookahead_m=1.2
-    )
+    assert path_blocked_local(pose, path, view, cost_threshold=200, lookahead_m=1.2)
 
 
 def test_reverse_backup_feasible_requires_cost_improvement():
@@ -591,7 +602,9 @@ def test_local_planner_prefers_reverse_when_blocked_ahead():
     assert cmd.vx <= 0.05 or abs(cmd.vtheta) > 0.1
 
 
-def _open_view_with_bin(pose: Pose2D, bin_xy: tuple[float, float], *, robot_radius_m: float = 0.22):
+def _open_view_with_bin(
+    pose: Pose2D, bin_xy: tuple[float, float], *, robot_radius_m: float = 0.22
+):
     """4 m open window around ``pose`` with a ~0.3 m box marked at ``bin_xy``."""
     lc = LocalCostmap(
         LocalCostmapConfig(
@@ -683,7 +696,12 @@ def test_local_planner_closed_loop_detour_passes_bin(robot_r, bin_x):
             bearing = conv.normalize_angle(
                 math.atan2(ty - pose.y, tx - pose.x) - pose.theta
             )
-            cmd = DriveCommand(0.3 if abs(bearing) < 1.0 else 0.0, 0.0, max(-1.0, min(1.0, 2.0 * bearing)), False)
+            cmd = DriveCommand(
+                0.3 if abs(bearing) < 1.0 else 0.0,
+                0.0,
+                max(-1.0, min(1.0, 2.0 * bearing)),
+                False,
+            )
             active = False
             prev = None
         else:
@@ -1404,16 +1422,12 @@ def test_slew_limit_ramps_yaw_and_preserves_arc():
     from src.nav_builtin.controller import limit_twist_rate
 
     cfg = _slew_cfg()
-    spin = limit_twist_rate(
-        DriveCommand(0.0, 0.0, 1.5, False), None, cfg=cfg, dt_s=0.1
-    )
+    spin = limit_twist_rate(DriveCommand(0.0, 0.0, 1.5, False), None, cfg=cfg, dt_s=0.1)
     assert spin.vx == 0.0
     assert spin.vtheta == pytest.approx(cfg.max_angular_accel_rad_s2 * 0.1)
 
     prev = DriveCommand(0.2, 0.0, 0.2, False)  # curvature 1.0 /m
-    out = limit_twist_rate(
-        DriveCommand(0.5, 0.0, 0.5, False), prev, cfg=cfg, dt_s=0.1
-    )
+    out = limit_twist_rate(DriveCommand(0.5, 0.0, 0.5, False), prev, cfg=cfg, dt_s=0.1)
     assert out.vx < 0.5
     assert out.vtheta / out.vx == pytest.approx(1.0, abs=1e-6)
 
@@ -1518,9 +1532,7 @@ def test_plan_seals_blocked_path_samples_from_local():
     }
     start = Pose2D(0.5, 2.0, 0.0)
     goal = Pose2D(3.5, 2.0, 0.0)
-    baseline = plan_path(
-        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    baseline = plan_path(m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert baseline.feasible
     lc = LocalCostmap(
         LocalCostmapConfig(
@@ -1602,7 +1614,9 @@ def test_smoothing_on_planning_costmap_keeps_detour_around_live_obstacle():
     )
     scan = _chair_scan_ahead(start)
     view = lc.update(start, scan)
-    baseline = plan_path(m, start, goal, inflation_radius_m=infl, robot_radius_m=robot_r)
+    baseline = plan_path(
+        m, start, goal, inflation_radius_m=infl, robot_radius_m=robot_r
+    )
     raw = plan_path(
         m,
         start,
@@ -1626,7 +1640,11 @@ def test_smoothing_on_planning_costmap_keeps_detour_around_live_obstacle():
     # The old behaviour (documented, not desired): static-only smoothing cuts
     # straight through the chair.
     static_smoothed = smooth_plan_path(
-        raw.path, m, inflation_radius_m=infl, robot_radius_m=robot_r, cost_scaling_factor=4.0
+        raw.path,
+        m,
+        inflation_radius_m=infl,
+        robot_radius_m=robot_r,
+        cost_scaling_factor=4.0,
     )
     assert worst(static_smoothed) >= 200
     # Fixed behaviour: smoothing on the planning costmap keeps the detour.
@@ -1642,9 +1660,7 @@ def test_local_planner_avoids_marked_obstacle():
     m = _empty_map(size=80, resolution=0.05)
     start = Pose2D(0.5, 2.0, 0.0)
     goal = Pose2D(3.5, 2.0, 0.0)
-    baseline = plan_path(
-        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    baseline = plan_path(m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert baseline.feasible
     lc = LocalCostmap(
         LocalCostmapConfig(
@@ -1799,9 +1815,7 @@ def test_costmap_hard_stop_blocks_translate_into_inscribed():
     )
     path = Path2D(points=((1.0, 1.0), (2.5, 1.0)), goal_theta=0.0)
     cfg = FollowerConfig(
-        obstacle=ObstacleConfig(
-            enabled=True, stop_distance_m=0.45, slow_distance_m=0.9
-        )
+        obstacle=ObstacleConfig(enabled=True, stop_distance_m=0.45, slow_distance_m=0.9)
     )
     cmd, progress = compute_path_command(
         pose,
@@ -1855,9 +1869,7 @@ def test_hard_stop_blocks_local_planner_into_stop_bubble():
     )
     path = Path2D(points=((1.0, 1.5), (2.5, 1.5)), goal_theta=0.0)
     cfg = FollowerConfig(
-        obstacle=ObstacleConfig(
-            enabled=True, stop_distance_m=0.45, slow_distance_m=0.9
-        )
+        obstacle=ObstacleConfig(enabled=True, stop_distance_m=0.45, slow_distance_m=0.9)
     )
     cmd, progress = compute_path_command(
         pose,
@@ -1865,9 +1877,7 @@ def test_hard_stop_blocks_local_planner_into_stop_bubble():
         cfg=cfg,
         scan=live,
         local_view=view,
-        local_planner=LocalPlannerConfig(
-            enabled=True, activate_cost_threshold=250
-        ),
+        local_planner=LocalPlannerConfig(enabled=True, activate_cost_threshold=250),
         robot_radius_m=0.08,
     )
     assert cmd.vx <= 1e-9

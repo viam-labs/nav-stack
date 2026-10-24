@@ -1,4 +1,5 @@
 """Duck-typed nav host for builtin navigation."""
+
 from __future__ import annotations
 
 from typing import Dict, Optional, Sequence
@@ -57,7 +58,9 @@ class BuiltinNavHost:
         # Rebuild navigator with updated limits/planner if config changes.
         self._builtin_nav.cancel()
         self._builtin_nav = make_builtin_navigator(
-            self._world, nav_cfg, logger=self._builtin_nav._logger  # noqa: SLF001
+            self._world,
+            nav_cfg,
+            logger=self._builtin_nav._logger,  # noqa: SLF001
         )
 
     def nav_backend(self) -> str:

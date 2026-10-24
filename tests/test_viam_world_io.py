@@ -1,4 +1,5 @@
 """Tests for ViamWorldIO + get_grid encode/decode (ROS-free nav I/O)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -703,9 +704,7 @@ def test_get_scan_can_exclude_obstacles_only_lidars():
         loop=MagicMock(),
         lidars=[
             LidarConfig(name="lidar", scan_source="get_laser_scan"),
-            LidarConfig(
-                name="camera", scan_source="point_cloud", obstacles_only=True
-            ),
+            LidarConfig(name="camera", scan_source="point_cloud", obstacles_only=True),
         ],
     )
     lidar_scan = conv.LaserScan2D(
@@ -771,9 +770,7 @@ def test_get_scan_lidar_only_does_not_fall_back_to_depth():
         loop=MagicMock(),
         lidars=[
             LidarConfig(name="lidar", scan_source="get_laser_scan"),
-            LidarConfig(
-                name="camera", scan_source="point_cloud", obstacles_only=True
-            ),
+            LidarConfig(name="camera", scan_source="point_cloud", obstacles_only=True),
         ],
     )
     depth_scan = conv.LaserScan2D(

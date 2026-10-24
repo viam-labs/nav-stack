@@ -4,6 +4,7 @@ Builtin MoveOnMap over Viam APIs only (``ViamWorldIO`` + ``BuiltinNavHost``):
 SLAM ``get_grid`` / ``GetPosition``, lidar shm/cameras, ``Base.SetVelocity``.
 No ROS / Nav2. Or use ``navigation-external`` against any ``rdk:service:slam``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -233,9 +234,7 @@ class NavigationService(NavServiceBase):
             ),
             logger=lambda m: LOGGER.info(m),
         )
-        navigator = make_builtin_navigator(
-            world, cfg, logger=lambda m: LOGGER.info(m)
-        )
+        navigator = make_builtin_navigator(world, cfg, logger=lambda m: LOGGER.info(m))
         host = BuiltinNavHost(navigator, world, viz, nav_cfg=cfg)
         self._nav_host = host
         self._builtin_runtime = SlamRuntime(
@@ -263,9 +262,7 @@ class NavigationService(NavServiceBase):
         self._framesystem_task = None
         self._framesystem_gen += 1
 
-    def _schedule_framesystem_footprint(
-        self, loop: asyncio.AbstractEventLoop
-    ) -> None:
+    def _schedule_framesystem_footprint(self, loop: asyncio.AbstractEventLoop) -> None:
         if get_parent_robot() is None:
             return
         self._framesystem_gen += 1
@@ -275,9 +272,7 @@ class NavigationService(NavServiceBase):
             self._apply_framesystem_footprint(gen, raw)
         )
 
-    async def _apply_framesystem_footprint(
-        self, gen: int, raw_attrs: Mapping
-    ) -> None:
+    async def _apply_framesystem_footprint(self, gen: int, raw_attrs: Mapping) -> None:
         if gen != self._framesystem_gen:
             return
         robot = get_parent_robot()
@@ -294,16 +289,18 @@ class NavigationService(NavServiceBase):
                 "framesystem footprint resolve failed; using config: %s", exc
             )
             return
-        if gen != self._framesystem_gen or self._cfg is not cfg or self._nav_host is not host:
+        if (
+            gen != self._framesystem_gen
+            or self._cfg is not cfg
+            or self._nav_host is not host
+        ):
             return
         try:
             new_cfg, _notes = apply_framesystem_to_nav_cfg(
                 cfg, fs, raw_attrs=raw_attrs, logger=LOGGER
             )
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning(
-                "framesystem footprint apply failed; using config: %s", exc
-            )
+            LOGGER.warning("framesystem footprint apply failed; using config: %s", exc)
             return
         if gen != self._framesystem_gen or self._nav_host is not host:
             return
@@ -335,5 +332,7 @@ class NavigationService(NavServiceBase):
 Registry.register_resource_creator(
     Motion.API,
     NavigationService.MODEL,
-    ResourceCreatorRegistration(NavigationService.new, NavigationService.validate_config),
+    ResourceCreatorRegistration(
+        NavigationService.new, NavigationService.validate_config
+    ),
 )

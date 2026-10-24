@@ -7,6 +7,7 @@ view while the camera still points at the same ground spot, so a look that
 the hallway. Remembered points stay until a newer frame could still see that
 height and no longer does, or they age out / fall behind the keep radius.
 """
+
 from __future__ import annotations
 
 import math
@@ -107,7 +108,9 @@ class AboveCartMemory:
         dx, dy = x - sx, y - sy
         horiz = math.hypot(dx, dy)
         half_h = math.radians(float(sensor.fov_deg)) / 2.0 - self._edge
-        half_v = math.radians(float(getattr(sensor, "vfov_deg", 58.0))) / 2.0 - self._edge
+        half_v = (
+            math.radians(float(getattr(sensor, "vfov_deg", 58.0))) / 2.0 - self._edge
+        )
         rmin = float(sensor.min_range) + self._rmargin
         rmax = float(sensor.max_range) - self._rmargin
         if half_h <= 0.0 or half_v <= 0.0 or rmax <= rmin or horiz < 1e-3:
@@ -115,11 +118,7 @@ class AboveCartMemory:
         bearing = math.atan2(dy, dx) - yaw
         bearing = (bearing + math.pi) % (2.0 * math.pi) - math.pi
         elev = math.atan2(z - sz, horiz)
-        return (
-            abs(bearing) <= half_h
-            and abs(elev) <= half_v
-            and rmin <= horiz <= rmax
-        )
+        return abs(bearing) <= half_h and abs(elev) <= half_v and rmin <= horiz <= rmax
 
     def _clear_still_visible(self, cap: Pose2D, sensor, world: np.ndarray) -> None:
         if not self._cells:

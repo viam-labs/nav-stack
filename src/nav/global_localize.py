@@ -3,6 +3,7 @@
 Scores candidate map-frame poses by aligning live scan endpoints with occupied
 cells. Used for global localization without MiR map pose or other external seeds.
 """
+
 from __future__ import annotations
 
 import math
@@ -581,7 +582,9 @@ def global_localize_scan(
                 range_max_m=range_max,
                 step_m=ray_step_m,
             )
-            combined = item.endpoint_eval.score + ray_weight * ((2.0 * ray_quality) - 1.0)
+            combined = item.endpoint_eval.score + ray_weight * (
+                (2.0 * ray_quality) - 1.0
+            )
             if combined > best_combined:
                 second_combined = best_combined
                 best_combined = combined
@@ -633,9 +636,7 @@ def global_localize_scan(
     )
 
     if not math.isfinite(best_eval.score):
-        raise RuntimeError(
-            "global scan match failed; no valid candidate in map bounds"
-        )
+        raise RuntimeError("global scan match failed; no valid candidate in map bounds")
 
     # Corridor 180° check on the fine winner (cheap; breaks common false peaks).
     yaw_choice = choose_yaw_or_flip(

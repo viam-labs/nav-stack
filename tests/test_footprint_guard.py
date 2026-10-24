@@ -1,4 +1,5 @@
 """Unit tests for the rectangular footprint collision guard."""
+
 from __future__ import annotations
 
 import math
@@ -51,7 +52,9 @@ def test_obstacle_ahead_regulates_speed_to_a_stop():
     assert free == pytest.approx(0.5 - 0.04, abs=0.03)
     far = g.guard(O, 0.4, 0.0, pts, allow_steer=False)
     assert 0.0 < far.vx < 0.4 and far.state == "slow"
-    close = g.guard(O, 0.4, 0.0, _wall(HL + 0.05, -0.3, HL + 0.05, 0.3), allow_steer=False)
+    close = g.guard(
+        O, 0.4, 0.0, _wall(HL + 0.05, -0.3, HL + 0.05, 0.3), allow_steer=False
+    )
     assert close.vx == 0.0 and close.state == "blocked"
 
 
@@ -75,9 +78,7 @@ def test_bumper_contact_does_not_drive_straight():
     g = _guard()
     # Just off the front-left of the nose: straight is blocked, spin is not.
     blob = np.array([[HL + 0.06, 0.12]])
-    res = g.guard(
-        O, 0.3, 0.0, blob, target=Pose2D(1.0, -0.8, 0.0), allow_steer=True
-    )
+    res = g.guard(O, 0.3, 0.0, blob, target=Pose2D(1.0, -0.8, 0.0), allow_steer=True)
     assert not (res.vx > 0.05 and abs(res.vtheta) < 0.08)
     assert abs(res.vtheta) >= 0.08
 
@@ -87,9 +88,7 @@ def test_shoulder_obstacle_inside_body_width_blocks():
     g = _guard()
     bin_pts = _wall(HL + 0.3, HW - 0.1, HL + 0.3, HW + 0.3)
     assert g.free_distance(O, 0.3, 0.0, bin_pts, 0.8) < 0.3
-    res = g.guard(
-        O, 0.3, 0.0, bin_pts, target=Pose2D(3.0, 0.0, 0.0), allow_steer=True
-    )
+    res = g.guard(O, 0.3, 0.0, bin_pts, target=Pose2D(3.0, 0.0, 0.0), allow_steer=True)
     # Steers right (away from the bin on the left), never reverses.
     assert res.state == "steer" and res.vx > 0.0 and res.vtheta < 0.0
 

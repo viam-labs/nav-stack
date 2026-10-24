@@ -165,11 +165,7 @@ class RPLidarSerial:
                     candidates = refreshed
             # Never probe the IMU's CH340 once claimed (or by chip family).
             candidates = drop_claimed_by_other("lidar", candidates)
-            candidates = [
-                p
-                for p in candidates
-                if port_chip_family(p) != "ch340"
-            ]
+            candidates = [p for p in candidates if port_chip_family(p) != "ch340"]
             busy_seen = False
             missing_seen = False
             for port in candidates:
@@ -321,13 +317,19 @@ class RPLidarSerial:
             if abort_check is not None and abort_check():
                 raise proto.RPLidarError("scan aborted")
             if first and first[0] == proto.SYNC:
-                second = self._read_exact(1, context="descriptor sync", abort_check=abort_check)
+                second = self._read_exact(
+                    1, context="descriptor sync", abort_check=abort_check
+                )
                 if second and second[0] == proto.SYNC2:
-                    rest = self._read_exact(5, context="descriptor", abort_check=abort_check)
+                    rest = self._read_exact(
+                        5, context="descriptor", abort_check=abort_check
+                    )
                     return proto.parse_descriptor(first + second + rest)
                 first = second
                 continue
-            first = self._read_exact(1, context="descriptor sync", abort_check=abort_check)
+            first = self._read_exact(
+                1, context="descriptor sync", abort_check=abort_check
+            )
         raise proto.RPLidarError("bad descriptor sync (timed out)")
 
     def _handshake(self) -> None:
@@ -360,7 +362,9 @@ class RPLidarSerial:
             except Exception as exc:  # noqa: BLE001
                 last = exc
         else:
-            raise proto.RPLidarError(f"GET_INFO failed after stop/reset retries: {last!r}")
+            raise proto.RPLidarError(
+                f"GET_INFO failed after stop/reset retries: {last!r}"
+            )
 
         status, code = self.get_health()
         if status == 2:

@@ -1,4 +1,5 @@
 """Tests for Viam framesystem → mount / footprint resolution."""
+
 from __future__ import annotations
 
 import asyncio
@@ -69,9 +70,7 @@ def _tracer_like_frames():
 
 def test_pose_raw_viam_axes_without_y_forward_convert():
     configs = _tracer_like_frames()
-    m = pose_of_frame_in_destination(
-        configs, "rplidar", "base", y_forward_base=False
-    )
+    m = pose_of_frame_in_destination(configs, "rplidar", "base", y_forward_base=False)
     assert m is not None
     assert abs(m.x - (-0.05)) < 1e-9
     assert abs(m.y - 0.24) < 1e-9
@@ -83,9 +82,7 @@ def test_pose_raw_viam_axes_without_y_forward_convert():
 def test_pose_converts_viam_y_forward_base_to_ros_x_forward():
     """FS is Viam Y-forward; nav-stack mounts are ROS X-forward."""
     configs = _tracer_like_frames()
-    m = pose_of_frame_in_destination(
-        configs, "rplidar", "base", y_forward_base=True
-    )
+    m = pose_of_frame_in_destination(configs, "rplidar", "base", y_forward_base=True)
     assert m is not None
     # p_ros = (y_v, -x_v) = (0.24, 0.05)
     assert abs(m.x - 0.24) < 1e-9
@@ -102,9 +99,7 @@ def test_fs_mount_round_trips_viam_rotation_and_points():
     from src.viam_frames import _pose_to_matrix, _viam_y_forward_base_to_ros
 
     configs = _tracer_like_frames()
-    m = pose_of_frame_in_destination(
-        configs, "rplidar", "base", y_forward_base=True
-    )
+    m = pose_of_frame_in_destination(configs, "rplidar", "base", y_forward_base=True)
     assert m is not None
     pose = configs[1].frame.pose_in_observer_frame.pose
     T_ros = _viam_y_forward_base_to_ros(_pose_to_matrix(pose))
@@ -134,14 +129,14 @@ def test_camera_fs_mount_round_trips_rotation():
     from src.viam_frames import _pose_to_matrix, _viam_y_forward_base_to_ros
 
     configs = _tracer_like_frames()
-    m = pose_of_frame_in_destination(
-        configs, "camera", "base", y_forward_base=True
-    )
+    m = pose_of_frame_in_destination(configs, "camera", "base", y_forward_base=True)
     assert m is not None
     T_ros = _viam_y_forward_base_to_ros(
         _pose_to_matrix(configs[2].frame.pose_in_observer_frame.pose)
     )
-    assert np.allclose(T_ros[:3, :3], _mount_rotation(m.theta, m.pitch, m.roll), atol=1e-9)
+    assert np.allclose(
+        T_ros[:3, :3], _mount_rotation(m.theta, m.pitch, m.roll), atol=1e-9
+    )
 
 
 def test_tracer_box_reads_viam_y_as_length():
@@ -372,7 +367,9 @@ def test_apply_nav_zero_or_null_falls_back_to_the_box(unset):
     cfg2, _ = apply_framesystem_to_nav_cfg(
         NavConfig.from_dict(raw), _tracer_like_frames(), raw_attrs=raw
     )
-    assert (cfg2.footprint_length_m, cfg2.footprint_width_m) == pytest.approx((0.72, 0.59))
+    assert (cfg2.footprint_length_m, cfg2.footprint_width_m) == pytest.approx(
+        (0.72, 0.59)
+    )
 
 
 def test_apply_nav_without_box_uses_robot_radius_for_the_missing_side():
@@ -405,7 +402,9 @@ def test_slam_crop_one_side_overrides_the_box():
     cfg = SlamConfig.from_dict(raw)
     apply_framesystem_to_slam_cfg(cfg, _tracer_like_frames(), raw_attrs=raw)
     lidar = cfg.lidars[0]
-    assert (lidar.footprint_length_m, lidar.footprint_width_m) == pytest.approx((0.9, 0.59))
+    assert (lidar.footprint_length_m, lidar.footprint_width_m) == pytest.approx(
+        (0.9, 0.59)
+    )
 
 
 def test_slam_crop_without_box_uses_a_robot_radius_disc():

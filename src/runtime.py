@@ -7,6 +7,7 @@ service) looks the shared runtime up by the SLAM service's resource name.
 Builtin nav registers a ``NavVizStore`` so nav-camera / get_costmap can render
 via the in-process nav viz store.
 """
+
 from __future__ import annotations
 
 from threading import Lock

@@ -1,4 +1,5 @@
 """Tests for Nav2 plan-without-execute helpers and DoCommands."""
+
 from __future__ import annotations
 
 import asyncio
@@ -71,7 +72,10 @@ def test_plan_to_point_do_command_returns_path_without_navigate():
         "planner_id": "GridBased",
         "planning_time_s": 0.01,
         "length_m": 2.5,
-        "path": [{"x": 0.0, "y": 0.0, "theta": 0.0}, {"x": 2.5, "y": 0.0, "theta": 0.0}],
+        "path": [
+            {"x": 0.0, "y": 0.0, "theta": 0.0},
+            {"x": 2.5, "y": 0.0, "theta": 0.0},
+        ],
         "goal": {"x": 2.5, "y": 0.0, "theta": 0.0},
         "start": None,
         "point_count": 2,
@@ -115,7 +119,10 @@ def test_execute_plan_navigates_preview_goal():
         "error_code": 0,
         "goal": {"x": 1.0, "y": 2.0, "theta": 0.5},
         "length_m": 3.0,
-        "path": [{"x": 0.0, "y": 0.0, "theta": 0.0}, {"x": 1.0, "y": 2.0, "theta": 0.5}],
+        "path": [
+            {"x": 0.0, "y": 0.0, "theta": 0.0},
+            {"x": 1.0, "y": 2.0, "theta": 0.5},
+        ],
     }
     nav._last_preview_plan = preview
     mgr = MagicMock()
@@ -153,7 +160,10 @@ def test_move_on_map_preview_extra_does_not_navigate():
         "feasible": True,
         "error_code": 0,
         "error_msg": "",
-        "path": [{"x": 0.0, "y": 0.0, "theta": 0.0}, {"x": 1.0, "y": 0.0, "theta": 0.0}],
+        "path": [
+            {"x": 0.0, "y": 0.0, "theta": 0.0},
+            {"x": 1.0, "y": 0.0, "theta": 0.0},
+        ],
         "goal": {"x": 1.0, "y": 0.0, "theta": 0.0},
         "length_m": 1.0,
     }

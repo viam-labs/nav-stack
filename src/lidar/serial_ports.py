@@ -137,7 +137,9 @@ def list_candidate_serial_ports(
     deduped = _dedupe_by_realpath(out)
 
     if chip == "cp210":
-        filtered = [p for p in deduped if _realpath(p) in cp210_reals or _is_cp210_id(p)]
+        filtered = [
+            p for p in deduped if _realpath(p) in cp210_reals or _is_cp210_id(p)
+        ]
         # Do NOT fall back to non-CP210 — that reintroduces wrong-port probes.
         return filtered
     if chip == "ch340":
@@ -150,9 +152,7 @@ def list_candidate_serial_ports(
     return deduped
 
 
-def is_safe_sensor_serial_port(
-    path: str, *, extra_exclude: Sequence[str] = ()
-) -> bool:
+def is_safe_sensor_serial_port(path: str, *, extra_exclude: Sequence[str] = ()) -> bool:
     """False for CAN adapters / unknown USB gadgets — never open these."""
     if _should_skip_port(path, extra_exclude=extra_exclude):
         return False

@@ -1,4 +1,5 @@
 """Background occupancy SLAM loop: predict → match → update."""
+
 from __future__ import annotations
 
 import math
@@ -54,9 +55,7 @@ class BuiltinSlamEngine:
         self._match_period_s = max(0.0, float(match_period_s))
 
         self._lock = threading.RLock()
-        self._grid: LogOddsGrid = occ.empty_grid(
-            resolution=cfg.map.resolution
-        )
+        self._grid: LogOddsGrid = occ.empty_grid(resolution=cfg.map.resolution)
         self._pose = conv.Pose2D(0.0, 0.0, 0.0)
         self._last_odom_pose: Optional[conv.Pose2D] = None
         self._last_odom_pose_at: Optional[float] = None
@@ -231,9 +230,7 @@ class BuiltinSlamEngine:
                     )
                 elif mode == MODE_MAPPING:
                     # Fresh mapping session.
-                    self._grid = occ.empty_grid(
-                        resolution=self._cfg.map.resolution
-                    )
+                    self._grid = occ.empty_grid(resolution=self._cfg.map.resolution)
                     self._pose = conv.Pose2D(0.0, 0.0, 0.0)
                     self._last_odom_pose = None
                     self._last_odom_heading = None
@@ -323,9 +320,7 @@ class BuiltinSlamEngine:
 
     def reset_map(self) -> None:
         with self._lock:
-            self._grid = occ.empty_grid(
-                resolution=self._cfg.map.resolution
-            )
+            self._grid = occ.empty_grid(resolution=self._cfg.map.resolution)
             self._pose = conv.Pose2D(0.0, 0.0, 0.0)
             self._last_odom_pose = None
             self._last_odom_heading = None
@@ -345,16 +340,16 @@ class BuiltinSlamEngine:
             except OSError:
                 pass
 
-    def clear_obstacles(
-        self, x_m: float, y_m: float, radius_m: float
-    ) -> dict:
+    def clear_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
         """Erase occupied cells in a disk (map frame meters). Builtin only."""
         with self._lock:
             # Copy first: get_map reads the published array off this lock.
             updated = occ.copy_grid(self._grid)
             cleared = occ.clear_disk(updated, x_m, y_m, radius_m)
             if cleared:
-                self._grid_edits.append(("clear", float(x_m), float(y_m), float(radius_m)))
+                self._grid_edits.append(
+                    ("clear", float(x_m), float(y_m), float(radius_m))
+                )
                 self._grid = updated
                 self._invalidate_occ_cache()
                 self._generation += 1
@@ -367,15 +362,15 @@ class BuiltinSlamEngine:
                 "resolution": float(self._grid.resolution),
             }
 
-    def add_obstacles(
-        self, x_m: float, y_m: float, radius_m: float
-    ) -> dict:
+    def add_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
         """Paint occupied cells in a disk (map frame meters). Builtin only."""
         with self._lock:
             updated = occ.copy_grid(self._grid)
             marked = occ.mark_disk(updated, x_m, y_m, radius_m)
             if marked:
-                self._grid_edits.append(("mark", float(x_m), float(y_m), float(radius_m)))
+                self._grid_edits.append(
+                    ("mark", float(x_m), float(y_m), float(radius_m))
+                )
                 self._grid = updated
                 self._invalidate_occ_cache()
                 self._generation += 1
@@ -488,13 +483,9 @@ class BuiltinSlamEngine:
         cfg = self._cfg
         with self._lock:
             current = self._pose
-            shift_m = math.hypot(
-                matched_pose.x - current.x, matched_pose.y - current.y
-            )
+            shift_m = math.hypot(matched_pose.x - current.x, matched_pose.y - current.y)
             shift_deg = abs(
-                math.degrees(
-                    conv.normalize_angle(matched_pose.theta - current.theta)
-                )
+                math.degrees(conv.normalize_angle(matched_pose.theta - current.theta))
             )
             scans_used = self._graph.scan_count()
             should_rebuild = (
@@ -613,7 +604,8 @@ class BuiltinSlamEngine:
                 if worst > self._LOOP_MAX_CHI2:
                     with self._lock:
                         self._graph.edges = [
-                            e for e in self._graph.edges
+                            e
+                            for e in self._graph.edges
                             if not any(e is x for x in new_edges)
                         ]
                     self._loop_stats["rejected_inconsistent"] += 1
@@ -688,10 +680,9 @@ class BuiltinSlamEngine:
     def _corrections_agree(a: conv.Pose2D, b: conv.Pose2D, at: conv.Pose2D) -> bool:
         pa = conv.compose_poses(a, at)
         pb = conv.compose_poses(b, at)
-        return (
-            math.hypot(pa.x - pb.x, pa.y - pb.y) <= 0.15
-            and abs(conv.normalize_angle(pa.theta - pb.theta)) <= math.radians(2.0)
-        )
+        return math.hypot(pa.x - pb.x, pa.y - pb.y) <= 0.15 and abs(
+            conv.normalize_angle(pa.theta - pb.theta)
+        ) <= math.radians(2.0)
 
     def run_loop_closure(self) -> dict:
         """One detection pass on the newest keyframe; closes after two agree."""
@@ -745,7 +736,9 @@ class BuiltinSlamEngine:
                 for e in edges:
                     self._graph.add_edge(e)
             shift_m = math.hypot(match.pose.x - prior.x, match.pose.y - prior.y)
-            shift_deg = abs(math.degrees(conv.normalize_angle(match.pose.theta - prior.theta)))
+            shift_deg = abs(
+                math.degrees(conv.normalize_angle(match.pose.theta - prior.theta))
+            )
             stats["closures"] += 1
             stats["last"] = {
                 "at": time.time(),
@@ -758,7 +751,10 @@ class BuiltinSlamEngine:
                 "shift_m": round(shift_m, 3),
                 "shift_deg": round(shift_deg, 2),
             }
-            if shift_m < self._LOOP_REBUILD_MIN_M and shift_deg < self._LOOP_REBUILD_MIN_DEG:
+            if (
+                shift_m < self._LOOP_REBUILD_MIN_M
+                and shift_deg < self._LOOP_REBUILD_MIN_DEG
+            ):
                 # Matcher-quantization sized: keep the edge for the next
                 # optimization but skip a full re-render now.
                 return {"status": "constrained", **stats["last"]}
@@ -972,9 +968,7 @@ class BuiltinSlamEngine:
             return
 
         with self._lock:
-            seed_pending = (
-                self._mode == MODE_LOCALIZING and self._seed_localize_pending
-            )
+            seed_pending = self._mode == MODE_LOCALIZING and self._seed_localize_pending
 
         if seed_pending:
             # Hold absolute pose at whatever set_pose/origin is until a full-map
@@ -1037,8 +1031,7 @@ class BuiltinSlamEngine:
             if nav_track:
                 prior_now = float(self._last_prior_score)
                 lost = (
-                    math.isfinite(prior_now)
-                    and prior_now < self._NAV_TRACK_MIN_PRIOR
+                    math.isfinite(prior_now) and prior_now < self._NAV_TRACK_MIN_PRIOR
                 )
                 matched, score, prior_score = scan_match.refine_pose(
                     occ_map,
@@ -1049,9 +1042,7 @@ class BuiltinSlamEngine:
                     ),
                     cross_half_m=self._NAV_LATERAL_MAX_M,
                     yaw_half_deg=math.degrees(
-                        self._NAV_LOST_YAW_RAD
-                        if lost
-                        else self._NAV_LATERAL_MAX_RAD
+                        self._NAV_LOST_YAW_RAD if lost else self._NAV_LATERAL_MAX_RAD
                     ),
                 )
             else:
@@ -1123,7 +1114,9 @@ class BuiltinSlamEngine:
         )
 
     def _lidar_odom_fresh(self, now: float) -> bool:
-        return self._lo_last_at is not None and now - self._lo_last_at <= self._LO_FRESH_S
+        return (
+            self._lo_last_at is not None and now - self._lo_last_at <= self._LO_FRESH_S
+        )
 
     def _occupied_map_points_locked(self) -> np.ndarray:
         grid = self._grid
@@ -1175,7 +1168,9 @@ class BuiltinSlamEngine:
                     self._lo_turn_rate = 0.0
                     self._lo.reset()
                     self._lo.add_keyscan(scan_xy, self._pose, force=True)
-                    self._log("builtin SLAM: lidar odometry lost track; restarting local map")
+                    self._log(
+                        "builtin SLAM: lidar odometry lost track; restarting local map"
+                    )
                 return False
             current = self._pose
             pose = result.pose
@@ -1186,8 +1181,12 @@ class BuiltinSlamEngine:
                     c, s = math.cos(current.theta), math.sin(current.theta)
                     fwd = self._lo_vel[0] + self._LO_GAIN * (c * rx + s * ry) / dt
                     left = self._lo_vel[1] + self._LO_GAIN * (-s * rx + c * ry) / dt
-                    fwd = max(-self._LO_MAX_FORWARD_M_S, min(self._LO_MAX_FORWARD_M_S, fwd))
-                    left = max(-self._LO_MAX_LATERAL_M_S, min(self._LO_MAX_LATERAL_M_S, left))
+                    fwd = max(
+                        -self._LO_MAX_FORWARD_M_S, min(self._LO_MAX_FORWARD_M_S, fwd)
+                    )
+                    left = max(
+                        -self._LO_MAX_LATERAL_M_S, min(self._LO_MAX_LATERAL_M_S, left)
+                    )
                     self._lo_vel = (fwd, left)
             if self._lo_prev_theta is not None:
                 turned = conv.normalize_angle(pose.theta - self._lo_prev_theta)
@@ -1210,7 +1209,10 @@ class BuiltinSlamEngine:
     def _lidar_odom_twist(self, now: float, dt: float) -> tuple[float, float]:
         """Body (forward, left) velocity for prediction, decayed when matches stop."""
         fwd, left = self._lo_vel
-        if self._lo_last_at is not None and now - self._lo_last_at > self._LO_DECAY_AFTER_S:
+        if (
+            self._lo_last_at is not None
+            and now - self._lo_last_at > self._LO_DECAY_AFTER_S
+        ):
             k = math.exp(-dt / self._LO_DECAY_TAU_S)
             fwd, left = fwd * k, left * k
             self._lo_vel = (fwd, left)
@@ -1244,9 +1246,9 @@ class BuiltinSlamEngine:
                 self._last_odom_time = now
             yaw_rate = 0.0
             if prev_pose is not None and prev_at is not None and now > prev_at:
-                yaw_rate = abs(
-                    conv.normalize_angle(pose.theta - prev_pose.theta)
-                ) / (now - prev_at)
+                yaw_rate = abs(conv.normalize_angle(pose.theta - prev_pose.theta)) / (
+                    now - prev_at
+                )
             self._last_yaw_rate = yaw_rate
             if scan is None or not new_scan:
                 return
@@ -1259,9 +1261,7 @@ class BuiltinSlamEngine:
             run_match = self._occ_cache_known > 0.02
 
         if run_match:
-            matched, score, prior_score = scan_match.refine_pose(
-                occ_map, scan, pose
-            )
+            matched, score, prior_score = scan_match.refine_pose(occ_map, scan, pose)
             with self._lock:
                 self._last_match_at = now
                 self._last_match_score = score
@@ -1271,7 +1271,10 @@ class BuiltinSlamEngine:
                 if matched is not None:
                     dist = math.hypot(matched.x - pose.x, matched.y - pose.y)
                     dyaw = abs(conv.normalize_angle(matched.theta - pose.theta))
-                    if dist <= self._SMALL_CORRECTION_M and dyaw <= self._SMALL_CORRECTION_RAD:
+                    if (
+                        dist <= self._SMALL_CORRECTION_M
+                        and dyaw <= self._SMALL_CORRECTION_RAD
+                    ):
                         self._match_accepts += 1
                     else:
                         self._match_rejects += 1
@@ -1376,9 +1379,7 @@ class BuiltinSlamEngine:
             float(scan.angle_min),
             float(scan.angle_increment),
             range_min=float(scan.range_min),
-            range_max=float(scan.range_max)
-            if math.isfinite(scan.range_max)
-            else 30.0,
+            range_max=float(scan.range_max) if math.isfinite(scan.range_max) else 30.0,
         )
         hook = None
         with self._lock:
@@ -1410,10 +1411,9 @@ class BuiltinSlamEngine:
                 self._log(f"keyframe hook failed: {exc}")
 
     def _poses_agree(self, a: conv.Pose2D, b: conv.Pose2D) -> bool:
-        return (
-            math.hypot(a.x - b.x, a.y - b.y) <= 0.08
-            and abs(conv.normalize_angle(a.theta - b.theta)) <= math.radians(5.0)
-        )
+        return math.hypot(a.x - b.x, a.y - b.y) <= 0.08 and abs(
+            conv.normalize_angle(a.theta - b.theta)
+        ) <= math.radians(5.0)
 
     def _blend_pose(
         self,
@@ -1555,9 +1555,7 @@ class BuiltinSlamEngine:
             if abs(cross) < 0.25 and abs(dyaw) < math.radians(10.0):
                 return False
         # The small-drift path already covers a tight, well-scored pose.
-        return (
-            abs(cross) > self._NAV_TRACK_MAX_M or abs(dyaw) > self._NAV_TRACK_MAX_RAD
-        )
+        return abs(cross) > self._NAV_TRACK_MAX_M or abs(dyaw) > self._NAV_TRACK_MAX_RAD
 
     def _navigation_active(self) -> bool:
         """True when builtin nav has an in-flight goal (MoveOnMap / route)."""
@@ -1741,10 +1739,7 @@ class BuiltinSlamEngine:
         turns the pose, so a parked cart does not rotate to a new heading.
         """
         rate = dth / dt if dt > 0.0 else 0.0
-        if (
-            self._imu_yaw_bias is None
-            and abs(rate) <= self._YAW_BIAS_SEED_MAX_RAD_S
-        ):
+        if self._imu_yaw_bias is None and abs(rate) <= self._YAW_BIAS_SEED_MAX_RAD_S:
             self._imu_yaw_bias = rate
         bias = 0.0 if self._imu_yaw_bias is None else self._imu_yaw_bias
         residual = rate - bias
@@ -1785,9 +1780,7 @@ class BuiltinSlamEngine:
         # than the deadband (Livox tilt) must be absorbed; otherwise it is
         # integrated forever and the parked cart slides. A short shove stays
         # ahead of this slow follow.
-        self._imu_ax_bias += residual * (
-            1.0 - math.exp(-dt / self._ACCEL_BIAS_TAU_S)
-        )
+        self._imu_ax_bias += residual * (1.0 - math.exp(-dt / self._ACCEL_BIAS_TAU_S))
         residual = ax - self._imu_ax_bias
         if abs(residual) < self._ACCEL_DEADBAND_M_S2:
             self._imu_forward_m_s = 0.0
@@ -1798,7 +1791,10 @@ class BuiltinSlamEngine:
                 -self._ACCEL_SPEED_MAX_M_S, min(self._ACCEL_SPEED_MAX_M_S, speed)
             )
             self._imu_forward_m_s = speed
-        if getattr(self._cfg, "base_velocity_convention", "viam") in BASE_VELOCITY_Y_FORWARD:
+        if (
+            getattr(self._cfg, "base_velocity_convention", "viam")
+            in BASE_VELOCITY_Y_FORWARD
+        ):
             return 0.0, speed
         return speed, 0.0
 
@@ -1807,9 +1803,7 @@ class BuiltinSlamEngine:
     # more yaw than that hold either.
     _ODOM_YAW_HOLD_MAX_S = 3.0
 
-    def _predict(
-        self, odom: Optional[conv.OdomReading], now: float
-    ) -> conv.Pose2D:
+    def _predict(self, odom: Optional[conv.OdomReading], now: float) -> conv.Pose2D:
         if odom is None:
             return self._pose
 
@@ -1860,10 +1854,7 @@ class BuiltinSlamEngine:
             max_xy = max(0.5, 0.6 * gap_s)
             yaw_hold_s = min(max(gap_s, 0.0), self._ODOM_YAW_HOLD_MAX_S)
             max_yaw = max(math.radians(40.0), prev_yaw_rate * yaw_hold_s)
-            if (
-                math.hypot(delta.x, delta.y) > max_xy
-                or abs(delta.theta) > max_yaw
-            ):
+            if math.hypot(delta.x, delta.y) > max_xy or abs(delta.theta) > max_yaw:
                 self._log(
                     "builtin SLAM: rejected odom jump "
                     f"dx={delta.x:.2f} dy={delta.y:.2f} "
@@ -1909,7 +1900,10 @@ class BuiltinSlamEngine:
         s = math.sin(self._pose.theta)
         if self._lidar_odom_active(odom) and self._lidar_odom_fresh(now):
             fwd, left = self._lidar_odom_twist(now, dt)
-            if getattr(self._cfg, "base_velocity_convention", "viam") in BASE_VELOCITY_Y_FORWARD:
+            if (
+                getattr(self._cfg, "base_velocity_convention", "viam")
+                in BASE_VELOCITY_Y_FORWARD
+            ):
                 self._last_odom_twist = (-left, fwd, odom.vtheta)
             else:
                 self._last_odom_twist = (fwd, left, odom.vtheta)
@@ -1921,7 +1915,10 @@ class BuiltinSlamEngine:
 
         vx, vy = self._twist_with_accel_prior(odom, dt)
         self._last_odom_twist = (vx, vy, odom.vtheta)
-        if getattr(self._cfg, "base_velocity_convention", "viam") in BASE_VELOCITY_Y_FORWARD:
+        if (
+            getattr(self._cfg, "base_velocity_convention", "viam")
+            in BASE_VELOCITY_Y_FORWARD
+        ):
             # Sensor-native Y-forward / X-right → map (theta=0 faces +X).
             dx = (c * vy + s * vx) * dt
             dy = (s * vy - c * vx) * dt

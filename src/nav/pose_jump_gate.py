@@ -8,6 +8,7 @@ policy for those paths; idle manual ``relocalize`` / ``apply=true`` bypasses
 it. Mid-nav force-apply is capped separately (see Slam
 ``localize_mid_nav_apply_max_*``) so a refine cannot teleport past ~1 m.
 """
+
 from __future__ import annotations
 
 import math
@@ -238,9 +239,7 @@ def candidate_beats_previous(
         return True
     dyaw_rad = math.radians(abs(float(shift_deg)))
     # Mild bar: base + distance + yaw. A 7 m false peak must beat previous by ~0.8.
-    need = 0.06 + 0.10 * max(0.0, float(shift_m)) + 0.08 * (
-        dyaw_rad / (math.pi / 4.0)
-    )
+    need = 0.06 + 0.10 * max(0.0, float(shift_m)) + 0.08 * (dyaw_rad / (math.pi / 4.0))
     if candidate_score < previous_score + need:
         return False
     # Prefer previous when its ray alignment is clearly better.

@@ -1,4 +1,5 @@
 """Local correlative scan-to-map matching for continuous tracking."""
+
 from __future__ import annotations
 
 import math
@@ -47,9 +48,7 @@ def score_pose(
     ).score
 
 
-def _required_improvement(
-    prior_score: float, dist_m: float, dyaw_rad: float
-) -> float:
+def _required_improvement(prior_score: float, dist_m: float, dyaw_rad: float) -> float:
     """Larger jumps and already-good priors need a clearer score win.
 
     Prevents A↔B peak flipping when two discrete poses score within noise.
@@ -214,8 +213,12 @@ def refine_pose(
         yaw_half_deg = min(yaw_half_deg, 8.0)
 
     if anisotropic:
-        along_offsets = np.arange(-float(along_half_m), float(along_half_m) + 1e-9, xy_step_m)
-        cross_offsets = np.arange(-float(cross_half_m), float(cross_half_m) + 1e-9, xy_step_m)
+        along_offsets = np.arange(
+            -float(along_half_m), float(along_half_m) + 1e-9, xy_step_m
+        )
+        cross_offsets = np.arange(
+            -float(cross_half_m), float(cross_half_m) + 1e-9, xy_step_m
+        )
         aa, cc = np.meshgrid(along_offsets, cross_offsets)
         cth = math.cos(prior.theta)
         sth = math.sin(prior.theta)

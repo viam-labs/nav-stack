@@ -6,6 +6,7 @@ renders a submap from *older* keyframes only — path far enough behind the
 robot — and matches a short window of recent scans against it with a wide
 correlative search. A good, unambiguous fit becomes a pose-graph edge.
 """
+
 from __future__ import annotations
 
 import math
@@ -111,7 +112,11 @@ def query_cloud(
         for s in snap.scans[k]:
             r = np.asarray(s.ranges, dtype=float)
             ang = s.angle_min + np.arange(r.size) * s.angle_increment
-            ok = np.isfinite(r) & (r >= s.range_min) & (r <= min(s.range_max, max_range_m))
+            ok = (
+                np.isfinite(r)
+                & (r >= s.range_min)
+                & (r <= min(s.range_max, max_range_m))
+            )
             if not np.any(ok):
                 continue
             px = r[ok] * np.cos(ang[ok])
@@ -229,12 +234,17 @@ def match_against(
     yaw_step = math.radians(_COARSE_YAW_DEG)
     n_yaw = int(math.ceil(math.radians(window_deg) / yaw_step))
     dyaws = np.arange(-n_yaw, n_yaw + 1) * yaw_step
-    surf = np.stack(
-        [
-            _lattice_sum(mg, mg.coarse, pts, prior.x, prior.y, prior.theta + d, offs)
-            for d in dyaws
-        ]
-    ).astype(float) / _HIT
+    surf = (
+        np.stack(
+            [
+                _lattice_sum(
+                    mg, mg.coarse, pts, prior.x, prior.y, prior.theta + d, offs
+                )
+                for d in dyaws
+            ]
+        ).astype(float)
+        / _HIT
+    )
     # Equal scores are common along walls; break ties toward the prior
     # instead of argmax's first (most negative) offset. Far below one point.
     ti = (offs / max(1, offs.max())) ** 2
@@ -253,8 +263,11 @@ def match_against(
     cov = np.cov(sample, rowvar=False) if sample.shape[0] >= 2 else np.zeros((3, 3))
     step = 2.0 * res
     cov = cov + np.diag(
-        [step**2 / 12.0 + 0.03**2, step**2 / 12.0 + 0.03**2,
-         yaw_step**2 / 12.0 + math.radians(0.5) ** 2]
+        [
+            step**2 / 12.0 + 0.03**2,
+            step**2 / 12.0 + 0.03**2,
+            yaw_step**2 / 12.0 + math.radians(0.5) ** 2,
+        ]
     )
 
     cx = prior.x + offs[best[2]] * res
@@ -265,9 +278,12 @@ def match_against(
     fy = cy + fine_offs * res
     window2 = max(window_m, res) ** 2
     yaw_span2 = max(math.radians(window_deg), 1e-6) ** 2
-    tie_xy = 1e-3 * _HIT * (
-        (fy[:, None] - prior.y) ** 2 + (fx[None, :] - prior.x) ** 2
-    ) / window2
+    tie_xy = (
+        1e-3
+        * _HIT
+        * ((fy[:, None] - prior.y) ** 2 + (fx[None, :] - prior.x) ** 2)
+        / window2
+    )
     best_f = (-math.inf, cx, cy, cth, -math.inf)
     for kk in range(-_FINE_YAW_STEPS, _FINE_YAW_STEPS + 1):
         yaw = cth + math.radians(_FINE_YAW_DEG) * kk
@@ -276,15 +292,25 @@ def match_against(
         ranked = s - tie_xy - tie_yaw
         j, i = np.unravel_index(int(np.argmax(ranked)), s.shape)
         if ranked[j, i] > best_f[4]:
-            best_f = (float(s[j, i]), float(fx[i]), float(fy[j]), yaw, float(ranked[j, i]))
+            best_f = (
+                float(s[j, i]),
+                float(fx[i]),
+                float(fy[j]),
+                yaw,
+                float(ranked[j, i]),
+            )
     obj, bx, by, bth, _ = best_f
     zero = np.zeros(1, dtype=np.int64)
     known = float(_lattice_sum(mg, mg.known, pts, bx, by, bth, zero)[0, 0])
     if known <= 0:
         return None
 
-    p_obj = float(_lattice_sum(mg, mg.fine, pts, prior.x, prior.y, prior.theta, zero)[0, 0])
-    p_known = float(_lattice_sum(mg, mg.known, pts, prior.x, prior.y, prior.theta, zero)[0, 0])
+    p_obj = float(
+        _lattice_sum(mg, mg.fine, pts, prior.x, prior.y, prior.theta, zero)[0, 0]
+    )
+    p_known = float(
+        _lattice_sum(mg, mg.known, pts, prior.x, prior.y, prior.theta, zero)[0, 0]
+    )
     return LoopMatch(
         pose=conv.Pose2D(float(bx), float(by), conv.normalize_angle(bth)),
         fit=obj / _HIT / known,
@@ -317,7 +343,9 @@ def detect(
     near = [
         i
         for i in old
-        if math.hypot(snap.poses[i, 0] - snap.poses[cur, 0], snap.poses[i, 1] - snap.poses[cur, 1])
+        if math.hypot(
+            snap.poses[i, 0] - snap.poses[cur, 0], snap.poses[i, 1] - snap.poses[cur, 1]
+        )
         <= radius
     ]
     if not near and base is None:
@@ -333,7 +361,9 @@ def detect(
         return None, "few_points"
     prior = snap.pose(cur)
     if base is not None:
-        base = crop_grid(base, prior.x, prior.y, params.submap_radius_m + params.query_max_range_m)
+        base = crop_grid(
+            base, prior.x, prior.y, params.submap_radius_m + params.query_max_range_m
+        )
     submap = render_grid(
         snap, resolution=resolution, nodes=old, base=base, center=(prior.x, prior.y)
     )
@@ -349,7 +379,11 @@ def detect(
     dx, dy = m.pose.x - prior.x, m.pose.y - prior.y
     dth = conv.normalize_angle(m.pose.theta - prior.theta)
     edge_m = params.window_m - 1.5 * resolution
-    if abs(dx) >= edge_m or abs(dy) >= edge_m or abs(math.degrees(dth)) >= params.window_deg - 1.0:
+    if (
+        abs(dx) >= edge_m
+        or abs(dy) >= edge_m
+        or abs(math.degrees(dth)) >= params.window_deg - 1.0
+    ):
         return m, "window_edge"
     evals = np.linalg.eigvalsh(m.cov[:2, :2])
     if math.sqrt(max(evals[0], 0.0)) > params.max_std_m:
@@ -364,7 +398,9 @@ def detect(
         if d < best_d:
             anchor, best_d = i, d
     m.anchor = anchor
-    m.gap_m = float(snap.travel[cur] - snap.travel[anchor]) if anchor is not None else 0.0
+    m.gap_m = (
+        float(snap.travel[cur] - snap.travel[anchor]) if anchor is not None else 0.0
+    )
     shift = math.hypot(dx, dy)
     if anchor is not None:
         allowed = max(0.3, params.drift_fraction * m.gap_m)

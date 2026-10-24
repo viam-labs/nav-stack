@@ -4,6 +4,7 @@ Each scan is aligned (2D point-to-point ICP) against the last few keyscans,
 starting from a constant-velocity guess. A cart with only a lidar and an IMU
 gets its translation from this, the same way ROS lidar-odometry stacks do.
 """
+
 from __future__ import annotations
 
 import math
@@ -47,9 +48,7 @@ def _transform(points: np.ndarray, pose: conv.Pose2D) -> np.ndarray:
 def _nearest(query: np.ndarray, ref: np.ndarray, ref_sq: np.ndarray):
     """Nearest ``ref`` index and squared distance for each ``query`` row."""
     d2 = (
-        np.sum(query * query, axis=1)[:, None]
-        + ref_sq[None, :]
-        - 2.0 * (query @ ref.T)
+        np.sum(query * query, axis=1)[:, None] + ref_sq[None, :] - 2.0 * (query @ ref.T)
     )
     idx = np.argmin(d2, axis=1)
     best = np.maximum(d2[np.arange(query.shape[0]), idx], 0.0)
@@ -75,7 +74,7 @@ def icp_2d(
         pose = conv.Pose2D(x, y, th)
         moved = _transform(src, pose)
         idx, d2 = _nearest(moved, ref, ref_sq)
-        corr = max(min_corr_m, max_corr_m * (0.75 ** it))
+        corr = max(min_corr_m, max_corr_m * (0.75**it))
         keep = d2 <= corr * corr
         if int(keep.sum()) < min_inliers:
             return None
@@ -202,17 +201,19 @@ class LidarOdometry:
             self._ref = np.vstack(parts)
         return self._ref
 
-    def match(
-        self, scan_xy: np.ndarray, guess: conv.Pose2D
-    ) -> Optional[IcpResult]:
+    def match(self, scan_xy: np.ndarray, guess: conv.Pose2D) -> Optional[IcpResult]:
         """ICP ``scan_xy`` against the local map. ``None`` when it does not fit."""
         if not self._keys:
             return None
         src = self._prepare(scan_xy)
         ref = self._reference()
-        ref = ref[np.hypot(ref[:, 0] - guess.x, ref[:, 1] - guess.y) <= self._ref_radius]
+        ref = ref[
+            np.hypot(ref[:, 0] - guess.x, ref[:, 1] - guess.y) <= self._ref_radius
+        ]
         if self._max_ref_points > 0 and ref.shape[0] > self._max_ref_points:
-            pick = np.linspace(0, ref.shape[0] - 1, self._max_ref_points, dtype=np.int64)
+            pick = np.linspace(
+                0, ref.shape[0] - 1, self._max_ref_points, dtype=np.int64
+            )
             ref = ref[pick]
         result = icp_2d(src, ref, guess)
         if result is None or result.inlier_ratio < self._min_inlier_ratio:

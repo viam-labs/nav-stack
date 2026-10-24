@@ -1,4 +1,5 @@
 """Goal lifecycle: plan → follow → replan → succeed / fail / cancel."""
+
 from __future__ import annotations
 
 import math
@@ -278,9 +279,7 @@ class NavSupervisor:
             float(spin_radius_m) if spin_radius_m else float(robot_radius_m),
         )
         # Centre-to-bumper distance for the forward stop bubble.
-        nose_offset = (
-            float(nose_offset_m) if nose_offset_m else float(robot_radius_m)
-        )
+        nose_offset = float(nose_offset_m) if nose_offset_m else float(robot_radius_m)
         half_track = (
             float(wheel_half_track_m)
             if wheel_half_track_m
@@ -348,9 +347,7 @@ class NavSupervisor:
         self._backup_cooldown_s = backup_cooldown_s
         self._recovery_wait_duration_s = max(0.0, float(recovery_wait_duration_s))
         self._replan_local_blocked_time_s = max(0.0, float(replan_local_blocked_time_s))
-        self._replan_local_min_period_s = max(
-            0.1, float(replan_local_min_period_s)
-        )
+        self._replan_local_min_period_s = max(0.1, float(replan_local_min_period_s))
         self._replan_max_early_detour_ratio = max(
             1.0, float(replan_max_early_detour_ratio)
         )
@@ -605,9 +602,7 @@ class NavSupervisor:
         if allow_inline and not have_cache:
             _job()
             return
-        threading.Thread(
-            target=_job, name="nav-global-costmap", daemon=True
-        ).start()
+        threading.Thread(target=_job, name="nav-global-costmap", daemon=True).start()
 
     def _xy_at_nav_goal(self, pose: Pose2D, goal: Pose2D, path: Path2D) -> bool:
         """True when XY is close enough to the *requested* goal (not a far snap)."""
@@ -677,12 +672,9 @@ class NavSupervisor:
             and 0.0 < abs(cmd.vtheta) < BASE_ANG_EPS_RAD_S
             and self._guard is not None
             and forward_clearance_m is not None
-            and forward_clearance_m
-            <= self._guard.cfg.length_m / 2.0 + 0.08
+            and forward_clearance_m <= self._guard.cfg.length_m / 2.0 + 0.08
         ):
-            lifted = DriveCommand(
-                0.0, 0.0, math.copysign(0.4, cmd.vtheta), False
-            )
+            lifted = DriveCommand(0.0, 0.0, math.copysign(0.4, cmd.vtheta), False)
             self._last_sent_cmd = lifted
             return lifted
 
@@ -811,10 +803,10 @@ class NavSupervisor:
             result.path = smoothed
         return result
 
-    def _publish_plan_viz(self, result: PlanResult, goal: Pose2D, start: Optional[Pose2D]) -> None:
-        preview = result.to_preview_dict(
-            goal=(goal.x, goal.y, goal.theta), start=start
-        )
+    def _publish_plan_viz(
+        self, result: PlanResult, goal: Pose2D, start: Optional[Pose2D]
+    ) -> None:
+        preview = result.to_preview_dict(goal=(goal.x, goal.y, goal.theta), start=start)
         try:
             if result.costmap_viz is not None:
                 self._world.set_viz_costmap(result.costmap_viz)
@@ -1066,9 +1058,7 @@ class NavSupervisor:
             if now < self._loc_settle_until:
                 return "hold"
             self._loc_phase = "idle"
-            return self._launch_loc_check(
-                self._loc_next_step, **self._loc_next_kwargs
-            )
+            return self._launch_loc_check(self._loc_next_step, **self._loc_next_kwargs)
         # The check compares the live scan to a finished map. While mapping,
         # new rays disagree with the partial grid and check_localization
         # returns not_localizing, so the pause never corrects the pose.
@@ -1158,10 +1148,7 @@ class NavSupervisor:
         if result is None:
             return "hold" if self._loc_refine_tries > 0 else None
         status = str(result.get("status") or "")
-        if (
-            status == "awaiting_confirm"
-            and step in ("probe", "recovery")
-        ):
+        if status == "awaiting_confirm" and step in ("probe", "recovery"):
             self._loc_refine_force_stop = True
             if calm or step == "recovery":
                 self._pause_for_loc_refine(pose, dist_goal, verdict, settle=False)
@@ -1186,9 +1173,11 @@ class NavSupervisor:
             )
             return self._launch_loc_check("apply", apply=True)
 
-        if step == "recovery" and (
-            status not in ("corrected", "ok") or not result.get("corrected")
-        ) and bool(result.get("good_match")):
+        if (
+            step == "recovery"
+            and (status not in ("corrected", "ok") or not result.get("corrected"))
+            and bool(result.get("good_match"))
+        ):
             return self._launch_loc_check(
                 "recovery_apply", apply=True, stopped_recovery=True
             )
@@ -1575,11 +1564,7 @@ class NavSupervisor:
     ) -> float:
         """Body-frame bearing of the route, else the straight-line goal."""
         follower = getattr(self, "_follower", None)
-        if (
-            path is not None
-            and follower is not None
-            and len(path.points) >= 2
-        ):
+        if path is not None and follower is not None and len(path.points) >= 2:
             target, _, _ = lookahead_pose(
                 pose,
                 path,
@@ -1617,12 +1602,8 @@ class NavSupervisor:
         guard = self._guard
         if guard is None or scan is None:
             return arc, "corridor"
-        pts = obstacle_points(
-            pose, scan, None, radius_m=guard.cfg.obstacle_radius_m
-        )
-        free = guard.free_distance(
-            pose, arc.vx, arc.vtheta, pts, guard.cfg.horizon_m
-        )
+        pts = obstacle_points(pose, scan, None, radius_m=guard.cfg.obstacle_radius_m)
+        free = guard.free_distance(pose, arc.vx, arc.vtheta, pts, guard.cfg.horizon_m)
         if guard._regulate(arc.vx, free) >= 0.05:
             return arc, "corridor"
         return spin, "yaw_open"
@@ -1730,8 +1711,7 @@ class NavSupervisor:
             state="failed",
             active=False,
             error_msg=(
-                "path blocked: no route around obstacle "
-                f"({count} replans failed)"
+                f"path blocked: no route around obstacle ({count} replans failed)"
             ),
             progress=prev_progress or None,
         )
@@ -1820,10 +1800,7 @@ class NavSupervisor:
             if not hold_active:
                 return None
             reason: Optional[str] = None
-            if (
-                self._detour_min_length_m > 0.0
-                and new_len < self._detour_min_length_m
-            ):
+            if self._detour_min_length_m > 0.0 and new_len < self._detour_min_length_m:
                 reason = (
                     f"short-flip hysteresis ({new_len:.1f} m < "
                     f"{self._detour_min_length_m:.1f} m ban)"
@@ -1849,9 +1826,7 @@ class NavSupervisor:
                 )
             # Prefer a milder peel when one already exists.
             if paint and best is not None and new_len > early_limit:
-                return (
-                    f"too long ({new_len:.1f} m > {early_limit:.1f} m)"
-                )
+                return f"too long ({new_len:.1f} m > {early_limit:.1f} m)"
             return None
 
         for label, paint in attempts:
@@ -1880,9 +1855,7 @@ class NavSupervisor:
                 continue
             stuck_cost = _still_local_blocked(replanned.path)
             if stuck_cost is not None:
-                reasons.append(
-                    f"{label}: still local-blocked (cost={stuck_cost})"
-                )
+                reasons.append(f"{label}: still local-blocked (cost={stuck_cost})")
                 continue
             new_len = _path_length(replanned.path)
             flip = _reject_short_flip(replanned.path, new_len)
@@ -1903,9 +1876,7 @@ class NavSupervisor:
                 new_path, result, label = forced
                 stuck_cost = _still_local_blocked(new_path)
                 if stuck_cost is not None:
-                    reasons.append(
-                        f"{label}: still local-blocked (cost={stuck_cost})"
-                    )
+                    reasons.append(f"{label}: still local-blocked (cost={stuck_cost})")
                 else:
                     new_len = _path_length(new_path)
                     flip = _reject_short_flip(new_path, new_len)
@@ -1917,7 +1888,12 @@ class NavSupervisor:
                             reasons.append(f"{label}: {too_long}")
                         else:
                             self._commit_replan_path(
-                                path, new_path, new_len, old_len, label, reasons,
+                                path,
+                                new_path,
+                                new_len,
+                                old_len,
+                                label,
+                                reasons,
                                 require_different=require_different,
                                 result=result,
                                 goal=goal,
@@ -1932,8 +1908,10 @@ class NavSupervisor:
             # (that is the thrash). Exception: path is actually blocked /
             # pose-jump recovery needs any escape (force_lift_short_flip).
             ban_was_only_reason = any("short-flip" in r for r in reasons)
-            if hold_active and allow_lift_ban and (
-                not ban_was_only_reason or force_lift_short_flip
+            if (
+                hold_active
+                and allow_lift_ban
+                and (not ban_was_only_reason or force_lift_short_flip)
             ):
                 reasons.append("detour-ban: lifting (no alternate)")
                 self._detour_ban_path = None
@@ -1963,7 +1941,12 @@ class NavSupervisor:
             return None
         new_len, new_path, result, label = best
         self._commit_replan_path(
-            path, new_path, new_len, old_len, label, reasons,
+            path,
+            new_path,
+            new_len,
+            old_len,
+            label,
+            reasons,
             require_different=require_different,
             result=result,
             goal=goal,
@@ -1997,8 +1980,7 @@ class NavSupervisor:
                 )
             )
             under_min = (
-                self._detour_min_length_m > 0.0
-                and new_len < self._detour_min_length_m
+                self._detour_min_length_m > 0.0 and new_len < self._detour_min_length_m
             )
             if matches_ban or under_min:
                 # Budgeted return to the abandoned short corridor.
@@ -2035,10 +2017,7 @@ class NavSupervisor:
 
     def _replan_blocked_at_start(self) -> bool:
         err = self._last_replan_error or ""
-        return (
-            "cannot reach plan start" in err
-            or "start pose is in lethal" in err
-        )
+        return "cannot reach plan start" in err or "start pose is in lethal" in err
 
     def _refine_stuck_pose(self) -> Optional[Pose2D]:
         """Ask SLAM for one small local match. Returns the pose when it moved."""
@@ -2217,7 +2196,9 @@ class NavSupervisor:
                 loc_hold_motion = False
                 if self._cancel.is_set():
                     self._world.stop()
-                    self._set_status(state="canceled", active=False, error_msg="canceled")
+                    self._set_status(
+                        state="canceled", active=False, error_msg="canceled"
+                    )
                     return
 
                 pose = self._world.get_pose()
@@ -2236,9 +2217,7 @@ class NavSupervisor:
                     blocked_fail_count = 0
                     blocked_fail_dist = None
 
-                self._set_status(
-                    pose={"x": pose.x, "y": pose.y, "theta": pose.theta}
-                )
+                self._set_status(pose={"x": pose.x, "y": pose.y, "theta": pose.theta})
 
                 # Large pose-jump awaiting confirm: stop until SLAM applies or
                 # rejects. Driving on the old pose while turning is how we plow.
@@ -2458,9 +2437,7 @@ class NavSupervisor:
                         radius_m=self._guard.cfg.obstacle_radius_m,
                         extra=mem_pts,
                     )
-                    straight = self._guard.free_distance(
-                        pose, 0.2, 0.0, guard_pts, 2.0
-                    )
+                    straight = self._guard.free_distance(pose, 0.2, 0.0, guard_pts, 2.0)
                     if math.isfinite(straight):
                         forward_clearance_m = straight + self._guard.cfg.length_m / 2.0
                     nose_clear = straight >= self._guard.cfg.alt_min_free_m or (
@@ -2554,9 +2531,7 @@ class NavSupervisor:
                     )
                     # How long since real motion while peeling with a clear nose.
                     peel_stuck_s = (
-                        max(0.0, now - last_progress_at)
-                        if nose_clear
-                        else 0.0
+                        max(0.0, now - last_progress_at) if nose_clear else 0.0
                     )
                     action = self._local_block_action(
                         nose_clear=nose_clear,
@@ -2589,9 +2564,7 @@ class NavSupervisor:
                         and self._guard is not None
                         and blocked_for >= wait_before_replan_s
                     ):
-                        corridor_yaw = self._corridor_escape_yaw(
-                            pose, scan, goal, path
-                        )
+                        corridor_yaw = self._corridor_escape_yaw(pose, scan, goal, path)
                     # An open scan heading is a way through. A global replan
                     # here only found ~48 m loops and held the wheels at zero
                     # until the goal timed out. Yaw or drive the corridor first.
@@ -2683,10 +2656,7 @@ class NavSupervisor:
                 allow_local_planner = (
                     self._local_costmap_enabled
                     and not waiting_for_clear
-                    and (
-                        local_blocked
-                        or failed_replan_while_blocked >= 1
-                    )
+                    and (local_blocked or failed_replan_while_blocked >= 1)
                 )
                 force_local = bool(local_blocked and allow_local_planner)
                 # Reactive stop/slow, nose_clear, and the local costmap all use
@@ -2766,15 +2736,12 @@ class NavSupervisor:
                 # rear lidar cone and the inflated costmap both treat the
                 # blob an inch ahead as occupying the reverse, which left
                 # this case at cmd 0 with obstacle "avoid".
-                if (
-                    now >= narrow_rev_cooldown_until
-                    and self._bumper_spin_reverse(
-                        nose_clear=nose_clear,
-                        spin_blocked=bool(progress.get("spin_blocked")),
-                        cmd_vx=cmd.vx,
-                        cmd_vtheta=cmd.vtheta,
-                        rear_open=True,
-                    )
+                if now >= narrow_rev_cooldown_until and self._bumper_spin_reverse(
+                    nose_clear=nose_clear,
+                    spin_blocked=bool(progress.get("spin_blocked")),
+                    cmd_vx=cmd.vx,
+                    cmd_vtheta=cmd.vtheta,
+                    rear_open=True,
                 ):
                     from .controller import _narrow_reverse_command, _try_narrow_reverse
 
@@ -2787,9 +2754,7 @@ class NavSupervisor:
                             guard_pts,
                             max(0.35, float(self._backup_dist_m)),
                         )
-                    rectangle_clear = (
-                        not math.isfinite(back_free) or back_free >= 0.12
-                    )
+                    rectangle_clear = not math.isfinite(back_free) or back_free >= 0.12
                     cone_clear = False
                     if (
                         not rectangle_clear
@@ -2857,9 +2822,8 @@ class NavSupervisor:
                         back_free = self._guard.free_distance(
                             pose, -0.15, 0.0, guard_pts, remain
                         )
-                        rear_cost_ok = (
-                            not math.isfinite(back_free)
-                            or back_free >= min(remain, 0.12)
+                        rear_cost_ok = not math.isfinite(back_free) or back_free >= min(
+                            remain, 0.12
                         )
                     if backed_m >= self._backup_dist_m or not rear_cost_ok:
                         narrow_rev_start = None
@@ -2998,9 +2962,7 @@ class NavSupervisor:
                         elif nose_unstick_start is not None:
                             moved = False
                             if nose_unstick_mode == "reverse":
-                                moved = (
-                                    distance_m(pose, nose_unstick_start) >= 0.05
-                                )
+                                moved = distance_m(pose, nose_unstick_start) >= 0.05
                             elif nose_unstick_mode == "turn":
                                 moved = (
                                     abs(
@@ -3029,10 +2991,7 @@ class NavSupervisor:
                         and nose_unstick_mode == "reverse"
                         and cmd.vx < -1e-6
                     ):
-                        if (
-                            distance_m(pose, nose_unstick_start)
-                            >= self._backup_dist_m
-                        ):
+                        if distance_m(pose, nose_unstick_start) >= self._backup_dist_m:
                             unstick_done = True
                     elif (
                         not unstick_done
@@ -3108,9 +3067,7 @@ class NavSupervisor:
                             "cmd_vx_mps": cmd.vx,
                             "cmd_vtheta_rad_s": 0.0,
                         }
-                    elif (
-                        nose_unstick_mode == "turn" and abs(cmd.vtheta) > 1e-6
-                    ):
+                    elif nose_unstick_mode == "turn" and abs(cmd.vtheta) > 1e-6:
                         progress = {
                             **progress,
                             "obstacle": "wait_turn",
@@ -3151,10 +3108,7 @@ class NavSupervisor:
                     and backup_attempts < self._backup_max_attempts
                     and now >= backup_cooldown_until
                     and not waiting_for_clear
-                    and (
-                        not local_blocked
-                        or failed_replan_while_blocked >= 2
-                    )
+                    and (not local_blocked or failed_replan_while_blocked >= 2)
                 )
 
                 if backup_active and backup_start is not None:
@@ -3169,15 +3123,8 @@ class NavSupervisor:
                         if local_view is not None
                         else 0
                     )
-                    rear = (
-                        rear_clearance_m(scan)
-                        if scan is not None
-                        else math.inf
-                    )
-                    worse = (
-                        local_view is not None
-                        and pose_cost > backup_start_cost + 5
-                    )
+                    rear = rear_clearance_m(scan) if scan is not None else math.inf
+                    worse = local_view is not None and pose_cost > backup_start_cost + 5
                     if (
                         backed_m >= self._backup_dist_m
                         or rear < self._backup_rear_clear_m * 0.85
@@ -3209,9 +3156,7 @@ class NavSupervisor:
                             vx_sign_history.clear()
                         cmd = DriveCommand(0.0, 0.0, 0.0, False)
                     else:
-                        cmd = DriveCommand(
-                            -self._backup_speed_mps, 0.0, 0.0, False
-                        )
+                        cmd = DriveCommand(-self._backup_speed_mps, 0.0, 0.0, False)
                         progress = {
                             **progress,
                             "local_planner": False,
@@ -3243,9 +3188,7 @@ class NavSupervisor:
                             )
                             backup_attempts += 1
                             spin_stuck_since = None
-                            cmd = DriveCommand(
-                                -self._backup_speed_mps, 0.0, 0.0, False
-                            )
+                            cmd = DriveCommand(-self._backup_speed_mps, 0.0, 0.0, False)
                             progress = {
                                 **progress,
                                 "local_planner": False,
@@ -3329,17 +3272,12 @@ class NavSupervisor:
                 # back jig is normal DWA peel in a tight corridor — stop-replan
                 # there was the "crazy jig then freeze" (live: oscillating=True,
                 # static_blocked=False, nose_clear). peel_stuck covers escalate.
-                osc_replan = bool(
-                    oscillating and local_blocked and not nose_clear
-                )
+                osc_replan = bool(oscillating and local_blocked and not nose_clear)
                 spin_rock = bool(
                     progress.get("spin_blocked") and oscillating and not nose_clear
                 )
                 should_replan = (replan_due or pose_jumped) and (
-                    static_blocked
-                    or osc_replan
-                    or spin_rock
-                    or backup_exhausted
+                    static_blocked or osc_replan or spin_rock or backup_exhausted
                 )
                 # Periodic check said "still clear" — still advance the timer.
                 # Otherwise replan_due stays true and the expensive static check
@@ -3378,7 +3316,9 @@ class NavSupervisor:
                         path,
                         scan,
                         require_different=not static_blocked,
-                        failed_count=failed_replan_while_blocked if local_blocked else 0,
+                        failed_count=failed_replan_while_blocked
+                        if local_blocked
+                        else 0,
                         local_view=local_view,
                         trigger=_trig,
                         # Path is actually blocked: do not let the goal-lifetime
@@ -3484,9 +3424,10 @@ class NavSupervisor:
                         )
 
                     def _reduced(c: DriveCommand, v) -> bool:
-                        return abs(v.vx) < abs(c.vx) - 1e-9 or abs(v.vtheta) < abs(
-                            c.vtheta
-                        ) - 1e-9
+                        return (
+                            abs(v.vx) < abs(c.vx) - 1e-9
+                            or abs(v.vtheta) < abs(c.vtheta) - 1e-9
+                        )
 
                     veto = _veto(cmd)
                     if _reduced(cmd, veto) and abs(pre_limit.vx) > 1e-6:
@@ -3510,7 +3451,11 @@ class NavSupervisor:
                     # The veto can leave a crawl the base sanitizer turns into
                     # a stop. That never ramps, so the bumper stays put. Yaw
                     # onto the path when the sweep is free; otherwise back up.
-                    if not loc_hold_motion and not cmd.done and now >= narrow_rev_cooldown_until:
+                    if (
+                        not loc_hold_motion
+                        and not cmd.done
+                        and now >= narrow_rev_cooldown_until
+                    ):
                         bearing = float(progress.get("bearing_error_rad") or 0.0)
                         rear_open = False
                         spin_clear = False
@@ -3560,7 +3505,9 @@ class NavSupervisor:
                                 cmd = DriveCommand(
                                     0.0,
                                     0.0,
-                                    math.copysign(_NOSE_UNSTICK_YAW_RATE, bearing or 1.0),
+                                    math.copysign(
+                                        _NOSE_UNSTICK_YAW_RATE, bearing or 1.0
+                                    ),
                                     False,
                                 )
                                 self._last_sent_cmd = cmd
@@ -3574,7 +3521,10 @@ class NavSupervisor:
                             deadband_turn_start = None
                             if deadband_rev_start is None:
                                 deadband_rev_start = pose
-                            if distance_m(pose, deadband_rev_start) >= self._backup_dist_m:
+                            if (
+                                distance_m(pose, deadband_rev_start)
+                                >= self._backup_dist_m
+                            ):
                                 finished_escape = True
                                 deadband_rev_start = None
                             else:
@@ -3644,9 +3594,15 @@ class NavSupervisor:
                             "vx": round(cmd.vx, 3),
                             "w": round(cmd.vtheta, 3),
                             "obs": progress.get("obstacle"),
-                            "near_m": round(near_d, 3) if math.isfinite(near_d) else None,
-                            "near_bx": round(near_x, 3) if math.isfinite(near_x) else None,
-                            "near_by": round(near_y, 3) if math.isfinite(near_y) else None,
+                            "near_m": round(near_d, 3)
+                            if math.isfinite(near_d)
+                            else None,
+                            "near_bx": round(near_x, 3)
+                            if math.isfinite(near_x)
+                            else None,
+                            "near_by": round(near_y, 3)
+                            if math.isfinite(near_y)
+                            else None,
                             "pts": int(len(guard_pts)),
                             "mem": int(len(mem_pts)) if mem_pts is not None else 0,
                             "wp": progress.get("waypoint_index"),
@@ -3655,9 +3611,7 @@ class NavSupervisor:
                 # Apply before status / lookahead feedback so the limited twist
                 # is what we report and close the loop on.
                 cmd = self._apply_speed_zone(pose, cmd)
-                cmd = self._lift_sub_deadband(
-                    cmd, progress.get("forward_clearance_m")
-                )
+                cmd = self._lift_sub_deadband(cmd, progress.get("forward_clearance_m"))
                 progress = {
                     **progress,
                     "cmd_vx_mps": cmd.vx,
@@ -3729,7 +3683,9 @@ class NavSupervisor:
                 # Clear-nose C-space pinch (pathc=253, local_blocked=false after
                 # rc22): slow pursuit must get the same grace or stall aborts
                 # the goal while crawling a doorway.
-                elif nose_clear and path_ahead_cost >= self._local_planner_activate_cost:
+                elif (
+                    nose_clear and path_ahead_cost >= self._local_planner_activate_cost
+                ):
                     from .costmap import LETHAL
 
                     if path_ahead_cost < int(LETHAL):
@@ -3814,8 +3770,8 @@ class NavSupervisor:
                     moved = distance_m(pose, last_progress_pose)
                     closing = dist_goal < last_progress_dist - 0.01
                     translating = abs(float(cmd.vx)) >= translating_floor
-                    bearing_improved = bearing_err < last_progress_bearing - math.radians(
-                        3.0
+                    bearing_improved = (
+                        bearing_err < last_progress_bearing - math.radians(3.0)
                     )
                     turned = abs(
                         conv.normalize_angle(pose.theta - last_progress_pose.theta)
@@ -3870,11 +3826,7 @@ class NavSupervisor:
                         self._note_base_stopped()
                         self._sleep_control_period(tick_started)
                         continue
-                    if (
-                        "goaway" in msg
-                        or "unavailable" in msg
-                        or "connection" in msg
-                    ):
+                    if "goaway" in msg or "unavailable" in msg or "connection" in msg:
                         self._io_timeout_streak += 1
                         if self._io_timeout_streak >= max(
                             8, self._drive_timeout_streak

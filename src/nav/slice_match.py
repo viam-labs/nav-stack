@@ -10,6 +10,7 @@ also agree with every band that has reference data nearby.
 
 Pure Python/numpy (no ROS) so it unit-tests like conversions.py.
 """
+
 from __future__ import annotations
 
 import math
@@ -125,9 +126,7 @@ def slice_points_by_bands(
         z = points[:, 2]
         sel = points[(z >= band.z_min) & (z <= band.z_max)][:, :2]
         if max_points_per_band > 0 and sel.shape[0] > max_points_per_band:
-            idx = np.linspace(
-                0, sel.shape[0] - 1, max_points_per_band, dtype=np.int64
-            )
+            idx = np.linspace(0, sel.shape[0] - 1, max_points_per_band, dtype=np.int64)
             sel = sel[idx]
         out.append(sel)
     return out
@@ -161,9 +160,7 @@ class SliceLibrary:
                 grid.add_points(pts, pose)
         self.scans_recorded += 1
 
-    def verify(
-        self, band_points: Sequence[np.ndarray], pose: conv.Pose2D
-    ) -> Dict:
+    def verify(self, band_points: Sequence[np.ndarray], pose: conv.Pose2D) -> Dict:
         """Check whether ``pose`` is consistent with stored band geometry.
 
         Per band: skipped when the current scan has too few points there or

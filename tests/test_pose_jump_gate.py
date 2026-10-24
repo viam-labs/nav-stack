@@ -1,4 +1,5 @@
 """Unit tests for large automatic pose-jump confirmation."""
+
 from __future__ import annotations
 
 import math
@@ -75,9 +76,7 @@ def test_disagreeing_large_jump_resets_confirm():
 def test_force_bypasses_confirm():
     gate = PoseJumpGate(confirm_count=3, large_m=0.75)
     current = conv.Pose2D(0.0, 0.0, 0.0)
-    decision = gate.evaluate(
-        current, conv.Pose2D(3.0, 0.0, 0.0), force=True
-    )
+    decision = gate.evaluate(current, conv.Pose2D(3.0, 0.0, 0.0), force=True)
     assert decision.should_apply is True
     assert decision.status == "forced"
 

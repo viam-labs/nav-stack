@@ -489,22 +489,31 @@ Until a costmap is available, the camera returns a placeholder frame.
 
 ```python
 await slam.do_command({"command": "start_localizing", "map": "ground-floor"})
-await slam.do_command({"command": "set_initial_pose", "pose": {"x": 0, "y": 0, "theta": 0}})
+await slam.do_command(
+    {"command": "set_initial_pose", "pose": {"x": 0, "y": 0, "theta": 0}}
+)
 # XY roughly right but heading unknown/wrong? builtin SLAM only self-corrects
 # ~±30° of yaw — add refine to run a full-yaw seeded scan match and apply it:
-await slam.do_command({"command": "set_initial_pose",
-                       "pose": {"x": 0, "y": 0, "theta": 0}, "refine": True})
+await slam.do_command(
+    {
+        "command": "set_initial_pose",
+        "pose": {"x": 0, "y": 0, "theta": 0},
+        "refine": True,
+    }
+)
 ```
 
 If the nav-stack map is aligned with the MiR onboard map, seed from the MiR pose instead
 (continuous laser matching on the MiR side; nav-stack still needs one `/initialpose` seed):
 
 ```python
-await slam.do_command({
-    "command": "start_localizing",
-    "map": "ground-floor",
-    "use_mir_pose": True,
-})
+await slam.do_command(
+    {
+        "command": "start_localizing",
+        "map": "ground-floor",
+        "use_mir_pose": True,
+    }
+)
 # or after localizing:
 await slam.do_command({"command": "relocalize", "use_mir_pose": True})
 ```
@@ -516,11 +525,13 @@ await slam.do_command({"command": "global_localize"})
 # search the whole map when pose is unknown:
 await slam.do_command({"command": "global_localize", "full_map": True})
 # narrow search around a rough guess (meters):
-await slam.do_command({
-    "command": "global_localize",
-    "pose": {"x": 1.0, "y": 2.0, "theta": 0.0},
-    "search_radius_m": 6.0,
-})
+await slam.do_command(
+    {
+        "command": "global_localize",
+        "pose": {"x": 1.0, "y": 2.0, "theta": 0.0},
+        "search_radius_m": 6.0,
+    }
+)
 # preview-only (do not publish /initialpose yet):
 await slam.do_command({"command": "global_localize", "apply": False})
 ```
@@ -556,8 +567,13 @@ DoCommand `navigate_to_point` / locations still use **meters / radians**:
 # Save the robot's current spot as "kitchen"
 await nav.do_command({"command": "add_location", "name": "kitchen"})
 # Or specify a pose (meters / radians, map frame)
-await nav.do_command({"command": "add_location", "name": "dock",
-                      "pose": {"x": 1.0, "y": 2.0, "theta": 0.0}})
+await nav.do_command(
+    {
+        "command": "add_location",
+        "name": "dock",
+        "pose": {"x": 1.0, "y": 2.0, "theta": 0.0},
+    }
+)
 
 await nav.do_command({"command": "navigate_to_location", "name": "kitchen"})
 await nav.do_command({"command": "navigate_to_point", "x": 3.5, "y": -1.0})
@@ -591,7 +607,6 @@ await nav.do_command({"command": "cancel"})
 # await nav.do_command({"command": "resume"})
 # → {"status": "navigating", "resumed": true, "target": {...}, "execution_id": "..."}
 # cancel / stop_plan / a new navigate clears any suspended goal (no resume).
-
 ```
 
 Locations CRUD: `add_location`, `get_location`, `list_locations`,
@@ -612,14 +627,24 @@ Physical obstacles are avoided automatically. Virtual zones are user-defined:
 
 ```python
 # A no-go region
-await nav.do_command({"command": "add_zone", "name": "fragile-display",
-                      "type": "keepout",
-                      "geometry": {"type": "circle", "center": [4.0, 1.5], "radius": 0.8}})
+await nav.do_command(
+    {
+        "command": "add_zone",
+        "name": "fragile-display",
+        "type": "keepout",
+        "geometry": {"type": "circle", "center": [4.0, 1.5], "radius": 0.8},
+    }
+)
 # A slow-down region (30% of max speed)
-await nav.do_command({"command": "add_zone", "name": "busy-aisle",
-                      "type": "speed_limit", "speed_pct": 30,
-                      "geometry": {"type": "polygon",
-                                   "points": [[0,0],[2,0],[2,3],[0,3]]}})
+await nav.do_command(
+    {
+        "command": "add_zone",
+        "name": "busy-aisle",
+        "type": "speed_limit",
+        "speed_pct": 30,
+        "geometry": {"type": "polygon", "points": [[0, 0], [2, 0], [2, 3], [0, 3]]},
+    }
+)
 ```
 
 Zones CRUD: `add_zone`, `get_zone`, `list_zones`, `update_zone`, `delete_zone`,

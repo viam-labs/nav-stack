@@ -1,4 +1,5 @@
 """Shared path geometry helpers for builtin nav."""
+
 from __future__ import annotations
 
 import math

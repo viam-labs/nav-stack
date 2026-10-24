@@ -1,4 +1,5 @@
 """Path-following controller built on simple_motion P-control + obstacle cone."""
+
 from __future__ import annotations
 
 import math
@@ -344,7 +345,9 @@ def drivable_min_speed(kappa: float, cfg: FollowerConfig) -> float:
     return max(_BASE_CRAWL_FLOOR_MPS, float(cfg.wheel_min_speed_mps) / denom)
 
 
-def keep_arc_drivable(cmd: DriveCommand, cfg: Optional[FollowerConfig] = None) -> DriveCommand:
+def keep_arc_drivable(
+    cmd: DriveCommand, cfg: Optional[FollowerConfig] = None
+) -> DriveCommand:
     """Keep a translating arc inside the region the base will actually execute.
 
     Obstacle slow-down scales ``vx`` toward zero; below the crawl floor the
@@ -675,9 +678,7 @@ def compute_path_command(
         cfg.approach_dist_m * 2.0,
         0.8,
     )
-    lookahead = _effective_lookahead(
-        cfg, speed_mps=est_speed, near_goal=near_goal
-    )
+    lookahead = _effective_lookahead(cfg, speed_mps=est_speed, near_goal=near_goal)
     target, idx, is_final = lookahead_pose(
         current,
         path,
@@ -830,11 +831,7 @@ def compute_path_command(
                     obstacle_state = "narrow_reverse"
     elif local_active:
         obstacle_state = "local_planner"
-        if (
-            scan is not None
-            and cfg.obstacle is not None
-            and cfg.obstacle.enabled
-        ):
+        if scan is not None and cfg.obstacle is not None and cfg.obstacle.enabled:
             forward_clearance = forward_clearance_m(scan, cfg.obstacle)
     elif (
         cfg.obstacle is not None
@@ -880,10 +877,7 @@ def compute_path_command(
         float(spin_radius_m) if spin_radius_m is not None else float(robot_radius_m)
     )
     spin_blocked = False
-    scan_spin_hit = (
-        scan is not None
-        and spin_clearance_m(scan) < spin_radius + 0.05
-    )
+    scan_spin_hit = scan is not None and spin_clearance_m(scan) < spin_radius + 0.05
     cost_spin_hit = (
         local_view is not None
         and spin_radius > float(robot_radius_m)
@@ -1021,11 +1015,7 @@ def compute_path_command(
             nose_m = float("inf")
             nose_open = True
             slow_m = stop_m + 0.35
-            if (
-                cfg.obstacle is not None
-                and cfg.obstacle.enabled
-                and scan is not None
-            ):
+            if cfg.obstacle is not None and cfg.obstacle.enabled and scan is not None:
                 half = float(cfg.obstacle.front_cone_half_rad)
                 nose_m = cone_min_range(scan, -half, half)
                 stop_lim = float(cfg.obstacle.stop_distance_m)
@@ -1100,7 +1090,9 @@ def compute_path_command(
         "path_length_m": _path_length(path),
         "obstacle": obstacle_state,
         "spin_blocked": spin_blocked,
-        "forward_clearance_m": None if math.isinf(forward_clearance) else forward_clearance,
+        "forward_clearance_m": None
+        if math.isinf(forward_clearance)
+        else forward_clearance,
         "bearing_error_rad": bearing,
         "crosstrack_m": crosstrack,
         "lookahead_m": lookahead,

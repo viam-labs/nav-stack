@@ -59,19 +59,38 @@ def test_parse_get_grid_camelcase():
 
 
 def test_parse_get_grid_snake_case_fallback():
-    resp = {"rows": 1, "cols": 2, "cell_size": 0.1, "x_min": 0.0, "y_min": 0.0, "data": [0, 0]}
+    resp = {
+        "rows": 1,
+        "cols": 2,
+        "cell_size": 0.1,
+        "x_min": 0.0,
+        "y_min": 0.0,
+        "data": [0, 0],
+    }
     assert parse_get_grid(resp)[2] == pytest.approx(0.1)
 
 
 def test_parse_get_grid_length_mismatch_returns_none():
-    resp = {"rows": 2, "cols": 3, "cellSize": 0.05, "xMin": 0, "yMin": 0, "data": [0, 0]}
+    resp = {
+        "rows": 2,
+        "cols": 3,
+        "cellSize": 0.05,
+        "xMin": 0,
+        "yMin": 0,
+        "data": [0, 0],
+    }
     assert parse_get_grid(resp) is None
 
 
 def test_parse_get_grid_malformed_returns_none():
     assert parse_get_grid({"rows": 2}) is None
     assert parse_get_grid("nope") is None
-    assert parse_get_grid({"rows": 0, "cols": 0, "cellSize": 0.05, "xMin": 0, "yMin": 0, "data": []}) is None
+    assert (
+        parse_get_grid(
+            {"rows": 0, "cols": 0, "cellSize": 0.05, "xMin": 0, "yMin": 0, "data": []}
+        )
+        is None
+    )
 
 
 def test_parse_get_grid_rejects_nonpositive_resolution():
@@ -98,7 +117,14 @@ def test_parse_get_grid_clamps_out_of_range_cells():
 
 
 def test_grid_key_stable_and_change_sensitive():
-    resp = {"rows": 2, "cols": 2, "cellSize": 0.05, "xMin": 0, "yMin": 0, "data": [0, 0, 0, 100]}
+    resp = {
+        "rows": 2,
+        "cols": 2,
+        "cellSize": 0.05,
+        "xMin": 0,
+        "yMin": 0,
+        "data": [0, 0, 0, 100],
+    }
     assert _grid_key(resp) == _grid_key(dict(resp))  # same content -> same key
     changed = {**resp, "data": [0, 0, 100, 100]}
     assert _grid_key(resp) != _grid_key(changed)  # different cells -> different key
