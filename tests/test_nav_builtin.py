@@ -398,7 +398,6 @@ def test_plan_respects_inflation_radius():
     """Lazy Theta* must not shortcut through the soft inflation halo."""
     grid = np.zeros((40, 40), dtype=np.int16)
     grid[20, 20] = 100  # pillar at map center
-    m = {"grid": grid, "resolution": 0.1, "origin_x": 0.0, "origin_y": 0.0}
     start = Pose2D(0.5, 2.0, 0.0)
     goal = Pose2D(3.5, 2.0, 0.0)
     occ = OccupancyGrid(grid=grid, resolution=0.1, origin_x=0.0, origin_y=0.0)
@@ -2211,7 +2210,7 @@ def test_try_replan_rejects_path_still_hitting_local_cost():
     )
 
 
-def test_builtin_navigator_cancel_sets_status():
+def test_open_room_replan_peels_around_bin_without_room_loop():
     """Open room: scan peels around a bin; corridor paint must not replace it
     with a room-scale loop."""
     from src.nav_builtin.controller import _path_length

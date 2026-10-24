@@ -24,7 +24,6 @@ from ..geom import conversions as conv
 from ..shm import pcshm
 from ..slam_client import parse_get_grid, slam_pose_to_pose2d
 from .viz_store import NavVizStore
-from .world_io import WorldIO
 
 
 def _abandon_future(fut: concurrent.futures.Future) -> None:
@@ -1204,8 +1203,3 @@ def _sanitize_base_cmd(
 def _is_near_zero_rpm_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return "nearly 0" in msg or "rpm that is nearly" in msg
-
-
-def _check_protocol() -> None:
-    _: WorldIO
-    del _

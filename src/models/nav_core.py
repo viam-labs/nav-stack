@@ -620,7 +620,7 @@ class NavServiceBase(Motion):
         if cmd == "get_location":
             return {"location": self._locations().get(str(command["name"])).to_dict()}
         if cmd == "list_locations":
-            return {"locations": [l.to_dict() for l in self._locations().list()]}
+            return {"locations": [loc.to_dict() for loc in self._locations().list()]}
         if cmd == "update_location":
             old_name = str(command["name"])
             loc = self._locations().update(

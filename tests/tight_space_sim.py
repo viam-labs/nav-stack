@@ -79,23 +79,23 @@ class RunResult:
 
     def length_flips(self, ratio: float = 1.4) -> int:
         """Count short↔long alternations of the committed global path."""
-        lens = [l for l in self.path_lengths if l > 0]
+        lens = [length for length in self.path_lengths if length > 0]
         if len(lens) < 3:
             return 0
         flips = 0
         direction = 0
         base = lens[0]
-        for l in lens[1:]:
-            if l > base * ratio:
+        for length in lens[1:]:
+            if length > base * ratio:
                 d = 1
-            elif l < base / ratio:
+            elif length < base / ratio:
                 d = -1
             else:
                 continue
             if direction != 0 and d != direction:
                 flips += 1
             direction = d
-            base = l
+            base = length
         return flips
 
 
@@ -287,9 +287,9 @@ class RectWorld:
         n = 720
         P = self._lidar_pose()
         c, s = math.cos(P.theta), math.sin(P.theta)
-        f, l = self.lidar_offset
-        lx = P.x + c * f - s * l
-        ly = P.y + s * f + c * l
+        f, lat = self.lidar_offset
+        lx = P.x + c * f - s * lat
+        ly = P.y + s * f + c * lat
         ang = P.theta - math.pi + np.arange(n) * (2.0 * math.pi / n)
         r = np.arange(0.02, self.range_max, RES / 4.0)
         xs = lx + np.cos(ang)[:, None] * r[None, :]
@@ -324,11 +324,11 @@ class RectWorld:
 
     def _depth_points(self) -> np.ndarray:
         """Body-frame hits of the forward depth camera (truth + body-only)."""
-        f, l, fov_deg, rmin, rmax = self.depth_cam
+        f, lat, fov_deg, rmin, rmax = self.depth_cam
         P = self.pose
         c, s = math.cos(P.theta), math.sin(P.theta)
-        cx = P.x + c * f - s * l
-        cy = P.y + s * f + c * l
+        cx = P.x + c * f - s * lat
+        cy = P.y + s * f + c * lat
         half = math.radians(fov_deg) / 2.0
         ang = P.theta + np.linspace(-half, half, 160)
         r = np.arange(0.02, rmax, RES / 4.0)
@@ -435,11 +435,11 @@ class RectWorld:
         depth = self._depth_scan()
         if depth is None:
             return []
-        f, l, fov_deg, rmin, rmax = self.depth_cam
+        f, lat, fov_deg, rmin, rmax = self.depth_cam
         cam = LidarConfig(
             name="camera",
             x=f,
-            y=l,
+            y=lat,
             min_range=rmin,
             max_range=rmax,
             obstacles_only=True,

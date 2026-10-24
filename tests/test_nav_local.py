@@ -1654,51 +1654,6 @@ def test_smoothing_on_planning_costmap_keeps_detour_around_live_obstacle():
 
 
 def test_local_planner_avoids_marked_obstacle():
-    """Fat seal on path samples the local map flags must change the route."""
-    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
-
-    m = _empty_map(size=80, resolution=0.05)
-    start = Pose2D(0.5, 2.0, 0.0)
-    goal = Pose2D(3.5, 2.0, 0.0)
-    baseline = plan_path(m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
-    assert baseline.feasible
-    lc = LocalCostmap(
-        LocalCostmapConfig(
-            width_m=4.0,
-            height_m=4.0,
-            resolution=0.05,
-            inflation_radius_m=0.25,
-            robot_radius_m=0.22,
-            use_global_static=False,
-        )
-    )
-    n = 72
-    ranges = np.full(n, np.inf)
-    ranges[n // 2] = 1.0
-    scan = conv.LaserScan2D(
-        ranges,
-        angle_min=-math.pi,
-        angle_increment=2 * math.pi / n,
-        range_min=0.05,
-        range_max=10.0,
-    )
-    view = lc.update(start, scan)
-    sealed = plan_path(
-        m,
-        start,
-        goal,
-        inflation_radius_m=0.25,
-        robot_radius_m=0.22,
-        local_view=view,
-        blocked_path=baseline.path,
-        blocked_path_pose=start,
-        paint_corridor=False,
-    )
-    assert sealed.feasible, sealed.error_msg
-    assert paths_meaningfully_differ(baseline.path, sealed.path)
-
-
-def test_local_planner_avoids_marked_obstacle():
     lc = LocalCostmap(
         LocalCostmapConfig(
             width_m=2.0,

@@ -32,11 +32,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .naming import validate_name
+
 KEEPOUT = "keepout"
 SPEED_LIMIT = "speed_limit"
 ZONE_TYPES = {KEEPOUT, SPEED_LIMIT}
-
-from .naming import validate_name
 
 
 def validate_zone_name(name: str) -> str:

@@ -20,7 +20,7 @@ from src.nav_builtin.types import Pose2D
 
 def test_slam_config_single_lidar_string():
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
-    assert [l.name for l in cfg.lidars] == ["front"]
+    assert [lidar.name for lidar in cfg.lidars] == ["front"]
     assert cfg.required_dependencies() == ["b", "front"]
 
 
@@ -385,7 +385,7 @@ def test_slam_config_obstacles_only_lidar():
     )
     assert cfg.lidars[0].obstacles_only is False
     assert cfg.lidars[1].obstacles_only is True
-    assert [l.name for l in cfg.slam_lidars()] == ["rplidar"]
+    assert [lidar.name for lidar in cfg.slam_lidars()] == ["rplidar"]
     # Mapping lidar is not point_cloud-only → do not apply Livox SLAM defaults.
     assert cfg.map_when_still is False
     assert cfg.imu_odom_mode == "coast"
@@ -908,7 +908,7 @@ def test_external_nav_config_builds_bridge_and_nav():
     }
     cfg = ExternalNavConfig.from_dict(d)
     # bridge SlamConfig carries the sensor deps
-    assert [l.name for l in cfg.bridge.lidars] == ["mid360"]
+    assert [lidar.name for lidar in cfg.bridge.lidars] == ["mid360"]
     assert cfg.bridge.movement_sensor == "mid360-imu"
     # nav NavConfig carries navigation behavior + the SLAM dep name
     assert cfg.nav.slam_service == "rtabmap"

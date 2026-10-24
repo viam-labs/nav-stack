@@ -266,12 +266,12 @@ def test_apply_slam_fills_mount_when_omitted():
     cfg2, notes = apply_framesystem_to_slam_cfg(cfg, configs, raw_attrs=raw)
     assert any("Y-forward" in n for n in notes)
     assert any("rplidar" in n and "framesystem" in n for n in notes)
-    rpl = next(l for l in cfg2.lidars if l.name == "rplidar")
+    rpl = next(lidar for lidar in cfg2.lidars if lidar.name == "rplidar")
     # Y-forward → X-forward: (x,y)_v=(-0.05,0.24) → (0.24, 0.05)
     assert abs(rpl.x - 0.24) < 1e-9
     assert abs(rpl.y - 0.05) < 1e-9
     assert abs(rpl.theta) < 1e-6
-    cam = next(l for l in cfg2.lidars if l.name == "camera")
+    cam = next(lidar for lidar in cfg2.lidars if lidar.name == "camera")
     assert abs(cam.x - 0.30) < 1e-9
     assert abs(cam.y - (-0.15)) < 1e-9
     # RealSense PCD is optical; FS OV RPY is convention, not lens aim — keep

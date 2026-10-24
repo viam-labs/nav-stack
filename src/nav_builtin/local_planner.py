@@ -593,17 +593,6 @@ def compute_local_command(
         lookahead_m=cfg.path_clearance_lookahead_m,
     )
     path_blocked_ahead = ahead_cost >= cfg.activate_cost_threshold
-    block_dist = (
-        path_block_distance_m(
-            pose,
-            path,
-            view,
-            threshold=cfg.activate_cost_threshold,
-            lookahead_m=cfg.path_clearance_lookahead_m,
-        )
-        if path_blocked_ahead
-        else None
-    )
     # Costs already encode the footprint; ``robot_radius_m`` is kept for API
     # compatibility and only bounds the margin.
     collision_r = max(
