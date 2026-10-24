@@ -18,14 +18,12 @@ from ..config import (
     MODE_MAPPING,
     SlamConfig,
 )
+from ..geom import conversions as conv
 from ..nav.global_localize import OccupancyMap
 from ..nav.maps import MapStore
 from ..nav.pose_jump_gate import PoseJumpGate
-from ..geom import conversions as conv
+from . import loop_closure, persistence, scan_match
 from . import occupancy as occ
-from . import persistence
-from . import scan_match
-from . import loop_closure
 from . import pose_graph as pg
 from .io_sensors import BuiltinSensors
 from .lidar_odom import LidarOdometry

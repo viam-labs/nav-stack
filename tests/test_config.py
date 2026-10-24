@@ -3,9 +3,6 @@ import math
 import numpy as np
 import pytest
 
-from src.geom import conversions as conv
-from src.nav_builtin.types import Pose2D
-
 from src.config import (
     DIFFERENTIAL,
     OMNI,
@@ -17,6 +14,8 @@ from src.config import (
     body_vtheta_to_viam_angular_deg_s,
     sensor_twist_to_body,
 )
+from src.geom import conversions as conv
+from src.nav_builtin.types import Pose2D
 
 
 def test_slam_config_single_lidar_string():

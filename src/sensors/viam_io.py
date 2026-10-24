@@ -21,7 +21,6 @@ from ..config import (
 )
 from ..geom import conversions as conv
 from ..shm import pcshm
-from ..shm.lidar import ShmPointCloudClient
 from .io_provider import IOProvider
 
 

@@ -17,7 +17,7 @@ obstacle there would be a collision), beyond ``keep_radius_m``, or after
 from __future__ import annotations
 
 import math
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 

@@ -19,8 +19,7 @@ from ..config import (
     SlamConfig,
 )
 from ..geom import conversions as conv
-from ..shm import imushm
-from ..shm import pcshm
+from ..shm import imushm, pcshm
 
 
 def _abandon_future(fut: concurrent.futures.Future) -> None:

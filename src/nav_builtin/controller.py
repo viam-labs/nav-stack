@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ..geom import conversions as conv
 from ..nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
@@ -21,7 +22,6 @@ from ..nav.simple_motion import (
     rear_clearance_m,
     spin_clearance_m,
 )
-from ..geom import conversions as conv
 from .footprint_guard import FootprintGuard, obstacle_points
 from .local_costmap import LocalCostmapView, reverse_path_clear, spin_disc_blocked
 from .local_planner import LocalPlannerConfig, compute_local_command

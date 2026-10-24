@@ -16,7 +16,6 @@ from src.nav_builtin.costmap import OccupancyGrid
 from src.nav_builtin.planner import plan_path
 from src.nav_builtin.supervisor import NavSupervisor
 
-
 RES = 0.05
 INSCRIBED = 0.59 / 2.0
 INFLATION = INSCRIBED + 0.05

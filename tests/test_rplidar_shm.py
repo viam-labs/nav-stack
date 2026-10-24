@@ -8,9 +8,9 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from src.geom import conversions as conv
 from src.lidar import rplidar_protocol as proto
 from src.lidar.rplidar_serial import RPLidarSerial
-from src.geom import conversions as conv
 from src.shm import pcshm
 from src.shm.lidar import ShmPointCloudClient
 

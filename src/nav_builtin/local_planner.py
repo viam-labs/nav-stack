@@ -8,11 +8,11 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from ..nav.simple_motion import DriveCommand, apply_velocity_floor
 from ..geom import conversions as conv
-from .path_utils import closest_point_on_path
+from ..nav.simple_motion import DriveCommand, apply_velocity_floor
 from .costmap import is_traversable
 from .local_costmap import LocalCostmapView, footprint_collides, max_cost_along_segment
+from .path_utils import closest_point_on_path
 from .types import Path2D, Pose2D
 
 # Set to a dict (tests / offline debugging) to capture per-tick scoring.

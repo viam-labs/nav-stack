@@ -143,8 +143,8 @@ def mark_path_block_from_local(
     (``same route``). Marking the blocked *path samples* with a fat disk forces
     a real peel.
     """
-    from .path_utils import closest_point_on_path
     from .local_costmap import max_cost_along_segment
+    from .path_utils import closest_point_on_path
 
     pts = path.points
     if len(pts) < 2:

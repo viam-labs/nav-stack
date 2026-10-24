@@ -19,7 +19,6 @@ import asyncio
 from typing import ClassVar, Mapping, Optional, Sequence
 
 from typing_extensions import Self
-
 from viam.components.camera import Camera
 from viam.logging import getLogger
 from viam.media.video import CameraMimeType, NamedImage, ViamImage
@@ -31,13 +30,13 @@ from viam.resource.types import Model, ModelFamily
 from viam.utils import struct_to_dict
 
 from ..config import NavCameraConfig
+from ..runtime import get_nav_view
 from ..viz.nav_view import (
     NavViewOptions,
     legend_text,
     placeholder_png,
     render_nav_view,
 )
-from ..runtime import get_nav_view
 
 LOGGER = getLogger(__name__)
 

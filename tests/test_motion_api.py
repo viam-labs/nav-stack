@@ -17,8 +17,8 @@ from viam.proto.service.motion import PlanState
 from viam.services.motion import Motion
 
 from src.config import NavConfig
-from src.models.navigation import NavigationService, _nav_status_to_plan_state
 from src.geom.conversions import Pose2D, viam_pose_to_pose2d
+from src.models.navigation import NavigationService, _nav_status_to_plan_state
 
 
 def test_nav_status_to_plan_state_mapping():

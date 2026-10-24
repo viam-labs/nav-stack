@@ -7,6 +7,7 @@ import math
 import numpy as np
 import pytest
 
+from src.geom import conversions as conv
 from src.nav_builtin.controller import (
     FollowerConfig,
     compute_path_command,
@@ -24,7 +25,6 @@ from src.nav_builtin.costmap import (
     nearest_free_pose,
 )
 from src.nav_builtin.navigator import BuiltinNavigator
-from src.nav_builtin.supervisor import NavSupervisor, yaw_align_give_up
 from src.nav_builtin.planner import (
     connect_plan_start,
     path_blocked,
@@ -32,8 +32,8 @@ from src.nav_builtin.planner import (
     plan_on_costmap,
     plan_path,
 )
+from src.nav_builtin.supervisor import NavSupervisor, yaw_align_give_up
 from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
-from src.geom import conversions as conv
 
 
 def _empty_map(size: int = 40, resolution: float = 0.05) -> dict:
@@ -119,7 +119,7 @@ def test_plan_start_next_to_live_obstacle_stays_feasible():
 
 def test_plan_path_avoids_keepout_mask():
     """Keepout cells are lethal for planning — path must detour around them."""
-    from src.nav.zones import Zone, KEEPOUT, rasterize_for_map
+    from src.nav.zones import KEEPOUT, Zone, rasterize_for_map
 
     m = _empty_map(size=80, resolution=0.05)
     start = Pose2D(0.5, 2.0, 0.0)
@@ -779,8 +779,8 @@ def test_plan_fails_when_goal_in_lethal():
 
 def test_plan_rejects_large_goal_snap():
     """Live inflation must not silently move the goal a metre away."""
-    from src.nav_builtin.planner import plan_on_costmap
     from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav_builtin.planner import plan_on_costmap
 
     m = _empty_map(size=60, resolution=0.1)
     # Block a wide region around the requested goal so nearest free is far.
@@ -798,8 +798,8 @@ def test_plan_rejects_large_goal_snap():
 
 def test_plan_start_snap_never_jumps_through_obstacle():
     """Start sealed in a dead-end corridor must fail, not snap past the plug."""
-    from src.nav_builtin.planner import plan_on_costmap
     from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav_builtin.planner import plan_on_costmap
 
     grid = np.full((40, 120), 100, dtype=np.int16)
     grid[18:23, 5:115] = 0  # 0.25 m corridor: robot centre cells are inscribed
@@ -822,8 +822,8 @@ def test_plan_does_not_double_inflate_goal_snap():
     from the nearest free cell. Re-checking a full 0.40 m disc demanded ~0.65 m
     of snap and rejected the plan (live: dock2, 0.55 m > 0.50 m).
     """
-    from src.nav_builtin.planner import plan_on_costmap
     from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav_builtin.planner import plan_on_costmap
 
     grid = np.zeros((80, 80), dtype=np.int16)
     grid[:, 0:2] = 100  # wall along x≈0

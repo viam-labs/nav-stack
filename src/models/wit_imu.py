@@ -19,7 +19,6 @@ import time
 from typing import Any, ClassVar, Dict, Mapping, Optional, Sequence, Tuple
 
 from typing_extensions import Self
-
 from viam.components.movement_sensor import MovementSensor
 from viam.logging import getLogger
 from viam.proto.app.robot import ComponentConfig
@@ -33,7 +32,6 @@ from viam.utils import struct_to_dict
 from ..imu.wit_protocol import (
     ALGORITHMS,
     GYRO_STILL_THRESHOLD_MAX_DPS,
-    WitError,
     WitSample,
 )
 from ..imu.wit_serial import WitSerial

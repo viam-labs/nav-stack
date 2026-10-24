@@ -9,6 +9,7 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
+from ..geom import conversions as conv
 from .costmap import (
     INSCRIBED,
     LETHAL,
@@ -25,11 +26,10 @@ from .costmap import (
     nearest_free_pose,
     occupancy_from_map_dict,
 )
-from .path_utils import closest_point_on_path
 from .local_costmap import LocalCostmapView, overlay_local_costs_on_costmap
 from .local_planner import path_cost_ahead
+from .path_utils import closest_point_on_path
 from .types import OccupancyGrid, Path2D, PlanResult, Pose2D
-from ..geom import conversions as conv
 
 PLANNER_ASTAR = "astar"
 PLANNER_LAZY_THETA = "lazy_theta_star"

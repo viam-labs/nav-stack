@@ -1,9 +1,9 @@
 import pytest
 
+from src.nav import zones as zmod
 from src.nav.locations import LocationStore
 from src.nav.maps import MapStore
 from src.nav.routes import RouteStore
-from src.nav import zones as zmod
 from src.nav.zones import ZoneStore
 
 

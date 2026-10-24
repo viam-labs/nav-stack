@@ -12,12 +12,11 @@ from src.config import (
     SLAM_BACKEND_BUILTIN,
     SlamConfig,
 )
-from src.nav.maps import MapStore
-from src.nav_builtin.viam_io import map_dict_to_get_grid, get_grid_response_to_map
 from src.geom import conversions as conv
+from src.nav.maps import MapStore
+from src.nav_builtin.viam_io import get_grid_response_to_map, map_dict_to_get_grid
 from src.slam_builtin import occupancy as occ
-from src.slam_builtin import persistence
-from src.slam_builtin import scan_match
+from src.slam_builtin import persistence, scan_match
 from src.slam_builtin.engine import BuiltinSlamEngine
 from src.slam_builtin.host import BuiltinSlamHost
 

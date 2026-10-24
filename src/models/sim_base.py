@@ -10,7 +10,6 @@ import asyncio
 from typing import Any, ClassVar, Dict, Mapping, Optional, Sequence
 
 from typing_extensions import Self
-
 from viam.components.base import Base, Vector3
 from viam.logging import getLogger
 from viam.proto.app.robot import ComponentConfig

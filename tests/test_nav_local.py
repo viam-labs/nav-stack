@@ -7,6 +7,7 @@ import math
 import numpy as np
 import pytest
 
+from src.geom import conversions as conv
 from src.nav.simple_motion import DriveCommand, rear_clearance_m
 from src.nav_builtin.controller import FollowerConfig, compute_path_command
 from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
@@ -19,7 +20,6 @@ from src.nav_builtin.local_costmap import (
 from src.nav_builtin.local_planner import LocalPlannerConfig, compute_local_command
 from src.nav_builtin.smoother import smooth_path
 from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
-from src.geom import conversions as conv
 
 
 def _empty_map(size: int = 40, resolution: float = 0.05) -> dict:
@@ -246,10 +246,10 @@ def test_spin_gate_uses_persisted_costmap_when_scan_is_clear():
 
 def test_spin_gate_does_not_crawl_forward_into_costmap_disc():
     """clear+spin_block prefers reverse when the (extra) spin disc is occupied."""
+    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
     from src.nav_builtin.costmap import INSCRIBED
     from src.nav_builtin.local_costmap import LocalCostmapView
     from src.nav_builtin.types import OccupancyGrid
-    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
 
     res = 0.05
     h = w = 80
@@ -1071,10 +1071,10 @@ def test_costmap_hard_stop_reverses_when_spin_disc_clear():
     Live rc26: bearing≈0, spin_blocked=false, nose clear, rear open — hard-stop
     only attempted reverse when the spin disc was also hit, so cmd stayed 0.
     """
+    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
     from src.nav_builtin.costmap import INSCRIBED
     from src.nav_builtin.local_costmap import LocalCostmapView
     from src.nav_builtin.types import OccupancyGrid
-    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
 
     res = 0.05
     h = w = 80
@@ -1143,10 +1143,10 @@ def test_costmap_hard_stop_crawls_when_reverse_refused_and_nose_open():
     Live rc25: spin-gate crawled, then hard-stop re-zeroed every tick because
     reverse was refused — avoid + spin_blocked + pathc=0 forever.
     """
+    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
     from src.nav_builtin.costmap import INSCRIBED
     from src.nav_builtin.local_costmap import LocalCostmapView
     from src.nav_builtin.types import OccupancyGrid
-    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
 
     res = 0.05
     h = w = 80
@@ -1219,10 +1219,10 @@ def test_costmap_hard_stop_crawls_when_reverse_refused_and_nose_open():
 
 def test_unstick_reverse_refuses_costmap_rear_collision():
     """Lidar rear can look open while local costs already block reverse."""
+    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
     from src.nav_builtin.costmap import INSCRIBED
     from src.nav_builtin.local_costmap import LocalCostmapView
     from src.nav_builtin.types import OccupancyGrid
-    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
 
     res = 0.05
     h = w = 80
@@ -1522,7 +1522,7 @@ def test_corridor_paint_preserves_requested_goal():
 def test_plan_seals_blocked_path_samples_from_local():
     """Fat seal on path samples the local map flags must change the route."""
     from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
-    from src.nav_builtin.planner import plan_path, paths_meaningfully_differ
+    from src.nav_builtin.planner import paths_meaningfully_differ, plan_path
 
     m = {
         "grid": np.zeros((80, 80), dtype=np.int16),
@@ -1595,7 +1595,7 @@ def test_smoothing_on_planning_costmap_keeps_detour_around_live_obstacle():
     and forced vias collapsed to 'same route'."""
     from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
     from src.nav_builtin.local_planner import path_cost_in_local_window
-    from src.nav_builtin.planner import plan_path, paths_meaningfully_differ
+    from src.nav_builtin.planner import paths_meaningfully_differ, plan_path
     from src.nav_builtin.smoother import smooth_path, smooth_plan_path
 
     m = _empty_map(size=100, resolution=0.05)
@@ -1790,7 +1790,6 @@ def test_compute_path_command_defers_local_planner_when_misaligned():
 def test_costmap_hard_stop_blocks_translate_into_inscribed():
     """Lidar nose clear but costmap inscribed ahead — must not translate."""
     from src.nav.simple_motion import ObstacleConfig
-    from src.nav_builtin.costmap import LETHAL
     from src.nav_builtin.local_costmap import LocalCostmapView
     from src.nav_builtin.types import OccupancyGrid
 

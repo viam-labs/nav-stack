@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import numpy as np
 import pytest
 
+from src.geom import conversions as conv
 from src.nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
@@ -18,7 +19,6 @@ from src.nav.simple_motion import (
     heading_error_rad,
     normalize_angle,
 )
-from src.geom import conversions as conv
 
 
 def _scan_with(range_by_angle: dict, num_bins: int = 360) -> conv.LaserScan2D:

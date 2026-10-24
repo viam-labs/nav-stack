@@ -19,7 +19,6 @@ import time
 from typing import ClassVar, Mapping, Optional, Sequence
 
 from typing_extensions import Self
-
 from viam.components.camera import Camera
 from viam.logging import getLogger
 from viam.proto.app.robot import ComponentConfig

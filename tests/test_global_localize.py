@@ -4,13 +4,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from src.geom import conversions as conv
 from src.nav.global_localize import (
     OccupancyMap,
     global_localize_scan,
     load_occupancy_from_map_dir,
     pgm_to_occupancy_grid,
 )
-from src.geom import conversions as conv
 
 
 def _asymmetric_map() -> OccupancyMap:

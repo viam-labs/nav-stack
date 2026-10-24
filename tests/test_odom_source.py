@@ -6,8 +6,8 @@ import pytest
 pytest.importorskip("viam")
 pytest.importorskip("viam.spatialmath")
 
-from viam.proto.common import GeoPoint, Orientation, Vector3
 from viam.components.movement_sensor import MovementSensor
+from viam.proto.common import GeoPoint, Orientation, Vector3
 
 from src.odom.source import (
     TypedMovementSensorOdom,

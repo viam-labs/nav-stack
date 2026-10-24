@@ -1,7 +1,7 @@
-from pathlib import Path
 import asyncio
 import math
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -10,9 +10,9 @@ from src.config import MODE_LOCALIZING, MODE_MAPPING, SlamConfig
 
 pytest.importorskip("viam")
 
+from src.geom import conversions as conv
 from src.models.slam import SlamService
 from src.nav.maps import MapStore
-from src.geom import conversions as conv
 
 
 def test_get_status_includes_diagnostics_and_sensor_probe(tmp_path: Path):

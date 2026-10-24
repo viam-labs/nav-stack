@@ -5,13 +5,13 @@ from __future__ import annotations
 import math
 import threading
 import time
-
-import numpy as np
 from collections import deque
 from typing import Any, Optional
 
+import numpy as np
+
 from ..config import NavConfig
-from .runtime_kwargs import builtin_nav_runtime_kwargs
+from ..geom import conversions as conv
 from ..nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
@@ -22,15 +22,14 @@ from ..nav.simple_motion import (
     spin_clearance_m,
 )
 from ..nav.zones import apply_speed_zone_limit
-from ..geom import conversions as conv
+from .above_cart import AboveCartMemory, above_cart_frames
 from .controller import (
     FollowerConfig,
     compute_path_command,
-    lookahead_pose,
     limit_twist_rate,
+    lookahead_pose,
     update_speed_estimate,
 )
-from .above_cart import AboveCartMemory, above_cart_frames
 from .depth_memory import DepthObstacleMemory, depth_frames
 from .footprint_guard import (
     FootprintGuard,
@@ -48,17 +47,16 @@ from .local_costmap import (
 )
 from .local_planner import LocalPlannerConfig
 from .planner import (
+    connect_plan_start,
     path_blocked,
-    path_blocked_local,
     path_blocked_on_costmap,
     paths_meaningfully_differ,
     plan_path,
-    connect_plan_start,
 )
+from .runtime_kwargs import builtin_nav_runtime_kwargs
 from .smoother import smooth_path, smooth_plan_path
 from .types import NavStatus, Path2D, PlanResult, Pose2D
 from .world_io import WorldIO
-
 
 _BLOCKED_REPLAN_FAIL_LIMIT = 8
 # After a blocked-nose replan fails, turn this far (then replan) when the
@@ -1089,9 +1087,6 @@ class NavSupervisor:
 
         from .loc_consistency import (
             loc_blocks_forward,
-            residual_is_lost,
-            slam_pose_is_trusted,
-            small_local_match_worth_applying,
         )
 
         verdict = self._measure_loc_disagreement(pose)

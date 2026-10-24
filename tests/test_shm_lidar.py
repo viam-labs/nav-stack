@@ -9,8 +9,8 @@ import pytest
 pytest.importorskip("viam")
 
 from src.config import SlamConfig
-from src.shm import pcshm
 from src.sensors.viam_io import build_io_provider
+from src.shm import pcshm
 from src.shm.lidar import ShmPointCloudClient
 
 _MIN_PCD = (
