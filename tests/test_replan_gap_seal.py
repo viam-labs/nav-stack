@@ -439,3 +439,90 @@ def test_static_plan_uses_doorway_but_scan_replan_takes_long_detour():
     )
     assert painted_len > 20.0, f"expected long detour, got {painted_len:.1f} m"
     assert max(p[0] for p in pts) > WALL_END - 1.0
+
+
+def test_defer_periodic_replan_while_the_scan_can_continue():
+    """An inscribed corridor must not zero the base for another failed search."""
+    defer = NavSupervisor._defer_periodic_replan
+    assert defer(
+        static_blocked=True,
+        nose_clear=True,
+        corridor_open=False,
+        pose_jumped=False,
+        osc_replan=False,
+        spin_rock=False,
+        backup_exhausted=False,
+    )
+    assert defer(
+        static_blocked=True,
+        nose_clear=False,
+        corridor_open=True,
+        pose_jumped=False,
+        osc_replan=False,
+        spin_rock=False,
+        backup_exhausted=False,
+    )
+    assert not defer(
+        static_blocked=True,
+        nose_clear=True,
+        corridor_open=True,
+        pose_jumped=True,
+        osc_replan=False,
+        spin_rock=False,
+        backup_exhausted=False,
+    )
+    assert not defer(
+        static_blocked=True,
+        nose_clear=False,
+        corridor_open=False,
+        pose_jumped=False,
+        osc_replan=False,
+        spin_rock=False,
+        backup_exhausted=False,
+    )
+    assert not defer(
+        static_blocked=False,
+        nose_clear=True,
+        corridor_open=True,
+        pose_jumped=False,
+        osc_replan=True,
+        spin_rock=False,
+        backup_exhausted=False,
+    )
+
+
+def test_small_corridor_yaw_steers_while_moving():
+    """A few degrees is an arc. A heading the arc cannot enter is a spin."""
+    from src.geom.conversions import points_to_scan
+    from src.nav_builtin.footprint_guard import FootprintGuard, GuardConfig
+
+    sup = NavSupervisor.__new__(NavSupervisor)
+    sup._guard = FootprintGuard(
+        GuardConfig(length_m=0.72, width_m=0.59, padding_m=0.07)
+    )
+    pose = Pose2D(0.0, 0.0, 0.0)
+    # Walls beside the robot, nothing on the nose.
+    angs = np.radians(np.concatenate([np.arange(40, 80, 4), np.arange(-80, -40, 4)]))
+    walls = np.stack([2.5 * np.cos(angs), 2.5 * np.sin(angs)], axis=1)
+    open_scan = points_to_scan(walls, range_min=0.05, range_max=8.0)
+    open_scan.capture_pose = pose
+    cmd, label = sup._corridor_motion(pose, open_scan, math.radians(4.0))
+    assert label == "corridor"
+    assert cmd.vx > 0.05
+    assert cmd.vtheta > 0.0
+
+    # Something sitting on the nose: the arc is not drivable.
+    xs = np.linspace(0.40, 0.55, 8)
+    ys = np.linspace(-0.25, 0.25, 12)
+    xx, yy = np.meshgrid(xs, ys)
+    blob = np.stack([xx.ravel(), yy.ravel()], axis=1)
+    blocked = points_to_scan(blob, range_min=0.05, range_max=8.0)
+    blocked.capture_pose = pose
+    cmd, label = sup._corridor_motion(pose, blocked, math.radians(4.0))
+    assert label == "yaw_open"
+    assert cmd.vx == 0.0
+    assert cmd.vtheta > 0.0
+
+    cmd, label = sup._corridor_motion(pose, open_scan, math.radians(30.0))
+    assert label == "yaw_open"
+    assert cmd.vx == 0.0

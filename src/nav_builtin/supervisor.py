@@ -65,11 +65,15 @@ _BLOCKED_REPLAN_FAIL_LIMIT = 8
 _NOSE_UNSTICK_YAW_RAD = 0.8
 _NOSE_UNSTICK_YAW_RATE = 0.45
 # Nose blocked, but some heading within 90° has a clear body-width corridor
-# on the raw scan. Yaw in place onto the one nearest the path, then plan.
-# The straight-line goal can sit behind the obstacle while the route is open
-# the other way. Any residual heading is a spin, not an arc: creeping while
-# still aimed at the obstacle is what the footprint guard then zeroes.
+# on the raw scan. Prefer the path heading: the straight-line goal can sit
+# behind the obstacle while the route is open the other way.
+# Nav2 regulated pure pursuit only rotates in place above
+# rotate_to_heading_min_angle (~45°). A few degrees is closed while
+# translating. In-place only once the opening is far enough that a creep
+# would sweep the nose across the wall; a touching nose still spins,
+# because that arc is what the footprint guard zeroes.
 _CORRIDOR_ALIGN_RAD = math.radians(3.0)
+_CORRIDOR_SPIN_RAD = math.radians(20.0)
 _CORRIDOR_MIN_TRAVEL_M = 0.8
 _CORRIDOR_MAX_YAW_RAD = math.radians(90.0)
 _CORRIDOR_DRIVE_MPS = 0.15
@@ -1588,6 +1592,65 @@ class NavSupervisor:
         return conv.normalize_angle(
             math.atan2(goal.y - pose.y, goal.x - pose.x) - pose.theta
         )
+
+    def _corridor_motion(
+        self,
+        pose: Pose2D,
+        scan: Optional[conv.LaserScan2D],
+        yaw: float,
+    ) -> tuple[DriveCommand, str]:
+        """Twist that takes the scan corridor without a full stop when it can.
+
+        A few degrees is a creep with yaw, the way Nav2 regulated pure
+        pursuit closes a carrot bearing under ~45°. The arc is checked on
+        the raw scan; if the nose is already touching, fall back to an
+        in-place spin so the guard does not zero the command.
+        """
+        sign = math.copysign(1.0, yaw if abs(yaw) > 1e-6 else 1.0)
+        spin = DriveCommand(0.0, 0.0, sign * _NOSE_UNSTICK_YAW_RATE, False)
+        if abs(yaw) < _CORRIDOR_ALIGN_RAD:
+            return DriveCommand(_CORRIDOR_DRIVE_MPS, 0.0, 0.0, False), "corridor"
+        if abs(yaw) >= _CORRIDOR_SPIN_RAD:
+            return spin, "yaw_open"
+        w = math.copysign(min(0.35, max(0.12, abs(yaw) / 0.5)), yaw)
+        arc = DriveCommand(_CORRIDOR_DRIVE_MPS, 0.0, w, False)
+        guard = self._guard
+        if guard is None or scan is None:
+            return arc, "corridor"
+        pts = obstacle_points(
+            pose, scan, None, radius_m=guard.cfg.obstacle_radius_m
+        )
+        free = guard.free_distance(
+            pose, arc.vx, arc.vtheta, pts, guard.cfg.horizon_m
+        )
+        if guard._regulate(arc.vx, free) >= 0.05:
+            return arc, "corridor"
+        return spin, "yaw_open"
+
+    @staticmethod
+    def _defer_periodic_replan(
+        *,
+        static_blocked: bool,
+        nose_clear: bool,
+        corridor_open: bool,
+        pose_jumped: bool,
+        osc_replan: bool,
+        spin_rock: bool,
+        backup_exhausted: bool,
+    ) -> bool:
+        """Skip a blocking global replan the scan can already drive through.
+
+        Nav2's controller keeps publishing velocity while ComputePathToPose
+        fails. An inscribed centerline stays ``static_blocked`` for a whole
+        corridor, and zeroing the base for that search every second is the
+        start/stop. Still replan on a pose jump, a rock, or a real stuck
+        nose with no scan opening.
+        """
+        if not static_blocked:
+            return False
+        if pose_jumped or osc_replan or spin_rock or backup_exhausted:
+            return False
+        return bool(nose_clear) or bool(corridor_open)
 
     def _published_pose_misregistered(self) -> bool:
         """Map walls are at the wrong place: a large scan match was refused."""
@@ -3283,7 +3346,23 @@ class NavSupervisor:
                 # (or a full inflate fallback) runs on every subsequent tick.
                 if replan_due and not should_replan:
                     last_replan = now
-                if should_replan:
+                if should_replan and self._defer_periodic_replan(
+                    static_blocked=static_blocked,
+                    nose_clear=nose_clear,
+                    corridor_open=corridor_yaw is not None,
+                    pose_jumped=pose_jumped,
+                    osc_replan=osc_replan,
+                    spin_rock=spin_rock,
+                    backup_exhausted=backup_exhausted,
+                ):
+                    # Keep the controller running. The search this would
+                    # start has been returning "no feasible path" and the
+                    # stop is the whole stutter.
+                    last_replan = now
+                    self._last_replan_trigger = (
+                        "deferred static_blocked; scan can continue"
+                    )
+                elif should_replan:
                     # On static/pose-jump recovery, accept any feasible plan —
                     # require_different would reject a valid near-identical route
                     # and count it as "replan failed".
@@ -3359,28 +3438,18 @@ class NavSupervisor:
                 # this yaw as "wait" and the inflated spin disc then zeroes it.
                 if corridor_yaw is not None and not loc_hold_motion:
                     nose_unstick_yaw_sign = math.copysign(1.0, corridor_yaw)
-                    if abs(corridor_yaw) >= _CORRIDOR_ALIGN_RAD:
-                        w = math.copysign(_NOSE_UNSTICK_YAW_RATE, corridor_yaw)
-                        cmd = DriveCommand(0.0, 0.0, w, False)
+                    # A moving pursuit command already closes a sub-3° error.
+                    # Replace it when the opening is off the nose, or when
+                    # the command has already stopped.
+                    if abs(corridor_yaw) >= _CORRIDOR_ALIGN_RAD or cmd.vx < 0.05:
+                        cmd, label = self._corridor_motion(pose, scan, corridor_yaw)
                         progress = {
                             **progress,
-                            "obstacle": "yaw_open",
-                            "local_planner": False,
-                            "corridor_yaw_rad": round(float(corridor_yaw), 3),
-                            "cmd_vx_mps": 0.0,
-                            "cmd_vtheta_rad_s": w,
-                        }
-                    elif cmd.vx < 0.05:
-                        # Already on the open heading. Drive straight; a yaw
-                        # here is an arc and the guard zeroes it against the nose.
-                        cmd = DriveCommand(_CORRIDOR_DRIVE_MPS, 0.0, 0.0, False)
-                        progress = {
-                            **progress,
-                            "obstacle": "corridor",
+                            "obstacle": label,
                             "local_planner": False,
                             "corridor_yaw_rad": round(float(corridor_yaw), 3),
                             "cmd_vx_mps": cmd.vx,
-                            "cmd_vtheta_rad_s": 0.0,
+                            "cmd_vtheta_rad_s": cmd.vtheta,
                         }
                 if loc_hold_motion:
                     cmd = DriveCommand(0.0, 0.0, 0.0, False)
