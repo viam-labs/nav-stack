@@ -99,6 +99,24 @@ def _localization_hold_provider(slam_service_name: str):
     return _get
 
 
+def _localization_check_provider(slam_service_name: str):
+    """Latest scan match, including a large jump that was not applied."""
+
+    def _get():
+        svc = get_slam_service(slam_service_name)
+        if svc is not None:
+            check = getattr(svc, "_last_relocalize_check", None)
+            if isinstance(check, dict) and check.get("status"):
+                return dict(check)
+        rt = get_slam(slam_service_name)
+        check = getattr(rt, "localization_check", None) if rt is not None else None
+        if isinstance(check, dict) and check.get("status") not in (None, "", "idle"):
+            return dict(check)
+        return None
+
+    return _get
+
+
 def _in_process_map_provider(slam_service_name: str):
     """Sync occupancy dict from the current SLAM host (re-resolves each call)."""
 
@@ -207,6 +225,7 @@ class NavigationService(NavServiceBase):
             pose_provider=_sync_slam_pose_provider(cfg.slam_service),
             map_provider=_in_process_map_provider(cfg.slam_service),
             localization_hold_provider=_localization_hold_provider(cfg.slam_service),
+            localization_check_provider=_localization_check_provider(cfg.slam_service),
             scan_provider=(
                 (lambda max_age_s, s=slam_rt.sim_sensors: s.get_scan(max_age_s))
                 if slam_rt.sim_sensors is not None

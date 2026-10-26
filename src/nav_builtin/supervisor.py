@@ -1589,6 +1589,19 @@ class NavSupervisor:
             math.atan2(goal.y - pose.y, goal.x - pose.x) - pose.theta
         )
 
+    def _published_pose_misregistered(self) -> bool:
+        """Map walls are at the wrong place: a large scan match was refused."""
+        from .loc_consistency import published_pose_misregistered
+
+        getter = getattr(self._world, "get_localization_check", None)
+        if not callable(getter):
+            return False
+        try:
+            check = getter()
+        except Exception:  # noqa: BLE001 - a status read must not stop the tick
+            return False
+        return published_pose_misregistered(check)
+
     @staticmethod
     def _bumper_spin_reverse(
         *,
@@ -2367,6 +2380,10 @@ class NavSupervisor:
                 nose_clear = True
                 forward_clearance_m: Optional[float] = None
                 guard_pts = None
+                # A refused multi-meter / large-yaw match leaves the static map
+                # on top of open floor. Judge the body against the scan.
+                map_untrusted = self._published_pose_misregistered()
+                collision_view = None if map_untrusted else local_view
                 obs_cfg = self._follower.obstacle
                 if self._guard is not None:
                     # Nose = can the rectangle move forward at all (straight
@@ -2374,7 +2391,7 @@ class NavSupervisor:
                     guard_pts = obstacle_points(
                         pose,
                         scan,
-                        local_view,
+                        collision_view,
                         radius_m=self._guard.cfg.obstacle_radius_m,
                         extra=mem_pts,
                     )
@@ -2419,6 +2436,10 @@ class NavSupervisor:
                         nose_clear=nose_clear,
                         forward_clearance_m=forward_clearance_m,
                     )
+                    # Inscribed or lethal map cost at a pose the scan rejected
+                    # is the phantom wall. A clear scan nose is not a block.
+                    if map_untrusted and nose_clear:
+                        local_blocked = False
                 # Reactive avoid spinning with a clear-looking path still means
                 # the robot cannot proceed — escalate to the blocked/replan path.
                 # Exception: path centerline free — a side/corridor phantom
@@ -2508,13 +2529,10 @@ class NavSupervisor:
                         corridor_yaw = self._corridor_escape_yaw(
                             pose, scan, goal, path
                         )
-                    # Still aimed at the obstacle: yaw onto the open heading
-                    # before another plan from this pose. An arc here clips.
-                    if (
-                        corridor_yaw is not None
-                        and abs(corridor_yaw) >= _CORRIDOR_ALIGN_RAD
-                        and action == "replan"
-                    ):
+                    # An open scan heading is a way through. A global replan
+                    # here only found ~48 m loops and held the wheels at zero
+                    # until the goal timed out. Yaw or drive the corridor first.
+                    if corridor_yaw is not None and action == "replan":
                         action = "wait"
                     if action == "wait":
                         waiting_for_clear = True
@@ -2618,7 +2636,7 @@ class NavSupervisor:
                     cfg=self._follower,
                     scan=scan,
                     speed_mps=self._last_cmd_vx,
-                    local_view=local_view,
+                    local_view=collision_view,
                     local_planner=self._local_planner if allow_local_planner else None,
                     robot_radius_m=self._robot_radius,
                     spin_radius_m=self._spin_radius,
@@ -2661,6 +2679,7 @@ class NavSupervisor:
                         else {}
                     ),
                     "nose_clear": bool(nose_clear),
+                    "map_pose_untrusted": bool(map_untrusted),
                     "above_cart": (
                         int(len(self._above_memory))
                         if self._above_memory is not None
@@ -3588,6 +3607,7 @@ class NavSupervisor:
                             "failed_replan_while_blocked",
                             "last_replan_error",
                             "nose_clear",
+                            "map_pose_untrusted",
                             "spin_blocked",
                             "local_replan_cooldown_s",
                             "forward_clearance_m",

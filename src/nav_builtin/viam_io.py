@@ -113,6 +113,7 @@ class ViamWorldIO:
         map_provider: Optional[Callable[[], Optional[dict]]] = None,
         scan_provider: Optional[Callable[[float], Optional[conv.LaserScan2D]]] = None,
         localization_hold_provider: Optional[Callable[[], Optional[dict]]] = None,
+        localization_check_provider: Optional[Callable[[], Optional[dict]]] = None,
     ):
         self._slam = slam
         self._base = base
@@ -138,6 +139,7 @@ class ViamWorldIO:
         self._map_provider = map_provider
         self._scan_provider = scan_provider
         self._localization_hold_provider = localization_hold_provider
+        self._localization_check_provider = localization_check_provider
         self._zone_masks = None  # optional ZoneMaskPublisher from BuiltinNavHost
         self._skip_get_laser_scan: set[str] = set()
         self._map_cache: Optional[dict] = None
@@ -1107,6 +1109,16 @@ class ViamWorldIO:
         except Exception:  # noqa: BLE001 - never block drive on status read
             return None
         return hold if isinstance(hold, dict) else None
+
+    def get_localization_check(self) -> Optional[dict]:
+        provider = self._localization_check_provider
+        if provider is None:
+            return None
+        try:
+            check = provider()
+        except Exception:  # noqa: BLE001 - never block drive on status read
+            return None
+        return check if isinstance(check, dict) else None
 
     def slam_mode(self) -> Optional[str]:
         """``mapping`` or ``localizing`` from the in-process SLAM service."""

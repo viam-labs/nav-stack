@@ -9,6 +9,7 @@ from src.nav_builtin.loc_consistency import (
     loc_blocks_forward,
     localization_looks_bad,
     match_scores_say_lost,
+    published_pose_misregistered,
     residual_is_lost,
     slam_pose_is_trusted,
     small_local_match_worth_applying,
@@ -181,6 +182,37 @@ def test_trusted_slam_pose_does_not_block_on_beam_residual():
     assert slam_pose_is_trusted(
         {**trusted, "previous_score": -0.1, "good_match": True}
     ) is False
+
+
+def test_published_pose_misregistered_on_a_refused_large_jump():
+    """The live hallway: 2.6 m / 74° refused, ray error still about a meter."""
+    refused = {
+        "status": "low_quality",
+        "corrected": False,
+        "large_jump": True,
+        "shift_m": 2.582,
+        "shift_deg": 74.0,
+        "ray_mae_m": 1.078,
+        "good_match": False,
+        "score": 0.29,
+    }
+    assert published_pose_misregistered(refused) is True
+    # Applied, or a weak score with no shift (map change): keep the map.
+    assert published_pose_misregistered({**refused, "corrected": True}) is False
+    assert (
+        published_pose_misregistered(
+            {
+                "status": "low_quality",
+                "corrected": False,
+                "large_jump": False,
+                "shift_m": 0.0,
+                "shift_deg": 0.0,
+                "ray_mae_m": 0.9,
+            }
+        )
+        is False
+    )
+    assert published_pose_misregistered(None) is False
 
 
 def test_small_local_match_worth_applying_live_dock_case():

@@ -157,6 +157,41 @@ def slam_pose_is_trusted(result: Optional[Mapping]) -> bool:
     return shift_m <= 0.25 and shift_deg <= 15.0
 
 
+def published_pose_misregistered(result: Optional[Mapping]) -> bool:
+    """True when a large scan match was refused and the pose was left in place.
+
+    Map walls are then registered to the wrong spot. A wide hallway reads as
+    a nose collision (inscribed cost, clearance equal to the nose). Collision
+    checks should follow the live scan until a correction is actually applied.
+    A weak score with no shift is map change, not this case.
+    """
+    if not isinstance(result, Mapping):
+        return False
+    if bool(result.get("corrected")):
+        return False
+    status = str(result.get("status") or "")
+    if status not in ("low_quality", "ambiguous", "refused_large"):
+        return False
+    try:
+        shift_m = abs(float(result.get("shift_m") or 0.0))
+        shift_deg = abs(float(result.get("shift_deg") or 0.0))
+        ray_mae_m = float(result.get("ray_mae_m") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not (
+        math.isfinite(shift_m)
+        and math.isfinite(shift_deg)
+        and math.isfinite(ray_mae_m)
+    ):
+        return False
+    large = (
+        bool(result.get("large_jump"))
+        or shift_m >= 0.75
+        or shift_deg >= 25.0
+    )
+    return large and ray_mae_m >= 0.45
+
+
 def loc_blocks_forward(
     verdict: LocDisagreement,
     result: Optional[Mapping] = None,

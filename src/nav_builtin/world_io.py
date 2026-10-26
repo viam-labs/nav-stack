@@ -52,6 +52,10 @@ class WorldIO(Protocol):
         """If non-None, nav must stop translating (large pose jump / loc hold)."""
         return None
 
+    def get_localization_check(self) -> Optional[dict]:
+        """Latest scan-match check, including ones that were not applied."""
+        return None
+
     def check_localization(
         self,
         *,
