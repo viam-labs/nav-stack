@@ -819,3 +819,37 @@ def test_get_scan_drops_cache_when_lidar_frames_stop():
     world._scan_cache_at = time.monotonic()  # noqa: SLF001
     held = world.get_scan(2.0)
     assert held is old
+
+
+def test_get_scan_drops_cache_when_no_lidars_configured():
+    """An empty lidar list must not keep serving a dead provider's last scan."""
+    scan = conv.points_to_scan(np.array([[2.0, 0.0]]), num_bins=16)
+    provided = {"scan": scan}
+
+    def _provider(_max_age_s: float):
+        return provided["scan"]
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[],
+        scan_provider=_provider,
+    )
+    world.get_pose = MagicMock(return_value=conv.Pose2D(0.0, 0.0, 0.0))
+    first = world.get_scan(2.0)
+    assert first is not None
+
+    provided["scan"] = None
+    world._scan_cache_at = time.monotonic() - 10.0  # noqa: SLF001
+    assert world.get_scan(2.0) is None
+    # Loc refine never falls back to the obstacle cache.
+    assert world.get_scan(2.0, include_obstacles_only=False) is None
+
+    world._scan_cache_at = time.monotonic()  # noqa: SLF001
+    # Moved past the short-horizon cache hit, so this is the no-lidar fallback.
+    world.get_pose = MagicMock(return_value=conv.Pose2D(1.0, 0.0, 0.0))
+    assert world.get_scan(2.0) is first
+    # max_age_s <= 0 asks not to expire, matching a missed lidar read.
+    world._scan_cache_at = time.monotonic() - 10.0  # noqa: SLF001
+    assert world.get_scan(0.0) is first

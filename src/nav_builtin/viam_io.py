@@ -456,6 +456,21 @@ class ViamWorldIO:
         except Exception:  # noqa: BLE001
             return None
 
+    def _reusable_scan_cache(
+        self, max_age_s: float, now: float, *, include_obstacles_only: bool
+    ) -> Optional[conv.LaserScan2D]:
+        """Last obstacle scan, only while it is still inside ``max_age_s``.
+
+        ``max_age_s <= 0`` asks not to expire the cache. Returning a scan
+        forever is how a dead lidar kept reporting 0.485 m of clearance
+        while the body drove into the wall.
+        """
+        if not include_obstacles_only or self._scan_cache is None:
+            return None
+        if max_age_s <= 0.0 or now - self._scan_cache_at <= max_age_s:
+            return self._scan_cache
+        return None
+
     def get_scan(
         self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True
     ) -> Optional[conv.LaserScan2D]:
@@ -499,7 +514,11 @@ class ViamWorldIO:
                     self._scan_cache_pose = pose
                 return provided
         if not self._lidars:
-            return self._scan_cache if include_obstacles_only else None
+            # Provider miss, or no scan source at all. Same age bound as a
+            # configured lidar that stops answering.
+            return self._reusable_scan_cache(
+                max_age_s, now, include_obstacles_only=include_obstacles_only
+            )
         primary: list[conv.LaserScan2D] = []
         depth_scans: list[conv.LaserScan2D] = []
         for lidar in self._lidars:
@@ -520,16 +539,9 @@ class ViamWorldIO:
             else:
                 primary.append(scan)
         if not primary and not depth_scans:
-            # A missed read may reuse the last scan only while it is still
-            # inside max_age. Returning it forever is how a dead lidar kept
-            # reporting 0.485 m of clearance while the body drove into the wall.
-            if (
-                include_obstacles_only
-                and self._scan_cache is not None
-                and (max_age_s <= 0.0 or now - self._scan_cache_at <= max_age_s)
-            ):
-                return self._scan_cache
-            return None
+            return self._reusable_scan_cache(
+                max_age_s, now, include_obstacles_only=include_obstacles_only
+            )
         if not include_obstacles_only or not depth_scans:
             if not primary:
                 # Lidar-only was requested but no primary lidar answered —
