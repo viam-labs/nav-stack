@@ -137,11 +137,22 @@ def _localized(status: Mapping[str, Any]) -> bool:
     pose = status.get("pose")
     if not isinstance(pose, dict) or "x" not in pose:
         return False
-    progress = status.get("progress") if isinstance(status.get("progress"), dict) else {}
-    if status.get("map_pose_untrusted") or progress.get("map_pose_untrusted"):
-        return False
     check = status.get("localization_check")
     if isinstance(check, dict) and check.get("status") in _UNTRUSTED_LOC:
+        return False
+    progress = status.get("progress") if isinstance(status.get("progress"), dict) else {}
+    # While a goal is running, the control loop's flag is current. After the
+    # goal ends that dict is kept (timeout, blocked replans) and would refuse
+    # every later goal even when the pose still fits the scan.
+    if status.get("active"):
+        if status.get("map_pose_untrusted") or progress.get("map_pose_untrusted"):
+            return False
+        return True
+    if status.get("map_pose_untrusted"):
+        return False
+    from ..nav_builtin.loc_consistency import published_pose_misregistered
+
+    if published_pose_misregistered(check if isinstance(check, dict) else None):
         return False
     return True
 

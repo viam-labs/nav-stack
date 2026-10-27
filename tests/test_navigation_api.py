@@ -135,6 +135,28 @@ def test_navigate_to_point_uses_meters_and_radians():
     assert status.localized is True
 
 
+def test_finished_goal_does_not_keep_the_untrusted_flag():
+    """A timeout leaves progress.map_pose_untrusted set. The pose is still published."""
+    status = status_from_dict(
+        {
+            "active": False,
+            "state": "failed",
+            "error_msg": "navigation timed out",
+            "pose": {"x": -7.8, "y": 2.4, "theta": 0.9},
+            "progress": {"map_pose_untrusted": True},
+            "localization_check": {
+                "status": "ambiguous",
+                "corrected": False,
+                "shift_m": 0.0,
+                "shift_deg": 0.0,
+                "ray_mae_m": 0.22,
+                "score": 0.83,
+            },
+        }
+    )
+    assert status.localized is True
+
+
 def test_ambiguous_check_still_has_a_pose():
     """A refused full-map peak keeps the published pose. Short nav can start."""
     status = status_from_dict(
