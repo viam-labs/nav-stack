@@ -301,7 +301,9 @@ def test_apply_match_nav_bleeds_heading_after_two_frames(monkeypatch):
     pose = engine.get_pose()
     assert pose.x == pytest.approx(0.0)
     assert pose.y == pytest.approx(0.0)
-    assert pose.theta == pytest.approx(math.radians(3.0), abs=1e-6)
+    # Prior still matches the scan, so the 6° error closes in one step
+    # instead of the 3° lost-pose bleed.
+    assert pose.theta == pytest.approx(math.radians(6.0), abs=1e-6)
 
 
 def test_apply_match_nav_steps_meter_scale_hallway_slip(monkeypatch):

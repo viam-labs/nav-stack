@@ -1647,10 +1647,18 @@ class BuiltinSlamEngine:
                     max_xy=self._NAV_LATERAL_STEP_M,
                     max_yaw=0.0,
                 )
-                yaw_step = max(
-                    -self._NAV_LATERAL_YAW_STEP,
-                    min(self._NAV_LATERAL_YAW_STEP, dyaw),
-                )
+                # A pose that already fits the scan can close the heading at
+                # the idle step (8°). A lost pose stays on the 3° bleed so a
+                # weak hallway peak cannot yaw the robot into the next corridor.
+                # The spin cutoff is unchanged: a smeared scan is not applied.
+                yaw_cap = self._NAV_LATERAL_YAW_STEP
+                trusted_prior = float(self._last_prior_score)
+                if (
+                    math.isfinite(trusted_prior)
+                    and trusted_prior >= self._NAV_TRACK_MIN_PRIOR
+                ):
+                    yaw_cap = self._SMALL_CORRECTION_RAD
+                yaw_step = max(-yaw_cap, min(yaw_cap, dyaw))
                 self._pose = conv.Pose2D(
                     pose.x,
                     pose.y,
