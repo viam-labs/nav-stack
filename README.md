@@ -10,8 +10,8 @@ This module (`viam-labs:nav-stack`) provides:
 | Model | API | Purpose |
 | --- | --- | --- |
 | `viam-labs:nav-stack:slam` | `rdk:service:slam` | Builtin occupancy mapping + localization. |
-| `viam-labs:nav-stack:navigation` | `rdk:service:motion` | Builtin MoveOnMap. Named locations, zones, `go_to_*` via `DoCommand`. |
-| `viam-labs:nav-stack:navigation-external` | `rdk:service:motion` | Same Motion + DoCommand surface against **any** `rdk:service:slam`. |
+| `viam-labs:nav-stack:navigation` | `rdk:service:navigation` | Locations, routes, zones, planned navigation, and direct go-to. |
+| `viam-labs:nav-stack:navigation-external` | `rdk:service:navigation` | Same Navigation service against **any** `rdk:service:slam`. |
 | `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders costmap + plan(s), pose, footprint and goal as a live camera image. |
 | `viam-labs:nav-stack:sim-base` | `rdk:component:base` | Simulated base for hardware-free mapping / nav (`SetVelocity` → raycast world). |
 | `viam-labs:nav-stack:rplidar` / `wit-imu` / `shm-pointcloud` | camera / movement_sensor | Optional sensor helpers with POSIX shm for low-latency reads. |
@@ -255,13 +255,16 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
 
 ### Navigation service
 
-**Breaking change:** both navigation models are now `rdk:service:motion` (previously
-`rdk:service:generic`). Update robot configs accordingly; attributes are unchanged.
+**Breaking change:** both navigation models are `rdk:service:navigation` (previously
+`rdk:service:motion`). Update robot configs accordingly; attributes are unchanged.
+`DoCommand` still accepts the meters/radians payloads in
+`docs/navigation-docommands.md`. Prefer the typed Navigation methods for
+locations, routes, zones, and motion.
 
 ```json
 {
   "name": "nav",
-  "api": "rdk:service:motion",
+  "api": "rdk:service:navigation",
   "model": "viam-labs:nav-stack:navigation",
   "attributes": {
     "slam_service": "slam",
@@ -283,31 +286,29 @@ For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a
 }
 ```
 
-#### MoveOnMap (Motion API)
+#### Navigation API
 
-Map-frame goals use the standard Motion API. Pose units are **millimeters** and
-orientation **degrees** (planar OrientationVector: `o_z=1`, yaw in `theta`):
+Map-frame positions are `common.Pose` values in **millimeters** and **degrees**
+(planar OrientationVector: `o_z=1`, yaw in `theta`). Zone geometry lengths are
+millimeters. Speed limits are meters/sec. `DoCommand` stays in meters and radians.
 
 ```python
 from viam.proto.common import Pose
-from viam.services.motion import MotionClient
+from viam.services.navigation import NavigationClient, Position
 
-nav = MotionClient.from_robot(robot, "nav")
-execution_id = await nav.move_on_map(
-    component_name="my-base",
-    destination=Pose(x=3500, y=-1000, z=0, o_x=0, o_y=0, o_z=1, theta=0),
-    slam_service_name="slam",
+nav = NavigationClient.from_robot(robot, "nav")
+await nav.navigate_to_point(
+    Position(pose=Pose(x=3500, y=-1000, z=0, o_x=0, o_y=0, o_z=1, theta=0))
 )
-# Non-blocking: poll progress
-plan = await nav.get_plan("my-base", execution_id=execution_id)
-await nav.stop_plan("my-base")  # cancel
+status = await nav.get_navigation_status()
+await nav.cancel()
 ```
 
-`MoveOnMap` returns an `execution_id`. Use `GetPlan` / `ListPlanStatuses` for
-status (`IN_PROGRESS` / `SUCCEEDED` / `STOPPED` / `FAILED`). `Move` and
-`MoveOnGlobe` are not implemented. Locations, zones, and simple `go_to_*` remain
-available via `DoCommand` (including the meters/radians `navigate_to_point`
-alias used by existing scripts).
+`GetNavigationStatus` reports the goal state (`ACTIVE`, `SUSPENDED`,
+`SUCCEEDED`, `FAILED`, `CANCELED`). `NavigateTo*` returns once the goal is
+accepted. `PlanToPoint` / `PlanToLocation` preview a path; `ExecutePlan` drives
+it. `GoTo*` is the direct closed-loop hop. `DoCommand` remains for diagnostics
+(`get_trace`, `test_drive`, `describe_motion`) and for existing scripts.
 Tune replan rate and recoveries under the `builtin` attribute block
 (`replan_period_s`, `recovery_wait_duration_s`, backup settings). Changes apply
 on reconfigure.
@@ -316,14 +317,14 @@ Set `"kinematics": "omni"` and a non-zero `max_vel_y` for omnidirectional bases.
 
 ### Navigation with an external SLAM service
 
-Use `viam-labs:nav-stack:navigation-external` to drive builtin navigation from **any** `rdk:service:slam` (for example a third-party RTAB-Map module). Same Motion + DoCommand surface as `navigation`; map/pose come from the SLAM service (`GetPosition`, `get_grid`), scans from configured lidars, and drive from `Base.SetVelocity`.
+Use `viam-labs:nav-stack:navigation-external` to drive builtin navigation from **any** `rdk:service:slam` (for example a third-party RTAB-Map module). Same Navigation service as `navigation`; map/pose come from the SLAM service (`GetPosition`, `get_grid`), scans from configured lidars, and drive from `Base.SetVelocity`.
 
 - `slam_service` names an `rdk:service:slam` dependency. It must support `GetPosition()` and a `get_grid` DoCommand returning `{rows, cols, xMin, yMin, cellSize, data}` with int8 cells (`-1`/`0`/`100`).
 
 ```json
 {
   "name": "nav",
-  "api": "rdk:service:motion",
+  "api": "rdk:service:navigation",
   "model": "viam-labs:nav-stack:navigation-external",
   "attributes": {
     "slam_service": "rtabmap",
@@ -388,7 +389,7 @@ Example fragment (configure `sim-base` **before** slam so the world exists; slam
     },
     {
       "name": "nav",
-      "api": "rdk:service:motion",
+      "api": "rdk:service:navigation",
       "model": "viam-labs:nav-stack:navigation",
       "attributes": {
         "slam_service": "slam",

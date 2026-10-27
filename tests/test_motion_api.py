@@ -14,6 +14,7 @@ from grpclib.exceptions import GRPCError
 from viam.proto.common import Pose, PoseInFrame
 from viam.proto.service.motion import PlanState
 from viam.services.motion import Motion
+from viam.services.navigation import Navigation
 
 from src.config import NavConfig
 from src.models.navigation import NavigationService, _nav_status_to_plan_state
@@ -44,9 +45,10 @@ def test_nav_status_to_plan_state_mapping():
     )
 
 
-def test_navigation_registers_as_motion():
-    assert NavigationService.API == Motion.API
-    assert issubclass(NavigationService, Motion)
+def test_navigation_registers_as_navigation_service():
+    assert NavigationService.API == Navigation.API
+    assert issubclass(NavigationService, Navigation)
+    assert not issubclass(NavigationService, Motion)
 
 
 def _configured_nav(*, nav_status=None, pose=None) -> tuple[NavigationService, MagicMock]:

@@ -10,14 +10,14 @@
       "short_description": "Builtin occupancy SLAM: mapping and localization on a Viam base."
     },
     {
-      "api": "rdk:service:motion",
+      "api": "rdk:service:navigation",
       "model": "viam-labs:nav-stack:navigation",
-      "short_description": "Builtin MoveOnMap over Viam APIs"
+      "short_description": "Obstacle-aware navigation: locations, routes, zones, and plans."
     },
     {
-      "api": "rdk:service:motion",
+      "api": "rdk:service:navigation",
       "model": "viam-labs:nav-stack:navigation-external",
-      "short_description": "MoveOnMap from any Viam slam service."
+      "short_description": "Same navigation service against any Viam slam service."
     },
     {
       "api": "rdk:component:camera",

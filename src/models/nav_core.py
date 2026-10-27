@@ -2,11 +2,12 @@
 
 Both navigation models — ``viam-labs:nav-stack:navigation`` (borrows the SLAM
 model's in-process runtime) and ``viam-labs:nav-stack:navigation-external``
-(builds its own runtime around an arbitrary ``rdk:service:slam``) — share the
-Motion API (``MoveOnMap`` / plan queries), DoCommand surface, and simple
-closed-loop motion. That logic lives here in ``NavServiceBase``; the concrete
-models differ only in how they obtain a ``SlamRuntime`` (``_resolve_runtime``)
-and how they stand it up (``reconfigure``).
+(builds its own runtime around an arbitrary ``rdk:service:slam``) — implement
+the Navigation service (locations, routes, zones, navigate / plan / go).
+``DoCommand`` remains for diagnostics and for callers that have not moved
+over. That logic lives here in ``NavServiceBase``; the concrete models differ
+only in how they obtain a ``SlamRuntime`` (``_resolve_runtime``) and how they
+stand it up (``reconfigure``).
 """
 from __future__ import annotations
 
@@ -35,6 +36,7 @@ from viam.proto.common import (
 from viam.proto.service.motion import (
     ComponentState,
     Constraints,
+    GetPlanResponse,
     MotionConfiguration,
     Plan,
     PlanState,
@@ -43,8 +45,10 @@ from viam.proto.service.motion import (
     PlanStep,
     PlanWithStatus,
 )
-from viam.services.motion import Motion
+from viam.services.navigation import Navigation
 from viam.utils import ValueTypes
+
+from .nav_api import NavigationApi
 
 from ..config import NavConfig, body_twist_to_viam_set_velocity
 from ..nav import zones as zones_mod
@@ -157,7 +161,7 @@ class _SuspendedNav:
         return out
 
 
-class NavServiceBase(Motion):
+class NavServiceBase(NavigationApi, Navigation):
     """Runtime-agnostic navigation orchestration shared by the navigation models.
 
     Subclasses must implement :meth:`_resolve_runtime` (return the active
@@ -369,7 +373,7 @@ class NavServiceBase(Motion):
         *,
         extra: Optional[Mapping[str, ValueTypes]] = None,
         timeout: Optional[float] = None,
-    ) -> Motion.Plan:
+    ) -> GetPlanResponse:
         self._sync_plan_state_from_nav()
         execution = self._plan_execution
         if execution is None:
@@ -494,7 +498,7 @@ class NavServiceBase(Motion):
             reason = str(status.get("state") or "failed")
         self._record_plan_state(execution, mapped, reason=reason)
 
-    def _plan_to_response(self, execution: _PlanExecution) -> Motion.Plan:
+    def _plan_to_response(self, execution: _PlanExecution) -> GetPlanResponse:
         component_key = str(Base.get_resource_name(execution.component_name))
         plan = Plan(
             id=execution.plan_id,
@@ -513,7 +517,7 @@ class NavServiceBase(Motion):
             timestamp=_utcnow_timestamp(),
             reason=execution.reason or "",
         )
-        return Motion.Plan(
+        return GetPlanResponse(
             current_plan_with_status=PlanWithStatus(
                 plan=plan,
                 status=current,

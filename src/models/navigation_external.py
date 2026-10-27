@@ -1,7 +1,7 @@
 """External-SLAM navigation model: ``viam-labs:nav-stack:navigation-external``.
 
-Like ``viam-labs:nav-stack:navigation`` (same ``rdk:service:motion`` + DoCommand
-surface, shared :class:`~.nav_core.NavServiceBase`), but instead of borrowing
+Like ``viam-labs:nav-stack:navigation`` (same Navigation service, shared
+:class:`~.nav_core.NavServiceBase`), but instead of borrowing
 the built-in SLAM model's in-process runtime it drives navigation from an
 **arbitrary Viam ``rdk:service:slam``** dependency.
 
@@ -23,7 +23,7 @@ from viam.proto.common import ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
-from viam.services.motion import Motion
+from viam.services.navigation import Navigation
 from viam.services.slam import SLAM
 from viam.utils import struct_to_dict
 
@@ -216,7 +216,7 @@ class ExternalNavigationService(NavServiceBase):
 
 
 Registry.register_resource_creator(
-    Motion.API,
+    Navigation.API,
     ExternalNavigationService.MODEL,
     ResourceCreatorRegistration(
         ExternalNavigationService.new, ExternalNavigationService.validate_config

@@ -1,6 +1,15 @@
 # Navigation service DoCommands
 
-Reference for `DoCommand` on the motion services:
+The navigation models implement `rdk:service:navigation`. Locations, routes,
+zones, `NavigateTo*`, `PlanTo*`, `ExecutePlan`, `GoTo*`, `Suspend`, `Resume`,
+`Cancel`, `GetPosition`, `GetNavigationStatus`, `GetProperties`, and
+`GetCostmap` are typed RPCs. Positions on that API are millimeters and degrees;
+zone lengths are millimeters; `max_speed` is meters/sec.
+
+`DoCommand` remains for diagnostics and for callers that have not moved over.
+It still uses meters and radians.
+
+Reference for `DoCommand` on:
 
 - `viam-labs:nav-stack:navigation`
 - `viam-labs:nav-stack:navigation-external`
@@ -11,8 +20,7 @@ Both share `[NavServiceBase.do_command](../src/models/nav_core.py)`. Payload sha
 { "command": "<name>", ...args }
 ```
 
-**Units (DoCommand):** map frame, **meters** and **radians**, unless a field name says otherwise (e.g. `angular_z_deg_s`).  
-Viam `MoveOnMap` uses millimeters / degrees — that is a separate Motion API path, not listed here.
+**Units (DoCommand):** map frame, **meters** and **radians**, unless a field name says otherwise (e.g. `angular_z_deg_s`).
 
 Unknown `command` values raise `ValueError`.
 

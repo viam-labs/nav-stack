@@ -60,6 +60,10 @@ def _pose_to_matrix(pose) -> np.ndarray:
     )
     R = np.asarray(ov.to_quaternion().to_rotation_matrix().elements, dtype=float)
     R = R.reshape(3, 3)
+    # viam-sdk 0.85 returns the transpose of the rotation 0.79 produced for the
+    # same orientation vector. Mounts were calibrated against that earlier
+    # matrix (OV θ=-90° is nav-stack yaw +π/2). Transpose keeps that pose.
+    R = R.T
     T = np.eye(4, dtype=float)
     T[:3, :3] = R
     T[0, 3] = float(pose.x)

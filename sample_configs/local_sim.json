@@ -56,7 +56,7 @@
     },
     {
       "name": "nav",
-      "api": "rdk:service:motion",
+      "api": "rdk:service:navigation",
       "model": "viam-labs:nav-stack:navigation",
       "attributes": {
         "slam_service": "slam",

@@ -1,6 +1,6 @@
 """Navigation service model: ``viam-labs:nav-stack:navigation``.
 
-Builtin MoveOnMap over Viam APIs only (``ViamWorldIO`` + ``BuiltinNavHost``):
+Builtin Navigation service over Viam APIs (``ViamWorldIO`` + ``BuiltinNavHost``):
 SLAM ``get_grid`` / ``GetPosition``, lidar shm/cameras, ``Base.SetVelocity``.
 No ROS / Nav2. Or use ``navigation-external`` against any ``rdk:service:slam``.
 """
@@ -18,7 +18,7 @@ from viam.proto.common import ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
-from viam.services.motion import Motion
+from viam.services.navigation import Navigation  # registers the Navigation RPC service
 from viam.services.slam import SLAM
 from viam.utils import struct_to_dict
 
@@ -333,7 +333,7 @@ class NavigationService(NavServiceBase):
 
 
 Registry.register_resource_creator(
-    Motion.API,
+    Navigation.API,
     NavigationService.MODEL,
     ResourceCreatorRegistration(NavigationService.new, NavigationService.validate_config),
 )
