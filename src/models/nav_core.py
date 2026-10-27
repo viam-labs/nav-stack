@@ -879,6 +879,11 @@ class NavServiceBase(NavigationApi, Navigation):
                     goal["name"] = self._active_goal_name
                     status["goal"] = goal
                 status["localization_check"] = dict(runtime.localization_check)
+                pose = status.get("pose")
+                if not isinstance(pose, dict) or "x" not in pose:
+                    live = self._live_map_pose_dict(mgr)
+                    if live is not None:
+                        status["pose"] = live
                 suspended = self._suspended
                 status["suspended"] = suspended is not None
                 status["suspended_goal"] = (
@@ -1524,16 +1529,31 @@ class NavServiceBase(NavigationApi, Navigation):
                 best_i = i
         return best_i
 
-    def _current_map_pose(self) -> conv.Pose2D:
-        runtime = self._require_runtime()
-        getter = getattr(runtime.manager, "get_pose_in_map", None)
+    def _live_map_pose_dict(self, mgr) -> Optional[dict]:
+        """Current map pose as meters/radians, or None when SLAM has no pose."""
+        getter = getattr(mgr, "get_pose_in_map", None)
         pose = getter() if callable(getter) else None
         if pose is None:
-            node = getattr(runtime.manager, "node", None)
-            pose = node.get_pose_in_map() if node is not None else None
+            node = getattr(mgr, "node", None)
+            if node is not None and hasattr(node, "get_pose_in_map"):
+                pose = node.get_pose_in_map()
         if pose is None:
+            return None
+        try:
+            return {
+                "x": float(pose.x),
+                "y": float(pose.y),
+                "theta": float(pose.theta),
+            }
+        except (TypeError, ValueError):
+            return None
+
+    def _current_map_pose(self) -> conv.Pose2D:
+        runtime = self._require_runtime()
+        live = self._live_map_pose_dict(runtime.manager)
+        if live is None:
             raise RuntimeError("current map pose unavailable")
-        return pose
+        return conv.Pose2D(live["x"], live["y"], live["theta"])
 
     async def _start_navigate_route(
         self, command: Mapping[str, ValueTypes]

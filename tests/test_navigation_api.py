@@ -135,10 +135,36 @@ def test_navigate_to_point_uses_meters_and_radians():
     assert status.localized is True
 
 
+def test_ambiguous_check_still_has_a_pose():
+    """A refused full-map peak keeps the published pose. Short nav can start."""
+    status = status_from_dict(
+        {
+            "active": False,
+            "state": "idle",
+            "pose": {"x": -4.2, "y": -0.5, "theta": 1.4},
+            "localization_check": {"status": "ambiguous", "score": 0.3},
+        }
+    )
+    assert status.localized is True
+
+
+def test_idle_status_fills_pose_from_slam():
+    nav, mgr = _configured(
+        {"active": False, "state": "idle", "pose": None, "motion": "builtin"}
+    )
+    mgr.get_pose_in_map.return_value = Pose2D(-4.2, -0.47, 1.38)
+    status = asyncio.run(nav.do_command({"command": "get_status"}))
+    assert status["pose"]["x"] == pytest.approx(-4.2)
+    assert status["pose"]["y"] == pytest.approx(-0.47)
+    assert status["pose"]["theta"] == pytest.approx(1.38)
+
+
 def test_navigate_to_point_refuses_when_pose_is_missing():
     nav, mgr = _configured(
         {"active": False, "state": "idle", "pose": None, "motion": "builtin"}
     )
+    mgr.get_pose_in_map.return_value = None
+    mgr.node = None
     dest = Position(pose=Pose(x=0, y=0, z=0, o_x=0, o_y=0, o_z=1, theta=0))
     with pytest.raises(GRPCError) as exc:
         asyncio.run(nav.navigate_to_point(dest))

@@ -39,8 +39,10 @@ from viam.utils import dict_to_struct
 from ..geom import conversions as conv
 
 _MM_PER_M = 1000.0
+# ``ambiguous`` is a refused full-map peak. The published pose stays put, and
+# a short goal is allowed to start from it.
 _UNTRUSTED_LOC = frozenset(
-    {"refused_large", "nav_hold", "awaiting_confirm", "error", "ambiguous"}
+    {"refused_large", "nav_hold", "awaiting_confirm", "error"}
 )
 
 
