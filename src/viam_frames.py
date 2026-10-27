@@ -60,10 +60,10 @@ def _pose_to_matrix(pose) -> np.ndarray:
     )
     R = np.asarray(ov.to_quaternion().to_rotation_matrix().elements, dtype=float)
     R = R.reshape(3, 3)
-    # viam-sdk 0.85 returns the transpose of the rotation 0.79 produced for the
-    # same orientation vector. Mounts were calibrated against that earlier
-    # matrix (OV θ=-90° is nav-stack yaw +π/2). Transpose keeps that pose.
-    R = R.T
+    # Use the rotation viam-sdk 0.85 returns. That matrix is the transpose of
+    # the 0.79 matrix for the same orientation vector. This robot's map was
+    # built with the 0.85 matrix (rplidar mount yaw π, wit heading −180°).
+    # Transposing it turns those mounts around and the map pose points backward.
     T = np.eye(4, dtype=float)
     T[:3, :3] = R
     T[0, 3] = float(pose.x)
@@ -77,9 +77,9 @@ def _matrix_to_mount(T: np.ndarray) -> MountPose:
 
     Yaw/pitch/roll are solved for nav-stack's ``Rz(yaw) @ Ry(pitch) @ Rx(roll)``
     (see ``geom.conversions._mount_rotation``). Do **not** use Viam EulerAngles
-    / OV θ directly: Viam's yaw sign for the same matrix is opposite ours on
-    pure Z rotations (OV θ=-90° ≡ our mount θ=+π/2), which showed up as a
-    consistent 90° CW localization error when mounts came from the framesystem.
+    / OV θ directly: on viam-sdk 0.85 a pure Z rotation of OV θ=-90° extracts
+    as mount θ=-π/2, and reading θ itself was a consistent 90° CW localization
+    error.
     """
     R = np.asarray(T[:3, :3], dtype=float)
     # R = Rz(yaw) Ry(pitch) Rx(roll): R[2,0] = -sin(pitch).

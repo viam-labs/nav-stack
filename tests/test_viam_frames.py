@@ -76,8 +76,8 @@ def test_pose_raw_viam_axes_without_y_forward_convert():
     assert abs(m.x - (-0.05)) < 1e-9
     assert abs(m.y - 0.24) < 1e-9
     assert abs(m.z - 0.15) < 1e-9
-    # Viam OV θ=-90° → same matrix as our mount θ=+π/2 (yaw sign differs).
-    assert abs(m.theta - (math.pi / 2)) < 1e-6
+    # viam-sdk 0.85: OV θ=-90° extracts as mount θ=-π/2.
+    assert abs(m.theta - (-math.pi / 2)) < 1e-6
 
 
 def test_pose_converts_viam_y_forward_base_to_ros_x_forward():
@@ -91,8 +91,8 @@ def test_pose_converts_viam_y_forward_base_to_ros_x_forward():
     assert abs(m.x - 0.24) < 1e-9
     assert abs(m.y - 0.05) < 1e-9
     assert abs(m.z - 0.15) < 1e-9
-    # Rz(-π/2) @ Rz(+π/2) = I → mount θ ≈ 0
-    assert abs(m.theta) < 1e-6
+    # SDK yaw is -π/2; Rz(-π/2) @ Rz(-π/2) = Rz(-π).
+    assert abs(abs(m.theta) - math.pi) < 1e-6
 
 
 def test_fs_mount_round_trips_viam_rotation_and_points():
@@ -124,8 +124,8 @@ def test_fs_mount_round_trips_viam_rotation_and_points():
         roll=m.roll,
     )[0]
     assert np.allclose(via_T, via_mount, atol=1e-9)
-    # After Y→X convert, R≈I: angle 0 (X-flipped −X) stays on base −X.
-    assert abs(via_mount[0] - (m.x - 1.0)) < 1e-9
+    # Mount yaw is π, so scan angle 0 (sensor −X) lands on base +X.
+    assert abs(via_mount[0] - (m.x + 1.0)) < 1e-9
     assert abs(via_mount[1] - m.y) < 1e-9
 
 
@@ -275,7 +275,7 @@ def test_apply_slam_fills_mount_when_omitted():
     # Y-forward → X-forward: (x,y)_v=(-0.05,0.24) → (0.24, 0.05)
     assert abs(rpl.x - 0.24) < 1e-9
     assert abs(rpl.y - 0.05) < 1e-9
-    assert abs(rpl.theta) < 1e-6
+    assert abs(abs(rpl.theta) - math.pi) < 1e-6
     cam = next(l for l in cfg2.lidars if l.name == "camera")
     assert abs(cam.x - 0.30) < 1e-9
     assert abs(cam.y - (-0.15)) < 1e-9
