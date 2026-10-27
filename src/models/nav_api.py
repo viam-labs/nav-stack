@@ -231,9 +231,15 @@ def status_from_dict(status: Mapping[str, Any]) -> NavStatus:
     msg = NavStatus(localized=_localized(status), updated_at=Timestamp())
     msg.updated_at.FromDatetime(datetime.now(timezone.utc))
 
+    # RDK's protobufToStatus requires Status.position; omitting it yields
+    # "position is required" to clients (e.g. after set_initial_pose refine
+    # while the DoCommand pose field is briefly unset). localized already
+    # says whether the pose is trusted.
     pose = status.get("pose")
     if isinstance(pose, dict) and "x" in pose:
         msg.position.CopyFrom(_position_from_xy(pose))
+    else:
+        msg.position.CopyFrom(_position_from_xy({"x": 0.0, "y": 0.0, "theta": 0.0}))
 
     vx = float(status.get("cmd_vx_mps") or 0.0)
     vtheta = float(status.get("cmd_vtheta_rad_s") or 0.0)
