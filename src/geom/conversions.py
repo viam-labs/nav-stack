@@ -1246,6 +1246,53 @@ def downsample_points(points: np.ndarray, *, max_points: int = 4000) -> np.ndarr
     return points[:: max(1, step)]
 
 
+def drop_shadowed_planar_returns(
+    points: np.ndarray,
+    *,
+    seed_range_m: float = 0.20,
+    shadow_range_m: float = 0.80,
+    lateral_m: float = 0.06,
+) -> np.ndarray:
+    """Drop the tail of a 2D beam that grazes the robot.
+
+    A planar scan that clips the shell reports the shell at a few centimetres
+    and then a string of farther ranges along almost the same ray. The near
+    end sits inside the footprint and is cropped; the tail does not, so the
+    robot always sees something beside it. A return is the tail when a closer
+    hit (under ``seed_range_m``) lies nearly on the same ray and this return
+    is still inside ``shadow_range_m``.
+    """
+    pts = np.asarray(points, dtype=float)
+    if pts.shape[0] < 2 or pts.shape[1] < 2:
+        return pts
+    rng = np.hypot(pts[:, 0], pts[:, 1])
+    ang = np.arctan2(pts[:, 1], pts[:, 0])
+    seeds = rng <= float(seed_range_m)
+    if not np.any(seeds):
+        return pts
+    cand = (rng > float(seed_range_m)) & (rng <= float(shadow_range_m))
+    if not np.any(cand):
+        return pts
+    dth = ang[cand, None] - ang[None, seeds]
+    dth = (dth + math.pi) % (2.0 * math.pi) - math.pi
+    lateral = rng[cand, None] * np.sin(dth)
+    beyond = rng[cand, None] * np.cos(dth) > rng[None, seeds]
+    shadowed = np.any(beyond & (np.abs(lateral) <= float(lateral_m)), axis=1)
+    if not np.any(shadowed):
+        return pts
+    keep = np.ones(pts.shape[0], dtype=bool)
+    keep[np.flatnonzero(cand)[shadowed]] = False
+    return pts[keep]
+
+
+def _planar_scan(points: np.ndarray) -> bool:
+    """True for a 2D lidar cloud (every point on one Z). Depth clouds are not."""
+    if points.shape[1] < 3:
+        return True
+    z = points[:, 2]
+    return float(np.max(z) - np.min(z)) < 0.01
+
+
 def prepare_lidar_point_cloud(
     points: np.ndarray,
     *,
@@ -1309,6 +1356,10 @@ def prepare_lidar_point_cloud(
     else:
         if cloud_frame == "camera_optical":
             pts = camera_optical_to_sensor_frame(pts)
+        # A 2D graze smears along the ray. Collapse that tail before the
+        # footprint crop, or the far end survives as a phantom beside the body.
+        if _planar_scan(pts):
+            pts = drop_shadowed_planar_returns(pts)
         pts = transform_lidar_mount_to_base_link(
             pts, x=x, y=y, z=z, theta=theta, pitch=pitch, roll=roll
         )

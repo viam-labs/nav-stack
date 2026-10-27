@@ -271,6 +271,35 @@ def test_prepare_lidar_point_cloud_drops_invalid_zero_and_nan_points():
     assert len(kept) == 2
 
 
+def test_prepare_lidar_point_cloud_drops_graze_smear_keeps_real_return():
+    """Bottom-lidar graze: shell at ~0.1 m, then a tail out to 0.6 m on the
+    next few degrees. The tail used to land just outside the body box."""
+    ang = math.radians(-140.0)
+    smear = []
+    for dist in (0.11, 0.33, 0.50, 0.58):
+        smear.append([dist * math.cos(ang), dist * math.sin(ang), 0.0])
+    # A few degrees further, still the tail (no hit on the shell).
+    ang2 = math.radians(-136.0)
+    smear.append([0.45 * math.cos(ang2), 0.45 * math.sin(ang2), 0.0])
+    # Real return well off that ray.
+    wall = [2.0, 0.4, 0.0]
+    out = conv.prepare_lidar_point_cloud(
+        np.array(smear + [wall]),
+        x=0.21,
+        y=0.0,
+        z=0.24,
+        theta=-math.pi / 2,
+        z_min=-0.2,
+        z_max=2.0,
+        footprint_length_m=0.48,
+        footprint_width_m=0.48,
+    )
+    assert len(out) == 1
+    # Wall, mounted: yaw -90° maps sensor (x, y) to base (y+0.21, -x).
+    assert out[0, 0] == pytest.approx(0.21 + 0.4)
+    assert out[0, 1] == pytest.approx(-2.0)
+
+
 def test_prepare_lidar_point_cloud_drops_inside_footprint_keeps_ahead():
     """A stand on the chassis and a hit the same distance in front of the
     bumper are the same range from a forward-mounted lidar. Only the stand
