@@ -358,6 +358,36 @@ def test_apply_match_nav_steps_lost_pose_past_along_gate(monkeypatch):
     assert pose.theta == pytest.approx(math.radians(3.0), abs=1e-6)
 
 
+def test_apply_match_nav_steps_sideways_when_the_slip_is_a_meter(monkeypatch):
+    """Short skid: ~1.4 m along and 0.6 m cross. Step sideways, not along."""
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.42  # noqa: SLF001
+    engine._last_match_score = 0.82  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    slipped = conv.Pose2D(1.40, 0.60, 0.0)
+    assert engine._apply_match(predicted, slipped, None) is False  # noqa: SLF001
+    assert engine.get_pose().y == pytest.approx(0.0)
+    moved = conv.Pose2D(0.20, 0.0, 0.0)
+    slipped_moved = conv.Pose2D(1.60, 0.60, 0.0)
+    assert engine._apply_match(moved, slipped_moved, None) is True  # noqa: SLF001
+    pose = engine.get_pose()
+    assert pose.x == pytest.approx(0.20, abs=1e-6)
+    assert pose.y == pytest.approx(0.10, abs=1e-6)
+    assert pose.theta == pytest.approx(0.0, abs=1e-6)
+
+
+def test_apply_match_nav_refuses_meter_scale_slide_along_hall(monkeypatch):
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.42  # noqa: SLF001
+    engine._last_match_score = 0.82  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    slid = conv.Pose2D(1.50, 0.05, math.radians(2.0))
+    assert engine._apply_match(predicted, slid, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, slid, None) is False  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.0)
+    assert engine.get_pose().y == pytest.approx(0.0)
+
+
 def test_apply_match_nav_refuses_lost_pose_that_only_slides_along(monkeypatch):
     engine = _nav_track_engine(monkeypatch)
     engine._last_prior_score = -0.46  # noqa: SLF001
