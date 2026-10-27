@@ -1,4 +1,5 @@
 """Unit tests for ROS-free builtin costmap + A* planner."""
+
 from __future__ import annotations
 
 import math
@@ -6,7 +7,12 @@ import math
 import numpy as np
 import pytest
 
-from src.nav_builtin.controller import FollowerConfig, compute_path_command, lookahead_pose
+from src.geom import conversions as conv
+from src.nav_builtin.controller import (
+    FollowerConfig,
+    compute_path_command,
+    lookahead_pose,
+)
 from src.nav_builtin.costmap import (
     FREE,
     HARD_BUFFER,
@@ -19,7 +25,6 @@ from src.nav_builtin.costmap import (
     nearest_free_pose,
 )
 from src.nav_builtin.navigator import BuiltinNavigator
-from src.nav_builtin.supervisor import NavSupervisor, yaw_align_give_up
 from src.nav_builtin.planner import (
     connect_plan_start,
     path_blocked,
@@ -27,8 +32,8 @@ from src.nav_builtin.planner import (
     plan_on_costmap,
     plan_path,
 )
+from src.nav_builtin.supervisor import NavSupervisor, yaw_align_give_up
 from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
-from src.geom import conversions as conv
 
 
 def _empty_map(size: int = 40, resolution: float = 0.05) -> dict:
@@ -63,16 +68,12 @@ def test_nearest_free_pose_requires_clear_footprint():
         occ, inflation_radius_m=0.25, robot_radius_m=0.22, cost_scaling_factor=4.0
     )
     # Center cell is lethal; center point overlaps inscribed halo at r=0.22 m.
-    assert not footprint_traversable(
-        costs, occ, 2.05, 2.05, robot_radius_m=0.22
-    )
+    assert not footprint_traversable(costs, occ, 2.05, 2.05, robot_radius_m=0.22)
     free = nearest_free_pose(
         costs, occ, 2.05, 2.05, robot_radius_m=0.22, max_radius_cells=12
     )
     assert free is not None
-    assert footprint_traversable(
-        costs, occ, free[0], free[1], robot_radius_m=0.22
-    )
+    assert footprint_traversable(costs, occ, free[0], free[1], robot_radius_m=0.22)
 
 
 def test_connect_plan_start_prepends_escape_from_blocked_pose():
@@ -81,9 +82,7 @@ def test_connect_plan_start_prepends_escape_from_blocked_pose():
     grid[30, 30] = 100
     start = Pose2D(1.52, 1.52, 0.0)  # inside pillar inflation
     goal = Pose2D(2.5, 1.52, 0.0)
-    main = plan_path(
-        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    main = plan_path(m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert main.feasible
     connected = connect_plan_start(
         m,
@@ -94,9 +93,7 @@ def test_connect_plan_start_prepends_escape_from_blocked_pose():
     )
     assert connected.feasible
     assert len(connected.path.points) >= len(main.path.points)
-    occ = OccupancyGrid(
-        grid=grid, resolution=0.05, origin_x=0.0, origin_y=0.0
-    )
+    occ = OccupancyGrid(grid=grid, resolution=0.05, origin_x=0.0, origin_y=0.0)
     costs = build_costmap(
         occ, inflation_radius_m=0.25, robot_radius_m=0.22, cost_scaling_factor=4.0
     )
@@ -122,14 +119,12 @@ def test_plan_start_next_to_live_obstacle_stays_feasible():
 
 def test_plan_path_avoids_keepout_mask():
     """Keepout cells are lethal for planning — path must detour around them."""
-    from src.nav.zones import Zone, KEEPOUT, rasterize_for_map
+    from src.nav.zones import KEEPOUT, Zone, rasterize_for_map
 
     m = _empty_map(size=80, resolution=0.05)
     start = Pose2D(0.5, 2.0, 0.0)
     goal = Pose2D(3.5, 2.0, 0.0)
-    baseline = plan_path(
-        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    baseline = plan_path(m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert baseline.feasible
     # Vertical keepout strip across the straight corridor near x=2 m.
     zones = [
@@ -163,9 +158,7 @@ def test_plan_path_marks_scan_for_dynamic_replan():
     m = _empty_map(size=60, resolution=0.05)
     start = Pose2D(0.5, 1.5, 0.0)
     goal = Pose2D(2.5, 1.5, 0.0)
-    baseline = plan_path(
-        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    baseline = plan_path(m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert baseline.feasible
     n = 72
     ranges = np.full(n, np.inf)
@@ -194,9 +187,7 @@ def test_mark_path_ahead_forces_detour_on_replan():
     m = _empty_map(size=80, resolution=0.05)
     start = Pose2D(0.5, 2.0, 0.0)
     goal = Pose2D(3.5, 2.0, 0.0)
-    baseline = plan_path(
-        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    baseline = plan_path(m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert baseline.feasible
     mid = Pose2D(2.0, 2.0, 0.0)
     blocked = plan_path(
@@ -231,7 +222,10 @@ def test_mark_path_ahead_keeps_robot_footprint_free():
     goal = Pose2D(5.0, 2.0, 0.0)
     baseline = plan_path(m, start, goal, inflation_radius_m=0.35, robot_radius_m=r)
     assert baseline.feasible
-    from src.nav_builtin.costmap import mark_path_ahead_on_occupancy, occupancy_from_map_dict
+    from src.nav_builtin.costmap import (
+        mark_path_ahead_on_occupancy,
+        occupancy_from_map_dict,
+    )
 
     occ = occupancy_from_map_dict(m)
     painted = mark_path_ahead_on_occupancy(
@@ -404,20 +398,15 @@ def test_plan_respects_inflation_radius():
     """Lazy Theta* must not shortcut through the soft inflation halo."""
     grid = np.zeros((40, 40), dtype=np.int16)
     grid[20, 20] = 100  # pillar at map center
-    m = {"grid": grid, "resolution": 0.1, "origin_x": 0.0, "origin_y": 0.0}
     start = Pose2D(0.5, 2.0, 0.0)
     goal = Pose2D(3.5, 2.0, 0.0)
-    occ = OccupancyGrid(
-        grid=grid, resolution=0.1, origin_x=0.0, origin_y=0.0
-    )
+    occ = OccupancyGrid(grid=grid, resolution=0.1, origin_x=0.0, origin_y=0.0)
     costs = build_costmap(
         occ, inflation_radius_m=0.35, robot_radius_m=0.05, cost_scaling_factor=3.0
     )
     # Soft halo out to inflation_radius; path may graze soft costs but must
     # stay traversable (outside inscribed/lethal).
-    result = plan_on_costmap(
-        occ, costs, start, goal, algorithm="lazy_theta_star"
-    )
+    result = plan_on_costmap(occ, costs, start, goal, algorithm="lazy_theta_star")
     assert result.feasible
     for x, y in result.path.points:
         r, c = occ.world_to_cell(x, y)
@@ -473,9 +462,7 @@ def _gap_map(gap_m: float, resolution: float = 0.05) -> OccupancyGrid:
     grid[wall : wall + 3, centre - half : centre + half] = 0
     grid[wall : wall + 3, :6] = 0  # detour around the left end
     grid[wall : wall + 3, w - 6 :] = 0  # and the right end
-    return OccupancyGrid(
-        grid=grid, resolution=resolution, origin_x=0.0, origin_y=0.0
-    )
+    return OccupancyGrid(grid=grid, resolution=resolution, origin_x=0.0, origin_y=0.0)
 
 
 def test_half_diagonal_radius_seals_gap_the_robot_fits_through():
@@ -677,9 +664,7 @@ def test_plan_straight_line_on_empty_map():
     m = _empty_map()
     start = Pose2D(0.25, 0.25, 0.0)
     goal = Pose2D(1.5, 1.5, 0.0)
-    result = plan_path(
-        m, start, goal, inflation_radius_m=0.2, robot_radius_m=0.1
-    )
+    result = plan_path(m, start, goal, inflation_radius_m=0.2, robot_radius_m=0.1)
     assert result.feasible
     assert len(result.path.points) >= 2
     assert result.path.points[0][0] == pytest.approx(start.x, abs=0.15)
@@ -722,6 +707,7 @@ def test_lazy_theta_star_shorter_or_smoother_than_astar():
         )
         is False
     )
+
 
 def test_lazy_theta_star_detours_around_wall():
     m = _wall_map()
@@ -785,17 +771,15 @@ def test_plan_fails_when_goal_in_lethal():
     }
     start = Pose2D(0.5, 0.5, 0.0)
     goal = Pose2D(1.5, 1.5, 0.0)
-    result = plan_path(
-        m, start, goal, inflation_radius_m=0.2, robot_radius_m=0.1
-    )
+    result = plan_path(m, start, goal, inflation_radius_m=0.2, robot_radius_m=0.1)
     assert result.feasible is False
     assert result.error_code != 0
 
 
 def test_plan_rejects_large_goal_snap():
     """Live inflation must not silently move the goal a metre away."""
-    from src.nav_builtin.planner import plan_on_costmap
     from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav_builtin.planner import plan_on_costmap
 
     m = _empty_map(size=60, resolution=0.1)
     # Block a wide region around the requested goal so nearest free is far.
@@ -813,8 +797,8 @@ def test_plan_rejects_large_goal_snap():
 
 def test_plan_start_snap_never_jumps_through_obstacle():
     """Start sealed in a dead-end corridor must fail, not snap past the plug."""
-    from src.nav_builtin.planner import plan_on_costmap
     from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav_builtin.planner import plan_on_costmap
 
     grid = np.full((40, 120), 100, dtype=np.int16)
     grid[18:23, 5:115] = 0  # 0.25 m corridor: robot centre cells are inscribed
@@ -837,8 +821,8 @@ def test_plan_does_not_double_inflate_goal_snap():
     from the nearest free cell. Re-checking a full 0.40 m disc demanded ~0.65 m
     of snap and rejected the plan (live: dock2, 0.55 m > 0.50 m).
     """
-    from src.nav_builtin.planner import plan_on_costmap
     from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav_builtin.planner import plan_on_costmap
 
     grid = np.zeros((80, 80), dtype=np.int16)
     grid[:, 0:2] = 100  # wall along x≈0
@@ -892,22 +876,28 @@ def test_path_blocked_horizon_ignores_far_obstacle():
         points=tuple((0.1 * i, 1.0) for i in range(40)),
         goal_theta=0.0,
     )
-    assert path_blocked(
-        m,
-        path,
-        inflation_radius_m=0.2,
-        robot_radius_m=0.1,
-        from_pose=Pose2D(0.0, 1.0, 0.0),
-        ahead_m=0.8,
-    ) is False
-    assert path_blocked(
-        m,
-        path,
-        inflation_radius_m=0.2,
-        robot_radius_m=0.1,
-        from_pose=Pose2D(0.0, 1.0, 0.0),
-        ahead_m=2.0,
-    ) is True
+    assert (
+        path_blocked(
+            m,
+            path,
+            inflation_radius_m=0.2,
+            robot_radius_m=0.1,
+            from_pose=Pose2D(0.0, 1.0, 0.0),
+            ahead_m=0.8,
+        )
+        is False
+    )
+    assert (
+        path_blocked(
+            m,
+            path,
+            inflation_radius_m=0.2,
+            robot_radius_m=0.1,
+            from_pose=Pose2D(0.0, 1.0, 0.0),
+            ahead_m=2.0,
+        )
+        is True
+    )
 
 
 def test_lazy_theta_plan_survives_path_blocked_on_corridor():
@@ -923,9 +913,7 @@ def test_lazy_theta_plan_survives_path_blocked_on_corridor():
     }
     start = Pose2D(5.69, 1.63, -3.1)
     goal = Pose2D(1.77, 2.34, -0.13)
-    result = plan_path(
-        m, start, goal, inflation_radius_m=0.35, robot_radius_m=0.22
-    )
+    result = plan_path(m, start, goal, inflation_radius_m=0.35, robot_radius_m=0.22)
     assert result.feasible
     assert (
         path_blocked(
@@ -1051,7 +1039,9 @@ def test_pursuit_regulates_speed_by_curvature():
     cfg.motion.max_linear_mps = 0.6
     current = Pose2D(0.0, 0.0, 0.0)
     # 40° bearing at L=0.5 → κ = 2 sin(40°)/0.5 ≈ 2.57 → r ≈ 0.39 m < 0.7.
-    target = Pose2D(0.5 * math.cos(math.radians(40)), 0.5 * math.sin(math.radians(40)), 0.0)
+    target = Pose2D(
+        0.5 * math.cos(math.radians(40)), 0.5 * math.sin(math.radians(40)), 0.0
+    )
     cmd, rotating = pursuit_command(current, target, cfg=cfg)
     assert not rotating
     assert cfg.regulated_min_speed_mps <= cmd.vx < 0.6 * 0.6
@@ -1142,7 +1132,9 @@ def test_pursuit_rotate_to_heading_has_hysteresis():
     current = Pose2D(0.0, 0.0, 0.0)
 
     def _at(deg: float) -> Pose2D:
-        return Pose2D(0.6 * math.cos(math.radians(deg)), 0.6 * math.sin(math.radians(deg)), 0.0)
+        return Pose2D(
+            0.6 * math.cos(math.radians(deg)), 0.6 * math.sin(math.radians(deg)), 0.0
+        )
 
     # Beyond the enter threshold: rotate-to-heading.
     far = _at(math.degrees(cfg.rotate_in_place_rad) + 15.0)
@@ -1170,12 +1162,20 @@ def test_keep_arc_drivable_preserves_curvature_at_crawl():
     out = keep_arc_drivable(DriveCommand(0.05, 0.0, 0.10, False), cfg)
     assert out.vtheta / out.vx == pytest.approx(2.0)
     assert out.vx >= 0.125
-    assert out.vx - abs(out.vtheta) * cfg.wheel_half_track_m >= cfg.wheel_min_speed_mps - 1e-9
+    assert (
+        out.vx - abs(out.vtheta) * cfg.wheel_half_track_m
+        >= cfg.wheel_min_speed_mps - 1e-9
+    )
     # Tighter than the min turn radius (r = 0.27 m): widen to r_min, not spin.
     tight = keep_arc_drivable(DriveCommand(0.08, 0.0, 0.30, False), cfg)
     assert tight.vx > 0.0
-    assert tight.vx / abs(tight.vtheta) == pytest.approx(cfg.effective_min_turn_radius_m())
-    assert tight.vx - abs(tight.vtheta) * cfg.wheel_half_track_m >= cfg.wheel_min_speed_mps - 1e-9
+    assert tight.vx / abs(tight.vtheta) == pytest.approx(
+        cfg.effective_min_turn_radius_m()
+    )
+    assert (
+        tight.vx - abs(tight.vtheta) * cfg.wheel_half_track_m
+        >= cfg.wheel_min_speed_mps - 1e-9
+    )
     # Already drivable / not translating: untouched.
     ok = DriveCommand(0.3, 0.0, 0.3, False)
     assert keep_arc_drivable(ok, cfg) == ok
@@ -1192,14 +1192,18 @@ def test_pursuit_respects_skid_steer_wheel_envelope():
     current = Pose2D(0.0, 0.0, 0.0)
     for deg in range(-58, 59, 4):
         for L in (0.6, 0.9, 1.2, 1.5):
-            tgt = Pose2D(L * math.cos(math.radians(deg)), L * math.sin(math.radians(deg)), 0.0)
+            tgt = Pose2D(
+                L * math.cos(math.radians(deg)), L * math.sin(math.radians(deg)), 0.0
+            )
             cmd, rotating = pursuit_command(current, tgt, cfg=cfg)
             assert not rotating
             inner = cmd.vx - abs(cmd.vtheta) * cfg.wheel_half_track_m
             assert inner >= cfg.wheel_min_speed_mps - 1e-9, (deg, L, cmd)
             assert cmd.vx >= 0.125
             if abs(cmd.vtheta) > 1e-9:
-                assert cmd.vx / abs(cmd.vtheta) >= cfg.effective_min_turn_radius_m() - 1e-9
+                assert (
+                    cmd.vx / abs(cmd.vtheta) >= cfg.effective_min_turn_radius_m() - 1e-9
+                )
 
 
 def test_follow_command_approach_cap_only_at_goal():
@@ -1490,6 +1494,7 @@ def test_follow_command_large_yaw_far_out_closes_xy_first():
     sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
     assert abs(sx) >= 0.12 - 1e-6 or (abs(sx) < 1e-9 and abs(st) >= 0.08)
 
+
 def test_follow_command_overshoot_reverses_instead_of_spinning():
     from src.nav_builtin.controller import compute_follow_command
     from src.nav_builtin.viam_io import _sanitize_base_cmd
@@ -1506,6 +1511,7 @@ def test_follow_command_overshoot_reverses_instead_of_spinning():
     sx, _, st = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
     assert sx < 0.0
     assert not cmd.done
+
 
 def test_compute_path_command_drives_forward():
     path = Path2D(points=((0.0, 0.0), (2.0, 0.0)), goal_theta=0.0)
@@ -1696,9 +1702,7 @@ def test_try_replan_holds_detour_against_short_flip():
         detour_short_flip_budget=0,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
-    short = plan_path(
-        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    short = plan_path(m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert short.feasible
     long_path = Path2D(
         points=((1.0, 3.0), (1.0, 5.0), (5.0, 5.0), (5.0, 3.0)),
@@ -1762,9 +1766,7 @@ def test_try_replan_rejects_too_long_early_detour():
         replan_allow_long_detour_after_fails=2,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
-    short = plan_path(
-        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    short = plan_path(m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert short.feasible
     # ~3× remaining — must be refused on early attempts.
     long_path = Path2D(
@@ -1823,9 +1825,7 @@ def test_try_replan_allows_budgeted_short_flip():
         detour_short_flip_budget=2,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
-    short = plan_path(
-        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    short = plan_path(m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert short.feasible
     long_path = Path2D(
         points=((1.0, 3.0), (1.0, 5.0), (5.0, 5.0), (5.0, 3.0)),
@@ -1909,9 +1909,7 @@ def test_try_replan_lifts_detour_ban_when_no_alternate():
         detour_short_flip_budget=0,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
-    short = plan_path(
-        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    short = plan_path(m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert short.feasible
     long_path = Path2D(
         points=((1.0, 3.0), (1.0, 5.0), (5.0, 5.0), (5.0, 3.0)),
@@ -1970,9 +1968,7 @@ def test_try_replan_force_lifts_short_flip_when_path_blocked():
         detour_short_flip_budget=0,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
-    short = plan_path(
-        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    short = plan_path(m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert short.feasible
     long_path = Path2D(
         points=((1.0, 3.0), (1.0, 5.0), (5.0, 5.0), (5.0, 3.0)),
@@ -2021,9 +2017,7 @@ def test_plan_path_marks_local_costmap_for_replan():
     m = _empty_map(size=80, resolution=0.05)
     start = Pose2D(0.5, 2.0, 0.0)
     goal = Pose2D(3.5, 2.0, 0.0)
-    baseline = plan_path(
-        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    baseline = plan_path(m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert baseline.feasible
     lc = LocalCostmap(
         LocalCostmapConfig(
@@ -2086,9 +2080,7 @@ def test_plan_path_overlay_avoids_second_local_obstacle():
     m = _empty_map(size=120, resolution=0.05)
     start = Pose2D(1.0, 3.0, 0.0)
     goal = Pose2D(5.0, 3.0, 0.0)
-    baseline = plan_path(
-        m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    baseline = plan_path(m, start, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert baseline.feasible
     lc = LocalCostmap(
         LocalCostmapConfig(
@@ -2136,8 +2128,7 @@ def test_plan_path_overlay_avoids_second_local_obstacle():
     assert paths_meaningfully_differ(baseline.path, detoured.path)
     # Accepted path must stay clear of *both* live blobs inside the window.
     assert (
-        path_cost_in_local_window(start, detoured.path, view, start_offset_m=0.22)
-        < 200
+        path_cost_in_local_window(start, detoured.path, view, start_offset_m=0.22) < 200
     ), "replan still intersects a live local obstacle"
 
 
@@ -2159,9 +2150,7 @@ def test_try_replan_rejects_path_still_hitting_local_cost():
         clearance_preference_m=0.0,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
-    base = plan_path(
-        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    base = plan_path(m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert base.feasible
     lc = LocalCostmap(
         LocalCostmapConfig(
@@ -2216,11 +2205,12 @@ def test_try_replan_rejects_path_still_hitting_local_cost():
     assert new is None
     assert "still local-blocked" in (sup._last_replan_error or "")
     assert any(
-        "still local-blocked" in str(a) for a in (sup._last_replan_info or {}).get("attempts", [])
+        "still local-blocked" in str(a)
+        for a in (sup._last_replan_info or {}).get("attempts", [])
     )
 
 
-def test_builtin_navigator_cancel_sets_status():
+def test_open_room_replan_peels_around_bin_without_room_loop():
     """Open room: scan peels around a bin; corridor paint must not replace it
     with a room-scale loop."""
     from src.nav_builtin.controller import _path_length
@@ -2241,9 +2231,7 @@ def test_builtin_navigator_cancel_sets_status():
         clearance_preference_m=0.0,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
-    base = plan_path(
-        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    base = plan_path(m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert base.feasible
     base_len = _path_length(base.path)
     n = 72
@@ -2282,9 +2270,7 @@ def test_forced_side_detour_peels_around_blocked_sample():
         clearance_preference_m=0.0,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
-    base = plan_path(
-        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    base = plan_path(m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert base.feasible
     base_len = _path_length(base.path)
     lc = LocalCostmap(
@@ -2334,9 +2320,7 @@ def test_try_replan_falls_to_forced_via_when_plans_identical():
         clearance_preference_m=0.0,
     )
     goal = Pose2D(5.0, 3.0, 0.0)
-    base = plan_path(
-        m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22
-    )
+    base = plan_path(m, world.pose, goal, inflation_radius_m=0.25, robot_radius_m=0.22)
     assert base.feasible
     lc = LocalCostmap(
         LocalCostmapConfig(
@@ -2630,7 +2614,9 @@ def test_nav_loc_refine_holds_when_residual_stays_lost():
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
     world.scan = _open_scan()
     sup = _loc_refine_supervisor(world)
-    t = threading.Thread(target=sup.run_goal, args=(Pose2D(1.6, 1.0, 0.0),), daemon=True)
+    t = threading.Thread(
+        target=sup.run_goal, args=(Pose2D(1.6, 1.0, 0.0),), daemon=True
+    )
     t.start()
     deadline = time.time() + 2.0
     while time.time() < deadline and world.loc_checks < 1:
@@ -2706,13 +2692,22 @@ def test_loc_check_returns_before_a_slow_match():
     def _slow(_w, **_kw):
         started.set()
         assert release.wait(2.0)
-        return {"status": "ok", "corrected": False, "good_match": True, "score": 0.6,
-                "shift_m": 0.0, "shift_deg": 0.0}
+        return {
+            "status": "ok",
+            "corrected": False,
+            "good_match": True,
+            "score": 0.6,
+            "shift_m": 0.0,
+            "shift_deg": 0.0,
+        }
 
     world.on_loc_check = _slow
     mild = LocDisagreement(
-        disagree=True, reason="scan_map", compared_beams=12,
-        disagree_beams=4, disagree_frac=0.333,
+        disagree=True,
+        reason="scan_map",
+        compared_beams=12,
+        disagree_beams=4,
+        disagree_frac=0.333,
     )
     sup = _loc_refine_supervisor(world)
     sup._measure_loc_disagreement = lambda _pose: mild  # noqa: SLF001

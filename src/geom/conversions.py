@@ -9,6 +9,7 @@ ROS2 installation. It handles:
 * multi-lidar LaserScan merging (scans -> common-frame XY points -> single scan)
 * depth/3D point cloud -> 2D LaserScan ranges
 """
+
 from __future__ import annotations
 
 import math
@@ -251,7 +252,9 @@ class OdomReading:
     vtheta: float  # rad/s about +Z
     pose: Optional[Pose2D] = None  # full odom-frame pose; replaces integration
     heading_rad: Optional[float] = None  # snap yaw while integrating x/y (MiR-style)
-    ax: Optional[float] = None  # body-frame horizontal linear accel, gravity removed (m/s^2)
+    ax: Optional[float] = (
+        None  # body-frame horizontal linear accel, gravity removed (m/s^2)
+    )
     ay: Optional[float] = None
 
 
@@ -365,9 +368,7 @@ def _parse_orientation_yaw_rad(readings: Mapping) -> Optional[float]:
             # Euler yaw is radians per Viam API; do not degree-guess small values.
             return float(block["yaw"])
         if all(k in block for k in ("x", "y", "z", "w")):
-            return _yaw_from_quaternion(
-                block["x"], block["y"], block["z"], block["w"]
-            )
+            return _yaw_from_quaternion(block["x"], block["y"], block["z"], block["w"])
         if all(k in block for k in ("o_x", "o_y", "o_z")):
             return _angle_to_rad(float(block.get("theta", 0.0)))
     return None
@@ -398,7 +399,16 @@ def _parse_heading_rad_from_readings(
             return None
         return _parse_orientation_yaw_rad(readings)
 
-    for tk in ("odom_yaw_deg", "odom_theta", "odom_yaw", "yaw_deg", "theta", "yaw", "heading", "pose_theta"):
+    for tk in (
+        "odom_yaw_deg",
+        "odom_theta",
+        "odom_yaw",
+        "yaw_deg",
+        "theta",
+        "yaw",
+        "heading",
+        "pose_theta",
+    ):
         if tk in readings:
             return _heading_value_to_rad(tk, float(readings[tk]))
     return _parse_orientation_yaw_rad(readings)
@@ -595,7 +605,15 @@ def parse_heading_sensor_readings(readings: Mapping) -> Optional[float]:
     """Yaw (rad) from a dedicated heading sensor such as an IMU."""
     if not readings:
         return None
-    for tk in ("odom_yaw_deg", "odom_theta", "odom_yaw", "yaw_deg", "theta", "yaw", "heading"):
+    for tk in (
+        "odom_yaw_deg",
+        "odom_theta",
+        "odom_yaw",
+        "yaw_deg",
+        "theta",
+        "yaw",
+        "heading",
+    ):
         if tk in readings:
             return _heading_value_to_rad(tk, float(readings[tk]))
     return _parse_orientation_yaw_rad(readings)
@@ -835,9 +853,7 @@ def path_msg_to_points(path_msg, *, max_points: int = 400) -> List[Dict[str, flo
     if max_points == 1:
         return [_one(poses[-1])]
     n = len(poses)
-    idxs = [
-        int(round(i * (n - 1) / float(max_points - 1))) for i in range(max_points)
-    ]
+    idxs = [int(round(i * (n - 1) / float(max_points - 1))) for i in range(max_points)]
     seen = set()
     ordered: List[int] = []
     for idx in idxs:
@@ -853,7 +869,9 @@ def path_length_m(points: List[Dict[str, float]]) -> float:
         return 0.0
     total = 0.0
     for a, b in zip(points, points[1:]):
-        total += math.hypot(float(b["x"]) - float(a["x"]), float(b["y"]) - float(a["y"]))
+        total += math.hypot(
+            float(b["x"]) - float(a["x"]), float(b["y"]) - float(a["y"])
+        )
     return total
 
 
@@ -1148,9 +1166,11 @@ def merge_scans(
     if not scans:
         return LaserScan2D(np.full(num_bins, np.inf), -math.pi, 2 * math.pi / num_bins)
     all_points = [s.to_points() for s in scans]
-    stacked = np.vstack([p for p in all_points if p.size]) if any(
-        p.size for p in all_points
-    ) else np.empty((0, 2))
+    stacked = (
+        np.vstack([p for p in all_points if p.size])
+        if any(p.size for p in all_points)
+        else np.empty((0, 2))
+    )
     return points_to_scan(
         stacked,
         angle_min=-math.pi,
@@ -1193,11 +1213,7 @@ def merge_lidar_and_depth_scans(
         if not math.isfinite(d):
             continue
         L = out[i]
-        if (
-            d <= phantom_max
-            and math.isfinite(L)
-            and d < L - margin
-        ):
+        if d <= phantom_max and math.isfinite(L) and d < L - margin:
             # Lidar sees much farther in this bin — treat near depth as phantom.
             continue
         if (not math.isfinite(L)) or d < L:
@@ -1339,9 +1355,7 @@ def prepare_lidar_point_cloud(
     return pts
 
 
-def filter_points_by_z(
-    points: np.ndarray, z_min: float, z_max: float
-) -> np.ndarray:
+def filter_points_by_z(points: np.ndarray, z_min: float, z_max: float) -> np.ndarray:
     """Keep ``(N, 3+)`` points whose Z lies in ``[z_min, z_max]``."""
     points = np.asarray(points, dtype=float)
     if points.size == 0 or points.shape[1] < 3:
@@ -1437,8 +1451,12 @@ def estimate_forward_range_flow(
     if prev_r.size < 20 or curr_r.size < 20:
         return None
 
-    prev_angles = prev.angle_min + np.arange(prev_r.size, dtype=float) * prev.angle_increment
-    curr_angles = curr.angle_min + np.arange(curr_r.size, dtype=float) * curr.angle_increment
+    prev_angles = (
+        prev.angle_min + np.arange(prev_r.size, dtype=float) * prev.angle_increment
+    )
+    curr_angles = (
+        curr.angle_min + np.arange(curr_r.size, dtype=float) * curr.angle_increment
+    )
     valid_prev = (
         np.isfinite(prev_r)
         & (prev_r >= float(prev.range_min))
@@ -1510,7 +1528,9 @@ def _scan_motion_grid_search(
     curr_r = np.asarray(curr.ranges, dtype=float)
     if prev_r.size < 20 or curr_r.size < 20:
         return None, {"reject": "sparse_scan"}
-    prev_angles = prev.angle_min + np.arange(prev_r.size, dtype=float) * prev.angle_increment
+    prev_angles = (
+        prev.angle_min + np.arange(prev_r.size, dtype=float) * prev.angle_increment
+    )
     valid_prev = (
         np.isfinite(prev_r)
         & (prev_r >= float(prev.range_min))
@@ -1524,7 +1544,9 @@ def _scan_motion_grid_search(
     prev_angles = prev_angles[idx]
     prev_r = prev_r[idx]
 
-    curr_angles = curr.angle_min + np.arange(curr_r.size, dtype=float) * curr.angle_increment
+    curr_angles = (
+        curr.angle_min + np.arange(curr_r.size, dtype=float) * curr.angle_increment
+    )
     valid_curr = (
         np.isfinite(curr_r)
         & (curr_r >= float(curr.range_min))
@@ -1687,9 +1709,7 @@ def estimate_scan_motion_with_debug(
 def scan_has_returns(scan: LaserScan2D) -> bool:
     """True when the scan contains at least one finite in-range return."""
     r = np.asarray(scan.ranges, dtype=float)
-    return bool(
-        np.any(np.isfinite(r) & (r >= scan.range_min) & (r <= scan.range_max))
-    )
+    return bool(np.any(np.isfinite(r) & (r >= scan.range_min) & (r <= scan.range_max)))
 
 
 # MiR250 laser mounts (meters, radians) — keep in sync with viam-mir-base mir_rosbridge.py.
@@ -1753,15 +1773,15 @@ def _laser_scan_dict_to_points(
         if distance_m < range_min or distance_m > range_max:
             continue
         angle = angle_min + index * angle_increment
-        sensor_xy.append(
-            (distance_m * math.cos(angle), distance_m * math.sin(angle))
-        )
+        sensor_xy.append((distance_m * math.cos(angle), distance_m * math.sin(angle)))
 
     if not sensor_xy:
         return LidarPoints(sensor=np.empty((0, 3)), base_link=np.empty((0, 3)))
 
     sensor_arr = np.asarray(sensor_xy, dtype=float)
-    sensor = np.column_stack([sensor_arr[:, 0], sensor_arr[:, 1], np.zeros(len(sensor_arr))])
+    sensor = np.column_stack(
+        [sensor_arr[:, 0], sensor_arr[:, 1], np.zeros(len(sensor_arr))]
+    )
     base_xy = _transform_xy(sensor_arr, mount)
     base_link = np.column_stack([base_xy[:, 0], base_xy[:, 1], np.zeros(len(base_xy))])
     return LidarPoints(sensor=sensor, base_link=base_link)
@@ -1944,9 +1964,7 @@ def base_link_cloud_to_lidar_scan(
     if points.size and points.shape[1] >= 3:
         points = filter_points_by_z(points, z_min, z_max)
     if not points_in_base_link and points.size:
-        points = transform_base_link_to_lidar_mount(
-            points, x=x, y=y, z=z, theta=theta
-        )
+        points = transform_base_link_to_lidar_mount(points, x=x, y=y, z=z, theta=theta)
     xy = points[:, :2] if points.size else np.empty((0, 2))
     return points_to_scan(xy, **scan_kwargs)
 
@@ -2057,8 +2075,16 @@ def parse_pcd(raw: bytes) -> np.ndarray:
         return arr[:, [col["x"], col["y"], col["z"]]].astype(float)
 
     # Binary: build a numpy structured dtype matching the PCD record layout.
-    type_map = {("F", 4): "f4", ("F", 8): "f8", ("U", 1): "u1", ("U", 2): "u2",
-                ("U", 4): "u4", ("I", 1): "i1", ("I", 2): "i2", ("I", 4): "i4"}
+    type_map = {
+        ("F", 4): "f4",
+        ("F", 8): "f8",
+        ("U", 1): "u1",
+        ("U", 2): "u2",
+        ("U", 4): "u4",
+        ("I", 1): "i1",
+        ("I", 2): "i2",
+        ("I", 4): "i4",
+    }
     dtype_fields = []
     for f, s, t, c in zip(fields, sizes, types, counts):
         np_t = type_map.get((t.upper(), s), f"V{s}")
@@ -2076,6 +2102,6 @@ def parse_pcd(raw: bytes) -> np.ndarray:
     structured = np.frombuffer(body[: npoints * record.itemsize], dtype=record)
     if not {"x", "y", "z"} <= set(structured.dtype.names or ()):
         return np.empty((0, 3))
-    return np.stack(
-        [structured["x"], structured["y"], structured["z"]], axis=1
-    ).astype(float)
+    return np.stack([structured["x"], structured["y"], structured["z"]], axis=1).astype(
+        float
+    )

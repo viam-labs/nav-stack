@@ -155,7 +155,7 @@ def test_eio_counts_as_missing_for_retry():
 
     assert is_port_missing_error(
         Exception(
-            "SerialException(5, \"could not open port: [Errno 5] Input/output error\")"
+            'SerialException(5, "could not open port: [Errno 5] Input/output error")'
         )
     )
 
@@ -237,7 +237,11 @@ def test_serial_exclude_extra_substring():
         patch(
             "src.lidar.serial_ports.os.path.realpath",
             side_effect=lambda p: (
-                "/dev/ttyUSB0" if "1a86" in p else "/dev/ttyUSB1" if "Silicon" in p else p
+                "/dev/ttyUSB0"
+                if "1a86" in p
+                else "/dev/ttyUSB1"
+                if "Silicon" in p
+                else p
             ),
         ),
         patch("src.lidar.serial_ports._usb_vid_pid_for_port", return_value=None),

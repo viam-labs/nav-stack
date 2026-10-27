@@ -1,4 +1,5 @@
 """Log-odds occupancy grid insert / convert."""
+
 from __future__ import annotations
 
 import math
@@ -278,9 +279,7 @@ def _paint_rays(
     max_steps = int(steps.max())
     h, w = lo.shape
     if max_steps <= 0:
-        inside = (
-            (rows1 >= 0) & (rows1 < h) & (cols1 >= 0) & (cols1 < w)
-        )
+        inside = (rows1 >= 0) & (rows1 < h) & (cols1 >= 0) & (cols1 < w)
         if np.any(inside):
             np.add.at(lo, (rows1[inside], cols1[inside]), np.float32(L_OCC))
             np.clip(lo, L_MIN, L_MAX, out=lo)

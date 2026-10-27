@@ -16,9 +16,7 @@ def test_forward_sector_min_range_detects_obstacle_ahead():
     # angle_min=-pi, increment=2pi/720 → bin for angle≈0 is 360
     ranges[360] = 1.5
     ranges[100] = 0.4  # far off to the side; must not win
-    scan = conv.LaserScan2D(
-        ranges, -math.pi, (2.0 * math.pi) / 720, 0.05, 25.0
-    )
+    scan = conv.LaserScan2D(ranges, -math.pi, (2.0 * math.pi) / 720, 0.05, 25.0)
     assert math.isclose(
         conv.forward_sector_min_range(scan, half_width_rad=math.radians(15.0)),
         1.5,
@@ -31,9 +29,7 @@ def test_nearest_return_bearing_deg_reports_offset_wall():
     # Put nearest hit at about +45° (bin ≈ 360 + 90 = 450 for 720 bins).
     ranges[450] = 1.0
     ranges[360] = 3.0  # forward is farther — nearest bearing should be ~45°
-    scan = conv.LaserScan2D(
-        ranges, -math.pi, (2.0 * math.pi) / 720, 0.05, 25.0
-    )
+    scan = conv.LaserScan2D(ranges, -math.pi, (2.0 * math.pi) / 720, 0.05, 25.0)
     bearing = conv.nearest_return_bearing_deg(scan)
     assert bearing is not None
     assert abs(bearing - 45.0) < 1.0
@@ -92,11 +88,15 @@ def test_points_to_scan_keeps_nearest():
 
 def test_merge_scans_combines_lidars():
     front = conv.LaserScan2D(
-        ranges=np.array([1.0]), angle_min=0.0, angle_increment=0.1,
+        ranges=np.array([1.0]),
+        angle_min=0.0,
+        angle_increment=0.1,
         sensor_pose=conv.Pose2D(0.0, 0.0, 0.0),
     )
     rear = conv.LaserScan2D(
-        ranges=np.array([1.0]), angle_min=math.pi, angle_increment=0.1,
+        ranges=np.array([1.0]),
+        angle_min=math.pi,
+        angle_increment=0.1,
         sensor_pose=conv.Pose2D(0.0, 0.0, math.pi),
     )
     merged = conv.merge_scans([front, rear], num_bins=360)
@@ -308,9 +308,7 @@ def test_prepare_lidar_point_cloud_downsamples_after_gates_keeps_near_hits():
         [np.linspace(-0.5, 0.5, 2000), np.full(2000, -0.2), np.full(2000, 5.0)]
     )
     # Near ankle-height obstacle on the right: few points at 0.6 m depth.
-    near = np.column_stack(
-        [np.full(40, 0.4), np.full(40, -0.12), np.full(40, 0.6)]
-    )
+    near = np.column_stack([np.full(40, 0.4), np.full(40, -0.12), np.full(40, 0.6)])
     cloud = np.vstack([far, near, np.zeros((500, 3))])
 
     # Old-style early downsample would almost never keep the 40 near points
@@ -371,9 +369,7 @@ def test_parse_pcd_malformed_missing_xyz():
 
 
 def test_parse_odom_pose_from_readings_flat():
-    pose = conv.parse_odom_pose_from_readings(
-        {"x": 1.5, "y": -2.0, "theta": 90.0}
-    )
+    pose = conv.parse_odom_pose_from_readings({"x": 1.5, "y": -2.0, "theta": 90.0})
     assert pose is not None
     assert pose.x == 1.5
     assert pose.y == -2.0
@@ -1066,7 +1062,11 @@ def test_extract_dominant_wall_angled_then_corrects():
     bias = math.radians(8.0)
     scan = _side_wall_scan(yaw_bias_rad=bias)
     obs = conv.extract_dominant_wall(
-        scan, min_length_m=2.0, min_inliers=20, parallel_tol_rad=math.radians(40), seed=2
+        scan,
+        min_length_m=2.0,
+        min_inliers=20,
+        parallel_tol_rad=math.radians(40),
+        seed=2,
     )
     assert obs is not None
     assert abs(obs.wall_yaw_body - bias) < math.radians(3.0)

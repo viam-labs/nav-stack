@@ -1,4 +1,5 @@
 """Shared types for the builtin navigator."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -123,8 +124,12 @@ class PlanResult:
     # The exact costmap the path was planned on (static + scan + local
     # overlay). Post-processing (smoothing, start bridging) must use this, not
     # a fresh static-only build, or it will shortcut through live obstacles.
-    planning_costs: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
-    planning_occ: Optional["OccupancyGrid"] = field(default=None, repr=False, compare=False)
+    planning_costs: Optional[np.ndarray] = field(
+        default=None, repr=False, compare=False
+    )
+    planning_occ: Optional["OccupancyGrid"] = field(
+        default=None, repr=False, compare=False
+    )
 
     def to_preview_dict(
         self,
@@ -134,7 +139,9 @@ class PlanResult:
         planner_id: str = "LazyThetaStar",
         max_points: int = 400,
     ) -> dict:
-        points = self.path.as_plan_points(max_points=max_points) if self.feasible else []
+        points = (
+            self.path.as_plan_points(max_points=max_points) if self.feasible else []
+        )
         length = 0.0
         for i in range(1, len(points)):
             length += float(

@@ -1,4 +1,5 @@
 """Duck-typed SLAM host for ``slam_backend: builtin``."""
+
 from __future__ import annotations
 
 import math
@@ -148,7 +149,5 @@ class BuiltinSlamHost:
         self._map_updates_enabled = bool(enabled)
 
     def flush_map_subscription(self) -> int:
-        self._visible_generation = int(
-            self._engine.diagnostics().get("generation", 0)
-        )
+        self._visible_generation = int(self._engine.diagnostics().get("generation", 0))
         return self._visible_generation

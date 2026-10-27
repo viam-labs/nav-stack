@@ -17,6 +17,7 @@ Obstacles are checked as points against the padded rectangle, so a 0.85 m
 doorway is passable for a 0.59 m wide robot as long as the body actually
 clears the jambs — no circular approximation of a rectangle.
 """
+
 from __future__ import annotations
 
 import math
@@ -197,7 +198,9 @@ def obstacle_points(
     return pts[d2 <= radius_m * radius_m]
 
 
-def _arc_poses(pose: Pose2D, v: float, w: float, dist_m: float, step_m: float) -> np.ndarray:
+def _arc_poses(
+    pose: Pose2D, v: float, w: float, dist_m: float, step_m: float
+) -> np.ndarray:
     n = max(1, int(math.ceil(dist_m / step_m)))
     s = np.arange(1, n + 1) * (dist_m / n) * (1.0 if v >= 0 else -1.0)
     kappa = w / v if abs(v) > 1e-9 else 0.0
@@ -375,7 +378,9 @@ class FootprintGuard:
         cfg = self.cfg
         if not math.isfinite(free_m):
             return abs(v)
-        return max(0.0, min(abs(v), (free_m - cfg.stop_gap_m) / cfg.time_to_collision_s))
+        return max(
+            0.0, min(abs(v), (free_m - cfg.stop_gap_m) / cfg.time_to_collision_s)
+        )
 
     def _drivable(self, v: float, w: float) -> Tuple[float, float]:
         """Keep an arc that the base sanitizer will not turn into a spin."""
@@ -415,12 +420,7 @@ class FootprintGuard:
         free = self.free_distance(pose, vx, vtheta, pts, horizon)
         v_ok = self._regulate(vx, free)
         need = cfg.alt_min_free_m if allow_steer else cfg.stop_gap_m + 0.02
-        if (
-            allow_steer
-            and vx > 0.0
-            and math.isfinite(free)
-            and free < horizon
-        ):
+        if allow_steer and vx > 0.0 and math.isfinite(free) and free < horizon:
             # Collision somewhere on the nominal arc: steer early if a clearly
             # freer forward arc exists, instead of closing to the stop gap.
             alt = self.best_forward_arc(
@@ -450,8 +450,10 @@ class FootprintGuard:
                 bearing = conv.normalize_angle(
                     math.atan2(target.y - pose.y, target.x - pose.x) - pose.theta
                 )
-                sign = math.copysign(1.0, bearing) if abs(bearing) > 1e-3 else (
-                    prefer_sign or 1.0
+                sign = (
+                    math.copysign(1.0, bearing)
+                    if abs(bearing) > 1e-3
+                    else (prefer_sign or 1.0)
                 )
                 for sg in (sign, -sign):
                     if self.free_rotation(pose, sg, pts) >= cfg.rot_horizon_rad * 0.5:
@@ -469,7 +471,9 @@ class FootprintGuard:
     ) -> Optional[Tuple[float, float, float]]:
         cfg = self.cfg
         v = max(cfg.alt_speed_mps, min(float(speed), 0.25))
-        kappas = np.linspace(-cfg.alt_max_curvature, cfg.alt_max_curvature, cfg.alt_samples)
+        kappas = np.linspace(
+            -cfg.alt_max_curvature, cfg.alt_max_curvature, cfg.alt_samples
+        )
         frees = self._free_distances_batch(pose, v, kappas, pts, horizon)
         best = None
         best_score = math.inf

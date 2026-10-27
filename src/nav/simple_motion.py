@@ -3,6 +3,7 @@
 Mirrors MiR manual-mode ``drive_to_pose`` but uses SLAM map poses (meters/radians)
 instead of the MiR REST map. No Nav2 required.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -336,7 +337,11 @@ def apply_obstacle_avoidance(
         preferred_clear = left if prefer_left else right
         if preferred_clear >= min_clear:
             direction = 1.0 if prefer_left else -1.0
-    return DriveCommand(0.0, 0.0, direction * max_angular_rad_s, False), "avoid", forward
+    return (
+        DriveCommand(0.0, 0.0, direction * max_angular_rad_s, False),
+        "avoid",
+        forward,
+    )
 
 
 def heading_error_rad(current_rad: float, target_rad: float) -> float:
@@ -409,9 +414,7 @@ def compute_drive_command(
 
     if at_xy:
         angular_cmd = _clamp(final_heading_error, max_angular)
-        return apply_velocity_floor(
-            DriveCommand(0.0, 0.0, angular_cmd, False), cfg
-        )
+        return apply_velocity_floor(DriveCommand(0.0, 0.0, angular_cmd, False), cfg)
 
     linear_cmd = _clamp(dist * 0.5, max_linear)
     if dist < cfg.xy_tolerance_m * 3:
@@ -419,9 +422,7 @@ def compute_drive_command(
     angular_cmd = _clamp(bearing_error * 1.5, max_angular)
     if abs(bearing_error) > math.radians(45.0):
         linear_cmd = min(linear_cmd, max_linear * 0.4)
-    return apply_velocity_floor(
-        DriveCommand(linear_cmd, 0.0, angular_cmd, False), cfg
-    )
+    return apply_velocity_floor(DriveCommand(linear_cmd, 0.0, angular_cmd, False), cfg)
 
 
 def config_from_nav(
@@ -542,12 +543,12 @@ async def drive_to_pose(
                     {
                         "distance_remaining_m": dist,
                         "bearing_error_rad": bearing,
-                        "heading_error_rad": heading_error_rad(current.theta, goal.theta),
+                        "heading_error_rad": heading_error_rad(
+                            current.theta, goal.theta
+                        ),
                         "obstacle": obstacle_state,
                         "forward_clearance_m": (
-                            None
-                            if math.isinf(forward_clearance)
-                            else forward_clearance
+                            None if math.isinf(forward_clearance) else forward_clearance
                         ),
                         "cmd_vx_mps": cmd.vx,
                         "cmd_vy_mps": cmd.vy,

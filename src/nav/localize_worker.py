@@ -16,6 +16,7 @@ Design:
 * Any subprocess failure (spawn error, broken pool, pickling) falls back to
   running the function in-process so localization never stops working.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -82,7 +83,9 @@ def map_token(occ_map: OccupancyMap) -> str:
 class LocalizeWorker:
     """Subprocess-backed matcher with in-process fallback."""
 
-    def __init__(self, *, enabled: bool = True, logger=None, call_timeout_s: float = 90.0):
+    def __init__(
+        self, *, enabled: bool = True, logger=None, call_timeout_s: float = 90.0
+    ):
         self._enabled = bool(enabled)
         self._logger = logger
         self._call_timeout_s = float(call_timeout_s)
@@ -132,7 +135,9 @@ class LocalizeWorker:
                 self.stats["last_error"] = f"spawn: {exc}"
                 self._enabled = False
                 self.stats["enabled"] = False
-                self._log(f"localize worker: cannot start subprocess ({exc}); in-process")
+                self._log(
+                    f"localize worker: cannot start subprocess ({exc}); in-process"
+                )
                 return None
             return self._pool
 

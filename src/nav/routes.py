@@ -4,6 +4,7 @@ A **route** is an ordered series of **waypoints**. Each waypoint is the name of
 a location on the same map (see ``locations.py``). Persistence is
 ``routes.json`` next to ``locations.json`` / ``zones.json``.
 """
+
 from __future__ import annotations
 
 import json
@@ -63,9 +64,7 @@ class RouteStore:
         self.path.write_text(json.dumps(data, indent=2))
 
     # -- route CRUD ----------------------------------------------------------
-    def add(
-        self, name: str, waypoints: Optional[Sequence[str]] = None
-    ) -> Route:
+    def add(self, name: str, waypoints: Optional[Sequence[str]] = None) -> Route:
         name = validate_route_name(name)
         if name in self._routes:
             raise ValueError(f"route {name!r} already exists")
@@ -142,16 +141,13 @@ class RouteStore:
         self._save()
         return route
 
-    def update_waypoint(
-        self, name: str, index: int, location: str
-    ) -> Route:
+    def update_waypoint(self, name: str, index: int, location: str) -> Route:
         """Replace the location name at ``index``."""
         route = self.get(name)
         idx = int(index)
         if idx < 0 or idx >= len(route.waypoints):
             raise ValueError(
-                f"waypoint index {idx} out of range "
-                f"(0..{len(route.waypoints) - 1})"
+                f"waypoint index {idx} out of range (0..{len(route.waypoints) - 1})"
             )
         route.waypoints[idx] = str(location)
         self._save()
@@ -170,8 +166,7 @@ class RouteStore:
             idx = int(index)
             if idx < 0 or idx >= len(route.waypoints):
                 raise ValueError(
-                    f"waypoint index {idx} out of range "
-                    f"(0..{len(route.waypoints) - 1})"
+                    f"waypoint index {idx} out of range (0..{len(route.waypoints) - 1})"
                 )
             del route.waypoints[idx]
         elif location is not None:
@@ -187,22 +182,16 @@ class RouteStore:
         self._save()
         return route
 
-    def move_waypoint(
-        self, name: str, from_index: int, to_index: int
-    ) -> Route:
+    def move_waypoint(self, name: str, from_index: int, to_index: int) -> Route:
         """Reorder: take waypoint at ``from_index`` and insert at ``to_index``."""
         route = self.get(name)
         n = len(route.waypoints)
         src = int(from_index)
         dst = int(to_index)
         if src < 0 or src >= n:
-            raise ValueError(
-                f"from_index {src} out of range (0..{n - 1})"
-            )
+            raise ValueError(f"from_index {src} out of range (0..{n - 1})")
         if dst < 0 or dst >= n:
-            raise ValueError(
-                f"to_index {dst} out of range (0..{n - 1})"
-            )
+            raise ValueError(f"to_index {dst} out of range (0..{n - 1})")
         loc = route.waypoints.pop(src)
         route.waypoints.insert(dst, loc)
         self._save()

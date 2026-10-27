@@ -10,6 +10,7 @@ can share the ring machinery; payload is a fixed binary sample, not PCD.
       roll pitch yaw 3xf32  # rad
       mx my mz       3xf32  # µT
 """
+
 from __future__ import annotations
 
 import struct
@@ -119,7 +120,9 @@ class Writer:
         self._w = pcshm.Writer(name, region_size=region_size)
         self.name = self._w.name
 
-    def write_sample(self, sample: ImuShmSample, timestamp_ns: Optional[int] = None) -> None:
+    def write_sample(
+        self, sample: ImuShmSample, timestamp_ns: Optional[int] = None
+    ) -> None:
         payload = pack_sample(
             ax=sample.ax,
             ay=sample.ay,

@@ -6,6 +6,7 @@ scans, and the grid can be re-rendered from optimized poses. Edges are the
 odometry chain between consecutive nodes plus loop constraints found by
 matching against older parts of the map.
 """
+
 from __future__ import annotations
 
 import math
@@ -136,7 +137,9 @@ class PoseGraph:
             self._rebase = conv.compose_poses(correction, self._rebase)
 
     # -- building -----------------------------------------------------------
-    def _make_scan(self, rel: conv.Pose2D, scan: conv.LaserScan2D) -> Optional[GraphScan]:
+    def _make_scan(
+        self, rel: conv.Pose2D, scan: conv.LaserScan2D
+    ) -> Optional[GraphScan]:
         ranges = np.asarray(scan.ranges, dtype=float)
         if ranges.size == 0:
             return None
@@ -251,7 +254,9 @@ class PoseGraph:
                 best, best_d = i, d
         return best
 
-    def earliest_node_near(self, pose: conv.Pose2D, *, radius_m: float = 1.5) -> Optional[int]:
+    def earliest_node_near(
+        self, pose: conv.Pose2D, *, radius_m: float = 1.5
+    ) -> Optional[int]:
         for i, n in enumerate(self.nodes):
             if math.hypot(n.pose.x - pose.x, n.pose.y - pose.y) <= radius_m:
                 return i
@@ -436,9 +441,9 @@ def optimize(
                     blocks.append((3 * (e.i - first_free), A))
                 if e.j >= first_free:
                     blocks.append((3 * (e.j - first_free), B))
-                for (ra, Ja) in blocks:
+                for ra, Ja in blocks:
                     b[ra : ra + 3] += Ja.T @ om @ err
-                    for (rb, Jb) in blocks:
+                    for rb, Jb in blocks:
                         H[ra : ra + 3, rb : rb + 3] += Ja.T @ om @ Jb
             H[np.diag_indices(dim)] += 1e-6
             try:

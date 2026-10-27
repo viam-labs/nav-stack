@@ -1,10 +1,11 @@
 """Unit tests for large automatic pose-jump confirmation."""
+
 from __future__ import annotations
 
 import math
 
-from src.nav.pose_jump_gate import PoseJumpGate, should_hold_drive_for_pose_jump
 from src.geom import conversions as conv
+from src.nav.pose_jump_gate import PoseJumpGate, should_hold_drive_for_pose_jump
 
 
 def test_should_hold_drive_for_awaiting_confirm():
@@ -75,9 +76,7 @@ def test_disagreeing_large_jump_resets_confirm():
 def test_force_bypasses_confirm():
     gate = PoseJumpGate(confirm_count=3, large_m=0.75)
     current = conv.Pose2D(0.0, 0.0, 0.0)
-    decision = gate.evaluate(
-        current, conv.Pose2D(3.0, 0.0, 0.0), force=True
-    )
+    decision = gate.evaluate(current, conv.Pose2D(3.0, 0.0, 0.0), force=True)
     assert decision.should_apply is True
     assert decision.status == "forced"
 

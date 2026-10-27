@@ -1,4 +1,5 @@
 """Create / reuse SimWorld from SlamConfig.sim."""
+
 from __future__ import annotations
 
 from ..geom import conversions as conv

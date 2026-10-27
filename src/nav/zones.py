@@ -20,6 +20,7 @@ Geometry is expressed in the map frame (meters). Supported shapes:
 The design leaves room for additional zone types (e.g. directional/preferred-lane)
 using the same masking plumbing.
 """
+
 from __future__ import annotations
 
 import json
@@ -31,11 +32,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .naming import validate_name
+
 KEEPOUT = "keepout"
 SPEED_LIMIT = "speed_limit"
 ZONE_TYPES = {KEEPOUT, SPEED_LIMIT}
-
-from .naming import validate_name
 
 
 def validate_zone_name(name: str) -> str:
@@ -192,9 +193,7 @@ def _cell_centers(
     return np.meshgrid(xs, ys)  # X, Y each shape (height, width)
 
 
-def _mask_for_geometry(
-    geometry: Dict, X: np.ndarray, Y: np.ndarray
-) -> np.ndarray:
+def _mask_for_geometry(geometry: Dict, X: np.ndarray, Y: np.ndarray) -> np.ndarray:
     shape = geometry["type"]
     if shape == "circle":
         cx, cy = geometry["center"]
@@ -353,9 +352,7 @@ def apply_speed_zone_limit(
         and abs(out_w) > _SANITIZE_SPIN_W_RAD_S
     ):
         out_vx = math.copysign(max(abs(out_vx), _CRAWL_FLOOR_MPS), out_vx)
-        out_w = math.copysign(
-            min(abs(out_w), _SANITIZE_SPIN_W_RAD_S), out_w
-        )
+        out_w = math.copysign(min(abs(out_w), _SANITIZE_SPIN_W_RAD_S), out_w)
     return out_vx, out_vy, out_w
 
 

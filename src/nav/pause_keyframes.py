@@ -7,6 +7,7 @@ stores a compact keyframe — primary-band 2D endpoints plus multi-height slice
 points — and revisit matching can snap to those views even when the raster map
 is ambiguous.
 """
+
 from __future__ import annotations
 
 import math
@@ -43,10 +44,9 @@ def nn_hit_rate(
     if query_xy.size == 0 or ref_xy.size == 0:
         return None
     # Brute-force is fine for pause keyframes (~few hundred points each).
-    d2 = (
-        (query_xy[:, None, 0] - ref_xy[None, :, 0]) ** 2
-        + (query_xy[:, None, 1] - ref_xy[None, :, 1]) ** 2
-    )
+    d2 = (query_xy[:, None, 0] - ref_xy[None, :, 0]) ** 2 + (
+        query_xy[:, None, 1] - ref_xy[None, :, 1]
+    ) ** 2
     nearest = np.sqrt(np.min(d2, axis=1))
     return float(np.mean(nearest <= tol_m))
 
@@ -112,9 +112,7 @@ class PauseKeyframeStore:
             endpoints = endpoints[idx]
         for prev in self._frames:
             dist = math.hypot(pose.x - prev.pose.x, pose.y - prev.pose.y)
-            dyaw = abs(
-                math.degrees(conv.normalize_angle(pose.theta - prev.pose.theta))
-            )
+            dyaw = abs(math.degrees(conv.normalize_angle(pose.theta - prev.pose.theta)))
             if dist < self.min_spacing_m and dyaw < self.min_spacing_deg:
                 return False
         bands = [np.asarray(p, dtype=float) for p in (band_points or [])]
@@ -191,14 +189,10 @@ class PauseKeyframeStore:
                             conv.normalize_angle(kf.pose.theta + iy * yaw_step),
                         )
                         q_map = _to_map_xy(query, pose)
-                        primary = nn_hit_rate(
-                            q_map, ref_map, tol_m=self.match_tol_m
-                        )
+                        primary = nn_hit_rate(q_map, ref_map, tol_m=self.match_tol_m)
                         if primary is None:
                             continue
-                        slice_rate = self._band_hit_rate(
-                            q_bands, ref_bands_map, pose
-                        )
+                        slice_rate = self._band_hit_rate(q_bands, ref_bands_map, pose)
                         if slice_rate is None:
                             score = primary
                         else:

@@ -1,4 +1,5 @@
 """Rolling local costmap for builtin navigation (map frame)."""
+
 from __future__ import annotations
 
 import math
@@ -93,7 +94,9 @@ class LocalCostmap:
             origin_y=self._origin_y,
         )
 
-    def _carry_persisted_marks(self, old_raw: np.ndarray, old_ox: float, old_oy: float) -> None:
+    def _carry_persisted_marks(
+        self, old_raw: np.ndarray, old_ox: float, old_oy: float
+    ) -> None:
         """Reproject previous live hits into the recentered window with decay."""
         decay = max(0, int(self._cfg.scan_persist_decay))
         if decay <= 0 or old_raw.size == 0:
@@ -160,9 +163,7 @@ class LocalCostmap:
             dist = math.hypot(pose.x - scan_pose.x, pose.y - scan_pose.y)
             if dtheta > math.radians(8.0) or dist > 0.08:
                 pts3 = np.column_stack([pts, np.zeros(len(pts))])
-                pts = conv.transform_points_between_poses(pts3, scan_pose, pose)[
-                    :, :2
-                ]
+                pts = conv.transform_points_between_poses(pts3, scan_pose, pose)[:, :2]
         cth = math.cos(pose.theta)
         sth = math.sin(pose.theta)
         wx = pose.x + cth * pts[:, 0] - sth * pts[:, 1]
@@ -173,8 +174,12 @@ class LocalCostmap:
         self._raw[rows[inside], cols[inside]] = 100
 
     def _mark_world(self, pts: np.ndarray) -> None:
-        cols = np.floor((pts[:, 0] - self._origin_x) / self._occ.resolution).astype(np.int32)
-        rows = np.floor((pts[:, 1] - self._origin_y) / self._occ.resolution).astype(np.int32)
+        cols = np.floor((pts[:, 0] - self._origin_x) / self._occ.resolution).astype(
+            np.int32
+        )
+        rows = np.floor((pts[:, 1] - self._origin_y) / self._occ.resolution).astype(
+            np.int32
+        )
         inside = (rows >= 0) & (rows < self._h) & (cols >= 0) & (cols < self._w)
         self._raw[rows[inside], cols[inside]] = 100
 
@@ -346,9 +351,7 @@ def reverse_backup_feasible(
     sample_step_m: float = 0.05,
 ) -> bool:
     """True when straight reverse stays traversable and ends in lower local cost."""
-    start_cost = footprint_max_cost(
-        view, x_m, y_m, robot_radius_m=robot_radius_m
-    )
+    start_cost = footprint_max_cost(view, x_m, y_m, robot_radius_m=robot_radius_m)
     if not reverse_path_clear(
         view,
         x_m,
@@ -424,7 +427,10 @@ def reverse_path_clear(
                     # what we are reversing *away* from. Only obstacles further
                     # behind (outside the start footprint pad) can refuse.
                     start_pad_m = max(0.10, 2.0 * res)
-                    if bx > 0.05 or math.hypot(wx - start_x, wy - start_y) <= start_pad_m:
+                    if (
+                        bx > 0.05
+                        or math.hypot(wx - start_x, wy - start_y) <= start_pad_m
+                    ):
                         continue
                 return False
     return True

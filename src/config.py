@@ -3,6 +3,7 @@
 Keeping these as plain dataclasses (no Viam SDK imports) makes the parsing
 logic easy to unit-test and shareable between the models and the runtime layer.
 """
+
 from __future__ import annotations
 
 import math
@@ -264,9 +265,7 @@ class LidarConfig:
             )
         cloud_frame = str(d.get("cloud_frame", CLOUD_FRAME_SENSOR)).strip().lower()
         if cloud_frame not in CLOUD_FRAMES:
-            raise ValueError(
-                f"lidar cloud_frame must be one of {sorted(CLOUD_FRAMES)}"
-            )
+            raise ValueError(f"lidar cloud_frame must be one of {sorted(CLOUD_FRAMES)}")
         name = d["name"]
         if "shm_name" in d:
             raw = d.get("shm_name")
@@ -483,12 +482,11 @@ def _dataclass_from_dict(
 
 def _merge_top_level_nav_tuning(d: Mapping) -> dict:
     """Build the ``builtin`` attribute dict: nested block wins over top-level."""
-    merged = {
-        key: d[key] for key in _TOP_LEVEL_NAV_TUNING_KEYS if key in d
-    }
+    merged = {key: d[key] for key in _TOP_LEVEL_NAV_TUNING_KEYS if key in d}
     nested = d.get("builtin") or d.get("nav2") or {}
     merged.update(dict(nested))
     return merged
+
 
 BUILTIN_PLANNER_ASTAR = "astar"
 BUILTIN_PLANNER_LAZY_THETA = "lazy_theta_star"
@@ -1064,8 +1062,7 @@ class SlamConfig:
             )
         if sim.enabled and slam_backend != SLAM_BACKEND_BUILTIN:
             raise ValueError(
-                "sim.enabled requires slam_backend=builtin "
-                f"(got {slam_backend!r})"
+                f"sim.enabled requires slam_backend=builtin (got {slam_backend!r})"
             )
         convention = d.get("base_velocity_convention", BASE_VELOCITY_VIAM)
         if convention not in BASE_VELOCITY_CONVENTIONS:
@@ -1104,9 +1101,7 @@ class SlamConfig:
             )
         )
         if imu_odom_mode not in IMU_ODOM_MODES:
-            raise ValueError(
-                f"imu_odom_mode must be one of {sorted(IMU_ODOM_MODES)}"
-            )
+            raise ValueError(f"imu_odom_mode must be one of {sorted(IMU_ODOM_MODES)}")
         heading_only_odom = bool(d.get("heading_only_odom", False))
         if heading_only_odom:
             imu_odom_mode = IMU_ODOM_NONE
@@ -1213,9 +1208,7 @@ class SlamConfig:
             d.get(
                 "mapping_revisit_check",
                 (map_when_still and all_point_cloud)
-                or (
-                    slam_backend == SLAM_BACKEND_BUILTIN and mode == MODE_MAPPING
-                ),
+                or (slam_backend == SLAM_BACKEND_BUILTIN and mode == MODE_MAPPING),
             )
         )
         mapping_revisit_while_moving = bool(
@@ -1224,10 +1217,7 @@ class SlamConfig:
                 # Continuous scanning: safe to correct mid-drive. map_when_still
                 # publishes sparse stop scans and shifts odom TF — keep parked.
                 (not map_when_still)
-                and (
-                    slam_backend == SLAM_BACKEND_BUILTIN
-                    or not all_point_cloud
-                ),
+                and (slam_backend == SLAM_BACKEND_BUILTIN or not all_point_cloud),
             )
         )
         heading_sensor = d.get("heading_sensor")
@@ -1328,7 +1318,6 @@ class SlamConfig:
     def tick_rate_hz(self) -> float:
         """Builtin SLAM predict/update loop rate (Hz)."""
         return max(float(self.scan_rate_hz), float(self.odom_rate_hz))
-
 
 
 @dataclass
@@ -1508,7 +1497,9 @@ class NavConfig:
 
     def inflation_is_noop(self) -> bool:
         """True when there is no soft band past hard clearance."""
-        return self.effective_inflation_radius_m() <= self.hard_clearance_radius_m() + 1e-6
+        return (
+            self.effective_inflation_radius_m() <= self.hard_clearance_radius_m() + 1e-6
+        )
 
     def effective_local_inflation_radius_m(self) -> float:
         """Absolute soft outer radius for *live* (scan) hits in the local costmap.

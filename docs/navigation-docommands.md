@@ -35,11 +35,13 @@ Named poses stored per active map.
 
 ```python
 await nav.do_command({"command": "add_location", "name": "kitchen"})
-await nav.do_command({
-    "command": "add_location",
-    "name": "dock",
-    "pose": {"x": 1.0, "y": 2.0, "theta": 0.0},
-})
+await nav.do_command(
+    {
+        "command": "add_location",
+        "name": "dock",
+        "pose": {"x": 1.0, "y": 2.0, "theta": 0.0},
+    }
+)
 await nav.do_command({"command": "list_locations"})
 ```
 
@@ -97,22 +99,28 @@ Adding a route (or setting waypoints) **requires** each location to already exis
 ```python
 await nav.do_command({"command": "add_location", "name": "dock", "x": 0, "y": 0})
 await nav.do_command({"command": "add_location", "name": "kitchen", "x": 3, "y": 1})
-await nav.do_command({
-    "command": "add_route",
-    "name": "patrol",
-    "waypoints": ["dock", "kitchen"],
-})
-await nav.do_command({
-    "command": "add_waypoint",
-    "route": "patrol",
-    "location": "lobby",  # must already exist as a location
-})
-await nav.do_command({
-    "command": "move_waypoint",
-    "route": "patrol",
-    "from_index": 2,
-    "to_index": 1,
-})
+await nav.do_command(
+    {
+        "command": "add_route",
+        "name": "patrol",
+        "waypoints": ["dock", "kitchen"],
+    }
+)
+await nav.do_command(
+    {
+        "command": "add_waypoint",
+        "route": "patrol",
+        "location": "lobby",  # must already exist as a location
+    }
+)
+await nav.do_command(
+    {
+        "command": "move_waypoint",
+        "route": "patrol",
+        "from_index": 2,
+        "to_index": 1,
+    }
+)
 await nav.do_command({"command": "list_routes"})
 ```
 
@@ -143,22 +151,26 @@ Geometry (map frame, meters):
 
 
 ```python
-await nav.do_command({
-    "command": "add_zone",
-    "name": "fragile-display",
-    "type": "keepout",
-    "geometry": {"type": "circle", "center": [4.0, 1.5], "radius": 0.8},
-})
-await nav.do_command({
-    "command": "add_zone",
-    "name": "busy-aisle",
-    "type": "speed_limit",
-    "speed_pct": 30,
-    "geometry": {
-        "type": "polygon",
-        "points": [[0, 0], [2, 0], [2, 3], [0, 3]],
-    },
-})
+await nav.do_command(
+    {
+        "command": "add_zone",
+        "name": "fragile-display",
+        "type": "keepout",
+        "geometry": {"type": "circle", "center": [4.0, 1.5], "radius": 0.8},
+    }
+)
+await nav.do_command(
+    {
+        "command": "add_zone",
+        "name": "busy-aisle",
+        "type": "speed_limit",
+        "speed_pct": 30,
+        "geometry": {
+            "type": "polygon",
+            "points": [[0, 0], [2, 0], [2, 3], [0, 3]],
+        },
+    }
+)
 ```
 
 ---
@@ -201,16 +213,20 @@ Follows an ordered list of waypoints with the builtin navigator, one leg at a ti
 
 ```python
 await nav.do_command({"command": "navigate_route", "name": "patrol"})
-await nav.do_command({
-    "command": "navigate_route",
-    "name": "patrol",
-    "start_nearest": True,
-    "loop": True,
-})
-await nav.do_command({
-    "command": "navigate_route",
-    "waypoints": ["dock", "kitchen", "lobby"],
-})
+await nav.do_command(
+    {
+        "command": "navigate_route",
+        "name": "patrol",
+        "start_nearest": True,
+        "loop": True,
+    }
+)
+await nav.do_command(
+    {
+        "command": "navigate_route",
+        "waypoints": ["dock", "kitchen", "lobby"],
+    }
+)
 ```
 
 Preview fields typically include `feasible`, `path` (`[{x,y,theta}, ...]`), `length_m`, `planning_time_s`, `error_msg` / `error_code` when infeasible. Successful previews are drawn on `nav-camera` when configured.
@@ -300,12 +316,14 @@ Returns `available`, `layer`, `origin_x`/`origin_y`, `resolution`, `width`/`heig
 ```python
 await nav.do_command({"command": "get_status"})
 await nav.do_command({"command": "describe_motion"})
-await nav.do_command({
-    "command": "test_drive",
-    "vx": 0.5,
-    "angular_z_deg_s": 57.3,
-    "duration_s": 2,
-})
+await nav.do_command(
+    {
+        "command": "test_drive",
+        "vx": 0.5,
+        "angular_z_deg_s": 57.3,
+        "duration_s": 2,
+    }
+)
 await nav.do_command({"command": "get_costmap", "layer": "local", "stride": 2})
 ```
 

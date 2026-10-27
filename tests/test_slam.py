@@ -1,7 +1,7 @@
-from pathlib import Path
 import asyncio
 import math
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -10,9 +10,9 @@ from src.config import MODE_LOCALIZING, MODE_MAPPING, SlamConfig
 
 pytest.importorskip("viam")
 
+from src.geom import conversions as conv
 from src.models.slam import SlamService
 from src.nav.maps import MapStore
-from src.geom import conversions as conv
 
 
 def test_get_status_includes_diagnostics_and_sensor_probe(tmp_path: Path):
@@ -158,16 +158,22 @@ def test_delete_inactive_map_does_not_restart_slam(tmp_path: Path):
     slam._reset_live_slam.assert_not_called()
 
 
-def test_delete_live_map_resets_when_configured_active_without_store_active(tmp_path: Path):
+def test_delete_live_map_resets_when_configured_active_without_store_active(
+    tmp_path: Path,
+):
     slam = SlamService("slam")
     store = MapStore(str(tmp_path))
     store.create_map("config-map")
     slam._map_store = store
-    slam._cfg = MagicMock(mode=MODE_MAPPING, active_map="config-map", map=MagicMock(resolution=0.05))
+    slam._cfg = MagicMock(
+        mode=MODE_MAPPING, active_map="config-map", map=MagicMock(resolution=0.05)
+    )
     slam._manager = MagicMock()
     slam._reset_live_slam = MagicMock()
 
-    result = asyncio.run(slam.do_command({"command": "delete_map", "map": "config-map"}))
+    result = asyncio.run(
+        slam.do_command({"command": "delete_map", "map": "config-map"})
+    )
 
     assert result == {
         "status": "deleted",
@@ -185,11 +191,15 @@ def test_delete_configured_name_does_not_reset_other_active_map(tmp_path: Path):
     store.create_map("config-map")
     store.set_active_map("floor1")
     slam._map_store = store
-    slam._cfg = MagicMock(mode=MODE_MAPPING, active_map="config-map", map=MagicMock(resolution=0.05))
+    slam._cfg = MagicMock(
+        mode=MODE_MAPPING, active_map="config-map", map=MagicMock(resolution=0.05)
+    )
     slam._manager = MagicMock()
     slam._reset_live_slam = MagicMock()
 
-    result = asyncio.run(slam.do_command({"command": "delete_map", "map": "config-map"}))
+    result = asyncio.run(
+        slam.do_command({"command": "delete_map", "map": "config-map"})
+    )
 
     assert result == {
         "status": "deleted",
@@ -566,9 +576,7 @@ def test_startup_local_refine_applies_parked_match_before_wide_search():
         "ambiguous": False,
         "second_best_score": 0.42,
     }
-    slam.do_command = AsyncMock(
-        side_effect=[match, match, {"status": "relocalizing"}]
-    )
+    slam.do_command = AsyncMock(side_effect=[match, match, {"status": "relocalizing"}])
     slam._wait_for_startup_localize_ready = AsyncMock(return_value=True)
 
     asyncio.run(
@@ -1203,9 +1211,7 @@ def test_periodic_relocalize_still_bad_escalates_when_prior_bad():
 
     slam._global_localize = AsyncMock(side_effect=_localize)
     slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
-    result = _run_relocalize_until_settled(
-        slam, full_map_escalation="still_bad"
-    )
+    result = _run_relocalize_until_settled(slam, full_map_escalation="still_bad")
     assert result["match_mode"] == "full_map_after_still_bad"
     assert slam._global_localize.await_count >= 2
 
@@ -1388,8 +1394,7 @@ def test_periodic_relocalize_runs_when_nav_active_but_stopped():
     assert first["auto_full_map_fallback"] is False
     # Full-map waits until the goal is idle. A stopped start only searches locally.
     assert not any(
-        bool(c.args[0].get("full_map"))
-        for c in slam._global_localize.await_args_list
+        bool(c.args[0].get("full_map")) for c in slam._global_localize.await_args_list
     )
 
 
@@ -1508,7 +1513,11 @@ def test_allow_during_navigation_refuses_trusted_large_jump_without_await():
 
 def test_is_navigation_active_sees_registered_builtin_nav_host():
     """BuiltinSlamHost always reports idle; registered nav host is the source of truth."""
-    from src.runtime import any_navigation_active, register_nav_host, unregister_nav_host
+    from src.runtime import (
+        any_navigation_active,
+        register_nav_host,
+        unregister_nav_host,
+    )
 
     unregister_nav_host("nav-test-active")
     assert any_navigation_active() is False

@@ -1,4 +1,5 @@
 """Lidar odometry: ICP tracks a wheel-less cart and only matched scans paint."""
+
 from __future__ import annotations
 
 import math
@@ -247,7 +248,9 @@ def _spin(engine, sensors, monkeypatch, *, seconds: float):
         engine._tick()  # noqa: SLF001
         sensors.clock += dt
         t = sensors.true
-        sensors.true = conv.Pose2D(t.x, t.y, conv.normalize_angle(t.theta + sensors.rate * dt))
+        sensors.true = conv.Pose2D(
+            t.x, t.y, conv.normalize_angle(t.theta + sensors.rate * dt)
+        )
 
 
 @pytest.mark.parametrize("gyro_scale", [1.0, 0.0])
@@ -264,7 +267,9 @@ def test_spin_tracks_yaw_and_keeps_skewed_scans_out(tmp_path, monkeypatch, gyro_
     _spin(engine, sensors, monkeypatch, seconds=2.0)
     last_scan_theta = conv.normalize_angle(sensors.true.theta - sensors.rate * 0.1)
     pose = engine.get_pose()
-    assert conv.normalize_angle(pose.theta - last_scan_theta) == pytest.approx(0.0, abs=math.radians(1.5))
+    assert conv.normalize_angle(pose.theta - last_scan_theta) == pytest.approx(
+        0.0, abs=math.radians(1.5)
+    )
     check = engine.diagnostics()["lidar_odometry"]["yaw_check"]
     assert check["lidar_deg"] == pytest.approx(57.0, abs=3.0)
     assert check["gyro_deg"] == pytest.approx(57.0 * gyro_scale, abs=6.0)
@@ -279,5 +284,7 @@ def test_wheel_odom_never_uses_lidar_odometry(tmp_path, monkeypatch):
     posed = conv.OdomReading(0.0, 0.0, 0.0, pose=conv.Pose2D(0.0, 0.0, 0.0))
     assert engine._lidar_odom_active(wheel) is False  # noqa: SLF001
     assert engine._lidar_odom_active(posed) is False  # noqa: SLF001
-    laser = SlamConfig.from_dict({"base": "b", "lidar": "front", "maps_dir": str(tmp_path)})
+    laser = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": str(tmp_path)}
+    )
     assert laser.lidar_odometry is False

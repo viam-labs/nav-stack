@@ -1,11 +1,7 @@
-
 import math
 
 import numpy as np
 import pytest
-
-from src.geom import conversions as conv
-from src.nav_builtin.types import Pose2D
 
 from src.config import (
     DIFFERENTIAL,
@@ -18,11 +14,13 @@ from src.config import (
     body_vtheta_to_viam_angular_deg_s,
     sensor_twist_to_body,
 )
+from src.geom import conversions as conv
+from src.nav_builtin.types import Pose2D
 
 
 def test_slam_config_single_lidar_string():
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
-    assert [l.name for l in cfg.lidars] == ["front"]
+    assert [lidar.name for lidar in cfg.lidars] == ["front"]
     assert cfg.required_dependencies() == ["b", "front"]
 
 
@@ -49,7 +47,9 @@ def test_slam_config_lidar_scan_source():
     assert cfg.map.minimum_travel_distance == pytest.approx(0.15)
     assert cfg.map.minimum_travel_heading == pytest.approx(0.12)
     assert cfg.slam_params.get("minimum_time_interval") == pytest.approx(0.3)
-    assert cfg.slam_params.get("correlation_search_space_dimension") == pytest.approx(0.6)
+    assert cfg.slam_params.get("correlation_search_space_dimension") == pytest.approx(
+        0.6
+    )
     with pytest.raises(ValueError, match="scan_source"):
         SlamConfig.from_dict(
             {"base": "b", "lidar": {"name": "x", "scan_source": "invalid"}}
@@ -100,9 +100,7 @@ def test_lidar_shm_name_empty_disables_default():
 
 
 def test_imu_shm_defaults_from_heading_sensor():
-    cfg = SlamConfig.from_dict(
-        {"base": "b", "lidar": "front", "heading_sensor": "wit"}
-    )
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front", "heading_sensor": "wit"})
     assert cfg.imu_shm_name == "/viam-imu-wit"
     cfg2 = SlamConfig.from_dict(
         {
@@ -289,7 +287,9 @@ def test_slam_config_global_localize_on_start_options():
     assert cfg.global_localize_on_start_target_ray_mae_m == pytest.approx(0.4)
     assert cfg.global_localize_on_start_post_apply_refine is True
     assert cfg.global_localize_on_start_post_apply_refine_delay_s == pytest.approx(8.0)
-    assert cfg.global_localize_on_start_post_apply_refine_options["map_source"] == "live"
+    assert (
+        cfg.global_localize_on_start_post_apply_refine_options["map_source"] == "live"
+    )
     assert cfg.global_localize_on_start_refine_options["full_map"] is False
 
 
@@ -352,7 +352,9 @@ def test_slam_config_global_localize_on_start_defaults_enabled():
     assert cfg.global_localize_on_start_target_ray_mae_m == pytest.approx(0.4)
     assert cfg.global_localize_on_start_post_apply_refine is True
     assert cfg.global_localize_on_start_post_apply_refine_delay_s == pytest.approx(8.0)
-    assert cfg.global_localize_on_start_post_apply_refine_options == {"map_source": "live"}
+    assert cfg.global_localize_on_start_post_apply_refine_options == {
+        "map_source": "live"
+    }
     assert cfg.global_localize_on_start_refine_options == {
         "full_map": False,
         "map_source": "live",
@@ -383,7 +385,7 @@ def test_slam_config_obstacles_only_lidar():
     )
     assert cfg.lidars[0].obstacles_only is False
     assert cfg.lidars[1].obstacles_only is True
-    assert [l.name for l in cfg.slam_lidars()] == ["rplidar"]
+    assert [lidar.name for lidar in cfg.slam_lidars()] == ["rplidar"]
     # Mapping lidar is not point_cloud-only → do not apply Livox SLAM defaults.
     assert cfg.map_when_still is False
     assert cfg.imu_odom_mode == "coast"
@@ -469,9 +471,7 @@ def test_loop_rate_hz_config():
     assert ext.nav.obstacles_only_rate_hz == pytest.approx(10.0)
 
     with pytest.raises(ValueError, match="control_rate_hz"):
-        NavConfig.from_dict(
-            {"slam_service": "slam", "base": "b", "control_rate_hz": 0}
-        )
+        NavConfig.from_dict({"slam_service": "slam", "base": "b", "control_rate_hz": 0})
     with pytest.raises(ValueError, match="obstacles_only_rate_hz"):
         NavConfig.from_dict(
             {"slam_service": "slam", "base": "b", "obstacles_only_rate_hz": 0}
@@ -565,9 +565,7 @@ def test_clearance_m_is_a_shared_hard_buffer_past_the_body():
     assert none.effective_local_inflation_radius_m() == pytest.approx(0.22)
 
     with pytest.raises(ValueError, match="clearance_m"):
-        NavConfig.from_dict(
-            {"slam_service": "slam", "base": "b", "clearance_m": -0.1}
-        )
+        NavConfig.from_dict({"slam_service": "slam", "base": "b", "clearance_m": -0.1})
 
 
 def test_inflation_margin_is_additive_past_hard_clearance():
@@ -841,15 +839,16 @@ def test_base_velocity_convention_mir_alias_normalizes_to_viam():
     assert ly == pytest.approx(500.0)
 
 
-
 def test_body_vtheta_to_viam_angular_is_degrees():
     import math
+
     # -1 rad/s must become ~-57.3 deg/s at Base.SetVelocity (Viam API).
     assert body_vtheta_to_viam_angular_deg_s(-1.0) == pytest.approx(-math.degrees(1.0))
     lx, ly, az = body_twist_to_viam_set_velocity(0.5, 0.0, -1.0, "viam")
     assert lx == pytest.approx(0.0)  # Y-forward: body vx -> linear.y
     assert ly == pytest.approx(500.0)
     assert az == pytest.approx(-math.degrees(1.0))
+
 
 def test_sensor_twist_to_body_viam_y_forward():
     # Sensor: forward on y=0.019, no lateral → ROS forward on vx.
@@ -868,7 +867,12 @@ def test_min_cmd_vel_defaults_and_legacy_alias():
     assert cfg.min_cmd_vel_theta == pytest.approx(0.0)
 
     cfg = NavConfig.from_dict(
-        {"slam_service": "slam", "base": "b", "min_cmd_vel_x": 0.25, "min_cmd_vel_theta": 0.5}
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "min_cmd_vel_x": 0.25,
+            "min_cmd_vel_theta": 0.5,
+        }
     )
     assert cfg.min_cmd_vel_x == pytest.approx(0.25)
     assert cfg.min_cmd_vel_theta == pytest.approx(0.5)
@@ -904,7 +908,7 @@ def test_external_nav_config_builds_bridge_and_nav():
     }
     cfg = ExternalNavConfig.from_dict(d)
     # bridge SlamConfig carries the sensor deps
-    assert [l.name for l in cfg.bridge.lidars] == ["mid360"]
+    assert [lidar.name for lidar in cfg.bridge.lidars] == ["mid360"]
     assert cfg.bridge.movement_sensor == "mid360-imu"
     # nav NavConfig carries navigation behavior + the SLAM dep name
     assert cfg.nav.slam_service == "rtabmap"

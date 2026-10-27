@@ -1,4 +1,5 @@
 """BuiltinNavigator: navigate / compute_path / cancel / status (no Nav2)."""
+
 from __future__ import annotations
 
 import threading

@@ -1,4 +1,5 @@
 """Lightweight DWA-style local planner on the rolling local costmap."""
+
 from __future__ import annotations
 
 import math
@@ -7,11 +8,11 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from ..nav.simple_motion import DriveCommand, apply_velocity_floor
 from ..geom import conversions as conv
-from .path_utils import closest_point_on_path
+from ..nav.simple_motion import DriveCommand, apply_velocity_floor
 from .costmap import is_traversable
 from .local_costmap import LocalCostmapView, footprint_collides, max_cost_along_segment
+from .path_utils import closest_point_on_path
 from .types import Path2D, Pose2D
 
 # Set to a dict (tests / offline debugging) to capture per-tick scoring.
@@ -109,7 +110,9 @@ def _path_distance_m(path: Path2D, x: float, y: float) -> float:
     return math.hypot(x - px, y - py)
 
 
-def path_point_ahead(path: Path2D, x: float, y: float, ahead_m: float) -> Tuple[float, float]:
+def path_point_ahead(
+    path: Path2D, x: float, y: float, ahead_m: float
+) -> Tuple[float, float]:
     """Point on ``path`` ``ahead_m`` past the closest projection of (x, y)."""
     pts = path.points
     if not pts:
@@ -155,7 +158,9 @@ class DetourField:
             return math.inf
         return float(self.dist_m[row, col])
 
-    def descent_heading(self, x: float, y: float, *, ring_m: float = 0.28) -> Optional[float]:
+    def descent_heading(
+        self, x: float, y: float, *, ring_m: float = 0.28
+    ) -> Optional[float]:
         """Heading (rad) toward the lowest field value on a ring around (x, y).
 
         This is the local geodesic direction around the blockage — sideways
@@ -588,17 +593,6 @@ def compute_local_command(
         lookahead_m=cfg.path_clearance_lookahead_m,
     )
     path_blocked_ahead = ahead_cost >= cfg.activate_cost_threshold
-    block_dist = (
-        path_block_distance_m(
-            pose,
-            path,
-            view,
-            threshold=cfg.activate_cost_threshold,
-            lookahead_m=cfg.path_clearance_lookahead_m,
-        )
-        if path_blocked_ahead
-        else None
-    )
     # Costs already encode the footprint; ``robot_radius_m`` is kept for API
     # compatibility and only bounds the margin.
     collision_r = max(
@@ -653,9 +647,7 @@ def compute_local_command(
             dd_pose=detour.at(pose.x, pose.y) if detour else None,
             blocked=path_blocked_ahead,
         )
-    field_far_m = (
-        float(max(detour.dist_m.shape)) * detour.resolution if detour else 0.0
-    )
+    field_far_m = float(max(detour.dist_m.shape)) * detour.resolution if detour else 0.0
     path_dist_now = _path_distance_m(path, pose.x, pose.y)
     goal_dist_now = math.hypot(pose.x - gx, pose.y - gy)
     pose_heading_err = abs(conv.normalize_angle(heading_ref - pose.theta))
@@ -689,9 +681,7 @@ def compute_local_command(
             # cell from the inscribed ring rejects even rotate-in-place and we
             # fall through to the blind fallback spin.
             if any(
-                _rollout_point_collides(
-                    view, pose, p, margin_m=collision_r
-                )
+                _rollout_point_collides(view, pose, p, margin_m=collision_r)
                 for p in rollout[1:]
             ):
                 continue
@@ -699,9 +689,13 @@ def compute_local_command(
             # that left DWA with rotate-only choices (spin, 57 failed replans)
             # while the flanks were open. Each rollout is judged on the cells it
             # actually crosses; the reactive stop bubble backs this up.
-            if path_blocked_ahead and vx > 0 and any(
-                view.cost_at_world(p.x, p.y) >= cfg.activate_cost_threshold
-                for p in rollout[1:]
+            if (
+                path_blocked_ahead
+                and vx > 0
+                and any(
+                    view.cost_at_world(p.x, p.y) >= cfg.activate_cost_threshold
+                    for p in rollout[1:]
+                )
             ):
                 continue
             end = rollout[-1]
@@ -737,9 +731,7 @@ def compute_local_command(
                 if not math.isfinite(dd):
                     dd = field_far_m
                 path_dist = _path_distance_m(path, end.x, end.y)
-                path_pen = (
-                    cfg.path_weight * cfg.detour_path_bias * path_dist
-                )
+                path_pen = cfg.path_weight * cfg.detour_path_bias * path_dist
                 goal_pen = (cfg.path_weight + cfg.goal_weight) * dd
             else:
                 # Progress relative to where we are, so every sample is on the
@@ -778,8 +770,14 @@ def compute_local_command(
                     score -= cont_w * 1.5
             if _DEBUG is not None:
                 _DEBUG.setdefault("candidates", []).append(
-                    (round(vx, 3), round(vtheta, 3), round(score, 3),
-                     round(goal_pen, 3), round(heading_err, 2), max_c)
+                    (
+                        round(vx, 3),
+                        round(vtheta, 3),
+                        round(score, 3),
+                        round(goal_pen, 3),
+                        round(heading_err, 2),
+                        max_c,
+                    )
                 )
             if best is None or score > best[2]:
                 best = (vx, vtheta, score)

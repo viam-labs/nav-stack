@@ -21,7 +21,9 @@ def _room_map(size_m: float = 6.0, res: float = 0.05) -> gl.OccupancyMap:
     return gl.OccupancyMap(grid=grid, resolution=res, origin_x=0.0, origin_y=0.0)
 
 
-def _scan_from(occ_map: gl.OccupancyMap, pose: conv.Pose2D, beams: int = 180) -> conv.LaserScan2D:
+def _scan_from(
+    occ_map: gl.OccupancyMap, pose: conv.Pose2D, beams: int = 180
+) -> conv.LaserScan2D:
     angles = np.linspace(-math.pi, math.pi, beams, endpoint=False)
     ranges = np.empty(beams)
     for i, a in enumerate(angles):
@@ -52,7 +54,9 @@ def test_subprocess_matches_in_process(worker):
     hint = conv.Pose2D(2.3, 3.2, 0.2)
 
     local = gl.global_localize_scan(occ, scan, hint=hint, search_radius_m=1.5)
-    remote = worker.call("global_localize_scan", occ, scan, hint=hint, search_radius_m=1.5)
+    remote = worker.call(
+        "global_localize_scan", occ, scan, hint=hint, search_radius_m=1.5
+    )
 
     assert remote.pose.x == pytest.approx(local.pose.x, abs=1e-9)
     assert remote.pose.y == pytest.approx(local.pose.y, abs=1e-9)
@@ -65,7 +69,9 @@ def test_subprocess_matches_in_process(worker):
     assert map_token(occ) in worker._sent_tokens  # noqa: SLF001
     score, mae = worker.call("score_pose_with_rays", occ, scan, truth)
     assert math.isfinite(score) and math.isfinite(mae)
-    choice = worker.call("choose_yaw_or_flip", occ, scan, remote.pose, reference_theta=0.4)
+    choice = worker.call(
+        "choose_yaw_or_flip", occ, scan, remote.pose, reference_theta=0.4
+    )
     assert choice.pose.theta == pytest.approx(remote.pose.theta, abs=1e-9)
 
 

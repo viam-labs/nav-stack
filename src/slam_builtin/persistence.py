@@ -1,4 +1,5 @@
 """Load / save map.yaml + map.pgm (+ last_pose.json) for builtin SLAM."""
+
 from __future__ import annotations
 
 import json
@@ -53,9 +54,7 @@ def save_last_pose(map_dir: Path, pose: conv.Pose2D) -> None:
     tmp.replace(path)
 
 
-def load_last_pose(
-    map_dir: Path, *, max_age_s: float = 0.0
-) -> Optional[conv.Pose2D]:
+def load_last_pose(map_dir: Path, *, max_age_s: float = 0.0) -> Optional[conv.Pose2D]:
     """Return the last saved pose, or None if missing/stale/corrupt.
 
     ``max_age_s`` <= 0 disables the age gate (always accept a valid file).

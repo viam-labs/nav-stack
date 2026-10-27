@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pytest
 
+from src.geom import conversions as conv
 from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
 from src.nav_builtin.controller import (
     FollowerConfig,
@@ -28,10 +29,11 @@ from src.nav_builtin.controller import (
 from src.nav_builtin.path_utils import signed_crosstrack_m
 from src.nav_builtin.types import Path2D, Pose2D
 from src.nav_builtin.viam_io import _sanitize_base_cmd
-from src.geom import conversions as conv
 
 
-def _densify(pts: List[Tuple[float, float]], step: float = 0.1) -> Tuple[Tuple[float, float], ...]:
+def _densify(
+    pts: List[Tuple[float, float]], step: float = 0.1
+) -> Tuple[Tuple[float, float], ...]:
     out: List[Tuple[float, float]] = [pts[0]]
     for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
         seg = math.hypot(x1 - x0, y1 - y0)
@@ -176,7 +178,11 @@ def _run(
         last_vx = update_speed_estimate(last_vx, cmd.vx)  # mirrors supervisor
         prev_cmd = cmd
         vx, _vy, w = _sanitize_base_cmd(cmd.vx, cmd.vy, cmd.vtheta)
-        if base is not None and vx > 0.0 and vx - abs(w) * base.half_track_m < base.wheel_min_mps:
+        if (
+            base is not None
+            and vx > 0.0
+            and vx - abs(w) * base.half_track_m < base.wheel_min_mps
+        ):
             # Base rejects "nearly 0 RPM"; ViamWorldIO retries with a wider arc.
             log.rejections += 1
             vx = max(vx, 0.06 + 0.32 * abs(w)) if abs(w) >= 0.08 else 0.0
@@ -224,7 +230,9 @@ def _straight() -> Path2D:
 
 
 def _l_corner() -> Path2D:
-    return Path2D(points=_densify([(0.0, 0.0), (3.0, 0.0), (3.0, 3.0)]), goal_theta=math.pi / 2)
+    return Path2D(
+        points=_densify([(0.0, 0.0), (3.0, 0.0), (3.0, 3.0)]), goal_theta=math.pi / 2
+    )
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
@@ -305,7 +313,14 @@ def test_corner_while_obstacle_slowing_keeps_arc(seed: int):
     obstacle = ObstacleConfig(enabled=True, stop_distance_m=0.5, slow_distance_m=1.0)
     cfg = _robot_cfg(obstacle=obstacle)
     scan = _uniform_scan(0.7)
-    log = _run(_l_corner(), Pose2D(0.0, 0.0, 0.0), cfg=cfg, scan=scan, seed=seed, max_ticks=4000)
+    log = _run(
+        _l_corner(),
+        Pose2D(0.0, 0.0, 0.0),
+        cfg=cfg,
+        scan=scan,
+        seed=seed,
+        max_ticks=4000,
+    )
     assert log.reached
     # Slowed, but every translating command stays drivable (vx ≥ crawl floor).
     moving = [v for v in log.vx if v > 0]
@@ -336,13 +351,16 @@ _HARSH = dict(base=HARSH, dt=0.2, noise_xy_m=0.03, noise_yaw_rad=math.radians(3.
 
 def _dogleg() -> Path2D:
     return Path2D(
-        points=_densify([(0.0, 0.0), (2.0, 0.0), (3.5, 1.2), (6.0, 1.2)]), goal_theta=0.0
+        points=_densify([(0.0, 0.0), (2.0, 0.0), (3.5, 1.2), (6.0, 1.2)]),
+        goal_theta=0.0,
     )
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_harsh_corner_never_rejected_by_base(seed: int):
-    log = _run(_l_corner(), Pose2D(0.0, 0.0, 0.0), cfg=_robot_cfg(), seed=seed, **_HARSH)
+    log = _run(
+        _l_corner(), Pose2D(0.0, 0.0, 0.0), cfg=_robot_cfg(), seed=seed, **_HARSH
+    )
     assert log.reached
     # Every translating command is inside the wheel envelope → no spin retries.
     assert log.rejections == 0
@@ -357,7 +375,13 @@ def test_harsh_corner_never_rejected_by_base(seed: int):
 def test_harsh_straight_keeps_heading(seed: int):
     """SLAM noise at 5 Hz must not become heading wag: the base should see
     almost no yaw commands, and actual heading stays within a few degrees."""
-    log = _run(_straight(), Pose2D(0.0, 0.0, math.radians(4.0)), cfg=_robot_cfg(), seed=seed, **_HARSH)
+    log = _run(
+        _straight(),
+        Pose2D(0.0, 0.0, math.radians(4.0)),
+        cfg=_robot_cfg(),
+        seed=seed,
+        **_HARSH,
+    )
     assert log.reached
     assert log.rejections == 0
     # Longer L + κ EMA lag a bit under harsh 5 Hz noise; still no zig-zag.

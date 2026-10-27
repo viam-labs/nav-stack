@@ -1,4 +1,5 @@
 """Unit tests for Motion MoveOnMap on NavServiceBase."""
+
 from __future__ import annotations
 
 import asyncio
@@ -16,12 +17,14 @@ from viam.proto.service.motion import PlanState
 from viam.services.motion import Motion
 
 from src.config import NavConfig
-from src.models.navigation import NavigationService, _nav_status_to_plan_state
 from src.geom.conversions import Pose2D, viam_pose_to_pose2d
+from src.models.navigation import NavigationService, _nav_status_to_plan_state
 
 
 def test_nav_status_to_plan_state_mapping():
-    assert _nav_status_to_plan_state({"active": True}) == PlanState.PLAN_STATE_IN_PROGRESS
+    assert (
+        _nav_status_to_plan_state({"active": True}) == PlanState.PLAN_STATE_IN_PROGRESS
+    )
     assert (
         _nav_status_to_plan_state({"active": False, "state": "succeeded"})
         == PlanState.PLAN_STATE_SUCCEEDED
@@ -49,7 +52,9 @@ def test_navigation_registers_as_motion():
     assert issubclass(NavigationService, Motion)
 
 
-def _configured_nav(*, nav_status=None, pose=None) -> tuple[NavigationService, MagicMock]:
+def _configured_nav(
+    *, nav_status=None, pose=None
+) -> tuple[NavigationService, MagicMock]:
     nav = NavigationService("nav")
     nav._cfg = NavConfig(
         slam_service="slam",
@@ -107,9 +112,7 @@ def test_move_on_map_calls_navigate_with_meters_radians():
 def test_stop_plan_cancels_and_marks_stopped():
     nav, mgr = _configured_nav()
     dest = Pose(x=1000.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
-    execution_id = asyncio.run(
-        nav.move_on_map("my-base", dest, "slam")
-    )
+    execution_id = asyncio.run(nav.move_on_map("my-base", dest, "slam"))
     asyncio.run(nav.stop_plan("my-base"))
     mgr.cancel.assert_called()
     plan = asyncio.run(nav.get_plan("my-base", execution_id=execution_id))
@@ -117,9 +120,7 @@ def test_stop_plan_cancels_and_marks_stopped():
 
 
 def test_get_plan_syncs_succeeded_from_nav_status():
-    nav, mgr = _configured_nav(
-        nav_status={"active": False, "state": "succeeded"}
-    )
+    nav, mgr = _configured_nav(nav_status={"active": False, "state": "succeeded"})
     dest = Pose(x=500.0, y=500.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
     # After navigate returns, sync will see succeeded.
     execution_id = asyncio.run(nav.move_on_map("my-base", dest, "slam"))
@@ -175,7 +176,9 @@ def test_move_and_move_on_globe_unimplemented():
 def test_do_command_navigate_to_point_still_works():
     nav, mgr = _configured_nav()
     result = asyncio.run(
-        nav.do_command({"command": "navigate_to_point", "x": 3.5, "y": -1.0, "theta": 0.1})
+        nav.do_command(
+            {"command": "navigate_to_point", "x": 3.5, "y": -1.0, "theta": 0.1}
+        )
     )
     assert result["status"] == "navigating"
     mgr.navigate.assert_called_once_with(3.5, -1.0, 0.1)
@@ -202,9 +205,7 @@ def test_suspend_resume_move_on_map():
     dest = Pose(x=1000.0, y=0.0, z=0.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
     execution_id = asyncio.run(nav.move_on_map("my-base", dest, "slam"))
 
-    suspended = asyncio.run(
-        nav.do_command({"command": "suspend", "reason": "safety"})
-    )
+    suspended = asyncio.run(nav.do_command({"command": "suspend", "reason": "safety"}))
     assert suspended["status"] == "suspended"
     assert suspended["goal"]["x"] == pytest.approx(1.0)
     assert suspended["goal"]["y"] == pytest.approx(0.0)
@@ -220,7 +221,11 @@ def test_suspend_resume_move_on_map():
     assert status["suspended_goal"]["x"] == pytest.approx(1.0)
 
     mgr.navigate.reset_mock()
-    mgr.nav_status.return_value = {"active": True, "state": "active", "goal": {"x": 1.0, "y": 0.0, "theta": 0.0}}
+    mgr.nav_status.return_value = {
+        "active": True,
+        "state": "active",
+        "goal": {"x": 1.0, "y": 0.0, "theta": 0.0},
+    }
     resumed = asyncio.run(nav.do_command({"command": "resume"}))
     assert resumed["status"] == "navigating"
     assert resumed["resumed"] is True
@@ -253,7 +258,9 @@ def test_cancel_clears_suspended_goal():
         }
     )
     asyncio.run(
-        nav.do_command({"command": "navigate_to_point", "x": 2.0, "y": 3.0, "theta": 0.5})
+        nav.do_command(
+            {"command": "navigate_to_point", "x": 2.0, "y": 3.0, "theta": 0.5}
+        )
     )
     asyncio.run(nav.do_command({"command": "suspend"}))
     assert nav._suspended is not None
@@ -271,7 +278,11 @@ def test_suspend_already_suspended_is_idempotent():
             "goal": {"x": 1.5, "y": -0.5, "theta": 0.1},
         }
     )
-    asyncio.run(nav.do_command({"command": "navigate_to_point", "x": 1.5, "y": -0.5, "theta": 0.1}))
+    asyncio.run(
+        nav.do_command(
+            {"command": "navigate_to_point", "x": 1.5, "y": -0.5, "theta": 0.1}
+        )
+    )
     first = asyncio.run(nav.do_command({"command": "suspend", "reason": "a"}))
     mgr.nav_status.return_value = {"active": False, "state": "canceled"}
     second = asyncio.run(nav.do_command({"command": "suspend", "reason": "b"}))
@@ -289,7 +300,11 @@ def _stub_locations(nav: NavigationService, poses: dict) -> None:
             self.theta = theta
 
     store = MagicMock()
-    store.get.side_effect = lambda name: _Loc(name, *poses[name]) if name in poses else (_ for _ in ()).throw(KeyError(name))
+    store.get.side_effect = lambda name: (
+        _Loc(name, *poses[name])
+        if name in poses
+        else (_ for _ in ()).throw(KeyError(name))
+    )
     nav._locations = MagicMock(return_value=store)  # type: ignore[method-assign]
 
 
@@ -400,7 +415,9 @@ def test_navigate_route_async_exposes_status(monkeypatch):
         )
 
     mgr.navigate.side_effect = on_navigate
-    mgr.nav_status.side_effect = lambda: queue[0] if queue else {"active": False, "state": "idle"}
+    mgr.nav_status.side_effect = lambda: (
+        queue[0] if queue else {"active": False, "state": "idle"}
+    )
     _real_sleep = asyncio.sleep
 
     async def _fast_sleep(*_a, **_k):
@@ -422,7 +439,10 @@ def test_navigate_route_async_exposes_status(monkeypatch):
         for _ in range(20):
             await _real_sleep(0)
             status = await nav.do_command({"command": "get_status"})
-            if status.get("motion") == "route" and status.get("route", {}).get("state") == "active":
+            if (
+                status.get("motion") == "route"
+                and status.get("route", {}).get("state") == "active"
+            ):
                 assert status["active"] is True
                 assert status["route"]["location"] == "dock"
                 break
@@ -480,7 +500,10 @@ def test_navigate_route_suspend_resume(monkeypatch):
         )
         for _ in range(30):
             await _real_sleep(0)
-            if nav._route_status.get("state") == "active" and mgr.navigate.call_count >= 1:
+            if (
+                nav._route_status.get("state") == "active"
+                and mgr.navigate.call_count >= 1
+            ):
                 break
         suspended = await nav.do_command({"command": "suspend", "reason": "safety"})
         assert suspended["status"] == "suspended"

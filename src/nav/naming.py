@@ -1,4 +1,5 @@
 """Shared name validation for maps, locations, zones, and routes."""
+
 from __future__ import annotations
 
 import re
@@ -19,7 +20,5 @@ def validate_name(name: str, kind: str) -> str:
             if kind == "location"
             else "letters, digits, space, dash or underscore"
         )
-        raise ValueError(
-            f"invalid {kind} name {name!r}: use 1-64 chars of {allowed}"
-        )
+        raise ValueError(f"invalid {kind} name {name!r}: use 1-64 chars of {allowed}")
     return name

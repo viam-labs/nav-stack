@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import numpy as np
 import pytest
 
+from src.geom import conversions as conv
 from src.nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
@@ -18,7 +19,6 @@ from src.nav.simple_motion import (
     heading_error_rad,
     normalize_angle,
 )
-from src.geom import conversions as conv
 
 
 def _scan_with(range_by_angle: dict, num_bins: int = 360) -> conv.LaserScan2D:
@@ -51,7 +51,9 @@ def test_compute_drive_command_done_at_goal():
 
 
 def test_compute_drive_command_drives_toward_goal():
-    cfg = SimpleMotionConfig(xy_tolerance_m=0.05, max_linear_mps=0.4, max_angular_rad_s=0.8)
+    cfg = SimpleMotionConfig(
+        xy_tolerance_m=0.05, max_linear_mps=0.4, max_angular_rad_s=0.8
+    )
     current = conv.Pose2D(0.0, 0.0, 0.0)
     goal = conv.Pose2D(2.0, 0.0, 0.0)
     cmd = compute_drive_command(current, goal, cfg=cfg, linear_mps=0.4)
@@ -252,18 +254,14 @@ def test_avoidance_does_not_crawl_when_arc_clears_corner_wall():
     scan = _scan_with({0.0: 0.68})
     # Tight left turn (κ ≈ 2.3 /m) rounding the corner.
     cmd = DriveCommand(0.25, 0.0, 0.58, False)
-    out, state, clr = apply_obstacle_avoidance(
-        cmd, scan, obs, max_angular_rad_s=1.0
-    )
+    out, state, clr = apply_obstacle_avoidance(cmd, scan, obs, max_angular_rad_s=1.0)
     assert out.vx == pytest.approx(cmd.vx)
     assert clr == pytest.approx(0.68, abs=0.02)
     assert state == "slow"  # still reported as near something
 
     # Heading straight at the same wall must still slow down.
     ahead = DriveCommand(0.25, 0.0, 0.0, False)
-    out2, state2, _ = apply_obstacle_avoidance(
-        ahead, scan, obs, max_angular_rad_s=1.0
-    )
+    out2, state2, _ = apply_obstacle_avoidance(ahead, scan, obs, max_angular_rad_s=1.0)
     assert state2 == "slow"
     assert out2.vx < ahead.vx
 
@@ -348,7 +346,9 @@ def test_avoidance_footprint_corridor_catches_shoulder_obstacle():
     # half-width body.
     scan = _scan_with({math.radians(50): 0.5})
     cone_only = ObstacleConfig(stop_distance_m=0.5, slow_distance_m=1.0)
-    out, state, _ = apply_obstacle_avoidance(cmd, scan, cone_only, max_angular_rad_s=0.8)
+    out, state, _ = apply_obstacle_avoidance(
+        cmd, scan, cone_only, max_angular_rad_s=0.8
+    )
     assert state == "clear"
 
     wide = ObstacleConfig(
@@ -425,7 +425,9 @@ def test_avoidance_holds_spin_when_front_occupied():
     """Rotate-to-heading must freeze for a true nose collision."""
     cmd = DriveCommand(0.0, 0.0, 0.5, False)
     scan = _scan_with({0.0: 0.1})
-    obs = ObstacleConfig(stop_distance_m=0.4, slow_distance_m=1.0, spin_collision_m=0.22)
+    obs = ObstacleConfig(
+        stop_distance_m=0.4, slow_distance_m=1.0, spin_collision_m=0.22
+    )
     out, state, clr = apply_obstacle_avoidance(cmd, scan, obs, max_angular_rad_s=0.8)
     assert state == "hold"
     assert out.vx == 0.0 and out.vtheta == 0.0
@@ -436,7 +438,9 @@ def test_avoidance_allows_corridor_spin_with_wall_at_stop_distance():
     """Wall at stop_distance ahead must not freeze rotate-to-heading."""
     cmd = DriveCommand(0.0, 0.0, 0.5, False)
     scan = _scan_with({0.0: 0.35})  # typical corridor wall during a 90° spin
-    obs = ObstacleConfig(stop_distance_m=0.4, slow_distance_m=1.0, spin_collision_m=0.22)
+    obs = ObstacleConfig(
+        stop_distance_m=0.4, slow_distance_m=1.0, spin_collision_m=0.22
+    )
     out, state, clr = apply_obstacle_avoidance(cmd, scan, obs, max_angular_rad_s=0.8)
     assert state == "clear"
     assert out == cmd

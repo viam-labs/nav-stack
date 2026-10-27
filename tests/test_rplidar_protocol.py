@@ -1,4 +1,5 @@
 """Unit tests for RPLIDAR model / baud / dense-express helpers (S2/S3)."""
+
 from __future__ import annotations
 
 from src.lidar import rplidar_protocol as proto
@@ -83,7 +84,9 @@ def test_command_with_payload_checksum():
     assert pkt[-1] == (checksum & 0xFF)
 
 
-def _make_dense_capsule(start_angle_deg: float, distances_mm, *, sync_bit: bool = False) -> bytes:
+def _make_dense_capsule(
+    start_angle_deg: float, distances_mm, *, sync_bit: bool = False
+) -> bytes:
     angle_q6 = int(round(start_angle_deg * 64.0)) & 0x7FFF
     if sync_bit:
         angle_q6 |= proto.EXP_SYNC_BIT

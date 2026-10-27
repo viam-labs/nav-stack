@@ -9,9 +9,7 @@ def test_describe_hard_right_turn_with_forward():
         "source": "builtin",
         "age_s": 0.1,
     }
-    phrase = describe_cmd_vel(
-        last, max_vel_x=0.75, max_vel_theta=1.2, held_s=3.0
-    )
+    phrase = describe_cmd_vel(last, max_vel_x=0.75, max_vel_theta=1.2, held_s=3.0)
     assert "forward" in phrase
     assert "hard" in phrase
     assert "right" in phrase
@@ -20,7 +18,12 @@ def test_describe_hard_right_turn_with_forward():
 
 def test_describe_spin_in_place_left():
     phrase = describe_cmd_vel(
-        {"body_vx_mps": 0.0, "body_vy_mps": 0.0, "body_vtheta_rad_s": 0.5, "source": "builtin"},
+        {
+            "body_vx_mps": 0.0,
+            "body_vy_mps": 0.0,
+            "body_vtheta_rad_s": 0.5,
+            "source": "builtin",
+        },
         max_vel_x=0.75,
         max_vel_theta=1.2,
     )
@@ -105,5 +108,8 @@ def test_summarize_includes_goal_relative_and_progress():
     assert "dock" in out["summary"]
     assert "ahead and to the right" in out["goal_relative"]
     assert out["toward_goal"] is not None
-    assert "closing distance" in out["toward_goal"] or "steering toward" in out["toward_goal"]
+    assert (
+        "closing distance" in out["toward_goal"]
+        or "steering toward" in out["toward_goal"]
+    )
     assert "—" in out["summary"]

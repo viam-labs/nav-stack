@@ -12,13 +12,13 @@ the ``navigation`` config attribute). Works with ``navigation`` or
 
 Point in the Viam app's camera stream at this component to watch planning live.
 """
+
 from __future__ import annotations
 
 import asyncio
 from typing import ClassVar, Mapping, Optional, Sequence
 
 from typing_extensions import Self
-
 from viam.components.camera import Camera
 from viam.logging import getLogger
 from viam.media.video import CameraMimeType, NamedImage, ViamImage
@@ -30,13 +30,13 @@ from viam.resource.types import Model, ModelFamily
 from viam.utils import struct_to_dict
 
 from ..config import NavCameraConfig
+from ..runtime import get_nav_view
 from ..viz.nav_view import (
     NavViewOptions,
     legend_text,
     placeholder_png,
     render_nav_view,
 )
-from ..runtime import get_nav_view
 
 LOGGER = getLogger(__name__)
 
@@ -107,14 +107,17 @@ class NavCamera(Camera):
         if hasattr(view, "enable_viz"):
             view.enable_viz(cfg.plan_history_len)
         snapshot = (
-            view.viz_snapshot()
-            if hasattr(view, "viz_snapshot")
-            else view.snapshot()
+            view.viz_snapshot() if hasattr(view, "viz_snapshot") else view.snapshot()
         )
         return render_nav_view(snapshot, self._opts)
 
     async def get_image(
-        self, mime_type: str = "", *, extra=None, timeout: Optional[float] = None, **kwargs
+        self,
+        mime_type: str = "",
+        *,
+        extra=None,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> ViamImage:
         png = await asyncio.to_thread(self._render)
         return ViamImage(png, CameraMimeType.PNG)
@@ -133,12 +136,14 @@ class NavCamera(Camera):
     async def get_properties(
         self, *, timeout: Optional[float] = None, **kwargs
     ) -> Camera.Properties:
-        return Camera.Properties(
-            supports_pcd=False, mime_types=[CameraMimeType.PNG]
-        )
+        return Camera.Properties(supports_pcd=False, mime_types=[CameraMimeType.PNG])
 
     async def do_command(
-        self, command: Mapping[str, object], *, timeout: Optional[float] = None, **kwargs
+        self,
+        command: Mapping[str, object],
+        *,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> Mapping[str, object]:
         """Debug/introspection surface (no video stream needed).
 
@@ -156,11 +161,7 @@ class NavCamera(Camera):
             return {"navigation": cfg.navigation, "bridge": False, "viz": False}
         if hasattr(view, "enable_viz"):
             view.enable_viz(cfg.plan_history_len)
-        snap = (
-            view.viz_snapshot()
-            if hasattr(view, "viz_snapshot")
-            else view.snapshot()
-        )
+        snap = view.viz_snapshot() if hasattr(view, "viz_snapshot") else view.snapshot()
 
         def _n(v) -> int:
             return len(v) if v else 0

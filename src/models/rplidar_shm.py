@@ -4,6 +4,7 @@
 ``viam:lidar:rplidar`` gRPC hop) and writes each revolution into the same shm
 layout as ``viam-shared-memory-test``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -14,7 +15,6 @@ from typing import ClassVar, Mapping, Optional, Sequence
 
 import numpy as np
 from typing_extensions import Self
-
 from viam.components.camera import Camera
 from viam.logging import getLogger
 from viam.proto.app.robot import ComponentConfig
@@ -24,10 +24,10 @@ from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
 from viam.utils import struct_to_dict
 
+from ..geom import conversions as conv
 from ..lidar.rplidar_protocol import RPLidarError, model_name, scan_to_xyz_m
 from ..lidar.rplidar_serial import RPLidarSerial
 from ..lidar.serial_ports import list_candidate_serial_ports, normalize_exclude_list
-from ..geom import conversions as conv
 from ..shm import pcshm
 
 LOGGER = getLogger(__name__)
@@ -83,7 +83,9 @@ class RPLidarShm(Camera):
 
     def _join_timeout_s(self) -> float:
         """Long enough for scan loop to exit reconnect backoff and UART reads."""
-        return self._max_reconnect_backoff_s + self._timeout_s + self._motor_warmup_s + 5.0
+        return (
+            self._max_reconnect_backoff_s + self._timeout_s + self._motor_warmup_s + 5.0
+        )
 
     def _mark_scan_progress(self) -> None:
         self._scan_loop_progress_wall = time.monotonic()
@@ -148,7 +150,9 @@ class RPLidarShm(Camera):
         self._motor_warmup_s = float(attrs.get("motor_warmup_s", 1.0))
         self._reset_settle_s = float(attrs.get("reset_settle_s", 0.5))
         self._reconnect_backoff_s = float(attrs.get("reconnect_backoff_s", 1.0))
-        self._max_reconnect_backoff_s = float(attrs.get("max_reconnect_backoff_s", 15.0))
+        self._max_reconnect_backoff_s = float(
+            attrs.get("max_reconnect_backoff_s", 15.0)
+        )
         self._max_publish_gap_s = float(attrs.get("max_publish_gap_s", 5.0))
         self._serial_path = serial_path or None
         self._serial_exclude = normalize_exclude_list(attrs.get("serial_exclude"))
@@ -317,7 +321,9 @@ class RPLidarShm(Camera):
                         except Exception as exc:  # noqa: BLE001
                             self._errors += 1
                             self._last_error = repr(exc)
-                            LOGGER.warning("rplidar %r publish failed: %s", self.name, exc)
+                            LOGGER.warning(
+                                "rplidar %r publish failed: %s", self.name, exc
+                            )
                 except Exception as exc:  # noqa: BLE001
                     self._errors += 1
                     self._last_error = repr(exc)
@@ -326,7 +332,10 @@ class RPLidarShm(Camera):
                     LOGGER.error("rplidar %r scan loop exited: %s", self.name, exc)
                     # Closing USB on a hub shared with CAN resets can0. Prefer a
                     # protocol-only restart when hub-soft mode is active.
-                    if device is not None and getattr(device, "_hub_soft", False) is True:
+                    if (
+                        device is not None
+                        and getattr(device, "_hub_soft", False) is True
+                    ):
                         try:
                             device.soft_restart()
                         except Exception:
@@ -411,7 +420,9 @@ class RPLidarShm(Camera):
         self._stall_abort.set()
 
     async def get_images(self, *, extra=None, timeout=None, **kwargs):
-        raise NotImplementedError("rplidar does not support get_images; use get_point_cloud")
+        raise NotImplementedError(
+            "rplidar does not support get_images; use get_point_cloud"
+        )
 
     async def get_point_cloud(
         self, *, extra=None, timeout: Optional[float] = None, **kwargs
@@ -429,7 +440,11 @@ class RPLidarShm(Camera):
         return Camera.Properties(supports_pcd=True, mime_types=["pointcloud/pcd"])
 
     async def do_command(
-        self, command: Mapping[str, object], *, timeout: Optional[float] = None, **kwargs
+        self,
+        command: Mapping[str, object],
+        *,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> Mapping[str, object]:
         cmd = command.get("command") if isinstance(command, Mapping) else None
         if cmd == "get_laser_scan":

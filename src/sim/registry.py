@@ -1,4 +1,5 @@
 """Process-global SimWorld registry (shared by sim-base + SLAM sensors)."""
+
 from __future__ import annotations
 
 from threading import Lock

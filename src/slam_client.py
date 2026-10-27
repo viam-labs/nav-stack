@@ -2,6 +2,7 @@
 
 Used by builtin nav (``ViamWorldIO``) and tests.
 """
+
 from __future__ import annotations
 
 import base64
@@ -68,9 +69,9 @@ def _clamp_occupancy(cells: list) -> list:
     try:
         import numpy as np
 
-        return np.clip(np.asarray(cells, dtype=np.int32), -1, 100).astype(
-            np.int8
-        ).tolist()
+        return (
+            np.clip(np.asarray(cells, dtype=np.int32), -1, 100).astype(np.int8).tolist()
+        )
     except Exception:
         return [(-1 if c < -1 else 100 if c > 100 else int(c)) for c in cells]
 

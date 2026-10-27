@@ -4,20 +4,21 @@ Registers the nav-stack resource models with the Viam module server.
 
 Builtin SLAM + builtin navigation only.
 """
+
 from __future__ import annotations
 
 import asyncio
 
 from viam.module.module import Module
 
-from .models.shm_pointcloud import ShmPointCloud
-from .models.rplidar_shm import RPLidarShm
-from .models.wit_imu import WitImu
-from .models.navigation_external import ExternalNavigationService
-from .models.navigation import NavigationService
 from .models.nav_camera import NavCamera
+from .models.navigation import NavigationService
+from .models.navigation_external import ExternalNavigationService
+from .models.rplidar_shm import RPLidarShm
+from .models.shm_pointcloud import ShmPointCloud
 from .models.sim_base import SimBase
 from .models.slam import SlamService
+from .models.wit_imu import WitImu
 
 
 async def main() -> None:

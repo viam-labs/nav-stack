@@ -1,4 +1,5 @@
 """Tests for builtin simulation (SimWorld, sim-base kinematics, SLAM smoke)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,9 +15,9 @@ from src.config import (
     body_twist_to_viam_set_velocity,
     viam_set_velocity_to_body_twist,
 )
+from src.geom import conversions as conv
 from src.models.sim_base import SimBase
 from src.nav.maps import MapStore
-from src.geom import conversions as conv
 from src.sim import (
     SimSensors,
     SimWorld,
@@ -84,7 +85,9 @@ def test_sim_world_collision_blocks_wall():
         if pose.x >= wall_x - 0.15:
             break
     pose = world.get_pose()
-    assert pose.x < wall_x - 0.01, f"expected stop before wall at {wall_x}, got x={pose.x}"
+    assert pose.x < wall_x - 0.01, (
+        f"expected stop before wall at {wall_x}, got x={pose.x}"
+    )
 
 
 def test_sim_world_teleport_syncs_pose():
@@ -149,7 +152,9 @@ def test_sim_slam_pose_tracks_world_not_teleport(tmp_path: Path):
 
 
 def test_sim_config_requires_builtin_backend():
-    with pytest.raises(ValueError, match="slam_toolbox|no longer supported|pre-ros-removal"):
+    with pytest.raises(
+        ValueError, match="slam_toolbox|no longer supported|pre-ros-removal"
+    ):
         SlamConfig.from_dict(
             {
                 "base": "sim-base",

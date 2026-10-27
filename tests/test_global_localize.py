@@ -4,13 +4,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from src.geom import conversions as conv
 from src.nav.global_localize import (
     OccupancyMap,
     global_localize_scan,
     load_occupancy_from_map_dir,
     pgm_to_occupancy_grid,
 )
-from src.geom import conversions as conv
 
 
 def _asymmetric_map() -> OccupancyMap:
@@ -25,7 +25,9 @@ def _asymmetric_map() -> OccupancyMap:
     return OccupancyMap(grid=grid, resolution=0.5, origin_x=0.0, origin_y=0.0)
 
 
-def _raycast_scan(occ_map: OccupancyMap, pose: conv.Pose2D, num_bins: int = 360) -> conv.LaserScan2D:
+def _raycast_scan(
+    occ_map: OccupancyMap, pose: conv.Pose2D, num_bins: int = 360
+) -> conv.LaserScan2D:
     """Raycast the occupancy map to synthesize a scan at ``pose``."""
     angle_min = -math.pi
     angle_increment = 2 * math.pi / num_bins
@@ -188,9 +190,7 @@ def test_choose_yaw_or_flip_prefers_reference_on_near_tie():
     scan = _raycast_scan(occ, true)
     # Pretend the matcher returned the opposite heading at the right XY.
     wrong = conv.Pose2D(true.x, true.y, true.theta + math.pi)
-    choice = choose_yaw_or_flip(
-        occ, scan, wrong, reference_theta=true.theta + 0.1
-    )
+    choice = choose_yaw_or_flip(occ, scan, wrong, reference_theta=true.theta + 0.1)
     assert choice.flipped is True
     assert abs(_wrap(choice.pose.theta - true.theta)) < math.radians(5)
 
