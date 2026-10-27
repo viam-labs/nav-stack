@@ -1534,17 +1534,14 @@ class SlamService(SLAM):
     ) -> Mapping[str, ValueTypes]:
         """Run one drift check; correct pose when a trusted match has moved.
 
-        Escalates to full-map ``global_localize`` when the local match is weak
-        (the usual failure mode when manual global_localize is what fixes drift)
-        or when Nav2 reports multiple recoveries on the active goal.
-        While still with a bad published-pose tick score, goes straight to
-        full-map — a 360° lidar already has the view; spinning does not help.
+        Stays on a local search whenever a map pose exists. A weak score, a
+        bad prior, or several nav recoveries do not escalate: that whole-map
+        search is the 15–20 s pause before the first command, and in a hallway
+        the peak is usually an ambiguous twin that gets refused. Full-map runs
+        only when there is no published pose to search around.
 
-        ``full_map_escalation``:
-        - ``low_quality`` (default): current watchdog — full-map after a weak
-          local match, or immediately when still-bad while idle.
-        - ``still_bad``: always try local first; full-map only when the current
-          pose still looks wrong after that (route between-leg checks).
+        ``full_map_escalation`` is accepted for callers and no longer starts a
+        full-map search while a pose exists.
 
         ``allow_during_navigation``: run a local cycle while a goal is active
         (used by builtin nav's lidar↔map refine). Does not force apply, and
@@ -1599,57 +1596,36 @@ class SlamService(SLAM):
                 nav_recoveries = 0
 
         still_bad, tick_score = self._published_pose_is_bad(cfg)
-        # Still + scan-does-not-explain-pose used to go straight to a full-map
-        # search. In a repetitive hall that finds a distant twin and refuses
-        # it, while the UI auto-refine (1 m, looser ray error) would have
-        # landed. Parked cycles try that local window first. Route-leg checks
-        # (still_bad escalation) always try local first to avoid a 40s+ pause.
+        current = mgr.get_pose_in_map()
+        # Full-map only with no published pose. A weak score around a known
+        # pose stays local.
+        have_pose = current is not None
+        force_full_map = not have_pose
         # Tick scores just above zero (the paused hallway was 0.12) are not
         # "still bad", but they are also not a pose the button would leave
         # alone. Try the 1 m window whenever the parked score is under the
-        # trusted-match bar.
+        # trusted-match bar. That window needs a pose to center on.
         parked_soft = (
-            tick_score is not None
+            have_pose
+            and tick_score is not None
             and tick_score < float(cfg.periodic_relocalize_min_score)
         )
         parked_button = (
-            not driving
+            have_pose
+            and not driving
             and escalation == "low_quality"
             and not stopped_recovery
             and apply_override is not True
             and nav_recoveries < cfg.periodic_relocalize_nav_recoveries_threshold
             and (bool(still_bad) or parked_soft)
         )
-        force_full_map = (
-            nav_recoveries >= cfg.periodic_relocalize_nav_recoveries_threshold
-            or (
-                still_bad
-                and not nav_active
-                and escalation == "low_quality"
-                and not parked_button
-            )
-        )
-        # A goal that has not started moving is still a goal. Full-map runs
-        # while idle; the start of nav only gets a local search. A full-map
-        # pass here is the 15–20 s pause before the first command. Many
-        # recoveries on an already-failing goal, and stopped recovery after a
-        # local check failed, may still search the whole map.
-        if (
-            nav_active
-            and not stopped_recovery
-            and nav_recoveries < cfg.periodic_relocalize_nav_recoveries_threshold
-        ):
-            force_full_map = False
-        current = mgr.get_pose_in_map()
 
         base_command: dict = {"command": "global_localize"}
         base_command.update(dict(cfg.periodic_relocalize_options))
         base_command["apply"] = False
-        if (escalation == "still_bad" and not stopped_recovery) or (
-            nav_active and not stopped_recovery
-        ):
-            # Do not let the local request auto-fall back into a full-map search.
-            base_command["auto_full_map_fallback"] = False
+        # A local request must not widen itself into a full-map search.
+        # Full-map is chosen only when ``force_full_map`` (no published pose).
+        base_command["auto_full_map_fallback"] = False
         if stopped_recovery:
             # Wider local window while halted — still prefer local before full-map.
             try:
@@ -1665,15 +1641,7 @@ class SlamService(SLAM):
             except (TypeError, ValueError):
                 base_command["local_yaw_window_deg"] = 120.0
 
-        match_mode = (
-            "local"
-            if parked_button
-            else (
-                "full_map_still_recovery"
-                if (still_bad and not driving and escalation == "low_quality")
-                else ("full_map" if force_full_map else "local")
-            )
-        )
+        match_mode = "local" if parked_button or not force_full_map else "full_map"
         match_command = dict(base_command)
         if force_full_map:
             match_command["full_map"] = True
@@ -1705,17 +1673,6 @@ class SlamService(SLAM):
         matched_pose = match.get("pose")
         shift_m, shift_deg = self._pose_shift_from_current(current, matched_pose)
 
-        # After local: is the *published* pose still unexplained by the scan?
-        prior_score = match.get("prior_score")
-        pose_still_bad = bool(still_bad)
-        if prior_score is not None:
-            try:
-                pose_still_bad = float(prior_score) <= float(
-                    cfg.periodic_relocalize_still_bad_score
-                )
-            except (TypeError, ValueError):
-                pass
-
         parked_hit = False
         if parked_button and match_mode == "local":
             parked_hit = self._parked_refine_worth_applying(
@@ -1723,33 +1680,6 @@ class SlamService(SLAM):
             )
             if parked_hit:
                 match_mode = "local_parked"
-            elif still_bad and not nav_active:
-                # Idle only. The 1 m window had nothing the button would keep.
-                # Fall through to the full-map recovery this cycle used to run
-                # first. An active goal, even one that has not moved yet, stays
-                # on the local result.
-                full_command = dict(base_command)
-                full_command["apply"] = False
-                full_command["full_map"] = True
-                full_command["auto_full_map_fallback"] = False
-                match = await self._global_localize(full_command)
-                match_mode = "full_map_still_recovery"
-                good_match, score, ray_mae = self._localization_match_quality(
-                    match, cfg
-                )
-                matched_pose = match.get("pose")
-                shift_m, shift_deg = self._pose_shift_from_current(
-                    current, matched_pose
-                )
-                prior_score = match.get("prior_score")
-                pose_still_bad = bool(still_bad)
-                if prior_score is not None:
-                    try:
-                        pose_still_bad = float(prior_score) <= float(
-                            cfg.periodic_relocalize_still_bad_score
-                        )
-                    except (TypeError, ValueError):
-                        pass
             else:
                 # Soft parked score: the 1 m peak was not the button's match.
                 # Continue with the ordinary local search.
@@ -1765,71 +1695,11 @@ class SlamService(SLAM):
                 shift_m, shift_deg = self._pose_shift_from_current(
                     current, matched_pose
                 )
-                prior_score = match.get("prior_score")
-                pose_still_bad = bool(still_bad)
-                if prior_score is not None:
-                    try:
-                        pose_still_bad = float(prior_score) <= float(
-                            cfg.periodic_relocalize_still_bad_score
-                        )
-                    except (TypeError, ValueError):
-                        pass
 
-        escalate_full = False
-        if (
-            not good_match
-            and not force_full_map
-            and apply_override is not True
-            and match_mode == "local"
-            and not parked_hit
-        ):
-            if escalation == "low_quality":
-                escalate_full = bool(cfg.periodic_relocalize_full_map_on_low_quality)
-            else:
-                # still_bad: only burn a full-map search when we are confident
-                # the current pose is wrong, not merely that a local peel was weak.
-                escalate_full = bool(pose_still_bad)
-            # An active goal stays local, including the stopped moment before
-            # the first command. Idle low-quality matches still escalate.
-            # Stopped recovery may escalate once.
-            if nav_active and not stopped_recovery:
-                escalate_full = False
-
-        if escalate_full:
-            full_command = dict(base_command)
-            full_command["full_map"] = True
-            full_command["auto_full_map_fallback"] = False
-            full_match = await self._global_localize(full_command)
-            full_good, full_score, full_ray_mae = self._localization_match_quality(
-                full_match, cfg
-            )
-            if full_good or full_score > score:
-                match = full_match
-                good_match = full_good
-                score = full_score
-                ray_mae = full_ray_mae
-                matched_pose = full_match.get("pose")
-                shift_m, shift_deg = self._pose_shift_from_current(current, matched_pose)
-                match_mode = (
-                    "full_map_after_still_bad"
-                    if escalation == "still_bad"
-                    else "full_map_after_low_quality"
-                )
-
-        # Refuse auto-apply of ambiguous full-map peaks (second-best often a
-        # corridor twin). Manual apply:true still bypasses via apply_override.
-        # Include fallback / full_map flags so a "local" command that escalated
-        # inside the matcher cannot sneak past this gate.
-        is_full_map_result = (
-            str(match_mode).startswith("full_map")
-            or bool(match.get("full_map"))
-            or bool(match.get("fallback_used"))
-        )
-        if (
-            apply_override is not True
-            and bool(match.get("ambiguous"))
-            and is_full_map_result
-        ):
+        # An ambiguous peak is usually a corridor twin. Do not confirm it onto
+        # the pose, whether the search was local or full-map. Manual apply:true
+        # still bypasses via apply_override.
+        if apply_override is not True and bool(match.get("ambiguous")):
             result = {
                 "status": "ambiguous",
                 "match_mode": match_mode,
@@ -1855,7 +1725,7 @@ class SlamService(SLAM):
             # confirming across cycles that alternate ambiguous / not.
             self._pose_jump_gate.clear()
             LOGGER.warning(
-                "periodic relocalize: refusing ambiguous full-map peak "
+                "periodic relocalize: refusing ambiguous peak "
                 "(score=%.2f second_best=%s mode=%s)",
                 score,
                 match.get("second_best_score"),
@@ -2552,7 +2422,7 @@ class SlamService(SLAM):
             "command": "global_localize",
             # Evaluate candidates first; apply only the best pose at the end.
             "apply": False,
-            "auto_full_map_fallback": True,
+            "auto_full_map_fallback": False,
         }
         command.update(dict(options))
         command["apply"] = False
@@ -3648,7 +3518,7 @@ class SlamService(SLAM):
         full_map = bool(command.get("full_map", hint is None))
         search_radius_m = float(command.get("search_radius_m", 8.0))
         apply_pose = command.get("apply", True) is not False
-        auto_full_map_fallback = bool(command.get("auto_full_map_fallback", True))
+        auto_full_map_fallback = bool(command.get("auto_full_map_fallback", False))
         fallback_score_threshold = float(command.get("fallback_score_threshold", 0.42))
         fallback_hit_rate_threshold = float(command.get("fallback_hit_rate_threshold", 0.6))
 

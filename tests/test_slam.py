@@ -914,7 +914,7 @@ def test_periodic_relocalize_cycle_low_quality_no_correction():
     result = asyncio.run(slam._periodic_relocalize_cycle())
 
     assert result["status"] == "low_quality"
-    assert slam._global_localize.await_count == 2
+    assert slam._global_localize.await_count == 1
     slam.do_command.assert_not_awaited()
 
 
@@ -1122,17 +1122,13 @@ def test_periodic_relocalize_soft_candidate_keeps_driving_if_prior_ok():
     assert not should_hold_drive_for_pose_jump(result)
 
 
-def test_periodic_relocalize_cycle_escalates_full_map_on_low_quality():
+def test_periodic_relocalize_cycle_stays_local_on_low_quality():
+    """A weak match around a known pose must not start a full-map search."""
     slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
 
     async def _localize(command):
-        if command.get("full_map"):
-            return {
-                "status": "matched",
-                "score": 0.85,
-                "ray_mae_m": 0.25,
-                "pose": {"x": 2.0, "y": 0.0, "theta": 0.0},
-            }
+        assert not command.get("full_map")
+        assert command.get("auto_full_map_fallback") is False
         return {
             "status": "matched",
             "score": 0.2,
@@ -1145,16 +1141,9 @@ def test_periodic_relocalize_cycle_escalates_full_map_on_low_quality():
 
     result = _run_relocalize_until_settled(slam)
 
-    assert result["status"] == "corrected"
-    assert result["match_mode"] == "full_map_after_low_quality"
-    assert slam._global_localize.await_count >= 2
-    full_cmds = [
-        call.args[0]
-        for call in slam._global_localize.await_args_list
-        if call.args[0].get("full_map")
-    ]
-    assert full_cmds
-    slam.do_command.assert_awaited_once()
+    assert result["status"] == "low_quality"
+    assert result["match_mode"] == "local"
+    slam.do_command.assert_not_awaited()
 
 
 def test_periodic_relocalize_still_bad_skips_full_map_when_prior_ok():
@@ -1181,18 +1170,13 @@ def test_periodic_relocalize_still_bad_skips_full_map_when_prior_ok():
     assert slam._global_localize.await_count == 1
 
 
-def test_periodic_relocalize_still_bad_escalates_when_prior_bad():
+def test_periodic_relocalize_still_bad_stays_local_when_prior_bad():
+    """A bad prior around a known pose stays local, including route-leg checks."""
     slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
     slam._tick_match_score = MagicMock(return_value=-0.2)
 
     async def _localize(command):
-        if command.get("full_map"):
-            return {
-                "status": "matched",
-                "score": 0.85,
-                "ray_mae_m": 0.25,
-                "pose": {"x": 2.0, "y": 0.0, "theta": 0.0},
-            }
+        assert not command.get("full_map")
         return {
             "status": "matched",
             "score": 0.2,
@@ -1206,8 +1190,10 @@ def test_periodic_relocalize_still_bad_escalates_when_prior_bad():
     result = _run_relocalize_until_settled(
         slam, full_map_escalation="still_bad"
     )
-    assert result["match_mode"] == "full_map_after_still_bad"
-    assert slam._global_localize.await_count >= 2
+    assert not str(result["match_mode"]).startswith("full_map")
+    assert not any(
+        call.args[0].get("full_map") for call in slam._global_localize.await_args_list
+    )
 
 
 def test_periodic_relocalize_cycle_full_map_when_nav_recoveries_high():
@@ -1229,10 +1215,9 @@ def test_periodic_relocalize_cycle_full_map_when_nav_recoveries_high():
 
     result = _run_relocalize_until_settled(slam)
 
-    assert result["status"] == "corrected"
-    assert result["match_mode"] == "full_map"
+    assert result["match_mode"] == "local"
     first_cmd = slam._global_localize.await_args_list[0].args[0]
-    assert first_cmd["full_map"] is True
+    assert first_cmd["full_map"] is not True
 
 
 def test_periodic_relocalize_cycle_recovery_applies_high_ray_mae():
@@ -1263,12 +1248,11 @@ def test_periodic_relocalize_cycle_recovery_applies_high_ray_mae():
 
     result = _run_relocalize_until_settled(slam)
 
-    assert result["status"] == "corrected"
-    assert result["corrected"] is True
-    assert result["good_match"] is False
-    assert result["recovery_apply"] is True
-    assert result["match_mode"] == "full_map"
-    slam.do_command.assert_awaited_once()
+    assert result["corrected"] is False
+    assert result["recovery_apply"] is False
+    assert result["match_mode"] == "local"
+    assert slam._global_localize.await_args.args[0].get("full_map") is not True
+    slam.do_command.assert_not_awaited()
 
 
 def test_periodic_relocalize_cycle_recovery_floor_blocks_garbage():
@@ -1570,40 +1554,29 @@ def test_periodic_relocalize_bypasses_startup_when_tick_match_bad():
     result = _run_relocalize_until_settled(slam)
 
     assert slam._startup_global_localize_task is None
-    assert result["status"] == "corrected"
-    assert result["match_mode"] == "full_map_still_recovery"
     first = slam._global_localize.await_args_list[0].args[0]
-    # A 1 m parked refine runs first. This peak is 1.5 m away, so the cycle
-    # still falls through to the full-map recovery.
+    # A pose exists, so a bad tick stays on the 1 m parked window.
     assert first.get("full_map") is not True
     assert first.get("search_radius_m") == 1.0
-    assert any(
+    assert not any(
         call.args[0].get("full_map") is True
         for call in slam._global_localize.await_args_list
     )
 
 
-def test_periodic_relocalize_still_bad_goes_straight_to_full_map():
+def test_periodic_relocalize_still_bad_stays_on_the_parked_window():
     slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
     slam._engine = MagicMock()
     slam._engine.diagnostics.return_value = {"last_match_score": -0.25}
 
     async def _localize(command):
-        if not command.get("full_map"):
-            assert command.get("search_radius_m") == 1.0
-            return {
-                "status": "matched",
-                "score": 0.1,
-                "ray_mae_m": 2.0,
-                "prior_score": -0.4,
-                "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
-                "ambiguous": False,
-            }
+        assert not command.get("full_map")
         return {
             "status": "matched",
-            "score": 0.8,
-            "ray_mae_m": 0.2,
-            "pose": {"x": 2.0, "y": 0.0, "theta": 0.0},
+            "score": 0.1,
+            "ray_mae_m": 2.0,
+            "prior_score": -0.4,
+            "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
             "ambiguous": False,
         }
 
@@ -1612,9 +1585,29 @@ def test_periodic_relocalize_still_bad_goes_straight_to_full_map():
 
     result = _run_relocalize_until_settled(slam)
 
-    assert result["match_mode"] == "full_map_still_recovery"
-    assert result["status"] == "corrected"
-    assert slam._global_localize.await_count >= 1
+    assert not str(result["match_mode"]).startswith("full_map")
+    assert result["corrected"] is False
+    slam.do_command.assert_not_awaited()
+
+
+def test_periodic_relocalize_full_map_only_without_a_pose():
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._manager.get_pose_in_map.return_value = None
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.8,
+            "ray_mae_m": 0.2,
+            "pose": {"x": 1.0, "y": 0.0, "theta": 0.0},
+            "ambiguous": False,
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = _run_relocalize_until_settled(slam)
+
+    assert result["match_mode"] == "full_map"
+    assert slam._global_localize.await_args.args[0]["full_map"] is True
 
 
 def test_periodic_relocalize_confirms_lost_sideways_jump_in_one_cycle():

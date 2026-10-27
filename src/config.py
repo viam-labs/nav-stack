@@ -815,7 +815,9 @@ class SlamConfig:
     mapping_revisit_max_shift_m: float = 10.0
     # Full-map fallback needs a stronger score: self-similar offices produce
     # convincing wrong corridors at map scale.
-    mapping_revisit_full_map_fallback: bool = True
+    # Off: a mapping revisit already has a pose, so a weak local match stays
+    # local. Full-map is for having no pose at all.
+    mapping_revisit_full_map_fallback: bool = False
     mapping_revisit_full_map_min_score: float = 0.75
     # Multi-height-slice verification: accumulate sparse per-band grids from
     # pause scans (3D lidar only) and veto a revisit correction whose pose
@@ -933,18 +935,17 @@ class SlamConfig:
     # builtin SLAM match path's tight age clamp.
     periodic_relocalize_max_scan_age_s: float = 0.75
     # Below this match score, or above this ray MAE (m), the local match is not
-    # trusted; the watchdog then tries a full-map global_localize (like manual).
+    # trusted and the pose is left alone. A full-map search runs only when
+    # there is no published pose.
     # ray MAE default is deliberately generous: on real robots a correctly
     # localized pose still has ~0.5-0.9 m ray MAE (lidar noise, map resolution,
     # partial coverage), so a tighter gate makes the routine drift-correction path
     # never fire and drift only gets caught after nav degrades into a recovery.
     periodic_relocalize_min_score: float = 0.5
     periodic_relocalize_max_ray_mae_m: float = 1.0
-    # In a recovery situation (full-map match because nav is failing or the local
-    # match was low quality) the watchdog mirrors a manual global_localize: it
-    # applies the best full-map match when its score clears this floor, ignoring
-    # the ray_mae gate. This is what lets a genuinely-lost robot recover even when
-    # the environment's baseline ray_mae is above periodic_relocalize_max_ray_mae_m.
+    # When a full-map match does run (no published pose), apply it once the
+    # score clears this floor, ignoring the ray_mae gate. A known pose stays
+    # on the local window even if nav is recovering.
     periodic_relocalize_recovery_min_score: float = 0.45
     periodic_relocalize_min_shift_m: float = 0.2
     periodic_relocalize_min_shift_deg: float = 10.0
@@ -969,10 +970,12 @@ class SlamConfig:
     localize_stopped_recovery_max_m: float = 3.0
     localize_stopped_recovery_max_deg: float = 90.0
     localize_stopped_recovery_min_score: float = 0.45
-    # When navigation reports this many recoveries on the active goal, skip the
-    # cheap local match and run full-map global_localize immediately.
+    # Recoveries no longer force a full-map search while a pose exists. The
+    # count still keeps a halted goal off the tight parked window.
     periodic_relocalize_nav_recoveries_threshold: int = 2
-    periodic_relocalize_full_map_on_low_quality: bool = True
+    # Kept for existing configs. The watchdog no longer escalates a weak local
+    # match to full-map while a pose exists.
+    periodic_relocalize_full_map_on_low_quality: bool = False
     periodic_relocalize_during_navigation: bool = False
     # While navigating, apply small continuous scan-match nudges (≤ 0.15 m /
     # 3° per match, blended) when the published pose already explains the scan
@@ -984,12 +987,13 @@ class SlamConfig:
     # has a weak scan score is released sooner (see the local grace in
     # ``_maybe_bypass_startup_localize``). 0 disables the hard cap.
     periodic_relocalize_bypass_startup_after_s: float = 45.0
-    # While still, if the continuous tick match score is at/below this, go
-    # straight to full-map global_localize (360° lidar already has the view;
-    # spinning does not help). Default 0 catches "scan does not explain pose".
+    # While still, a tick match score at/below this marks the published pose
+    # unexplained. The watchdog then tries the 1 m parked window. It does not
+    # start a full-map search while that pose exists. Default 0 catches
+    # "scan does not explain pose".
     periodic_relocalize_still_bad_score: float = 0.0
     # While parked and the published pose does not explain the scan, try the
-    # UI auto-refine window before a full-map search. Same 1 m radius and
+    # UI auto-refine window. Same 1 m radius and
     # apply floors as ``set_initial_pose`` refine. Yaw stays inside ±45° so
     # an unattended cycle cannot lock the opposite heading.
     periodic_relocalize_parked_radius_m: float = 1.0
@@ -1006,7 +1010,7 @@ class SlamConfig:
             "full_map": False,
             "map_source": "live",
             "search_radius_m": 3.0,
-            "auto_full_map_fallback": True,
+            "auto_full_map_fallback": False,
         }
     )
     # Drop point-cloud hits whose base_link XY lies inside the robot box (a

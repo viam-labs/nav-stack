@@ -175,7 +175,7 @@ def test_slam_config_map_when_still_livox_defaults():
     assert cfg.mapping_revisit_full_map_min_score == pytest.approx(0.75)
     assert cfg.mapping_revisit_min_shift_m == pytest.approx(1.0)
     assert cfg.mapping_revisit_max_shift_m == pytest.approx(10.0)
-    assert cfg.mapping_revisit_full_map_fallback is True
+    assert cfg.mapping_revisit_full_map_fallback is False
     # Multi-height-slice verification defaults (3D lidar).
     assert cfg.mapping_revisit_slice_verify is True
     assert cfg.mapping_revisit_slice_bands == [[0.15, 0.45], [1.6, 2.4]]
@@ -307,10 +307,10 @@ def test_slam_config_periodic_relocalize_defaults():
     assert cfg.periodic_relocalize_min_shift_m == pytest.approx(0.2)
     assert cfg.periodic_relocalize_min_shift_deg == pytest.approx(10.0)
     assert cfg.periodic_relocalize_nav_recoveries_threshold == 2
-    assert cfg.periodic_relocalize_full_map_on_low_quality is True
+    assert cfg.periodic_relocalize_full_map_on_low_quality is False
     assert cfg.periodic_relocalize_during_navigation is False
     assert cfg.periodic_relocalize_options["search_radius_m"] == pytest.approx(3.0)
-    assert cfg.periodic_relocalize_options["auto_full_map_fallback"] is True
+    assert cfg.periodic_relocalize_options["auto_full_map_fallback"] is False
 
 
 def test_slam_config_periodic_relocalize_overrides():

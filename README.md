@@ -151,7 +151,7 @@ circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
 | `wall_yaw_min_length_m` / `wall_yaw_max_step_deg` / `wall_yaw_blend` | SLAM | Wall fit length gate (default `2.0` m), max yaw step per pause (default `2°`), and blend toward the wall (default `0.5`) |
 | `mapping_revisit_check` | SLAM | Mapping-time revisit watchdog: periodically scan-match against the live map near the current pose and shift the odom TF when a strong match disagrees, so a revisited corridor links up instead of duplicating. Default `true` when `map_when_still` + point-cloud lidars |
 | `mapping_revisit_interval_s` / `_search_radius_m` / `_wide_radius_m` | SLAM | Check interval (default `20` s) and tiered search radii: local first (default `5` m), wider on weak match (default `12` m) |
-| `mapping_revisit_min_score` / `_max_ray_mae_m` / `_full_map_min_score` | SLAM | Match quality gates (defaults `0.6` / `0.8` m); full-map fallback needs the stricter `0.75` score since self-similar offices produce convincing wrong corridors |
+| `mapping_revisit_min_score` / `_max_ray_mae_m` / `_full_map_min_score` | SLAM | Match quality gates (defaults `0.6` / `0.8` m). The full-map fallback is off (`mapping_revisit_full_map_fallback`); if enabled it needs the stricter `0.75` score since self-similar offices produce convincing wrong corridors |
 | `mapping_revisit_min_shift_m` / `_min_shift_deg` / `_max_shift_m` | SLAM | Correct only when the match moved at least `1.0` m / `10°` from the current pose and no more than `10` m (larger = likely false match) |
 | `builtin_loop_closure` | SLAM | Builtin automatic loop closure while mapping. Keyframes (every `builtin_loop_node_spacing_m` `0.5` m / `_deg` `20°`) form a pose graph; each new keyframe's last ~2 m of scans is matched against a submap rendered from **older keyframes only** (≥ `builtin_loop_min_travel_m` `6` m of path behind), so the drifted copy being painted now cannot confirm itself. Two consecutive agreeing matches add loop edges, the graph is optimized (error spread along the loop, not dumped on the last pose), and the grid is re-rendered from the corrected keyframes — removing doubled walls. Revisit-watchdog corrections and `optimize_pose_graph` use the same graph. Status: `slam_diagnostics.loop_closure`. Default `true` |
 | `builtin_loop_search_radius_m` / `_search_window_m` / `_search_window_deg` / `_min_score` | SLAM | Loop detection: old keyframes within `4` m, correlative search ±`1.5` m / ±`15°` around the current estimate, accept fit ≥ `0.55`. Matches at the window edge, ambiguous in both axes, or with more drift than ~10% of the loop length are rejected; along a featureless corridor only the sideways correction carries weight |
@@ -173,7 +173,7 @@ circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
 | `obstacles_only_rate_hz` | Nav | Background refresh rate for `obstacles_only` depth cams (default `5`). Control tick never awaits GetPointCloud; prefer POSIX `shm_name` for 10–20 Hz |
 | `avoid_obstacles_above_cart` | Nav | Remember depth returns after they leave the vertical view, and do not drive under them. Band is the camera's returns up to `z_max` (default `true`) |
 | `cart_height_m` | Nav | Optional. When set, only depth returns above this height (m, floor to the top of the cart) are remembered as overhead |
-| `periodic_relocalize_still_bad_score` | SLAM | While still, if tick match score ≤ this (default `0`), run full-map `global_localize` immediately instead of a local peek. |
+| `periodic_relocalize_still_bad_score` | SLAM | While still, a tick match score ≤ this (default `0`) marks the published pose unexplained. The watchdog tries the 1 m parked window and stays local while a pose exists. |
 | `periodic_relocalize_bypass_startup_after_s` | SLAM | Cancel a stuck startup localize after this many seconds (default `90`) so the drift watchdog can recover. |
 | `builtin SLAM` | SLAM | Common builtin SLAM params (resolution, max_laser_range, etc.) |
 | `slam_params` | SLAM | Advanced map/scan tuning keys (merged into engine defaults) |
@@ -534,9 +534,10 @@ Speed/robustness knobs: `local_yaw_window_deg`, `coarse_position_step_m`,
 `min_in_map_ratio`, `hit_radius_cells`, `ray_refine_candidates`,
 `ray_refine_beams`, `ray_step_m`, `ray_weight`.
 
-By default, `global_localize` now auto-falls back to full-map search when local
-search quality is weak. Tune or disable with `auto_full_map_fallback`,
-`fallback_score_threshold`, and `fallback_hit_rate_threshold`.
+`global_localize` stays on the local window when a pose exists. A full-map
+search runs only when there is no published pose. `auto_full_map_fallback`
+defaults off; `fallback_score_threshold` and `fallback_hit_rate_threshold`
+apply only when that fallback is turned on.
 
 When you are roughly in the right place but nav-stack drifted (~2 m), trigger scan-to-map
 matching with wider covariance:
