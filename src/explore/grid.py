@@ -169,19 +169,21 @@ def visible_new_cells(
         return 0
     step = grid.resolution / 2.0
     steps = int(max_range_m / step)
-    seen = set()
-    occupied = grid.occupied_mask()
-    unknown = grid.unknown_mask()
-    for k in range(n_rays):
-        ang = 2.0 * math.pi * k / n_rays
-        dx, dy = math.cos(ang), math.sin(ang)
-        for s in range(1, steps + 1):
-            r, c = grid.to_cell(x + dx * s * step, y + dy * s * step)
-            if not grid.in_bounds(r, c) or occupied[r, c]:
-                break
-            if unknown[r, c]:
-                seen.add((r, c))
-    return len(seen)
+    angles = 2.0 * math.pi * np.arange(n_rays) / n_rays
+    dist = np.arange(1, steps + 1) * step
+    xs = x + np.outer(np.cos(angles), dist)
+    ys = y + np.outer(np.sin(angles), dist)
+    rows = np.floor((ys - grid.y_min) / grid.resolution + 1e-9).astype(int)
+    cols = np.floor((xs - grid.x_min) / grid.resolution + 1e-9).astype(int)
+    oob = (rows < 0) | (rows >= grid.rows) | (cols < 0) | (cols >= grid.cols)
+    rows_c = np.clip(rows, 0, grid.rows - 1)
+    cols_c = np.clip(cols, 0, grid.cols - 1)
+    cells = grid.cells[rows_c, cols_c]
+    blocked = oob | (cells >= 50)
+    hit = np.cumsum(blocked, axis=1) > 0
+    unknown = (cells < 0) & ~hit
+    linear = rows_c[unknown] * grid.cols + cols_c[unknown]
+    return int(np.unique(linear).size)
 
 
 def under_seen_goals(
