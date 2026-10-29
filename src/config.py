@@ -1635,3 +1635,45 @@ class NavCameraConfig:
         # Depend on the navigation service so Viam constructs it (and registers
         # its viz store) before this camera.
         return [self.navigation]
+
+
+@dataclass
+class ExploreConfig:
+    """Config for ``viam-labs:nav-stack:explore``.
+
+    Autonomous mapping drive: explores from the live SLAM grid under a time
+    budget using the navigation service, then saves the map and returns home.
+    """
+
+    slam_service: str
+    navigation_service: str
+    base: str
+    max_linear_mps: float = 0.4
+    max_angular_dps: float = 30.0
+    home_tolerance_m: float = 0.5
+    structure_fraction: float = 0.15
+    revisit_fraction: float = 0.1
+    well_seen_m: float = 4.0
+    keyframe_max: int = 2000
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "ExploreConfig":
+        names = {}
+        for key in ("slam_service", "navigation_service", "base"):
+            value = d.get(key)
+            if not value:
+                raise ValueError(f"explore config requires {key!r}")
+            names[key] = str(value)
+        return cls(
+            **names,
+            max_linear_mps=float(d.get("max_linear_mps", 0.4)),
+            max_angular_dps=float(d.get("max_angular_dps", 30.0)),
+            home_tolerance_m=float(d.get("home_tolerance_m", 0.5)),
+            structure_fraction=float(d.get("structure_fraction", 0.15)),
+            revisit_fraction=float(d.get("revisit_fraction", 0.1)),
+            well_seen_m=float(d.get("well_seen_m", 4.0)),
+            keyframe_max=int(d.get("keyframe_max", 2000)),
+        )
+
+    def required_dependencies(self) -> List[str]:
+        return [self.slam_service, self.navigation_service, self.base]

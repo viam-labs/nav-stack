@@ -17,6 +17,7 @@ from .models.navigation_external import ExternalNavigationService
 from .models.navigation import NavigationService
 from .models.nav_camera import NavCamera
 from .models.sim_base import SimBase
+from .models.explore import ExploreService
 from .models.slam import SlamService
 
 
@@ -35,6 +36,7 @@ async def main() -> None:
     module.add_model_from_registry(ShmPointCloud.API, ShmPointCloud.MODEL)
     module.add_model_from_registry(RPLidarShm.API, RPLidarShm.MODEL)
     module.add_model_from_registry(WitImu.API, WitImu.MODEL)
+    module.add_model_from_registry(ExploreService.API, ExploreService.MODEL)
     await module.start()
 
 
