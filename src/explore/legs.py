@@ -7,6 +7,8 @@ from typing import Awaitable, Callable, Optional
 
 from .clients import NavClient, Pose
 
+ACTIVATION_GRACE_S = 3.0
+
 
 @dataclass
 class LegResult:
@@ -50,6 +52,7 @@ class LegRunner:
     ) -> LegResult:
         start = self._clock()
         timeout = leg_timeout_s(planned_length_m, self._max_linear_mps)
+        before = await self._nav.status()
         if planned:
             await self._nav.navigate_to_point(x, y, theta)
         else:
@@ -58,6 +61,7 @@ class LegRunner:
         def done(ok: bool, reason: str, pose: Optional[Pose]) -> LegResult:
             return LegResult(ok, reason, pose, self._clock() - start)
 
+        started = False
         while True:
             status = await self._nav.status()
             if self._should_stop():
@@ -66,7 +70,8 @@ class LegRunner:
             if not status.localized:
                 await self._nav.cancel()
                 return done(False, "lost_pose", status.pose)
-            if not status.active:
+            started = started or status.active or status.state != before.state
+            if not status.active and started:
                 if status.state in ("failed", "canceled"):
                     return done(False, status.state, status.pose)
                 if status.state == "succeeded":
@@ -74,6 +79,9 @@ class LegRunner:
                     if pose is None or math.hypot(pose.x - x, pose.y - y) > goal_tolerance_m:
                         return done(False, "far_from_goal", pose)
                     return done(True, "", pose)
+            if not started and self._clock() - start > ACTIVATION_GRACE_S:
+                await self._nav.cancel()
+                return done(False, "not_started", status.pose)
             if self._clock() - start > timeout:
                 await self._nav.cancel()
                 return done(False, "timeout", status.pose)

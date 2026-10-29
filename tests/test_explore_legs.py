@@ -99,3 +99,16 @@ def test_unplanned_leg_uses_go_to_point():
     nav, clk = FakeNav([st(True, "active"), st(False, "succeeded", 2.0, 0.0)]), FakeClock()
     r = go(runner(nav, clk), planned=False)
     assert r.ok and nav.calls[0] == ("go", 2.0, 0.0, 0.4)
+
+
+def test_leg_ignores_stale_succeeded_until_goal_activates():
+    stale = st(False, "succeeded", 2.0, 0.0)
+    nav, clk = FakeNav([stale, st(True, "active"), st(False, "succeeded", 0.0, 0.0)]), FakeClock()
+    r = go(runner(nav, clk))
+    assert not r.ok and r.reason == "far_from_goal"
+
+
+def test_leg_that_never_activates_fails_quickly():
+    nav, clk = FakeNav([st(False, "idle", 0.0, 0.0)]), FakeClock()
+    r = go(runner(nav, clk))
+    assert not r.ok and r.reason == "not_started" and clk.t < 10.0
