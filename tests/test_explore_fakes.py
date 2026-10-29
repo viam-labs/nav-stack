@@ -35,7 +35,8 @@ def test_fake_nav_drives_to_goal_and_reveals():
     nav = FakeNav(w, s, clk)
 
     async def go():
-        assert await nav.plan_to_point(3.0, 1.0) == (True, 2.0)
+        feasible, length = await nav.plan_to_point(3.0, 1.0)
+        assert feasible and abs(length - 2.0) < 0.05
         await nav.navigate_to_point(3.0, 1.0, 0.0)
         while (await nav.status()).active:
             await clk.sleep(0.5)
@@ -46,7 +47,9 @@ def test_fake_nav_drives_to_goal_and_reveals():
     assert known_fraction(s, w) > 0.1
 
 
-def test_fake_nav_fails_on_blocked_line():
+def test_fake_nav_routes_around_walls_and_rejects_unreachable():
     w = world()
     nav = FakeNav(w, FakeSlam(w), FakeClock())
-    assert asyncio.run(nav.plan_to_point(7.0, 3.0)) == (False, 0.0)
+    feasible, length = asyncio.run(nav.plan_to_point(7.0, 3.0))
+    assert feasible and length > 8.0
+    assert asyncio.run(nav.plan_to_point(4.0, 3.0)) == (False, 0.0)
