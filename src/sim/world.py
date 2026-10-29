@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -130,6 +130,40 @@ class SimWorld:
         self._vtheta = 0.0  # rad/s
         self._last_integrate_at = time.monotonic()
         self._odom_pose = conv.Pose2D(seed.x, seed.y, seed.theta)
+        self._obstacles: Dict[int, List[Tuple[int, int, int]]] = {}
+        self._next_obstacle_id = 1
+
+    def add_obstacle(self, x: float, y: float, radius_m: float) -> int:
+        with self._lock:
+            grid = self.map.grid
+            r0, c0 = self.map.world_to_cell(x, y)
+            rad = int(math.ceil(radius_m / self.map.resolution))
+            saved: List[Tuple[int, int, int]] = []
+            for r in range(r0 - rad, r0 + rad + 1):
+                for c in range(c0 - rad, c0 + rad + 1):
+                    if not self.map.in_bounds(r, c):
+                        continue
+                    cx, cy = self.map.origin_x + (c + 0.5) * self.map.resolution, (
+                        self.map.origin_y + (r + 0.5) * self.map.resolution
+                    )
+                    if math.hypot(cx - x, cy - y) > radius_m:
+                        continue
+                    saved.append((r, c, int(grid[r, c])))
+                    grid[r, c] = 100
+            oid = self._next_obstacle_id
+            self._next_obstacle_id += 1
+            self._obstacles[oid] = saved
+            return oid
+
+    def remove_obstacle(self, obstacle_id: int) -> None:
+        with self._lock:
+            for r, c, value in self._obstacles.pop(obstacle_id, []):
+                self.map.grid[r, c] = value
+
+    def clear_obstacles(self) -> None:
+        with self._lock:
+            for oid in list(self._obstacles):
+                self.remove_obstacle(oid)
 
     def reset(self, pose: Optional[conv.Pose2D] = None) -> None:
         with self._lock:
