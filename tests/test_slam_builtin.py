@@ -134,7 +134,7 @@ def test_refine_pose_tracks_prior():
         ranges, float(angles[0]), float(angles[1] - angles[0]), 0.1, 10.0
     )
     prior = conv.Pose2D(0.15, -0.10, math.radians(6.0))
-    matched, score, prior_score = scan_match.refine_pose(
+    matched, score, prior_score, _rival = scan_match.refine_pose(
         occ_map,
         scan,
         prior,
@@ -169,7 +169,7 @@ def test_refine_pose_rejects_weak_improvement():
     ranges = np.full(40, 1.0)
     scan = conv.LaserScan2D(ranges, -math.pi / 2, math.pi / 40, 0.1, 10.0)
     prior = conv.Pose2D(0.0, 0.0, 0.0)
-    matched, score, prior_score = scan_match.refine_pose(
+    matched, score, prior_score, _rival = scan_match.refine_pose(
         occ_map, scan, prior, min_score=0.5
     )
     assert matched is None
@@ -356,6 +356,36 @@ def test_apply_match_nav_steps_lost_pose_past_along_gate(monkeypatch):
     assert pose.x == pytest.approx(0.20, abs=1e-6)
     assert pose.y == pytest.approx(0.10, abs=1e-6)
     assert pose.theta == pytest.approx(math.radians(3.0), abs=1e-6)
+
+
+def test_apply_match_nav_refuses_sideways_step_when_a_second_wall_ties(monkeypatch):
+    """Two peaks within 0.08 are not a direction, even if they agree twice."""
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.42  # noqa: SLF001
+    engine._last_match_score = 0.58  # noqa: SLF001
+    engine._last_match_rival_score = 0.52  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    slipped = conv.Pose2D(0.10, -1.50, 0.0)
+    assert engine._apply_match(predicted, slipped, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, slipped, None) is False  # noqa: SLF001
+    assert engine.get_pose().x == pytest.approx(0.0)
+    assert engine.get_pose().y == pytest.approx(0.0)
+
+
+def test_apply_match_nav_steps_sideways_when_the_other_wall_is_worse(monkeypatch):
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.42  # noqa: SLF001
+    engine._last_match_score = 0.58  # noqa: SLF001
+    engine._last_match_rival_score = 0.30  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    slipped = conv.Pose2D(0.05, -0.80, 0.0)
+    assert engine._apply_match(predicted, slipped, None) is False  # noqa: SLF001
+    moved = conv.Pose2D(0.20, 0.0, 0.0)
+    slipped_moved = conv.Pose2D(0.25, -0.80, 0.0)
+    assert engine._apply_match(moved, slipped_moved, None) is True  # noqa: SLF001
+    pose = engine.get_pose()
+    assert pose.x == pytest.approx(0.20, abs=1e-6)
+    assert pose.y == pytest.approx(-0.10, abs=1e-6)
 
 
 def test_apply_match_nav_steps_sideways_when_the_slip_is_a_meter(monkeypatch):

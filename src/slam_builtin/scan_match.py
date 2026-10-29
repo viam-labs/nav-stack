@@ -112,6 +112,11 @@ def _candidate_scores(
     return scores
 
 
+# Farther than this from the winning cell, a high score is a second wall
+# rather than the same peak sampled on the next grid point.
+_RIVAL_SEP_M = 0.40
+
+
 def shift_axes(
     current: conv.Pose2D, matched: conv.Pose2D
 ) -> Tuple[float, float, float]:
@@ -175,10 +180,12 @@ def refine_pose(
     max_scan_points: int = 120,
     along_half_m: Optional[float] = None,
     cross_half_m: Optional[float] = None,
-) -> Tuple[Optional[conv.Pose2D], float, float]:
+) -> Tuple[Optional[conv.Pose2D], float, float, float]:
     """Search a local window around ``prior``.
 
-    Returns ``(pose_or_none, best_score, prior_score)``. Rejects candidates that
+    Returns ``(pose_or_none, best_score, prior_score, rival_score)``.
+    ``rival_score`` is the best peak at least ``_RIVAL_SEP_M`` from the winner,
+    or ``-inf`` when the window has only one blob. Rejects candidates that
     do not beat the prior by a distance-weighted margin (anti-oscillation).
 
     ``along_half_m`` and ``cross_half_m`` search in the prior heading frame
@@ -187,7 +194,7 @@ def refine_pose(
     """
     scan_xy = scan_endpoints_base_link(scan)
     if scan_xy.shape[0] < 20:
-        return None, float("-inf"), float("-inf")
+        return None, float("-inf"), float("-inf"), float("-inf")
     if max_scan_points > 0 and scan_xy.shape[0] > max_scan_points:
         pick = np.linspace(0, scan_xy.shape[0] - 1, max_scan_points, dtype=np.int32)
         scan_xy = scan_xy[pick]
@@ -230,9 +237,13 @@ def refine_pose(
     yaw_half = math.radians(yaw_half_deg)
     yaw_step = math.radians(yaw_step_deg)
     n_yaw = max(1, int(round(2.0 * yaw_half / yaw_step)) + 1)
+    # A cell next to the winner is the same blob. A rival is another pose
+    # far enough away to be a different wall.
+    rival_sep2 = _RIVAL_SEP_M * _RIVAL_SEP_M
 
     best_pose: Optional[conv.Pose2D] = None
     best_score = float("-inf")
+    peaks: list[tuple[float, float, float]] = []
     for it in range(n_yaw):
         dth = -yaw_half + it * yaw_step
         yaw = conv.normalize_angle(prior.theta + dth)
@@ -240,16 +251,39 @@ def refine_pose(
             occ_map, scan_xy, cand_x, cand_y, yaw, occupied_lookup=lookup
         )
         idx = int(np.argmax(scores))
-        if scores[idx] > best_score:
-            best_score = float(scores[idx])
+        local_score = float(scores[idx])
+        if not math.isfinite(local_score):
+            continue
+        peaks.append((local_score, float(cand_x[idx]), float(cand_y[idx])))
+        dx = cand_x - cand_x[idx]
+        dy = cand_y - cand_y[idx]
+        far = (dx * dx + dy * dy) >= rival_sep2
+        if bool(np.any(far)):
+            far_scores = np.where(far, scores, float("-inf"))
+            far_idx = int(np.argmax(far_scores))
+            far_score = float(far_scores[far_idx])
+            if math.isfinite(far_score):
+                peaks.append(
+                    (far_score, float(cand_x[far_idx]), float(cand_y[far_idx]))
+                )
+        if local_score > best_score:
+            best_score = local_score
             best_pose = conv.Pose2D(float(cand_x[idx]), float(cand_y[idx]), yaw)
 
+    rival_score = float("-inf")
+    if best_pose is not None:
+        for score, x, y in peaks:
+            if (x - best_pose.x) ** 2 + (y - best_pose.y) ** 2 < rival_sep2:
+                continue
+            if score > rival_score:
+                rival_score = score
+
     if best_pose is None or best_score < min_score:
-        return None, best_score, prior_score
+        return None, best_score, prior_score, rival_score
 
     dist = math.hypot(best_pose.x - prior.x, best_pose.y - prior.y)
     dyaw = abs(conv.normalize_angle(best_pose.theta - prior.theta))
     need = _required_improvement(prior_score, dist, dyaw)
     if best_score < prior_score + need:
-        return None, best_score, prior_score
-    return best_pose, best_score, prior_score
+        return None, best_score, prior_score, rival_score
+    return best_pose, best_score, prior_score, rival_score

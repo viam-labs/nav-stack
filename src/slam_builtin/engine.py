@@ -68,6 +68,7 @@ class BuiltinSlamEngine:
         self._thread: Optional[threading.Thread] = None
         self._last_match_score = float("nan")
         self._last_prior_score = float("nan")
+        self._last_match_rival_score = float("nan")
         self._last_scan_age_s = float("nan")
         self._last_scan_obj: Optional[conv.LaserScan2D] = None
         self._last_tick_pose: Optional[conv.Pose2D] = None
@@ -1040,7 +1041,7 @@ class BuiltinSlamEngine:
                     math.isfinite(prior_now)
                     and prior_now < self._NAV_TRACK_MIN_PRIOR
                 )
-                matched, score, prior_score = scan_match.refine_pose(
+                matched, score, prior_score, rival_score = scan_match.refine_pose(
                     occ_map,
                     scan,
                     predicted,
@@ -1061,13 +1062,14 @@ class BuiltinSlamEngine:
                     yaw_step_deg=4.0 if lost else 2.0,
                 )
             else:
-                matched, score, prior_score = scan_match.refine_pose(
+                matched, score, prior_score, rival_score = scan_match.refine_pose(
                     occ_map, scan, predicted
                 )
             with self._lock:
                 self._last_match_at = now
                 self._last_match_score = score
                 self._last_prior_score = prior_score
+                self._last_match_rival_score = rival_score
                 if self._pose_epoch != epoch:
                     # Pose moved frame (loop closure) mid-match.
                     return
@@ -1265,13 +1267,14 @@ class BuiltinSlamEngine:
             run_match = self._occ_cache_known > 0.02
 
         if run_match:
-            matched, score, prior_score = scan_match.refine_pose(
+            matched, score, prior_score, rival_score = scan_match.refine_pose(
                 occ_map, scan, pose
             )
             with self._lock:
                 self._last_match_at = now
                 self._last_match_score = score
                 self._last_prior_score = prior_score
+                self._last_match_rival_score = rival_score
                 # Do not apply match to pose (would fight SimWorld). Count how
                 # often the map agrees with ground truth for status.
                 if matched is not None:
@@ -1491,6 +1494,10 @@ class BuiltinSlamEngine:
     # The in-window leftover on a drifted hall is about 0.12; a real wall
     # alignment has to clear this.
     _NAV_LATERAL_MIN_SCORE = 0.20
+    # A lost pose scores near zero, so the winning cell only has to beat it by
+    # a few points. That is not a direction. The winner has to clear the next
+    # wall (a peak at least 0.40 m away) by this much or the step is refused.
+    _NAV_LATERAL_RIVAL_MARGIN = 0.08
     _NAV_TRACK_MIN_PRIOR = 0.25
     _NAV_TRACK_MIN_SCORE = 0.35
     _NAV_TRACK_MAX_YAW_RATE = 0.35
@@ -1514,6 +1521,18 @@ class BuiltinSlamEngine:
             return False
         score = float(self._last_match_score)
         return math.isfinite(score) and score >= self._NAV_TRACK_MIN_SCORE
+
+    def _lateral_peak_is_unique(self) -> bool:
+        """True when no second wall scores almost as well as the winner.
+
+        A missing rival (no other peak in the window, or a test that did not
+        run the search) is one peak. Two close scores are not a direction.
+        """
+        best = float(self._last_match_score)
+        rival = float(self._last_match_rival_score)
+        if not math.isfinite(best) or not math.isfinite(rival):
+            return True
+        return best - rival >= self._NAV_LATERAL_RIVAL_MARGIN
 
     def _nav_lateral_score_ok(self) -> bool:
         """Sideways recovery may use a lower score once the prior is lost."""
@@ -1548,6 +1567,8 @@ class BuiltinSlamEngine:
         arms the correction; the next agreeing frame takes a small step.
         """
         if not self._nav_lateral_score_ok():
+            return False
+        if not self._lateral_peak_is_unique():
             return False
         along, cross, dyaw = scan_match.shift_axes(predicted, matched)
         prior = float(self._last_prior_score)
