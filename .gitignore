@@ -224,3 +224,6 @@ scripts/watch_describe_motion.py
 # Local sim bring-up artifacts
 sample_configs/.local_sim.generated.json
 .local/
+
+# superpowers scratch
+.superpowers/
