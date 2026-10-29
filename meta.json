@@ -43,6 +43,11 @@
       "api": "rdk:component:movement_sensor",
       "model": "viam-labs:nav-stack:wit-imu",
       "short_description": "WitMotion IMU with USB autodetect and POSIX shm for builtin SLAM."
+    },
+    {
+      "api": "rdk:service:generic",
+      "model": "viam-labs:nav-stack:explore",
+      "short_description": "Autonomous exploration drive for mapping: frontier and revisit goals under a time budget."
     }
   ],
   "entrypoint": "run.sh",
