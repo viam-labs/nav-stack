@@ -7,6 +7,7 @@ Builtin SLAM + builtin navigation only.
 from __future__ import annotations
 
 import asyncio
+import sys
 
 from viam.module.module import Module
 
@@ -20,7 +21,16 @@ from .models.sim_base import SimBase
 from .models.slam import SlamService
 
 
+# SLAM ticks, nav, the lidar/IMU readers and the module event loop share one
+# GIL. A pure-Python planner flood holds it for seconds; at the default 5 ms
+# switch interval every event-loop step behind it waits ~5 ms, so SLAM's
+# 80 ms odometry reads time out for the whole plan and turns made meanwhile
+# are dropped. 0.5 ms keeps those reads ~15 ms with no planner slowdown.
+_GIL_SWITCH_INTERVAL_S = 0.0005
+
+
 async def main() -> None:
+    sys.setswitchinterval(_GIL_SWITCH_INTERVAL_S)
     module = Module.from_args()
     from .runtime import set_module
 
