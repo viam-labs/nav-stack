@@ -71,3 +71,14 @@ def test_slam_status_and_grid():
     assert (st.mode, st.keyframes, st.graph_full, st.closures) == ("mapping", 12, False, 2)
     none_grid = ViamSlamClient(Recorder({"available": False, "reason": "no_map"}))
     assert asyncio.run(none_grid.grid()) is None
+
+
+def test_nav_status_exposes_simple_nav_state():
+    raw = {
+        "active": False,
+        "state": "canceled",
+        "pose": {"x": 1.0, "y": 2.0, "theta": 0.0},
+        "simple_nav": {"state": "succeeded", "motion": "simple"},
+    }
+    st = asyncio.run(ViamNavClient(Recorder(raw)).status())
+    assert st.state == "canceled" and st.simple_state == "succeeded"

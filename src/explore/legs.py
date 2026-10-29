@@ -8,6 +8,7 @@ from typing import Awaitable, Callable, Optional
 from .clients import NavClient, Pose
 
 ACTIVATION_GRACE_S = 3.0
+STATUS_ERROR_LIMIT = 3
 
 
 @dataclass
@@ -40,6 +41,17 @@ class LegRunner:
         self._poll_s = poll_s
         self._should_stop = should_stop
 
+    async def _status(self) -> NavStatus:
+        errors = 0
+        while True:
+            try:
+                return await self._nav.status()
+            except Exception:  # noqa: BLE001
+                errors += 1
+                if errors >= STATUS_ERROR_LIMIT:
+                    raise
+                await self._sleep(self._poll_s)
+
     async def run(
         self,
         x: float,
@@ -52,29 +64,35 @@ class LegRunner:
     ) -> LegResult:
         start = self._clock()
         timeout = leg_timeout_s(planned_length_m, self._max_linear_mps)
-        before = await self._nav.status()
+        before = await self._status()
+        if not before.localized:
+            return LegResult(False, "lost_pose", before.pose, 0.0)
         if planned:
             await self._nav.navigate_to_point(x, y, theta)
         else:
             await self._nav.go_to_point(x, y, theta, velocity_mps=self._max_linear_mps)
+
+        def leg_state(status: NavStatus) -> str:
+            return status.state if planned else status.simple_state
 
         def done(ok: bool, reason: str, pose: Optional[Pose]) -> LegResult:
             return LegResult(ok, reason, pose, self._clock() - start)
 
         started = False
         while True:
-            status = await self._nav.status()
+            status = await self._status()
             if self._should_stop():
                 await self._nav.cancel()
                 return done(False, "canceled", status.pose)
             if not status.localized:
                 await self._nav.cancel()
                 return done(False, "lost_pose", status.pose)
-            started = started or status.active or status.state != before.state
+            state = leg_state(status)
+            started = started or status.active or state != leg_state(before)
             if not status.active and started:
-                if status.state in ("failed", "canceled"):
-                    return done(False, status.state, status.pose)
-                if status.state == "succeeded":
+                if state in ("failed", "canceled"):
+                    return done(False, state, status.pose)
+                if state == "succeeded":
                     pose = status.pose
                     if pose is None or math.hypot(pose.x - x, pose.y - y) > goal_tolerance_m:
                         return done(False, "far_from_goal", pose)

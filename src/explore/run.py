@@ -56,6 +56,10 @@ class _Finish(Exception):
     pass
 
 
+def _approach_theta(frm: Pose, goal: Candidate) -> float:
+    return math.atan2(goal.y - frm.y, goal.x - frm.x)
+
+
 @dataclass
 class _State:
     phase: str = "idle"
@@ -89,6 +93,7 @@ class ExploreRun:
         self._raw_sleep = sleep
         self._stop_base = stop_base
         self._stop_requested = False
+        self._abort_home = False
         self._started_at: Optional[float] = None
         self._s = _State()
         self._blacklist = Blacklist()
@@ -103,6 +108,8 @@ class ExploreRun:
     # -- public ----------------------------------------------------------------
     def request_stop(self) -> None:
         self._stop_requested = True
+        if self._s.phase == "finishing":
+            self._abort_home = True
 
     def status(self) -> dict:
         elapsed = 0.0 if self._started_at is None else self._clock() - self._started_at
@@ -149,9 +156,13 @@ class ExploreRun:
             await self._structure_phase()
             await self._fill_phase()
             await self._revisit_phase()
+            await self._idle_fill()
         except _Finish:
             pass
-        await self._finish()
+        except Exception as exc:  # noqa: BLE001
+            self._s.last_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            await self._finish()
         return self.status()
 
     # -- helpers ---------------------------------------------------------------
@@ -197,7 +208,7 @@ class ExploreRun:
         raw = await self._slam.grid()
         if raw is None:
             return None
-        grid = OccGrid.from_get_grid(raw)
+        grid = await asyncio.to_thread(OccGrid.from_get_grid, raw)
         if grid is not None:
             self._s.coverage_cells = grid.known_free_count()
         return grid
@@ -254,23 +265,31 @@ class ExploreRun:
         outer = Circuit(waypoints=[])
         closures_before = (await self._slam.status()).closures
         path_m = 0.0
+        far_m = 0.0
+        prev_travel: Optional[Tuple[float, float]] = None
         pose = start
         while self._structure_budget_left(await self._keyframes()):
             self._check_budget()
+            pose = await self._pose()
             grid = await self._grid()
-            hop = None if grid is None else next_wall_hop(grid, pose, hop_m=HOP_M)
+            hop = None
+            if grid is not None:
+                hop = await asyncio.to_thread(
+                    next_wall_hop, grid, pose, hop_m=HOP_M, prev_travel=prev_travel
+                )
             if hop is None or self._blacklist.blocked(hop.x, hop.y, self._clock()):
                 break
             theta = facing_wall_theta(grid, Pose(hop.x, hop.y, 0.0))
             result = await self._leg(hop, planned=False, length_m=HOP_M, theta=theta)
             if result.ok and result.end_pose is not None:
-                path_m += math.hypot(result.end_pose.x - pose.x, result.end_pose.y - pose.y)
-                pose = result.end_pose
+                end = result.end_pose
+                prev_travel = (end.x - pose.x, end.y - pose.y)
+                path_m += math.hypot(*prev_travel)
+                far_m = max(far_m, math.hypot(end.x - start.x, end.y - start.y))
+                pose = end
                 outer.waypoints.append(hop)
-            else:
-                pose = await self._pose()
             await self._sleep(STRUCTURE_PAUSE_S)
-            if circuit_closed(path_m, pose, start):
+            if circuit_closed(path_m, pose, start, far_m=far_m):
                 break
         if outer.waypoints:
             outer.closures = (await self._slam.status()).closures - closures_before
@@ -280,7 +299,9 @@ class ExploreRun:
             grid = await self._grid()
             if grid is None:
                 break
-            goals = inner_circuit_goals(grid, await self._pose(), clearance_m=self._p.robot_radius_m * 3)
+            goals = await asyncio.to_thread(
+                inner_circuit_goals, grid, await self._pose(), clearance_m=self._p.robot_radius_m * 3
+            )
             if len(goals) < 2:
                 break
             circuit = Circuit(waypoints=goals)
@@ -306,6 +327,8 @@ class ExploreRun:
                 continue
             grid = await self._grid()
             theta = None if grid is None else facing_wall_theta(grid, Pose(goal.x, goal.y, 0.0))
+            if theta is None:
+                theta = _approach_theta(here, goal)
             await self._leg(goal, planned=True, length_m=length, theta=theta)
             driven += 1
             await self._sleep(pause_s)
@@ -318,9 +341,11 @@ class ExploreRun:
             return []
         pose = await self._pose()
         now = self._clock()
-        frontiers = frontier_goals(grid, self._p.robot_radius_m)
+        frontiers = await asyncio.to_thread(frontier_goals, grid, self._p.robot_radius_m)
         self._s.frontier_count = len(frontiers)
-        under = under_seen_goals(grid, self._s.visited, self._p.well_seen_m)
+        under = await asyncio.to_thread(
+            under_seen_goals, grid, self._s.visited, self._p.well_seen_m
+        )
         pool = [c for c in frontiers + under if not self._blacklist.blocked(c.x, c.y, now)]
         pool.sort(key=lambda c: math.hypot(c.x - pose.x, c.y - pose.y))
         scored: List[Scored] = []
@@ -328,9 +353,17 @@ class ExploreRun:
             feasible, length = await self._nav.plan_to_point(cand.x, cand.y)
             if not feasible:
                 continue
-            gain = visible_new_cells(grid, cand.x, cand.y, max_range_m=SCORE_RANGE_M)
+            gain = await asyncio.to_thread(
+                visible_new_cells, grid, cand.x, cand.y, max_range_m=SCORE_RANGE_M
+            )
             scored.append(Scored(cand, gain, length, score(gain, length)))
         return rank(scored, self._p.min_score)
+
+    async def _fill_leg(self, best: Scored) -> None:
+        here = await self._pose()
+        theta = _approach_theta(here, best.candidate)
+        await self._leg(best.candidate, planned=True, length_m=best.path_len_m, theta=theta)
+        await self._sleep(FILL_PAUSE_S)
 
     async def _fill_phase(self) -> None:
         await self._set_phase("fill")
@@ -339,65 +372,70 @@ class ExploreRun:
             ranked = await self._candidates()
             if not ranked:
                 return
-            best = ranked[0]
-            await self._leg(best.candidate, planned=True, length_m=best.path_len_m)
-            await self._sleep(FILL_PAUSE_S)
+            await self._fill_leg(ranked[0])
 
     async def _revisit_phase(self) -> None:
-        slam = await self._slam.status()
-        self._s.keyframes_used = slam.keyframes
-        can_close = not slam.graph_full and slam.keyframes < self._p.keyframe_max
-        if can_close and self._s.circuits:
-            await self._set_phase("revisit")
-            ordered = sorted(self._s.circuits, key=lambda c: c.closures)
-            while self._remaining() > 0.0:
-                driven = 0
-                for circuit in ordered:
-                    self._check_budget()
-                    driven += await self._drive_circuit(
-                        circuit, pause_s=STRUCTURE_PAUSE_S, structure=False
-                    )
-                if driven == 0:
-                    await self._sleep(IDLE_POLL_S)
-        else:
-            await self._set_phase("fill")
+        if not self._s.circuits:
+            return
+        for circuit in sorted(self._s.circuits, key=lambda c: c.closures):
+            slam = await self._slam.status()
+            self._s.keyframes_used = slam.keyframes
+            if slam.graph_full or slam.keyframes >= self._p.keyframe_max:
+                return
+            if self._s.phase != "revisit":
+                await self._set_phase("revisit")
+            self._check_budget()
+            await self._drive_circuit(circuit, pause_s=STRUCTURE_PAUSE_S, structure=False)
+
+    async def _idle_fill(self) -> None:
+        await self._set_phase("fill")
         while self._remaining() > 0.0:
             self._check_budget()
             ranked = await self._candidates()
             if ranked:
-                best = ranked[0]
-                await self._leg(best.candidate, planned=True, length_m=best.path_len_m)
-                await self._sleep(FILL_PAUSE_S)
+                await self._fill_leg(ranked[0])
             else:
                 await self._sleep(IDLE_POLL_S)
 
     async def _finish(self) -> None:
         await self._set_phase("finishing")
-        try:
-            await self._nav.cancel()
-            await self._slam.optimize()
-            await self._slam.save_map()
-            home = self._s.home
-            went_home = False
-            if home is not None:
-                for _ in range(2):
-                    went_home = await self._go_home(home)
-                    if went_home:
-                        break
-            if not went_home:
+        errors: List[str] = []
+        for name, step in (("cancel", self._nav.cancel), ("optimize", self._slam.optimize),
+                           ("save_map", self._slam.save_map)):
+            try:
+                await step()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name} failed: {exc}")
+        home = self._s.home
+        went_home = False
+        reason = "no home pose"
+        if home is not None:
+            for attempt in range(2):
+                if attempt and self._abort_home:
+                    reason = "stop requested"
+                    break
+                try:
+                    went_home, reason = await self._go_home(home)
+                except Exception as exc:  # noqa: BLE001
+                    went_home, reason = False, f"{type(exc).__name__}: {exc}"
+                if went_home:
+                    break
+        if not went_home:
+            errors.append(f"return home failed: {reason}")
+            try:
+                await self._nav.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
                 await self._stop_base()
-                if home is None:
-                    self._s.last_error = self._s.last_error or "return home skipped: no home pose"
-                else:
-                    msg = f"return home failed: {self._last_home_reason}"
-                    self._s.last_error = f"{self._s.last_error}; {msg}" if self._s.last_error else msg
-        except Exception as exc:  # noqa: BLE001
-            self._s.last_error = f"finish failed: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"base stop failed: {exc}")
+        if errors:
+            joined = "; ".join(errors)
+            self._s.last_error = f"{self._s.last_error}; {joined}" if self._s.last_error else joined
         await self._set_phase("done")
 
-    _last_home_reason = ""
-
-    async def _go_home(self, home: Pose) -> bool:
+    async def _go_home(self, home: Pose) -> Tuple[bool, str]:
         pose = (await self._nav.status()).pose
         feasible, length = await self._nav.plan_to_point(home.x, home.y)
         if not feasible:
@@ -407,5 +445,4 @@ class ExploreRun:
             home.x, home.y, home.theta,
             planned=True, planned_length_m=length, goal_tolerance_m=self._p.home_tolerance_m,
         )
-        self._last_home_reason = result.reason
-        return result.ok
+        return result.ok, result.reason

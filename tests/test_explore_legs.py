@@ -47,6 +47,12 @@ def st(active, state, x=0.0, y=0.0, localized=True):
     )
 
 
+def st2(active, state, simple_state, x=0.0, y=0.0):
+    s = st(active, state, x, y)
+    s.simple_state = simple_state
+    return s
+
+
 def runner(nav, clk, **kw):
     return LegRunner(nav, max_linear_mps=0.4, clock=clk.now, sleep=clk.sleep, **kw)
 
@@ -96,8 +102,9 @@ def test_should_stop_cancels_leg():
 
 
 def test_unplanned_leg_uses_go_to_point():
-    nav, clk = FakeNav([st(True, "active"), st(False, "succeeded", 2.0, 0.0)]), FakeClock()
-    r = go(runner(nav, clk), planned=False)
+    nav = FakeNav([st2(False, "idle", "idle"), st2(True, "canceled", "active"),
+                   st2(False, "canceled", "succeeded", 2.0, 0.0)])
+    r = go(runner(nav, FakeClock()), planned=False)
     assert r.ok and nav.calls[0] == ("go", 2.0, 0.0, 0.4)
 
 
@@ -112,3 +119,32 @@ def test_leg_that_never_activates_fails_quickly():
     nav, clk = FakeNav([st(False, "idle", 0.0, 0.0)]), FakeClock()
     r = go(runner(nav, clk))
     assert not r.ok and r.reason == "not_started" and clk.t < 10.0
+
+
+def test_unplanned_leg_reads_simple_nav_state_not_top_level():
+    nav = FakeNav([st2(False, "idle", "idle"), st2(True, "canceled", "active"),
+                   st2(False, "canceled", "succeeded", 2.0, 0.0)])
+    r = go(runner(nav, FakeClock()), planned=False)
+    assert r.ok
+
+
+def test_leg_not_sent_when_pose_already_lost():
+    nav, clk = FakeNav([st(False, "idle", localized=False)]), FakeClock()
+    r = go(runner(nav, clk))
+    assert r.reason == "lost_pose" and not any(c[0] in ("nav", "go") for c in nav.calls)
+
+
+def test_leg_tolerates_transient_status_errors():
+    class Flaky(FakeNav):
+        def __init__(self, statuses):
+            super().__init__(statuses)
+            self.boom = 2
+
+        async def status(self):
+            if self.boom and self.calls:
+                self.boom -= 1
+                raise RuntimeError("grpc hiccup")
+            return await super().status()
+
+    nav, clk = Flaky([st(True, "active"), st(False, "succeeded", 2.0, 0.0)]), FakeClock()
+    assert go(runner(nav, clk)).ok

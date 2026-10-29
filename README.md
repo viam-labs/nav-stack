@@ -393,10 +393,12 @@ a wall-following outer circuit and a few inner loops of at least 12 m, pausing
 is fresh. **Fill**: frontier cells and free cells farther than `well_seen_m`
 from any visited pose are scored by expected newly seen cells per planned meter
 and driven with planned navigation. **Revisit** (the last `revisit_fraction`):
-replays the structure circuits, least-closed first, unless the pose graph is
-full. **Finish** (timeout, `stop`, or an unrecoverable error): cancel,
+replays each structure circuit once, least-closed first, unless the pose graph
+is full, then returns to fill (or idles) until the budget ends. **Finish** (timeout, `stop`, or an unrecoverable error): cancel,
 `optimize`, `save_map`, navigate home (one retry), else stop in place. The map
-is saved before the drive home.
+is saved before the drive home. A `stop` received while finishing skips the
+retry of the drive home. Any error from a SLAM or navigation call ends the run
+through the same finish sequence and is reported in `last_error`.
 
 Failed legs (error, timeout at 3x the planned time with a 20 s floor, or ending
 more than 1 m from the goal) blacklist the goal for 10 minutes; five in a row
