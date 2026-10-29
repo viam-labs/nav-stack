@@ -49,9 +49,9 @@ def test_facing_wall_theta_points_at_nearest_wall():
 
 def test_circuit_closed():
     s = Pose(1.0, 1.0, 0.0)
-    assert not circuit_closed(5.0, Pose(1.2, 1.0, 0.0), s)
-    assert not circuit_closed(20.0, Pose(5.0, 1.0, 0.0), s)
-    assert circuit_closed(20.0, Pose(1.2, 1.0, 0.0), s)
+    assert not circuit_closed(5.0, Pose(1.2, 1.0, 0.0), s, far_m=5.0)
+    assert not circuit_closed(20.0, Pose(5.0, 1.0, 0.0), s, far_m=5.0)
+    assert circuit_closed(20.0, Pose(1.2, 1.0, 0.0), s, far_m=5.0)
 
 
 def test_inner_circuit_goals_are_clear_of_walls_and_long_enough():
@@ -62,3 +62,28 @@ def test_inner_circuit_goals_are_clear_of_walls_and_long_enough():
     for c in goals[:-1]:
         assert 1.0 <= c.x <= 7.0 and 1.0 <= c.y <= 5.0
     assert path_length([(1.5, 1.5)] + [(c.x, c.y) for c in goals]) >= 12.0
+
+
+def test_wall_hops_keep_direction_around_the_room():
+    g = walled_room()
+    pose = Pose(1.0, 0.8, math.pi)
+    prev = None
+    hops = []
+    for _ in range(12):
+        hop = next_wall_hop(g, pose, prev_travel=prev)
+        assert hop is not None
+        travel = (hop.x - pose.x, hop.y - pose.y)
+        if prev is not None:
+            assert travel[0] * prev[0] + travel[1] * prev[1] >= -0.1
+        hops.append((hop.x, hop.y))
+        prev = travel
+        pose = Pose(hop.x, hop.y, math.atan2(travel[1], travel[0]))
+    xs = [h[0] for h in hops]
+    ys = [h[1] for h in hops]
+    assert max(xs) - min(xs) > 4.0 and max(ys) - min(ys) > 3.0
+
+
+def test_circuit_closed_requires_excursion():
+    s = Pose(1.0, 1.0, 0.0)
+    assert not circuit_closed(20.0, Pose(1.2, 1.0, 0.0), s, far_m=1.0)
+    assert circuit_closed(20.0, Pose(1.2, 1.0, 0.0), s, far_m=4.0)

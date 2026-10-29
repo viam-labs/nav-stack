@@ -127,8 +127,34 @@ class ExploreService(Generic):
             return {"error": error}
         self._run = run
         self._run_task = asyncio.create_task(run.run())
+        self._run_task.add_done_callback(self._on_run_done)
         LOGGER.info("explore run started for %.0f s", duration_s)
         return {"started": True, "duration_s": duration_s}
+
+    def _on_run_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            LOGGER.warning("explore run cancelled")
+            return
+        exc = task.exception()
+        if exc is not None:
+            LOGGER.error("explore run crashed: %r", exc)
+            return
+        LOGGER.info("explore run finished: %s", task.result())
+
+    async def close(self) -> None:
+        if self._run is not None and self._run_active():
+            self._run.request_stop()
+            self._run.request_stop()
+            try:
+                await asyncio.wait_for(self._run_task, timeout=60.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
+                self._run_task.cancel()
+        if self._base is not None:
+            try:
+                await self._base.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        await super().close()
 
 
 Registry.register_resource_creator(

@@ -205,8 +205,10 @@ class FakeNav:
         length = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
         return True, round(float(length), 6)
 
-    def _start(self, x: float, y: float, theta: float) -> None:
+    def _start(self, x: float, y: float, theta: float, *, planned: bool = True) -> None:
         self.legs += 1
+        self._planned = planned
+        self.last_theta = theta
         self._goal = (x, y, theta)
         self._last_t = self.clock.now()
         self._error = ""
@@ -222,7 +224,7 @@ class FakeNav:
         self._start(x, y, theta)
 
     async def go_to_point(self, x: float, y: float, theta: float, velocity_mps: float) -> None:
-        self._start(x, y, theta)
+        self._start(x, y, theta, planned=False)
 
     async def cancel(self) -> None:
         self.cancels += 1
@@ -266,14 +268,16 @@ class FakeNav:
             self.slam.reveal(self.world.get_pose())
         self._advance()
         p = self.world.get_pose()
+        planned = getattr(self, "_planned", True)
         return NavStatus(
             active=self._active,
-            state=self._state,
+            state=self._state if planned else "canceled",
             pose=None if self.lose_pose else Pose(p.x, p.y, p.theta),
             localized=not self.lose_pose,
             max_angular_rad_s=self.max_angular_rad_s,
             robot_radius_m=0.3,
             error=self._error,
+            simple_state="idle" if planned else self._state,
         )
 
 

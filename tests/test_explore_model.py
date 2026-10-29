@@ -75,3 +75,16 @@ def test_start_twice_is_an_error_and_stop_ends_run():
     assert a == {"started": True, "duration_s": 300.0}
     assert "already" in b["error"] and s == {"stopping": True}
     assert st["phase"] == "done"
+
+
+def test_close_ends_active_run_and_stops_base():
+    svc = make()
+
+    async def go():
+        await svc.do_command({"command": "start", "duration_s": 300})
+        await svc.close()
+        return await svc.do_command({"command": "status"})
+
+    st = asyncio.run(go())
+    assert st["phase"] == "done"
+    assert any(c["command"] == "base_stop" for c in svc._base.calls)

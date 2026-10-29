@@ -64,6 +64,7 @@ def next_wall_hop(
     hop_m: float = 1.5,
     standoff_m: float = 0.8,
     search_m: float = 3.0,
+    prev_travel: Optional[Tuple[float, float]] = None,
 ) -> Optional[Candidate]:
     wall = _nearest_wall(grid, pose, search_m)
     if wall is None:
@@ -74,25 +75,38 @@ def next_wall_hop(
         return None
     nx, ny = nx / norm, ny / norm
     base = (wall[0] + nx * standoff_m, wall[1] + ny * standoff_m)
-    travel = (-ny, nx)
-    for _ in range(2):
+    along = (-ny, nx)
+    if prev_travel is not None and along[0] * prev_travel[0] + along[1] * prev_travel[1] < 0:
+        along = (-along[0], -along[1])
+    attempts = [(along, base), ((along[1], -along[0]), (pose.x, pose.y)),
+                ((-along[1], along[0]), (pose.x, pose.y))]
+    for travel, origin in attempts:
         hop = hop_m
         while hop >= 0.5:
-            target = (base[0] + travel[0] * hop, base[1] + travel[1] * hop)
+            target = (origin[0] + travel[0] * hop, origin[1] + travel[1] * hop)
             if _segment_clear(grid, (pose.x, pose.y), target) and (
-                _wall_distance(grid, target[0], target[1], search_m) >= standoff_m - 1e-6
+                _wall_distance(grid, target[0], target[1], search_m) >= standoff_m - 0.05
             ):
                 return Candidate(target[0], target[1], "circuit")
             hop -= 0.25
-        travel = (travel[1], -travel[0])
-        base = (pose.x, pose.y)
     return None
 
 
 def circuit_closed(
-    path_m: float, pose: Pose, start: Pose, *, min_path_m: float = 12.0, close_m: float = 1.5
+    path_m: float,
+    pose: Pose,
+    start: Pose,
+    *,
+    min_path_m: float = 12.0,
+    close_m: float = 1.5,
+    far_m: float = 0.0,
+    min_far_m: float = 3.0,
 ) -> bool:
-    return path_m >= min_path_m and math.hypot(pose.x - start.x, pose.y - start.y) < close_m
+    return (
+        path_m >= min_path_m
+        and far_m >= min_far_m
+        and math.hypot(pose.x - start.x, pose.y - start.y) < close_m
+    )
 
 
 def inner_circuit_goals(

@@ -1,6 +1,7 @@
 """Occupancy grid analysis for exploration: frontiers, visibility, coverage."""
 from __future__ import annotations
 
+import base64
 import math
 from collections import deque
 from dataclasses import dataclass
@@ -31,6 +32,20 @@ class OccGrid:
 
     @classmethod
     def from_get_grid(cls, resp: Mapping) -> Optional["OccGrid"]:
+        data = resp.get("data") if isinstance(resp, Mapping) else None
+        if isinstance(data, (str, bytes, bytearray)):
+            try:
+                rows, cols = int(resp["rows"]), int(resp["cols"])
+                cell_size = float(resp.get("cellSize", resp.get("cell_size")))
+                x_min = float(resp.get("xMin", resp.get("x_min")))
+                y_min = float(resp.get("yMin", resp.get("y_min")))
+                raw = base64.b64decode(data) if isinstance(data, str) else bytes(data)
+            except (KeyError, TypeError, ValueError):
+                return None
+            if rows <= 0 or cols <= 0 or cell_size <= 0 or len(raw) != rows * cols:
+                return None
+            arr = np.clip(np.frombuffer(raw, dtype=np.int8), -1, 100).reshape(rows, cols)
+            return cls(cells=arr, resolution=cell_size, x_min=x_min, y_min=y_min)
         parsed = parse_get_grid(dict(resp))
         if parsed is None:
             return None
@@ -143,20 +158,24 @@ def frontier_goals(
     grid: OccGrid, robot_radius_m: float, min_cluster_cells: int = 6
 ) -> List[Candidate]:
     clear = clear_mask(grid, robot_radius_m)
-    clear_cells = np.argwhere(clear)
-    if clear_cells.size == 0:
+    if not clear.any():
         return []
-    search_cells = 1.0 / grid.resolution
+    search_cells = int(math.ceil(1.0 / grid.resolution))
     goals: List[Candidate] = []
     for cluster in _clusters(_frontier_mask(grid)):
         if len(cluster) < min_cluster_cells:
             continue
-        centroid = np.mean(np.asarray(cluster, dtype=float), axis=0)
-        d = np.hypot(clear_cells[:, 0] - centroid[0], clear_cells[:, 1] - centroid[1])
+        cr, cc = np.mean(np.asarray(cluster, dtype=float), axis=0)
+        r_lo, r_hi = max(0, int(cr) - search_cells), min(grid.rows, int(cr) + search_cells + 1)
+        c_lo, c_hi = max(0, int(cc) - search_cells), min(grid.cols, int(cc) + search_cells + 1)
+        local = np.argwhere(clear[r_lo:r_hi, c_lo:c_hi])
+        if local.size == 0:
+            continue
+        d = np.hypot(local[:, 0] + r_lo - cr, local[:, 1] + c_lo - cc)
         i = int(np.argmin(d))
         if d[i] > search_cells:
             continue
-        x, y = grid.to_world(int(clear_cells[i, 0]), int(clear_cells[i, 1]))
+        x, y = grid.to_world(int(local[i, 0] + r_lo), int(local[i, 1] + c_lo))
         goals.append(Candidate(x, y, "frontier"))
     return goals
 

@@ -23,6 +23,7 @@ class NavStatus:
     max_angular_rad_s: Optional[float]
     robot_radius_m: Optional[float]
     error: str
+    simple_state: str = ""
 
 
 @dataclass
@@ -77,6 +78,7 @@ class ViamNavClient:
     async def status(self) -> NavStatus:
         raw = await self._res.do_command({"command": "get_status"})
         limits = raw.get("limits") if isinstance(raw.get("limits"), Mapping) else {}
+        simple = raw.get("simple_nav") if isinstance(raw.get("simple_nav"), Mapping) else {}
         return NavStatus(
             active=bool(raw.get("active", False)),
             state=str(raw.get("state", "")),
@@ -85,6 +87,7 @@ class ViamNavClient:
             max_angular_rad_s=_optf(limits.get("max_angular_rad_s")),
             robot_radius_m=_optf(raw.get("robot_radius_m")),
             error=str(raw.get("error_msg") or raw.get("error") or ""),
+            simple_state=str(simple.get("state", "")),
         )
 
     async def plan_to_point(self, x: float, y: float) -> Tuple[bool, float]:

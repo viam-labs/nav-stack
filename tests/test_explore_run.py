@@ -150,3 +150,76 @@ def test_home_failure_stops_in_place():
     final = asyncio.run(go())
     assert final["phase"] == "done" and slam.saved == 1 and stops == [1]
     assert "home" in final["last_error"]
+
+
+def test_docommand_exception_mid_run_still_finishes():
+    w, clk, slam, nav, run, stops = setup(duration_s=900.0)
+    orig = nav.status
+
+    async def boom():
+        if run.status()["legs"] >= 2:
+            raise RuntimeError("grpc unavailable")
+        return await orig()
+
+    nav.status = boom
+    final = asyncio.run(run.run())
+    assert final["phase"] == "done" and "grpc unavailable" in final["last_error"]
+    assert slam.saved == 1 and stops == [1]
+
+
+def test_finish_saves_map_even_if_optimize_raises():
+    w, clk, slam, nav, run, _ = setup(duration_s=60.0)
+
+    async def bad_optimize():
+        raise RuntimeError("optimize exploded")
+
+    slam.optimize = bad_optimize
+    final = asyncio.run(run.run())
+    assert final["phase"] == "done" and slam.saved == 1 and "optimize" in final["last_error"]
+
+
+def test_stop_during_finishing_skips_home_retry():
+    w, clk, slam, nav, run, stops = setup(duration_s=120.0)
+    starts = {}
+
+    async def go():
+        task = asyncio.ensure_future(run.run())
+        while run.status()["phase"] != "finishing":
+            await asyncio.sleep(0)
+        starts["before"] = nav.legs
+        nav.block_all = True
+        run.request_stop()
+        return await task
+
+    final = asyncio.run(go())
+    assert final["phase"] == "done" and nav.legs - starts["before"] == 1 and stops == [1]
+
+
+def test_revisit_returns_to_fill_after_one_replay():
+    w, clk, slam, nav, run, _ = setup(duration_s=900.0)
+    final, seen = asyncio.run(run_watching(run))
+    order = [p for i, p in enumerate(seen) if i == 0 or p != seen[i - 1]]
+    assert "revisit" in order
+    assert order[order.index("revisit") + 1] == "fill"
+
+
+def test_fill_legs_face_their_approach_direction():
+    import math
+    from src.explore import run as run_mod
+
+    w, clk, slam, nav, run, _ = setup(duration_s=300.0)
+    seen = []
+    orig = run_mod.ExploreRun._leg
+
+    async def leg(self, goal, **kw):
+        if self._s.phase == "fill":
+            p = w.get_pose()
+            seen.append((kw.get("theta"), math.atan2(goal.y - p.y, goal.x - p.x)))
+        return await orig(self, goal, **kw)
+
+    run_mod.ExploreRun._leg = leg
+    try:
+        asyncio.run(run.run())
+    finally:
+        run_mod.ExploreRun._leg = orig
+    assert seen and all(t is not None and abs(t - a) < 1e-6 for t, a in seen)
