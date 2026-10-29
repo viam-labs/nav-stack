@@ -29,6 +29,7 @@ FAILURES_BEFORE_FINISH = 20
 LOST_POSE_POLL_S = 5.0
 LOST_POSE_MAX_S = 60.0
 IDLE_POLL_S = 5.0
+MIN_LEG_M = 1.0
 
 
 @dataclass
@@ -296,6 +297,9 @@ class ExploreRun:
                 return driven
             self._check_budget()
             if self._blacklist.blocked(goal.x, goal.y, self._clock()):
+                continue
+            here = await self._pose()
+            if math.hypot(goal.x - here.x, goal.y - here.y) <= MIN_LEG_M:
                 continue
             feasible, length = await self._nav.plan_to_point(goal.x, goal.y)
             if not feasible:
