@@ -251,6 +251,18 @@ def test_apply_match_never_jumps_during_nav(monkeypatch):
     assert engine.get_pose().x == pytest.approx(0.0)
 
 
+def test_apply_match_nav_track_refuses_a_tied_second_wall(monkeypatch):
+    """The 5 cm nudge needs the same unique peak as a sideways recovery."""
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_match_rival_score = 0.55  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    small = conv.Pose2D(0.10, 0.0, math.radians(2.0))
+    assert engine._apply_match(predicted, small, None) is False  # noqa: SLF001
+    pose = engine.get_pose()
+    assert pose.x == pytest.approx(0.0)
+    assert pose.theta == pytest.approx(0.0)
+
+
 def test_apply_match_nav_tracks_small_drift(monkeypatch):
     """Good prior + good match: a small nudge applies, blended and clamped."""
     engine = _nav_track_engine(monkeypatch)

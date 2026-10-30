@@ -1692,6 +1692,60 @@ def test_periodic_relocalize_parked_applies_button_style_local_match():
     assert cmd["pose"]["theta"] == pytest.approx(-0.28)
 
 
+def test_periodic_relocalize_stopped_applies_a_local_peak_past_one_meter():
+    """A stopped local peak that beats the published pose is applied.
+
+    It sits outside the 1 m parked window and its ray error misses the
+    strict good-match bar. It is not a coin-flip with a second wall.
+    """
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.50,
+            "ray_mae_m": 1.2,
+            "prior_score": -0.40,
+            "prior_ray_mae_m": 1.6,
+            "pose": {"x": 1.2, "y": 0.0, "theta": 0.0},
+            "ambiguous": False,
+            "second_best_score": 0.10,
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+
+    result = _run_relocalize_until_settled(slam)
+
+    assert result["status"] == "corrected"
+    assert result["corrected"] is True
+    assert not str(result["match_mode"]).startswith("full_map")
+    cmd = slam.do_command.await_args.args[0]
+    assert cmd["pose"]["x"] == pytest.approx(1.2)
+
+
+def test_periodic_relocalize_stopped_refuses_a_weak_local_peak():
+    """The lost-pose case: 2.8 m away and a 0.12 score is not a correction."""
+    slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.12,
+            "ray_mae_m": 1.57,
+            "prior_score": -0.44,
+            "prior_ray_mae_m": 1.9,
+            "pose": {"x": 2.76, "y": 0.0, "theta": math.radians(82.0)},
+            "ambiguous": False,
+            "second_best_score": -0.10,
+        }
+    )
+    slam.do_command = AsyncMock()
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "low_quality"
+    assert result["corrected"] is False
+    slam.do_command.assert_not_awaited()
+
+
 def test_periodic_relocalize_refuses_ambiguous_full_map():
     slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)
     slam._engine = MagicMock()

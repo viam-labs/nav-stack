@@ -1346,6 +1346,93 @@ class SlamService(SLAM):
                 return False
         return True
 
+    def _stopped_local_beats_published(
+        self,
+        cfg: SlamConfig,
+        match: Mapping[str, ValueTypes],
+        shift_m: float,
+        shift_deg: float,
+        match_command: Mapping[str, ValueTypes],
+        *,
+        driving: bool,
+        match_mode: str,
+    ) -> bool:
+        """True when a stopped wider-local peak should replace the published pose.
+
+        The 1 m parked window has its own apply path. This is the ordinary
+        local search around a pose (the 3 m watchdog window). A coin-flip
+        with the next wall stays refused. The peak has to clear the recovery
+        score floor and beat the pose that is published now.
+        """
+        if driving or not str(match_mode).startswith("local"):
+            return False
+        if bool(match.get("ambiguous")):
+            return False
+        try:
+            score = float(match.get("score", float("-inf")))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not math.isfinite(score)
+            or score < float(cfg.periodic_relocalize_recovery_min_score)
+        ):
+            return False
+        ray_mae: Optional[float] = None
+        ray_raw = match.get("ray_mae_m")
+        if ray_raw is not None:
+            try:
+                ray_mae = float(ray_raw)
+            except (TypeError, ValueError):
+                return False
+            if (
+                math.isfinite(ray_mae)
+                and ray_mae > float(cfg.periodic_relocalize_parked_max_ray_mae_m)
+            ):
+                return False
+        if math.isinf(shift_m) or math.isinf(shift_deg):
+            return False
+        if shift_m < float(cfg.periodic_relocalize_min_shift_m) and (
+            shift_deg < float(cfg.periodic_relocalize_min_shift_deg)
+        ):
+            return False
+        try:
+            radius = float(match_command.get("search_radius_m") or 0.0)
+        except (TypeError, ValueError):
+            radius = 0.0
+        if radius <= 0.0:
+            try:
+                radius = float(
+                    dict(cfg.periodic_relocalize_options).get("search_radius_m") or 3.0
+                )
+            except (TypeError, ValueError):
+                radius = 3.0
+        if shift_m > radius:
+            return False
+        prior_raw = match.get("prior_score")
+        if prior_raw is None:
+            return False
+        try:
+            prior = float(prior_raw)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(prior):
+            return False
+        prior_ray_raw = match.get("prior_ray_mae_m")
+        prior_ray: Optional[float] = None
+        if prior_ray_raw is not None:
+            try:
+                prior_ray = float(prior_ray_raw)
+            except (TypeError, ValueError):
+                prior_ray = None
+        return candidate_beats_previous(
+            previous_score=prior,
+            candidate_score=score,
+            shift_m=float(shift_m),
+            shift_deg=float(shift_deg),
+            previous_ray_mae_m=prior_ray,
+            candidate_ray_mae_m=ray_mae,
+        )
+
     def _periodic_relocalize_preflight(
         self, cfg: SlamConfig
     ) -> Optional[Mapping[str, ValueTypes]]:
@@ -1748,12 +1835,22 @@ class SlamService(SLAM):
             full_map_recovery
             and score >= cfg.periodic_relocalize_recovery_min_score
         )
+        stopped_local = self._stopped_local_beats_published(
+            cfg,
+            match,
+            shift_m,
+            shift_deg,
+            match_command,
+            driving=driving,
+            match_mode=match_mode,
+        )
         should_apply = apply_override is True or (
             apply_override is None
             and (
                 recovery_apply
                 or (good_match and drifted)
                 or parked_hit
+                or stopped_local
             )
         )
 

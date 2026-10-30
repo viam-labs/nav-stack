@@ -1639,8 +1639,15 @@ class BuiltinSlamEngine:
         return score >= self._NAV_LATERAL_MIN_SCORE
 
     def _nav_track_ok(self, predicted: conv.Pose2D, matched: conv.Pose2D) -> bool:
-        """Small drift: the published pose already explains the scan."""
+        """Small drift: the published pose already explains the scan.
+
+        The same second-wall test as a sideways recovery. A parallel wall
+        that scores almost as well is not a direction, so the 5 cm nudge
+        does not walk the pose into it.
+        """
         if not self._nav_track_fresh():
+            return False
+        if not self._lateral_peak_is_unique():
             return False
         along, cross, dyaw = scan_match.shift_axes(predicted, matched)
         if abs(along) > self._NAV_TRACK_MAX_M or abs(cross) > self._NAV_TRACK_MAX_M:
