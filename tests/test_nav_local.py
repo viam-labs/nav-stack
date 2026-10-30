@@ -134,6 +134,45 @@ def test_local_costmap_syncs_stale_scan_pose():
     assert view.cost_at_world(2.0, 0.0) == 0
 
 
+def test_local_costmap_places_a_slightly_late_scan_where_it_was_taken():
+    """6° and 4 cm of motion since capture still moves a 2 m wall 21 cm.
+
+    Small motions used to be painted as if seen from the current pose.
+    """
+    from src.nav_builtin.costmap import scan_world_points
+
+    lc = LocalCostmap(
+        LocalCostmapConfig(
+            width_m=6.0,
+            height_m=6.0,
+            resolution=0.05,
+            inflation_radius_m=0.10,
+            robot_radius_m=0.05,
+            use_global_static=False,
+        )
+    )
+    n = 360
+    ranges = np.full(n, np.inf)
+    ranges[n // 2] = 2.0  # angle 0 = robot +X
+    captured = conv.Pose2D(0.0, 0.0, math.radians(6.0))
+    scan = conv.LaserScan2D(
+        ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.05,
+        range_max=10.0,
+        capture_pose=captured,
+    )
+    current = conv.Pose2D(0.04, 0.0, 0.0)
+    wx, wy = 2.0 * math.cos(captured.theta), 2.0 * math.sin(captured.theta)
+    view = lc.update(current, scan)
+    assert view.cost_at_world(wx, wy) > 0
+    assert view.cost_at_world(2.04, 0.0) == 0
+    pts = scan_world_points(current, scan)
+    assert pts[0, 0] == pytest.approx(wx, abs=1e-6)
+    assert pts[0, 1] == pytest.approx(wy, abs=1e-6)
+
+
 def test_local_costmap_persists_hits_after_scan_loses_them():
     """Low obstacles drop out of depth/lidar FOV on rotate — keep them briefly."""
     lc = LocalCostmap(

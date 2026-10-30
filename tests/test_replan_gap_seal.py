@@ -234,6 +234,11 @@ def test_corridor_escape_yaw_follows_the_path_not_the_goal():
     )
     toward_path = sup._corridor_escape_yaw(pose, scan, goal, path)
     assert toward_path is not None and toward_path < math.radians(-25.0)
+    # Once a side is picked it holds, even when the path now prefers the other.
+    held = sup._corridor_escape_yaw(
+        pose, scan, goal, path, commit_heading=math.radians(46.0)
+    )
+    assert held is not None and held > math.radians(25.0)
 
 
 def test_sub_deadband_reverse_is_lifted_to_backup_speed():

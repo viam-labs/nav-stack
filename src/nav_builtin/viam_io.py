@@ -110,6 +110,7 @@ class ViamWorldIO:
         scan_bins: int = 360,
         logger=None,
         pose_provider: Optional[Callable[[], Optional[conv.Pose2D]]] = None,
+        pose_at_provider: Optional[Callable[[float], Optional[conv.Pose2D]]] = None,
         map_provider: Optional[Callable[[], Optional[dict]]] = None,
         scan_provider: Optional[Callable[[float], Optional[conv.LaserScan2D]]] = None,
         localization_hold_provider: Optional[Callable[[], Optional[dict]]] = None,
@@ -136,6 +137,12 @@ class ViamWorldIO:
         # worker's run_coroutine_threadsafe waits and can return the SLAM API's
         # origin placeholder (0,0,0) or stall — which freezes bearing_error.
         self._pose_provider = pose_provider
+        # Map pose at a past monotonic time. Scans are stamped with the pose
+        # they were taken from; stamping the pose at read time drew every
+        # obstacle shifted by speed × latency (rotated during a turn).
+        self._pose_at_provider = pose_at_provider
+        # lidar name -> monotonic capture estimate of the last frame read.
+        self._read_captured_at: dict[str, float] = {}
         self._map_provider = map_provider
         self._scan_provider = scan_provider
         self._localization_hold_provider = localization_hold_provider
@@ -537,6 +544,10 @@ class ViamWorldIO:
             if lidar.obstacles_only:
                 depth_scans.append(scan)
             else:
+                if pose is not None:
+                    scan = self._warp_lidar_scan_to_pose(
+                        scan, self._read_captured_at.get(lidar.name), pose
+                    )
                 primary.append(scan)
         if not primary and not depth_scans:
             return self._reusable_scan_cache(
@@ -635,6 +646,17 @@ class ViamWorldIO:
                 out.append((cached[1], cached[0], lidar))
         return out
 
+    def _map_pose_at(self, t: Optional[float]) -> Optional[conv.Pose2D]:
+        """Map pose when a frame was captured; the current pose if unknown."""
+        if t is not None and self._pose_at_provider is not None:
+            try:
+                pose = self._pose_at_provider(t)
+            except Exception:  # noqa: BLE001
+                pose = None
+            if pose is not None:
+                return pose
+        return self._map_pose_now()
+
     def _map_pose_now(self) -> Optional[conv.Pose2D]:
         if self._pose_provider is not None:
             try:
@@ -699,6 +721,57 @@ class ViamWorldIO:
             range_max=float(scan.range_max),
         )
         return self._stamp_capture_pose(rebuilt, current)
+
+    def _warp_lidar_scan_to_pose(
+        self,
+        scan: conv.LaserScan2D,
+        captured_at: Optional[float],
+        current: conv.Pose2D,
+    ) -> conv.LaserScan2D:
+        """Re-express a lidar frame in the base frame at ``current``.
+
+        The frame was taken a read latency ago. Every consumer pairs the
+        merged scan with the current pose, so it is moved by the odometry
+        motion since capture. Unknown capture pose or an implausible shift
+        leaves the frame as read.
+        """
+        if captured_at is None or self._pose_at_provider is None:
+            return scan
+        try:
+            cap = self._pose_at_provider(captured_at)
+        except Exception:  # noqa: BLE001
+            cap = None
+        if cap is None:
+            return scan
+        dtheta = abs(conv.normalize_angle(current.theta - cap.theta))
+        dist = math.hypot(current.x - cap.x, current.y - cap.y)
+        if dist < 1e-3 and dtheta < 1e-3:
+            return scan
+        if dist > self._obstacles_max_shift_m or dtheta > self._obstacles_max_shift_rad:
+            return scan
+        pts = scan.to_points()
+        if pts.size == 0:
+            return scan
+        pts3 = np.column_stack([pts, np.zeros(len(pts))])
+        moved = conv.transform_points_between_poses(pts3, cap, current)[:, :2]
+        n_bins = int(len(scan.ranges)) if len(scan.ranges) else self._scan_bins
+        warped = conv.points_to_scan(
+            moved,
+            angle_min=-math.pi,
+            angle_max=math.pi,
+            num_bins=max(n_bins, 8),
+            range_min=float(scan.range_min),
+            range_max=float(scan.range_max),
+        )
+        if scan.cloud_xy is not None and len(scan.cloud_xy):
+            cloud3 = np.column_stack(
+                [scan.cloud_xy, np.zeros(len(scan.cloud_xy))]
+            )
+            warped.cloud_xy = np.ascontiguousarray(
+                conv.transform_points_between_poses(cloud3, cap, current)[:, :2],
+                dtype=float,
+            )
+        return warped
 
     def _remember_above_cart(self, raw_pts: np.ndarray, lidar: LidarConfig) -> None:
         if not lidar.obstacles_only or not self._above_cart_enabled:
@@ -789,7 +862,8 @@ class ViamWorldIO:
                 return None
             self._shm_lidar.note_fallback(lidar.shm_name)
             return None
-        raw, _age = got
+        raw, age = got
+        self._read_captured_at[lidar.name] = time.monotonic() - max(0.0, float(age))
         return self._pcd_to_scan(raw, lidar)
 
     def _kick_obstacles_only_refresh(self, lidar: LidarConfig) -> None:
@@ -826,12 +900,14 @@ class ViamWorldIO:
         gen = (prev[0] if prev is not None else 0) + 1
         self._obstacles_job_gen[name] = (gen, now)
 
-        def _store(scan: conv.LaserScan2D, job_gen: int) -> None:
+        def _store(scan: conv.LaserScan2D, job_gen: int, captured_at: float) -> None:
             current = self._obstacles_job_gen.get(name)
             if current is None or current[0] != job_gen:
                 return
+            # Depth reads take 0.1–0.4 s. The pose when the read returned is
+            # that far past where the camera actually was.
             self._per_lidar_scan[name] = (
-                self._stamp_capture_pose(scan, self._map_pose_now()),
+                self._stamp_capture_pose(scan, self._map_pose_at(captured_at)),
                 time.monotonic(),
             )
 
@@ -841,10 +917,15 @@ class ViamWorldIO:
                     lidar, max_age_s=max(2.0, self._obstacles_only_period_s * 2)
                 )
                 if shm_scan is not None:
-                    _store(shm_scan, job_gen)
+                    _store(
+                        shm_scan,
+                        job_gen,
+                        self._read_captured_at.get(name, time.monotonic()),
+                    )
                     return
                 if cam is None:
                     return
+                requested_at = time.monotonic()
                 data = await cam.get_point_cloud(timeout=2.0)
                 raw = data[0] if isinstance(data, tuple) else data
                 loop = asyncio.get_running_loop()
@@ -852,7 +933,7 @@ class ViamWorldIO:
                     None, lambda: self._pcd_to_scan(raw, lidar)
                 )
                 if scan is not None:
-                    _store(scan, job_gen)
+                    _store(scan, job_gen, requested_at)
             except Exception as exc:  # noqa: BLE001
                 self._log(f"obstacles_only lidar {name} refresh failed: {exc}")
             finally:
@@ -901,6 +982,7 @@ class ViamWorldIO:
             fut, started = slot
             if fut.done():
                 self._lidar_futs.pop(name, None)
+                self._read_captured_at[name] = started
                 try:
                     return fut.result()
                 except Exception:  # noqa: BLE001
@@ -929,6 +1011,7 @@ class ViamWorldIO:
             self._lidar_futs.pop(name, None)
             return None
         self._lidar_futs.pop(name, None)
+        self._read_captured_at[name] = now
         return result
 
     async def _read_lidar_scan_grpc(

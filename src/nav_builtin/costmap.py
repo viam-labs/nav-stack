@@ -25,24 +25,22 @@ def scan_world_points(
     *,
     max_beams: int = 360,
 ) -> np.ndarray:
-    """Map-frame XY hits from a lidar scan (finite ranges only)."""
+    """Map-frame XY hits from a lidar scan (finite ranges only).
+
+    Points are placed from the pose the scan was captured at when it carries
+    one; ``pose`` is only the fallback.
+    """
     pts = scan.to_points()
     if pts.size == 0:
         return np.zeros((0, 2), dtype=np.float64)
     if max_beams > 0 and pts.shape[0] > max_beams:
         pick = np.linspace(0, pts.shape[0] - 1, max_beams, dtype=np.int32)
         pts = pts[pick]
-    scan_pose = scan.capture_pose
-    if scan_pose is not None:
-        dtheta = abs(conv.normalize_angle(pose.theta - scan_pose.theta))
-        dist = math.hypot(pose.x - scan_pose.x, pose.y - scan_pose.y)
-        if dtheta > math.radians(8.0) or dist > 0.08:
-            pts3 = np.column_stack([pts, np.zeros(len(pts))])
-            pts = conv.transform_points_between_poses(pts3, scan_pose, pose)[:, :2]
-    cth = math.cos(pose.theta)
-    sth = math.sin(pose.theta)
-    wx = pose.x + cth * pts[:, 0] - sth * pts[:, 1]
-    wy = pose.y + sth * pts[:, 0] + cth * pts[:, 1]
+    frame = scan.capture_pose if scan.capture_pose is not None else pose
+    cth = math.cos(frame.theta)
+    sth = math.sin(frame.theta)
+    wx = frame.x + cth * pts[:, 0] - sth * pts[:, 1]
+    wy = frame.y + sth * pts[:, 0] + cth * pts[:, 1]
     finite = np.isfinite(wx) & np.isfinite(wy)
     return np.column_stack([wx[finite], wy[finite]])
 
@@ -307,20 +305,25 @@ def _disk_offsets(radius_cells: int) -> Tuple[np.ndarray, np.ndarray]:
     return np.asarray(ys, dtype=np.int32), np.asarray(xs, dtype=np.int32)
 
 
-def _limited_cell_distance(seed: np.ndarray, max_r: int) -> np.ndarray:
-    """Cell distance to the nearest True seed, capped at ``max_r``.
+_FAR_CELLS = 1_000_000.0
 
-    Same rings as a Euclidean dilation (``ceil(hypot)``): a cell is distance
-    ``r`` when ``(r-1)^2 < dx^2+dy^2 <= r^2``. Farther cells stay at
-    1_000_000. The passes are numpy ufuncs, so a full-map rebuild does not
-    hold the GIL the way a Python ring loop does — that stall was hitching
-    the nav loop every time mapping bumped the costmap.
+
+def _limited_cell_distance(seed: np.ndarray, max_r: int) -> np.ndarray:
+    """Euclidean centre-to-centre distance (cells) to the nearest True seed.
+
+    Cells farther than ``max_r`` stay at ``_FAR_CELLS``. The distance is not
+    rounded up: a ``ceil`` here, compared against a radius that was also
+    rounded up to whole cells, kept up to one extra cell of keep-out on each
+    wall and closed gaps 10 cm narrower than the configured footprint.
+    The passes are numpy ufuncs, so a full-map rebuild does not hold the GIL
+    the way a Python ring loop does — that stall was hitching the nav loop
+    every time mapping bumped the costmap.
     """
     seed = np.asarray(seed, dtype=bool)
     h, w = seed.shape
-    dist = np.full((h, w), 1_000_000, dtype=np.int32)
+    dist = np.full((h, w), _FAR_CELLS, dtype=np.float64)
     if max_r <= 0 or not seed.any():
-        dist[seed] = 0
+        dist[seed] = 0.0
         return dist
     cap = int(max_r) * int(max_r)
     inf = cap + 1
@@ -339,45 +342,41 @@ def _limited_cell_distance(seed: np.ndarray, max_r: int) -> np.ndarray:
         np.minimum(best[:, :-dx], vert[:, dx:] + d2, out=best[:, :-dx])
     near = best <= cap
     if near.any():
-        # Exact for integer squares up to the radii we inflate; the bias
-        # keeps float sqrt from bumping a perfect square up one cell.
-        dist[near] = np.ceil(
-            np.sqrt(best[near].astype(np.float64)) - 1e-9
-        ).astype(np.int32)
+        dist[near] = np.sqrt(best[near].astype(np.float64))
     return dist
 
 
 def _ring_cell_distance(seed: np.ndarray, max_r: int) -> np.ndarray:
-    """Same rings as ``_limited_cell_distance``, walked in Python.
+    """Same distances as ``_limited_cell_distance``, walked in Python.
 
     This is the localization path. Mapping uses the numpy field so a full-map
     rebuild does not freeze the control loop.
     """
     seed = np.asarray(seed, dtype=bool)
     h, w = seed.shape
-    dist = np.full((h, w), 1_000_000, dtype=np.int32)
+    dist = np.full((h, w), _FAR_CELLS, dtype=np.float64)
     seed_y, seed_x = np.nonzero(seed)
     if seed_y.size:
-        dist[seed_y, seed_x] = 0
+        dist[seed_y, seed_x] = 0.0
     if max_r <= 0 or seed_y.size == 0:
         return dist
-    for r in range(1, int(max_r) + 1):
-        ring = []
-        r2_lo = (r - 1) * (r - 1)
-        r2_hi = r * r
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                d2 = dy * dy + dx * dx
-                if r2_lo < d2 <= r2_hi:
-                    ring.append((dy, dx))
-        for dy, dx in ring:
-            yy = seed_y + dy
-            xx = seed_x + dx
-            valid = (yy >= 0) & (yy < h) & (xx >= 0) & (xx < w)
-            yy, xx = yy[valid], xx[valid]
-            closer = dist[yy, xx] > r
-            yy, xx = yy[closer], xx[closer]
-            dist[yy, xx] = r
+    r = int(max_r)
+    cap = r * r
+    offsets = [
+        (dy * dy + dx * dx, dy, dx)
+        for dy in range(-r, r + 1)
+        for dx in range(-r, r + 1)
+        if 0 < dy * dy + dx * dx <= cap
+    ]
+    offsets.sort()
+    for d2, dy, dx in offsets:
+        d = math.sqrt(d2)
+        yy = seed_y + dy
+        xx = seed_x + dx
+        valid = (yy >= 0) & (yy < h) & (xx >= 0) & (xx < w)
+        yy, xx = yy[valid], xx[valid]
+        closer = dist[yy, xx] > d
+        dist[yy[closer], xx[closer]] = d
     return dist
 
 
@@ -463,18 +462,20 @@ def build_costmap(
     else:
         dist = _ring_cell_distance(seed, max_r)
 
-    # Apply inflation costs on free cells (vectorized).
+    # Apply inflation costs on free cells (vectorized). Distances are compared
+    # in metres against the configured radii, not in rounded-up cells.
+    dist_all_m = dist * res
+    eps = 1e-9
     free = costs == FREE
-    within_soft = free & (dist <= inflate_cells)
+    within_soft = free & (dist_all_m <= inflate_m + eps)
     if within_soft.any():
-        hard = within_soft & (dist <= inscribed_cells)
+        hard = within_soft & (dist_all_m <= inscribed_m + eps)
         if hard.any():
             # Workspace band = clearance past the wall (hard − body). The
             # remaining C-space (body inflation) stays blocked but is not drawn.
             clearance_m = max(0.0, inscribed_m - body_m)
-            clearance_cells = max(0, int(math.ceil(clearance_m / res)))
-            if clearance_m > 1e-9 and clearance_cells < inscribed_cells:
-                workspace = hard & (dist <= clearance_cells)
+            if clearance_m > 1e-9 and clearance_m < inscribed_m - eps:
+                workspace = hard & (dist_all_m <= clearance_m + eps)
                 costs[workspace] = HARD_BUFFER
                 cspace = hard & ~workspace
                 if cspace.any():
@@ -483,7 +484,7 @@ def build_costmap(
                 costs[hard] = INSCRIBED
         soft = within_soft & ~hard
         if soft.any():
-            dist_m = dist[soft].astype(np.float64) * res
+            dist_m = dist_all_m[soft]
             # Nav2-style: decay with clearance past the hard radius so the
             # outer soft edge stays meaningful and paths prefer open space.
             clearance_m = np.maximum(0.0, dist_m - inscribed_m)
@@ -493,10 +494,14 @@ def build_costmap(
             costs[soft] = np.clip(soft_costs, 1, HARD_BUFFER - 1).astype(np.uint8)
 
     # Planner-only preference past inflation (not shown in costmap viz).
-    if prefer_m > 1e-6 and prefer_cells > inflate_cells:
-        prefer = free & (dist > inflate_cells) & (dist <= prefer_cells)
+    if prefer_m > 1e-6:
+        prefer = (
+            free
+            & (dist_all_m > inflate_m + eps)
+            & (dist_all_m <= prefer_outer_m + eps)
+        )
         if prefer.any():
-            dist_m = dist[prefer].astype(np.float64) * res
+            dist_m = dist_all_m[prefer]
             # 0 at inflation edge → 1 at preference outer.
             frac = np.clip((dist_m - inflate_m) / prefer_m, 0.0, 1.0)
             pref_costs = np.rint(

@@ -437,12 +437,14 @@ def pursuit_command(
     cfg: FollowerConfig,
     rotate_active: bool = False,
     prev_cmd: Optional[DriveCommand] = None,
+    speed_mps: Optional[float] = None,
 ) -> Tuple[DriveCommand, bool]:
     """Regulated pure pursuit toward the lookahead point ``target``.
 
     Returns ``(cmd, rotating)`` where ``rotating`` is the rotate-to-heading
     state to feed back next tick (hysteresis). ``prev_cmd`` (last issued
-    command) enables curvature smoothing across ticks.
+    command) enables curvature smoothing across ticks. ``speed_mps`` is the
+    measured forward speed; unknown means cruise.
     """
     motion = cfg.motion
     max_linear = motion.max_linear_mps
@@ -482,23 +484,37 @@ def pursuit_command(
     # Skid-steer cannot drive arcs tighter than min_turn_radius while
     # translating (inner wheel → 0 → base rejects → spin). Widen the arc.
     kappa_max = 1.0 / cfg.effective_min_turn_radius_m()
+    # Past either radius ω stops growing with κ: the drivable clamp, or the
+    # speed regulation that holds ω at v_cruise / regulated_min_radius.
+    kappa_lock = kappa_max
+    if float(cfg.regulated_min_radius_m) > 1e-6:
+        kappa_lock = min(kappa_lock, 1.0 / float(cfg.regulated_min_radius_m))
+    saturated = abs(kappa) > kappa_lock
     if abs(kappa) > kappa_max:
         kappa = math.copysign(kappa_max, kappa)
     # Curvature regulation slows v by r/r_min and therefore locks ω at
     # v_cruise/r_min (~0.7 rad/s here) for every tighter arc. Nav2 does the
     # same, and only stops to spin once the carrot bearing exceeds
     # rotate_to_heading_min_angle. Holding that ω on a shallow hallway bend
-    # yaws through the path and trips our rotate-to-heading. While
-    # translating, close the current bearing over about half a lookahead
-    # time instead of outrunning it. Rotate-in-place still handles a carrot
-    # past ``rotate_in_place_rad``.
+    # yaws through the path and trips our rotate-to-heading. A saturated arc
+    # instead closes the current bearing over about half a lookahead time.
+    # An unsaturated arc is the pursuit geometry itself and stays as is:
+    # capping it too halved the steering into every corner.
+    # Rotate-in-place still handles a carrot past ``rotate_in_place_rad``.
     horizon_s = max(0.4, float(cfg.lookahead_time_s) * 0.5)
     w_track = abs(alpha) / horizon_s
-    if max_linear > 1e-6:
-        kappa_cap = w_track / max_linear
+    # The cap is a yaw rate, so it becomes a curvature at the speed actually
+    # driven. Obstacle slowing scales v after this and keeps the arc; a cap
+    # taken at cruise turned that slow corner ~3× wider than intended.
+    v_ref = max_linear
+    if speed_mps is not None and math.isfinite(float(speed_mps)):
+        floor = min(max_linear, max(float(cfg.regulated_min_speed_mps), 0.05))
+        v_ref = max(floor, min(max_linear, abs(float(speed_mps))))
+    if v_ref > 1e-6:
+        kappa_cap = w_track / v_ref
         # Also drop a smoothed turn that has already passed the carrot.
         # Keeping that sign is how one saturated arc becomes the spin back.
-        if abs(kappa) > kappa_cap or alpha * kappa < 0.0:
+        if (saturated and abs(kappa) > kappa_cap) or alpha * kappa < 0.0:
             sign = math.copysign(1.0, alpha if abs(alpha) > 1e-6 else kappa)
             kappa = sign * min(abs(kappa), kappa_cap)
 
@@ -731,6 +747,7 @@ def compute_path_command(
                 cfg=cfg,
                 rotate_active=rotate_active,
                 prev_cmd=prev_cmd,
+                speed_mps=speed_mps,
             )
             cmd = apply_velocity_floor(cmd, cfg.motion)
 
@@ -745,7 +762,12 @@ def compute_path_command(
         # it finds no sample and returns zero. The footprint guard knows the
         # actual rectangle — hand it pursuit and let it pick the free arc.
         cmd, rotating = pursuit_command(
-            current, target, cfg=cfg, rotate_active=rotate_active, prev_cmd=prev_cmd
+            current,
+            target,
+            cfg=cfg,
+            rotate_active=rotate_active,
+            prev_cmd=prev_cmd,
+            speed_mps=speed_mps,
         )
         cmd = apply_velocity_floor(cmd, cfg.motion)
         local_active = False

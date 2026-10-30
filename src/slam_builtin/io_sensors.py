@@ -91,6 +91,11 @@ class BuiltinSensors:
         self._scan_max_age_s = float(scan_max_age_s)
         self._scan_cache: Optional[conv.LaserScan2D] = None
         self._scan_cache_at = 0.0  # first time this exact scan content was seen
+        # Best estimate of when the lidar took it: shm writer stamp, or when
+        # the gRPC read that returned it was sent. Later than the real capture
+        # by the driver's own buffering, never earlier.
+        self._scan_captured_at = float("nan")
+        self._read_captured_at: dict[str, float] = {}
         self._scan_cache_key: Optional[int] = None
         self._scan_fetch_at = 0.0
         # True after a fetch returned nothing. The next successful read is a
@@ -197,12 +202,15 @@ class BuiltinSensors:
             return self._stale_or_none(max_age_s, now, fresh)
         self._scan_fetch_at = now
         scans = []
+        captured = []
         for lidar in lidars:
             if lidar.obstacles_only:
                 continue
             scan = self._read_lidar_scan_sync(lidar, max_age_s=max_age_s)
             if scan is not None:
                 scans.append(scan)
+                captured.append(self._read_captured_at.get(lidar.name, now))
+        captured_at = sum(captured) / len(captured) if captured else now
         if not scans:
             # An in-flight read is not a dropout. Only a finished miss (camera
             # down, empty cloud) should let the next identical frame count
@@ -230,12 +238,14 @@ class BuiltinSensors:
                 self._scan_cache = merged
                 self._scan_cache_key = key
                 self._scan_cache_at = now
+                self._scan_captured_at = min(captured_at, now)
                 self._scan_had_gap = False
                 return merged
             return None
         self._scan_cache = merged
         self._scan_cache_key = key
         self._scan_cache_at = now
+        self._scan_captured_at = min(captured_at, now)
         self._scan_had_gap = False
         return merged
 
@@ -255,6 +265,12 @@ class BuiltinSensors:
         if self._scan_cache is None:
             return float("nan")
         return max(0.0, time.monotonic() - self._scan_cache_at)
+
+    def scan_captured_at(self) -> float:
+        """Monotonic time the current cached scan was captured (NaN if none)."""
+        if self._scan_cache is None:
+            return float("nan")
+        return self._scan_captured_at
 
     def _pcd_to_scan(self, raw: bytes, lidar: LidarConfig) -> conv.LaserScan2D:
         pts = conv.parse_pcd(raw)
@@ -313,7 +329,8 @@ class BuiltinSensors:
                 return None
             self._shm.note_fallback(lidar.shm_name)
             return None
-        raw, _age = got
+        raw, age = got
+        self._read_captured_at[lidar.name] = time.monotonic() - max(0.0, float(age))
         return self._pcd_to_scan(raw, lidar)
 
     def _read_lidar_scan_sync(
@@ -339,6 +356,7 @@ class BuiltinSensors:
             fut, started = slot
             if fut.done():
                 self._lidar_futs.pop(name, None)
+                self._read_captured_at[name] = started
                 try:
                     return fut.result()
                 except Exception:  # noqa: BLE001
@@ -369,6 +387,7 @@ class BuiltinSensors:
             self._lidar_futs.pop(name, None)
             return None
         self._lidar_futs.pop(name, None)
+        self._read_captured_at[name] = now
         return result
 
     async def _read_lidar_scan_grpc(

@@ -79,6 +79,20 @@ def _sync_slam_pose_provider(slam_service_name: str):
     return _get
 
 
+def _sync_slam_pose_at_provider(slam_service_name: str):
+    """Map pose at a past monotonic time from the in-process SLAM engine."""
+
+    def _get(t: float):
+        rt = get_slam(slam_service_name)
+        manager = getattr(rt, "manager", None) if rt is not None else None
+        getter = getattr(manager, "get_pose_in_map_at", None)
+        if callable(getter):
+            return getter(t)
+        return None
+
+    return _get
+
+
 def _localization_hold_provider(slam_service_name: str):
     """Stop nav while SLAM awaits confirm on a large pose jump, or holds on
     uncertain large shifts during navigation (``nav_hold``)."""
@@ -223,6 +237,7 @@ class NavigationService(NavServiceBase):
             obstacles_only_period_s=cfg.obstacles_only_period_s(),
             drive_timeout_s=float(getattr(cfg.builtin, "drive_timeout_s", 5.0)),
             pose_provider=_sync_slam_pose_provider(cfg.slam_service),
+            pose_at_provider=_sync_slam_pose_at_provider(cfg.slam_service),
             map_provider=_in_process_map_provider(cfg.slam_service),
             localization_hold_provider=_localization_hold_provider(cfg.slam_service),
             localization_check_provider=_localization_check_provider(cfg.slam_service),

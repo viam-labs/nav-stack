@@ -93,6 +93,10 @@ class BuiltinSlamHost:
     def get_pose_in_map(self) -> Optional[conv.Pose2D]:
         return self._engine.get_pose()
 
+    def get_pose_in_map_at(self, t: float) -> Optional[conv.Pose2D]:
+        """Map pose at monotonic time ``t`` (``None`` outside recent history)."""
+        return self._engine.get_pose_at(t)
+
     def pose_restored_from_disk(self) -> bool:
         return self._engine.pose_restored_from_disk()
 

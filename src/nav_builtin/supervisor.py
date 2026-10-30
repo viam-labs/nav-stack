@@ -1523,12 +1523,16 @@ class NavSupervisor:
         scan: conv.LaserScan2D,
         goal: Pose2D,
         path: Optional[Path2D] = None,
+        *,
+        commit_heading: Optional[float] = None,
     ) -> Optional[float]:
         """Yaw (rad, +CCW) onto a scan corridor the rectangle can enter.
 
         Prefers the path lookahead. The straight-line goal can point through
         the obstacle while the route is open the other way, and a few degrees
-        toward that goal used to beat a wide opening on the path.
+        toward that goal used to beat a wide opening on the path. Once a
+        corridor is picked, ``commit_heading`` (its map heading) is preferred
+        while it stays open.
 
         None when no heading within 90° of the nose has ``_CORRIDOR_MIN_TRAVEL_M``
         of body-width clearance, or the rectangle cannot spin onto it. Uses
@@ -1541,7 +1545,10 @@ class NavSupervisor:
         body = scan.to_points()
         if body.size == 0:
             return None
-        bearing = self._corridor_prefer_rad(pose, goal, path)
+        if commit_heading is not None:
+            bearing = conv.normalize_angle(commit_heading - pose.theta)
+        else:
+            bearing = self._corridor_prefer_rad(pose, goal, path)
         yaw = open_corridor_yaw(
             body,
             half_length_m=guard._hl,
@@ -2181,6 +2188,10 @@ class NavSupervisor:
             nose_unstick_start: Optional[Pose2D] = None
             nose_unstick_mode = ""
             nose_unstick_yaw_sign = 1.0
+            # Map heading of the scan corridor picked for this blocked
+            # episode. Two openings nearly tied either side of a centred
+            # obstacle swapped winners every tick and the spin dithered.
+            corridor_heading: Optional[float] = None
             local_blocked_since: Optional[float] = None
             last_local_replan_at = 0.0
             failed_replan_while_blocked = 0
@@ -2582,21 +2593,34 @@ class NavSupervisor:
                         and nose_clear
                     ):
                         action = "keep_dwa"
+                    # A turn already under way keeps going when the nose reads
+                    # clear partway round. Handing that tick back to pursuit
+                    # turned the robot straight back into the obstacle.
                     if (
-                        not nose_clear
+                        (not nose_clear or corridor_heading is not None)
                         and not loc_hold_motion
                         and scan is not None
                         and self._guard is not None
                         and blocked_for >= wait_before_replan_s
                     ):
                         corridor_yaw = self._corridor_escape_yaw(
-                            pose, scan, goal, path
+                            pose, scan, goal, path, commit_heading=corridor_heading
+                        )
+                        corridor_heading = (
+                            conv.normalize_angle(pose.theta + corridor_yaw)
+                            if corridor_yaw is not None
+                            else None
                         )
                     # An open scan heading is a way through. A global replan
-                    # here only found ~48 m loops and held the wheels at zero
-                    # until the goal timed out. Yaw or drive the corridor first.
-                    if corridor_yaw is not None and action == "replan":
-                        action = "wait"
+                    # from the blocked heading only found ~48 m loops and held
+                    # the wheels at zero until the goal timed out. Turn onto
+                    # the corridor first, then plan from there; between
+                    # attempts the corridor is driven.
+                    if corridor_yaw is not None:
+                        if abs(corridor_yaw) < _CORRIDOR_ALIGN_RAD and cooldown_ready:
+                            action = "replan"
+                        elif action == "replan":
+                            action = "wait"
                     if action == "wait":
                         waiting_for_clear = True
                     elif action == "replan":
@@ -2656,6 +2680,7 @@ class NavSupervisor:
                             nose_unstick_start = None
                             nose_unstick_mode = ""
                             corridor_yaw = None
+                            corridor_heading = None
                         else:
                             failed_replan_while_blocked += 1
                             blocked_fail_count += 1
@@ -2675,6 +2700,7 @@ class NavSupervisor:
                     failed_replan_while_blocked = 0
                     nose_unstick_start = None
                     nose_unstick_mode = ""
+                    corridor_heading = None
                     self._stuck_pose_refine_used = False
 
                 # DWA only when the route is actually blocked (or after a failed
@@ -3663,6 +3689,19 @@ class NavSupervisor:
                     "cmd_vx_mps": cmd.vx,
                     "cmd_vtheta_rad_s": cmd.vtheta,
                 }
+                if holding_for_localize and progress.get("obstacle") != "no_scan":
+                    # Avoidance ran this tick, but the base is held for SLAM.
+                    # Report the hold, not avoidance's "clear".
+                    progress["obstacle"] = "loc_hold"
+                    progress["localization_hold"] = {
+                        "status": loc_hold.get("status"),
+                        "confirm_count": loc_hold.get("confirm_count"),
+                        "confirm_needed": loc_hold.get("confirm_needed"),
+                        "shift_m": loc_hold.get("shift_m")
+                        or loc_hold.get("jump_shift_m"),
+                        "shift_deg": loc_hold.get("shift_deg")
+                        or loc_hold.get("jump_shift_deg"),
+                    }
 
                 self._set_status(
                     pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
@@ -3686,6 +3725,7 @@ class NavSupervisor:
                             "corridor_yaw_rad",
                             "distance_remaining_m",
                             "waypoint_index",
+                            "localization_hold",
                         )
                         if k in progress
                     },

@@ -761,6 +761,50 @@ def test_get_scan_can_exclude_obstacles_only_lidars():
     assert float(np.nanmin(full_phantom.ranges)) == pytest.approx(2.0)
 
 
+def test_get_scan_moves_a_late_lidar_frame_to_the_current_pose():
+    """A wall 2 m ahead, seen 0.2 s ago while driving 0.5 m/s, is 1.9 m now."""
+    from src.config import LidarConfig
+
+    captured = conv.Pose2D(1.0, 0.0, 0.0)
+    current = conv.Pose2D(1.1, 0.0, 0.0)
+    asked = []
+
+    def _pose_at(t):
+        asked.append(t)
+        return captured
+
+    world = ViamWorldIO(
+        slam=MagicMock(),
+        base=MagicMock(),
+        loop=MagicMock(),
+        lidars=[LidarConfig(name="lidar", scan_source="get_laser_scan")],
+        pose_at_provider=_pose_at,
+    )
+    wall = conv.points_to_scan(
+        np.array([[2.0, y] for y in np.linspace(-0.3, 0.3, 13)]),
+        angle_min=-math.pi,
+        angle_max=math.pi,
+        num_bins=360,
+        range_min=0.05,
+        range_max=10.0,
+    )
+
+    def _read(lidar, max_age_s=2.0):
+        world._read_captured_at[lidar.name] = 42.0  # noqa: SLF001
+        return wall
+
+    world.get_pose = MagicMock(return_value=current)
+    world._read_lidar_scan_sync = MagicMock(side_effect=_read)  # noqa: SLF001
+
+    got = world.get_scan(2.0)
+    assert got is not None
+    assert asked == [42.0]
+    assert got.capture_pose == current
+    ahead = got.to_points()
+    ahead = ahead[np.abs(ahead[:, 1]) < 0.05]
+    assert float(np.median(ahead[:, 0])) == pytest.approx(1.9, abs=0.01)
+
+
 def test_get_scan_lidar_only_does_not_fall_back_to_depth():
     """include_obstacles_only=False must not return depth when lidar is silent."""
     from src.config import LidarConfig

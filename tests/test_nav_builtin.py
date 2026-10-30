@@ -1081,7 +1081,9 @@ def test_pursuit_shallow_bend_does_not_yaw_at_min_radius():
     gentle, rotating = pursuit_command(current, _carrot(14.0, 1.2), cfg=cfg)
     assert not rotating
     assert gentle.vx == pytest.approx(0.5, abs=0.05)
-    assert abs(gentle.vtheta) <= abs(math.radians(14.0)) / horizon_s + 1e-6
+    # The arc through the carrot, no tighter.
+    through_carrot = 2.0 * math.sin(math.radians(14.0)) / 1.2
+    assert gentle.vtheta / gentle.vx <= through_carrot + 1e-6
     assert abs(gentle.vtheta) < 0.25
 
     # Tight-lookahead carrot (~45° at 0.6 m) used to saturate at r_min.

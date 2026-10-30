@@ -159,8 +159,8 @@ def test_tight_space(monkeypatch, name, cond):
     grid, start, goal, extras, fits = SCENARIOS[name]()
     c = CONDITIONS[cond]
     # clearance_m is a hard planner minimum: gaps under body + 2*clearance
-    # (plus a cell of quantisation) are correctly refused.
-    if fits and NARROWEST[name] < sim.WIDTH + 2.0 * c["clearance_m"] + 2 * sim.RES:
+    # are correctly refused, and gaps at or over it must be driven.
+    if fits and NARROWEST[name] < sim.WIDTH + 2.0 * c["clearance_m"]:
         fits = False
     r = sim.run(
         grid,

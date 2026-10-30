@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from time import perf_counter
 from typing import Optional
@@ -73,6 +74,12 @@ class BuiltinSlamEngine:
         self._last_scan_obj: Optional[conv.LaserScan2D] = None
         self._last_tick_pose: Optional[conv.Pose2D] = None
         self._last_tick_at: Optional[float] = None
+        # Odometry-only motion chain (never corrected) and its recent samples.
+        # Relative motion between two times is frame-independent, so a scan
+        # can be matched at the pose it was taken from even across corrections.
+        self._odom_chain = conv.Pose2D(0.0, 0.0, 0.0)
+        self._odom_hist: deque = deque(maxlen=64)
+        self._last_scan_latency_s = float("nan")
         self._last_yaw_rate = 0.0
         self._insert_skips_turning = 0
         self._ticks = 0
@@ -831,6 +838,68 @@ class BuiltinSlamEngine:
         with self._lock:
             return self._pose
 
+    def get_pose_at(self, t: float) -> Optional[conv.Pose2D]:
+        """Map pose at monotonic time ``t``, in the current map frame.
+
+        The current pose with the odometry motion since ``t`` undone. ``None``
+        when ``t`` is outside the recent history.
+        """
+        with self._lock:
+            motion = self._motion_since(t)
+            if motion is None:
+                return None
+            return conv.compose_poses(self._pose, conv.invert_pose(motion))
+
+    # Older captures are not compensated: the odometry history is short and a
+    # frame this late is already refused by the scan age limits.
+    _MAX_SCAN_LATENCY_S = 1.0
+
+    def _motion_since(self, t: float) -> Optional[conv.Pose2D]:
+        """Body-frame odometry motion from time ``t`` to the newest sample."""
+        hist = self._odom_hist
+        if not hist or not math.isfinite(t):
+            return None
+        t_new, c_new = hist[-1]
+        if t >= t_new:
+            return conv.Pose2D(0.0, 0.0, 0.0)
+        if t_new - t > self._MAX_SCAN_LATENCY_S or t < hist[0][0]:
+            return None
+        c_at = hist[0][1]
+        for (t0, c0), (t1, c1) in zip(hist, list(hist)[1:]):
+            if t0 <= t <= t1:
+                step = conv.compose_poses(conv.invert_pose(c0), c1)
+                a = (t - t0) / (t1 - t0) if t1 > t0 else 1.0
+                c_at = conv.compose_poses(
+                    c0, conv.Pose2D(a * step.x, a * step.y, a * step.theta)
+                )
+                break
+        return conv.compose_poses(conv.invert_pose(c_at), c_new)
+
+    def _record_odom_step(
+        self, before: conv.Pose2D, after: conv.Pose2D, now: float
+    ) -> None:
+        step = conv.compose_poses(conv.invert_pose(before), after)
+        self._odom_chain = conv.compose_poses(self._odom_chain, step)
+        self._odom_hist.append((now, self._odom_chain))
+
+    def _scan_capture_motion(self) -> Optional[conv.Pose2D]:
+        """Motion since the current scan was captured (``None``: unknown)."""
+        fn = getattr(self._sensors, "scan_captured_at", None)
+        if not callable(fn):
+            return None
+        try:
+            captured_at = float(fn())
+        except Exception:  # noqa: BLE001
+            return None
+        if not math.isfinite(captured_at):
+            return None
+        motion = self._motion_since(captured_at)
+        if motion is not None and self._odom_hist:
+            self._last_scan_latency_s = max(
+                0.0, self._odom_hist[-1][0] - captured_at
+            )
+        return motion
+
     def get_odom_twist(self) -> tuple[float, float, float]:
         with self._lock:
             return self._last_odom_twist
@@ -883,6 +952,7 @@ class BuiltinSlamEngine:
                 "last_match_score": self._last_match_score,
                 "last_prior_score": self._last_prior_score,
                 "last_scan_age_s": self._last_scan_age_s,
+                "last_scan_latency_s": self._last_scan_latency_s,
                 "yaw_rate_deg_s": round(math.degrees(self._last_yaw_rate), 2),
                 "insert_skips_turning": self._insert_skips_turning,
                 "generation": self._generation,
@@ -991,8 +1061,10 @@ class BuiltinSlamEngine:
         with self._lock:
             self._ticks += 1
             prev_pose, prev_at = self._last_tick_pose, self._last_tick_at
+            before = self._pose
             predicted = self._predict(odom, now)
             self._pose = predicted
+            self._record_odom_step(before, predicted, now)
             self._last_tick_pose, self._last_tick_at = predicted, now
             yaw_rate = 0.0
             if prev_pose is not None and prev_at is not None and now > prev_at:
@@ -1008,6 +1080,15 @@ class BuiltinSlamEngine:
                 self._lo.reset()
             match_due = now - self._last_match_at >= self._match_period_s
             epoch = self._pose_epoch
+            # The scan was taken before this tick. Matching it at ``predicted``
+            # left the pose behind by speed × latency (and the heading by the
+            # turn rate × latency), so the body sat beside its drawn pose.
+            capture_motion = self._scan_capture_motion()
+            scan_pose = (
+                conv.compose_poses(predicted, conv.invert_pose(capture_motion))
+                if capture_motion is not None
+                else predicted
+            )
 
         occ_map = None
         run_match = False
@@ -1044,7 +1125,7 @@ class BuiltinSlamEngine:
                 matched, score, prior_score, rival_score = scan_match.refine_pose(
                     occ_map,
                     scan,
-                    predicted,
+                    scan_pose,
                     along_half_m=(
                         self._NAV_LOST_ALONG_M if lost else self._NAV_TRACK_MAX_M
                     ),
@@ -1063,8 +1144,10 @@ class BuiltinSlamEngine:
                 )
             else:
                 matched, score, prior_score, rival_score = scan_match.refine_pose(
-                    occ_map, scan, predicted
+                    occ_map, scan, scan_pose
                 )
+            if matched is not None and capture_motion is not None:
+                matched = conv.compose_poses(matched, capture_motion)
             with self._lock:
                 self._last_match_at = now
                 self._last_match_score = score
@@ -1093,7 +1176,7 @@ class BuiltinSlamEngine:
                 # No scan match: the pose is a guess. Painting there doubles walls.
                 self._lo_inserts_held += 1
             else:
-                self._maybe_insert_scan(scan, now)
+                self._maybe_insert_scan(scan, now, capture_motion=capture_motion)
 
     # -- lidar odometry --------------------------------------------------------
     # Lidar velocity is trusted this long after the last match; after that the
@@ -1356,14 +1439,23 @@ class BuiltinSlamEngine:
         )
         return True
 
-    def _maybe_insert_scan(self, scan, now: float) -> None:
+    def _maybe_insert_scan(
+        self,
+        scan,
+        now: float,
+        *,
+        capture_motion: Optional[conv.Pose2D] = None,
+    ) -> None:
         """Ray-cast into the grid only after movement or a timeout.
 
         The paint runs off the pose lock and in numpy, so GetPosition and the
-        nav control loop are not stuck behind a Python Bresenham.
+        nav control loop are not stuck behind a Python Bresenham. The scan is
+        painted from the pose it was captured at.
         """
         with self._lock:
             pose = self._pose
+            if capture_motion is not None:
+                pose = conv.compose_poses(pose, conv.invert_pose(capture_motion))
             last = self._last_insert_pose
             if last is not None:
                 moved = math.hypot(pose.x - last.x, pose.y - last.y)

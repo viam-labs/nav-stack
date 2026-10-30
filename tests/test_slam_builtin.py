@@ -1281,6 +1281,120 @@ def _wall_scan(n: int = 360, dist: float = 3.0) -> conv.LaserScan2D:
     )
 
 
+def _room_scan(pose: conv.Pose2D, n: int = 360, half_x: float = 2.0, half_y: float = 1.5):
+    """Base-frame scan from inside an axis-aligned room centred on the origin."""
+    angles = -math.pi + np.arange(n) * (2 * math.pi / n)
+    ranges = np.empty(n)
+    for i, a in enumerate(angles):
+        dx, dy = math.cos(pose.theta + a), math.sin(pose.theta + a)
+        hits = []
+        if abs(dx) > 1e-9:
+            hits += [(half_x - pose.x) / dx, (-half_x - pose.x) / dx]
+        if abs(dy) > 1e-9:
+            hits += [(half_y - pose.y) / dy, (-half_y - pose.y) / dy]
+        ranges[i] = min(t for t in hits if t > 0)
+    return conv.LaserScan2D(
+        ranges=ranges,
+        angle_min=-math.pi,
+        angle_increment=2 * math.pi / n,
+        range_min=0.1,
+        range_max=10.0,
+    )
+
+
+def test_engine_pose_at_undoes_odometry_since_then(tmp_path: Path):
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": str(tmp_path), "mode": "mapping"}
+    )
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore(str(tmp_path)))  # type: ignore[arg-type]
+    pose = conv.Pose2D(0.0, 0.0, 0.0)
+    for k in range(1, 6):
+        after = conv.compose_poses(pose, conv.Pose2D(0.05, 0.0, math.radians(2.0)))
+        engine._record_odom_step(pose, after, 10.0 + 0.1 * k)  # noqa: SLF001
+        pose = after
+    engine._pose = pose  # noqa: SLF001
+    back = engine.get_pose_at(10.3)
+    assert back is not None
+    expected = conv.Pose2D(0.0, 0.0, 0.0)
+    for _ in range(3):
+        expected = conv.compose_poses(expected, conv.Pose2D(0.05, 0.0, math.radians(2.0)))
+    assert back.x == pytest.approx(expected.x, abs=1e-9)
+    assert back.y == pytest.approx(expected.y, abs=1e-9)
+    assert back.theta == pytest.approx(expected.theta, abs=1e-9)
+    # Halfway between samples interpolates the step.
+    mid = engine.get_pose_at(10.25)
+    assert mid.theta == pytest.approx(math.radians(5.0), abs=1e-6)
+    # A correction moves the past with the present: same relative motion.
+    engine._pose = conv.Pose2D(5.0, -1.0, math.pi / 2)  # noqa: SLF001
+    shifted = engine.get_pose_at(10.3)
+    rel_before = conv.compose_poses(conv.invert_pose(back), pose)
+    rel_after = conv.compose_poses(conv.invert_pose(shifted), engine.get_pose())
+    assert rel_after.x == pytest.approx(rel_before.x, abs=1e-9)
+    assert rel_after.y == pytest.approx(rel_before.y, abs=1e-9)
+    assert rel_after.theta == pytest.approx(rel_before.theta, abs=1e-9)
+    # Outside the history: unknown, not a guess.
+    assert engine.get_pose_at(9.0) is None
+    assert engine.get_pose_at(12.0).x == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize("report_capture", [True, False])
+def test_engine_matches_a_late_scan_at_the_pose_it_was_taken(
+    tmp_path: Path, monkeypatch, report_capture
+):
+    """The robot drives at 0.5 m/s; each scan reaches SLAM 0.2 s after capture.
+
+    Matching it at the current pose pulled the pose back 10 cm toward where
+    the scan was taken, every match. Matched at its capture pose and carried
+    forward, the pose stays on the robot.
+    """
+    import src.slam_builtin.engine as engine_mod
+
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": str(tmp_path), "mode": "localizing"}
+    )
+    clock = {"t": 100.0}
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: clock["t"])
+    latency_s, speed = 0.2, 0.5
+    truth_at = lambda t: conv.Pose2D(-0.8 + speed * (t - 100.0), 0.1, 0.0)  # noqa: E731
+
+    class _Sensors(_FakeSensors):
+        def get_scan(self, max_age_s: float = 2.0, *, fresh: bool = False):
+            return _room_scan(truth_at(clock["t"] - latency_s))
+
+        def get_odom(self):
+            return conv.OdomReading(0.0, 0.0, 0.0, pose=truth_at(clock["t"]))
+
+    if report_capture:
+        _Sensors.scan_captured_at = lambda self: clock["t"] - latency_s
+
+    engine = BuiltinSlamEngine(
+        cfg, _Sensors(), MapStore(str(tmp_path)), match_period_s=0.0  # type: ignore[arg-type]
+    )
+    grid = occ.empty_grid(resolution=0.05, size_m=6.0)
+    room = _room_scan(conv.Pose2D(0.0, 0.0, 0.0))
+    for _ in range(4):
+        grid = occ.insert_scan(
+            grid, 0.0, 0.0, 0.0, room.ranges, room.angle_min, room.angle_increment,
+            range_min=0.1, range_max=10.0, max_beams=360,
+        )
+    with engine._lock:  # noqa: SLF001
+        engine._grid = grid  # noqa: SLF001
+        engine._seed_localize_pending = False  # noqa: SLF001
+        engine._invalidate_occ_cache()  # noqa: SLF001
+    engine.set_pose(truth_at(clock["t"]))
+    for _ in range(16):
+        clock["t"] += 0.1
+        engine._tick()  # noqa: SLF001
+    truth = truth_at(clock["t"])
+    lag = truth.x - engine.get_pose().x
+    if report_capture:
+        assert abs(lag) < 0.03
+        assert engine.diagnostics()["last_scan_latency_s"] == pytest.approx(latency_s)
+    else:
+        # Without a capture time the old behaviour remains: the pose trails.
+        assert lag > 0.05
+
+
 def test_engine_does_not_reinsert_same_scan_while_heading_turns(tmp_path: Path):
     """A scan object already inserted must not be painted again at new yaw."""
     cfg = SlamConfig.from_dict(
@@ -1388,6 +1502,102 @@ def test_builtin_sensors_get_scan_fresh_dedupes_same_revolution(monkeypatch):
     assert sensors.get_scan(2.0) is c
     assert calls["n"] == 3
     assert sensors.scan_age_s() < 0.5
+
+
+def test_builtin_sensors_reports_when_the_scan_was_captured(monkeypatch):
+    import asyncio
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
+    sensors = BuiltinSensors(
+        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
+        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+    )
+    assert math.isnan(sensors.scan_captured_at())
+    reads = [(_wall_scan(dist=3.0), 5.0), (_wall_scan(dist=3.0), 5.3), (_wall_scan(dist=3.2), 5.6)]
+    calls = {"n": 0}
+
+    def _read(lidar, *, max_age_s):
+        del max_age_s
+        scan, captured = reads[min(calls["n"], len(reads) - 1)]
+        calls["n"] += 1
+        sensors._read_captured_at[lidar.name] = captured  # noqa: SLF001
+        return scan
+
+    monkeypatch.setattr(sensors, "_read_lidar_scan_sync", _read)
+    monkeypatch.setattr(sensors, "_SCAN_MIN_REFETCH_S", 0.0)
+    sensors.get_scan(0.75, fresh=True)
+    assert sensors.scan_captured_at() == pytest.approx(5.0)
+    # Same revolution read again: still the time it was first captured.
+    sensors.get_scan(0.75, fresh=True)
+    assert sensors.scan_captured_at() == pytest.approx(5.0)
+    sensors.get_scan(0.75, fresh=True)
+    assert sensors.scan_captured_at() == pytest.approx(5.6)
+
+
+def test_builtin_sensors_reports_when_the_scan_was_captured(monkeypatch):
+    import asyncio
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
+    sensors = BuiltinSensors(
+        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
+        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+    )
+    assert math.isnan(sensors.scan_captured_at())
+    reads = [(_wall_scan(dist=3.0), 5.0), (_wall_scan(dist=3.0), 5.3), (_wall_scan(dist=3.2), 5.6)]
+    calls = {"n": 0}
+
+    def _read(lidar, *, max_age_s):
+        del max_age_s
+        scan, captured = reads[min(calls["n"], len(reads) - 1)]
+        calls["n"] += 1
+        sensors._read_captured_at[lidar.name] = captured  # noqa: SLF001
+        return scan
+
+    monkeypatch.setattr(sensors, "_read_lidar_scan_sync", _read)
+    monkeypatch.setattr(sensors, "_SCAN_MIN_REFETCH_S", 0.0)
+    sensors.get_scan(0.75, fresh=True)
+    assert sensors.scan_captured_at() == pytest.approx(5.0)
+    # Same revolution read again: still the time it was first captured.
+    sensors.get_scan(0.75, fresh=True)
+    assert sensors.scan_captured_at() == pytest.approx(5.0)
+    sensors.get_scan(0.75, fresh=True)
+    assert sensors.scan_captured_at() == pytest.approx(5.6)
+
+
+def test_builtin_sensors_reports_when_the_scan_was_captured(monkeypatch):
+    import asyncio
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
+    sensors = BuiltinSensors(
+        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
+        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+    )
+    assert math.isnan(sensors.scan_captured_at())
+    reads = [(_wall_scan(dist=3.0), 5.0), (_wall_scan(dist=3.0), 5.3), (_wall_scan(dist=3.2), 5.6)]
+    calls = {"n": 0}
+
+    def _read(lidar, *, max_age_s):
+        del max_age_s
+        scan, captured = reads[min(calls["n"], len(reads) - 1)]
+        calls["n"] += 1
+        sensors._read_captured_at[lidar.name] = captured  # noqa: SLF001
+        return scan
+
+    monkeypatch.setattr(sensors, "_read_lidar_scan_sync", _read)
+    monkeypatch.setattr(sensors, "_SCAN_MIN_REFETCH_S", 0.0)
+    sensors.get_scan(0.75, fresh=True)
+    assert sensors.scan_captured_at() == pytest.approx(5.0)
+    # Same revolution read again: still the time it was first captured.
+    sensors.get_scan(0.75, fresh=True)
+    assert sensors.scan_captured_at() == pytest.approx(5.0)
+    sensors.get_scan(0.75, fresh=True)
+    assert sensors.scan_captured_at() == pytest.approx(5.6)
 
 
 def test_builtin_sensors_get_scan_accepts_replay_after_dropout(monkeypatch):
