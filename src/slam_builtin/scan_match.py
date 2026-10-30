@@ -117,6 +117,139 @@ def _candidate_scores(
 _RIVAL_SEP_M = 0.40
 
 
+def scan_map_fit(
+    occ_map: OccupancyMap,
+    scan: conv.LaserScan2D,
+    pose: conv.Pose2D,
+    *,
+    min_score: float = 0.5,
+) -> str:
+    """``open`` when the map cannot judge ``pose``, else ``fit`` or ``miss``.
+
+    Unknown cells do not count. A heading that drops returns into empty space
+    the map already knows is a miss, even if part of the scan is new ground.
+    """
+    scan_xy = scan_endpoints_base_link(scan)
+    if scan_xy.shape[0] < 20:
+        return "open"
+    c = math.cos(pose.theta)
+    s = math.sin(pose.theta)
+    wx = pose.x + c * scan_xy[:, 0] - s * scan_xy[:, 1]
+    wy = pose.y + s * scan_xy[:, 0] + c * scan_xy[:, 1]
+    grid = occ_map.grid
+    height, width = grid.shape
+    res = occ_map.resolution
+    cols = np.floor((wx - occ_map.origin_x) / res).astype(np.int32)
+    rows = np.floor((wy - occ_map.origin_y) / res).astype(np.int32)
+    inside = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+    if int(inside.sum()) < 20:
+        return "open"
+    rows_c = np.clip(rows, 0, height - 1)
+    cols_c = np.clip(cols, 0, width - 1)
+    known = (grid[rows_c, cols_c] >= 0) & inside
+    if int(known.sum()) / float(inside.sum()) < 0.25:
+        return "open"
+    # Score only the points that fall inside the grid. Points past the edge
+    # are how the map grows; they must not veto a scan whose overlap hits walls.
+    lookup = _inflate_occupied(grid >= 50, 2)
+    hits = lookup[rows_c, cols_c] & inside
+    free = (grid[rows_c, cols_c] == 0) & inside
+    denom = float(inside.sum())
+    overlap = float(hits.sum()) / denom - 0.7 * float(free.sum()) / denom
+    if overlap >= min_score:
+        return "fit"
+    return "miss"
+
+
+def score_at_pose(
+    occ_map: OccupancyMap, scan: conv.LaserScan2D, pose: conv.Pose2D
+) -> float:
+    """How well ``scan`` lands on ``occ_map`` at ``pose``.
+
+    ``-inf`` when too little of the scan overlaps the map to judge. A high
+    score means returns sit on walls already drawn; near or below zero they
+    land in empty space.
+    """
+    scan_xy = scan_endpoints_base_link(scan)
+    if scan_xy.shape[0] < 20:
+        return float("-inf")
+    if scan_xy.shape[0] > 120:
+        pick = np.linspace(0, scan_xy.shape[0] - 1, 120, dtype=np.int32)
+        scan_xy = scan_xy[pick]
+    occupied = occ_map.grid >= 50
+    lookup = _inflate_occupied(occupied, 2)
+    return float(
+        _candidate_scores(
+            occ_map,
+            scan_xy,
+            np.array([pose.x]),
+            np.array([pose.y]),
+            pose.theta,
+            occupied_lookup=lookup,
+        )[0]
+    )
+
+
+def search_heading(
+    occ_map: OccupancyMap,
+    scan: conv.LaserScan2D,
+    pose: conv.Pose2D,
+    *,
+    yaw_step_deg: float = 4.0,
+    min_score: float = 0.5,
+) -> Tuple[Optional[conv.Pose2D], float]:
+    """Best heading at ``pose``'s position. XY stays put.
+
+    Used after an in-place spin, when wheel yaw can be tens of degrees off
+    and the narrow tracking window would not see the walls.
+    """
+    scan_xy = scan_endpoints_base_link(scan)
+    if scan_xy.shape[0] < 20:
+        return None, float("-inf")
+    if scan_xy.shape[0] > 120:
+        pick = np.linspace(0, scan_xy.shape[0] - 1, 120, dtype=np.int32)
+        scan_xy = scan_xy[pick]
+    occupied = occ_map.grid >= 50
+    lookup = _inflate_occupied(occupied, 2)
+    step = math.radians(yaw_step_deg)
+    n = max(1, int(round(2.0 * math.pi / step)))
+    scored: list[tuple[float, float]] = []
+    for i in range(n):
+        yaw = conv.normalize_angle(pose.theta + i * step)
+        score = float(
+            _candidate_scores(
+                occ_map,
+                scan_xy,
+                np.array([pose.x]),
+                np.array([pose.y]),
+                yaw,
+                occupied_lookup=lookup,
+            )[0]
+        )
+        scored.append((score, yaw))
+    # A centered hall scores the same forwards and backwards. Among headings
+    # that tie the best, stay with the one nearest the wheels.
+    best_score = max(item[0] for item in scored)
+    near = [
+        item
+        for item in scored
+        if math.isfinite(item[0]) and item[0] >= best_score - 0.05
+    ]
+    if not near:
+        return None, best_score
+    _score, best_yaw = min(
+        near, key=lambda item: abs(conv.normalize_angle(item[1] - pose.theta))
+    )
+    chosen = conv.Pose2D(pose.x, pose.y, best_yaw)
+    # Points past the grid edge lower every heading by about the same amount.
+    # Keep a heading whose overlap sits on the walls.
+    if best_score < min_score and scan_map_fit(
+        occ_map, scan, chosen, min_score=min_score
+    ) != "fit":
+        return None, best_score
+    return chosen, best_score
+
+
 def refine_pose(
     occ_map: OccupancyMap,
     scan: conv.LaserScan2D,

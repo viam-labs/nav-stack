@@ -1658,6 +1658,96 @@ def test_engine_restores_last_pose_on_localizing(tmp_path: Path):
     assert again.y == pytest.approx(5.0)
 
 
+def test_rewind_spin_poses_keeps_the_turn_and_takes_the_matched_heading():
+    from src.slam_builtin.engine import rewind_spin_poses
+
+    odom = [
+        conv.Pose2D(0.0, 0.0, 0.0),
+        conv.Pose2D(0.0, 0.0, math.pi / 2),
+    ]
+    # Wheels ended 0.2 rad past the heading that matches the map.
+    end = conv.Pose2D(0.0, 0.0, math.pi / 2 - 0.2)
+    poses = rewind_spin_poses(odom, end)
+    assert poses[1].theta == pytest.approx(end.theta)
+    assert poses[0].theta == pytest.approx(-0.2)
+
+
+def test_mapping_does_not_paint_a_scan_that_misses_the_map(tmp_path: Path):
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": str(tmp_path), "mode": "mapping"}
+    )
+    heading = {"th": 0.0}
+
+    class _Sensors(_FakeSensors):
+        def get_scan(self, max_age_s: float = 2.0, *, fresh: bool = False):
+            # Always the view from heading 0, even when the wheels say otherwise.
+            return _room_scan(conv.Pose2D(0.0, 0.0, 0.0))
+
+        def get_odom(self):
+            return conv.OdomReading(
+                0.0, 0.0, 0.0,
+                pose=conv.Pose2D(0.0, 0.0, heading["th"]),
+                heading_rad=heading["th"],
+            )
+
+    engine = BuiltinSlamEngine(
+        cfg, _Sensors(), MapStore(str(tmp_path)), rate_hz=10.0
+    )  # type: ignore[arg-type]
+    engine._tick()  # noqa: SLF001
+    assert engine._updates == 1  # noqa: SLF001
+    # 30 deg is inside the odom jump gate; 10 s keeps the yaw rate under the
+    # in-place spin hold, so this tick is judged against the map as-is.
+    engine._last_tick_at -= 10.0  # noqa: SLF001
+    heading["th"] = math.radians(30.0)
+    engine._tick()  # noqa: SLF001
+    assert engine._updates == 1  # noqa: SLF001
+    assert engine._insert_skips_unmatched == 1  # noqa: SLF001
+
+
+def test_spin_is_painted_at_the_heading_that_matches(tmp_path: Path):
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": str(tmp_path), "mode": "mapping"}
+    )
+    heading = {"th": 0.0}
+    view = {"th": 0.0}
+
+    class _Sensors(_FakeSensors):
+        def get_scan(self, max_age_s: float = 2.0, *, fresh: bool = False):
+            return _room_scan(conv.Pose2D(0.0, 0.0, view["th"]))
+
+        def get_odom(self):
+            return conv.OdomReading(
+                0.0, 0.0, 0.0,
+                pose=conv.Pose2D(0.0, 0.0, heading["th"]),
+                heading_rad=heading["th"],
+            )
+
+    engine = BuiltinSlamEngine(
+        cfg, _Sensors(), MapStore(str(tmp_path)), rate_hz=10.0
+    )  # type: ignore[arg-type]
+    engine._tick()  # noqa: SLF001
+    assert engine._updates == 1  # noqa: SLF001
+    # In-place spin. The scan is what the room looks like at the true heading,
+    # which stays 0 while the wheels run 30 degrees ahead.
+    engine._last_tick_at -= 0.1  # noqa: SLF001
+    heading["th"] = math.radians(30.0)
+    view["th"] = 0.0
+    engine._tick()  # noqa: SLF001
+    assert engine._updates == 1  # noqa: SLF001
+    assert engine._spin_hold  # noqa: SLF001
+    engine._last_tick_at -= 2.0  # noqa: SLF001
+    engine._tick()  # noqa: SLF001
+    assert engine._updates > 1  # noqa: SLF001
+    assert engine.get_pose().theta == pytest.approx(0.0, abs=math.radians(6.0))
+    assert not engine._spin_hold  # noqa: SLF001
+    painted = engine._updates  # noqa: SLF001
+    engine._last_tick_at -= 0.1  # noqa: SLF001
+    engine._tick()  # noqa: SLF001
+    assert not engine._spin_hold  # noqa: SLF001
+    assert engine.get_pose().theta == pytest.approx(0.0, abs=math.radians(6.0))
+    assert engine._updates >= painted  # noqa: SLF001
+
+
 def test_match_scan_leaves_out_a_depth_camera(monkeypatch):
     """A depth camera feeds mapping, not the scan that moves the pose."""
     import asyncio

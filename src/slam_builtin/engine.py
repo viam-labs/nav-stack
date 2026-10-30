@@ -31,6 +31,45 @@ from .io_sensors import BuiltinSensors
 from .lidar_odom import LidarOdometry
 from .types import LogOddsGrid
 
+# A scan is drawn only when it lands on walls already in the map.
+_MAP_INSERT_MIN_SCORE = 0.5
+# In-place turns slower than the hard smear skip still write a rotated wing
+# if they are painted live. Hold them and draw after the robot stops.
+_SPIN_HOLD_YAW_RATE = math.radians(15.0)
+_SPIN_HOLD_LINEAR = 0.20
+_SPIN_HOLD_MAX = 80
+
+
+def rewind_spin_poses(
+    odom_poses: list, end: conv.Pose2D
+) -> list:
+    """Place each odom pose so the last one is ``end``.
+
+    Yaw changes and body-frame steps between the odom poses are kept. The
+    end heading is the one that matched the map, so a slip during the spin
+    does not rotate the scans.
+    """
+    if not odom_poses:
+        return []
+    out: list = [None] * len(odom_poses)
+    out[-1] = conv.Pose2D(end.x, end.y, end.theta)
+    for i in range(len(odom_poses) - 2, -1, -1):
+        a = odom_poses[i]
+        b = odom_poses[i + 1]
+        dth = conv.normalize_angle(b.theta - a.theta)
+        c, s = math.cos(a.theta), math.sin(a.theta)
+        dx, dy = b.x - a.x, b.y - a.y
+        body_x = c * dx + s * dy
+        body_y = -s * dx + c * dy
+        th = conv.normalize_angle(out[i + 1].theta - dth)
+        c2, s2 = math.cos(th), math.sin(th)
+        out[i] = conv.Pose2D(
+            out[i + 1].x - (c2 * body_x - s2 * body_y),
+            out[i + 1].y - (s2 * body_x + c2 * body_y),
+            th,
+        )
+    return out
+
 
 class BuiltinSlamEngine:
     """In-process 2D occupancy mapping + localization."""
@@ -61,6 +100,8 @@ class BuiltinSlamEngine:
         # Height slices painted while mapping. The published ``_grid`` is their
         # union, so a lidar beam cannot clear a camera hit at another height.
         self._height_bands: dict = {}
+        # Scans captured during an in-place spin, painted once it stops.
+        self._spin_hold: list = []
         self._pose = conv.Pose2D(0.0, 0.0, 0.0)
         self._last_odom_pose: Optional[conv.Pose2D] = None
         self._last_odom_pose_at: Optional[float] = None
@@ -84,6 +125,8 @@ class BuiltinSlamEngine:
         self._odom_hist: deque = deque(maxlen=64)
         self._last_scan_latency_s = float("nan")
         self._last_yaw_rate = 0.0
+        self._last_lin_rate = 0.0
+        self._insert_skips_unmatched = 0
         self._insert_skips_turning = 0
         self._ticks = 0
         self._updates = 0
@@ -335,6 +378,7 @@ class BuiltinSlamEngine:
                 resolution=self._cfg.map.resolution
             )
             self._height_bands = {}
+            self._spin_hold = []
             self._pose = conv.Pose2D(0.0, 0.0, 0.0)
             self._last_odom_pose = None
             self._last_odom_heading = None
@@ -958,6 +1002,7 @@ class BuiltinSlamEngine:
                 "last_scan_latency_s": self._last_scan_latency_s,
                 "yaw_rate_deg_s": round(math.degrees(self._last_yaw_rate), 2),
                 "insert_skips_turning": self._insert_skips_turning,
+                "insert_skips_unmatched": self._insert_skips_unmatched,
                 "generation": self._generation,
                 "seed_localize_pending": self._seed_localize_pending,
                 "pose_restored_from_disk": self._pose_restored_from_disk,
@@ -1070,11 +1115,17 @@ class BuiltinSlamEngine:
             self._record_odom_step(before, predicted, now)
             self._last_tick_pose, self._last_tick_at = predicted, now
             yaw_rate = 0.0
+            lin_rate = 0.0
             if prev_pose is not None and prev_at is not None and now > prev_at:
+                dt = now - prev_at
                 yaw_rate = abs(
                     conv.normalize_angle(predicted.theta - prev_pose.theta)
-                ) / (now - prev_at)
+                ) / dt
+                lin_rate = math.hypot(
+                    predicted.x - prev_pose.x, predicted.y - prev_pose.y
+                ) / dt
             self._last_yaw_rate = yaw_rate
+            self._last_lin_rate = lin_rate
             if scan is None or not new_scan:
                 return
             use_lo = self._lidar_odom_active(odom)
@@ -1136,15 +1187,19 @@ class BuiltinSlamEngine:
             with self._lock:
                 if self._pose_epoch != epoch:
                     return
-            if yaw_rate > self._MAX_INSERT_YAW_RATE:
-                # One lidar revolution (~100 ms) is skewed by yaw_rate*0.1 s;
-                # inserting it during a fast spin paints walls as arcs.
-                self._insert_skips_turning += 1
-            elif use_lo and turning and self._last_insert_pose is not None:
-                self._insert_skips_turning += 1
-            elif use_lo and not lo_ok and self._last_insert_pose is not None:
+            if use_lo and not lo_ok and self._last_insert_pose is not None:
                 # No scan match: the pose is a guess. Painting there doubles walls.
                 self._lo_inserts_held += 1
+            elif self._spinning(yaw_rate, lin_rate):
+                # A turn smears a scan and the wheel heading is the part that
+                # slips. Hold the frames and draw them once a still scan lines
+                # up with the map.
+                self._remember_spin_scan(scan, now, capture_motion)
+                self._insert_skips_turning += 1
+            elif self._spin_hold:
+                self._flush_spin_hold(scan, now, capture_motion)
+            elif not self._scan_fits_map(scan, scan_pose):
+                self._insert_skips_unmatched += 1
             else:
                 self._maybe_insert_scan(scan, now, capture_motion=capture_motion)
 
@@ -1409,6 +1464,193 @@ class BuiltinSlamEngine:
         )
         return True
 
+    def _spinning(self, yaw_rate: float, lin_rate: float) -> bool:
+        turning = yaw_rate > _SPIN_HOLD_YAW_RATE or (
+            self._spin_hold and yaw_rate > math.radians(5.0)
+        )
+        return turning and lin_rate < _SPIN_HOLD_LINEAR
+
+    def _copy_scan(self, scan: conv.LaserScan2D) -> conv.LaserScan2D:
+        xyz = getattr(scan, "cloud_xyz", None)
+        xy = getattr(scan, "cloud_xy", None)
+        return conv.LaserScan2D(
+            ranges=np.array(scan.ranges, dtype=float, copy=True),
+            angle_min=float(scan.angle_min),
+            angle_increment=float(scan.angle_increment),
+            range_min=float(scan.range_min),
+            range_max=float(scan.range_max),
+            sensor_pose=scan.sensor_pose,
+            capture_pose=scan.capture_pose,
+            cloud_xy=None if xy is None else np.array(xy, dtype=float, copy=True),
+            cloud_xyz=None if xyz is None else np.array(xyz, dtype=float, copy=True),
+        )
+
+    def _copy_frames(self, frames: list) -> list:
+        out = []
+        for item in frames:
+            if isinstance(item, tuple):
+                out.append((item[0], self._copy_scan(item[1])))
+            else:
+                out.append(self._copy_scan(item))
+        return out
+
+    def _capture_pose(self, capture_motion: Optional[conv.Pose2D]) -> conv.Pose2D:
+        with self._lock:
+            pose = self._pose
+        if capture_motion is not None:
+            pose = conv.compose_poses(pose, conv.invert_pose(capture_motion))
+        return conv.Pose2D(pose.x, pose.y, pose.theta)
+
+    def _remember_spin_scan(
+        self,
+        scan: conv.LaserScan2D,
+        now: float,
+        capture_motion: Optional[conv.Pose2D],
+    ) -> None:
+        self._spin_hold.append(
+            (
+                self._copy_scan(scan),
+                self._capture_pose(capture_motion),
+                self._copy_frames(self._mapping_frames()),
+                now,
+            )
+        )
+        if len(self._spin_hold) > _SPIN_HOLD_MAX:
+            self._spin_hold.clear()
+            self._log("dropped mapping spin buffer; the turn ran too long")
+
+    def _scan_map_fit(self, scan: conv.LaserScan2D, pose: conv.Pose2D) -> str:
+        """``open``, ``fit``, or ``miss`` for painting ``scan`` at ``pose``."""
+        try:
+            occ_map = self._occupancy_for_match()
+        except Exception:  # noqa: BLE001
+            return "open"
+        return scan_match.scan_map_fit(
+            occ_map, scan, pose, min_score=_MAP_INSERT_MIN_SCORE
+        )
+
+    def _scan_fits_map(self, scan: conv.LaserScan2D, pose: conv.Pose2D) -> bool:
+        """True when the map does not yet constrain ``pose``, or the scan lands on it."""
+        return self._scan_map_fit(scan, pose) != "miss"
+
+    def _flush_spin_hold(
+        self,
+        scan: conv.LaserScan2D,
+        now: float,
+        capture_motion: Optional[conv.Pose2D],
+    ) -> None:
+        pose = self._capture_pose(capture_motion)
+        held = list(self._spin_hold)
+        self._spin_hold = []
+        held.append(
+            (self._copy_scan(scan), pose, self._copy_frames(self._mapping_frames()), now)
+        )
+        end = pose
+        fit = self._scan_map_fit(scan, pose)
+        if fit == "miss":
+            try:
+                occ_map = self._occupancy_for_match()
+            except Exception:  # noqa: BLE001
+                occ_map = None
+            found, found_score = (None, float("-inf"))
+            if occ_map is not None:
+                found, found_score = scan_match.search_heading(
+                    occ_map, scan, pose, min_score=_MAP_INSERT_MIN_SCORE
+                )
+            if found is None:
+                self._insert_skips_unmatched += len(held)
+                self._log(
+                    "dropped mapping spin; stopped scan does not match "
+                    f"the map (score={found_score:.2f})"
+                )
+                return
+            end = found
+            with self._lock:
+                self._pose = conv.Pose2D(self._pose.x, self._pose.y, found.theta)
+                # The tick already stored the wheel heading. Leaving it there
+                # makes the next sample look like another spin.
+                if self._last_tick_pose is not None:
+                    self._last_tick_pose = conv.Pose2D(
+                        self._last_tick_pose.x,
+                        self._last_tick_pose.y,
+                        found.theta,
+                    )
+                self._last_yaw_rate = 0.0
+        corrected = rewind_spin_poses([item[1] for item in held], end)
+        for (held_scan, _pose, frames, held_now), paint_at in zip(held, corrected):
+            self._paint_mapping_scan(
+                held_scan, paint_at, held_now, frames=frames
+            )
+
+    def _paint_mapping_scan(
+        self,
+        scan: conv.LaserScan2D,
+        pose_snap: conv.Pose2D,
+        now: float,
+        *,
+        frames: Optional[list] = None,
+    ) -> None:
+        """Draw one mapping scan at ``pose_snap``. Caller already decided it fits."""
+        if frames is None:
+            frames = self._mapping_frames()
+        with self._lock:
+            src = self._grid
+        band_scans = self._band_scans(frames)
+        primary_band = 0
+        if band_scans:
+            painted, bands, primary, extras, primary_band = self._paint_height_bands(
+                pose_snap, band_scans, src
+            )
+        else:
+            painted = occ.insert_scan(
+                occ.copy_grid(src),
+                pose_snap.x,
+                pose_snap.y,
+                pose_snap.theta,
+                np.asarray(scan.ranges, dtype=float),
+                float(scan.angle_min),
+                float(scan.angle_increment),
+                range_min=float(scan.range_min),
+                range_max=float(scan.range_max)
+                if math.isfinite(scan.range_max)
+                else 30.0,
+            )
+            bands = None
+            primary, extras = scan, None
+        hook = None
+        with self._lock:
+            if self._grid is not src:
+                return
+            self._grid = painted
+            if bands is not None:
+                self._height_bands = bands
+            self._last_insert_pose = pose_snap
+            self._last_insert_at = now
+            self._updates += 1
+            if self._mode == MODE_MAPPING:
+                hook = self._keyframe_hook
+                nodes = len(self._graph)
+                self._graph.add_scan(
+                    pose_snap, primary, band=primary_band, also=extras
+                )
+                if (
+                    len(self._graph) > nodes
+                    and self._loop_closure_enabled()
+                    and now - self._loop_last_attempt_at
+                    >= float(self._cfg.builtin_loop_check_interval_s)
+                ):
+                    self._loop_event.set()
+            # The next scan is judged against this paint. Leaving the match
+            # grid stale would let a wrong heading draw for another 20 scans.
+            self._invalidate_occ_cache()
+            if self._updates % 20 == 0:
+                self._generation += 1
+        if hook is not None:
+            try:
+                hook(scan, [], pose_snap)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"keyframe hook failed: {exc}")
+
     def _mapping_frames(self) -> list:
         fn = getattr(self._sensors, "mapping_frames", None)
         if not callable(fn):
@@ -1510,63 +1752,8 @@ class BuiltinSlamEngine:
                     and now - self._last_insert_at < 1.0
                 ):
                     return
-            src = self._grid
             pose_snap = conv.Pose2D(pose.x, pose.y, pose.theta)
-            frames = self._mapping_frames()
-        band_scans = self._band_scans(frames)
-        primary_band = 0
-        if band_scans:
-            painted, bands, primary, extras, primary_band = self._paint_height_bands(
-                pose_snap, band_scans, src
-            )
-        else:
-            painted = occ.insert_scan(
-                occ.copy_grid(src),
-                pose_snap.x,
-                pose_snap.y,
-                pose_snap.theta,
-                np.asarray(scan.ranges, dtype=float),
-                float(scan.angle_min),
-                float(scan.angle_increment),
-                range_min=float(scan.range_min),
-                range_max=float(scan.range_max)
-                if math.isfinite(scan.range_max)
-                else 30.0,
-            )
-            bands = None
-            primary, extras = scan, None
-        hook = None
-        with self._lock:
-            # Drop the paint if clear/reset/rebuild replaced the grid mid-ray.
-            if self._grid is not src:
-                return
-            self._grid = painted
-            if bands is not None:
-                self._height_bands = bands
-            self._last_insert_pose = pose_snap
-            self._last_insert_at = now
-            self._updates += 1
-            if self._mode == MODE_MAPPING:
-                hook = self._keyframe_hook
-                nodes = len(self._graph)
-                self._graph.add_scan(
-                    pose_snap, primary, band=primary_band, also=extras
-                )
-                if (
-                    len(self._graph) > nodes
-                    and self._loop_closure_enabled()
-                    and now - self._loop_last_attempt_at
-                    >= float(self._cfg.builtin_loop_check_interval_s)
-                ):
-                    self._loop_event.set()
-            if self._updates % 20 == 0:
-                self._generation += 1
-                self._invalidate_occ_cache()
-        if hook is not None:
-            try:
-                hook(scan, [], pose_snap)
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"keyframe hook failed: {exc}")
+        self._paint_mapping_scan(scan, pose_snap, now)
 
     def _poses_agree(self, a: conv.Pose2D, b: conv.Pose2D) -> bool:
         return (
