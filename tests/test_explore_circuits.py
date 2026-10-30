@@ -52,6 +52,7 @@ def test_circuit_closed():
     assert not circuit_closed(5.0, Pose(1.2, 1.0, 0.0), s, far_m=5.0)
     assert not circuit_closed(20.0, Pose(5.0, 1.0, 0.0), s, far_m=5.0)
     assert circuit_closed(20.0, Pose(1.2, 1.0, 0.0), s, far_m=5.0)
+    assert not circuit_closed(20.0, Pose(1.2, 1.0, 0.0), s, far_m=1.0)
 
 
 def test_inner_circuit_goals_are_clear_of_walls_and_long_enough():
@@ -81,9 +82,3 @@ def test_wall_hops_keep_direction_around_the_room():
     xs = [h[0] for h in hops]
     ys = [h[1] for h in hops]
     assert max(xs) - min(xs) > 4.0 and max(ys) - min(ys) > 3.0
-
-
-def test_circuit_closed_requires_excursion():
-    s = Pose(1.0, 1.0, 0.0)
-    assert not circuit_closed(20.0, Pose(1.2, 1.0, 0.0), s, far_m=1.0)
-    assert circuit_closed(20.0, Pose(1.2, 1.0, 0.0), s, far_m=4.0)

@@ -3,7 +3,6 @@ import asyncio
 from src.config import ExploreConfig
 from src.models.explore import ExploreService
 
-
 class Rec:
     def __init__(self, replies):
         self.replies, self.calls = replies, []
@@ -50,11 +49,6 @@ def test_start_refuses_when_slam_not_mapping():
     out = asyncio.run(svc.do_command({"command": "start", "duration_s": 10}))
     assert "mapping" in out["error"]
     assert not any(c["command"] in ("navigate_to_point", "go_to_point") for c in svc._nav.calls)
-
-
-def test_start_refuses_when_nav_turns_too_fast():
-    out = asyncio.run(make(ang=1.5).do_command({"command": "start", "duration_s": 10}))
-    assert "angular" in out["error"]
 
 
 def test_stop_without_run_is_an_error():

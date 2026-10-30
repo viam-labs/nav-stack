@@ -34,7 +34,6 @@ def setup(**kw):
     run = ExploreRun(nav, slam, params(**kw), clock=clk.now, sleep=clk.sleep, stop_base=stop_base)
     return w, clk, slam, nav, run, stops
 
-
 async def run_watching(run):
     phases = []
     task = asyncio.ensure_future(run.run())
@@ -62,6 +61,7 @@ def test_phases_progress_in_order():
     if order and order[0] == "idle":
         order = order[1:]
     assert order[:2] == ["structure", "fill"] and order[-2:] == ["finishing", "done"]
+    assert order[order.index("revisit") + 1] == "fill"
 
 
 def test_stop_mid_leg_finishes_once():
@@ -193,14 +193,6 @@ def test_stop_during_finishing_skips_home_retry():
 
     final = asyncio.run(go())
     assert final["phase"] == "done" and nav.legs - starts["before"] == 1 and stops == [1]
-
-
-def test_revisit_returns_to_fill_after_one_replay():
-    w, clk, slam, nav, run, _ = setup(duration_s=900.0)
-    final, seen = asyncio.run(run_watching(run))
-    order = [p for i, p in enumerate(seen) if i == 0 or p != seen[i - 1]]
-    assert "revisit" in order
-    assert order[order.index("revisit") + 1] == "fill"
 
 
 def test_fill_legs_face_their_approach_direction():
