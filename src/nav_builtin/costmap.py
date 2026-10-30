@@ -60,7 +60,8 @@ def mark_points_on_occupancy(
             origin_x=occ.origin_x,
             origin_y=occ.origin_y,
         )
-    cells = max(1, int(math.ceil(float(radius_m) / occ.resolution)))
+    # Radius 0 marks only the point's own cell.
+    cells = max(0, int(math.ceil(float(radius_m) / occ.resolution)))
     dy, dx = _disk_offsets(cells)
     for wx, wy in points:
         row, col = occ.world_to_cell(float(wx), float(wy))

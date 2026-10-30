@@ -968,6 +968,44 @@ def test_plan_with_scan_does_not_seal_mapped_corridor():
     assert result.feasible
 
 
+def _doorway_of_scan_hits(gap_m: float):
+    """6 x 6 m free map; a wall of live scan hits across y=3 with one gap."""
+    res = 0.05
+    m = {
+        "grid": np.zeros((120, 120), dtype=np.int16),
+        "resolution": res,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+    }
+    start = Pose2D(3.0, 1.0, 0.0)
+    xa, xb = 3.0 - gap_m / 2.0, 3.0 + gap_m / 2.0
+    xs = np.concatenate([np.arange(0.0, xa + 1e-9, res / 2), np.arange(xb, 6.0, res / 2)])
+    rel = np.column_stack([xs - start.x, np.full_like(xs, 3.0 - start.y)])
+    scan = conv.points_to_scan(rel, num_bins=4096, range_min=0.0, range_max=10.0)
+    return m, start, Pose2D(3.0, 5.0, 0.0), scan
+
+
+def test_live_hits_inflate_once_like_mapped_walls():
+    """A lidar return is the obstacle's surface; only build_costmap inflates it.
+
+    With a 0.12 m hit disc on top of the robot radius, a doorway between live
+    hits had to be 1.10 m wide (tracer2a: 0.365 m radius) while the same
+    mapped doorway passed at 0.80 m.
+    """
+    robot_r = 0.295 + 0.07
+    kw = dict(
+        inflation_radius_m=robot_r,
+        robot_radius_m=robot_r,
+        body_radius_m=0.295,
+        clearance_preference_m=0.25,
+        dynamic_obstacle_radius_m=0.12,
+    )
+    m, start, goal, scan = _doorway_of_scan_hits(0.85)
+    assert plan_path(m, start, goal, scan=scan, scan_pose=start, **kw).feasible
+    m, start, goal, scan = _doorway_of_scan_hits(0.70)
+    assert not plan_path(m, start, goal, scan=scan, scan_pose=start, **kw).feasible
+
+
 def test_lookahead_advances_along_path():
     path = Path2D(points=((0.0, 0.0), (1.0, 0.0), (2.0, 0.0)), goal_theta=0.0)
     pose = Pose2D(0.0, 0.0, 0.0)
@@ -1645,10 +1683,11 @@ def test_try_replan_falls_back_to_scan_plan_and_records_reason():
     goal = Pose2D(5.0, 1.5, 0.0)
     base = sup.plan(goal, start=world.pose)
     assert base.feasible
-    # Bin 0.8 m ahead, offset toward the +y wall, seen by the scan.
+    # Bin 0.8 m ahead, just off the centerline toward the +y wall, seen by the
+    # scan. It has to block the straight route once inflated a single time.
     n = 72
     ranges = np.full(n, np.inf)
-    ranges[n // 2 + 2] = math.hypot(0.8, 0.15)  # beam at +10 deg -> (1.8, 1.65)
+    ranges[n // 2 + 1] = 0.8  # beam at +5 deg -> (1.80, 1.57)
     scan = conv.LaserScan2D(
         ranges,
         angle_min=-math.pi,
