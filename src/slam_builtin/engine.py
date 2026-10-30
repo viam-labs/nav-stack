@@ -58,6 +58,9 @@ class BuiltinSlamEngine:
         self._grid: LogOddsGrid = occ.empty_grid(
             resolution=cfg.map.resolution
         )
+        # Height slices painted while mapping. The published ``_grid`` is their
+        # union, so a lidar beam cannot clear a camera hit at another height.
+        self._height_bands: dict = {}
         self._pose = conv.Pose2D(0.0, 0.0, 0.0)
         self._last_odom_pose: Optional[conv.Pose2D] = None
         self._last_odom_pose_at: Optional[float] = None
@@ -331,6 +334,7 @@ class BuiltinSlamEngine:
             self._grid = occ.empty_grid(
                 resolution=self._cfg.map.resolution
             )
+            self._height_bands = {}
             self._pose = conv.Pose2D(0.0, 0.0, 0.0)
             self._last_odom_pose = None
             self._last_odom_heading = None
@@ -621,8 +625,12 @@ class BuiltinSlamEngine:
                     info["status"] = "rejected_inconsistent"
                     return info
             poses = res_opt.poses
+        with self._lock:
+            extra = self._graph.scans_after(snap.last_seq)
         started = perf_counter()
-        grid = pg.render_grid(snap, resolution=res, poses=poses, base=base)
+        grid = pg.render_grid(
+            snap, resolution=res, poses=poses, base=base, extra=extra
+        )
         render_ms = (perf_counter() - started) * 1000.0
         self._loop_stats["last_render_ms"] = round(render_ms, 1)
         info["render_ms"] = round(render_ms, 1)
@@ -631,9 +639,12 @@ class BuiltinSlamEngine:
                 info["status"] = "aborted"
                 return info
             tail = self._graph.apply_poses(snap, poses)
-            # Inserts that landed while optimizing/rendering.
-            for pose, s in self._graph.scans_after(snap.last_seq):
-                grid = pg.paint_scan(grid, pose, s)
+            # Inserts that landed while rendering, after ``extra`` was taken.
+            newer = self._graph.scans_after(snap.last_seq)
+            if len(newer) != len(extra):
+                grid = pg.render_grid(
+                    snap, resolution=res, poses=poses, base=base, extra=newer
+                )
             self._replay_grid_edits_locked(grid)
             self._grid = grid
             self._generation += 1
@@ -1398,6 +1409,80 @@ class BuiltinSlamEngine:
         )
         return True
 
+    def _mapping_frames(self) -> list:
+        fn = getattr(self._sensors, "mapping_frames", None)
+        if not callable(fn):
+            return []
+        try:
+            frames = fn()
+        except Exception:  # noqa: BLE001
+            return []
+        return list(frames or [])
+
+    def _band_scans(self, frames: list) -> dict:
+        """Per-height scans when the sensors are not all in one plane."""
+        clouds = []
+        range_min = 0.05
+        range_max = 25.0
+        for item in frames:
+            scan = item[1] if isinstance(item, tuple) else item
+            xyz = getattr(scan, "cloud_xyz", None)
+            if xyz is None:
+                continue
+            pts = np.asarray(xyz, dtype=float)
+            if pts.size == 0 or pts.ndim != 2 or pts.shape[1] < 3:
+                continue
+            clouds.append(pts)
+            range_min = min(range_min, float(getattr(scan, "range_min", range_min)))
+            limit = float(getattr(scan, "range_max", range_max))
+            if math.isfinite(limit):
+                range_max = max(range_max, limit)
+        if not clouds:
+            return {}
+        from .height_bands import band_scans
+
+        return band_scans(
+            clouds,
+            num_bins=int(self._cfg.scan_bins),
+            range_min=range_min,
+            range_max=range_max,
+        )
+
+    def _paint_height_bands(self, pose: conv.Pose2D, scans: dict, src: LogOddsGrid):
+        from .height_bands import compress_bands, cover_bands
+
+        with self._lock:
+            bands = {b: occ.copy_grid(g) for b, g in self._height_bands.items()}
+            if not bands and np.any(np.abs(src.log_odds) > 0.05):
+                bands[0] = occ.copy_grid(src)
+        for band, scan in scans.items():
+            base = bands.get(band)
+            if base is None:
+                template = next(iter(bands.values()), src)
+                base = LogOddsGrid(
+                    log_odds=np.zeros_like(template.log_odds),
+                    resolution=template.resolution,
+                    origin_x=template.origin_x,
+                    origin_y=template.origin_y,
+                )
+            limit = float(scan.range_max)
+            bands[band] = occ.insert_scan(
+                base,
+                pose.x,
+                pose.y,
+                pose.theta,
+                np.asarray(scan.ranges, dtype=float),
+                float(scan.angle_min),
+                float(scan.angle_increment),
+                range_min=float(scan.range_min),
+                range_max=limit if math.isfinite(limit) else 30.0,
+            )
+        bands = cover_bands(bands)
+        fused = compress_bands(bands)
+        items = list(scans.items())
+        primary_band, primary = items[0]
+        return fused, bands, primary, items[1:], int(primary_band)
+
     def _maybe_insert_scan(
         self,
         scan,
@@ -1427,32 +1512,46 @@ class BuiltinSlamEngine:
                     return
             src = self._grid
             pose_snap = conv.Pose2D(pose.x, pose.y, pose.theta)
-        painted = occ.insert_scan(
-            occ.copy_grid(src),
-            pose_snap.x,
-            pose_snap.y,
-            pose_snap.theta,
-            np.asarray(scan.ranges, dtype=float),
-            float(scan.angle_min),
-            float(scan.angle_increment),
-            range_min=float(scan.range_min),
-            range_max=float(scan.range_max)
-            if math.isfinite(scan.range_max)
-            else 30.0,
-        )
+            frames = self._mapping_frames()
+        band_scans = self._band_scans(frames)
+        primary_band = 0
+        if band_scans:
+            painted, bands, primary, extras, primary_band = self._paint_height_bands(
+                pose_snap, band_scans, src
+            )
+        else:
+            painted = occ.insert_scan(
+                occ.copy_grid(src),
+                pose_snap.x,
+                pose_snap.y,
+                pose_snap.theta,
+                np.asarray(scan.ranges, dtype=float),
+                float(scan.angle_min),
+                float(scan.angle_increment),
+                range_min=float(scan.range_min),
+                range_max=float(scan.range_max)
+                if math.isfinite(scan.range_max)
+                else 30.0,
+            )
+            bands = None
+            primary, extras = scan, None
         hook = None
         with self._lock:
             # Drop the paint if clear/reset/rebuild replaced the grid mid-ray.
             if self._grid is not src:
                 return
             self._grid = painted
+            if bands is not None:
+                self._height_bands = bands
             self._last_insert_pose = pose_snap
             self._last_insert_at = now
             self._updates += 1
             if self._mode == MODE_MAPPING:
                 hook = self._keyframe_hook
                 nodes = len(self._graph)
-                self._graph.add_scan(pose_snap, scan)
+                self._graph.add_scan(
+                    pose_snap, primary, band=primary_band, also=extras
+                )
                 if (
                     len(self._graph) > nodes
                     and self._loop_closure_enabled()

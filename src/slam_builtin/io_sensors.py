@@ -12,6 +12,7 @@ import numpy as np
 from viam.utils import struct_to_dict
 
 from ..config import (
+    CLOUD_FRAME_CAMERA_OPTICAL,
     LIDAR_SCAN_GET_LASER_SCAN,
     LIDAR_SCAN_POINT_CLOUD,
     LidarConfig,
@@ -104,6 +105,8 @@ class BuiltinSensors:
         self._scan_had_gap = False
         # Lidars whose gRPC read is still in flight. That is not a dropout.
         self._lidar_pending: set[str] = set()
+        # Last per-sensor scans, including depth cameras left out of the match.
+        self._mapping_frames: list = []
         # One gRPC scan read per lidar. A dead camera that ignores cancel must
         # not stack a new GetPointCloud on every tick — that wedges the module
         # loop, so localization stays blind after the device returns.
@@ -185,7 +188,9 @@ class BuiltinSensors:
         caller can skip matching/inserting a scan it already consumed.
 
         Sensors with ``obstacles_only=true`` are omitted (nav costmap reads them
-        via ViamWorldIO instead).
+        via ViamWorldIO instead). Depth cameras (``camera_optical``) are read
+        for mapping bands but left out of this merged scan, so they cannot
+        move the pose. A camera-only robot still matches on those scans.
         """
         if not self._mounts_ready:
             return None
@@ -201,17 +206,24 @@ class BuiltinSensors:
         if not lidars:
             return self._stale_or_none(max_age_s, now, fresh)
         self._scan_fetch_at = now
-        scans = []
+        frames = []
+        match = []
         captured = []
         for lidar in lidars:
             if lidar.obstacles_only:
                 continue
             scan = self._read_lidar_scan_sync(lidar, max_age_s=max_age_s)
-            if scan is not None:
-                scans.append(scan)
-                captured.append(self._read_captured_at.get(lidar.name, now))
+            if scan is None:
+                continue
+            frames.append((lidar, scan))
+            captured.append(self._read_captured_at.get(lidar.name, now))
+            if lidar.cloud_frame != CLOUD_FRAME_CAMERA_OPTICAL:
+                match.append(scan)
+        self._mapping_frames = frames
+        if not match:
+            match = [scan for _, scan in frames]
         captured_at = sum(captured) / len(captured) if captured else now
-        if not scans:
+        if not match:
             # An in-flight read is not a dropout. Only a finished miss (camera
             # down, empty cloud) should let the next identical frame count
             # as a new observation.
@@ -219,9 +231,9 @@ class BuiltinSensors:
                 self._scan_had_gap = True
             return self._stale_or_none(max_age_s, now, fresh)
         merged = (
-            scans[0]
-            if len(scans) == 1
-            else conv.merge_scans(scans, self._cfg.scan_bins)
+            match[0]
+            if len(match) == 1
+            else conv.merge_scans(match, self._cfg.scan_bins)
         )
         key = _scan_content_key(merged)
         if cached is not None and key == self._scan_cache_key:
@@ -266,6 +278,14 @@ class BuiltinSensors:
             return float("nan")
         return max(0.0, time.monotonic() - self._scan_cache_at)
 
+    def mapping_frames(self) -> list:
+        """Per-sensor scans from the last ``get_scan`` read.
+
+        Includes depth cameras omitted from the match scan. ``obstacles_only``
+        sensors are still absent.
+        """
+        return list(self._mapping_frames)
+
     def scan_captured_at(self) -> float:
         """Monotonic time the current cached scan was captured (NaN if none)."""
         if self._scan_cache is None:
@@ -303,7 +323,10 @@ class BuiltinSensors:
         if pts.shape[0]:
             r = np.hypot(pts[:, 0], pts[:, 1])
             keep = (r >= lidar.min_range) & (r <= lidar.max_range)
-            scan.cloud_xy = np.ascontiguousarray(pts[keep, :2], dtype=float)
+            kept = pts[keep]
+            scan.cloud_xy = np.ascontiguousarray(kept[:, :2], dtype=float)
+            if kept.shape[1] >= 3:
+                scan.cloud_xyz = np.ascontiguousarray(kept[:, :3], dtype=float)
         return scan
 
     def _try_shm_scan(

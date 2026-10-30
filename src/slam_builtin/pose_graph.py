@@ -30,6 +30,8 @@ class GraphScan:
     angle_increment: float
     range_min: float
     range_max: float
+    # Height slice this scan raytraces. 0 is the legacy single-plane scan.
+    band: int = 0
 
 
 @dataclass
@@ -37,6 +39,8 @@ class GraphNode:
     pose: conv.Pose2D
     travel_m: float
     scans: List[GraphScan] = field(default_factory=list)
+    # Map inserts stored here. Extra height-band scans do not count.
+    inserts: int = 0
 
 
 @dataclass
@@ -136,7 +140,9 @@ class PoseGraph:
             self._rebase = conv.compose_poses(correction, self._rebase)
 
     # -- building -----------------------------------------------------------
-    def _make_scan(self, rel: conv.Pose2D, scan: conv.LaserScan2D) -> Optional[GraphScan]:
+    def _make_scan(
+        self, rel: conv.Pose2D, scan: conv.LaserScan2D, *, band: int = 0
+    ) -> Optional[GraphScan]:
         ranges = np.asarray(scan.ranges, dtype=float)
         if ranges.size == 0:
             return None
@@ -160,16 +166,27 @@ class PoseGraph:
             angle_increment=angle_increment,
             range_min=float(scan.range_min),
             range_max=range_max,
+            band=int(band),
         )
 
-    def add_scan(self, pose: conv.Pose2D, scan: conv.LaserScan2D) -> bool:
+    def add_scan(
+        self,
+        pose: conv.Pose2D,
+        scan: conv.LaserScan2D,
+        *,
+        band: int = 0,
+        also: Optional[Sequence[Tuple[int, conv.LaserScan2D]]] = None,
+    ) -> bool:
         """Store a map insert; starts a new node after enough motion."""
         pose = conv.Pose2D(float(pose.x), float(pose.y), float(pose.theta))
         if not self.nodes:
-            gs = self._make_scan(conv.Pose2D(0.0, 0.0, 0.0), scan)
+            gs = self._make_scan(conv.Pose2D(0.0, 0.0, 0.0), scan, band=band)
             if gs is None:
                 return False
-            self.nodes.append(GraphNode(pose=pose, travel_m=0.0, scans=[gs]))
+            scans = [gs, *self._extra_scans(conv.Pose2D(0.0, 0.0, 0.0), also)]
+            self.nodes.append(
+                GraphNode(pose=pose, travel_m=0.0, scans=scans, inserts=1)
+            )
             return True
         last = self.nodes[-1]
         last_live = conv.compose_poses(self._rebase, last.pose)
@@ -180,7 +197,7 @@ class PoseGraph:
             if len(self.nodes) >= self.max_nodes:
                 self.full = True
                 return False
-            gs = self._make_scan(conv.Pose2D(0.0, 0.0, 0.0), scan)
+            gs = self._make_scan(conv.Pose2D(0.0, 0.0, 0.0), scan, band=band)
             if gs is None:
                 return False
             info = odometry_info(rel)
@@ -195,13 +212,18 @@ class PoseGraph:
                 info = info * 1e-4
                 self._rebase = conv.Pose2D(0.0, 0.0, 0.0)
             self.nodes.append(
-                GraphNode(pose=pose, travel_m=last.travel_m + moved, scans=[gs])
+                GraphNode(
+                    pose=pose,
+                    travel_m=last.travel_m + moved,
+                    scans=[gs, *self._extra_scans(conv.Pose2D(0.0, 0.0, 0.0), also)],
+                    inserts=1,
+                )
             )
             self.edges.append(
                 GraphEdge(len(self.nodes) - 2, len(self.nodes) - 1, rel, info)
             )
             return True
-        if len(last.scans) >= self.scans_per_node:
+        if last.inserts >= self.scans_per_node:
             return False
         # Spread the kept scans across the node instead of the first few ticks.
         prev = last.scans[-1].rel
@@ -212,11 +234,25 @@ class PoseGraph:
             and abs(conv.normalize_angle(rel.theta - prev.theta)) < step_rad
         ):
             return False
-        gs = self._make_scan(rel, scan)
+        gs = self._make_scan(rel, scan, band=band)
         if gs is None:
             return False
         last.scans.append(gs)
+        last.scans.extend(self._extra_scans(rel, also))
+        last.inserts += 1
         return True
+
+    def _extra_scans(
+        self,
+        rel: conv.Pose2D,
+        also: Optional[Sequence[Tuple[int, conv.LaserScan2D]]],
+    ) -> List[GraphScan]:
+        out: List[GraphScan] = []
+        for band, scan in also or []:
+            gs = self._make_scan(rel, scan, band=int(band))
+            if gs is not None:
+                out.append(gs)
+        return out
 
     def add_edge(self, edge: GraphEdge) -> None:
         self.edges.append(edge)
@@ -319,31 +355,56 @@ def render_grid(
     base: Optional[LogOddsGrid] = None,
     center: Optional[Tuple[float, float]] = None,
     progress: Optional[Callable[[int, int], None]] = None,
+    extra: Optional[Sequence[Tuple[conv.Pose2D, GraphScan]]] = None,
 ) -> LogOddsGrid:
-    """Ray-cast stored scans at (optimized) node poses into a fresh grid."""
+    """Ray-cast stored scans at (optimized) node poses into a fresh grid.
+
+    Scans tagged with a height ``band`` are drawn into that band only, then
+    collapsed so a cell stays occupied while any band still sees it.
+    """
+    from .height_bands import compress_bands
+
     if base is not None:
-        grid = occ.copy_grid(base)
+        seed = occ.copy_grid(base)
     elif center is not None:
         size = 20.0
-        grid = occ.empty_grid(
+        seed = occ.empty_grid(
             resolution=resolution,
             size_m=size,
             origin_x=center[0] - size / 2.0,
             origin_y=center[1] - size / 2.0,
         )
     else:
-        grid = occ.empty_grid(resolution=resolution)
+        seed = occ.empty_grid(resolution=resolution)
+    bands: dict = {0: seed}
     poses = snap.poses if poses is None else poses
     order = range(len(snap)) if nodes is None else nodes
     total = len(order)
+
+    def _paint(pose: conv.Pose2D, scan: GraphScan) -> None:
+        band = int(getattr(scan, "band", 0))
+        grid = bands.get(band)
+        if grid is None:
+            grid = LogOddsGrid(
+                log_odds=np.zeros_like(bands[0].log_odds),
+                resolution=bands[0].resolution,
+                origin_x=bands[0].origin_x,
+                origin_y=bands[0].origin_y,
+            )
+        bands[band] = paint_scan(grid, pose, scan)
+
     for k, i in enumerate(order):
         p = poses[i]
         node_pose = conv.Pose2D(float(p[0]), float(p[1]), float(p[2]))
         for s in snap.scans[i]:
-            grid = paint_scan(grid, conv.compose_poses(node_pose, s.rel), s)
+            _paint(conv.compose_poses(node_pose, s.rel), s)
         if progress is not None:
             progress(k + 1, total)
-    return grid
+    for pose, scan in extra or []:
+        _paint(pose, scan)
+    if len(bands) == 1:
+        return bands[0]
+    return compress_bands(bands)
 
 
 # -- optimization -------------------------------------------------------------

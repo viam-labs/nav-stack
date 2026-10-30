@@ -1656,3 +1656,63 @@ def test_engine_restores_last_pose_on_localizing(tmp_path: Path):
     assert again is not None
     assert again.x == pytest.approx(4.0)
     assert again.y == pytest.approx(5.0)
+
+
+def test_match_scan_leaves_out_a_depth_camera(monkeypatch):
+    """A depth camera feeds mapping, not the scan that moves the pose."""
+    import asyncio
+
+    from src.slam_builtin.io_sensors import BuiltinSensors
+
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidars": [
+                {"name": "front"},
+                {"name": "depth", "cloud_frame": "camera_optical"},
+            ],
+        }
+    )
+    sensors = BuiltinSensors(
+        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
+        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+    )
+
+    def _read(lidar, *, max_age_s):
+        del max_age_s
+        dist = 1.0 if lidar.name == "depth" else 3.0
+        return _wall_scan(dist=dist)
+
+    monkeypatch.setattr(sensors, "_read_lidar_scan_sync", _read)
+    monkeypatch.setattr(sensors, "_SCAN_MIN_REFETCH_S", 0.0)
+    scan = sensors.get_scan(1.0, fresh=True)
+    assert scan is not None
+    finite = scan.ranges[np.isfinite(scan.ranges)]
+    assert finite.min() == pytest.approx(3.0)
+    names = [lidar.name for lidar, _ in sensors.mapping_frames()]
+    assert names == ["front", "depth"]
+
+
+def test_camera_hit_survives_a_lidar_beam_at_another_height():
+    """A later lidar ray past a camera hit does not erase that hit."""
+    from src.slam_builtin.height_bands import compress_bands, paint_bands
+
+    pose = conv.Pose2D(0.0, 0.0, 0.0)
+    camera = np.array([[1.0, 0.0, 0.80]])
+    lidar_past = np.array([[3.0, 0.0, 0.21]])
+    bands = paint_bands(
+        {}, [camera], pose, resolution=0.05, num_bins=360,
+        range_min=0.05, range_max=30.0,
+    )
+    bands = paint_bands(
+        bands, [lidar_past], pose, resolution=0.05, num_bins=360,
+        range_min=0.05, range_max=30.0,
+    )
+    fused = compress_bands(bands)
+
+    def odds(x, y):
+        row, col = fused.world_to_cell(x, y)
+        return float(fused.log_odds[row, col])
+
+    assert odds(1.0, 0.0) >= 0.5
+    assert odds(3.0, 0.0) >= 0.5
