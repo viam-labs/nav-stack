@@ -886,22 +886,22 @@ def plan_path(
             origin_x=occ.origin_x,
             origin_y=occ.origin_y,
         )
-    # Paint lidar hits as occupied *cells* (small radius). build_costmap then
-    # applies inflation once. Using inflation_radius here double-inflates walls
-    # already on the map and can seal narrow corridors.
+    # A lidar or depth return is the obstacle's surface, so it marks only its
+    # own cell, the same as a mapped wall. build_costmap then adds the robot
+    # radius and clearance once. A thicker hit is a second inflation: the old
+    # 0.12 m disc made every live obstacle block 0.54 m instead of 0.40 m, and
+    # a doorway between live hits had to be 1.10 m wide instead of 0.80 m.
     if scan is not None and scan_pose is not None:
-        hit_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
         occ = mark_scan_on_occupancy(
-            occ, scan_pose, scan, obstacle_radius_m=hit_r
+            occ, scan_pose, scan, obstacle_radius_m=0.0
         )
     if local_view is not None:
-        hit_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
         # Copy only raw, novel scan hits from the cached local view. Its merged
         # cost layer includes global inflation and must not be painted/reinflated.
         occ = mark_local_costmap_on_occupancy(
             occ,
             local_view,
-            radius_m=hit_r,
+            radius_m=0.0,
         )
         # The seal is a corridor paint: a 0.35 m band on the old centerline
         # also closes the free side when the obstacle only clips one shoulder

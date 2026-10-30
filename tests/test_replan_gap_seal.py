@@ -385,14 +385,13 @@ def test_path_locally_blocked_ignores_inscribed_when_corridor_open():
     )
 
 
-def test_static_plan_uses_doorway_but_scan_replan_takes_long_detour():
-    """Mirrors live: plan_to_point ~4 m through gap; navigate replan ~47 m.
+def test_scan_replan_keeps_the_doorway_the_static_plan_uses():
+    """Live: plan_to_point ~4 m through the gap, but navigate replanned ~47 m.
 
-    Initial plan is scan-free. Every ``_try_replan`` paints live hits with a
-    0.12 m disc then full footprint inflation — enough to seal a 1.08 m gap
-    when the frames read even slightly inward — and the 1.8× length cap does
-    not apply to that first scan+local attempt. Runtime policy now delays that
-    replan while the nose is clear so DWA can keep the short route.
+    Every ``_try_replan`` painted live hits as a 0.12 m disc and then added the
+    full footprint inflation. That sealed a 1.08 m gap when the frames read
+    even slightly inward. Hits now mark one cell and are inflated once, so the
+    replan keeps the doorway.
     """
     occ = _gap_map()
     start = Pose2D(DOOR_X, WALL_Y - 1.5, math.pi / 2)
@@ -442,8 +441,8 @@ def test_static_plan_uses_doorway_but_scan_replan_takes_long_detour():
         math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
         for i in range(len(pts) - 1)
     )
-    assert painted_len > 20.0, f"expected long detour, got {painted_len:.1f} m"
-    assert max(p[0] for p in pts) > WALL_END - 1.0
+    assert painted_len < 5.0, f"expected the doorway, got a {painted_len:.1f} m detour"
+    assert max(p[0] for p in pts) < WALL_END - 1.0
 
 
 def test_defer_periodic_replan_while_the_scan_can_continue():
