@@ -49,7 +49,6 @@ from ..nav.pose_jump_gate import (
     stuck_refine_decision,
 )
 from ..geom import conversions as conv
-from ..slam_builtin.scan_match import lateral_correction_pose, shift_axes
 from ..shm.lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
@@ -1502,38 +1501,6 @@ class SlamService(SLAM):
         )
         return shift_m, shift_deg
 
-    def _lost_sideways_match(
-        self,
-        current: Optional[conv.Pose2D],
-        matched_pose: object,
-        prior_score: object,
-    ) -> bool:
-        """True when a bad pose's match is a sideways slip, not a hall slide.
-
-        Same lost-pose bar as the driving tracker (prior under 0.25). The
-        along-hall part of a heading error is allowed; a pure slide is not.
-        """
-        if current is None or not isinstance(matched_pose, Mapping):
-            return False
-        try:
-            prior = float(prior_score) if prior_score is not None else None
-        except (TypeError, ValueError):
-            return False
-        if prior is None or not math.isfinite(prior) or prior >= 0.25:
-            return False
-        try:
-            matched = self._pose_from_mapping(matched_pose)
-        except (TypeError, ValueError):
-            return False
-        along, cross, dyaw = shift_axes(current, matched)
-        if abs(cross) < 0.25 and abs(dyaw) < math.radians(10.0):
-            return False
-        if abs(along) > 0.80 or abs(cross) > 1.20:
-            return False
-        if abs(dyaw) > math.radians(45.0):
-            return False
-        return True
-
     def _tick_match_score(self) -> Optional[float]:
         """Latest continuous scan-match score for the published pose, if any."""
         engine = self._engine
@@ -2081,54 +2048,6 @@ class SlamService(SLAM):
                     stopped_recovery,
                 )
                 return self._publish_relocalize_check(result)
-            # Driving refine keeps the sideways part of a local peak and drops
-            # a slide along the hall or a heading change. Stopped recovery
-            # may still apply a larger trusted match.
-            if (
-                allow_during_navigation
-                and not stopped_recovery
-                and current is not None
-                and str(match_mode).startswith("local")
-            ):
-                raw = self._pose_from_mapping(matched_pose)
-                lateral = lateral_correction_pose(current, raw)
-                if lateral is None:
-                    self._pose_jump_gate.clear()
-                    result["status"] = "refused_along"
-                    result["corrected"] = False
-                    result["lateral_only"] = False
-                    LOGGER.info(
-                        "periodic relocalize: refusing mid-nav match that is "
-                        "not a sideways hallway correction "
-                        "(%.2f m / %.1f deg score=%.2f)",
-                        0.0 if math.isinf(shift_m) else shift_m,
-                        0.0 if math.isinf(shift_deg) else shift_deg,
-                        score,
-                    )
-                    return self._publish_relocalize_check(result)
-                matched_pose = {
-                    "x": lateral.x,
-                    "y": lateral.y,
-                    "theta": lateral.theta,
-                }
-                shift_m, shift_deg = self._pose_shift_from_current(
-                    current, matched_pose
-                )
-                result["shift_m"] = (
-                    None if math.isinf(shift_m) else round(shift_m, 3)
-                )
-                result["shift_deg"] = (
-                    None if math.isinf(shift_deg) else round(shift_deg, 2)
-                )
-                result["lateral_only"] = True
-                large_jump = (
-                    (not math.isinf(shift_m) and shift_m >= cfg.localize_jump_large_m)
-                    or (
-                        not math.isinf(shift_deg)
-                        and shift_deg >= cfg.localize_jump_large_deg
-                    )
-                )
-                result["large_jump"] = bool(large_jump)
             candidate = self._pose_from_mapping(matched_pose)
             # Stopped recovery: a trusted large match may apply once without
             # waiting for a second agreeing frame (base is already halted).
@@ -2138,47 +2057,6 @@ class SlamService(SLAM):
             decision = self._confirm_pose_jump(
                 current, candidate, force=force_jump
             )
-            # A stopped cart used to wait for the next 20 s watchdog tick
-            # before the second sample, holding the wheels at the bumper.
-            # When the pose is already lost and the peak is sideways, take
-            # the remaining samples in this cycle.
-            if (
-                not decision.should_apply
-                and not driving
-                and not str(match_mode).startswith("full_map")
-                and self._lost_sideways_match(current, matched_pose, prior_score)
-            ):
-                extra = max(0, decision.confirm_needed - decision.confirm_count)
-                for _ in range(extra):
-                    nxt = await self._global_localize(dict(match_command))
-                    nxt_pose = nxt.get("pose") if isinstance(nxt, Mapping) else None
-                    if not isinstance(nxt_pose, Mapping):
-                        break
-                    nxt_prior = nxt.get("prior_score", prior_score)
-                    if not self._lost_sideways_match(current, nxt_pose, nxt_prior):
-                        break
-                    nxt_shift_m, nxt_shift_deg = self._pose_shift_from_current(
-                        current, nxt_pose
-                    )
-                    if (
-                        match_mode == "local_parked"
-                        and not self._parked_refine_worth_applying(
-                            cfg, nxt, nxt_shift_m, nxt_shift_deg
-                        )
-                    ):
-                        break
-                    matched_pose = nxt_pose
-                    shift_m, shift_deg = nxt_shift_m, nxt_shift_deg
-                    good_match, score, ray_mae = self._localization_match_quality(
-                        nxt, cfg
-                    )
-                    prior_score = nxt_prior
-                    candidate = self._pose_from_mapping(matched_pose)
-                    decision = self._confirm_pose_jump(
-                        current, candidate, force=False
-                    )
-                    if decision.should_apply:
-                        break
             result.update(self._jump_decision_dict(decision))
             if not decision.should_apply:
                 result["status"] = "awaiting_confirm"

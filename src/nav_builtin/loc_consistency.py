@@ -378,7 +378,7 @@ def localization_looks_bad(
     frac = (float(bad) / float(compared)) if compared else 0.0
     trigger = compared >= int(min_beams) and frac >= float(min_frac)
     # Optional: a few beams with a moderate gap. Off by default — open doors
-    # and moved furniture trip it constantly; nav_scan_track handles drift.
+    # and moved furniture trip it constantly.
     if (
         not trigger
         and int(early_beams) > 0

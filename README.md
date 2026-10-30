@@ -133,7 +133,6 @@ circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
 | `periodic_relocalize_during_navigation` | SLAM | Allow periodic relocalize while MoveOnMap is active (default `false`; soft-holds during nav were disruptive) |
 | `localize_mid_nav_apply_max_m` / `_deg` | SLAM | While a goal is active, never apply a pose jump past this size (default `1.0` m / `30°`) — even with `apply: true`. Matches the nav refine force-apply cap; larger mid-drive snaps stay `refused_large` |
 | `localize_stopped_recovery_max_m` / `_deg` / `_min_score` | SLAM | After nav stops for bad loc, one recovery may apply a *trusted* match up to `3.0` m / `90°` (score ≥ `0.45`) so the goal can continue instead of stop/go. Weak / ambiguous peaks stay refused |
-| `nav_scan_track` | SLAM | While navigating, apply small continuous scan-match nudges (≤ `0.15` m / `3°`, blended, at most `5` cm / `1°` per match) when the published pose already fits the scan (score ≥ `0.25`), the match is good (≥ `0.35`), and the base is not spinning. Large jumps stay refused during nav. Default `true` |
 | `global_localize_on_start_refine` | SLAM | Run a second auto `global_localize` pass after startup (default `true`) |
 | `global_localize_on_start_refine_delay_s` | SLAM | Delay before second refine pass (default `8.0`) |
 | `global_localize_on_start_refine_max_passes` | SLAM | Max startup refine passes while quality is below target (default `3`) |

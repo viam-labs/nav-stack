@@ -977,11 +977,6 @@ class SlamConfig:
     # match to full-map while a pose exists.
     periodic_relocalize_full_map_on_low_quality: bool = False
     periodic_relocalize_during_navigation: bool = False
-    # While navigating, apply small continuous scan-match nudges (≤ 0.15 m /
-    # 3° per match, blended) when the published pose already explains the scan
-    # and the match clearly beats it. Keeps odom drift from building up to a
-    # stop-and-refine. Large jumps stay refused during nav.
-    nav_scan_track: bool = True
     # If startup global_localize is still running this long (s), cancel it so
     # the drift watchdog can take over. A restored-pose startup that already
     # has a weak scan score is released sooner (see the local grace in
