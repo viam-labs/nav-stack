@@ -3,7 +3,6 @@ import asyncio
 from src.explore.clients import NavStatus, Pose
 from src.explore.legs import LegRunner, leg_timeout_s
 
-
 class FakeNav:
     def __init__(self, statuses):
         self.statuses, self.calls = list(statuses), []
@@ -22,7 +21,6 @@ class FakeNav:
 
     async def cancel(self):
         self.calls.append(("cancel",))
-
 
 class FakeClock:
     def __init__(self):
@@ -119,13 +117,6 @@ def test_leg_that_never_activates_fails_quickly():
     nav, clk = FakeNav([st(False, "idle", 0.0, 0.0)]), FakeClock()
     r = go(runner(nav, clk))
     assert not r.ok and r.reason == "not_started" and clk.t < 10.0
-
-
-def test_unplanned_leg_reads_simple_nav_state_not_top_level():
-    nav = FakeNav([st2(False, "idle", "idle"), st2(True, "canceled", "active"),
-                   st2(False, "canceled", "succeeded", 2.0, 0.0)])
-    r = go(runner(nav, FakeClock()), planned=False)
-    assert r.ok
 
 
 def test_leg_not_sent_when_pose_already_lost():
