@@ -254,6 +254,14 @@ class SimBase(Base):
         if cmd in {"get_pose", "pose"}:
             pose = world.get_pose()
             return {"x": pose.x, "y": pose.y, "theta": pose.theta}
+        if cmd == "add_obstacle":
+            oid = world.add_obstacle(
+                float(command["x"]), float(command["y"]), float(command.get("radius_m", 0.2))
+            )
+            return {"ok": True, "id": oid}
+        if cmd == "clear_obstacles":
+            world.clear_obstacles()
+            return {"ok": True}
         raise Exception(f"unknown sim-base command: {cmd!r}")
 
 

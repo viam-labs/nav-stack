@@ -14,6 +14,7 @@ This module (`viam-labs:nav-stack`) provides:
 | `viam-labs:nav-stack:navigation-external` | `rdk:service:navigation` | Same Navigation service against **any** `rdk:service:slam`. |
 | `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders costmap + plan(s), pose, footprint and goal as a live camera image. |
 | `viam-labs:nav-stack:sim-base` | `rdk:component:base` | Simulated base for hardware-free mapping / nav (`SetVelocity` → raycast world). |
+| `viam-labs:nav-stack:explore` | `rdk:service:generic` | Autonomous exploration drive for mapping: frontier and revisit goals under a time budget. |
 | `viam-labs:nav-stack:rplidar` / `wit-imu` / `shm-pointcloud` | camera / movement_sensor | Optional sensor helpers with POSIX shm for low-latency reads. |
 
 ## How it works
@@ -342,6 +343,69 @@ Use `viam-labs:nav-stack:navigation-external` to drive builtin navigation from *
 
 Optional attributes: `trust_movement_sensor_pose` (default `false`), `snap_heading` (default `false`), plus the same lidar/odometry tuning fields as the SLAM service and the same `builtin` block as `navigation`. The built-in `navigation` model is unchanged; use it when you map with `nav-stack:slam`.
 
+### Explore service (autonomous mapping drive)
+
+`viam-labs:nav-stack:explore` drives the robot around an unmapped space for a
+time budget so builtin SLAM maps it, then saves the map and returns to where it
+started. It is a client of the SLAM and navigation services and never drives
+the base directly except to stop.
+
+```json
+{
+  "name": "explore",
+  "api": "rdk:service:generic",
+  "model": "viam-labs:nav-stack:explore",
+  "attributes": {
+    "slam_service": "slam",
+    "navigation_service": "navigation",
+    "base": "my-base",
+    "max_linear_mps": 0.4,
+    "max_angular_dps": 30,
+    "home_tolerance_m": 0.5,
+    "structure_fraction": 0.15,
+    "revisit_fraction": 0.1,
+    "well_seen_m": 4.0,
+    "keyframe_max": 2000
+  }
+}
+```
+
+Requirements checked by `start` (nothing moves if either fails):
+
+- The SLAM service is in `mapping` mode (`start_mapping`).
+- The navigation service's `max_vel_theta` is at or below `max_angular_dps`
+  (default 30°/s ≈ 0.52 rad/s), e.g. `"max_vel_theta": 0.5`. Builtin SLAM drops
+  scans while yawing faster than 45°/s, and nav's default is 1.5 rad/s.
+
+DoCommands:
+
+| Command | Args | Reply |
+| --- | --- | --- |
+| `start` | `duration_s` | `{"started": true, "duration_s": N}` or `{"error": "..."}` |
+| `stop` | — | `{"stopping": true}`; the finish sequence runs as on timeout |
+| `status` | — | `{phase, elapsed_s, remaining_s, legs, legs_failed, coverage_cells, frontier_count, keyframes_used, last_error, home}` |
+
+A run has three phases, then a finish. **Structure** (the first
+`structure_fraction` of the budget, or until 60% of `keyframe_max` keyframes):
+a wall-following outer circuit and a few inner loops of at least 12 m, pausing
+2 s facing a wall between legs, so loop closure fires while the keyframe budget
+is fresh. **Fill**: frontier cells and free cells farther than `well_seen_m`
+from any visited pose are scored by expected newly seen cells per planned meter
+and driven with planned navigation. **Revisit** (the last `revisit_fraction`):
+replays each structure circuit once, least-closed first, unless the pose graph
+is full, then returns to fill (or idles) until the budget ends. **Finish** (timeout, `stop`, or an unrecoverable error): cancel,
+`optimize`, `save_map`, navigate home (one retry), else stop in place. The map
+is saved before the drive home. A `stop` received while finishing skips the
+retry of the drive home. Any error from a SLAM or navigation call ends the run
+through the same finish sequence and is reported in `last_error`.
+
+Failed legs (error, timeout at 3x the planned time with a 20 s floor, or ending
+more than 1 m from the goal) blacklist the goal for 10 minutes; five in a row
+pause the run for 30 s and twenty end it. A lost pose or an unhealthy SLAM is
+waited out for 60 s, then the run finishes. Moving obstacles are left to the
+navigation service's local costmap; the explore service only avoids goals that
+already failed.
+
 ### Builtin simulation (no hardware)
 
 Bring up slam + navigation against a raycast floorplan so you can **map**, **localize**, **plan/execute** paths (including from nav-stack-ui), and **repeat** the same path after a pose reset — without real lidars or a wheeled base.
@@ -405,6 +469,7 @@ Notes:
 - Default world is a built-in L-corridor; set `sim.map_path` / `map_path` on sim-base to a `.npy` grid (+ optional sibling `.json` with `resolution`, `origin_x`, `origin_y`).
 - Lidars and movement sensors are omitted when `sim.enabled` is true.
 - Reset pose for repeatable runs: `sim-base` DoCommand `{"command": "reset"}` (optional `x` / `y` / `theta`).
+- Inject obstacles the map does not know about: `sim-base` DoCommand `{"command": "add_obstacle", "x": 2.0, "y": 1.0, "radius_m": 0.3}` (returns an `id`) and `{"command": "clear_obstacles"}`; `get_pose` returns ground truth.
 
 **Local bring-up (viam-server):**
 

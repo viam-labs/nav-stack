@@ -68,6 +68,17 @@
         "max_vel_theta": 1.0,
         "clearance_m": 0.2
       }
+    },
+    {
+      "name": "explore",
+      "api": "rdk:service:generic",
+      "model": "viam-labs:nav-stack:explore",
+      "attributes": {
+        "slam_service": "slam",
+        "navigation_service": "nav",
+        "base": "sim-base",
+        "max_angular_dps": 60
+      }
     }
   ]
 }
