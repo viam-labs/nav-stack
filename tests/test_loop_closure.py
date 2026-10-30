@@ -219,6 +219,39 @@ def test_match_against_recovers_offset():
     assert m.fit > 0.55
 
 
+def test_long_loop_recovers_a_several_meter_drift():
+    """A return several meters and tens of degrees off is inside the search.
+
+    The old ±1.5 m / ±15° window could not see this. Translation still has to
+    stay under about 10% of the loop, which a long loop allows.
+    """
+    truth = _truth_world()
+    graph = pg.PoseGraph(node_spacing_m=0.5)
+    poses = _path()
+    shift = conv.Pose2D(1.4, 1.2, math.radians(25.0))
+    cut = len(poses) - 40
+    for i, pose in enumerate(poses):
+        stored = pose if i < cut else conv.compose_poses(shift, pose)
+        graph.add_scan(stored, _raycast(truth, pose))
+    snap = graph.snapshot()
+    assert float(snap.travel[-1]) > 35.0
+    wandered = math.hypot(
+        snap.poses[-1, 0] - poses[-1].x, snap.poses[-1, 1] - poses[-1].y
+    )
+    assert wandered > 2.5
+    match, reason = loop_closure.detect(
+        snap, loop_closure.LoopClosureParams(), resolution=RES
+    )
+    assert reason == "ok", reason
+    assert match is not None
+    # Along the corridor a fraction of a meter is unobservable. The meters of
+    # drift and the heading are not.
+    residual = math.hypot(match.pose.x - poses[-1].x, match.pose.y - poses[-1].y)
+    assert residual < 0.6
+    assert residual < wandered / 2
+    assert abs(conv.normalize_angle(match.pose.theta - poses[-1].theta)) < math.radians(4.0)
+
+
 def test_detect_rejects_when_no_old_geometry():
     truth = _truth_world()
     graph = pg.PoseGraph(node_spacing_m=0.5)

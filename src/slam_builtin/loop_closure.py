@@ -25,13 +25,15 @@ from .types import LogOddsGrid
 class LoopClosureParams:
     min_travel_gap_m: float = 6.0
     search_radius_m: float = 4.0
-    submap_radius_m: float = 8.0
+    # Wide enough that a several-meter return on a long loop is still inside
+    # the submap. The match window below is the part that has to see the drift.
+    submap_radius_m: float = 16.0
     submap_max_nodes: int = 80
     query_travel_m: float = 2.0
     query_max_points: int = 400
     query_max_range_m: float = 12.0
-    window_m: float = 1.5
-    window_deg: float = 15.0
+    window_m: float = 8.0
+    window_deg: float = 45.0
     min_score: float = 0.55
     min_overlap: float = 0.3
     min_points: int = 60
@@ -159,6 +161,19 @@ _COARSE_YAW_DEG = 2.0
 _FINE_XY_CELLS = 3
 _FINE_YAW_DEG = 0.5
 _FINE_YAW_STEPS = 4
+# Coarse cells on a side. A short window stays at 0.1 m; a long-loop window
+# steps up so the lattice does not grow with the square of the search.
+_COARSE_MAX_STEPS = 20
+
+
+def _coarse_cell_step(window_m: float, res: float) -> int:
+    if res <= 0:
+        return 2
+    span = float(window_m) / res
+    cells = 2
+    if span / cells > _COARSE_MAX_STEPS:
+        cells = max(2, int(math.ceil(span / _COARSE_MAX_STEPS)))
+    return cells
 
 
 def _match_grid(grid: LogOddsGrid) -> _MatchGrid:
@@ -224,8 +239,9 @@ def match_against(
         return None
     mg = _match_grid(grid)
     res = mg.resolution
-    k = int(round(window_m / (2.0 * res)))
-    offs = np.arange(-k, k + 1, dtype=np.int64) * 2
+    cells = _coarse_cell_step(window_m, res)
+    k = int(round(window_m / (cells * res))) if res > 0 else 0
+    offs = np.arange(-k, k + 1, dtype=np.int64) * cells
     yaw_step = math.radians(_COARSE_YAW_DEG)
     n_yaw = int(math.ceil(math.radians(window_deg) / yaw_step))
     dyaws = np.arange(-n_yaw, n_yaw + 1) * yaw_step
@@ -251,7 +267,7 @@ def match_against(
         [prior.x + offs[ii] * res, prior.y + offs[ji] * res, dyaws[yi]], axis=1
     )
     cov = np.cov(sample, rowvar=False) if sample.shape[0] >= 2 else np.zeros((3, 3))
-    step = 2.0 * res
+    step = cells * res
     cov = cov + np.diag(
         [step**2 / 12.0 + 0.03**2, step**2 / 12.0 + 0.03**2,
          yaw_step**2 / 12.0 + math.radians(0.5) ** 2]
@@ -260,7 +276,9 @@ def match_against(
     cx = prior.x + offs[best[2]] * res
     cy = prior.y + offs[best[1]] * res
     cth = prior.theta + dyaws[best[0]]
-    fine_offs = np.arange(-_FINE_XY_CELLS, _FINE_XY_CELLS + 1, dtype=np.int64)
+    # Cover a full coarse step so the fine pass can reach the next sample.
+    fine_half = max(_FINE_XY_CELLS, cells)
+    fine_offs = np.arange(-fine_half, fine_half + 1, dtype=np.int64)
     fx = cx + fine_offs * res
     fy = cy + fine_offs * res
     window2 = max(window_m, res) ** 2
@@ -368,7 +386,10 @@ def detect(
     shift = math.hypot(dx, dy)
     if anchor is not None:
         allowed = max(0.3, params.drift_fraction * m.gap_m)
-        allowed_deg = max(5.0, 1.0 * m.gap_m)
+        # Heading slip is not proportional to distance, so a spin can close
+        # inside the search window. Translation stays a fraction of the loop:
+        # a long loop may use the whole window, a short one may not.
+        allowed_deg = params.window_deg
         if shift > allowed or abs(math.degrees(dth)) > allowed_deg:
             return m, "implausible_drift"
     return m, "ok"

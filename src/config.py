@@ -859,8 +859,8 @@ class SlamConfig:
     # counts as "old" geometry for loop detection.
     builtin_loop_min_travel_m: float = 6.0
     builtin_loop_search_radius_m: float = 4.0
-    builtin_loop_search_window_m: float = 1.5
-    builtin_loop_search_window_deg: float = 15.0
+    builtin_loop_search_window_m: float = 8.0
+    builtin_loop_search_window_deg: float = 45.0
     builtin_loop_min_score: float = 0.55
     builtin_loop_check_interval_s: float = 2.0
     # Newest nodes moved by one optimization (older ones stay fixed).
