@@ -68,6 +68,7 @@ from ..viam_frames import (
 from ..slam_builtin import BuiltinSlamEngine, BuiltinSlamHost
 from ..slam_builtin.localize_supervisor import LocalizeSupervisor
 from ..slam_builtin.io_sensors import BuiltinSensors
+from .do_command_util import build_alias_map, dispatch_do_command, require
 
 LOGGER = getLogger(__name__)
 
@@ -82,6 +83,13 @@ RELOCALIZE_YAW_VARIANCE_RAD2 = (math.pi / 4) ** 2
 _NAV_STOPPED_BEFORE_CHECK_S = 2.0
 _NAV_STOPPED_LIN_MPS = 0.05
 _NAV_STOPPED_YAW_RAD_S = 0.08
+
+_SLAM_DO_ALIASES = build_alias_map({
+    "optimize": ("optimize_graph",),
+    "relocalize": ("refine_localization",),
+    "clear_obstacles": ("erase_obstacles",),
+    "add_obstacles": ("mark_obstacles",),
+})
 
 
 class SlamService(SLAM):
@@ -1566,385 +1574,495 @@ class SlamService(SLAM):
         )
 
     # -- DoCommand -----------------------------------------------------------
+    def _do_command_handlers(self):
+        return {
+            "get_mode": self._cmd_get_mode,
+            "get_grid": self._cmd_get_grid,
+            "get_status": self._cmd_get_status,
+            "start_mapping": self._cmd_start_mapping,
+            "start_localizing": self._cmd_start_localizing,
+            "save_map": self._cmd_save_map,
+            "optimize": self._cmd_optimize,
+            "set_initial_pose": self._cmd_set_initial_pose,
+            "relocalize": self._cmd_relocalize,
+            "global_localize": self._cmd_global_localize,
+            "check_localization": self._cmd_check_localization,
+            "get_localization_check": self._cmd_get_localization_check,
+            "stuck_pose_refine": self._cmd_stuck_pose_refine,
+            "revisit_check": self._cmd_revisit_check,
+            "get_revisit_check": self._cmd_get_revisit_check,
+            "list_maps": self._cmd_list_maps,
+            "get_active_map": self._cmd_get_active_map,
+            "set_active_map": self._cmd_set_active_map,
+            "rename_map": self._cmd_rename_map,
+            "clear_map": self._cmd_clear_map,
+            "clear_obstacles": self._cmd_clear_obstacles,
+            "add_obstacles": self._cmd_add_obstacles,
+            "delete_map": self._cmd_delete_map,
+        }
+
     async def do_command(
         self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None, **kwargs
     ) -> Mapping[str, ValueTypes]:
-        cmd = command.get("command")
+        if self._map_store is None or self._manager is None:
+            raise RuntimeError("SLAM service not configured")
+        return await dispatch_do_command(
+            self._do_command_handlers(),
+            command,
+            aliases=_SLAM_DO_ALIASES,
+        )
+
+    def _cmd_get_mode(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return {"mode": self._cfg.mode if self._cfg else None}
+
+
+    async def _cmd_get_grid(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
         store = self._map_store
         mgr = self._manager
-        if store is None or mgr is None:
-            raise RuntimeError("SLAM service not configured")
+        assert store is not None and mgr is not None
+        # Occupancy for external consumers (builtin nav ViamWorldIO, etc.).
+        def _grid():
+            node = mgr.node
+            if node is None:
+                return None
+            return node.get_map()
 
-        if cmd == "get_mode":
-            return {"mode": self._cfg.mode if self._cfg else None}
+        map_data = await asyncio.to_thread(_grid)
+        if map_data is None or map_data.get("grid") is None:
+            return {"available": False, "reason": "no_map"}
+        from ..nav_builtin.viam_io import map_dict_to_get_grid
 
-        if cmd == "get_grid":
-            # Occupancy for external consumers (builtin nav ViamWorldIO, etc.).
-            def _grid():
-                node = mgr.node
-                if node is None:
-                    return None
-                return node.get_map()
+        return map_dict_to_get_grid(map_data)
 
-            map_data = await asyncio.to_thread(_grid)
-            if map_data is None or map_data.get("grid") is None:
-                return {"available": False, "reason": "no_map"}
-            from ..nav_builtin.viam_io import map_dict_to_get_grid
 
-            return map_dict_to_get_grid(map_data)
+    async def _cmd_get_status(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        probe_sensors = require(command, "probe_sensors", bool, default=True)
 
-        if cmd == "get_status":
-            probe_sensors = command.get("probe_sensors", True)
-            if probe_sensors is not None:
-                probe_sensors = bool(probe_sensors)
+        def _status():
+            return mgr.slam_diagnostics()
 
-            def _status():
-                return mgr.slam_diagnostics()
-
-            status = await asyncio.to_thread(_status)
-            status["mode"] = self._cfg.mode if self._cfg else None
-            status["slam_backend"] = (
-                self._cfg.slam_backend if self._cfg else None
-            )
-            status["localize_worker"] = dict(self._localizer.stats)
-            status["active_map"] = store.get_active_map_name()
-            if self._cfg is not None:
-                status["base"] = self._cfg.base
-                status["movement_sensor"] = self._cfg.movement_sensor
-                status["movement_sensor_yaw_deg"] = self._cfg.movement_sensor_yaw_deg
-                status["map_when_still"] = self._cfg.map_when_still
-                status["heading_sensor"] = self._cfg.heading_sensor
-                status["lidars"] = [
-                    {
-                        "name": lidar.name,
-                        "scan_source": lidar.scan_source,
-                        "mount": {
-                            "x": lidar.x,
-                            "y": lidar.y,
-                            "z": lidar.z,
-                            "theta": lidar.theta,
-                            "pitch": lidar.pitch,
-                            "roll": lidar.roll,
-                        },
-                        "z_min": lidar.z_min,
-                        "z_max": lidar.z_max,
-                        "min_range": lidar.min_range,
-                        "max_range": lidar.max_range,
-                        "shm_name": lidar.shm_name,
-                        "shm_required": lidar.shm_required,
-                        "obstacles_only": bool(lidar.obstacles_only),
-                    }
-                    for lidar in self._cfg.lidars
-                ]
-            status["localization_check"] = dict(self._last_relocalize_check)
-            status["localization_state"] = self._loc_state.snapshot()
-            status["revisit_check"] = dict(self._last_revisit_check)
-            if self._pause_keyframes is not None:
-                status["pause_keyframes"] = self._pause_keyframes.status()
-            shm_status = self._shm_lidar.status()
-            if shm_status:
-                status["lidar_shm"] = shm_status
-            if probe_sensors and self._cfg is not None:
-                status["sensor_probe"] = await self._probe_sensors()
-            return status
-
-        if cmd == "start_mapping":
-            name = command.get("map")
-            if name:
-                store.get_or_create_map(str(name))
-                store.set_active_map(str(name))
-            # Subprocess-heavy manager calls must stay off the module event
-            # loop: the bridge marshals odom/lidar/cmd_vel onto it, so blocking
-            # here stalls TF and scans.
-            await asyncio.to_thread(self._start_mode, MODE_MAPPING)
-            self._reschedule_mode_watchdogs()
-            return {"status": "mapping", "map": store.get_active_map_name()}
-
-        if cmd == "start_localizing":
-            name = command.get("map")
-            if name:
-                store.set_active_map(str(name))
-            handle = store.active_handle()
-            need_map = (
-                handle.has_any_map()
-                if self._cfg is not None and self._cfg.uses_builtin_slam()
-                else (handle.has_serialized_map() if handle else False)
-            )
-            if not handle or not need_map:
-                raise ValueError("active map has no saved data; map it first")
-            await asyncio.to_thread(self._start_mode, MODE_LOCALIZING)
-            self._reschedule_mode_watchdogs()
-            result: dict[str, ValueTypes] = {
-                "status": "localizing",
-                "map": store.get_active_map_name(),
-            }
-            if command.get("use_mir_pose", False):
-                relocalize_result = await self.do_command(
-                    {"command": "relocalize", "use_mir_pose": True},
-                    **kwargs,
-                )
-                result["relocalize"] = relocalize_result
-            return result
-
-        if cmd == "save_map":
-            handle = store.active_handle()
-            if not handle:
-                raise ValueError("no active map")
-            # save_map runs ros2 CLI subprocesses (30-40s timeouts); keep the
-            # event loop free so mapping TF/scans continue while saving.
-            await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
-            return {"status": "saved", "map": handle.name}
-
-        if cmd in ("optimize", "optimize_graph"):
-            # Force SPA: there is no bare CorrectPoses service, so we
-            # serialize + deserialize the live graph (loader calls Compute()).
-            if self._cfg is not None and self._cfg.mode != MODE_MAPPING:
-                raise ValueError(
-                    "optimize requires SLAM mode mapping; call start_mapping first"
-                )
-            handle = store.active_handle()
-            if not handle:
-                raise ValueError("no active map")
-            return await asyncio.to_thread(
-                mgr.optimize_pose_graph, handle.serialization_stem
-            )
-
-        if cmd == "set_initial_pose":
-            pose = self._resolve_pose(command)
-            await asyncio.to_thread(mgr.set_initial_pose, pose)
-            # Manual seed wins over any in-flight large-jump confirm toward a
-            # corridor twin — otherwise the next watchdog tick can finish the
-            # confirm and yank the pose back across the map.
-            self._pose_jump_gate.clear()
-            self._mark_pose_seeded("set_initial_pose")
-            # Also cancel boot full-map localize: it can still finish after the
-            # user has already placed the robot and overwrite a good seed.
-            self._cancel_startup_global_localize_task()
-            # ``refine: true`` runs a seeded scan match around the given XY with
-            # a full yaw sweep — the matcher itself only searches ~±30° of
-            # heading, so a seed with roughly-right XY but wrong theta can never
-            # self-correct without this.
-            if command.get("refine"):
-                refine_cmd: dict = {
-                    "command": "global_localize",
-                    "pose": {"x": pose.x, "y": pose.y, "theta": pose.theta},
-                    # Keep XY close to the manual seed. A 3 m window was sliding
-                    # ~2 m along repetitive corridor geometry to a slightly
-                    # different local max; 1 m is enough to fix heading/offset.
-                    "search_radius_m": float(command.get("search_radius_m", 1.0)),
-                    "local_yaw_window_deg": float(
-                        command.get("local_yaw_window_deg", 360.0)
-                    ),
-                    "full_map": False,
-                    "auto_full_map_fallback": False,
-                    # Manual seed refine must be willing to accept a weak-but-
-                    # better peak (corridor twins often top out ~0.3). Absolute
-                    # floors still apply via beat-prior logic in _global_localize;
-                    # also drop ambiguous refuse so a near-tie local peak can land.
-                    "min_apply_score": float(command.get("min_apply_score", 0.22)),
-                    "max_apply_ray_mae_m": float(
-                        command.get("max_apply_ray_mae_m", 1.5)
-                    ),
-                    "refuse_ambiguous": bool(command.get("refuse_ambiguous", False)),
+        status = await asyncio.to_thread(_status)
+        status["mode"] = self._cfg.mode if self._cfg else None
+        status["slam_backend"] = (
+            self._cfg.slam_backend if self._cfg else None
+        )
+        status["localize_worker"] = dict(self._localizer.stats)
+        status["active_map"] = store.get_active_map_name()
+        if self._cfg is not None:
+            status["base"] = self._cfg.base
+            status["movement_sensor"] = self._cfg.movement_sensor
+            status["movement_sensor_yaw_deg"] = self._cfg.movement_sensor_yaw_deg
+            status["map_when_still"] = self._cfg.map_when_still
+            status["heading_sensor"] = self._cfg.heading_sensor
+            status["lidars"] = [
+                {
+                    "name": lidar.name,
+                    "scan_source": lidar.scan_source,
+                    "mount": {
+                        "x": lidar.x,
+                        "y": lidar.y,
+                        "z": lidar.z,
+                        "theta": lidar.theta,
+                        "pitch": lidar.pitch,
+                        "roll": lidar.roll,
+                    },
+                    "z_min": lidar.z_min,
+                    "z_max": lidar.z_max,
+                    "min_range": lidar.min_range,
+                    "max_range": lidar.max_range,
+                    "shm_name": lidar.shm_name,
+                    "shm_required": lidar.shm_required,
+                    "obstacles_only": bool(lidar.obstacles_only),
                 }
-                # Forward optional denser-search knobs from the caller.
-                for key in (
-                    "coarse_position_step_m",
-                    "coarse_yaw_step_deg",
-                    "fine_position_step_m",
-                    "fine_yaw_step_deg",
-                    "ray_weight",
-                    "ray_refine_candidates",
-                    "ray_refine_beams",
-                ):
-                    if key in command:
-                        refine_cmd[key] = command[key]
-                result = await self._global_localize(refine_cmd)
-                return {"status": "ok", "refine": result}
-            return {"status": "ok"}
+                for lidar in self._cfg.lidars
+            ]
+        status["localization_check"] = dict(self._last_relocalize_check)
+        status["localization_state"] = self._loc_state.snapshot()
+        status["revisit_check"] = dict(self._last_revisit_check)
+        if self._pause_keyframes is not None:
+            status["pause_keyframes"] = self._pause_keyframes.status()
+        shm_status = self._shm_lidar.status()
+        if shm_status:
+            status["lidar_shm"] = shm_status
+        if probe_sensors and self._cfg is not None:
+            status["sensor_probe"] = await self._probe_sensors()
+        return status
 
-        if cmd in ("relocalize", "refine_localization"):
-            if self._cfg is not None and self._cfg.mode != MODE_LOCALIZING:
-                raise ValueError(
-                    "relocalize requires SLAM mode localizing; call start_localizing first"
-                )
-            pose = await self._resolve_relocalize_seed(command)
-            position_variance_m2 = float(
-                command.get("position_variance_m2", RELOCALIZE_POSITION_VARIANCE_M2)
+
+    async def _cmd_start_mapping(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        name = command.get("map")
+        if name:
+            store.get_or_create_map(str(name))
+            store.set_active_map(str(name))
+        # Subprocess-heavy manager calls must stay off the module event
+        # loop: the bridge marshals odom/lidar/cmd_vel onto it, so blocking
+        # here stalls TF and scans.
+        await asyncio.to_thread(self._start_mode, MODE_MAPPING)
+        self._reschedule_mode_watchdogs()
+        return {"status": "mapping", "map": store.get_active_map_name()}
+
+
+    async def _cmd_start_localizing(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        name = command.get("map")
+        if name:
+            store.set_active_map(str(name))
+        handle = store.active_handle()
+        need_map = (
+            handle.has_any_map()
+            if self._cfg is not None and self._cfg.uses_builtin_slam()
+            else (handle.has_serialized_map() if handle else False)
+        )
+        if not handle or not need_map:
+            raise ValueError("active map has no saved data; map it first")
+        await asyncio.to_thread(self._start_mode, MODE_LOCALIZING)
+        self._reschedule_mode_watchdogs()
+        result: dict[str, ValueTypes] = {
+            "status": "localizing",
+            "map": store.get_active_map_name(),
+        }
+        if command.get("use_mir_pose", False):
+            relocalize_result = await self.do_command(
+                {"command": "relocalize", "use_mir_pose": True},
+                **kwargs,
             )
-            yaw_variance_rad2 = float(
-                command.get("yaw_variance_rad2", RELOCALIZE_YAW_VARIANCE_RAD2)
+            result["relocalize"] = relocalize_result
+        return result
+
+
+    async def _cmd_save_map(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        handle = store.active_handle()
+        if not handle:
+            raise ValueError("no active map")
+        # save_map runs ros2 CLI subprocesses (30-40s timeouts); keep the
+        # event loop free so mapping TF/scans continue while saving.
+        await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
+        return {"status": "saved", "map": handle.name}
+
+
+    async def _cmd_optimize(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        # Force SPA: there is no bare CorrectPoses service, so we
+        # serialize + deserialize the live graph (loader calls Compute()).
+        if self._cfg is not None and self._cfg.mode != MODE_MAPPING:
+            raise ValueError(
+                "optimize requires SLAM mode mapping; call start_mapping first"
             )
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: mgr.relocalize(
-                    pose,
-                    position_variance_m2=position_variance_m2,
-                    yaw_variance_rad2=yaw_variance_rad2,
+        handle = store.active_handle()
+        if not handle:
+            raise ValueError("no active map")
+        return await asyncio.to_thread(
+            mgr.optimize_pose_graph, handle.serialization_stem
+        )
+
+
+    async def _cmd_set_initial_pose(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        pose = self._resolve_pose(command)
+        await asyncio.to_thread(mgr.set_initial_pose, pose)
+        # Manual seed wins over any in-flight large-jump confirm toward a
+        # corridor twin — otherwise the next watchdog tick can finish the
+        # confirm and yank the pose back across the map.
+        self._pose_jump_gate.clear()
+        self._mark_pose_seeded("set_initial_pose")
+        # Also cancel boot full-map localize: it can still finish after the
+        # user has already placed the robot and overwrite a good seed.
+        self._cancel_startup_global_localize_task()
+        # ``refine: true`` runs a seeded scan match around the given XY with
+        # a full yaw sweep — the matcher itself only searches ~±30° of
+        # heading, so a seed with roughly-right XY but wrong theta can never
+        # self-correct without this.
+        if command.get("refine"):
+            refine_cmd: dict = {
+                "command": "global_localize",
+                "pose": {"x": pose.x, "y": pose.y, "theta": pose.theta},
+                # Keep XY close to the manual seed. A 3 m window was sliding
+                # ~2 m along repetitive corridor geometry to a slightly
+                # different local max; 1 m is enough to fix heading/offset.
+                "search_radius_m": float(command.get("search_radius_m", 1.0)),
+                "local_yaw_window_deg": float(
+                    command.get("local_yaw_window_deg", 360.0)
                 ),
-            )
-            self._mark_pose_seeded(cmd)
-            return {
-                "status": "relocalizing",
-                "seed_pose": {"x": pose.x, "y": pose.y, "theta": pose.theta},
+                "full_map": False,
+                "auto_full_map_fallback": False,
+                # Manual seed refine must be willing to accept a weak-but-
+                # better peak (corridor twins often top out ~0.3). Absolute
+                # floors still apply via beat-prior logic in _global_localize;
+                # also drop ambiguous refuse so a near-tie local peak can land.
+                "min_apply_score": float(command.get("min_apply_score", 0.22)),
+                "max_apply_ray_mae_m": float(
+                    command.get("max_apply_ray_mae_m", 1.5)
+                ),
+                "refuse_ambiguous": bool(command.get("refuse_ambiguous", False)),
             }
+            # Forward optional denser-search knobs from the caller.
+            for key in (
+                "coarse_position_step_m",
+                "coarse_yaw_step_deg",
+                "fine_position_step_m",
+                "fine_yaw_step_deg",
+                "ray_weight",
+                "ray_refine_candidates",
+                "ray_refine_beams",
+            ):
+                if key in command:
+                    refine_cmd[key] = command[key]
+            result = await self._global_localize(refine_cmd)
+            return {"status": "ok", "refine": result}
+        return {"status": "ok"}
 
-        if cmd == "global_localize":
-            return await self._global_localize(command)
 
-        if cmd == "check_localization":
-            # Run one drift-watchdog cycle on demand. ``apply`` forces or
-            # suppresses the correction; omit it to use the drift thresholds.
-            # ``full_map_escalation``: ``low_quality`` (default) or ``still_bad``
-            # (local first; full-map only when the published pose still looks wrong).
-            # ``stopped_recovery``: nav already halted for bad loc — wider search
-            # and a larger trusted apply so the goal can continue.
-            apply_override = command.get("apply")
-            escalation = command.get("full_map_escalation", "low_quality")
-            return await self._periodic_relocalize_cycle(
-                apply_override=(
-                    None if apply_override is None else bool(apply_override)
-                ),
-                full_map_escalation=str(escalation or "low_quality"),
-                allow_during_navigation=bool(
-                    command.get("allow_during_navigation")
-                ),
-                stopped_recovery=bool(command.get("stopped_recovery")),
+    async def _cmd_relocalize(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        cmd = str(command.get("command"))
+        if self._cfg is not None and self._cfg.mode != MODE_LOCALIZING:
+            raise ValueError(
+                "relocalize requires SLAM mode localizing; call start_localizing first"
             )
+        pose = await self._resolve_relocalize_seed(command)
+        position_variance_m2 = float(
+            command.get("position_variance_m2", RELOCALIZE_POSITION_VARIANCE_M2)
+        )
+        yaw_variance_rad2 = float(
+            command.get("yaw_variance_rad2", RELOCALIZE_YAW_VARIANCE_RAD2)
+        )
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: mgr.relocalize(
+                pose,
+                position_variance_m2=position_variance_m2,
+                yaw_variance_rad2=yaw_variance_rad2,
+            ),
+        )
+        self._mark_pose_seeded(cmd)
+        return {
+            "status": "relocalizing",
+            "seed_pose": {"x": pose.x, "y": pose.y, "theta": pose.theta},
+        }
 
-        if cmd == "get_localization_check":
-            return dict(self._last_relocalize_check)
 
-        if cmd == "stuck_pose_refine":
-            # One ~1 m local match while navigation cannot leave its cell.
-            # Mapping and localizing both apply a small better pose. No full-map search.
-            return await self._stuck_pose_refine()
+    async def _cmd_global_localize(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return await self._global_localize(command)
 
-        if cmd == "revisit_check":
-            # Mapping-mode revisit check on demand. ``apply`` forces the odom
-            # correction (or set false for a dry run); omit for gated behavior.
-            # ``yaw_flip`` takes the opposite heading of the auto corridor
-            # disambiguation (same XY). ``flip_yaw_only`` reverses the current
-            # map heading in place without re-matching — recovery when XY is
-            # already right but facing is 180° wrong.
-            if bool(command.get("flip_yaw_only")):
-                return await self._flip_current_map_yaw()
-            apply_override = command.get("apply")
-            return await self._mapping_revisit_cycle(
-                apply_override=(
-                    None if apply_override is None else bool(apply_override)
-                ),
-                yaw_flip=bool(command.get("yaw_flip")),
-            )
 
-        if cmd == "get_revisit_check":
-            return dict(self._last_revisit_check)
+    async def _cmd_check_localization(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        # Run one drift-watchdog cycle on demand. ``apply`` forces or
+        # suppresses the correction; omit it to use the drift thresholds.
+        # ``full_map_escalation``: ``low_quality`` (default) or ``still_bad``
+        # (local first; full-map only when the published pose still looks wrong).
+        # ``stopped_recovery``: nav already halted for bad loc — wider search
+        # and a larger trusted apply so the goal can continue.
+        apply_override = command.get("apply")
+        escalation = command.get("full_map_escalation", "low_quality")
+        return await self._periodic_relocalize_cycle(
+            apply_override=(
+                None if apply_override is None else bool(apply_override)
+            ),
+            full_map_escalation=str(escalation or "low_quality"),
+            allow_during_navigation=bool(
+                command.get("allow_during_navigation")
+            ),
+            stopped_recovery=bool(command.get("stopped_recovery")),
+        )
+
+
+    def _cmd_get_localization_check(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return dict(self._last_relocalize_check)
+
+
+    async def _cmd_stuck_pose_refine(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        # One ~1 m local match while navigation cannot leave its cell.
+        # Mapping and localizing both apply a small better pose. No full-map search.
+        return await self._stuck_pose_refine()
+
+
+    async def _cmd_revisit_check(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        # Mapping-mode revisit check on demand. ``apply`` forces the odom
+        # correction (or set false for a dry run); omit for gated behavior.
+        # ``yaw_flip`` takes the opposite heading of the auto corridor
+        # disambiguation (same XY). ``flip_yaw_only`` reverses the current
+        # map heading in place without re-matching — recovery when XY is
+        # already right but facing is 180° wrong.
+        if bool(command.get("flip_yaw_only")):
+            return await self._flip_current_map_yaw()
+        apply_override = command.get("apply")
+        return await self._mapping_revisit_cycle(
+            apply_override=(
+                None if apply_override is None else bool(apply_override)
+            ),
+            yaw_flip=bool(command.get("yaw_flip")),
+        )
+
+
+    def _cmd_get_revisit_check(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return dict(self._last_revisit_check)
 
         # -- map management --
-        if cmd == "list_maps":
-            return {"maps": store.list_maps()}
-        if cmd == "get_active_map":
-            return {"map": store.get_active_map_name()}
-        if cmd == "set_active_map":
-            store.set_active_map(str(command["map"]))
-            return {"map": store.get_active_map_name()}
-        if cmd == "rename_map":
-            handle = store.rename_map(str(command["map"]), str(command["new_name"]))
-            return {"map": handle.name}
-        if cmd == "clear_map":
+
+
+    def _cmd_list_maps(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        return {"maps": store.list_maps()}
+
+
+    def _cmd_get_active_map(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        return {"map": store.get_active_map_name()}
+
+
+    def _cmd_set_active_map(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        assert store is not None
+        store.set_active_map(require(command, "map", str))
+        return {"map": store.get_active_map_name()}
+
+
+    def _cmd_rename_map(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        assert store is not None
+        handle = store.rename_map(
+            require(command, "map", str),
+            require(command, "new_name", str),
+        )
+        return {"map": handle.name}
+
+
+    async def _cmd_clear_map(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        handle = store.active_handle()
+        if not handle:
+            raise ValueError("no active map")
+        self._begin_map_reset()
+        try:
+            handle.clear_serialized_data()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._reset_live_slam, MODE_MAPPING)
+        finally:
+            self._end_map_reset()
+        return {"status": "cleared", "map": handle.name, "mode": MODE_MAPPING}
+
+
+    async def _cmd_clear_obstacles(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return await self._cmd_paint_obstacles(command, adding=False)
+
+    async def _cmd_add_obstacles(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return await self._cmd_paint_obstacles(command, adding=True)
+
+    async def _cmd_paint_obstacles(
+        self, command: Mapping[str, ValueTypes], *, adding: bool
+    ) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        # Paint free or occupied space into the live occupancy grid (builtin SLAM).
+        x = command.get("x")
+        y = command.get("y")
+        if x is None or y is None:
+            pose = command.get("pose")
+            if isinstance(pose, Mapping):
+                x = pose.get("x")
+                y = pose.get("y")
+        if x is None or y is None:
+            raise ValueError(
+                f"{('add_obstacles' if adding else 'clear_obstacles')} requires x,y (or pose.x/pose.y)"
+            )
+        radius = command.get("radius_m", command.get("radius", 0.35))
+        try:
+            x_m = float(x)
+            y_m = float(y)
+            radius_m = float(radius)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("x, y, radius_m must be numbers") from exc
+        if radius_m <= 0:
+            raise ValueError("radius_m must be > 0")
+
+        def _paint():
+            method = "add_obstacles" if adding else "clear_obstacles"
+            paint_fn = getattr(mgr, method, None)
+            if paint_fn is None and getattr(mgr, "node", None) is not None:
+                paint_fn = getattr(mgr.node, method, None)
+            if paint_fn is None:
+                raise RuntimeError(
+                    f"{method} requires slam_backend=builtin "
+                    "(no live occupancy editor on this SLAM host)"
+                )
+            return paint_fn(x_m, y_m, radius_m)
+
+        result = await asyncio.to_thread(_paint)
+        save = command.get("save", False)
+        out = dict(result) if isinstance(result, Mapping) else {"result": result}
+        out["status"] = "ok"
+        out["map"] = store.get_active_map_name()
+        out["saved"] = False
+        if save:
             handle = store.active_handle()
             if not handle:
                 raise ValueError("no active map")
+            await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
+            out["saved"] = True
+        return out
+
+
+    async def _cmd_delete_map(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        name = validate_map_name(
+            str(command.get("map") or store.get_active_map_name() or "")
+        )
+        if not name:
+            raise ValueError("no map specified and no active map")
+        was_live = self._map_is_live(name, store)
+        if was_live:
             self._begin_map_reset()
-            try:
-                handle.clear_serialized_data()
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._reset_live_slam, MODE_MAPPING)
-            finally:
-                self._end_map_reset()
-            return {"status": "cleared", "map": handle.name, "mode": MODE_MAPPING}
-        if cmd in ("clear_obstacles", "erase_obstacles", "add_obstacles", "mark_obstacles"):
-            adding = cmd in ("add_obstacles", "mark_obstacles")
-            # Paint free or occupied space into the live occupancy grid (builtin SLAM).
-            x = command.get("x")
-            y = command.get("y")
-            if x is None or y is None:
-                pose = command.get("pose")
-                if isinstance(pose, Mapping):
-                    x = pose.get("x")
-                    y = pose.get("y")
-            if x is None or y is None:
-                raise ValueError(f"{cmd} requires x,y (or pose.x/pose.y)")
-            radius = command.get("radius_m", command.get("radius", 0.35))
-            try:
-                x_m = float(x)
-                y_m = float(y)
-                radius_m = float(radius)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("x, y, radius_m must be numbers") from exc
-            if radius_m <= 0:
-                raise ValueError("radius_m must be > 0")
-
-            def _paint():
-                method = "add_obstacles" if adding else "clear_obstacles"
-                paint_fn = getattr(mgr, method, None)
-                if paint_fn is None and getattr(mgr, "node", None) is not None:
-                    paint_fn = getattr(mgr.node, method, None)
-                if paint_fn is None:
-                    raise RuntimeError(
-                        f"{method} requires slam_backend=builtin "
-                        "(no live occupancy editor on this SLAM host)"
-                    )
-                return paint_fn(x_m, y_m, radius_m)
-
-            result = await asyncio.to_thread(_paint)
-            save = command.get("save", False)
-            out = dict(result) if isinstance(result, Mapping) else {"result": result}
-            out["status"] = "ok"
-            out["map"] = store.get_active_map_name()
-            out["saved"] = False
-            if save:
-                handle = store.active_handle()
-                if not handle:
-                    raise ValueError("no active map")
-                await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
-                out["saved"] = True
-            return out
-        if cmd == "delete_map":
-            name = validate_map_name(
-                str(command.get("map") or store.get_active_map_name() or "")
-            )
-            if not name:
-                raise ValueError("no map specified and no active map")
-            was_live = self._map_is_live(name, store)
+        try:
+            store.delete_map(name)
             if was_live:
-                self._begin_map_reset()
-            try:
-                store.delete_map(name)
-                if was_live:
-                    resolution = (
-                        self._cfg.map.resolution if self._cfg else 0.05
-                    )
-                    store.get_or_create_map(name, resolution=resolution)
-                    store.set_active_map(name)
-                    if self._cfg is not None:
-                        self._cfg.active_map = name
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        None, self._reset_live_slam, MODE_MAPPING
-                    )
-            finally:
-                if was_live:
-                    self._end_map_reset()
-            return {
-                "status": "deleted",
-                "map": name,
-                "active_map": store.get_active_map_name(),
-                "mode": MODE_MAPPING if was_live else (self._cfg.mode if self._cfg else None),
-            }
+                resolution = (
+                    self._cfg.map.resolution if self._cfg else 0.05
+                )
+                store.get_or_create_map(name, resolution=resolution)
+                store.set_active_map(name)
+                if self._cfg is not None:
+                    self._cfg.active_map = name
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, self._reset_live_slam, MODE_MAPPING
+                )
+        finally:
+            if was_live:
+                self._end_map_reset()
+        return {
+            "status": "deleted",
+            "map": name,
+            "active_map": store.get_active_map_name(),
+            "mode": MODE_MAPPING if was_live else (self._cfg.mode if self._cfg else None),
+        }
 
-        raise ValueError(f"unknown command: {cmd!r}")
 
     def _resolve_pose(self, command: Mapping[str, ValueTypes]) -> conv.Pose2D:
         if "location" in command:

@@ -49,6 +49,7 @@ from viam.services.navigation import Navigation
 from viam.utils import ValueTypes
 
 from .nav_api import NavigationApi
+from .do_command_util import build_alias_map, dispatch_do_command, require
 
 from ..config import NavConfig, body_twist_to_viam_set_velocity
 from ..nav import zones as zones_mod
@@ -159,6 +160,19 @@ class _SuspendedNav:
             out["route_total"] = len(self.route_waypoints or [])
             out["loop"] = bool(self.route_loop)
         return out
+
+
+_NAV_DO_ALIASES = build_alias_map({
+    "delete_location": ("remove_location",),
+    "delete_route": ("remove_route",),
+    "get_last_plan": ("get_preview_plan",),
+    "get_status": ("describe_motion", "what_am_i_doing"),
+    "plan_to_location": ("compute_path_to_location",),
+    "plan_to_point": ("compute_path_to_point",),
+    "remove_waypoint": ("delete_waypoint",),
+    "resume": ("resume_nav",),
+    "suspend": ("pause_nav", "suspend_nav"),
+})
 
 
 class NavServiceBase(NavigationApi, Navigation):
@@ -595,517 +609,657 @@ class NavServiceBase(NavigationApi, Navigation):
             publish(keepout, speed, res, ox, oy)
 
     # -- DoCommand -----------------------------------------------------------
+    def _do_command_handlers(self):
+        return {
+            "add_location": self._cmd_add_location,
+            "get_location": self._cmd_get_location,
+            "list_locations": self._cmd_list_locations,
+            "update_location": self._cmd_update_location,
+            "delete_location": self._cmd_delete_location,
+            "delete_all_locations": self._cmd_delete_all_locations,
+            "add_route": self._cmd_add_route,
+            "get_route": self._cmd_get_route,
+            "list_routes": self._cmd_list_routes,
+            "update_route": self._cmd_update_route,
+            "delete_route": self._cmd_delete_route,
+            "delete_all_routes": self._cmd_delete_all_routes,
+            "list_waypoints": self._cmd_list_waypoints,
+            "set_waypoints": self._cmd_set_waypoints,
+            "clear_waypoints": self._cmd_clear_waypoints,
+            "add_waypoint": self._cmd_add_waypoint,
+            "update_waypoint": self._cmd_update_waypoint,
+            "remove_waypoint": self._cmd_remove_waypoint,
+            "move_waypoint": self._cmd_move_waypoint,
+            "add_zone": self._cmd_add_zone,
+            "get_zone": self._cmd_get_zone,
+            "list_zones": self._cmd_list_zones,
+            "update_zone": self._cmd_update_zone,
+            "delete_zone": self._cmd_delete_zone,
+            "delete_all_zones": self._cmd_delete_all_zones,
+            "navigate_to_location": self._cmd_navigate_to_location,
+            "navigate_to_point": self._cmd_navigate_to_point,
+            "navigate_route": self._cmd_navigate_route,
+            "plan_to_point": self._cmd_plan_to_point,
+            "plan_to_location": self._cmd_plan_to_location,
+            "get_last_plan": self._cmd_get_last_plan,
+            "execute_plan": self._cmd_execute_plan,
+            "go_to_location": self._cmd_go_to_location,
+            "go_to_point": self._cmd_go_to_point,
+            "suspend": self._cmd_suspend,
+            "resume": self._cmd_resume,
+            "cancel": self._cmd_cancel,
+            "test_drive": self._cmd_test_drive,
+            "get_trace": self._cmd_get_trace,
+            "get_status": self._cmd_get_status,
+            "get_costmap": self._cmd_get_costmap,
+        }
+
     async def do_command(
         self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None, **kwargs
     ) -> Mapping[str, ValueTypes]:
-        cmd = command.get("command")
+        self._require_runtime()
+        return await dispatch_do_command(
+            self._do_command_handlers(),
+            command,
+            aliases=_NAV_DO_ALIASES,
+        )
+
+    def _cmd_add_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
         runtime = self._require_runtime()
-        mgr = runtime.manager
+        loc = self._add_location(command, runtime)
+        return {"location": loc.to_dict()}
 
-        # -- locations CRUD --
-        if cmd == "add_location":
-            loc = self._add_location(command, runtime)
-            return {"location": loc.to_dict()}
-        if cmd == "get_location":
-            return {"location": self._locations().get(str(command["name"])).to_dict()}
-        if cmd == "list_locations":
-            return {"locations": [l.to_dict() for l in self._locations().list()]}
-        if cmd == "update_location":
-            old_name = str(command["name"])
-            loc = self._locations().update(
-                old_name,
-                x=command.get("x"),
-                y=command.get("y"),
-                theta=command.get("theta"),
-                new_name=command.get("new_name"),
-            )
-            new_name = command.get("new_name")
-            if new_name is not None and str(new_name) != old_name:
-                self._routes().rename_location_refs(old_name, str(new_name))
-            return {"location": loc.to_dict()}
-        if cmd in ("delete_location", "remove_location"):
-            name = str(command["name"])
-            self._locations().delete(name)
-            self._routes().remove_location_refs(name)
-            return {"status": "deleted"}
-        if cmd == "delete_all_locations":
-            self._locations().delete_all()
-            # Empty locations → clear every route's waypoints (routes remain).
-            routes = self._routes()
-            for route in routes.list():
-                routes.clear_waypoints(route.name)
-            return {"status": "deleted"}
 
-        # -- routes / waypoints CRUD --
-        if cmd == "add_route":
-            name = str(command["name"])
-            raw_wps = command.get("waypoints") or []
-            if not isinstance(raw_wps, (list, tuple)):
-                raise ValueError("waypoints must be a list of location names")
-            waypoints = [
-                str(w.get("location", w) if isinstance(w, Mapping) else w)
-                for w in raw_wps
-            ]
-            self._require_location_names(waypoints)
-            route = self._routes().add(name, waypoints)
-            return {"route": self._route_to_dict(route)}
-        if cmd == "get_route":
-            route = self._routes().get(str(command["name"]))
-            return {"route": self._route_to_dict(route)}
-        if cmd == "list_routes":
-            return {
-                "routes": [self._route_to_dict(r) for r in self._routes().list()]
-            }
-        if cmd == "update_route":
-            route = self._routes().update(
-                str(command["name"]),
-                new_name=command.get("new_name"),
-            )
-            return {"route": self._route_to_dict(route)}
-        if cmd in ("delete_route", "remove_route"):
-            self._routes().delete(str(command["name"]))
-            return {"status": "deleted"}
-        if cmd == "delete_all_routes":
-            self._routes().delete_all()
-            return {"status": "deleted"}
+    def _cmd_get_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        name = require(command, "name", str)
+        return {"location": self._locations().get(name).to_dict()}
 
-        if cmd == "list_waypoints":
-            route = self._routes().get(str(command["route"]))
-            return {"route": route.name, "waypoints": self._route_to_dict(route)["waypoints"]}
-        if cmd == "set_waypoints":
-            route_name = str(command["route"])
-            raw_wps = command.get("waypoints") or []
-            if not isinstance(raw_wps, (list, tuple)):
-                raise ValueError("waypoints must be a list of location names")
-            waypoints = [
-                str(w.get("location", w) if isinstance(w, Mapping) else w)
-                for w in raw_wps
-            ]
-            self._require_location_names(waypoints)
-            route = self._routes().set_waypoints(route_name, waypoints)
-            return {"route": self._route_to_dict(route)}
-        if cmd == "clear_waypoints":
-            route = self._routes().clear_waypoints(str(command["route"]))
-            return {"route": self._route_to_dict(route)}
-        if cmd == "add_waypoint":
-            route_name = str(command["route"])
-            location = str(command["location"])
-            self._require_location_names([location])
-            index = command.get("index")
-            route = self._routes().add_waypoint(
-                route_name,
-                location,
-                index=int(index) if index is not None else None,
-            )
-            return {"route": self._route_to_dict(route)}
-        if cmd == "update_waypoint":
-            route_name = str(command["route"])
-            location = str(command["location"])
-            self._require_location_names([location])
-            route = self._routes().update_waypoint(
-                route_name, int(command["index"]), location
-            )
-            return {"route": self._route_to_dict(route)}
-        if cmd in ("remove_waypoint", "delete_waypoint"):
-            route_name = str(command["route"])
-            index = command.get("index")
-            location = command.get("location")
-            route = self._routes().remove_waypoint(
-                route_name,
-                index=int(index) if index is not None else None,
-                location=str(location) if location is not None else None,
-            )
-            return {"route": self._route_to_dict(route)}
-        if cmd == "move_waypoint":
-            route = self._routes().move_waypoint(
-                str(command["route"]),
-                int(command["from_index"]),
-                int(command["to_index"]),
-            )
-            return {"route": self._route_to_dict(route)}
 
-        # -- zones CRUD --
-        if cmd == "add_zone":
-            zone = self._zones().add(
-                str(command["name"]),
-                str(command["type"]),
-                dict(command["geometry"]),
-                speed_pct=command.get("speed_pct"),
-            )
-            self._refresh_zone_masks()
-            return {"zone": zone.to_dict()}
-        if cmd == "get_zone":
-            return {"zone": self._zones().get(str(command["name"])).to_dict()}
-        if cmd == "list_zones":
-            zlist = self._zones().list(command.get("type"))
-            return {"zones": [z.to_dict() for z in zlist]}
-        if cmd == "update_zone":
-            zone = self._zones().update(
-                str(command["name"]),
-                type=command.get("type"),
-                geometry=dict(command["geometry"]) if "geometry" in command else None,
-                speed_pct=command.get("speed_pct"),
-                new_name=command.get("new_name"),
-            )
-            self._refresh_zone_masks()
-            return {"zone": zone.to_dict()}
-        if cmd == "delete_zone":
-            self._zones().delete(str(command["name"]))
-            self._refresh_zone_masks()
-            return {"status": "deleted"}
-        if cmd == "delete_all_zones":
-            self._zones().delete_all(command.get("type"))
-            self._refresh_zone_masks()
-            return {"status": "deleted"}
+    def _cmd_list_locations(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return {"locations": [l.to_dict() for l in self._locations().list()]}
 
-        # -- navigation --
+
+    def _cmd_update_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        old_name = str(command["name"])
+        loc = self._locations().update(
+            old_name,
+            x=command.get("x"),
+            y=command.get("y"),
+            theta=command.get("theta"),
+            new_name=command.get("new_name"),
+        )
+        new_name = command.get("new_name")
+        if new_name is not None and str(new_name) != old_name:
+            self._routes().rename_location_refs(old_name, str(new_name))
+        return {"location": loc.to_dict()}
+
+
+    def _cmd_delete_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        name = str(command["name"])
+        self._locations().delete(name)
+        self._routes().remove_location_refs(name)
+        return {"status": "deleted"}
+
+
+    def _cmd_delete_all_locations(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        self._locations().delete_all()
+        # Empty locations → clear every route's waypoints (routes remain).
+        routes = self._routes()
+        for route in routes.list():
+            routes.clear_waypoints(route.name)
+        return {"status": "deleted"}
+
+
+    def _cmd_add_route(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        name = str(command["name"])
+        raw_wps = command.get("waypoints") or []
+        if not isinstance(raw_wps, (list, tuple)):
+            raise ValueError("waypoints must be a list of location names")
+        waypoints = [
+            str(w.get("location", w) if isinstance(w, Mapping) else w)
+            for w in raw_wps
+        ]
+        self._require_location_names(waypoints)
+        route = self._routes().add(name, waypoints)
+        return {"route": self._route_to_dict(route)}
+
+
+    def _cmd_get_route(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        route = self._routes().get(str(command["name"]))
+        return {"route": self._route_to_dict(route)}
+
+
+    def _cmd_list_routes(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return {
+            "routes": [self._route_to_dict(r) for r in self._routes().list()]
+        }
+
+
+    def _cmd_update_route(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        route = self._routes().update(
+            str(command["name"]),
+            new_name=command.get("new_name"),
+        )
+        return {"route": self._route_to_dict(route)}
+
+
+    def _cmd_delete_route(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        self._routes().delete(str(command["name"]))
+        return {"status": "deleted"}
+
+
+    def _cmd_delete_all_routes(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        self._routes().delete_all()
+        return {"status": "deleted"}
+
+
+    def _cmd_list_waypoints(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        route = self._routes().get(str(command["route"]))
+        return {"route": route.name, "waypoints": self._route_to_dict(route)["waypoints"]}
+
+
+    def _cmd_set_waypoints(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        route_name = str(command["route"])
+        raw_wps = command.get("waypoints") or []
+        if not isinstance(raw_wps, (list, tuple)):
+            raise ValueError("waypoints must be a list of location names")
+        waypoints = [
+            str(w.get("location", w) if isinstance(w, Mapping) else w)
+            for w in raw_wps
+        ]
+        self._require_location_names(waypoints)
+        route = self._routes().set_waypoints(route_name, waypoints)
+        return {"route": self._route_to_dict(route)}
+
+
+    def _cmd_clear_waypoints(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        route = self._routes().clear_waypoints(str(command["route"]))
+        return {"route": self._route_to_dict(route)}
+
+
+    def _cmd_add_waypoint(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        route_name = str(command["route"])
+        location = str(command["location"])
+        self._require_location_names([location])
+        index = command.get("index")
+        route = self._routes().add_waypoint(
+            route_name,
+            location,
+            index=int(index) if index is not None else None,
+        )
+        return {"route": self._route_to_dict(route)}
+
+
+    def _cmd_update_waypoint(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        route_name = str(command["route"])
+        location = str(command["location"])
+        self._require_location_names([location])
+        route = self._routes().update_waypoint(
+            route_name, int(command["index"]), location
+        )
+        return {"route": self._route_to_dict(route)}
+
+
+    def _cmd_remove_waypoint(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        route_name = str(command["route"])
+        index = command.get("index")
+        location = command.get("location")
+        route = self._routes().remove_waypoint(
+            route_name,
+            index=int(index) if index is not None else None,
+            location=str(location) if location is not None else None,
+        )
+        return {"route": self._route_to_dict(route)}
+
+
+    def _cmd_move_waypoint(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        route = self._routes().move_waypoint(
+            str(command["route"]),
+            int(command["from_index"]),
+            int(command["to_index"]),
+        )
+        return {"route": self._route_to_dict(route)}
+
+
+    def _cmd_add_zone(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        zone = self._zones().add(
+            str(command["name"]),
+            str(command["type"]),
+            dict(command["geometry"]),
+            speed_pct=command.get("speed_pct"),
+        )
+        self._refresh_zone_masks()
+        return {"zone": zone.to_dict()}
+
+
+    def _cmd_get_zone(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return {"zone": self._zones().get(str(command["name"])).to_dict()}
+
+
+    def _cmd_list_zones(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        zlist = self._zones().list(command.get("type"))
+        return {"zones": [z.to_dict() for z in zlist]}
+
+
+    def _cmd_update_zone(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        zone = self._zones().update(
+            str(command["name"]),
+            type=command.get("type"),
+            geometry=dict(command["geometry"]) if "geometry" in command else None,
+            speed_pct=command.get("speed_pct"),
+            new_name=command.get("new_name"),
+        )
+        self._refresh_zone_masks()
+        return {"zone": zone.to_dict()}
+
+
+    def _cmd_delete_zone(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        self._zones().delete(str(command["name"]))
+        self._refresh_zone_masks()
+        return {"status": "deleted"}
+
+
+    def _cmd_delete_all_zones(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        self._zones().delete_all(command.get("type"))
+        self._refresh_zone_masks()
+        return {"status": "deleted"}
+
         # navigate/cancel/status may block (planning / drive). Keep them off the
         # module event loop so Base.SetVelocity and sensor reads stay responsive.
-        if cmd == "navigate_to_location":
-            loc = self._locations().get(str(command["name"]))
-            self._suspended = None
-            self._active_goal_name = loc.name
-            await self._cancel_route()
-            await self._cancel_simple_nav()
-            await asyncio.to_thread(mgr.navigate, loc.x, loc.y, loc.theta)
-            return {"status": "navigating", "target": loc.to_dict()}
-        if cmd == "navigate_to_point":
-            x = float(command["x"])
-            y = float(command["y"])
-            theta = float(command.get("theta", 0.0))
-            self._suspended = None
-            self._active_goal_name = None
-            await self._cancel_route()
-            await self._cancel_simple_nav()
-            await asyncio.to_thread(mgr.navigate, x, y, theta)
-            return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
-        if cmd == "navigate_route":
-            return await self._start_navigate_route(command)
-        if cmd in ("plan_to_point", "compute_path_to_point"):
-            return await self._plan_preview(command, mgr)
-        if cmd in ("plan_to_location", "compute_path_to_location"):
-            loc = self._locations().get(str(command["name"]))
-            payload = dict(command)
-            payload["x"] = loc.x
-            payload["y"] = loc.y
-            payload["theta"] = loc.theta
-            preview = await self._plan_preview(payload, mgr)
-            preview["location"] = loc.to_dict()
-            self._last_preview_plan = preview
-            return preview
-        if cmd in ("get_last_plan", "get_preview_plan"):
-            preview = self._last_preview_plan or mgr.last_preview_plan()
-            if not preview:
-                raise ValueError("no preview plan; call plan_to_point first")
-            return {"plan": preview}
-        if cmd == "execute_plan":
-            preview = self._last_preview_plan or mgr.last_preview_plan()
-            if not preview:
-                raise ValueError("no preview plan; call plan_to_point first")
-            if not preview.get("feasible"):
-                raise ValueError(
-                    preview.get("error_msg")
-                    or f"last preview was not feasible (error_code={preview.get('error_code')})"
-                )
-            goal = preview.get("goal") or {}
-            x = float(goal["x"])
-            y = float(goal["y"])
-            theta = float(goal.get("theta", 0.0))
-            name = preview.get("location", {}).get("name") if isinstance(preview.get("location"), dict) else None
-            self._suspended = None
-            self._active_goal_name = name
-            await self._cancel_route()
-            await self._cancel_simple_nav()
-            await asyncio.to_thread(mgr.navigate, x, y, theta)
-            return {
-                "status": "navigating",
-                "target": {"x": x, "y": y, "theta": theta, **({"name": name} if name else {})},
-                "from_preview": True,
-                "length_m": preview.get("length_m"),
-            }
-        if cmd == "go_to_location":
-            loc = self._locations().get(str(command["name"]))
-            self._suspended = None
-            self._active_goal_name = loc.name
-            await self._cancel_route()
-            return await self._start_simple_go(loc.x, loc.y, loc.theta, command)
-        if cmd == "go_to_point":
-            x = float(command["x"])
-            y = float(command["y"])
-            theta = float(command.get("theta", 0.0))
-            self._suspended = None
-            self._active_goal_name = None
-            await self._cancel_route()
-            return await self._start_simple_go(x, y, theta, command)
-        if cmd in ("suspend", "pause_nav", "suspend_nav"):
-            return await self._suspend_nav(command)
-        if cmd in ("resume", "resume_nav"):
-            return await self._resume_nav(command)
-        if cmd == "cancel":
-            self._active_goal_name = None
-            self._suspended = None
-            await self._cancel_route()
-            await self._cancel_simple_nav()
-            await asyncio.to_thread(mgr.cancel)
-            if self._plan_execution is not None:
-                self._record_plan_state(
-                    self._plan_execution,
-                    PlanState.PLAN_STATE_STOPPED,
-                    reason="cancel",
-                )
-            return {"status": "canceled"}
-        if cmd == "test_drive":
-            return await self._test_drive(command)
-        if cmd == "get_trace":
-            from ..nav_builtin.supervisor import recent_trace
 
-            seconds = float(command.get("seconds", 30.0))
-            return {"ticks": recent_trace(seconds)}
-        if cmd in ("get_status", "describe_motion", "what_am_i_doing"):
-            def _status():
-                status = mgr.nav_status()
-                simple = dict(self._simple_nav_status)
-                status["simple_nav"] = simple
-                if simple.get("state") == "active":
-                    status["active"] = True
-                    status["motion"] = "simple"
-                    # Prefer simple-nav target when active (builtin goal may be stale).
-                    target = simple.get("target")
-                    if isinstance(target, dict):
-                        status["goal"] = dict(target)
-                goal = status.get("goal")
-                if isinstance(goal, dict) and self._active_goal_name:
-                    goal = dict(goal)
-                    goal["name"] = self._active_goal_name
-                    status["goal"] = goal
-                status["localization_check"] = dict(runtime.localization_check)
-                state = runtime.localization_check.get("state")
-                if isinstance(state, dict):
-                    status["localization_state"] = dict(state)
-                pose = status.get("pose")
-                if not isinstance(pose, dict) or "x" not in pose:
-                    live = self._live_map_pose_dict(mgr)
-                    if live is not None:
-                        status["pose"] = live
-                suspended = self._suspended
-                status["suspended"] = suspended is not None
-                status["suspended_goal"] = (
-                    suspended.to_dict() if suspended is not None else None
-                )
-                route = dict(self._route_status)
-                status["route"] = route
-                if route.get("state") == "active":
-                    status["active"] = True
-                    status["motion"] = "route"
-                return status
 
-            status = await asyncio.to_thread(_status)
-            if cmd == "get_status":
-                try:
-                    cfg = self._require_cfg()
-                    fl = cfg.footprint_length_m
-                    fw = cfg.footprint_width_m
-                    if fl and fw:
-                        status["footprint_length_m"] = float(fl)
-                        status["footprint_width_m"] = float(fw)
-                    else:
-                        diam = 2.0 * float(cfg.robot_radius)
-                        status["footprint_length_m"] = diam
-                        status["footprint_width_m"] = diam
-                    status["robot_radius_m"] = float(cfg.hard_clearance_radius_m())
-                except Exception:  # noqa: BLE001
-                    pass
-                return status
-            cfg = self._require_cfg()
-            return summarize_nav_motion(
-                status,
-                max_vel_x=float(cfg.max_linear_velocity),
-                max_vel_theta=float(cfg.max_vel_theta),
+    async def _cmd_navigate_to_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        runtime = self._require_runtime()
+        mgr = runtime.manager
+        loc = self._locations().get(require(command, "name", str))
+        self._suspended = None
+        self._active_goal_name = loc.name
+        await self._cancel_route()
+        await self._cancel_simple_nav()
+        await asyncio.to_thread(mgr.navigate, loc.x, loc.y, loc.theta)
+        return {"status": "navigating", "target": loc.to_dict()}
+
+
+    async def _cmd_navigate_to_point(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        runtime = self._require_runtime()
+        mgr = runtime.manager
+        x = require(command, "x", float)
+        y = require(command, "y", float)
+        theta = require(command, "theta", float, default=0.0)
+        self._suspended = None
+        self._active_goal_name = None
+        await self._cancel_route()
+        await self._cancel_simple_nav()
+        await asyncio.to_thread(mgr.navigate, x, y, theta)
+        return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
+
+
+    async def _cmd_navigate_route(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return await self._start_navigate_route(command)
+
+
+    async def _cmd_plan_to_point(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        runtime = self._require_runtime()
+        mgr = runtime.manager
+        return await self._plan_preview(command, mgr)
+
+
+    async def _cmd_plan_to_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        runtime = self._require_runtime()
+        mgr = runtime.manager
+        loc = self._locations().get(str(command["name"]))
+        payload = dict(command)
+        payload["x"] = loc.x
+        payload["y"] = loc.y
+        payload["theta"] = loc.theta
+        preview = await self._plan_preview(payload, mgr)
+        preview["location"] = loc.to_dict()
+        self._last_preview_plan = preview
+        return preview
+
+
+    def _cmd_get_last_plan(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        runtime = self._require_runtime()
+        mgr = runtime.manager
+        preview = self._last_preview_plan or mgr.last_preview_plan()
+        if not preview:
+            raise ValueError("no preview plan; call plan_to_point first")
+        return {"plan": preview}
+
+
+    async def _cmd_execute_plan(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        runtime = self._require_runtime()
+        mgr = runtime.manager
+        preview = self._last_preview_plan or mgr.last_preview_plan()
+        if not preview:
+            raise ValueError("no preview plan; call plan_to_point first")
+        if not preview.get("feasible"):
+            raise ValueError(
+                preview.get("error_msg")
+                or f"last preview was not feasible (error_code={preview.get('error_code')})"
             )
-        if cmd == "get_costmap":
-            # Inflated costmap for operator UIs (nav-stack-ui Costmap toggle).
-            # ``layer``: ``auto`` (local while navigating, else global), ``local``
-            # (rolling window around the robot — refreshed on demand even when
-            # idle), or ``global``.
-            from ..runtime import get_nav_view
+        goal = preview.get("goal") or {}
+        x = float(goal["x"])
+        y = float(goal["y"])
+        theta = float(goal.get("theta", 0.0))
+        name = preview.get("location", {}).get("name") if isinstance(preview.get("location"), dict) else None
+        self._suspended = None
+        self._active_goal_name = name
+        await self._cancel_route()
+        await self._cancel_simple_nav()
+        await asyncio.to_thread(mgr.navigate, x, y, theta)
+        return {
+            "status": "navigating",
+            "target": {"x": x, "y": y, "theta": theta, **({"name": name} if name else {})},
+            "from_preview": True,
+            "length_m": preview.get("length_m"),
+        }
 
-            view = get_nav_view(self.name)
-            if view is None:
-                return {"available": False, "reason": "viz_unavailable"}
 
-            cfg = self._require_cfg()
-            layer_req = str(command.get("layer", "auto")).lower()
-            if layer_req not in ("local", "global", "auto"):
-                layer_req = "auto"
+    async def _cmd_go_to_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        loc = self._locations().get(str(command["name"]))
+        self._suspended = None
+        self._active_goal_name = loc.name
+        await self._cancel_route()
+        return await self._start_simple_go(loc.x, loc.y, loc.theta, command)
 
-            def _fetch():
-                import time as _time
 
-                if hasattr(view, "enable_viz"):
-                    view.enable_viz(8)
-                snap = (
-                    view.viz_snapshot()
-                    if hasattr(view, "viz_snapshot")
-                    else view.snapshot()
+    async def _cmd_go_to_point(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        x = require(command, "x", float)
+        y = require(command, "y", float)
+        theta = require(command, "theta", float, default=0.0)
+        self._suspended = None
+        self._active_goal_name = None
+        await self._cancel_route()
+        return await self._start_simple_go(x, y, theta, command)
+
+
+    async def _cmd_suspend(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return await self._suspend_nav(command)
+
+
+    async def _cmd_resume(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return await self._resume_nav(command)
+
+
+    async def _cmd_cancel(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        runtime = self._require_runtime()
+        mgr = runtime.manager
+        self._active_goal_name = None
+        self._suspended = None
+        await self._cancel_route()
+        await self._cancel_simple_nav()
+        await asyncio.to_thread(mgr.cancel)
+        if self._plan_execution is not None:
+            self._record_plan_state(
+                self._plan_execution,
+                PlanState.PLAN_STATE_STOPPED,
+                reason="cancel",
+            )
+        return {"status": "canceled"}
+
+
+    async def _cmd_test_drive(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        return await self._test_drive(command)
+
+
+    def _cmd_get_trace(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        from ..nav_builtin.supervisor import recent_trace
+
+        seconds = float(command.get("seconds", 30.0))
+        return {"ticks": recent_trace(seconds)}
+
+
+    async def _cmd_get_status(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        cmd = str(command.get("command"))
+        runtime = self._require_runtime()
+        mgr = runtime.manager
+        def _status():
+            status = mgr.nav_status()
+            simple = dict(self._simple_nav_status)
+            status["simple_nav"] = simple
+            if simple.get("state") == "active":
+                status["active"] = True
+                status["motion"] = "simple"
+                # Prefer simple-nav target when active (builtin goal may be stale).
+                target = simple.get("target")
+                if isinstance(target, dict):
+                    status["goal"] = dict(target)
+            goal = status.get("goal")
+            if isinstance(goal, dict) and self._active_goal_name:
+                goal = dict(goal)
+                goal["name"] = self._active_goal_name
+                status["goal"] = goal
+            status["localization_check"] = dict(runtime.localization_check)
+            state = runtime.localization_check.get("state")
+            if isinstance(state, dict):
+                status["localization_state"] = dict(state)
+            pose = status.get("pose")
+            if not isinstance(pose, dict) or "x" not in pose:
+                live = self._live_map_pose_dict(mgr)
+                if live is not None:
+                    status["pose"] = live
+            suspended = self._suspended
+            status["suspended"] = suspended is not None
+            status["suspended_goal"] = (
+                suspended.to_dict() if suspended is not None else None
+            )
+            route = dict(self._route_status)
+            status["route"] = route
+            if route.get("state") == "active":
+                status["active"] = True
+                status["motion"] = "route"
+            return status
+
+        status = await asyncio.to_thread(_status)
+        if cmd == "get_status":
+            try:
+                cfg = self._require_cfg()
+                fl = cfg.footprint_length_m
+                fw = cfg.footprint_width_m
+                if fl and fw:
+                    status["footprint_length_m"] = float(fl)
+                    status["footprint_width_m"] = float(fw)
+                else:
+                    diam = 2.0 * float(cfg.robot_radius)
+                    status["footprint_length_m"] = diam
+                    status["footprint_width_m"] = diam
+                status["robot_radius_m"] = float(cfg.hard_clearance_radius_m())
+            except Exception:  # noqa: BLE001
+                pass
+            return status
+        cfg = self._require_cfg()
+        return summarize_nav_motion(
+            status,
+            max_vel_x=float(cfg.max_linear_velocity),
+            max_vel_theta=float(cfg.max_vel_theta),
+        )
+
+
+    async def _cmd_get_costmap(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+        runtime = self._require_runtime()
+        # Inflated costmap for operator UIs (nav-stack-ui Costmap toggle).
+        # ``layer``: ``auto`` (local while navigating, else global), ``local``
+        # (rolling window around the robot — refreshed on demand even when
+        # idle), or ``global``.
+        from ..runtime import get_nav_view
+
+        view = get_nav_view(self.name)
+        if view is None:
+            return {"available": False, "reason": "viz_unavailable"}
+
+        cfg = self._require_cfg()
+        layer_req = str(command.get("layer", "auto")).lower()
+        if layer_req not in ("local", "global", "auto"):
+            layer_req = "auto"
+
+        def _fetch():
+            import time as _time
+
+            if hasattr(view, "enable_viz"):
+                view.enable_viz(8)
+            snap = (
+                view.viz_snapshot()
+                if hasattr(view, "viz_snapshot")
+                else view.snapshot()
+            )
+
+            nav_active = False
+            try:
+                nav_active = bool(runtime.manager.nav_status().get("active"))
+            except Exception:  # noqa: BLE001
+                pass
+            use_local = layer_req == "local" or (
+                layer_req == "auto" and nav_active
+            )
+            layer_used = "global"
+            cm = None
+
+            if use_local:
+                # Follower only refreshes snap["local_costmap"] while a plan
+                # is active. Prefer that live map when navigating; when idle,
+                # never reuse a stale snap — rebuild the rolling window.
+                local_cm = (
+                    snap.get("local_costmap") if nav_active else None
                 )
-
-                nav_active = False
-                try:
-                    nav_active = bool(runtime.manager.nav_status().get("active"))
-                except Exception:  # noqa: BLE001
-                    pass
-                use_local = layer_req == "local" or (
-                    layer_req == "auto" and nav_active
-                )
-                layer_used = "global"
-                cm = None
-
-                if use_local:
-                    # Follower only refreshes snap["local_costmap"] while a plan
-                    # is active. Prefer that live map when navigating; when idle,
-                    # never reuse a stale snap — rebuild the rolling window.
-                    local_cm = (
-                        snap.get("local_costmap") if nav_active else None
+                if local_cm is not None and local_cm.get("grid") is not None:
+                    cm = local_cm
+                    layer_used = "local"
+                elif layer_req == "local":
+                    idle = self._build_idle_local_costmap(
+                        runtime, view, cfg
                     )
-                    if local_cm is not None and local_cm.get("grid") is not None:
-                        cm = local_cm
+                    if idle is not None:
+                        cm = idle
                         layer_used = "local"
-                    elif layer_req == "local":
-                        idle = self._build_idle_local_costmap(
-                            runtime, view, cfg
-                        )
-                        if idle is not None:
-                            cm = idle
-                            layer_used = "local"
 
-                if cm is None:
-                    cm = snap.get("costmap")
-                if layer_used == "global":
-                    now = _time.monotonic()
-                    cached = self._builtin_costmap_cache
-                    if (
-                        cached is not None
-                        and now - self._builtin_costmap_cache_at < 0.2
-                    ):
-                        return cached, layer_used
-                    # Always refresh from the live SLAM/world map — never prefer
-                    # snap["map"], which is only updated when something else
-                    # called world.get_map() (often stale throughout mapping).
-                    mp = None
-                    world = getattr(runtime.manager, "_world", None)
-                    if world is None:
-                        world = getattr(runtime.manager, "_builtin_world", None)
-                    if world is not None and hasattr(world, "get_map"):
+            if cm is None:
+                cm = snap.get("costmap")
+            if layer_used == "global":
+                now = _time.monotonic()
+                cached = self._builtin_costmap_cache
+                if (
+                    cached is not None
+                    and now - self._builtin_costmap_cache_at < 0.2
+                ):
+                    return cached, layer_used
+                # Always refresh from the live SLAM/world map — never prefer
+                # snap["map"], which is only updated when something else
+                # called world.get_map() (often stale throughout mapping).
+                mp = None
+                world = getattr(runtime.manager, "_world", None)
+                if world is None:
+                    world = getattr(runtime.manager, "_builtin_world", None)
+                if world is not None and hasattr(world, "get_map"):
+                    try:
+                        mp = world.get_map()
+                    except Exception:  # noqa: BLE001
+                        mp = None
+                if mp is None or mp.get("grid") is None:
+                    if hasattr(runtime.manager, "get_map"):
                         try:
-                            mp = world.get_map()
+                            mp = runtime.manager.get_map()
                         except Exception:  # noqa: BLE001
                             mp = None
-                    if mp is None or mp.get("grid") is None:
-                        if hasattr(runtime.manager, "get_map"):
-                            try:
-                                mp = runtime.manager.get_map()
-                            except Exception:  # noqa: BLE001
-                                mp = None
-                    if mp is None or mp.get("grid") is None:
-                        if hasattr(view, "get_map"):
-                            mp = view.get_map()
-                    if mp is None or mp.get("grid") is None:
-                        mp = snap.get("map")
-                    if mp is not None and mp.get("grid") is not None:
-                        from ..nav_builtin.costmap import (
-                            build_costmap,
-                            costmap_viz_dict,
-                            occupancy_from_map_dict,
-                        )
+                if mp is None or mp.get("grid") is None:
+                    if hasattr(view, "get_map"):
+                        mp = view.get_map()
+                if mp is None or mp.get("grid") is None:
+                    mp = snap.get("map")
+                if mp is not None and mp.get("grid") is not None:
+                    from ..nav_builtin.costmap import (
+                        build_costmap,
+                        costmap_viz_dict,
+                        occupancy_from_map_dict,
+                    )
 
-                        occ = occupancy_from_map_dict(mp)
-                        masks = None
-                        zone_for = getattr(world, "zone_masks_for", None) if world else None
-                        if not callable(zone_for):
-                            zone_for = getattr(runtime.manager, "zone_masks_for", None)
-                        if callable(zone_for):
-                            try:
-                                masks = zone_for(mp)
-                            except Exception:  # noqa: BLE001
-                                masks = None
-                        if masks is not None and masks.keepout.shape == occ.grid.shape:
-                            from ..nav_builtin.types import OccupancyGrid
-
-                            occ = OccupancyGrid(
-                                grid=zones_mod.apply_keepout_to_grid(
-                                    occ.grid, masks.keepout
-                                ),
-                                resolution=occ.resolution,
-                                origin_x=occ.origin_x,
-                                origin_y=occ.origin_y,
-                            )
-                        costs = build_costmap(
-                            occ,
-                            # Same radii the planner uses, so the rendered ring
-                            # matches the costmap paths are actually planned on.
-                            inflation_radius_m=cfg.effective_inflation_radius_m(),
-                            robot_radius_m=cfg.hard_clearance_radius_m(),
-                            body_radius_m=cfg.inscribed_radius_m(),
-                            cost_scaling_factor=float(
-                                cfg.builtin.cost_scaling_factor
-                            ),
-                            mapping=_world_is_mapping(world),
-                        )
-                        cm = costmap_viz_dict(occ, costs)
-                        self._builtin_costmap_cache = cm
-                        self._builtin_costmap_cache_at = now
-                        # Keep nav-camera / viz store in sync with the live map.
+                    occ = occupancy_from_map_dict(mp)
+                    masks = None
+                    zone_for = getattr(world, "zone_masks_for", None) if world else None
+                    if not callable(zone_for):
+                        zone_for = getattr(runtime.manager, "zone_masks_for", None)
+                    if callable(zone_for):
                         try:
-                            if hasattr(view, "set_map"):
-                                view.set_map(mp)
-                            if hasattr(view, "set_costmap"):
-                                view.set_costmap(cm)
-                            elif hasattr(view, "_viz_lock"):
-                                with view._viz_lock:  # noqa: SLF001
-                                    view._viz_global_costmap = {  # noqa: SLF001
-                                        "grid": cm["grid"],
-                                        "resolution": cm["resolution"],
-                                        "origin_x": cm["origin_x"],
-                                        "origin_y": cm["origin_y"],
-                                    }
+                            masks = zone_for(mp)
                         except Exception:  # noqa: BLE001
-                            pass
-                if cm is None:
-                    cm = snap.get("map")
-                return cm, layer_used
+                            masks = None
+                    if masks is not None and masks.keepout.shape == occ.grid.shape:
+                        from ..nav_builtin.types import OccupancyGrid
 
-            cm, layer_used = await asyncio.to_thread(_fetch)
-            if not cm or cm.get("grid") is None:
-                return {"available": False, "reason": "no_costmap"}
+                        occ = OccupancyGrid(
+                            grid=zones_mod.apply_keepout_to_grid(
+                                occ.grid, masks.keepout
+                            ),
+                            resolution=occ.resolution,
+                            origin_x=occ.origin_x,
+                            origin_y=occ.origin_y,
+                        )
+                    costs = build_costmap(
+                        occ,
+                        # Same radii the planner uses, so the rendered ring
+                        # matches the costmap paths are actually planned on.
+                        inflation_radius_m=cfg.effective_inflation_radius_m(),
+                        robot_radius_m=cfg.hard_clearance_radius_m(),
+                        body_radius_m=cfg.inscribed_radius_m(),
+                        cost_scaling_factor=float(
+                            cfg.builtin.cost_scaling_factor
+                        ),
+                        mapping=_world_is_mapping(world),
+                    )
+                    cm = costmap_viz_dict(occ, costs)
+                    self._builtin_costmap_cache = cm
+                    self._builtin_costmap_cache_at = now
+                    # Keep nav-camera / viz store in sync with the live map.
+                    try:
+                        if hasattr(view, "set_map"):
+                            view.set_map(mp)
+                        if hasattr(view, "set_costmap"):
+                            view.set_costmap(cm)
+                        elif hasattr(view, "_viz_lock"):
+                            with view._viz_lock:  # noqa: SLF001
+                                view._viz_global_costmap = {  # noqa: SLF001
+                                    "grid": cm["grid"],
+                                    "resolution": cm["resolution"],
+                                    "origin_x": cm["origin_x"],
+                                    "origin_y": cm["origin_y"],
+                                }
+                    except Exception:  # noqa: BLE001
+                        pass
+            if cm is None:
+                cm = snap.get("map")
+            return cm, layer_used
 
-            import base64
+        cm, layer_used = await asyncio.to_thread(_fetch)
+        if not cm or cm.get("grid") is None:
+            return {"available": False, "reason": "no_costmap"}
 
-            import numpy as np
+        import base64
 
-            grid = np.asarray(cm["grid"])
-            # Default stride=2 (~10 cm cells) keeps RPC payloads modest for UI poll.
-            stride = max(1, int(command.get("stride", 2)))
-            if stride > 1:
-                grid = grid[::stride, ::stride]
-            height, width = int(grid.shape[0]), int(grid.shape[1])
-            resolution = float(cm["resolution"]) * stride
-            # 255 = unknown (-1); 0 free; 1..100 cost.
-            u8 = np.where(grid < 0, 255, np.clip(grid, 0, 100)).astype(np.uint8)
-            return {
-                "available": True,
-                "layer": layer_used,
-                "origin_x": float(cm["origin_x"]),
-                "origin_y": float(cm["origin_y"]),
-                "resolution": resolution,
-                "width": width,
-                "height": height,
-                "encoding": "uint8_row_major",
-                "unknown": 255,
-                "data_b64": base64.b64encode(u8.tobytes()).decode("ascii"),
-                "nav_backend": cfg.nav_backend,
-            }
+        import numpy as np
 
-        raise ValueError(f"unknown command: {cmd!r}")
+        grid = np.asarray(cm["grid"])
+        # Default stride=2 (~10 cm cells) keeps RPC payloads modest for UI poll.
+        stride = max(1, int(command.get("stride", 2)))
+        if stride > 1:
+            grid = grid[::stride, ::stride]
+        height, width = int(grid.shape[0]), int(grid.shape[1])
+        resolution = float(cm["resolution"]) * stride
+        # 255 = unknown (-1); 0 free; 1..100 cost.
+        u8 = np.where(grid < 0, 255, np.clip(grid, 0, 100)).astype(np.uint8)
+        return {
+            "available": True,
+            "layer": layer_used,
+            "origin_x": float(cm["origin_x"]),
+            "origin_y": float(cm["origin_y"]),
+            "resolution": resolution,
+            "width": width,
+            "height": height,
+            "encoding": "uint8_row_major",
+            "unknown": 255,
+            "data_b64": base64.b64encode(u8.tobytes()).decode("ascii"),
+            "nav_backend": cfg.nav_backend,
+        }
+
 
     def _build_idle_local_costmap(self, runtime, view, cfg: NavConfig):
         """Rolling local costmap while idle (UI Local layer / get_costmap).
