@@ -2116,7 +2116,6 @@ class NavSupervisor:
 
             while time.monotonic() < ep.deadline:
                 tick_started = time.monotonic()
-                loc_hold_motion = False
                 if self._cancel.is_set():
                     self._world.stop()
                     self._set_status(state="canceled", active=False, error_msg="canceled")
@@ -2185,117 +2184,29 @@ class NavSupervisor:
                 if loc.abort:
                     return
                 now = loc.now
-                loc_hold_motion = loc.loc_hold_motion
                 holding_for_localize = loc.holding_for_localize
                 loc_hold = loc.loc_hold
 
-                tick = run_sense_tick(self, ep, now=now, pose=pose, path=path)
-                block = run_block_policy(
-                    self,
-                    ep,
-                    tick,
-                    goal=goal,
-                    path=path,
-                    loc_hold_motion=loc_hold_motion,
+                tick = run_sense_tick(
+                    self, ep, now=now, pose=pose, path=path, goal=goal
                 )
-                waiting_for_clear = block.waiting_for_clear
-                corridor_yaw = block.corridor_yaw
+                tick.loc_hold_motion = loc.loc_hold_motion
+                block = run_block_policy(self, ep, tick)
                 if block.action == "replan":
-                    outcome, corridor_yaw = apply_blocked_replan(
-                        self,
-                        ep,
-                        goal=goal,
-                        pose=pose,
-                        path=path,
-                        scan=tick.scan,
-                        local_view=tick.local_view,
-                        nose_clear=tick.nose_clear,
-                        path_ahead_cost=tick.path_ahead_cost,
-                        corridor_yaw=corridor_yaw,
-                    )
-                    path, pose = outcome.path, outcome.pose
-                    if outcome.abort:
+                    if apply_blocked_replan(self, ep, tick).abort:
                         return
 
-                follow = run_path_follow(
-                    self,
-                    ep,
-                    tick,
-                    goal=goal,
-                    path=path,
-                    pose=pose,
-                    waiting_for_clear=waiting_for_clear,
-                    corridor_yaw=corridor_yaw,
-                    loc_hold_motion=loc_hold_motion,
-                )
-                if follow.abort:
+                if run_path_follow(self, ep, tick).abort:
                     return
-                cmd, progress = follow.cmd, dict(follow.progress)
-                path, pose = follow.path, follow.pose
-
-                backup = run_backup_recovery(
-                    self,
-                    ep,
-                    now=now,
-                    pose=pose,
-                    goal=goal,
-                    path=path,
-                    scan=tick.scan,
-                    local_view=tick.local_view,
-                    cmd=cmd,
-                    progress=progress,
-                    local_blocked=tick.local_blocked,
-                    waiting_for_clear=waiting_for_clear,
-                )
-                cmd, progress = backup.cmd, dict(backup.progress)
-                path, pose = backup.path, backup.pose
-
-                periodic = run_periodic_replan(
-                    self,
-                    ep,
-                    now=now,
-                    pose=pose,
-                    goal=goal,
-                    path=path,
-                    scan=tick.scan,
-                    local_view=tick.local_view,
-                    cmd=cmd,
-                    progress=progress,
-                    local_blocked=tick.local_blocked,
-                    nose_clear=tick.nose_clear,
-                    corridor_yaw=corridor_yaw,
-                )
-                if periodic.abort:
+                run_backup_recovery(self, ep, tick)
+                if run_periodic_replan(self, ep, tick).abort:
                     return
-                path, pose = periodic.path, periodic.pose
 
-                gate = run_final_gate(
-                    self,
-                    ep,
-                    now=now,
-                    pose=pose,
-                    goal=goal,
-                    path=path,
-                    scan=tick.scan,
-                    local_view=tick.local_view,
-                    guard_pts=tick.guard_pts,
-                    nose_clear=tick.nose_clear,
-                    cmd=cmd,
-                    progress=progress,
-                    corridor_yaw=corridor_yaw,
-                    waiting_for_clear=waiting_for_clear,
-                    loc_hold_motion=loc_hold_motion,
-                )
-                path, pose = gate.path, gate.pose
+                gate = run_final_gate(self, ep, tick)
                 out = finish_tick_output(
                     self,
                     tick,
                     gate,
-                    goal=goal,
-                    path=path,
-                    pose=pose,
-                    cmd=gate.cmd,
-                    progress=dict(gate.progress),
                     holding_for_localize=holding_for_localize,
                     loc_hold=loc_hold,
                     tick_started=tick_started,
@@ -2303,32 +2214,18 @@ class NavSupervisor:
                 if out.succeeded:
                     return
                 if out.skip_rest:
+                    path = tick.path
                     continue
-                cmd, progress = out.cmd, dict(out.progress)
 
-                stall = run_stall_watch(
-                    self,
-                    ep,
-                    now=now,
-                    pose=pose,
-                    goal=goal,
-                    path=path,
-                    scan=tick.scan,
-                    local_view=tick.local_view,
-                    cmd=cmd,
-                    progress=progress,
-                    local_blocked=tick.local_blocked,
-                    nose_clear=tick.nose_clear,
-                    path_ahead_cost=tick.path_ahead_cost,
-                )
-                if stall.abort:
+                if run_stall_watch(self, ep, tick).abort:
                     return
-                path = stall.path
 
                 if send_tick_velocity(
-                    self, ep, cmd, tick_started=tick_started
+                    self, ep, tick, tick_started=tick_started
                 ):
+                    path = tick.path
                     continue
+                path = tick.path
 
             self._world.stop()
             self._set_status(

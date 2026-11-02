@@ -14,14 +14,11 @@ if TYPE_CHECKING:
     from .final_gate import GateResult
     from .sense_tick import TickContext
     from .supervisor import NavSupervisor
-    from .types import Path2D, Pose2D
 
 
 @dataclass
 class TickOutputResult:
-    cmd: DriveCommand
-    progress: Mapping[str, Any]
-    # Caller should continue (no_scan / transient drive reject).
+    # Caller should continue (no_scan).
     skip_rest: bool = False
     # Caller should return (reached goal on cmd.done).
     succeeded: bool = False
@@ -54,11 +51,6 @@ def finish_tick_output(
     tick: "TickContext",
     gate: "GateResult",
     *,
-    goal: "Pose2D",
-    path: "Path2D",
-    pose: "Pose2D",
-    cmd: DriveCommand,
-    progress: Mapping[str, Any],
     holding_for_localize: bool,
     loc_hold: Optional[Mapping[str, Any]],
     tick_started: float,
@@ -66,19 +58,18 @@ def finish_tick_output(
     """Speed-zone, TRACE, status, no_scan stop, cmd.done goal check."""
     from . import supervisor as _sup
 
-    progress = dict(progress)
     if gate.traced:
         mem_pts = tick.mem_pts
         guard_pts = tick.guard_pts
         _sup._TRACE.append(
             {
                 "t": round(time.time(), 3),
-                "x": round(pose.x, 3),
-                "y": round(pose.y, 3),
-                "th": round(pose.theta, 4),
-                "vx": round(cmd.vx, 3),
-                "w": round(cmd.vtheta, 3),
-                "obs": progress.get("obstacle"),
+                "x": round(tick.pose.x, 3),
+                "y": round(tick.pose.y, 3),
+                "th": round(tick.pose.theta, 4),
+                "vx": round(tick.cmd.vx, 3),
+                "w": round(tick.cmd.vtheta, 3),
+                "obs": tick.progress.get("obstacle"),
                 "near_m": (
                     round(gate.near_d, 3) if math.isfinite(gate.near_d) else None
                 ),
@@ -90,78 +81,69 @@ def finish_tick_output(
                 ),
                 "pts": int(len(guard_pts)) if guard_pts is not None else 0,
                 "mem": int(len(mem_pts)) if mem_pts is not None else 0,
-                "wp": progress.get("waypoint_index"),
+                "wp": tick.progress.get("waypoint_index"),
             }
         )
-    # Apply before status / lookahead feedback so the limited twist
-    # is what we report and close the loop on.
-    cmd = nav._apply_speed_zone(pose, cmd)  # noqa: SLF001
-    cmd = nav._lift_sub_deadband(  # noqa: SLF001
-        cmd, progress.get("forward_clearance_m")
+    tick.cmd = nav._apply_speed_zone(tick.pose, tick.cmd)  # noqa: SLF001
+    tick.cmd = nav._lift_sub_deadband(  # noqa: SLF001
+        tick.cmd, tick.progress.get("forward_clearance_m")
     )
-    progress = {
-        **progress,
-        "cmd_vx_mps": cmd.vx,
-        "cmd_vtheta_rad_s": cmd.vtheta,
+    tick.progress = {
+        **tick.progress,
+        "cmd_vx_mps": tick.cmd.vx,
+        "cmd_vtheta_rad_s": tick.cmd.vtheta,
     }
-    progress = overlay_loc_hold_progress(
-        progress,
+    tick.progress = overlay_loc_hold_progress(
+        tick.progress,
         holding_for_localize=holding_for_localize,
         loc_hold=loc_hold,
     )
 
     nav._set_status(  # noqa: SLF001
-        pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
-        progress={k: progress[k] for k in _PROGRESS_KEYS if k in progress},
+        pose={"x": tick.pose.x, "y": tick.pose.y, "theta": tick.pose.theta},
+        progress={k: tick.progress[k] for k in _PROGRESS_KEYS if k in tick.progress},
     )
-    if progress.get("obstacle") == "no_scan":
-        # No fresh lidar frame: stop translation and yaw. The last
-        # scan must not be driven or spun on.
+    if tick.progress.get("obstacle") == "no_scan":
         nav._world.set_velocity(0.0, 0.0, 0.0)  # noqa: SLF001
         nav._last_sent_cmd = DriveCommand(0.0, 0.0, 0.0, False)  # noqa: SLF001
         nav._last_sent_at = _sup.time.monotonic()  # noqa: SLF001
         nav._sleep_control_period(tick_started)  # noqa: SLF001
-        return TickOutputResult(cmd=cmd, progress=progress, skip_rest=True)
+        return TickOutputResult(skip_rest=True)
 
-    if cmd.done:
-        at_goal = nav._xy_at_nav_goal(pose, goal, path) and (  # noqa: SLF001
-            abs(conv.normalize_angle(pose.theta - goal.theta))
+    if tick.cmd.done:
+        at_goal = nav._xy_at_nav_goal(tick.pose, tick.goal, tick.path) and (  # noqa: SLF001
+            abs(conv.normalize_angle(tick.pose.theta - tick.goal.theta))
             <= nav._follower.motion.yaw_tolerance_rad  # noqa: SLF001
         )
         if at_goal:
             nav._world.stop()  # noqa: SLF001
             nav._set_status(state="succeeded", active=False, error_msg="")  # noqa: SLF001
-            return TickOutputResult(cmd=cmd, progress=progress, succeeded=True)
+            return TickOutputResult(succeeded=True)
 
-    return TickOutputResult(cmd=cmd, progress=progress)
+    return TickOutputResult()
 
 
 def send_tick_velocity(
     nav: "NavSupervisor",
     ep,
-    cmd: DriveCommand,
+    tick: "TickContext",
     *,
     tick_started: float,
 ) -> bool:
     """Publish cmd_vel. True ⇒ caller should continue the outer loop."""
     from .controller import update_speed_estimate
 
+    cmd = tick.cmd
     try:
         nav._world.set_velocity(cmd.vx, cmd.vy, cmd.vtheta)  # noqa: SLF001
         nav._io_timeout_streak = 0  # noqa: SLF001
     except TimeoutError:
-        # Transient event-loop starvation — don't abort the goal on
-        # a single missed cmd_vel (common when SLAM mapping + lidar
-        # gRPC share the module loop with Base.SetVelocity).
         nav._io_timeout_streak += 1  # noqa: SLF001
         if nav._io_timeout_streak >= nav._drive_timeout_streak:  # noqa: SLF001
             raise
         nav._sleep_control_period(tick_started)  # noqa: SLF001
         return True
     except Exception as exc:  # noqa: BLE001
-        # Motor "nearly 0 RPM" / similar drive rejects: skip tick.
-        # Also treat gRPC GOAWAY / unavailable as transient while
-        # resources flap (lidar USB reconnect storms).
         msg = str(exc).lower()
         if "nearly 0" in msg or "rpm" in msg:
             try:
@@ -178,8 +160,6 @@ def send_tick_velocity(
             nav._sleep_control_period(tick_started)  # noqa: SLF001
             return True
         raise
-    # Smoothed speed for the velocity-scaled lookahead (see
-    # ``update_speed_estimate``): raw cmd feedback limit-cycles.
     nav._last_cmd_vx = update_speed_estimate(nav._last_cmd_vx, cmd.vx)  # noqa: SLF001
     ep.prev_cmd = cmd
     nav._sleep_control_period(tick_started)  # noqa: SLF001

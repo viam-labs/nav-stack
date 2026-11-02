@@ -1,14 +1,15 @@
 """Per-tick sensing for ``NavSupervisor.run_goal``.
 
 Fetches scan / depth / above-cart, refreshes the local costmap, builds
-``guard_pts``, and decides nose_clear / local_blocked. No wait/replan/DWA
-policy — that is ``block_policy``.
+``guard_pts``, and decides nose_clear / local_blocked. Later phases mutate
+the same ``TickContext`` (cmd / progress / path / pose / corridor) instead
+of re-threading those fields as kwargs.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import numpy as np
 
@@ -16,6 +17,7 @@ from ..geom import conversions as conv
 from ..nav.simple_motion import DriveCommand, cone_min_range
 from .above_cart import above_cart_frames
 from .depth_memory import depth_frames
+from .escape import EscapeSense
 from .footprint_guard import obstacle_points
 from .types import Path2D, Pose2D
 
@@ -33,10 +35,16 @@ def _mono() -> float:
 
 @dataclass
 class TickContext:
-    """Frozen-enough per-tick inputs shared by later phases."""
+    """Per-tick inputs shared by every phase of ``run_goal``.
+
+    Sense fields are set once; ``cmd`` / ``progress`` / ``path`` / ``pose`` /
+    corridor / wait flags are updated in place as phases run.
+    """
 
     now: float
     pose: Pose2D
+    path: Path2D
+    goal: Pose2D
     scan: Optional[conv.LaserScan2D]
     mem_pts: Any
     local_view: Optional["LocalCostmapView"]
@@ -48,11 +56,54 @@ class TickContext:
     local_blocked: bool
     map_untrusted: bool
     collision_view: Optional["LocalCostmapView"]
-    # Filled by later phases; kept here so EscapeSense builders share one object.
-    cmd: Optional[DriveCommand] = None
-    progress: Mapping[str, Any] = field(default_factory=dict)
+    cmd: DriveCommand = field(
+        default_factory=lambda: DriveCommand(0.0, 0.0, 0.0, False)
+    )
+    progress: Dict[str, Any] = field(default_factory=dict)
     waiting_for_clear: bool = False
     corridor_yaw: Optional[float] = None
+    loc_hold_motion: bool = False
+
+    def escape_sense(
+        self,
+        nav: "NavSupervisor",
+        ep: "GoalEpisode",
+        *,
+        prefer_yaw_sign: Optional[float] = None,
+        corridor_active: bool = False,
+    ) -> EscapeSense:
+        """Build EscapeSense from this tick + nav/episode constants."""
+        yaw = self.corridor_yaw
+        if prefer_yaw_sign is None:
+            prefer_yaw_sign = (
+                math.copysign(1.0, yaw)
+                if yaw is not None
+                else ep.escape_m.yaw_sign
+            )
+        return EscapeSense(
+            now=self.now,
+            pose=self.pose,
+            cmd=self.cmd,
+            progress=self.progress,
+            nose_clear=self.nose_clear,
+            waiting=self.waiting_for_clear,
+            failed_replans=ep.failed_replan_while_blocked,
+            spin_blocked=bool(self.progress.get("spin_blocked")),
+            heading_open=yaw is not None,
+            bearing_rad=float(self.progress.get("bearing_error_rad") or 0.0),
+            scan=self.scan,
+            local_view=self.local_view,
+            guard=nav._guard,  # noqa: SLF001
+            guard_pts=self.guard_pts,
+            robot_radius_m=nav._robot_radius,  # noqa: SLF001
+            spin_radius_m=nav._spin_radius,  # noqa: SLF001
+            follower=nav._follower,  # noqa: SLF001
+            backup_dist_m=float(nav._backup_dist_m),  # noqa: SLF001
+            backup_cooldown_s=float(nav._backup_cooldown_s),  # noqa: SLF001
+            loc_hold=self.loc_hold_motion,
+            corridor_active=corridor_active,
+            prefer_yaw_sign=float(prefer_yaw_sign),
+        )
 
 
 def run_sense_tick(
@@ -62,6 +113,7 @@ def run_sense_tick(
     now: float,
     pose: Pose2D,
     path: Path2D,
+    goal: Pose2D,
 ) -> TickContext:
     """Scan + memory + local costmap + nose / local_blocked detection."""
     need_scan = (
@@ -225,6 +277,8 @@ def run_sense_tick(
     return TickContext(
         now=now,
         pose=pose,
+        path=path,
+        goal=goal,
         scan=scan,
         mem_pts=mem_pts,
         local_view=local_view,
