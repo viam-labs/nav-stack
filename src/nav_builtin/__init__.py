@@ -2,6 +2,7 @@
 
 ROS-free MoveOnMap / navigate_* / plan_to_* over Viam APIs (``ViamWorldIO``).
 """
+
 from .host import BuiltinNavHost, make_builtin_navigator
 from .navigator import BuiltinNavigator
 from .types import NavStatus, OccupancyGrid, Path2D, PlanResult, Pose2D

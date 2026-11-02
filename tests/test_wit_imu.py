@@ -1,4 +1,5 @@
 """Tests for WitMotion protocol, IMU shm, and wit-imu helpers."""
+
 from __future__ import annotations
 
 import math
@@ -51,12 +52,12 @@ def test_parser_accepts_classic_wire_stream_like_device():
     # Two classic frames back-to-back (second sync terminates the first Go line).
     wire = b"".join(
         [
-            bytes([0x55, TYPE_ORIENT]) + payload + bytes([
-                sum(bytes([0x55, TYPE_ORIENT]) + payload) & 0xFF
-            ]),
-            bytes([0x55, TYPE_GYRO]) + (b"\x00" * 8) + bytes([
-                sum(bytes([0x55, TYPE_GYRO]) + b"\x00" * 8) & 0xFF
-            ]),
+            bytes([0x55, TYPE_ORIENT])
+            + payload
+            + bytes([sum(bytes([0x55, TYPE_ORIENT]) + payload) & 0xFF]),
+            bytes([0x55, TYPE_GYRO])
+            + (b"\x00" * 8)
+            + bytes([sum(bytes([0x55, TYPE_GYRO]) + b"\x00" * 8) & 0xFF]),
         ]
     )
     n = parser.feed(wire)
@@ -224,9 +225,15 @@ def test_config_commands_wit_register_protocol():
         bytes.fromhex("ffaa240100"),
         bytes.fromhex("ffaa010400"),
     ]
-    assert config_commands("keep", zero_yaw=True) == [CMD_UNLOCK, bytes.fromhex("ffaa010400")]
+    assert config_commands("keep", zero_yaw=True) == [
+        CMD_UNLOCK,
+        bytes.fromhex("ffaa010400"),
+    ]
     # Never saves to flash.
-    assert all(c != bytes.fromhex("ffaa000000") for c in config_commands("6axis", zero_yaw=True))
+    assert all(
+        c != bytes.fromhex("ffaa000000")
+        for c in config_commands("6axis", zero_yaw=True)
+    )
     with pytest.raises(WitError):
         config_commands("3axis")
 
@@ -267,7 +274,9 @@ def test_config_commands_gyro_still_threshold():
         bytes.fromhex("ffaa240100"),
         bytes.fromhex("ffaa613200"),
     ]
-    assert config_commands("keep", gyro_still_threshold_dps=1.0)[-1] == bytes.fromhex("ffaa61e803")
+    assert config_commands("keep", gyro_still_threshold_dps=1.0)[-1] == bytes.fromhex(
+        "ffaa61e803"
+    )
     assert config_commands("keep", gyro_still_threshold_dps=None) == []
     with pytest.raises(WitError):
         config_commands("keep", gyro_still_threshold_dps=-0.1)
@@ -325,16 +334,10 @@ def test_open_first_working_skips_lcus2_relay():
             return len(self._buf)
 
         def read(self, n=1):
-            if (
-                not self._buf
-                and self.port == relay
-                and self.writes == [b"\xff"]
-            ):
+            if not self._buf and self.port == relay and self.writes == [b"\xff"]:
                 self._buf = b"CH1: OFF\r\nCH2: OFF\r\n"
             if not self._buf and self.port == imu and self.baudrate == 115200:
-                self._buf = b"".join(
-                    _frame(TYPE_GYRO, b"\x00" * 8) for _ in range(4)
-                )
+                self._buf = b"".join(_frame(TYPE_GYRO, b"\x00" * 8) for _ in range(4))
             chunk = self._buf[:n]
             self._buf = self._buf[n:]
             return chunk

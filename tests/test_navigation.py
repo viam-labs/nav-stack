@@ -1,4 +1,5 @@
 """Lightweight navigation model smoke tests (builtin path)."""
+
 import asyncio
 
 import pytest

@@ -9,6 +9,7 @@ Framing and scaling match ``viam-modules/wit-motion`` ``imuwit``:
 * Angle packets (``0x53``) convert degrees → radians; gyro (``0x52``) stays deg/s
   for the Viam ``GetAngularVelocity`` API (same as the Go module).
 """
+
 from __future__ import annotations
 
 import math

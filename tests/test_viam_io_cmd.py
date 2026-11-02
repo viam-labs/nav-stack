@@ -1,4 +1,5 @@
 """Tests for ViamWorldIO cmd sanitization."""
+
 from __future__ import annotations
 
 from src.nav_builtin.viam_io import _is_near_zero_rpm_error, _sanitize_base_cmd
@@ -25,6 +26,8 @@ def test_sanitize_keeps_normal_drive():
 
 def test_near_zero_rpm_error_detection():
     assert _is_near_zero_rpm_error(
-        Exception("(<Status.UNKNOWN: 2>, 'Cannot move motor at an RPM that is nearly 0', None)")
+        Exception(
+            "(<Status.UNKNOWN: 2>, 'Cannot move motor at an RPM that is nearly 0', None)"
+        )
     )
     assert not _is_near_zero_rpm_error(Exception("timeout"))

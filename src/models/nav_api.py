@@ -5,6 +5,7 @@ Wire format follows the reworked Navigation API: local positions are
 millimeters, and speed limits are meters/sec. Internals stay meters and
 radians. ``DoCommand`` is unchanged and still uses meters and radians.
 """
+
 from __future__ import annotations
 
 import base64
@@ -41,17 +42,13 @@ from ..geom import conversions as conv
 _MM_PER_M = 1000.0
 # ``ambiguous`` is a refused full-map peak. The published pose stays put, and
 # a short goal is allowed to start from it.
-_UNTRUSTED_LOC = frozenset(
-    {"refused_large", "nav_hold", "awaiting_confirm", "error"}
-)
+_UNTRUSTED_LOC = frozenset({"refused_large", "nav_hold", "awaiting_confirm", "error"})
 
 
 def pose2d_to_position(pose: conv.Pose2D) -> Position:
     x_mm, y_mm, z_mm, o_x, o_y, o_z, theta_deg = conv.pose2d_to_viam_slam_pose(pose)
     return Position(
-        pose=Pose(
-            x=x_mm, y=y_mm, z=z_mm, o_x=o_x, o_y=o_y, o_z=o_z, theta=theta_deg
-        )
+        pose=Pose(x=x_mm, y=y_mm, z=z_mm, o_x=o_x, o_y=o_y, o_z=o_z, theta=theta_deg)
     )
 
 
@@ -140,7 +137,9 @@ def _localized(status: Mapping[str, Any]) -> bool:
     check = status.get("localization_check")
     if isinstance(check, dict) and check.get("status") in _UNTRUSTED_LOC:
         return False
-    progress = status.get("progress") if isinstance(status.get("progress"), dict) else {}
+    progress = (
+        status.get("progress") if isinstance(status.get("progress"), dict) else {}
+    )
     # While a goal is running, the control loop's flag is current. After the
     # goal ends that dict is kept (timeout, blocked replans) and would refuse
     # every later goal even when the pose still fits the scan.
@@ -200,7 +199,9 @@ def _path_positions(points: Any) -> List[Position]:
 def _nav_mode(status: Mapping[str, Any]) -> NavMode:
     motion = str(status.get("motion") or "")
     route = status.get("route") if isinstance(status.get("route"), dict) else {}
-    simple = status.get("simple_nav") if isinstance(status.get("simple_nav"), dict) else {}
+    simple = (
+        status.get("simple_nav") if isinstance(status.get("simple_nav"), dict) else {}
+    )
     suspended = (
         status.get("suspended_goal")
         if isinstance(status.get("suspended_goal"), dict)
@@ -323,12 +324,16 @@ def status_from_dict(status: Mapping[str, Any]) -> NavStatus:
             goal.suspend_reason = str(reason)
         route = status.get("route") if isinstance(status.get("route"), dict) else {}
         if goal.mode == NavMode.NAV_MODE_ROUTE and (route or suspended):
-            source = route if route.get("waypoints") else {
-                "name": (suspended or {}).get("route") or "",
-                "index": (suspended or {}).get("route_index") or 0,
-                "loop": (suspended or {}).get("loop") or False,
-                "waypoints": (suspended or {}).get("route_waypoints") or [],
-            }
+            source = (
+                route
+                if route.get("waypoints")
+                else {
+                    "name": (suspended or {}).get("route") or "",
+                    "index": (suspended or {}).get("route_index") or 0,
+                    "loop": (suspended or {}).get("loop") or False,
+                    "waypoints": (suspended or {}).get("route_waypoints") or [],
+                }
+            )
             goal.route.CopyFrom(_route_progress(source))
     if state == GoalState.GOAL_STATE_FAILED:
         message = str(status.get("error_msg") or "navigation failed")
@@ -353,7 +358,9 @@ def _status_extra(status: Mapping[str, Any]):
     return dict_to_struct(extra)
 
 
-def plan_from_preview(preview: Mapping[str, Any], location: Optional[str] = None) -> Plan:
+def plan_from_preview(
+    preview: Mapping[str, Any], location: Optional[str] = None
+) -> Plan:
     if not preview.get("feasible"):
         raise GRPCError(
             Status.FAILED_PRECONDITION,
@@ -426,7 +433,9 @@ class NavigationApi:
         timeout: Optional[float] = None,
         **kwargs,
     ) -> Location:
-        result = await self._nav_call({"command": "get_location", "name": location_name})
+        result = await self._nav_call(
+            {"command": "get_location", "name": location_name}
+        )
         loc = result["location"]
         return Location(name=str(loc["name"]), position=_position_from_xy(loc))
 
@@ -946,7 +955,9 @@ class NavigationApi:
             }
         )
         if not raw.get("available"):
-            return GetCostmapResponse(available=False, layer=str(raw.get("layer") or ""))
+            return GetCostmapResponse(
+                available=False, layer=str(raw.get("layer") or "")
+            )
         data = base64.b64decode(raw.get("data_b64") or "")
         return GetCostmapResponse(
             available=True,

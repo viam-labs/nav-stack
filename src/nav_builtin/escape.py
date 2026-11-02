@@ -9,6 +9,7 @@ rear-clear checks. One policy, one reverse command, one rear-clear gate:
 Entry conditions still differ (wait after a failed replan, bumper with a
 cheap path, crawl the base would drop). The *choice* once stuck is here.
 """
+
 from __future__ import annotations
 
 import math
@@ -108,7 +109,9 @@ def reverse_clear(
     """Rectangle-first, cone/costmap-second rear clear for an escape reverse."""
     need = max(0.35, float(backup_dist_m))
     if guard is not None and guard_pts is not None:
-        if rectangle_rear_open(guard, pose, guard_pts, distance_m=need, min_free_m=0.12):
+        if rectangle_rear_open(
+            guard, pose, guard_pts, distance_m=need, min_free_m=0.12
+        ):
             return True
     return rear_open(
         scan,
@@ -151,7 +154,9 @@ def try_reverse(
     return None
 
 
-def turn_command(bearing_rad: float = 0.0, *, rate: float = UNSTICK_YAW_RATE) -> DriveCommand:
+def turn_command(
+    bearing_rad: float = 0.0, *, rate: float = UNSTICK_YAW_RATE
+) -> DriveCommand:
     """In-place yaw toward ``bearing_rad`` (or +rate when bearing is ~0)."""
     sign = math.copysign(1.0, bearing_rad) if abs(bearing_rad) > 1e-6 else 1.0
     return DriveCommand(0.0, 0.0, sign * float(rate), False)
@@ -367,7 +372,9 @@ class EscapeMachine:
         """Nose cleared or a new path landed — drop an in-flight escape."""
         self.reset()
 
-    def _enter(self, mode: str, pose: Pose2D, trigger: str, yaw_sign: float = 1.0) -> None:
+    def _enter(
+        self, mode: str, pose: Pose2D, trigger: str, yaw_sign: float = 1.0
+    ) -> None:
         self.mode = mode
         self.start = pose
         self.trigger = trigger
@@ -462,13 +469,18 @@ class EscapeMachine:
             return self._finish(sense)
         cmd = reverse_command(sense.follower)
         # Undrivable reverse yaws while backing so the bumper does not re-hit.
-        if self.trigger == "undrivable_nose" and abs(sense.bearing_rad) >= TURN_BEARING_RAD:
+        if (
+            self.trigger == "undrivable_nose"
+            and abs(sense.bearing_rad) >= TURN_BEARING_RAD
+        ):
             cmd = DriveCommand(
                 cmd.vx, 0.0, math.copysign(0.20, sense.bearing_rad), False
             )
         return EscapeResult(
             cmd=cmd,
-            obstacle="narrow_reverse" if self.trigger != "blocked_nose_unstick" else "wait_reverse",
+            obstacle="narrow_reverse"
+            if self.trigger != "blocked_nose_unstick"
+            else "wait_reverse",
             active_mode=MODE_REVERSE,
         )
 
@@ -613,11 +625,7 @@ class EscapeMachine:
             return EscapeResult(
                 cmd=cmd, obstacle="wait_reverse", active_mode=MODE_REVERSE
             )
-        keep_yaw = (
-            abs(cmd.vx) < 1e-6
-            and abs(cmd.vy) < 1e-6
-            and abs(cmd.vtheta) > 1e-6
-        )
+        keep_yaw = abs(cmd.vx) < 1e-6 and abs(cmd.vy) < 1e-6 and abs(cmd.vtheta) > 1e-6
         return EscapeResult(
             cmd=DriveCommand(0.0, 0.0, cmd.vtheta if keep_yaw else 0.0, False),
             obstacle="wait",

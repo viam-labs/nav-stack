@@ -1,4 +1,5 @@
 """Unit tests for ROS-free builtin occupancy SLAM."""
+
 from __future__ import annotations
 
 import math
@@ -31,7 +32,9 @@ def test_slam_backend_default_is_builtin():
 
 
 def test_slam_backend_toolbox_and_invalid():
-    with pytest.raises(ValueError, match="pre-ros-removal|slam_toolbox|no longer supported"):
+    with pytest.raises(
+        ValueError, match="pre-ros-removal|slam_toolbox|no longer supported"
+    ):
         SlamConfig.from_dict(
             {"base": "b", "lidar": "front", "slam_backend": "slam_toolbox"}
         )
@@ -181,9 +184,7 @@ def test_apply_match_small_correction_applies_immediately():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     engine._last_prior_score = 0.5  # noqa: SLF001
     predicted = conv.Pose2D(0.0, 0.0, 0.0)
     # 0.10 m correction = drift tracking; applied on the first frame.
@@ -197,9 +198,7 @@ def test_apply_match_large_jump_requires_two_frames():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     engine._last_prior_score = 0.5  # noqa: SLF001
     predicted = conv.Pose2D(0.0, 0.0, 0.0)
     peak_a = conv.Pose2D(0.40, 0.0, 0.0)
@@ -232,9 +231,7 @@ def _nav_track_engine(monkeypatch, **cfg_extra):
             **cfg_extra,
         }
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     monkeypatch.setattr(engine, "_navigation_active", lambda: True)
     engine._last_prior_score = 0.45  # noqa: SLF001
     engine._last_match_score = 0.60  # noqa: SLF001
@@ -301,19 +298,21 @@ def test_predict_rejects_a_heading_step_the_body_cannot_turn():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=10.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=10.0)  # type: ignore[arg-type]
     engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
     t0 = 10.0
     engine._predict(  # noqa: SLF001
-        conv.OdomReading(0.0, 0.0, 0.0, pose=conv.Pose2D(0.0, 0.0, 0.0), heading_rad=0.0),
+        conv.OdomReading(
+            0.0, 0.0, 0.0, pose=conv.Pose2D(0.0, 0.0, 0.0), heading_rad=0.0
+        ),
         t0,
     )
     # Wheels say 2 deg; the heading sensor jumps 35 deg. Wheels win.
     pose = engine._predict(  # noqa: SLF001
         conv.OdomReading(
-            0.0, 0.0, 0.0,
+            0.0,
+            0.0,
+            0.0,
             pose=conv.Pose2D(0.0, 0.0, math.radians(2.0)),
             heading_rad=math.radians(35.0),
         ),
@@ -325,7 +324,9 @@ def test_predict_rejects_a_heading_step_the_body_cannot_turn():
     engine._pose = pose  # noqa: SLF001
     pose = engine._predict(  # noqa: SLF001
         conv.OdomReading(
-            0.0, 0.0, 0.0,
+            0.0,
+            0.0,
+            0.0,
             pose=conv.Pose2D(0.0, 0.0, math.radians(9.0)),
             heading_rad=math.radians(43.0),
         ),
@@ -338,9 +339,7 @@ def test_predict_twist_path_rejects_a_heading_snap_and_keeps_the_gyro():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=10.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=10.0)  # type: ignore[arg-type]
     engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
     t0 = 20.0
     engine._predict(conv.OdomReading(0.0, 0.0, 0.1, heading_rad=0.0), t0)  # noqa: SLF001
@@ -407,9 +406,7 @@ def test_apply_match_strong_lone_peak_recovers_a_lost_prior_when_idle():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     engine._last_prior_score = -0.3  # noqa: SLF001
     engine._last_match_score = 0.62  # noqa: SLF001
     engine._last_match_rival_score = 0.21  # noqa: SLF001
@@ -427,9 +424,7 @@ def test_apply_match_odom_only_when_prior_untrusted(monkeypatch):
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     monkeypatch.setattr(engine, "_navigation_active", lambda: False)
 
     predicted = conv.Pose2D(0.0, 0.0, 0.0)
@@ -451,9 +446,7 @@ def test_predict_absolute_odom_uses_deltas_and_gates_jumps():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     engine.set_pose(conv.Pose2D(5.0, 5.0, math.radians(90.0)))
 
     t0 = 50.0
@@ -498,9 +491,7 @@ def test_host_relocalize_applies_drift_correction():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     host = BuiltinSlamHost(engine)
     engine.set_pose(conv.Pose2D(1.0, 1.0, 0.0))
 
@@ -513,9 +504,7 @@ def test_host_relocalize_soft_seed():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     host = BuiltinSlamHost(engine)
     engine.set_pose(conv.Pose2D(1.0, 1.0, 0.0))
 
@@ -770,8 +759,7 @@ def test_odom_yaw_hold_matches_reader():
     from src.odom.source import TypedMovementSensorOdom
 
     assert (
-        BuiltinSlamEngine._ODOM_YAW_HOLD_MAX_S
-        == TypedMovementSensorOdom.MAX_HOLD_GAP_S
+        BuiltinSlamEngine._ODOM_YAW_HOLD_MAX_S == TypedMovementSensorOdom.MAX_HOLD_GAP_S
     )
 
 
@@ -1042,9 +1030,7 @@ def test_apply_map_pose_correction_rebuilds_grid():
             "mapping_revisit_min_shift_deg": 1.0,
         }
     )
-    engine = BuiltinSlamEngine(
-        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
     host = BuiltinSlamHost(engine)
     scan = conv.LaserScan2D(np.array([2.0]), 0.0, 0.0, 0.1, 10.0)
 
@@ -1123,7 +1109,13 @@ def _sensors_with_heading(wit, **cfg_extra):
     from src.slam_builtin.io_sensors import BuiltinSensors
 
     cfg = SlamConfig.from_dict(
-        {"base": "b", "lidar": "f", "movement_sensor": "odom", "heading_sensor": "wit", **cfg_extra}
+        {
+            "base": "b",
+            "lidar": "f",
+            "movement_sensor": "odom",
+            "heading_sensor": "wit",
+            **cfg_extra,
+        }
     )
     return BuiltinSensors(
         cfg=cfg,
@@ -1193,7 +1185,9 @@ def _wall_scan(n: int = 360, dist: float = 3.0) -> conv.LaserScan2D:
     )
 
 
-def _room_scan(pose: conv.Pose2D, n: int = 360, half_x: float = 2.0, half_y: float = 1.5):
+def _room_scan(
+    pose: conv.Pose2D, n: int = 360, half_x: float = 2.0, half_y: float = 1.5
+):
     """Base-frame scan from inside an axis-aligned room centred on the origin."""
     angles = -math.pi + np.arange(n) * (2 * math.pi / n)
     ranges = np.empty(n)
@@ -1229,7 +1223,9 @@ def test_engine_pose_at_undoes_odometry_since_then(tmp_path: Path):
     assert back is not None
     expected = conv.Pose2D(0.0, 0.0, 0.0)
     for _ in range(3):
-        expected = conv.compose_poses(expected, conv.Pose2D(0.05, 0.0, math.radians(2.0)))
+        expected = conv.compose_poses(
+            expected, conv.Pose2D(0.05, 0.0, math.radians(2.0))
+        )
     assert back.x == pytest.approx(expected.x, abs=1e-9)
     assert back.y == pytest.approx(expected.y, abs=1e-9)
     assert back.theta == pytest.approx(expected.theta, abs=1e-9)
@@ -1280,14 +1276,25 @@ def test_engine_matches_a_late_scan_at_the_pose_it_was_taken(
         _Sensors.scan_captured_at = lambda self: clock["t"] - latency_s
 
     engine = BuiltinSlamEngine(
-        cfg, _Sensors(), MapStore(str(tmp_path)), match_period_s=0.0  # type: ignore[arg-type]
+        cfg,
+        _Sensors(),
+        MapStore(str(tmp_path)),
+        match_period_s=0.0,  # type: ignore[arg-type]
     )
     grid = occ.empty_grid(resolution=0.05, size_m=6.0)
     room = _room_scan(conv.Pose2D(0.0, 0.0, 0.0))
     for _ in range(4):
         grid = occ.insert_scan(
-            grid, 0.0, 0.0, 0.0, room.ranges, room.angle_min, room.angle_increment,
-            range_min=0.1, range_max=10.0, max_beams=360,
+            grid,
+            0.0,
+            0.0,
+            0.0,
+            room.ranges,
+            room.angle_min,
+            room.angle_increment,
+            range_min=0.1,
+            range_max=10.0,
+            max_beams=360,
         )
     with engine._lock:  # noqa: SLF001
         engine._grid = grid  # noqa: SLF001
@@ -1322,7 +1329,10 @@ def test_engine_does_not_reinsert_same_scan_while_heading_turns(tmp_path: Path):
 
         def get_odom(self):
             return conv.OdomReading(
-                0.0, 0.0, 0.0, pose=conv.Pose2D(0.0, 0.0, heading["th"]),
+                0.0,
+                0.0,
+                0.0,
+                pose=conv.Pose2D(0.0, 0.0, heading["th"]),
                 heading_rad=heading["th"],
             )
 
@@ -1365,7 +1375,10 @@ def test_engine_skips_insert_when_spinning_fast(tmp_path: Path):
 
         def get_odom(self):
             return conv.OdomReading(
-                0.0, 0.0, 0.0, pose=conv.Pose2D(0.0, 0.0, heading["th"]),
+                0.0,
+                0.0,
+                0.0,
+                pose=conv.Pose2D(0.0, 0.0, heading["th"]),
                 heading_rad=heading["th"],
             )
 
@@ -1391,8 +1404,13 @@ def test_builtin_sensors_get_scan_fresh_dedupes_same_revolution(monkeypatch):
 
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
     sensors = BuiltinSensors(
-        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
-        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+        cfg=cfg,
+        cameras={},
+        movement_sensor=None,
+        heading_sensor=None,
+        shm_lidar=None,
+        loop=asyncio.new_event_loop(),
+        odom_reader=None,
     )
     scans = [_wall_scan(dist=3.0), _wall_scan(dist=3.0), _wall_scan(dist=3.2)]
     calls = {"n": 0}
@@ -1424,11 +1442,20 @@ def test_builtin_sensors_reports_when_the_scan_was_captured(monkeypatch):
 
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
     sensors = BuiltinSensors(
-        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
-        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+        cfg=cfg,
+        cameras={},
+        movement_sensor=None,
+        heading_sensor=None,
+        shm_lidar=None,
+        loop=asyncio.new_event_loop(),
+        odom_reader=None,
     )
     assert math.isnan(sensors.scan_captured_at())
-    reads = [(_wall_scan(dist=3.0), 5.0), (_wall_scan(dist=3.0), 5.3), (_wall_scan(dist=3.2), 5.6)]
+    reads = [
+        (_wall_scan(dist=3.0), 5.0),
+        (_wall_scan(dist=3.0), 5.3),
+        (_wall_scan(dist=3.2), 5.6),
+    ]
     calls = {"n": 0}
 
     def _read(lidar, *, max_age_s):
@@ -1456,11 +1483,20 @@ def test_builtin_sensors_reports_when_the_scan_was_captured(monkeypatch):
 
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
     sensors = BuiltinSensors(
-        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
-        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+        cfg=cfg,
+        cameras={},
+        movement_sensor=None,
+        heading_sensor=None,
+        shm_lidar=None,
+        loop=asyncio.new_event_loop(),
+        odom_reader=None,
     )
     assert math.isnan(sensors.scan_captured_at())
-    reads = [(_wall_scan(dist=3.0), 5.0), (_wall_scan(dist=3.0), 5.3), (_wall_scan(dist=3.2), 5.6)]
+    reads = [
+        (_wall_scan(dist=3.0), 5.0),
+        (_wall_scan(dist=3.0), 5.3),
+        (_wall_scan(dist=3.2), 5.6),
+    ]
     calls = {"n": 0}
 
     def _read(lidar, *, max_age_s):
@@ -1488,11 +1524,20 @@ def test_builtin_sensors_reports_when_the_scan_was_captured(monkeypatch):
 
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
     sensors = BuiltinSensors(
-        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
-        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+        cfg=cfg,
+        cameras={},
+        movement_sensor=None,
+        heading_sensor=None,
+        shm_lidar=None,
+        loop=asyncio.new_event_loop(),
+        odom_reader=None,
     )
     assert math.isnan(sensors.scan_captured_at())
-    reads = [(_wall_scan(dist=3.0), 5.0), (_wall_scan(dist=3.0), 5.3), (_wall_scan(dist=3.2), 5.6)]
+    reads = [
+        (_wall_scan(dist=3.0), 5.0),
+        (_wall_scan(dist=3.0), 5.3),
+        (_wall_scan(dist=3.2), 5.6),
+    ]
     calls = {"n": 0}
 
     def _read(lidar, *, max_age_s):
@@ -1526,8 +1571,13 @@ def test_builtin_sensors_get_scan_accepts_replay_after_dropout(monkeypatch):
 
     cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
     sensors = BuiltinSensors(
-        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
-        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+        cfg=cfg,
+        cameras={},
+        movement_sensor=None,
+        heading_sensor=None,
+        shm_lidar=None,
+        loop=asyncio.new_event_loop(),
+        odom_reader=None,
     )
     wall = _wall_scan(dist=3.0)
     reads = {"n": 0}
@@ -1572,8 +1622,13 @@ def test_lidar_grpc_returns_a_fast_scan_on_the_same_call():
     try:
         cfg = SlamConfig.from_dict({"base": "b", "lidar": "front"})
         sensors = BuiltinSensors(
-            cfg=cfg, cameras={"front": object()}, movement_sensor=None,
-            heading_sensor=None, shm_lidar=None, loop=loop, odom_reader=None,
+            cfg=cfg,
+            cameras={"front": object()},
+            movement_sensor=None,
+            heading_sensor=None,
+            shm_lidar=None,
+            loop=loop,
+            odom_reader=None,
         )
         wall = _wall_scan(dist=2.5)
 
@@ -1623,8 +1678,13 @@ def test_lidar_grpc_does_not_pile_up_when_camera_hangs():
             }
         )
         sensors = BuiltinSensors(
-            cfg=cfg, cameras={"front": _Cam()}, movement_sensor=None,
-            heading_sensor=None, shm_lidar=None, loop=loop, odom_reader=None,
+            cfg=cfg,
+            cameras={"front": _Cam()},
+            movement_sensor=None,
+            heading_sensor=None,
+            shm_lidar=None,
+            loop=loop,
+            odom_reader=None,
         )
         sensors._LIDAR_RPC_WAIT_S = 0.05  # noqa: SLF001
         sensors._LIDAR_RPC_STUCK_S = 0.2  # noqa: SLF001
@@ -1661,8 +1721,13 @@ def test_builtin_sensors_get_scan_skips_obstacles_only(monkeypatch):
         }
     )
     sensors = BuiltinSensors(
-        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
-        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+        cfg=cfg,
+        cameras={},
+        movement_sensor=None,
+        heading_sensor=None,
+        shm_lidar=None,
+        loop=asyncio.new_event_loop(),
+        odom_reader=None,
     )
     seen = []
 
@@ -1697,16 +1762,33 @@ def test_apply_heading_from_shm_skips_grpc():
         def read_latest(self, max_age_s=None):
             del max_age_s
             return imushm.ImuShmSample(
-                ax=0, ay=0, az=9.8, gx=0, gy=0, gz=12.0,
-                roll=0, pitch=0, yaw=math.radians(42.0),
+                ax=0,
+                ay=0,
+                az=9.8,
+                gx=0,
+                gy=0,
+                gz=12.0,
+                roll=0,
+                pitch=0,
+                yaw=math.radians(42.0),
             )
 
     cfg = SlamConfig.from_dict(
-        {"base": "b", "lidar": "f", "heading_sensor": "wit", "imu_shm_name": "/viam-imu-wit"}
+        {
+            "base": "b",
+            "lidar": "f",
+            "heading_sensor": "wit",
+            "imu_shm_name": "/viam-imu-wit",
+        }
     )
     sensors = BuiltinSensors(
-        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=_HeadingBoom(),
-        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+        cfg=cfg,
+        cameras={},
+        movement_sensor=None,
+        heading_sensor=_HeadingBoom(),
+        shm_lidar=None,
+        loop=asyncio.new_event_loop(),
+        odom_reader=None,
     )
     sensors._imu_shm = _FakeImuShm()  # noqa: SLF001
     out = sensors._apply_heading_from_shm(conv.OdomReading(0.1, 0.0, 0.0))  # noqa: SLF001
@@ -1741,10 +1823,17 @@ def test_get_odom_does_not_block_slam_tick_on_busy_loop():
                 await asyncio.get_running_loop().run_in_executor(None, release.wait)
                 return conv.OdomReading(0.0, 0.3, 0.0, pose=conv.Pose2D(1.0, 0.0, 0.0))
 
-        cfg = SlamConfig.from_dict({"base": "b", "lidar": "f", "movement_sensor": "odom"})
+        cfg = SlamConfig.from_dict(
+            {"base": "b", "lidar": "f", "movement_sensor": "odom"}
+        )
         sensors = BuiltinSensors(
-            cfg=cfg, cameras={}, movement_sensor=object(), heading_sensor=None,
-            shm_lidar=None, loop=loop, odom_reader=_Reader(),
+            cfg=cfg,
+            cameras={},
+            movement_sensor=object(),
+            heading_sensor=None,
+            shm_lidar=None,
+            loop=loop,
+            odom_reader=_Reader(),
         )
 
         t0 = time.monotonic()
@@ -1794,9 +1883,7 @@ def test_engine_restores_last_pose_on_localizing(tmp_path: Path):
     grid = occ.empty_grid(resolution=0.05, size_m=8.0)
     grid.log_odds[40, 40] = 2.0
     persistence.save_occupancy(handle.root, grid)
-    persistence.save_last_pose(
-        handle.root, conv.Pose2D(1.25, 2.5, math.radians(90.0))
-    )
+    persistence.save_last_pose(handle.root, conv.Pose2D(1.25, 2.5, math.radians(90.0)))
 
     cfg = SlamConfig.from_dict(
         {
@@ -1856,14 +1943,14 @@ def test_mapping_does_not_paint_a_scan_that_misses_the_map(tmp_path: Path, monke
 
         def get_odom(self):
             return conv.OdomReading(
-                0.0, 0.0, 0.0,
+                0.0,
+                0.0,
+                0.0,
                 pose=conv.Pose2D(0.0, 0.0, heading["th"]),
                 heading_rad=heading["th"],
             )
 
-    engine = BuiltinSlamEngine(
-        cfg, _Sensors(), MapStore(str(tmp_path)), rate_hz=10.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _Sensors(), MapStore(str(tmp_path)), rate_hz=10.0)  # type: ignore[arg-type]
     engine._tick()  # noqa: SLF001
     assert engine._updates == 1  # noqa: SLF001
     # 30 deg over 10 s is a turn the body can make, and keeps the yaw rate
@@ -1889,14 +1976,14 @@ def test_spin_is_painted_at_the_heading_that_matches(tmp_path: Path):
 
         def get_odom(self):
             return conv.OdomReading(
-                0.0, 0.0, 0.0,
+                0.0,
+                0.0,
+                0.0,
                 pose=conv.Pose2D(0.0, 0.0, heading["th"]),
                 heading_rad=heading["th"],
             )
 
-    engine = BuiltinSlamEngine(
-        cfg, _Sensors(), MapStore(str(tmp_path)), rate_hz=10.0
-    )  # type: ignore[arg-type]
+    engine = BuiltinSlamEngine(cfg, _Sensors(), MapStore(str(tmp_path)), rate_hz=10.0)  # type: ignore[arg-type]
     engine._tick()  # noqa: SLF001
     assert engine._updates == 1  # noqa: SLF001
     # In-place spin. The scan is what the room looks like at the true heading,
@@ -1926,8 +2013,16 @@ def _room_occ_map(truth: conv.Pose2D, half_x: float = 3.0, half_y: float = 2.0):
     room = _room_scan(truth, half_x=half_x, half_y=half_y)
     for _ in range(4):
         grid = occ.insert_scan(
-            grid, truth.x, truth.y, truth.theta, room.ranges, room.angle_min,
-            room.angle_increment, range_min=0.1, range_max=10.0, max_beams=360,
+            grid,
+            truth.x,
+            truth.y,
+            truth.theta,
+            room.ranges,
+            room.angle_min,
+            room.angle_increment,
+            range_min=0.1,
+            range_max=10.0,
+            max_beams=360,
         )
     return scan_match.occupancy_map_from_int16(
         occ.to_occupancy_int16(grid),
@@ -1978,8 +2073,13 @@ def test_candidate_cannot_win_by_shedding_beams_into_unknown():
     )
     assert cov_shed < cov_truth - 0.05
     scores = scan_match._candidate_scores(  # noqa: SLF001
-        half, xy, np.array([0.6]), np.array([0.0]), 0.0,
-        occupied_lookup=lookup, min_coverage=cov_truth - 0.05,
+        half,
+        xy,
+        np.array([0.6]),
+        np.array([0.0]),
+        0.0,
+        occupied_lookup=lookup,
+        min_coverage=cov_truth - 0.05,
     )
     assert scores[0] == float("-inf")
 
@@ -2028,8 +2128,13 @@ def test_match_scan_leaves_out_a_depth_camera(monkeypatch):
         }
     )
     sensors = BuiltinSensors(
-        cfg=cfg, cameras={}, movement_sensor=None, heading_sensor=None,
-        shm_lidar=None, loop=asyncio.new_event_loop(), odom_reader=None,
+        cfg=cfg,
+        cameras={},
+        movement_sensor=None,
+        heading_sensor=None,
+        shm_lidar=None,
+        loop=asyncio.new_event_loop(),
+        odom_reader=None,
     )
 
     def _read(lidar, *, max_age_s):
@@ -2055,12 +2160,22 @@ def test_camera_hit_survives_a_lidar_beam_at_another_height():
     camera = np.array([[1.0, 0.0, 0.80]])
     lidar_past = np.array([[3.0, 0.0, 0.21]])
     bands = paint_bands(
-        {}, [camera], pose, resolution=0.05, num_bins=360,
-        range_min=0.05, range_max=30.0,
+        {},
+        [camera],
+        pose,
+        resolution=0.05,
+        num_bins=360,
+        range_min=0.05,
+        range_max=30.0,
     )
     bands = paint_bands(
-        bands, [lidar_past], pose, resolution=0.05, num_bins=360,
-        range_min=0.05, range_max=30.0,
+        bands,
+        [lidar_past],
+        pose,
+        resolution=0.05,
+        num_bins=360,
+        range_min=0.05,
+        range_max=30.0,
     )
     fused = compress_bands(bands)
 

@@ -1,4 +1,5 @@
 """Adapter SLAM / nav use to talk to Viam components without SDK coupling."""
+
 from __future__ import annotations
 
 

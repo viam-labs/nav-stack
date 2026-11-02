@@ -1,4 +1,5 @@
 """Viam-backed WorldIO: SLAM + lidars + base."""
+
 from __future__ import annotations
 
 import asyncio
@@ -225,9 +226,7 @@ class ViamWorldIO:
         except TimeoutError as exc:
             fut.cancel()
             # concurrent.futures.TimeoutError has empty str(); make it actionable.
-            raise TimeoutError(
-                f"Viam IO timed out after {timeout:.1f}s"
-            ) from exc
+            raise TimeoutError(f"Viam IO timed out after {timeout:.1f}s") from exc
 
     def _schedule_drive(self, make_coro, intent: dict, *, wait_s: float) -> None:
         """Queue Base.SetVelocity on the module loop without starving on wait.
@@ -306,9 +305,7 @@ class ViamWorldIO:
             fut.result(timeout=max(0.0, float(wait_s)))
         except concurrent.futures.TimeoutError as exc:
             # Leave the RPC running — do not cancel. Caller sees pending.
-            raise TimeoutError(
-                f"Viam IO timed out after {wait_s:.1f}s"
-            ) from exc
+            raise TimeoutError(f"Viam IO timed out after {wait_s:.1f}s") from exc
         finally:
             if self._pending_drive_fut is fut and fut.done():
                 self._pending_drive_fut = None
@@ -366,10 +363,7 @@ class ViamWorldIO:
 
     def get_map(self) -> Optional[dict]:
         now = time.monotonic()
-        if (
-            self._map_cache is not None
-            and now - self._map_cache_at < self._map_cache_s
-        ):
+        if self._map_cache is not None and now - self._map_cache_at < self._map_cache_s:
             return self._map_cache
         if self._map_provider is not None:
             try:
@@ -491,9 +485,7 @@ class ViamWorldIO:
             and self._scan_cache_pose is not None
             and pose is not None
         ):
-            dtheta = abs(
-                conv.normalize_angle(pose.theta - self._scan_cache_pose.theta)
-            )
+            dtheta = abs(conv.normalize_angle(pose.theta - self._scan_cache_pose.theta))
             dist = math.hypot(
                 pose.x - self._scan_cache_pose.x, pose.y - self._scan_cache_pose.y
             )
@@ -595,7 +587,9 @@ class ViamWorldIO:
             self._scan_cache_pose = pose
         return merged
 
-    def set_above_cart(self, enabled: bool, cart_height_m: Optional[float] = None) -> None:
+    def set_above_cart(
+        self, enabled: bool, cart_height_m: Optional[float] = None
+    ) -> None:
         """Remember depth returns that leave the vertical view.
 
         ``cart_height_m`` unset or <= 0 uses the camera's own band up to
@@ -606,7 +600,9 @@ class ViamWorldIO:
             height = float(cart_height_m) if cart_height_m else 0.0
         except (TypeError, ValueError):
             height = 0.0
-        self._cart_height_m = height if self._above_cart_enabled and height > 0.0 else 0.0
+        self._cart_height_m = (
+            height if self._above_cart_enabled and height > 0.0 else 0.0
+        )
         if not self._above_cart_enabled:
             self._above_cart_pts.clear()
 
@@ -764,9 +760,7 @@ class ViamWorldIO:
             range_max=float(scan.range_max),
         )
         if scan.cloud_xy is not None and len(scan.cloud_xy):
-            cloud3 = np.column_stack(
-                [scan.cloud_xy, np.zeros(len(scan.cloud_xy))]
-            )
+            cloud3 = np.column_stack([scan.cloud_xy, np.zeros(len(scan.cloud_xy))])
             warped.cloud_xy = np.ascontiguousarray(
                 conv.transform_points_between_poses(cloud3, cap, current)[:, :2],
                 dtype=float,
@@ -802,9 +796,7 @@ class ViamWorldIO:
         )
         self._above_cart_pts[lidar.name] = above if above.size else np.empty((0, 3))
 
-    def _pcd_to_scan(
-        self, raw: bytes, lidar: LidarConfig
-    ) -> conv.LaserScan2D:
+    def _pcd_to_scan(self, raw: bytes, lidar: LidarConfig) -> conv.LaserScan2D:
         pts = conv.parse_pcd(raw)
         self._remember_above_cart(pts, lidar)
         # Depth cams are dense; crop by range/height then downsample so the
@@ -885,10 +877,7 @@ class ViamWorldIO:
             self._obstacles_refresh_inflight.discard(name)
         cached = self._per_lidar_scan.get(name)
         now = time.monotonic()
-        if (
-            cached is not None
-            and now - cached[1] < self._obstacles_only_period_s
-        ):
+        if cached is not None and now - cached[1] < self._obstacles_only_period_s:
             return
         if self._loop.is_closed():
             return
@@ -1176,6 +1165,7 @@ class ViamWorldIO:
         # Shares skip-duplicate + coalesce paths with set_velocity so loc_hold /
         # succeed / cancel do not re-issue SetVelocity(0) every tick.
         self.set_velocity(0.0, 0.0, 0.0)
+
     def set_viz_plan(
         self,
         path_xy: tuple,

@@ -3,6 +3,7 @@
 ``SetVelocity`` / ``Stop`` update the shared :class:`~..sim.world.SimWorld` so
 teleop and builtin nav drive the raycast environment like a real Viam base.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -104,9 +105,7 @@ class SimBase(Base):
                 )
         else:
             sim_map = (
-                load_sim_map(str(map_path))
-                if map_path
-                else make_builtin_corridor()
+                load_sim_map(str(map_path)) if map_path else make_builtin_corridor()
             )
             self._world = SimWorld(
                 sim_map,

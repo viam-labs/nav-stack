@@ -1,4 +1,5 @@
 """Plain-English summaries of what navigation is commanding the base to do."""
+
 from __future__ import annotations
 
 import math
@@ -43,7 +44,10 @@ def _held_seconds(history: list, last: Mapping[str, Any]) -> Optional[float]:
             if held > 0.05:
                 return round(held, 1)
     # Single entry / no prior: if it's a stop that's been sitting, use its age.
-    if last.get("source") in ("stop", "simple_stop", "watchdog_stop") and float(cur_age) > 0.2:
+    if (
+        last.get("source") in ("stop", "simple_stop", "watchdog_stop")
+        and float(cur_age) > 0.2
+    ):
         return round(float(cur_age), 1)
     return None
 
@@ -94,7 +98,11 @@ def describe_goal_relative(
         except (KeyError, TypeError, ValueError):
             return None
         dist = distance_remaining
-        if isinstance(dist, (int, float)) and math.isfinite(float(dist)) and float(dist) > 0.05:
+        if (
+            isinstance(dist, (int, float))
+            and math.isfinite(float(dist))
+            and float(dist) > 0.05
+        ):
             return f"goal{label_bit} at map ({gx:.1f}, {gy:.1f}), about {float(dist):.1f} m remaining"
         return f"goal{label_bit} at map ({gx:.1f}, {gy:.1f})"
 
@@ -160,7 +168,9 @@ def describe_goal_progress(
         return "not currently making progress toward the goal"
 
     try:
-        yaw_err = _wrap_pi(float(goal.get("theta", pose["theta"])) - float(pose["theta"]))
+        yaw_err = _wrap_pi(
+            float(goal.get("theta", pose["theta"])) - float(pose["theta"])
+        )
     except (KeyError, TypeError, ValueError):
         yaw_err = 0.0
 
@@ -184,7 +194,9 @@ def describe_goal_progress(
         if abs(bearing) < math.radians(45):
             bits.append("closing distance toward the goal")
         elif abs(bearing) > math.radians(100):
-            bits.append("driving forward while the goal is behind (likely on a curved path)")
+            bits.append(
+                "driving forward while the goal is behind (likely on a curved path)"
+            )
         else:
             bits.append("advancing while the goal is off to the side")
     elif vx < -0.02:
@@ -251,7 +263,11 @@ def describe_cmd_vel(
         parts.append("holding a tiny nonzero velocity")
 
     # Prefer "driving forward … while turning …"
-    if len(parts) == 2 and parts[0].startswith("driving") and parts[1].startswith("turning"):
+    if (
+        len(parts) == 2
+        and parts[0].startswith("driving")
+        and parts[1].startswith("turning")
+    ):
         phrase = f"{parts[0]} while {parts[1]}"
     else:
         phrase = ", ".join(parts)
@@ -352,7 +368,11 @@ def summarize_nav_motion(
 
     if goal_where:
         context_bits.append(goal_where)
-    elif isinstance(dist, (int, float)) and math.isfinite(float(dist)) and float(dist) > 0.05:
+    elif (
+        isinstance(dist, (int, float))
+        and math.isfinite(float(dist))
+        and float(dist) > 0.05
+    ):
         context_bits.append(f"about {float(dist):.1f} m remaining")
     if isinstance(recoveries, int) and recoveries > 0:
         context_bits.append(f"{recoveries} recoveries so far")

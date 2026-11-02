@@ -8,6 +8,7 @@ the built-in SLAM model's in-process runtime it drives navigation from an
 ROS-free: map and pose come from the SLAM service (``get_grid`` / ``GetPosition``),
 scans from lidar cameras / shm, and drive from ``Base.SetVelocity``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -120,9 +121,7 @@ class ExternalNavigationService(NavServiceBase):
         self._base = cast(Base, dependencies[Base.get_resource_name(ext.nav.base)])
         slam = cast(SLAM, dependencies[SLAM.get_resource_name(ext.slam_service)])
         cameras = {
-            lidar.name: cast(
-                Camera, dependencies[Camera.get_resource_name(lidar.name)]
-            )
+            lidar.name: cast(Camera, dependencies[Camera.get_resource_name(lidar.name)])
             for lidar in bridge_cfg.lidars
         }
 
@@ -162,7 +161,9 @@ class ExternalNavigationService(NavServiceBase):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - keep the config footprint
-            LOGGER.warning("framesystem footprint resolve failed; using config: %s", exc)
+            LOGGER.warning(
+                "framesystem footprint resolve failed; using config: %s", exc
+            )
 
     def _configure_builtin(
         self,

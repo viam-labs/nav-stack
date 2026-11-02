@@ -11,6 +11,7 @@ Each scenario runs under several conditions: ideal sensing, noisy sensing
 (1 cm lidar range noise, ~2 cm / 1 deg wandering localisation error), and the
 default ``clearance_m`` (0.2) as well as the live tracer value (0.03).
 """
+
 from __future__ import annotations
 
 import math
@@ -33,11 +34,23 @@ def _door_wall(g, *, x: float, y0: float, y1: float, thick: float = 0.1):
 
 def bin_beside_route():
     """Live rc24: bin at the shoulder, not in the map, lidar sees it."""
-    return _room(), Pose2D(1.0, 3.0, 0.0), Pose2D(8.5, 3.0, 0.0), [(4.3, 3.2, 4.7, 3.6)], True
+    return (
+        _room(),
+        Pose2D(1.0, 3.0, 0.0),
+        Pose2D(8.5, 3.0, 0.0),
+        [(4.3, 3.2, 4.7, 3.6)],
+        True,
+    )
 
 
 def bin_on_route():
-    return _room(), Pose2D(1.0, 3.0, 0.0), Pose2D(8.5, 3.0, 0.0), [(4.3, 2.8, 4.7, 3.2)], True
+    return (
+        _room(),
+        Pose2D(1.0, 3.0, 0.0),
+        Pose2D(8.5, 3.0, 0.0),
+        [(4.3, 2.8, 4.7, 3.2)],
+        True,
+    )
 
 
 def door_straight(door_m):
@@ -57,7 +70,7 @@ def unknown_speckle_on_route():
     g = _room()
     for x in (3.0, 4.5, 6.0):
         r0, c0 = int(3.0 / sim.RES), int(x / sim.RES)
-        g[r0:r0 + 2, c0:c0 + 2] = -1
+        g[r0 : r0 + 2, c0 : c0 + 2] = -1
     return g, Pose2D(1.0, 3.0, 0.0), Pose2D(8.5, 3.0, 0.0), [], True
 
 
@@ -65,7 +78,13 @@ def door_then_bin():
     """Tight door, then a bin half-blocking the far side (the live pinch)."""
     g = _room()
     _door_wall(g, x=5.0, y0=2.5, y1=3.5)
-    return g, Pose2D(2.0, 3.0, 0.0), Pose2D(8.5, 3.0, 0.0), [(6.0, 3.05, 6.4, 3.45)], True
+    return (
+        g,
+        Pose2D(2.0, 3.0, 0.0),
+        Pose2D(8.5, 3.0, 0.0),
+        [(6.0, 3.05, 6.4, 3.45)],
+        True,
+    )
 
 
 def corridor_bend():
@@ -92,7 +111,13 @@ def corridor_dead_end():
     sim.box(g, 0.5, 0.5, 3.0, 3.5, v=0)
     sim.box(g, 3.0, 1.55, 7.0, 2.45, v=0)
     sim.box(g, 7.0, 0.5, 9.5, 3.5, v=0)
-    return g, Pose2D(1.5, 2.0, 0.0), Pose2D(8.5, 2.0, 0.0), [(4.8, 1.55, 5.2, 2.45)], False
+    return (
+        g,
+        Pose2D(1.5, 2.0, 0.0),
+        Pose2D(8.5, 2.0, 0.0),
+        [(4.8, 1.55, 5.2, 2.45)],
+        False,
+    )
 
 
 def short_tight_vs_long_wide():
@@ -192,7 +217,12 @@ def _curved_leg(x, y, th, gap, reach=0.08):
     lx, ly = x + nx * d, y + ny * d
     fx, fy = x + nx * (d - reach), y + ny * (d - reach)
     tube = (lx - 0.02, ly - 0.02, lx + 0.02, ly + 0.02)
-    low = (min(lx, fx) - 0.02, min(ly, fy) - 0.02, max(lx, fx) + 0.02, max(ly, fy) + 0.02)
+    low = (
+        min(lx, fx) - 0.02,
+        min(ly, fy) - 0.02,
+        max(lx, fx) + 0.02,
+        max(ly, fy) + 0.02,
+    )
     return tube, low
 
 
@@ -246,7 +276,11 @@ def test_person_blocking_hallway_resumes_promptly(monkeypatch, stand_s):
     assert r.state == "succeeded", d
     at_leave = next((x for t, x, *_ in r.trace if t - 1000.0 >= t_off), None)
     moved = next(
-        (t - 1000.0 for t, x, *_ in r.trace if t - 1000.0 >= t_off and x > at_leave + 0.2),
+        (
+            t - 1000.0
+            for t, x, *_ in r.trace
+            if t - 1000.0 >= t_off and x > at_leave + 0.2
+        ),
         None,
     )
     assert moved is not None and moved - t_off < 1.5, d

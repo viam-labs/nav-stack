@@ -1,4 +1,5 @@
 """Scan-vs-map consistency used for mid-nav localization refine."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -128,22 +129,23 @@ def test_loc_blocks_forward_live_wall_case():
     )
     assert residual_is_lost(live) is False
     assert loc_blocks_forward(live) is True
-    assert match_scores_say_lost(
-        {"previous_score": -0.24, "tick_match_score": -0.04}
-    )
+    assert match_scores_say_lost({"previous_score": -0.24, "tick_match_score": -0.04})
     assert loc_blocks_forward(
         LocDisagreement(disagree=False),
         {"status": "ok", "previous_score": -0.1},
     )
     # Live tick recovered; the stale negative prior must not keep holding.
-    assert loc_blocks_forward(
-        LocDisagreement(disagree=False),
-        {
-            "status": "refused_along",
-            "previous_score": -0.03,
-            "tick_match_score": 0.37,
-        },
-    ) is False
+    assert (
+        loc_blocks_forward(
+            LocDisagreement(disagree=False),
+            {
+                "status": "refused_along",
+                "previous_score": -0.03,
+                "tick_match_score": 0.37,
+            },
+        )
+        is False
+    )
     assert loc_blocks_forward(
         LocDisagreement(disagree=False),
         {"status": "refused_large"},
@@ -179,9 +181,10 @@ def test_trusted_slam_pose_does_not_block_on_beam_residual():
     assert slam_pose_is_trusted(trusted) is True
     assert loc_blocks_forward(residual, trusted) is False
     # Negative prior still blocks even with a decent candidate score.
-    assert slam_pose_is_trusted(
-        {**trusted, "previous_score": -0.1, "good_match": True}
-    ) is False
+    assert (
+        slam_pose_is_trusted({**trusted, "previous_score": -0.1, "good_match": True})
+        is False
+    )
 
 
 def test_published_pose_misregistered_on_a_refused_large_jump():

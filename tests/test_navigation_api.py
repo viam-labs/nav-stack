@@ -1,4 +1,5 @@
 """Typed Navigation service: units and the methods that replace DoCommand."""
+
 from __future__ import annotations
 
 import asyncio
@@ -87,7 +88,10 @@ def test_status_maps_active_goal_and_velocity():
             "motion": "builtin",
             "pose": {"x": 1.0, "y": 2.0, "theta": 0.0},
             "goal": {"x": 3.0, "y": 4.0, "theta": 0.0, "name": "wait"},
-            "path": [{"x": 1.0, "y": 2.0, "theta": 0.0}, {"x": 3.0, "y": 4.0, "theta": 0.0}],
+            "path": [
+                {"x": 1.0, "y": 2.0, "theta": 0.0},
+                {"x": 3.0, "y": 4.0, "theta": 0.0},
+            ],
             "length_m": 2.8,
             "distance_remaining_m": 2.8,
             "cmd_vx_mps": 0.2,
@@ -115,13 +119,18 @@ def test_not_localized_message_says_how_long_and_what_to_do():
             "state": "lost",
             "since_s": 94.0,
             "last_attempt": {
-                "status": "ambiguous", "score": 0.31, "shift_m": 3.3, "shift_deg": 24.0,
+                "status": "ambiguous",
+                "score": 0.31,
+                "shift_m": 3.3,
+                "shift_deg": 24.0,
             },
             "suggested_action": "set an initial pose near the robot",
         },
     }
     msg = not_localized_message(status)
-    assert msg.startswith("not localized (lost for 94 s (ambiguous, best match 0.31 at 3.3 m / 24 deg)")
+    assert msg.startswith(
+        "not localized (lost for 94 s (ambiguous, best match 0.31 at 3.3 m / 24 deg)"
+    )
     assert "set an initial pose" in msg
     # The state can also ride inside the check dict (shared with SLAM).
     status.pop("localization_state")

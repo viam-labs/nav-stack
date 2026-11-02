@@ -3,6 +3,7 @@
 A location is a named pose in the map frame, stored in meters/radians (
 convention) in the map's ``locations.json``.
 """
+
 from __future__ import annotations
 
 import json

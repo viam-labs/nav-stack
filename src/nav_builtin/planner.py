@@ -1,4 +1,5 @@
 """Global planners on an inflated costmap (A* and Lazy Theta*)."""
+
 from __future__ import annotations
 
 import heapq
@@ -473,9 +474,9 @@ def _simplify(cells: List[Cell]) -> List[Cell]:
         y0, x0 = out[-1]
         y1, x1 = cells[i]
         y2, x2 = cells[i + 1]
-        if (y1 - y0) * (x2 - x1) == (y2 - y1) * (x1 - x0) and (y1 - y0) * (
-            x2 - x0
-        ) == (y2 - y0) * (x1 - x0):
+        if (y1 - y0) * (x2 - x1) == (y2 - y1) * (x1 - x0) and (y1 - y0) * (x2 - x0) == (
+            y2 - y0
+        ) * (x1 - x0):
             continue
         out.append(cells[i])
     out.append(cells[-1])
@@ -560,9 +561,7 @@ def path_blocked_local(
     if path.empty:
         return True
     return (
-        path_cost_ahead(
-            pose, path, view, lookahead_m=lookahead_m, margin_m=margin_m
-        )
+        path_cost_ahead(pose, path, view, lookahead_m=lookahead_m, margin_m=margin_m)
         >= cost_threshold
     )
 
@@ -726,9 +725,7 @@ def plan_on_costmap(
             robot_radius_m=cell_r,
             max_radius_cells=snap_radius_cells,
         )
-        start_cell = (
-            occ.world_to_cell(start_xy[0], start_xy[1]) if start_xy else None
-        )
+        start_cell = occ.world_to_cell(start_xy[0], start_xy[1]) if start_xy else None
     else:
         start_cell = nearest_free_cell(
             costs,
@@ -752,9 +749,7 @@ def plan_on_costmap(
         start_xy = None
         start_cell = None
     gr, gc = occ.world_to_cell(goal.x, goal.y)
-    goal_cell = nearest_free_cell(
-        costs, gr, gc, max_radius_cells=snap_radius_cells
-    )
+    goal_cell = nearest_free_cell(costs, gr, gc, max_radius_cells=snap_radius_cells)
     if goal_cell is None:
         goal_xy = None
     elif goal_cell == (gr, gc):
@@ -821,9 +816,7 @@ def plan_on_costmap(
         else:
             world_list = [start_xy, goal_xy]
     sample_step = max(0.05, float(occ.resolution) * 0.5)
-    world_list = _densify_world_path(
-        costs, occ, world_list, sample_step_m=sample_step
-    )
+    world_list = _densify_world_path(costs, occ, world_list, sample_step_m=sample_step)
 
     return PlanResult(
         feasible=True,
@@ -891,9 +884,7 @@ def plan_path(
     # already on the map and can seal narrow corridors.
     if scan is not None and scan_pose is not None:
         hit_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
-        occ = mark_scan_on_occupancy(
-            occ, scan_pose, scan, obstacle_radius_m=hit_r
-        )
+        occ = mark_scan_on_occupancy(occ, scan_pose, scan, obstacle_radius_m=hit_r)
     if local_view is not None:
         hit_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
         # Copy only raw, novel scan hits from the cached local view. Its merged
@@ -923,17 +914,13 @@ def plan_path(
                 lookahead_m=1.5,
                 start_offset_m=float(robot_radius_m) + 0.05,
                 end_offset_m=(
-                    seal_r
-                    + 2.0 * float(robot_radius_m)
-                    + 2.0 * float(occ.resolution)
+                    seal_r + 2.0 * float(robot_radius_m) + 2.0 * float(occ.resolution)
                 ),
             )
-    if (
-        paint_corridor
-        and blocked_path is not None
-        and blocked_path_pose is not None
-    ):
-        block_r = max(float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12))
+    if paint_corridor and blocked_path is not None and blocked_path_pose is not None:
+        block_r = max(
+            float(occ.resolution), min(float(dynamic_obstacle_radius_m), 0.12)
+        )
         # Leave the robot's own footprint unpainted (start would otherwise be
         # lethal and snap sideways), and only paint the stretch the local
         # costmap actually flagged — not 2.5 m of route.
@@ -943,11 +930,11 @@ def plan_path(
             blocked_path_pose,
             radius_m=block_r,
             lookahead_m=1.5,
-            start_offset_m=float(robot_radius_m) + block_r + 2.0 * float(occ.resolution),
+            start_offset_m=float(robot_radius_m)
+            + block_r
+            + 2.0 * float(occ.resolution),
             end_offset_m=(
-                block_r
-                + 2.0 * float(robot_radius_m)
-                + 2.0 * float(occ.resolution)
+                block_r + 2.0 * float(robot_radius_m) + 2.0 * float(occ.resolution)
             ),
         )
     costs = build_costmap(

@@ -6,6 +6,7 @@ says how long the robot has been unable to place itself or what to do about
 it. This tracker keeps that across cycles so ``get_status`` and the goal
 refusal can say "lost for 94 s, best match 0.31 at 3.3 m: set an initial pose".
 """
+
 from __future__ import annotations
 
 import math
@@ -96,7 +97,11 @@ class LocalizationStateTracker:
             self._bad_streak += 1
             mode = str(result.get("match_mode") or "")
             score = _finite(result.get("score"))
-            if mode.startswith("full_map") and score is not None and score < MAP_MISMATCH_SCORE:
+            if (
+                mode.startswith("full_map")
+                and score is not None
+                and score < MAP_MISMATCH_SCORE
+            ):
                 self._set(LOC_MAP_MISMATCH, f"full_map_best_{score:.2f}")
                 return
             if self._bad_streak >= self._lost_after:

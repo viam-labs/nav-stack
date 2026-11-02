@@ -17,6 +17,7 @@ Layout on disk::
 Locations, zones, and routes are intentionally scoped to a map: switching the
 active map switches them too.
 """
+
 from __future__ import annotations
 
 import json

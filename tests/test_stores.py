@@ -148,7 +148,11 @@ def test_zone_crud_and_validation(tmp_path):
     assert len(store.list(zmod.KEEPOUT)) == 1
 
     with pytest.raises(ValueError):
-        store.add("nospeed", zmod.SPEED_LIMIT, {"type": "circle", "center": [0, 0], "radius": 1})
+        store.add(
+            "nospeed",
+            zmod.SPEED_LIMIT,
+            {"type": "circle", "center": [0, 0], "radius": 1},
+        )
 
     with pytest.raises(ValueError):
         store.add("badtype", "lava", {"type": "circle", "center": [0, 0], "radius": 1})
@@ -159,10 +163,21 @@ def test_zone_crud_and_validation(tmp_path):
 
 def test_zone_rasterize_keepout():
     zones = [
-        zmod.Zone("box", zmod.KEEPOUT, {"type": "box", "center": [0.5, 0.5], "size": [1.0, 1.0]})
+        zmod.Zone(
+            "box",
+            zmod.KEEPOUT,
+            {"type": "box", "center": [0.5, 0.5], "size": [1.0, 1.0]},
+        )
     ]
-    mask = zmod.rasterize_zones(zones, zmod.KEEPOUT, width=2, height=2, resolution=1.0,
-                                origin_x=0.0, origin_y=0.0)
+    mask = zmod.rasterize_zones(
+        zones,
+        zmod.KEEPOUT,
+        width=2,
+        height=2,
+        resolution=1.0,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
     assert mask.shape == (2, 2)
     # The box covers the cell whose center is (0.5, 0.5) -> index (0,0).
     assert mask[0, 0] == 100
@@ -170,19 +185,43 @@ def test_zone_rasterize_keepout():
 
 def test_zone_rasterize_speed_most_restrictive():
     zones = [
-        zmod.Zone("a", zmod.SPEED_LIMIT, {"type": "circle", "center": [0.5, 0.5], "radius": 5}, speed_pct=50),
-        zmod.Zone("b", zmod.SPEED_LIMIT, {"type": "circle", "center": [0.5, 0.5], "radius": 5}, speed_pct=20),
+        zmod.Zone(
+            "a",
+            zmod.SPEED_LIMIT,
+            {"type": "circle", "center": [0.5, 0.5], "radius": 5},
+            speed_pct=50,
+        ),
+        zmod.Zone(
+            "b",
+            zmod.SPEED_LIMIT,
+            {"type": "circle", "center": [0.5, 0.5], "radius": 5},
+            speed_pct=20,
+        ),
     ]
-    mask = zmod.rasterize_zones(zones, zmod.SPEED_LIMIT, width=1, height=1, resolution=1.0,
-                               origin_x=0.0, origin_y=0.0)
+    mask = zmod.rasterize_zones(
+        zones,
+        zmod.SPEED_LIMIT,
+        width=1,
+        height=1,
+        resolution=1.0,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
     assert mask[0, 0] == 20
 
 
 def test_zone_rasterize_polygon():
     poly = {"type": "polygon", "points": [[0, 0], [3, 0], [3, 3], [0, 3]]}
     zones = [zmod.Zone("p", zmod.KEEPOUT, poly)]
-    mask = zmod.rasterize_zones(zones, zmod.KEEPOUT, width=3, height=3, resolution=1.0,
-                               origin_x=0.0, origin_y=0.0)
+    mask = zmod.rasterize_zones(
+        zones,
+        zmod.KEEPOUT,
+        width=3,
+        height=3,
+        resolution=1.0,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
     # All 9 cell centers (0.5/1.5/2.5) fall inside the 3x3 polygon.
     assert (mask == 100).sum() == 9
 
@@ -206,25 +245,19 @@ def test_apply_speed_zone_limit_caps_only_above_zone_max():
     from src.nav_builtin.viam_io import _sanitize_base_cmd
 
     # 30% of 0.50 m/s is 0.15. 0.30 is over the cap; yaw stays.
-    vx, vy, w = zmod.apply_speed_zone_limit(
-        0.30, 0.0, 0.50, 30.0, max_linear_mps=0.50
-    )
+    vx, vy, w = zmod.apply_speed_zone_limit(0.30, 0.0, 0.50, 30.0, max_linear_mps=0.50)
     assert abs(vx - 0.15) < 1e-9
     assert w == 0.50
     sx, _, sw = _sanitize_base_cmd(vx, vy, w)
     assert sx != 0.0
 
     # Already under the cap: reverse and its yaw are untouched.
-    vx, vy, w = zmod.apply_speed_zone_limit(
-        -0.10, 0.0, 0.20, 30.0, max_linear_mps=0.50
-    )
+    vx, vy, w = zmod.apply_speed_zone_limit(-0.10, 0.0, 0.20, 30.0, max_linear_mps=0.50)
     assert vx == -0.10
     assert w == 0.20
 
     # Cap below the spin threshold with a hard yaw: stay a translating command.
-    vx, vy, w = zmod.apply_speed_zone_limit(
-        0.40, 0.0, 1.0, 20.0, max_linear_mps=0.50
-    )
+    vx, vy, w = zmod.apply_speed_zone_limit(0.40, 0.0, 1.0, 20.0, max_linear_mps=0.50)
     assert abs(vx) >= 0.125
     assert abs(w) <= 0.25
     sx, _, sw = _sanitize_base_cmd(vx, vy, w)
@@ -232,9 +265,7 @@ def test_apply_speed_zone_limit_caps_only_above_zone_max():
     assert abs(sw) > 0.0
 
     # Pure spin is not a linear overspeed.
-    vx, vy, w = zmod.apply_speed_zone_limit(
-        0.0, 0.0, 0.8, 30.0, max_linear_mps=0.50
-    )
+    vx, vy, w = zmod.apply_speed_zone_limit(0.0, 0.0, 0.8, 30.0, max_linear_mps=0.50)
     assert vx == 0.0
     assert w == 0.8
 

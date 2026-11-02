@@ -13,6 +13,7 @@ anything there. They are also dropped when the body covers them (a real
 obstacle there would be a collision), beyond ``keep_radius_m``, or after
 ``ttl_s``.
 """
+
 from __future__ import annotations
 
 import math
@@ -71,7 +72,10 @@ class DepthObstacleMemory:
                 wy = cap.y + s * pts[:, 0] + c * pts[:, 1]
                 near = (wx - pose.x) ** 2 + (wy - pose.y) ** 2 <= self._keep_r**2
                 for x, y in zip(wx[near], wy[near]):
-                    key = (int(math.floor(x / self._cell)), int(math.floor(y / self._cell)))
+                    key = (
+                        int(math.floor(x / self._cell)),
+                        int(math.floor(y / self._cell)),
+                    )
                     self._cells[key] = (float(x), float(y), now)
         self._evict(pose, now)
 

@@ -5,6 +5,7 @@
 must use the same numbers, or a command that looks nonzero never reaches
 the wheels and the bumper stays put.
 """
+
 from __future__ import annotations
 
 import math
@@ -90,9 +91,7 @@ def lift_sub_deadband(
     if cmd.vx > 1e-6:
         return DriveCommand(0.0, 0.0, 0.0, False)
     if cmd.vx < -1e-6:
-        return DriveCommand(
-            -max(0.10, abs(cmd.vx), LIN_EPS_MPS), 0.0, 0.0, False
-        )
+        return DriveCommand(-max(0.10, abs(cmd.vx), LIN_EPS_MPS), 0.0, 0.0, False)
     return DriveCommand(
         0.0,
         0.0,

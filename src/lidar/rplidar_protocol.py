@@ -189,7 +189,13 @@ def scan_to_xyz_m(
     return out
 
 
-def encode_info(*, model: int = MODEL_A1, firmware=(1, 0), hardware=0, serial: Optional[bytes] = None) -> bytes:
+def encode_info(
+    *,
+    model: int = MODEL_A1,
+    firmware=(1, 0),
+    hardware=0,
+    serial: Optional[bytes] = None,
+) -> bytes:
     ser = (serial or b"\x00" * 16)[:16].ljust(16, b"\x00")
     return bytes((model, firmware[1], firmware[0], hardware)) + ser
 
@@ -216,9 +222,11 @@ def encode_hq_motor_rpm(rpm: int = DEFAULT_TOF_RPM) -> bytes:
 
 
 def encode_express_scan_payload(working_mode: int = 0, working_flags: int = 0) -> bytes:
-    return bytes((int(working_mode) & 0xFF,)) + int(working_flags).to_bytes(
-        2, "little"
-    ) + (0).to_bytes(2, "little")
+    return (
+        bytes((int(working_mode) & 0xFF,))
+        + int(working_flags).to_bytes(2, "little")
+        + (0).to_bytes(2, "little")
+    )
 
 
 def encode_get_lidar_conf(conf_type: int, reserve: bytes = b"") -> bytes:

@@ -10,6 +10,7 @@ starting at ``(origin_x, origin_y)`` with +y increasing up the rows. Images have
 row 0 at the top, so the grid is flipped vertically once and every world->pixel
 mapping uses the same flip -> world-up renders as image-up (matches rviz).
 """
+
 from __future__ import annotations
 
 import io
@@ -219,7 +220,9 @@ def _build_frame(
     return img, frame
 
 
-def _poly_px(frame: _Frame, pts: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+def _poly_px(
+    frame: _Frame, pts: Sequence[Tuple[float, float]]
+) -> List[Tuple[float, float]]:
     return [frame.to_px(x, y) for (x, y) in pts]
 
 
@@ -227,7 +230,9 @@ def _draw_polyline(draw, frame, pts, color, width, alpha=255):
     if not pts or len(pts) < 2:
         return
     line = _poly_px(frame, pts)
-    draw.line(line, fill=(*color, alpha), width=max(1, int(round(width))), joint="curve")
+    draw.line(
+        line, fill=(*color, alpha), width=max(1, int(round(width))), joint="curve"
+    )
 
 
 def _draw_pose(draw, frame, pose, radius_m, color):
@@ -311,9 +316,7 @@ def _encode(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def render_nav_view(
-    snapshot: Dict, options: Optional[NavViewOptions] = None
-) -> bytes:
+def render_nav_view(snapshot: Dict, options: Optional[NavViewOptions] = None) -> bytes:
     """Render a nav-camera snapshot to PNG bytes.
 
     ``snapshot`` keys (all optional / may be ``None``/empty):
@@ -351,9 +354,7 @@ def render_nav_view(
     if opts.show_footprint:
         fp = snapshot.get("footprint")
         if fp and len(fp) >= 3:
-            draw.polygon(
-                _poly_px(frame, fp), outline=(*_C_FOOTPRINT, 255)
-            )
+            draw.polygon(_poly_px(frame, fp), outline=(*_C_FOOTPRINT, 255))
         elif pose is not None:
             # No footprint published yet: draw the configured radius as a circle.
             px, py = frame.to_px(pose[0], pose[1])

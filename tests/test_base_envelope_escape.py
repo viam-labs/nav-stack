@@ -1,4 +1,5 @@
 """Shared base envelope + nose-escape policy."""
+
 from __future__ import annotations
 
 import math
@@ -149,9 +150,7 @@ def test_escape_machine_bumper_reverse_then_replan(monkeypatch):
 def test_escape_machine_wait_freeze_and_unstick_turn(monkeypatch):
     monkeypatch.setattr(escape, "try_reverse", lambda *a, **k: None)
     monkeypatch.setattr(escape, "bumper_wants_reverse", lambda **k: False)
-    monkeypatch.setattr(
-        escape.EscapeMachine, "_spin_clear", lambda self, s: False
-    )
+    monkeypatch.setattr(escape.EscapeMachine, "_spin_clear", lambda self, s: False)
     m = escape.EscapeMachine()
     # Idle wait with no unstick path → freeze.
     r = m.tick_pre(

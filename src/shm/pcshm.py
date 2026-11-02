@@ -150,7 +150,9 @@ class Reader:
         self.name = normalize_name(name)
         self.region_size = region_size
         self.slot_size = region_size // NUM_SLOTS
-        self._shm = _open_shm(_python_shm_name(self.name), create=False, size=region_size)
+        self._shm = _open_shm(
+            _python_shm_name(self.name), create=False, size=region_size
+        )
         self._buf = self._shm.buf
 
     def read(self) -> Tuple[bytes, int]:

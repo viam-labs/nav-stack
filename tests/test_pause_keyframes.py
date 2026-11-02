@@ -1,4 +1,5 @@
 """Tests for pause keyframe store / match (src/nav/pause_keyframes.py)."""
+
 import math
 
 import numpy as np
@@ -22,9 +23,7 @@ def test_nn_hit_rate_identity_and_shift():
 
 
 def test_store_dedupes_near_duplicates():
-    store = pause_keyframes.PauseKeyframeStore(
-        min_spacing_m=0.5, min_spacing_deg=20.0
-    )
+    store = pause_keyframes.PauseKeyframeStore(min_spacing_m=0.5, min_spacing_deg=20.0)
     scan = _wall_scan()
     pose = conv.Pose2D(1.0, 2.0, 0.1)
     assert store.add(pose, scan, []) is True
@@ -34,9 +33,7 @@ def test_store_dedupes_near_duplicates():
 
 
 def test_match_finds_keyframe_from_different_yaw():
-    store = pause_keyframes.PauseKeyframeStore(
-        match_tol_m=0.35, yaw_step_deg=10.0
-    )
+    store = pause_keyframes.PauseKeyframeStore(match_tol_m=0.35, yaw_step_deg=10.0)
     true = conv.Pose2D(0.0, 0.0, math.pi / 2)
     scan = _wall_scan()
     # Head-height "shelf" unique to this stop.

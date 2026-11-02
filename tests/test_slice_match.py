@@ -1,4 +1,5 @@
 """Tests for multi-height-slice revisit verification (src/nav/slice_match.py)."""
+
 import math
 
 import numpy as np

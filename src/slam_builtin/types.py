@@ -1,4 +1,5 @@
 """Shared types for builtin occupancy SLAM."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
