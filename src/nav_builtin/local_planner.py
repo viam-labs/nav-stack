@@ -10,8 +10,8 @@ import numpy as np
 from ..nav.simple_motion import DriveCommand, apply_velocity_floor
 from ..geom import conversions as conv
 from .path_utils import closest_point_on_path
-from .costmap import is_traversable
-from .local_costmap import LocalCostmapView, footprint_collides, max_cost_along_segment
+from .costmap import HARD_BUFFER, LETHAL
+from .local_costmap import LocalCostmapView, max_cost_along_segment
 from .types import Path2D, Pose2D
 
 # Set to a dict (tests / offline debugging) to capture per-tick scoring.
@@ -68,6 +68,41 @@ class LocalPlannerConfig:
     enabled: bool = True
 
 
+def _normalize_angles(th: np.ndarray) -> np.ndarray:
+    return (th + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _simulate_batch(
+    pose: Pose2D,
+    vx: np.ndarray,
+    vtheta: np.ndarray,
+    *,
+    sim_time_s: float,
+    sim_dt_s: float,
+) -> np.ndarray:
+    """Integrate all ``(vx, vtheta)`` samples → ``(n_traj, n_steps+1, 3)`` poses."""
+    dt = max(float(sim_dt_s), 1e-3)
+    steps = max(1, int(round(float(sim_time_s) / dt)))
+    n = int(vx.shape[0])
+    out = np.empty((n, steps + 1, 3), dtype=np.float64)
+    out[:, 0, 0] = pose.x
+    out[:, 0, 1] = pose.y
+    out[:, 0, 2] = pose.theta
+    x = np.full(n, float(pose.x), dtype=np.float64)
+    y = np.full(n, float(pose.y), dtype=np.float64)
+    th = np.full(n, float(pose.theta), dtype=np.float64)
+    vx = np.asarray(vx, dtype=np.float64)
+    vtheta = np.asarray(vtheta, dtype=np.float64)
+    for t in range(steps):
+        x = x + np.cos(th) * vx * dt
+        y = y + np.sin(th) * vx * dt
+        th = _normalize_angles(th + vtheta * dt)
+        out[:, t + 1, 0] = x
+        out[:, t + 1, 1] = y
+        out[:, t + 1, 2] = th
+    return out
+
+
 def _simulate(
     pose: Pose2D,
     vx: float,
@@ -76,30 +111,36 @@ def _simulate(
     sim_time_s: float,
     sim_dt_s: float,
 ) -> list[Pose2D]:
-    dt = max(float(sim_dt_s), 1e-3)
-    steps = max(1, int(round(sim_time_s / dt)))
-    out = [pose]
-    x, y, th = pose.x, pose.y, pose.theta
-    for _ in range(steps):
-        c = math.cos(th)
-        s = math.sin(th)
-        x += (c * vx) * dt
-        y += (s * vx) * dt
-        th = conv.normalize_angle(th + vtheta * dt)
-        out.append(Pose2D(x, y, th))
+    batch = _simulate_batch(
+        pose,
+        np.asarray([vx], dtype=np.float64),
+        np.asarray([vtheta], dtype=np.float64),
+        sim_time_s=sim_time_s,
+        sim_dt_s=sim_dt_s,
+    )
+    return [Pose2D(float(p[0]), float(p[1]), float(p[2])) for p in batch[0]]
+
+
+def _dilate_blocked(blocked: np.ndarray, cells: int) -> np.ndarray:
+    """OR-dilate a boolean grid by a disk of radius ``cells`` (pure numpy)."""
+    if cells <= 0:
+        return blocked.copy()
+    h, w = blocked.shape
+    out = blocked.copy()
+    ys, xs = np.nonzero(blocked)
+    if ys.size == 0:
+        return out
+    for dy in range(-cells, cells + 1):
+        for dx in range(-cells, cells + 1):
+            if dy * dy + dx * dx > cells * cells:
+                continue
+            if dy == 0 and dx == 0:
+                continue
+            yy = ys + dy
+            xx = xs + dx
+            m = (yy >= 0) & (yy < h) & (xx >= 0) & (xx < w)
+            out[yy[m], xx[m]] = True
     return out
-
-
-def _rollout_point_collides(
-    view: LocalCostmapView,
-    start: Pose2D,
-    p: Pose2D,
-    *,
-    margin_m: float,
-) -> bool:
-    if math.hypot(p.x - start.x, p.y - start.y) <= margin_m:
-        return not is_traversable(view.cost_at_world(p.x, p.y))
-    return footprint_collides(view, p.x, p.y, robot_radius_m=margin_m)
 
 
 def _path_distance_m(path: Path2D, x: float, y: float) -> float:
@@ -661,128 +702,169 @@ def compute_local_command(
     pose_heading_err = abs(conv.normalize_angle(heading_ref - pose.theta))
     translate_ok = pose_heading_err <= float(cfg.max_translate_heading_err_rad)
 
-    for i in range(n_vx):
-        if n_vx == 1:
-            vx = 0.0
+    # Velocity lattice → flat (n_traj,) samples.
+    if n_vx == 1:
+        vxs = np.asarray([0.0], dtype=np.float64)
+    else:
+        vxs = -max_reverse + (forward_max + max_reverse) * np.arange(
+            n_vx, dtype=np.float64
+        ) / (n_vx - 1)
+    vts = -max_vel_theta + (2.0 * max_vel_theta) * np.arange(
+        n_vt, dtype=np.float64
+    ) / (n_vt - 1)
+    vx_grid, vt_grid = np.meshgrid(vxs, vts, indexing="ij")
+    vx_flat = vx_grid.ravel()
+    vt_flat = vt_grid.ravel()
+
+    # When the path ahead is blocked, still allow shallow reverse to unstick;
+    # deep reverse is for backup recovery, not DWA. Facing way off the clear
+    # direction: rotate in place first (no forward creep into side clutter).
+    skip = np.zeros(vx_flat.shape[0], dtype=bool)
+    if path_blocked_ahead:
+        skip |= vx_flat < -0.08
+    if not translate_ok:
+        skip |= vx_flat > 0.02
+
+    poses = _simulate_batch(
+        pose,
+        vx_flat,
+        vt_flat,
+        sim_time_s=cfg.sim_time_s,
+        sim_dt_s=cfg.sim_dt_s,
+    )
+    # Steps after the current pose: (n_traj, n_steps, 3)
+    xs = poses[:, 1:, 0]
+    ys = poses[:, 1:, 1]
+    costs = np.asarray(view.costs)
+    h, w = costs.shape
+    res = float(view.occ.resolution)
+    ox = float(view.occ.origin_x)
+    oy = float(view.occ.origin_y)
+    cols = np.floor((xs - ox) / res).astype(np.int32)
+    rows = np.floor((ys - oy) / res).astype(np.int32)
+    oob = (rows < 0) | (rows >= h) | (cols < 0) | (cols >= w)
+    safe_r = np.clip(rows, 0, h - 1)
+    safe_c = np.clip(cols, 0, w - 1)
+
+    # Non-traversable cells (same rule as is_traversable / allow_unknown=False).
+    blocked = costs >= HARD_BUFFER
+    cells = max(1, int(math.ceil(collision_r / res)))
+    dilated = _dilate_blocked(blocked, cells)
+
+    # Near the start: only the robot's own cell must be free (rotate-in-place
+    # next to an inscribed ring). Farther: disc of radius collision_r.
+    dists = np.hypot(xs - pose.x, ys - pose.y)
+    near = dists <= collision_r
+    center_hit = oob | blocked[safe_r, safe_c]
+    # footprint_collides treats any disc cell outside the map as a hit.
+    disc_oob = (
+        (safe_r - cells < 0)
+        | (safe_r + cells >= h)
+        | (safe_c - cells < 0)
+        | (safe_c + cells >= w)
+    )
+    disc_hit = oob | disc_oob | dilated[safe_r, safe_c]
+    point_hit = np.where(near, center_hit, disc_hit)
+    traj_hit = point_hit.any(axis=1)
+
+    # Fancy-index costs once for obstacle scoring + blocked-route veto.
+    step_costs = np.where(oob, LETHAL, costs[safe_r, safe_c])
+    max_c = step_costs.max(axis=1)
+    high_cost = (step_costs >= cfg.activate_cost_threshold).any(axis=1)
+
+    # Survivors: not skipped, not colliding; forward samples on a blocked route
+    # must not cross activate-threshold cells.
+    alive = ~skip & ~traj_hit
+    if path_blocked_ahead:
+        alive &= ~((vx_flat > 0.0) & high_cost)
+
+    ends_x = poses[:, -1, 0]
+    ends_y = poses[:, -1, 1]
+    ends_th = poses[:, -1, 2]
+
+    for k in np.flatnonzero(alive):
+        vx = float(vx_flat[k])
+        vtheta = float(vt_flat[k])
+        end_x = float(ends_x[k])
+        end_y = float(ends_y[k])
+        end_th = float(ends_th[k])
+        path_dist = _path_distance_m(path, end_x, end_y)
+        # On a blocked route, forward motion must leave the corridor —
+        # not drive down it at max speed toward a block beyond the horizon.
+        if path_blocked_ahead and vx > 0.08:
+            leaving = path_dist >= 0.22 or path_dist >= path_dist_now + 0.12
+            if not leaving:
+                continue
+        heading_err = abs(conv.normalize_angle(heading_ref - end_th))
+        # Max (not summed) cost along the rollout: summing made every
+        # motion from inside an inflation ring look equally bad, so the
+        # "do nothing" sample won.
+        obs_pen = float(max_c[k]) / 253.0
+        if vx >= 0.0:
+            speed_term = cfg.speed_weight * vx
+            if path_blocked_ahead and vx > 1e-3:
+                speed_term *= 0.15
+        elif path_blocked_ahead:
+            speed_term = cfg.speed_weight * cfg.reverse_speed_weight * abs(vx)
         else:
-            vx = -max_reverse + (forward_max + max_reverse) * i / (n_vx - 1)
-        # When the path ahead is blocked, still allow shallow reverse to unstick;
-        # deep reverse is for backup recovery, not DWA.
-        if path_blocked_ahead and vx < -0.08:
-            continue
-        # Facing way off the clear direction: rotate in place first. Tiny
-        # forward creeps with vθ=0 were how the robot walked into side clutter
-        # with nose_clear still true (obstacle not in the forward cone).
-        if not translate_ok and vx > 0.02:
-            continue
-        for j in range(n_vt):
-            vtheta = -max_vel_theta + (2.0 * max_vel_theta) * j / (n_vt - 1)
-            rollout = _simulate(
-                pose,
-                vx,
-                vtheta,
-                sim_time_s=cfg.sim_time_s,
-                sim_dt_s=cfg.sim_dt_s,
-            )
-            # Where the rollout *goes* needs the margin; where the robot already
-            # *is* only needs its own cell drivable — otherwise standing one
-            # cell from the inscribed ring rejects even rotate-in-place and we
-            # fall through to the blind fallback spin.
-            if any(
-                _rollout_point_collides(
-                    view, pose, p, margin_m=collision_r
-                )
-                for p in rollout[1:]
+            speed_term = cfg.speed_weight * 0.35 * abs(vx)
+        if detour is not None:
+            # Field progress around the bin, plus a soft path bias so the
+            # peel stays near the route instead of a room-scale arc.
+            dd = detour.at(end_x, end_y)
+            if not math.isfinite(dd):
+                dd = field_far_m
+            path_dist = _path_distance_m(path, end_x, end_y)
+            path_pen = cfg.path_weight * cfg.detour_path_bias * path_dist
+            goal_pen = (cfg.path_weight + cfg.goal_weight) * dd
+        else:
+            # Progress relative to where we are, so every sample is on the
+            # same scale. The old 0.2x reverse discount compared "80% off
+            # the goal distance" against full price for forward, and a
+            # 1 cm reverse creep beat every forward arc whenever the route
+            # was blocked.
+            goal_dist = math.hypot(end_x - gx, end_y - gy)
+            path_pen = cfg.path_weight * (path_dist - path_dist_now)
+            goal_pen = cfg.goal_weight * (goal_dist - goal_dist_now)
+        score = (
+            -path_pen
+            - goal_pen
+            + speed_term
+            - cfg.obstacle_weight * obs_pen
+            - cfg.heading_weight * heading_err
+        )
+        if abs(vx) < 1e-3 and abs(vtheta) > 1e-3 and path_blocked_ahead:
+            score -= cfg.spin_penalty
+        if prev_vx is not None and prev_vt is not None and max_vel_x > 1e-6:
+            # Stick to the last DWA choice so noisy costmaps don't chatter.
+            # Only while translating: a rotate-in-place that turned out to
+            # be the wrong way must stay cheap to reverse, or the spin
+            # locks itself in.
+            prev_moving = abs(prev_vx) >= 0.05
+            cont_w = cfg.continuity_weight * (1.0 if prev_moving else 0.5)
+            dvx = abs(vx - prev_vx) / max(max_vel_x, 1e-3)
+            dvt = abs(vtheta - prev_vt) / max(max_vel_theta, 1e-3)
+            score -= cont_w * (dvx + dvt)
+            if (
+                prev_moving
+                and abs(prev_vt) > 0.05
+                and abs(vtheta) > 0.05
+                and (prev_vt > 0) != (vtheta > 0)
             ):
-                continue
-            # A lethal cell on the *route* must not veto every forward rollout —
-            # that left DWA with rotate-only choices (spin, 57 failed replans)
-            # while the flanks were open. Each rollout is judged on the cells it
-            # actually crosses; the reactive stop bubble backs this up.
-            if path_blocked_ahead and vx > 0 and any(
-                view.cost_at_world(p.x, p.y) >= cfg.activate_cost_threshold
-                for p in rollout[1:]
-            ):
-                continue
-            end = rollout[-1]
-            path_dist = _path_distance_m(path, end.x, end.y)
-            # On a blocked route, forward motion must leave the corridor —
-            # not drive down it at max speed toward a block beyond the horizon.
-            if path_blocked_ahead and vx > 0.08:
-                leaving = path_dist >= 0.22 or path_dist >= path_dist_now + 0.12
-                if not leaving:
-                    continue
-            heading_err = abs(conv.normalize_angle(heading_ref - end.theta))
-            # Max (not summed) cost along the rollout: summing made every
-            # motion from inside an inflation ring look equally bad, so the
-            # "do nothing" sample won.
-            max_c = 0
-            for p in rollout[1:]:
-                c = view.cost_at_world(p.x, p.y)
-                if c > max_c:
-                    max_c = c
-            obs_pen = max_c / 253.0
-            if vx >= 0.0:
-                speed_term = cfg.speed_weight * vx
-                if path_blocked_ahead and vx > 1e-3:
-                    speed_term *= 0.15
-            elif path_blocked_ahead:
-                speed_term = cfg.speed_weight * cfg.reverse_speed_weight * abs(vx)
-            else:
-                speed_term = cfg.speed_weight * 0.35 * abs(vx)
-            if detour is not None:
-                # Field progress around the bin, plus a soft path bias so the
-                # peel stays near the route instead of a room-scale arc.
-                dd = detour.at(end.x, end.y)
-                if not math.isfinite(dd):
-                    dd = field_far_m
-                path_dist = _path_distance_m(path, end.x, end.y)
-                path_pen = (
-                    cfg.path_weight * cfg.detour_path_bias * path_dist
+                score -= cont_w * 1.5
+        if _DEBUG is not None:
+            _DEBUG.setdefault("candidates", []).append(
+                (
+                    round(vx, 3),
+                    round(vtheta, 3),
+                    round(score, 3),
+                    round(goal_pen, 3),
+                    round(heading_err, 2),
+                    int(max_c[k]),
                 )
-                goal_pen = (cfg.path_weight + cfg.goal_weight) * dd
-            else:
-                # Progress relative to where we are, so every sample is on the
-                # same scale. The old 0.2x reverse discount compared "80% off
-                # the goal distance" against full price for forward, and a
-                # 1 cm reverse creep beat every forward arc whenever the route
-                # was blocked.
-                goal_dist = math.hypot(end.x - gx, end.y - gy)
-                path_pen = cfg.path_weight * (path_dist - path_dist_now)
-                goal_pen = cfg.goal_weight * (goal_dist - goal_dist_now)
-            score = (
-                -path_pen
-                - goal_pen
-                + speed_term
-                - cfg.obstacle_weight * obs_pen
-                - cfg.heading_weight * heading_err
             )
-            if abs(vx) < 1e-3 and abs(vtheta) > 1e-3 and path_blocked_ahead:
-                score -= cfg.spin_penalty
-            if prev_vx is not None and prev_vt is not None and max_vel_x > 1e-6:
-                # Stick to the last DWA choice so noisy costmaps don't chatter.
-                # Only while translating: a rotate-in-place that turned out to
-                # be the wrong way must stay cheap to reverse, or the spin
-                # locks itself in.
-                prev_moving = abs(prev_vx) >= 0.05
-                cont_w = cfg.continuity_weight * (1.0 if prev_moving else 0.5)
-                dvx = abs(vx - prev_vx) / max(max_vel_x, 1e-3)
-                dvt = abs(vtheta - prev_vt) / max(max_vel_theta, 1e-3)
-                score -= cont_w * (dvx + dvt)
-                if (
-                    prev_moving
-                    and abs(prev_vt) > 0.05
-                    and abs(vtheta) > 0.05
-                    and (prev_vt > 0) != (vtheta > 0)
-                ):
-                    score -= cont_w * 1.5
-            if _DEBUG is not None:
-                _DEBUG.setdefault("candidates", []).append(
-                    (round(vx, 3), round(vtheta, 3), round(score, 3),
-                     round(goal_pen, 3), round(heading_err, 2), max_c)
-                )
-            if best is None or score > best[2]:
-                best = (vx, vtheta, score)
+        if best is None or score > best[2]:
+            best = (vx, vtheta, score)
 
     if best is None:
         # Every rollout collides: rotate in place toward the route ahead.
