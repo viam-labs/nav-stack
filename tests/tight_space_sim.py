@@ -68,6 +68,8 @@ class RunResult:
     contacts: int
     first_contact: Optional[Tuple[float, float, float]]
     path_lengths: List[float] = field(default_factory=list)
+    # Distinct ``progress["obstacle"]`` values in the order they first appeared
+    # (transitions only — a long stretch of ``clear`` is one entry).
     obstacle_states: List[str] = field(default_factory=list)
     reversing_s: float = 0.0
     trace: List[Tuple[float, float, float, float, float]] = field(default_factory=list)
@@ -92,6 +94,42 @@ class RunResult:
             direction = d
             base = l
         return flips
+
+    def saw(self, *labels: str) -> bool:
+        """True when every label appears somewhere in ``obstacle_states``."""
+        have = set(self.obstacle_states)
+        return all(lab in have for lab in labels)
+
+    def never(self, *labels: str) -> bool:
+        """True when none of the labels appear in ``obstacle_states``."""
+        have = set(self.obstacle_states)
+        return not any(lab in have for lab in labels)
+
+    def saw_in_order(self, *labels: str) -> bool:
+        """True when ``labels`` is a subsequence of ``obstacle_states``.
+
+        Intermediate states are allowed (``clear → wait → clear`` still
+        matches ``("wait",)`` and ``("clear", "clear")``).
+        """
+        if not labels:
+            return True
+        i = 0
+        for obs in self.obstacle_states:
+            if obs == labels[i]:
+                i += 1
+                if i == len(labels):
+                    return True
+        return False
+
+    def detail(self) -> str:
+        return (
+            f"state={self.state} err={self.error!r} t={self.sim_s:.1f}s "
+            f"contacts={self.contacts} first={self.first_contact} "
+            f"flips={self.length_flips()} "
+            f"lens={[round(x, 1) for x in self.path_lengths][:12]} "
+            f"states={self.obstacle_states[:24]} rev={self.reversing_s:.1f}s "
+            f"end=({self.final_pose.x:.2f},{self.final_pose.y:.2f})"
+        )
 
 
 class RectWorld:
@@ -154,6 +192,10 @@ class RectWorld:
         # (x0, y0, x1, y1, t_on, t_off): a person stepping in and out.
         self.timed: List[Tuple[float, float, float, float, float, float]] = []
         self._timed_active: Tuple[bool, ...] = ()
+        # (x0, y0, x1, y1, t_on): paint into the *nav map* once t >= t_on so a
+        # later replan fails while the body is already against the truth obstacle.
+        self.timed_map: List[Tuple[float, float, float, float, float]] = []
+        self._timed_map_applied: Tuple[bool, ...] = ()
         self.pose = pose
         self.samples = _body_samples(length, width, RES / 2.0)
         self.scan_bins = scan_bins
@@ -195,9 +237,24 @@ class RectWorld:
         self.truth = truth
         self._scan_age = 1e9
 
+    def _update_timed_map(self) -> None:
+        if not self.timed_map:
+            return
+        applied = tuple(self.elapsed_s >= t_on for *_, t_on in self.timed_map)
+        if applied == self._timed_map_applied:
+            return
+        # Only newly-due seals (never un-paint).
+        for (x0, y0, x1, y1, _), was, now in zip(
+            self.timed_map, self._timed_map_applied or (False,) * len(self.timed_map), applied
+        ):
+            if now and not was:
+                box(self.nav_grid, x0, y0, x1, y1)
+        self._timed_map_applied = applied
+
     def advance(self, dt: float) -> None:
         self.elapsed_s += dt
         self._update_timed()
+        self._update_timed_map()
         sub = 0.01
         t = 0.0
         vx, vth = self.cmd
@@ -491,6 +548,11 @@ def run(
     yaw_gain: float = 1.0,
     rot_center_fwd_m: float = 0.0,
     depth_cam: Optional[Tuple[float, float, float, float, float]] = None,
+    # Simulated-time window [t0, t1) during which get_localization_hold returns
+    # a hold dict (map-mismatch / large jump). None disables.
+    loc_hold_window: Optional[Tuple[float, float]] = None,
+    # (x0, y0, x1, y1, t_on): seal the nav map after t_on (replan starts failing).
+    timed_map_obstacles: Sequence[Tuple[float, float, float, float, float]] = (),
 ) -> RunResult:
     truth = nav_grid.copy()
     for ob in extra_obstacles:
@@ -515,6 +577,21 @@ def run(
         depth_cam=depth_cam,
     )
     world.timed = list(timed_obstacles)
+    world.timed_map = list(timed_map_obstacles)
+    if loc_hold_window is not None:
+        t0, t1 = float(loc_hold_window[0]), float(loc_hold_window[1])
+
+        def _loc_hold():
+            t = world.elapsed_s
+            if t0 <= t < t1:
+                return {
+                    "reason": "large_jump",
+                    "status": "hold",
+                    "sim_t": round(t, 2),
+                }
+            return None
+
+        world.get_localization_hold = _loc_hold  # type: ignore[method-assign]
     clock = FakeClock(world)
     world.clock = clock
     fake_time = types.SimpleNamespace(

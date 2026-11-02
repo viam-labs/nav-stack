@@ -195,6 +195,31 @@ def test_escape_machine_wait_freeze_and_unstick_turn(monkeypatch):
     assert r3.replan_trigger == "blocked_nose_unstick"
 
 
+def test_escape_machine_wait_unstick_despite_follower_crawl(monkeypatch):
+    """Wait must unstick even when the follower still offers a slow forward."""
+    rev = DriveCommand(-0.12, 0.0, 0.0, False)
+    monkeypatch.setattr(escape, "try_reverse", lambda *a, **k: rev)
+    monkeypatch.setattr(escape, "bumper_wants_reverse", lambda **k: False)
+    monkeypatch.setattr(
+        escape.EscapeMachine, "_spin_clear", lambda self, s: False
+    )
+    m = escape.EscapeMachine()
+    r = m.tick_pre(
+        _sense(
+            waiting=True,
+            failed_replans=2,
+            nose_clear=False,
+            cmd=DriveCommand(0.11, 0.0, 0.0, False),
+            scan=object(),
+            local_view=object(),
+            progress={"obstacle": "slow"},
+        )
+    )
+    assert r.active_mode == escape.MODE_REVERSE
+    assert r.obstacle == "wait_reverse"
+    assert r.cmd is not None and r.cmd.vx < 0.0
+
+
 def test_escape_machine_undrivable_post(monkeypatch):
     monkeypatch.setattr(escape, "undrivable_nose", lambda **k: escape.TURN)
     monkeypatch.setattr(escape, "rectangle_rear_open", lambda *a, **k: False)

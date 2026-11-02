@@ -545,8 +545,15 @@ class EscapeMachine:
         if not sense.waiting:
             return EscapeResult()
 
-        # Wait: inject reverse when frozen on a spin-blocked / lethal nose.
+        # Wait owns translation. The follower may still offer a slow forward
+        # crawl ("slow"); that cmd is zeroed at the freeze below, so unstick
+        # must not require it to already be ~0 — otherwise failed_replans
+        # climb forever with the bumper against a plug.
         cmd = sense.cmd
+        if cmd.vx > 1e-6:
+            cmd = DriveCommand(0.0, 0.0, 0.0, False)
+
+        # Wait: inject reverse when frozen on a spin-blocked / lethal nose.
         if (
             abs(cmd.vx) < 1e-6
             and abs(cmd.vtheta) < 1e-6
