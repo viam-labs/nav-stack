@@ -1524,6 +1524,7 @@ class NavSupervisor:
         path: Optional[Path2D] = None,
         *,
         commit_heading: Optional[float] = None,
+        scan_world_pts: Optional[np.ndarray] = None,
     ) -> Optional[float]:
         """Yaw (rad, +CCW) onto a scan corridor the rectangle can enter.
 
@@ -1563,6 +1564,7 @@ class NavSupervisor:
             scan,
             None,
             radius_m=guard.cfg.obstacle_radius_m,
+            scan_world_pts=scan_world_pts,
         )
         free = guard.free_rotation(pose, math.copysign(1.0, yaw), world)
         # The next slice of the sweep has to be clear. Requiring the whole
@@ -1604,6 +1606,8 @@ class NavSupervisor:
         pose: Pose2D,
         scan: Optional[conv.LaserScan2D],
         yaw: float,
+        *,
+        scan_world_pts: Optional[np.ndarray] = None,
     ) -> tuple[DriveCommand, str]:
         """Twist that takes the scan corridor without a full stop when it can.
 
@@ -1624,7 +1628,11 @@ class NavSupervisor:
         if guard is None or scan is None:
             return arc, "corridor"
         pts = obstacle_points(
-            pose, scan, None, radius_m=guard.cfg.obstacle_radius_m
+            pose,
+            scan,
+            None,
+            radius_m=guard.cfg.obstacle_radius_m,
+            scan_world_pts=scan_world_pts,
         )
         free = guard.free_distance(
             pose, arc.vx, arc.vtheta, pts, guard.cfg.horizon_m

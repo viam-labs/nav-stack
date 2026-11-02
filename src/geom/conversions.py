@@ -196,43 +196,32 @@ def costmap_frame_to_map(cm: dict, frame_to_map: Pose2D) -> dict:
         return cm
     res = float(cm["resolution"])
     ox, oy = float(cm["origin_x"]), float(cm["origin_y"])
-    h, w = grid.shape
 
-    map_xs: list[float] = []
-    map_ys: list[float] = []
-    cells: list[tuple[int, int, int]] = []
-    for row in range(h):
-        for col in range(w):
-            val = int(grid[row, col])
-            if val < 0:
-                continue
-            fx = ox + (col + 0.5) * res
-            fy = oy + (row + 0.5) * res
-            mp = compose_poses(frame_to_map, Pose2D(fx, fy, 0.0))
-            map_xs.append(mp.x)
-            map_ys.append(mp.y)
-            cells.append((row, col, val))
-
-    if not cells:
+    known = grid >= 0
+    if not known.any():
         return cm
+    rows, cols = np.nonzero(known)
+    vals = grid[rows, cols].astype(np.int16, copy=False)
+    fx = ox + (cols.astype(np.float64) + 0.5) * res
+    fy = oy + (rows.astype(np.float64) + 0.5) * res
+    c = math.cos(frame_to_map.theta)
+    s = math.sin(frame_to_map.theta)
+    map_x = frame_to_map.x + c * fx - s * fy
+    map_y = frame_to_map.y + s * fx + c * fy
 
-    min_x = min(map_xs) - res
-    min_y = min(map_ys) - res
-    max_x = max(map_xs) + res
-    max_y = max(map_ys) + res
+    min_x = float(map_x.min()) - res
+    min_y = float(map_y.min()) - res
+    max_x = float(map_x.max()) + res
+    max_y = float(map_y.max()) + res
     out_w = max(1, int(math.ceil((max_x - min_x) / res)))
     out_h = max(1, int(math.ceil((max_y - min_y) / res)))
     out = np.full((out_h, out_w), -1, dtype=np.int16)
 
-    for row, col, val in cells:
-        fx = ox + (col + 0.5) * res
-        fy = oy + (row + 0.5) * res
-        mp = compose_poses(frame_to_map, Pose2D(fx, fy, 0.0))
-        oc = int((mp.x - min_x) / res)
-        orow = int((mp.y - min_y) / res)
-        if 0 <= orow < out_h and 0 <= oc < out_w:
-            prev = int(out[orow, oc])
-            out[orow, oc] = val if prev < 0 else max(prev, val)
+    oc = np.floor((map_x - min_x) / res).astype(np.int32)
+    orow = np.floor((map_y - min_y) / res).astype(np.int32)
+    inb = (orow >= 0) & (orow < out_h) & (oc >= 0) & (oc < out_w)
+    # maximum.at: empty cells stay -1; known vals (>=0) win over -1 and each other.
+    np.maximum.at(out, (orow[inb], oc[inb]), vals[inb])
 
     return {
         "grid": out,

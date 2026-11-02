@@ -19,7 +19,7 @@ from ..nav.simple_motion import DriveCommand, cone_min_range
 from .above_cart import above_cart_frames
 from .depth_memory import depth_frames
 from .escape import EscapeSense
-from .footprint_guard import obstacle_points
+from .footprint_guard import obstacle_points, scan_to_world_points
 from .types import Path2D, Pose2D
 
 if TYPE_CHECKING:
@@ -71,6 +71,8 @@ class TickContext:
     local_blocked: bool
     map_untrusted: bool
     collision_view: Optional["LocalCostmapView"]
+    # Tick-local scan→world XY (shared by guard / corridor / path-follow).
+    scan_world_pts: Any = None
     cmd: DriveCommand = field(
         default_factory=lambda: DriveCommand(0.0, 0.0, 0.0, False)
     )
@@ -224,6 +226,7 @@ def run_sense_tick(
     guard_pts = None
     map_untrusted = nav._published_pose_misregistered()  # noqa: SLF001
     collision_view = None if map_untrusted else local_view
+    scan_world_pts = scan_to_world_points(pose, scan) if scan is not None else None
     obs_cfg = nav._follower.obstacle  # noqa: SLF001
     if nav._guard is not None:  # noqa: SLF001
         guard_pts = obstacle_points(
@@ -232,6 +235,7 @@ def run_sense_tick(
             collision_view,
             radius_m=nav._guard.cfg.obstacle_radius_m,  # noqa: SLF001
             extra=mem_pts,
+            scan_world_pts=scan_world_pts,
         )
         straight = nav._guard.free_distance(  # noqa: SLF001
             pose, 0.2, 0.0, guard_pts, 2.0
@@ -313,6 +317,7 @@ def run_sense_tick(
         local_blocked=local_blocked,
         map_untrusted=map_untrusted,
         collision_view=collision_view,
+        scan_world_pts=scan_world_pts,
         phase_ms={
             "sense_ms": sense_ms,
             "costmap_ms": costmap_ms,

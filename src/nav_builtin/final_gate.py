@@ -48,7 +48,10 @@ def run_final_gate(
         ep.escape_m.yaw_sign = math.copysign(1.0, corridor_yaw)
         if abs(corridor_yaw) >= CORRIDOR_ALIGN_RAD or cmd.vx < LIN_EPS_MPS:
             cmd, label = nav._corridor_motion(  # noqa: SLF001
-                tick.pose, tick.scan, corridor_yaw
+                tick.pose,
+                tick.scan,
+                corridor_yaw,
+                scan_world_pts=tick.scan_world_pts,
             )
             progress = {
                 **progress,
@@ -75,6 +78,7 @@ def run_final_gate(
                 tick.scan,
                 None,
                 radius_m=nav._guard.cfg.obstacle_radius_m,  # noqa: SLF001
+                scan_world_pts=tick.scan_world_pts,
             )
 
         def _veto(c: DriveCommand):

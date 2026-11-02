@@ -137,6 +137,23 @@ def open_corridor_yaw(
     return float(yaws[best])
 
 
+def scan_to_world_points(
+    pose: Pose2D,
+    scan: Optional[conv.LaserScan2D],
+) -> np.ndarray:
+    """Map-frame XY hits from ``scan`` (capture pose when set, else ``pose``)."""
+    if scan is None:
+        return np.empty((0, 2), dtype=float)
+    pts = scan.to_points()
+    if not pts.size:
+        return np.empty((0, 2), dtype=float)
+    ref = scan.capture_pose or pose
+    c, s = math.cos(ref.theta), math.sin(ref.theta)
+    wx = ref.x + c * pts[:, 0] - s * pts[:, 1]
+    wy = ref.y + s * pts[:, 0] + c * pts[:, 1]
+    return np.stack([wx, wy], axis=1)
+
+
 def obstacle_points(
     pose: Pose2D,
     scan: Optional[conv.LaserScan2D],
@@ -144,6 +161,7 @@ def obstacle_points(
     *,
     radius_m: float,
     extra: Optional[np.ndarray] = None,
+    scan_world_pts: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """World-frame obstacle points near ``pose``.
 
@@ -152,18 +170,20 @@ def obstacle_points(
     projected with a stale pose, smear walls a cell inward, and in a 0.9 m
     corridor that alone reads as a collision. ``extra`` adds world points
     kept elsewhere (depth obstacles that left the camera's view).
+
+    Pass ``scan_world_pts`` (from :func:`scan_to_world_points`) to reuse a
+    tick-local transform instead of rebuilding it on every call.
     """
     chunks = []
     if extra is not None and np.size(extra):
         chunks.append(np.asarray(extra, dtype=float).reshape(-1, 2))
-    if scan is not None:
-        pts = scan.to_points()
-        if pts.size:
-            ref = scan.capture_pose or pose
-            c, s = math.cos(ref.theta), math.sin(ref.theta)
-            wx = ref.x + c * pts[:, 0] - s * pts[:, 1]
-            wy = ref.y + s * pts[:, 0] + c * pts[:, 1]
-            chunks.append(np.stack([wx, wy], axis=1))
+    if scan_world_pts is not None:
+        if np.size(scan_world_pts):
+            chunks.append(np.asarray(scan_world_pts, dtype=float).reshape(-1, 2))
+    elif scan is not None:
+        world = scan_to_world_points(pose, scan)
+        if world.size:
+            chunks.append(world)
     if local_view is not None:
         costs = np.asarray(local_view.costs)
         res = float(local_view.occ.resolution)

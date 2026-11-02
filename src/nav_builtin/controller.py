@@ -582,6 +582,7 @@ def compute_path_command(
     force_local_planner: bool = False,
     guard: Optional[FootprintGuard] = None,
     guard_extra_pts: Optional[np.ndarray] = None,
+    scan_world_pts: Optional[np.ndarray] = None,
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``.
 
@@ -605,6 +606,7 @@ def compute_path_command(
             local_view,
             radius_m=guard.cfg.obstacle_radius_m,
             extra=guard_extra_pts,
+            scan_world_pts=scan_world_pts,
         )
         # Tight space (body within ~20 cm of something): track the path
         # closely. The long, deadbanded lookahead that calms open-floor

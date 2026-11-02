@@ -92,6 +92,7 @@ def run_block_policy(
             tick.goal,
             tick.path,
             commit_heading=ep.corridor_heading,
+            scan_world_pts=tick.scan_world_pts,
         )
         tick.corridor_yaw = corridor_yaw
         ep.corridor_heading = (

@@ -292,17 +292,55 @@ def occupancy_from_map_dict(map_data: dict) -> OccupancyGrid:
     )
 
 
+_DISK_OFFSET_CACHE: dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+_RING_OFFSET_CACHE: dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+
+
 def _disk_offsets(radius_cells: int) -> Tuple[np.ndarray, np.ndarray]:
-    if radius_cells <= 0:
-        return np.array([0], dtype=np.int32), np.array([0], dtype=np.int32)
-    ys, xs = [], []
-    r2 = radius_cells * radius_cells
-    for dy in range(-radius_cells, radius_cells + 1):
-        for dx in range(-radius_cells, radius_cells + 1):
-            if dx * dx + dy * dy <= r2:
-                ys.append(dy)
-                xs.append(dx)
-    return np.asarray(ys, dtype=np.int32), np.asarray(xs, dtype=np.int32)
+    """Cached (dy, dx) offsets for a filled disk of ``radius_cells``."""
+    r = int(radius_cells)
+    cached = _DISK_OFFSET_CACHE.get(r)
+    if cached is not None:
+        return cached
+    if r <= 0:
+        out = (
+            np.array([0], dtype=np.int32),
+            np.array([0], dtype=np.int32),
+        )
+    else:
+        ys, xs = [], []
+        r2 = r * r
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if dx * dx + dy * dy <= r2:
+                    ys.append(dy)
+                    xs.append(dx)
+        out = (np.asarray(ys, dtype=np.int32), np.asarray(xs, dtype=np.int32))
+    _DISK_OFFSET_CACHE[r] = out
+    return out
+
+
+def _ring_offsets(radius_cells: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Cached Chebyshev ring offsets: ``max(|dy|, |dx|) == radius_cells``."""
+    r = int(radius_cells)
+    cached = _RING_OFFSET_CACHE.get(r)
+    if cached is not None:
+        return cached
+    if r <= 0:
+        out = (
+            np.array([0], dtype=np.int32),
+            np.array([0], dtype=np.int32),
+        )
+    else:
+        ys, xs = [], []
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if max(abs(dy), abs(dx)) == r:
+                    ys.append(dy)
+                    xs.append(dx)
+        out = (np.asarray(ys, dtype=np.int32), np.asarray(xs, dtype=np.int32))
+    _RING_OFFSET_CACHE[r] = out
+    return out
 
 
 _FAR_CELLS = 1_000_000.0
@@ -612,20 +650,23 @@ def nearest_free_cell(
     if 0 <= row < h and 0 <= col < w and is_traversable(int(costs[row, col])):
         return row, col
     for r in range(1, max_radius_cells + 1):
-        best: Optional[Tuple[int, int]] = None
-        best_d2 = 0
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if max(abs(dy), abs(dx)) != r:
-                    continue
-                yy, xx = row + dy, col + dx
-                if 0 <= yy < h and 0 <= xx < w and is_traversable(int(costs[yy, xx])):
-                    d2 = dy * dy + dx * dx
-                    if best is None or d2 < best_d2:
-                        best = (yy, xx)
-                        best_d2 = d2
-        if best is not None:
-            return best
+        dys, dxs = _ring_offsets(r)
+        rows = row + dys
+        cols = col + dxs
+        inb = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+        if not inb.any():
+            continue
+        rr = rows[inb]
+        cc = cols[inb]
+        free = np.asarray(costs)[rr, cc] < HARD_BUFFER
+        if not free.any():
+            continue
+        rr = rr[free]
+        cc = cc[free]
+        rdy = dys[inb][free]
+        rdx = dxs[inb][free]
+        i = int(np.argmin(rdy * rdy + rdx * rdx))
+        return int(rr[i]), int(cc[i])
     return None
 
 
@@ -642,17 +683,12 @@ def footprint_max_cost(
     cells = max(1, int(math.ceil(float(robot_radius_m) / res)))
     row, col = occ.world_to_cell(x_m, y_m)
     h, w = costs.shape
-    r2 = cells * cells
-    worst = FREE
-    for dy in range(-cells, cells + 1):
-        for dx in range(-cells, cells + 1):
-            if dx * dx + dy * dy > r2:
-                continue
-            rr, cc = row + dy, col + dx
-            if not (0 <= rr < h and 0 <= cc < w):
-                return LETHAL
-            worst = max(worst, int(costs[rr, cc]))
-    return worst
+    dys, dxs = _disk_offsets(cells)
+    rows = row + dys
+    cols = col + dxs
+    if ((rows < 0) | (rows >= h) | (cols < 0) | (cols >= w)).any():
+        return LETHAL
+    return int(np.asarray(costs)[rows, cols].max())
 
 
 def footprint_traversable(
@@ -688,16 +724,14 @@ def nearest_free_pose(
     row, col = occ.world_to_cell(x_m, y_m)
     h, w = costs.shape
     for r in range(1, max_radius_cells + 1):
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if max(abs(dy), abs(dx)) != r:
-                    continue
-                yy, xx = row + dy, col + dx
-                if not (0 <= yy < h and 0 <= xx < w):
-                    continue
-                wx, wy = occ.cell_to_world(yy, xx)
-                if footprint_traversable(
-                    costs, occ, wx, wy, robot_radius_m=robot_radius_m
-                ):
-                    return wx, wy
+        dys, dxs = _ring_offsets(r)
+        for dy, dx in zip(dys.tolist(), dxs.tolist()):
+            yy, xx = row + int(dy), col + int(dx)
+            if not (0 <= yy < h and 0 <= xx < w):
+                continue
+            wx, wy = occ.cell_to_world(yy, xx)
+            if footprint_traversable(
+                costs, occ, wx, wy, robot_radius_m=robot_radius_m
+            ):
+                return wx, wy
     return None

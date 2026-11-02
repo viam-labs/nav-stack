@@ -8,7 +8,15 @@ from typing import Optional, Tuple
 import numpy as np
 
 from ..geom import conversions as conv
-from .costmap import FREE, LETHAL, build_costmap, is_hard, is_traversable
+from .costmap import (
+    FREE,
+    HARD_BUFFER,
+    LETHAL,
+    _disk_offsets,
+    build_costmap,
+    is_hard,
+    is_traversable,
+)
 from .types import OccupancyGrid
 
 
@@ -317,17 +325,12 @@ def footprint_max_cost(
     cells = max(1, int(math.ceil(robot_radius_m / res)))
     row, col = view.world_to_cell(x_m, y_m)
     h, w = view.costs.shape
-    r2 = cells * cells
-    worst = FREE
-    for dy in range(-cells, cells + 1):
-        for dx in range(-cells, cells + 1):
-            if dx * dx + dy * dy > r2:
-                continue
-            rr, cc = row + dy, col + dx
-            if not (0 <= rr < h and 0 <= cc < w):
-                return LETHAL
-            worst = max(worst, int(view.costs[rr, cc]))
-    return worst
+    dys, dxs = _disk_offsets(cells)
+    rows = row + dys
+    cols = col + dxs
+    if ((rows < 0) | (rows >= h) | (cols < 0) | (cols >= w)).any():
+        return LETHAL
+    return int(np.asarray(view.costs)[rows, cols].max())
 
 
 def reverse_backup_feasible(
@@ -437,17 +440,13 @@ def footprint_collides(
     cells = max(1, int(math.ceil(robot_radius_m / res)))
     row, col = view.world_to_cell(x_m, y_m)
     h, w = view.costs.shape
-    r2 = cells * cells
-    for dy in range(-cells, cells + 1):
-        for dx in range(-cells, cells + 1):
-            if dx * dx + dy * dy > r2:
-                continue
-            rr, cc = row + dy, col + dx
-            if not (0 <= rr < h and 0 <= cc < w):
-                return True
-            if not is_traversable(int(view.costs[rr, cc])):
-                return True
-    return False
+    dys, dxs = _disk_offsets(cells)
+    rows = row + dys
+    cols = col + dxs
+    if ((rows < 0) | (rows >= h) | (cols < 0) | (cols >= w)).any():
+        return True
+    vals = np.asarray(view.costs)[rows, cols]
+    return bool(np.any(vals >= HARD_BUFFER))
 
 
 def spin_disc_blocked(

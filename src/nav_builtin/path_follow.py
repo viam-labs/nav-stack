@@ -59,6 +59,7 @@ def run_path_follow(
         force_local_planner=force_local,
         guard=nav._guard,  # noqa: SLF001
         guard_extra_pts=tick.mem_pts,
+        scan_world_pts=tick.scan_world_pts,
     )
     ep.rotate_active = bool(progress.get("rotate_to_heading"))
     ep.local_planner_active = bool(progress.get("local_planner"))
