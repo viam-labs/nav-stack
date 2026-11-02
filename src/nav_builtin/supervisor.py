@@ -15,9 +15,7 @@ from ..nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
     SimpleMotionConfig,
-    cone_min_range,
     distance_m,
-    rear_clearance_m,
 )
 from ..nav.zones import apply_speed_zone_limit
 from ..geom import conversions as conv
@@ -28,17 +26,27 @@ from .controller import (
     limit_twist_rate,
     update_speed_estimate,
 )
-from .above_cart import AboveCartMemory, above_cart_frames
+from .above_cart import AboveCartMemory
 from .base_envelope import lift_sub_deadband
-from .depth_memory import DepthObstacleMemory, depth_frames
+from .depth_memory import DepthObstacleMemory
 from .escape import (
     UNSTICK_YAW_RATE as _NOSE_UNSTICK_YAW_RATE,
-    EscapeMachine,
     EscapeSense,
     blocked_nose_unstick,
     bumper_wants_reverse,
     undrivable_nose,
 )
+from .backup_recovery import run_backup_recovery
+from .final_gate import run_final_gate
+from .goal_episode import GoalEpisode
+from .block_policy import run_block_policy
+from .replan_controller import (
+    apply_blocked_replan,
+    apply_escape_pre_replan,
+    apply_periodic_replan,
+    apply_stall_replan,
+)
+from .sense_tick import run_sense_tick
 from .footprint_guard import (
     FootprintGuard,
     GuardConfig,
@@ -48,8 +56,6 @@ from .footprint_guard import (
 from .local_costmap import (
     LocalCostmap,
     LocalCostmapConfig,
-    footprint_max_cost,
-    reverse_backup_feasible,
 )
 from .local_planner import LocalPlannerConfig
 from .planner import (
@@ -2105,58 +2111,15 @@ class NavSupervisor:
             preview = self._publish_plan_viz(result, goal, start=None)
             self._set_status(path=preview["path"], length_m=preview["length_m"])
 
-            deadline = time.monotonic() + self._goal_timeout_s(
-                float(preview.get("length_m") or 0.0)
+            _now0 = time.monotonic()
+            ep = GoalEpisode(
+                deadline=_now0
+                + self._goal_timeout_s(float(preview.get("length_m") or 0.0)),
+                last_replan=_now0,
+                last_progress_at=_now0,
             )
-            last_replan = time.monotonic()
-            last_progress_pose: Optional[Pose2D] = None
-            last_progress_at = time.monotonic()
-            last_progress_dist = float("inf")
-            last_progress_bearing = float("inf")
-            spin_stuck_since: Optional[float] = None
-            backup_active = False
-            backup_start: Optional[Pose2D] = None
-            backup_start_cost = 0
-            backup_attempts = 0
-            backup_cooldown_until = 0.0
-            # Bumper / wait-unstick / undrivable / narrow_reverse bound.
-            escape_m = EscapeMachine()
-            # Map heading of the scan corridor picked for this blocked
-            # episode. Two openings nearly tied either side of a centred
-            # obstacle swapped winners every tick and the spin dithered.
-            corridor_heading: Optional[float] = None
-            local_blocked_since: Optional[float] = None
-            last_local_replan_at = 0.0
-            failed_replan_while_blocked = 0
-            failed_static_replan = 0
-            local_planner_active = False
-            reactive_avoid_since: Optional[float] = None
-            last_obstacle_state = ""
-            prev_local_cmd: Optional[DriveCommand] = None
-            prev_cmd: Optional[DriveCommand] = None
-            rotate_active = False
-            vx_sign_history: list[tuple[float, int]] = []
-            align_best_err: Optional[float] = None
-            align_progress_at: Optional[float] = None
-            last_tick_pose: Optional[Pose2D] = None
-            # Only validate the next few metres — full-path static checks on
-            # long goals trip on far unknown/inflation and abort immediately.
-            path_block_horizon_m = 5.0
-            # Abort only when the route stays blocked *and* lidar is not clear.
-            # Clearance + stall/timeout still end hopeless runs.
-            static_replan_fail_limit = 5
-            # Parked and stopped-goal checks apply up to 1 m. A 1.5 m bar
-            # left that correction on the old path (the corner slip was 0.98 m).
-            pose_jump_replan_m = 0.5
-            was_loc_holding = False
-            pending_loc_replan = False
-            # Consecutive failed blocked-replans; reset only by a successful
-            # replan or real progress toward the goal (not by a one-tick
-            # local_blocked flicker).
-            blocked_fail_count = 0
-            blocked_fail_dist: Optional[float] = None
 
-            while time.monotonic() < deadline:
+            while time.monotonic() < ep.deadline:
                 tick_started = time.monotonic()
                 loc_hold_motion = False
                 if self._cancel.is_set():
@@ -2174,11 +2137,10 @@ class NavSupervisor:
                     )
                     return
                 if (
-                    blocked_fail_dist is not None
-                    and distance_m(pose, goal) < blocked_fail_dist - 0.5
+                    ep.blocked_fail_dist is not None
+                    and distance_m(pose, goal) < ep.blocked_fail_dist - 0.5
                 ):
-                    blocked_fail_count = 0
-                    blocked_fail_dist = None
+                    ep.on_goal_progress()
 
                 self._set_status(
                     pose={"x": pose.x, "y": pose.y, "theta": pose.theta}
@@ -2194,10 +2156,10 @@ class NavSupervisor:
                     except Exception:  # noqa: BLE001
                         loc_hold = None
                 holding_for_localize = isinstance(loc_hold, dict)
-                entering_loc_hold = holding_for_localize and not was_loc_holding
-                if was_loc_holding and not holding_for_localize:
-                    pending_loc_replan = True
-                was_loc_holding = holding_for_localize
+                entering_loc_hold = holding_for_localize and not ep.was_loc_holding
+                if ep.was_loc_holding and not holding_for_localize:
+                    ep.pending_loc_replan = True
+                ep.was_loc_holding = holding_for_localize
 
                 # Goal reached? Use the *requested* goal — path[-1] can be a
                 # free-cell snap that used to let us "succeed" a metre away.
@@ -2214,12 +2176,12 @@ class NavSupervisor:
                 # stops reducing the error. A rotation that is still closing
                 # the gap keeps going past the stall window.
                 if xy_ok:
-                    give_up, align_best_err, align_progress_at = yaw_align_give_up(
+                    give_up, ep.align_best_err, ep.align_progress_at = yaw_align_give_up(
                         now,
                         yaw_err_abs,
                         self._yaw_align_timeout_s,
-                        align_best_err,
-                        align_progress_at,
+                        ep.align_best_err,
+                        ep.align_progress_at,
                     )
                     if give_up:
                         self._world.stop()
@@ -2230,8 +2192,8 @@ class NavSupervisor:
                         )
                         return
                 else:
-                    align_best_err = None
-                    align_progress_at = None
+                    ep.align_best_err = None
+                    ep.align_progress_at = None
 
                 if holding_for_localize:
                     hold_status = str((loc_hold or {}).get("status") or "")
@@ -2250,12 +2212,12 @@ class NavSupervisor:
                         self._world.stop()
                         self._note_base_stopped()
                     loc_hold_motion = True
-                    last_progress_at = now
-                    last_progress_pose = pose
-                    last_progress_dist = dist_goal_chk
-                    last_progress_bearing = float("inf")
-                    spin_stuck_since = None
-                    deadline += time.monotonic() - tick_started
+                    ep.last_progress_at = now
+                    ep.last_progress_pose = pose
+                    ep.last_progress_dist = dist_goal_chk
+                    ep.last_progress_bearing = float("inf")
+                    ep.spin_stuck_since = None
+                    ep.deadline += time.monotonic() - tick_started
                     self._set_status(
                         pose={"x": pose.x, "y": pose.y, "theta": pose.theta},
                         progress={
@@ -2286,353 +2248,56 @@ class NavSupervisor:
                     if loc_outcome == "fail":
                         return
                     if loc_outcome == "resume":
-                        pending_loc_replan = True
+                        ep.pending_loc_replan = True
                     if loc_outcome == "hold":
                         loc_hold_motion = True
-                        last_progress_at = now
-                        last_progress_pose = pose
-                        last_progress_dist = dist_goal_chk
-                        last_progress_bearing = float("inf")
-                        spin_stuck_since = None
+                        ep.last_progress_at = now
+                        ep.last_progress_pose = pose
+                        ep.last_progress_dist = dist_goal_chk
+                        ep.last_progress_bearing = float("inf")
+                        ep.spin_stuck_since = None
                     # Time spent waiting on localization does not count
                     # against the goal timeout.
                     if loc_outcome in ("hold", "resume", "continue"):
-                        deadline += time.monotonic() - tick_started
+                        ep.deadline += time.monotonic() - tick_started
 
-                need_scan = (
-                    self._follower.obstacle is not None
-                    and self._follower.obstacle.enabled
-                ) or self._local_costmap is not None
-                refresh_local = self._local_costmap is not None and (
-                    now - self._local_view_at >= self._local_update_period_s
-                    or self._local_view_cache is None
+                tick = run_sense_tick(self, ep, now=now, pose=pose, path=path)
+                scan = tick.scan
+                mem_pts = tick.mem_pts
+                local_view = tick.local_view
+                guard_pts = tick.guard_pts
+                nose_clear = tick.nose_clear
+                path_ahead_cost = tick.path_ahead_cost
+                pose_cost = tick.pose_cost
+                local_blocked = tick.local_blocked
+                map_untrusted = tick.map_untrusted
+                collision_view = tick.collision_view
+                block = run_block_policy(
+                    self,
+                    ep,
+                    tick,
+                    goal=goal,
+                    path=path,
+                    loc_hold_motion=loc_hold_motion,
                 )
-
-                scan = None
-                if need_scan:
-                    try:
-                        # Fused lidar + obstacles_only depth: reactive cone,
-                        # local costmap / DWA, and nose_clear. Loc refine still
-                        # reads lidar-only (the map was built from lidar).
-                        scan = self._world.get_scan(self._scan_max_age)
-                    except TimeoutError:
-                        scan = None
-                mem_pts = None
-                if self._guard is not None:
-                    self._depth_memory.update(
-                        depth_frames(self._world), pose, time.monotonic()
-                    )
-                    mem_pts = self._depth_memory.points()
-                if self._above_memory is not None:
-                    self._above_memory.update(
-                        above_cart_frames(self._world), pose, time.monotonic()
-                    )
-                    above_pts = self._above_memory.points()
-                    if above_pts.size:
-                        mem_pts = (
-                            above_pts
-                            if mem_pts is None or not np.size(mem_pts)
-                            else np.vstack([np.asarray(mem_pts), above_pts])
-                        )
-
-                local_view = self._local_view_cache
-                if refresh_local:
-                    self._kick_global_costmap_refresh(allow_inline=True)
-                    # Missing scan must not wipe live marks — that made
-                    # path_blocked_local flicker false under IO load while
-                    # reactive avoid still saw the obstacle on the next tick.
-                    if scan is None:
-                        local_view = self._local_view_cache
-                    else:
-                        costmap_scan = scan
-                        if costmap_scan.capture_pose is None:
-                            costmap_scan = conv.LaserScan2D(
-                                ranges=costmap_scan.ranges,
-                                angle_min=costmap_scan.angle_min,
-                                angle_increment=costmap_scan.angle_increment,
-                                range_min=costmap_scan.range_min,
-                                range_max=costmap_scan.range_max,
-                                sensor_pose=costmap_scan.sensor_pose,
-                                capture_pose=pose,
-                            )
-                        with self._global_cache_lock:
-                            global_occ = self._global_occ_cache
-                            global_costs = self._global_costs_cache
-                        local_view = self._local_costmap.update(
-                            pose,
-                            costmap_scan,
-                            global_occ=global_occ,
-                            global_costs=global_costs,
-                            extra_points=mem_pts,
-                            mapping=self._slam_is_mapping(),
-                        )
-                        self._local_view_cache = local_view
-                        self._local_view_at = now
-                        self._local_costmap_updates += 1
-                        if self._local_costmap_enabled:
-                            from .costmap import local_view_viz_dict
-
-                            try:
-                                self._world.set_viz_local_costmap(
-                                    local_view_viz_dict(local_view)
-                                )
-                            except Exception:  # noqa: BLE001 - viz is best-effort
-                                pass
-
-                path_ahead_cost = 0
-                pose_cost = 0
-                local_blocked = False
-                # Nose / clearance first — inscribed path cost with a clear
-                # nose must not force DWA (hunt-and-peck in doorways).
-                nose_clear = True
-                forward_clearance_m: Optional[float] = None
-                guard_pts = None
-                # A refused multi-meter / large-yaw match leaves the static map
-                # on top of open floor. Judge the body against the scan.
-                map_untrusted = self._published_pose_misregistered()
-                collision_view = None if map_untrusted else local_view
-                obs_cfg = self._follower.obstacle
-                if self._guard is not None:
-                    # Nose = can the rectangle move forward at all (straight
-                    # or on some arc)? Not a padded lidar cone.
-                    guard_pts = obstacle_points(
-                        pose,
-                        scan,
-                        collision_view,
-                        radius_m=self._guard.cfg.obstacle_radius_m,
-                        extra=mem_pts,
-                    )
-                    straight = self._guard.free_distance(
-                        pose, 0.2, 0.0, guard_pts, 2.0
-                    )
-                    if math.isfinite(straight):
-                        forward_clearance_m = straight + self._guard.cfg.length_m / 2.0
-                    nose_clear = straight >= self._guard.cfg.alt_min_free_m or (
-                        self._guard.best_forward_arc(
-                            pose, guard_pts, None, self._guard.cfg.horizon_m, 0.0
-                        )
-                        is not None
-                    )
-                elif obs_cfg is not None and obs_cfg.enabled and scan is not None:
-                    half = float(obs_cfg.front_cone_half_rad)
-                    nose_range = cone_min_range(scan, -half, half)
-                    if math.isfinite(nose_range):
-                        forward_clearance_m = float(nose_range)
-                    nose_clear = (
-                        forward_clearance_m is None
-                        or forward_clearance_m > obs_cfg.stop_distance_m
-                    )
-                if local_view is not None:
-                    from .local_planner import path_cost_ahead as _path_cost_ahead
-
-                    path_ahead_cost = int(
-                        _path_cost_ahead(
-                            pose,
-                            path,
-                            local_view,
-                            lookahead_m=self._local_planner.path_clearance_lookahead_m,
-                        )
-                    )
-                    # Local costs are footprint-inflated: hard pose cost means
-                    # the body already overlaps keep-out.
-                    pose_cost = int(local_view.cost_at_world(pose.x, pose.y))
-                    local_blocked = self._path_locally_blocked(
+                waiting_for_clear = block.waiting_for_clear
+                corridor_yaw = block.corridor_yaw
+                if block.action == "replan":
+                    outcome, corridor_yaw = apply_blocked_replan(
+                        self,
+                        ep,
+                        goal=goal,
+                        pose=pose,
+                        path=path,
+                        scan=scan,
+                        local_view=local_view,
+                        nose_clear=nose_clear,
                         path_ahead_cost=path_ahead_cost,
-                        pose_cost=pose_cost,
-                        activate_cost=int(self._local_planner_activate_cost),
-                        nose_clear=nose_clear,
-                        forward_clearance_m=forward_clearance_m,
+                        corridor_yaw=corridor_yaw,
                     )
-                    # Inscribed or lethal map cost at a pose the scan rejected
-                    # is the phantom wall. A clear scan nose is not a block.
-                    if map_untrusted and nose_clear:
-                        local_blocked = False
-                # Reactive avoid spinning with a clear-looking path still means
-                # the robot cannot proceed — escalate to the blocked/replan path.
-                # Exception: path centerline free — a side/corridor phantom
-                # used to force avoid→replan forever while path_cost=0
-                # (live rc21: planning churn). Require real local cost.
-                if (
-                    last_obstacle_state == "avoid"
-                    and reactive_avoid_since is not None
-                    and now - reactive_avoid_since >= 0.8
-                    and self._path_locally_blocked(
-                        path_ahead_cost=path_ahead_cost,
-                        pose_cost=pose_cost,
-                        activate_cost=int(self._local_planner_activate_cost),
-                        nose_clear=nose_clear,
-                        forward_clearance_m=forward_clearance_m,
-                    )
-                ):
-                    local_blocked = True
-                    if local_blocked_since is None:
-                        local_blocked_since = reactive_avoid_since
-                # Also treat "already in lethal" from the follower as blocked so
-                # we enter keep_dwa / replan instead of stalling on a clear path.
-                if last_obstacle_state == "in_lethal":
-                    local_blocked = True
-                    if local_blocked_since is None:
-                        local_blocked_since = now
-                # Front-vs-side policy (not motion classification):
-                # - Recent block: wait (people crossing) — resume if clear.
-                # - After grace, blocked nose → replan; clear nose → DWA peel.
-                wait_before_replan_s = max(
-                    self._recovery_wait_duration_s,
-                    self._replan_local_blocked_time_s,
-                )
-                waiting_for_clear = False
-                # Signed yaw onto a raw-scan corridor, when the nose is blocked
-                # but a nearby heading (toward the goal) is wide enough to drive.
-                corridor_yaw: Optional[float] = None
-                if local_blocked:
-                    if local_blocked_since is None:
-                        local_blocked_since = now
-                    blocked_for = now - local_blocked_since
-                    # Exponential backoff between failed blocked-replans: each
-                    # attempt is a full-map plan, and retrying every 0.5 s
-                    # forever starves the control loop.
-                    cooldown_ready = now - last_local_replan_at >= min(
-                        8.0,
-                        self._replan_local_min_period_s
-                        * (2.0 ** min(blocked_fail_count, 4)),
-                    )
-                    # How long since real motion while peeling with a clear nose.
-                    peel_stuck_s = (
-                        max(0.0, now - last_progress_at)
-                        if nose_clear
-                        else 0.0
-                    )
-                    action = self._local_block_action(
-                        nose_clear=nose_clear,
-                        blocked_for_s=blocked_for,
-                        wait_before_replan_s=wait_before_replan_s,
-                        replan_cooldown_ready=cooldown_ready,
-                        peel_stuck_s=peel_stuck_s,
-                    )
-                    # Contradiction: path centerline free (path_cost low) but we
-                    # still "wait for nose" — freezes forever on phantom/side
-                    # blocks while replan also fails. Prefer DWA peel instead.
-                    if (
-                        action == "wait"
-                        and path_ahead_cost < self._local_planner_activate_cost
-                    ):
-                        action = "keep_dwa"
-                    # Same trap for replan: pathc=0 + nose_clear + failed
-                    # "cannot reach plan start" was a stop/replan death spiral
-                    # (rc21 live). Keep peeling / reverse instead.
-                    if (
-                        action == "replan"
-                        and path_ahead_cost < self._local_planner_activate_cost
-                        and nose_clear
-                    ):
-                        action = "keep_dwa"
-                    # A turn already under way keeps going when the nose reads
-                    # clear partway round. Handing that tick back to pursuit
-                    # turned the robot straight back into the obstacle.
-                    if (
-                        (not nose_clear or corridor_heading is not None)
-                        and not loc_hold_motion
-                        and scan is not None
-                        and self._guard is not None
-                        and blocked_for >= wait_before_replan_s
-                    ):
-                        corridor_yaw = self._corridor_escape_yaw(
-                            pose, scan, goal, path, commit_heading=corridor_heading
-                        )
-                        corridor_heading = (
-                            conv.normalize_angle(pose.theta + corridor_yaw)
-                            if corridor_yaw is not None
-                            else None
-                        )
-                    # An open scan heading is a way through. A global replan
-                    # from the blocked heading only found ~48 m loops and held
-                    # the wheels at zero until the goal timed out. Turn onto
-                    # the corridor first, then plan from there; between
-                    # attempts the corridor is driven.
-                    if corridor_yaw is not None:
-                        if abs(corridor_yaw) < _CORRIDOR_ALIGN_RAD and cooldown_ready:
-                            action = "replan"
-                        elif action == "replan":
-                            action = "wait"
-                    if action == "wait":
-                        waiting_for_clear = True
-                    elif action == "replan":
-                        # Stop only long enough to plan. Paint + forced-via
-                        # kick in so we do not keep accepting the same corridor.
-                        _trig = (
-                            f"local_blocked cost={path_ahead_cost} "
-                            f"nose_clear={nose_clear}"
-                        )
-                        self._stop_before_replan(_trig)
-                        new_path = self._try_replan(
-                            goal,
-                            pose,
-                            path,
-                            scan,
-                            failed_count=max(1, failed_replan_while_blocked),
-                            require_different=failed_replan_while_blocked < 3,
-                            local_view=local_view,
-                            trigger=_trig,
-                        )
-                        # Start cooldown when planning *finishes*. Planning can
-                        # take >2 s; stamping its start with a 0.5 s cooldown
-                        # made the next control tick replan again immediately.
-                        replan_finished = time.monotonic()
-                        last_local_replan_at = replan_finished
-                        last_replan = replan_finished
-                        if new_path is None:
-                            recovered = self._recover_unreachable_start(
-                                goal,
-                                pose,
-                                path,
-                                scan,
-                                failed_count=max(1, failed_replan_while_blocked),
-                                local_view=local_view,
-                                trigger=_trig,
-                            )
-                            if recovered is not None:
-                                new_path = recovered
-                                fresh = self._world.get_pose()
-                                if fresh is not None:
-                                    pose = fresh
-                        if new_path is not None:
-                            path = new_path
-                            local_blocked_since = None
-                            failed_replan_while_blocked = 0
-                            backup_attempts = 0
-                            vx_sign_history.clear()
-                            spin_stuck_since = None
-                            reactive_avoid_since = None
-                            last_obstacle_state = ""
-                            prev_local_cmd = None
-                            local_planner_active = False
-                            prev_cmd = None
-                            rotate_active = False
-                            blocked_fail_count = 0
-                            blocked_fail_dist = None
-                            escape_m.clear_episode()
-                            corridor_yaw = None
-                            corridor_heading = None
-                        else:
-                            failed_replan_while_blocked += 1
-                            blocked_fail_count += 1
-                            if blocked_fail_dist is None:
-                                blocked_fail_dist = distance_m(pose, goal)
-                            # Nav2 BT semantics: bounded retries, then fail —
-                            # not an infinite replan loop in front of a plug.
-                            # An open scan corridor is a way through the
-                            # inflation the planner just refused; yaw or creep
-                            # it instead of failing the goal.
-                            if corridor_yaw is None and self._abort_blocked_replans(
-                                blocked_fail_count, nose_clear=nose_clear
-                            ):
-                                return
-                else:
-                    local_blocked_since = None
-                    failed_replan_while_blocked = 0
-                    escape_m.clear_episode()
-                    corridor_heading = None
-                    self._stuck_pose_refine_used = False
+                    path, pose = outcome.path, outcome.pose
+                    if outcome.abort:
+                        return
 
                 # DWA only when the route is actually blocked (or after a failed
                 # detour). Clear-nose C-space pinch: pursuit + reactive slow —
@@ -2642,7 +2307,7 @@ class NavSupervisor:
                     and not waiting_for_clear
                     and (
                         local_blocked
-                        or failed_replan_while_blocked >= 1
+                        or ep.failed_replan_while_blocked >= 1
                     )
                 )
                 force_local = bool(local_blocked and allow_local_planner)
@@ -2662,34 +2327,34 @@ class NavSupervisor:
                     spin_radius_m=self._spin_radius,
                     min_cmd_vel_x=self._follower.motion.min_linear_mps,
                     min_cmd_vel_theta=self._follower.motion.min_angular_rad_s,
-                    local_planner_active=local_planner_active,
-                    prev_local_cmd=prev_local_cmd,
-                    rotate_active=rotate_active,
-                    prev_cmd=prev_cmd,
+                    local_planner_active=ep.local_planner_active,
+                    prev_local_cmd=ep.prev_local_cmd,
+                    rotate_active=ep.rotate_active,
+                    prev_cmd=ep.prev_cmd,
                     force_local_planner=force_local,
                     guard=self._guard,
                     guard_extra_pts=mem_pts,
                 )
-                rotate_active = bool(progress.get("rotate_to_heading"))
-                local_planner_active = bool(progress.get("local_planner"))
-                if local_planner_active:
-                    prev_local_cmd = cmd
+                ep.rotate_active = bool(progress.get("rotate_to_heading"))
+                ep.local_planner_active = bool(progress.get("local_planner"))
+                if ep.local_planner_active:
+                    ep.prev_local_cmd = cmd
                 else:
-                    prev_local_cmd = None
+                    ep.prev_local_cmd = None
 
                 obs_state = str(progress.get("obstacle") or "")
                 if obs_state == "avoid":
-                    if reactive_avoid_since is None:
-                        reactive_avoid_since = now
+                    if ep.reactive_avoid_since is None:
+                        ep.reactive_avoid_since = now
                 else:
-                    reactive_avoid_since = None
-                last_obstacle_state = obs_state
+                    ep.reactive_avoid_since = None
+                ep.last_obstacle_state = obs_state
                 progress = {
                     **progress,
                     "local_blocked": bool(local_blocked),
                     "path_cost_ahead": int(path_ahead_cost),
                     "pose_cost": int(pose_cost),
-                    "failed_replan_while_blocked": int(failed_replan_while_blocked),
+                    "failed_replan_while_blocked": int(ep.failed_replan_while_blocked),
                     "last_replan_error": self._last_replan_error,
                     "last_replan_trigger": self._last_replan_trigger,
                     "last_replan_info": dict(self._last_replan_info),
@@ -2709,7 +2374,7 @@ class NavSupervisor:
                         max(
                             0.0,
                             self._replan_local_min_period_s
-                            - (time.monotonic() - last_local_replan_at),
+                            - (time.monotonic() - ep.last_local_replan_at),
                         ),
                         2,
                     ),
@@ -2717,7 +2382,7 @@ class NavSupervisor:
                 }
 
                 # Bumper adopt / narrow_reverse bound / wait inject / unstick.
-                escape_pre = escape_m.tick_pre(
+                escape_pre = ep.escape_m.tick_pre(
                     EscapeSense(
                         now=now,
                         pose=pose,
@@ -2725,7 +2390,7 @@ class NavSupervisor:
                         progress=progress,
                         nose_clear=nose_clear,
                         waiting=waiting_for_clear,
-                        failed_replans=failed_replan_while_blocked,
+                        failed_replans=ep.failed_replan_while_blocked,
                         spin_blocked=bool(progress.get("spin_blocked")),
                         heading_open=corridor_yaw is not None,
                         bearing_rad=float(progress.get("bearing_error_rad") or 0.0),
@@ -2742,63 +2407,27 @@ class NavSupervisor:
                         prefer_yaw_sign=(
                             math.copysign(1.0, corridor_yaw)
                             if corridor_yaw is not None
-                            else escape_m.yaw_sign
+                            else ep.escape_m.yaw_sign
                         ),
                     )
                 )
                 if escape_pre.replan_trigger is not None:
-                    trigger = escape_pre.replan_trigger
-                    self._stop_before_replan(trigger)
-                    if trigger == "blocked_nose_unstick":
-                        new_path = self._try_replan(
-                            goal,
-                            pose,
-                            path,
-                            scan,
-                            failed_count=max(1, failed_replan_while_blocked),
-                            require_different=failed_replan_while_blocked < 3,
-                            local_view=local_view,
-                            trigger=trigger,
-                        )
-                    else:
-                        new_path = self._try_replan(
-                            goal,
-                            pose,
-                            path,
-                            scan,
-                            failed_count=failed_replan_while_blocked,
-                            local_view=local_view,
-                            trigger=trigger,
-                        )
-                    replan_finished = time.monotonic()
-                    last_local_replan_at = replan_finished
-                    last_replan = replan_finished
-                    if new_path is not None:
-                        path = new_path
-                        last_progress_at = now
-                        local_blocked_since = None
-                        failed_replan_while_blocked = 0
-                        vx_sign_history.clear()
-                        if trigger == "blocked_nose_unstick":
-                            backup_attempts = 0
-                            spin_stuck_since = None
-                            reactive_avoid_since = None
-                            last_obstacle_state = ""
-                            prev_local_cmd = None
-                            local_planner_active = False
-                            prev_cmd = None
-                            rotate_active = False
-                            blocked_fail_count = 0
-                            blocked_fail_dist = None
-                    elif trigger == "blocked_nose_unstick":
-                        failed_replan_while_blocked += 1
-                        blocked_fail_count += 1
-                        if blocked_fail_dist is None:
-                            blocked_fail_dist = distance_m(pose, goal)
-                        if corridor_yaw is None and self._abort_blocked_replans(
-                            blocked_fail_count, nose_clear=nose_clear
-                        ):
-                            return
+                    outcome = apply_escape_pre_replan(
+                        self,
+                        ep,
+                        goal=goal,
+                        pose=pose,
+                        path=path,
+                        scan=scan,
+                        local_view=local_view,
+                        trigger=escape_pre.replan_trigger,
+                        nose_clear=nose_clear,
+                        corridor_yaw=corridor_yaw,
+                        now=now,
+                    )
+                    path, pose = outcome.path, outcome.pose
+                    if outcome.abort:
+                        return
                     cmd = escape_pre.cmd or DriveCommand(0.0, 0.0, 0.0, False)
                     progress = {
                         **progress,
@@ -2820,152 +2449,52 @@ class NavSupervisor:
                         "cmd_vtheta_rad_s": cmd.vtheta,
                     }
                 if waiting_for_clear:
-                    last_progress_at = now
-                    last_progress_pose = pose
-                    last_progress_dist = distance_m(pose, goal)
-                    last_progress_bearing = float("inf")
+                    ep.last_progress_at = now
+                    ep.last_progress_pose = pose
+                    ep.last_progress_dist = distance_m(pose, goal)
+                    ep.last_progress_bearing = float("inf")
 
-                allow_backup = (
-                    self._backup_enabled
-                    and scan is not None
-                    and local_view is not None
-                    and progress.get("local_planner")
-                    and abs(cmd.vx) < 0.05
-                    and abs(cmd.vtheta) > 0.1
-                    and backup_attempts < self._backup_max_attempts
-                    and now >= backup_cooldown_until
-                    and not waiting_for_clear
-                    and (
-                        not local_blocked
-                        or failed_replan_while_blocked >= 2
-                    )
+                backup = run_backup_recovery(
+                    self,
+                    ep,
+                    now=now,
+                    pose=pose,
+                    goal=goal,
+                    path=path,
+                    scan=scan,
+                    local_view=local_view,
+                    cmd=cmd,
+                    progress=progress,
+                    local_blocked=local_blocked,
+                    waiting_for_clear=waiting_for_clear,
                 )
-
-                if backup_active and backup_start is not None:
-                    backed_m = distance_m(pose, backup_start)
-                    pose_cost = (
-                        footprint_max_cost(
-                            local_view,
-                            pose.x,
-                            pose.y,
-                            robot_radius_m=self._robot_radius,
-                        )
-                        if local_view is not None
-                        else 0
-                    )
-                    rear = (
-                        rear_clearance_m(scan)
-                        if scan is not None
-                        else math.inf
-                    )
-                    worse = (
-                        local_view is not None
-                        and pose_cost > backup_start_cost + 5
-                    )
-                    if (
-                        backed_m >= self._backup_dist_m
-                        or rear < self._backup_rear_clear_m * 0.85
-                        or worse
-                    ):
-                        backup_active = False
-                        backup_start = None
-                        spin_stuck_since = None
-                        backup_cooldown_until = now + self._backup_cooldown_s
-                        self._stop_before_replan("backup_done")
-                        new_path = self._try_replan(
-                            goal,
-                            pose,
-                            path,
-                            scan,
-                            failed_count=failed_replan_while_blocked,
-                            local_view=local_view,
-                            trigger="backup_done",
-                        )
-                        replan_finished = time.monotonic()
-                        last_local_replan_at = replan_finished
-                        last_replan = replan_finished
-                        if new_path is not None:
-                            path = new_path
-                            last_progress_at = now
-                            local_blocked_since = None
-                            failed_replan_while_blocked = 0
-                            backup_attempts = 0
-                            vx_sign_history.clear()
-                        cmd = DriveCommand(0.0, 0.0, 0.0, False)
-                    else:
-                        cmd = DriveCommand(
-                            -self._backup_speed_mps, 0.0, 0.0, False
-                        )
-                        progress = {
-                            **progress,
-                            "local_planner": False,
-                            "obstacle": "backup",
-                            "cmd_vx_mps": cmd.vx,
-                            "cmd_vtheta_rad_s": cmd.vtheta,
-                        }
-                elif allow_backup:
-                    if spin_stuck_since is None:
-                        spin_stuck_since = now
-                    elif now - spin_stuck_since >= self._backup_stuck_time_s:
-                        rear_ok = rear_clearance_m(scan) >= self._backup_rear_clear_m
-                        costmap_ok = reverse_backup_feasible(
-                            local_view,
-                            pose.x,
-                            pose.y,
-                            pose.theta,
-                            robot_radius_m=self._robot_radius,
-                            distance_m=self._backup_dist_m,
-                        )
-                        if rear_ok and costmap_ok:
-                            backup_active = True
-                            backup_start = pose
-                            backup_start_cost = footprint_max_cost(
-                                local_view,
-                                pose.x,
-                                pose.y,
-                                robot_radius_m=self._robot_radius,
-                            )
-                            backup_attempts += 1
-                            spin_stuck_since = None
-                            cmd = DriveCommand(
-                                -self._backup_speed_mps, 0.0, 0.0, False
-                            )
-                            progress = {
-                                **progress,
-                                "local_planner": False,
-                                "obstacle": "backup",
-                                "cmd_vx_mps": cmd.vx,
-                                "cmd_vtheta_rad_s": cmd.vtheta,
-                            }
-                        else:
-                            spin_stuck_since = None
-                else:
-                    spin_stuck_since = None
+                cmd, progress = backup.cmd, dict(backup.progress)
+                path, pose = backup.path, backup.pose
 
                 if abs(cmd.vx) > 0.05:
                     sign = 1 if cmd.vx > 0 else -1
-                    vx_sign_history.append((now, sign))
-                    vx_sign_history = [
-                        (t, s) for t, s in vx_sign_history if now - t <= 3.0
+                    ep.vx_sign_history.append((now, sign))
+                    ep.vx_sign_history = [
+                        (t, s) for t, s in ep.vx_sign_history if now - t <= 3.0
                     ]
                 oscillating = False
-                if len(vx_sign_history) >= 4:
+                if len(ep.vx_sign_history) >= 4:
                     flips = sum(
                         1
-                        for i in range(1, len(vx_sign_history))
-                        if vx_sign_history[i][1] != vx_sign_history[i - 1][1]
+                        for i in range(1, len(ep.vx_sign_history))
+                        if ep.vx_sign_history[i][1] != ep.vx_sign_history[i - 1][1]
                     )
                     oscillating = flips >= 3
 
-                replan_due = now - last_replan >= self._replan_period
+                replan_due = now - ep.last_replan >= self._replan_period
                 map_data = None
                 static_blocked = False
-                pose_jumped = pending_loc_replan
-                if last_tick_pose is not None:
+                pose_jumped = ep.pending_loc_replan
+                if ep.last_tick_pose is not None:
                     pose_jumped = pose_jumped or (
-                        distance_m(pose, last_tick_pose) >= pose_jump_replan_m
+                        distance_m(pose, ep.last_tick_pose) >= ep.pose_jump_replan_m
                     )
-                last_tick_pose = pose
+                ep.last_tick_pose = pose
                 if replan_due or pose_jumped:
                     # Prefer the already-inflated global cache (background thread).
                     # Falling back to path_blocked() rebuilds the full map costmap
@@ -2981,7 +2510,7 @@ class NavSupervisor:
                             path,
                             robot_radius_m=self._robot_radius,
                             from_pose=pose,
-                            ahead_m=path_block_horizon_m,
+                            ahead_m=ep.path_block_horizon_m,
                         )
                     else:
                         map_data = self._world.get_map()
@@ -2993,20 +2522,20 @@ class NavSupervisor:
                             inflation_radius_m=self._inflation,
                             robot_radius_m=self._robot_radius,
                             from_pose=pose,
-                            ahead_m=path_block_horizon_m,
+                            ahead_m=ep.path_block_horizon_m,
                             mapping=self._slam_is_mapping(),
                             keepout_mask=keepout,
                         )
                     # Large localization corrections used to force a replan even
                     # when the polyline was still free — that stop+replan looped
                     # forever under the detour ban (short-flip rejected every
-                    # shorter candidate, pending_loc_replan never cleared).
+                    # shorter candidate, ep.pending_loc_replan never cleared).
                     # Soft loc nudge with a clear path: keep following.
                     if pose_jumped and not static_blocked:
-                        pending_loc_replan = False
+                        ep.pending_loc_replan = False
 
                 backup_exhausted = (
-                    backup_attempts >= self._backup_max_attempts and local_blocked
+                    ep.backup_attempts >= self._backup_max_attempts and local_blocked
                 )
                 # Sign-flip rock (narrow crawl ↔ reverse) with a *blocked* nose
                 # still forces a replan. With a clear nose, the same forward/
@@ -3029,7 +2558,7 @@ class NavSupervisor:
                 # Otherwise replan_due stays true and the expensive static check
                 # (or a full inflate fallback) runs on every subsequent tick.
                 if replan_due and not should_replan:
-                    last_replan = now
+                    ep.last_replan = now
                 if should_replan and self._defer_periodic_replan(
                     static_blocked=static_blocked,
                     nose_clear=nose_clear,
@@ -3042,7 +2571,7 @@ class NavSupervisor:
                     # Keep the controller running. The search this would
                     # start has been returning "no feasible path" and the
                     # stop is the whole stutter.
-                    last_replan = now
+                    ep.last_replan = now
                     self._last_replan_trigger = (
                         "deferred static_blocked; scan can continue"
                     )
@@ -3050,43 +2579,22 @@ class NavSupervisor:
                     # On static/pose-jump recovery, accept any feasible plan —
                     # require_different would reject a valid near-identical route
                     # and count it as "replan failed".
-                    _trig = (
-                        f"periodic static_blocked={static_blocked} "
-                        f"pose_jumped={pose_jumped} "
-                        f"oscillating={oscillating}"
-                    )
-                    self._stop_before_replan(_trig)
-                    new_path = self._try_replan(
-                        goal,
-                        pose,
-                        path,
-                        scan,
-                        require_different=not static_blocked,
-                        failed_count=failed_replan_while_blocked if local_blocked else 0,
+                    outcome = apply_periodic_replan(
+                        self,
+                        ep,
+                        goal=goal,
+                        pose=pose,
+                        path=path,
+                        scan=scan,
                         local_view=local_view,
-                        trigger=_trig,
-                        # Path is actually blocked: do not let the goal-lifetime
-                        # detour ban refuse every shorter escape.
-                        allow_lift_ban=True,
-                        force_lift_short_flip=bool(static_blocked),
+                        local_blocked=local_blocked,
+                        static_blocked=static_blocked,
+                        pose_jumped=pose_jumped,
+                        oscillating=oscillating,
+                        now=now,
                     )
-                    replan_finished = time.monotonic()
-                    last_local_replan_at = replan_finished
-                    last_replan = replan_finished
-                    # Always drop the loc-replan latch — otherwise a failed
-                    # attempt (short-flip / infeasible) stop-replans forever.
-                    pending_loc_replan = False
-                    if new_path is not None:
-                        path = new_path
-                        last_progress_at = now
-                        local_blocked_since = None
-                        failed_replan_while_blocked = 0
-                        failed_static_replan = 0
-                        backup_attempts = 0
-                        vx_sign_history.clear()
-                        spin_stuck_since = None
-                    elif static_blocked:
-                        failed_static_replan += 1
+                    path, pose = outcome.path, outcome.pose
+                    if outcome.abort_msg == "static_replan_fail":
                         clearance = progress.get("forward_clearance_m")
                         has_room = clearance is None or float(clearance) >= 0.35
                         obstacle = str(progress.get("obstacle") or "")
@@ -3099,7 +2607,7 @@ class NavSupervisor:
                         # a mid-route localization jump often fails a few replans
                         # before the map/pose settle.
                         if (
-                            failed_static_replan >= static_replan_fail_limit
+                            ep.failed_static_replan >= ep.static_replan_fail_limit
                             and not lidar_open
                         ):
                             self._world.stop()
@@ -3109,165 +2617,29 @@ class NavSupervisor:
                                 error_msg="replan failed (path blocked)",
                             )
                             return
-                    else:
-                        last_replan = time.monotonic()
 
-                # Final gate: slew-limit against the twist already on the base so
-                # source handoffs (pursuit ↔ DWA ↔ avoid ↔ post-replan resume)
-                # ramp instead of stepping. Status and stall detection below use
-                # the limited command, which is what the base actually gets.
-                # A localization hold still ran avoidance above; the command
-                # that leaves this tick is zero so a latched speed cannot coast.
-                # Applied after the blocked-nose wait, which otherwise relabels
-                # this yaw as "wait" and the inflated spin disc then zeroes it.
-                if corridor_yaw is not None and not loc_hold_motion:
-                    escape_m.yaw_sign = math.copysign(1.0, corridor_yaw)
-                    # A moving pursuit command already closes a sub-3° error.
-                    # Replace it when the opening is off the nose, or when
-                    # the command has already stopped.
-                    if abs(corridor_yaw) >= _CORRIDOR_ALIGN_RAD or cmd.vx < 0.05:
-                        cmd, label = self._corridor_motion(pose, scan, corridor_yaw)
-                        progress = {
-                            **progress,
-                            "obstacle": label,
-                            "local_planner": False,
-                            "corridor_yaw_rad": round(float(corridor_yaw), 3),
-                            "cmd_vx_mps": cmd.vx,
-                            "cmd_vtheta_rad_s": cmd.vtheta,
-                        }
-                if loc_hold_motion:
-                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
-                pre_limit = cmd
-                cmd = self._rate_limited(cmd)
-                if self._guard is not None and not cmd.done:
-                    # Reduce-only veto on whatever is about to go to the base
-                    # (slew-limited pursuit, backup, recovery spins).
-                    veto_pts = guard_pts
-                    if (
-                        progress.get("obstacle") in ("yaw_open", "corridor")
-                        and scan is not None
-                    ):
-                        # Inflation of the blob on the nose fills the spin disc
-                        # even when the rectangle can rotate and then drive.
-                        # Judge this escape against the raw scan.
-                        veto_pts = obstacle_points(
-                            pose,
-                            scan,
-                            None,
-                            radius_m=self._guard.cfg.obstacle_radius_m,
-                        )
-
-                    def _veto(c: DriveCommand):
-                        return self._guard.guard(
-                            pose,
-                            c.vx,
-                            c.vtheta,
-                            veto_pts,
-                            max_dist_m=distance_m(pose, goal),
-                            allow_steer=False,
-                        )
-
-                    def _reduced(c: DriveCommand, v) -> bool:
-                        return abs(v.vx) < abs(c.vx) - 1e-9 or abs(v.vtheta) < abs(
-                            c.vtheta
-                        ) - 1e-9
-
-                    veto = _veto(cmd)
-                    if _reduced(cmd, veto) and abs(pre_limit.vx) > 1e-6:
-                        # The slew limiter ramps ω slower than v, which
-                        # straightens the arc the guard approved — through a
-                        # doorway that clips the jamb. Keep the approved
-                        # curvature at the ramped speed instead.
-                        same_arc = DriveCommand(
-                            cmd.vx,
-                            cmd.vy,
-                            pre_limit.vtheta * (cmd.vx / pre_limit.vx),
-                            cmd.done,
-                        )
-                        arc_veto = _veto(same_arc)
-                        if not _reduced(same_arc, arc_veto):
-                            cmd, veto = same_arc, arc_veto
-                            self._last_sent_cmd = cmd
-                    if _reduced(cmd, veto):
-                        cmd = DriveCommand(veto.vx, cmd.vy, veto.vtheta, cmd.done)
-                        self._last_sent_cmd = cmd
-                    # The veto can leave a crawl the base sanitizer turns into
-                    # a stop. That never ramps, so the bumper stays put. Yaw
-                    # onto the path when the sweep is free; otherwise back up.
-                    if not cmd.done:
-                        escape_post = escape_m.tick_post(
-                            EscapeSense(
-                                now=now,
-                                pose=pose,
-                                cmd=cmd,
-                                progress=progress,
-                                nose_clear=nose_clear,
-                                waiting=waiting_for_clear,
-                                failed_replans=failed_replan_while_blocked,
-                                spin_blocked=bool(progress.get("spin_blocked")),
-                                heading_open=corridor_yaw is not None,
-                                bearing_rad=float(
-                                    progress.get("bearing_error_rad") or 0.0
-                                ),
-                                scan=scan,
-                                local_view=local_view,
-                                guard=self._guard,
-                                guard_pts=guard_pts,
-                                robot_radius_m=self._robot_radius,
-                                spin_radius_m=self._spin_radius,
-                                follower=self._follower,
-                                backup_dist_m=float(self._backup_dist_m),
-                                backup_cooldown_s=float(self._backup_cooldown_s),
-                                loc_hold=loc_hold_motion,
-                                corridor_active=progress.get("obstacle")
-                                in ("yaw_open", "corridor"),
-                                prefer_yaw_sign=escape_m.yaw_sign,
-                            )
-                        )
-                        if escape_post.replan_trigger is not None:
-                            self._stop_before_replan(escape_post.replan_trigger)
-                            new_path = self._try_replan(
-                                goal,
-                                pose,
-                                path,
-                                scan,
-                                failed_count=failed_replan_while_blocked,
-                                local_view=local_view,
-                                trigger=escape_post.replan_trigger,
-                            )
-                            replan_finished = time.monotonic()
-                            last_local_replan_at = replan_finished
-                            last_replan = replan_finished
-                            if new_path is not None:
-                                path = new_path
-                                last_progress_at = now
-                                local_blocked_since = None
-                                failed_replan_while_blocked = 0
-                                vx_sign_history.clear()
-                            cmd = escape_post.cmd or DriveCommand(
-                                0.0, 0.0, 0.0, False
-                            )
-                            self._last_sent_cmd = cmd
-                            progress = {
-                                **progress,
-                                "obstacle": escape_post.obstacle
-                                or "narrow_reverse_done",
-                                "local_planner": False,
-                                "cmd_vx_mps": 0.0,
-                                "cmd_vtheta_rad_s": 0.0,
-                            }
-                        elif escape_post.cmd is not None:
-                            cmd = escape_post.cmd
-                            self._last_sent_cmd = cmd
-                            progress = {
-                                **progress,
-                                "obstacle": escape_post.obstacle
-                                or progress.get("obstacle"),
-                                "local_planner": False,
-                                "cmd_vx_mps": cmd.vx,
-                                "cmd_vtheta_rad_s": cmd.vtheta,
-                            }
-                    near_d, near_x, near_y = self._guard.nearest(pose, guard_pts)
+                # Final gate: corridor → slew-limit → veto → same-arc → tick_post.
+                # Status and stall detection below use the limited command.
+                gate = run_final_gate(
+                    self,
+                    ep,
+                    now=now,
+                    pose=pose,
+                    goal=goal,
+                    path=path,
+                    scan=scan,
+                    local_view=local_view,
+                    guard_pts=guard_pts,
+                    nose_clear=nose_clear,
+                    cmd=cmd,
+                    progress=progress,
+                    corridor_yaw=corridor_yaw,
+                    waiting_for_clear=waiting_for_clear,
+                    loc_hold_motion=loc_hold_motion,
+                )
+                cmd, progress = gate.cmd, dict(gate.progress)
+                path, pose = gate.path, gate.pose
+                if gate.traced:
                     _TRACE.append(
                         {
                             "t": round(time.time(), 3),
@@ -3277,10 +2649,22 @@ class NavSupervisor:
                             "vx": round(cmd.vx, 3),
                             "w": round(cmd.vtheta, 3),
                             "obs": progress.get("obstacle"),
-                            "near_m": round(near_d, 3) if math.isfinite(near_d) else None,
-                            "near_bx": round(near_x, 3) if math.isfinite(near_x) else None,
-                            "near_by": round(near_y, 3) if math.isfinite(near_y) else None,
-                            "pts": int(len(guard_pts)),
+                            "near_m": (
+                                round(gate.near_d, 3)
+                                if math.isfinite(gate.near_d)
+                                else None
+                            ),
+                            "near_bx": (
+                                round(gate.near_x, 3)
+                                if math.isfinite(gate.near_x)
+                                else None
+                            ),
+                            "near_by": (
+                                round(gate.near_y, 3)
+                                if math.isfinite(gate.near_y)
+                                else None
+                            ),
+                            "pts": int(len(guard_pts)) if guard_pts is not None else 0,
                             "mem": int(len(mem_pts)) if mem_pts is not None else 0,
                             "wp": progress.get("waypoint_index"),
                         }
@@ -3389,83 +2773,46 @@ class NavSupervisor:
                 )
 
                 def _mark_progress() -> None:
-                    nonlocal last_progress_pose, last_progress_at
-                    nonlocal last_progress_dist, last_progress_bearing
-                    last_progress_pose = pose
-                    last_progress_at = now
-                    last_progress_dist = dist_goal
-                    last_progress_bearing = bearing_err
+                    ep.last_progress_pose = pose
+                    ep.last_progress_at = now
+                    ep.last_progress_dist = dist_goal
+                    ep.last_progress_bearing = bearing_err
 
                 def _stall_replan_or_fail(error_msg: str) -> bool:
                     """Try replan (incl. forced via). True ⇒ caller should return."""
-                    nonlocal path, last_progress_at, last_progress_dist
-                    nonlocal last_progress_bearing, last_replan
-                    nonlocal last_local_replan_at, local_blocked_since, backup_attempts
-                    nonlocal failed_replan_while_blocked
-                    from .costmap import LETHAL
-
-                    # Clear nose + non-lethal path: C-space pinch / slow crawl.
-                    # Stop-replan cannot help and was failing goals (live rc22:
-                    # stall with pathc=253, nose_clear, local_blocked=false).
-                    if nose_clear and path_ahead_cost < int(LETHAL):
-                        last_progress_at = now
-                        return False
-                    # Nose on the bumper and spin disc blocked: the escape is
-                    # reverse, not another plan of the same free corridor.
-                    if (
-                        not nose_clear
-                        and bool(progress.get("spin_blocked"))
-                        and cmd.vx < -1e-6
-                    ):
-                        return False
-                    _trig = f"stall:{error_msg}"
-                    self._stop_before_replan(_trig)
-                    new_path = self._try_replan(
-                        goal,
-                        pose,
-                        path,
-                        scan,
-                        failed_count=max(2, failed_replan_while_blocked),
+                    nonlocal path
+                    outcome, should_return = apply_stall_replan(
+                        self,
+                        ep,
+                        goal=goal,
+                        pose=pose,
+                        path=path,
+                        scan=scan,
                         local_view=local_view,
-                        trigger=_trig,
-                    )
-                    replan_finished = time.monotonic()
-                    last_local_replan_at = replan_finished
-                    last_replan = replan_finished
-                    if new_path is not None:
-                        path = new_path
-                        last_progress_at = now
-                        last_progress_dist = dist_goal
-                        last_progress_bearing = bearing_err
-                        local_blocked_since = None
-                        failed_replan_while_blocked = 0
-                        backup_attempts = 0
-                        return False
-                    # Still recovering: do not abort while local_blocked and
-                    # we have not exhausted several forced-via attempts.
-                    if local_blocked and failed_replan_while_blocked < 5:
-                        failed_replan_while_blocked += 1
-                        last_progress_at = now
-                        return False
-                    self._world.stop()
-                    self._set_status(
-                        state="failed",
-                        active=False,
+                        local_blocked=local_blocked,
+                        nose_clear=nose_clear,
+                        path_ahead_cost=path_ahead_cost,
+                        dist_goal=dist_goal,
+                        bearing_err=bearing_err,
                         error_msg=error_msg,
+                        now=now,
+                        progress_spin_blocked=bool(progress.get("spin_blocked")),
+                        cmd_vx=float(cmd.vx),
                     )
-                    return True
+                    path = outcome.path
+                    return should_return
 
-                if last_progress_pose is None:
+                if ep.last_progress_pose is None:
                     _mark_progress()
                 else:
-                    moved = distance_m(pose, last_progress_pose)
-                    closing = dist_goal < last_progress_dist - 0.01
+                    moved = distance_m(pose, ep.last_progress_pose)
+                    closing = dist_goal < ep.last_progress_dist - 0.01
                     translating = abs(float(cmd.vx)) >= translating_floor
-                    bearing_improved = bearing_err < last_progress_bearing - math.radians(
+                    bearing_improved = bearing_err < ep.last_progress_bearing - math.radians(
                         3.0
                     )
                     turned = abs(
-                        conv.normalize_angle(pose.theta - last_progress_pose.theta)
+                        conv.normalize_angle(pose.theta - ep.last_progress_pose.theta)
                     )
                     if closing or (
                         moved >= self._follower.motion.stall_progress_m
@@ -3478,7 +2825,7 @@ class NavSupervisor:
                     elif translating:
                         if turned >= self._follower.motion.stall_progress_rad:
                             _mark_progress()
-                        elif now - last_progress_at >= stall_limit_s:
+                        elif now - ep.last_progress_at >= stall_limit_s:
                             if _stall_replan_or_fail("navigation stalled"):
                                 return
                     elif spinning and (
@@ -3486,7 +2833,7 @@ class NavSupervisor:
                         or bearing_improved
                     ):
                         _mark_progress()
-                    elif now - last_progress_at >= stall_limit_s:
+                    elif now - ep.last_progress_at >= stall_limit_s:
                         if _stall_replan_or_fail(
                             "navigation stalled (no forward progress)"
                         ):
@@ -3533,7 +2880,7 @@ class NavSupervisor:
                 # Smoothed speed for the velocity-scaled lookahead (see
                 # ``update_speed_estimate``): raw cmd feedback limit-cycles.
                 self._last_cmd_vx = update_speed_estimate(self._last_cmd_vx, cmd.vx)
-                prev_cmd = cmd
+                ep.prev_cmd = cmd
                 self._sleep_control_period(tick_started)
 
             self._world.stop()
