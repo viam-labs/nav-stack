@@ -20,7 +20,7 @@ from ..nav.simple_motion import (
     spin_clearance_m,
 )
 from ..geom import conversions as conv
-from .base_envelope import CRAWL_FLOOR_MPS, LIN_EPS_MPS
+from .base_envelope import CRAWL_FLOOR_MPS, LIN_EPS_MPS, SPIN_VX_FLOOR_MPS
 from .escape import try_reverse as _try_narrow_reverse
 # Re-exports for tests / older call sites that imported these names here.
 from .escape import rear_open as _rear_open_for_unstick  # noqa: F401
@@ -28,6 +28,7 @@ from .escape import reverse_command as _narrow_reverse_command  # noqa: F401
 from .footprint_guard import FootprintGuard, obstacle_points
 from .local_costmap import LocalCostmapView, reverse_path_clear, spin_disc_blocked
 from .local_planner import LocalPlannerConfig, compute_local_command
+from .thresholds import SPIN_CLEAR_MARGIN_M, TRANSLATE_YAW_CAP_RAD_S
 from .path_utils import closest_point_on_path, signed_crosstrack_m
 from .types import Path2D, Pose2D
 
@@ -145,13 +146,13 @@ def _near_goal_command(
     xy_settle_m = xy_settle_radius_m(xy_tol)
     # Once inside acceptance, prefer final yaw over point-facing RIP so we do
     # not oscillate: face-point → crawl → overshoot → final-yaw → drift → repeat.
-    final_yaw_hand_off_m = max(0.12, min(xy_tol * 0.5, 0.15))
+    final_yaw_hand_off_m = max(SPIN_VX_FLOOR_MPS, min(xy_tol * 0.5, 0.15))
     yaw_cap = min(0.40, motion.max_angular_rad_s)
-    # Keep |vθ| under the sanitizer's 0.25 cut when also translating.
-    translate_yaw_cap = min(yaw_cap, 0.22)
-    # Floor above sanitizer lin_eps (0.05) and the tiny+turn kill (0.12).
-    crawl_floor = 0.12
-    soft_floor = 0.05  # lin_eps; pair with small vθ so soft crawl survives
+    # Keep |vθ| under the sanitizer's SPIN_W_CAP when also translating.
+    translate_yaw_cap = min(yaw_cap, TRANSLATE_YAW_CAP_RAD_S)
+    # Floor above sanitizer lin_eps and the tiny+turn kill (SPIN_VX_FLOOR).
+    crawl_floor = SPIN_VX_FLOOR_MPS
+    soft_floor = LIN_EPS_MPS  # pair with small vθ so soft crawl survives
 
     def _spin_yaw() -> DriveCommand:
         vtheta = _clamp(yaw_err * 0.85, yaw_cap)
@@ -253,7 +254,7 @@ def _effective_lookahead(
     hi = max(cfg.min_lookahead_m, cfg.max_lookahead_m)
     if near_goal:
         return lo
-    if abs(speed_mps) < 0.05:
+    if abs(speed_mps) < LIN_EPS_MPS:
         # Starting / after rotate-to-heading: no speed to scale from.
         return max(lo, min(hi, cfg.lookahead_m))
     return max(lo, min(hi, abs(speed_mps) * cfg.lookahead_time_s))
@@ -770,7 +771,7 @@ def compute_path_command(
             nose_m = max(0.05, float(cfg.obstacle.spin_collision_m))
             if math.isfinite(forward_clearance) and forward_clearance > stop_m:
                 crawl = min(
-                    max(float(cfg.motion.min_linear_mps), 0.12),
+                    max(float(cfg.motion.min_linear_mps), SPIN_VX_FLOOR_MPS),
                     float(cfg.motion.max_linear_mps),
                 )
                 cmd = DriveCommand(crawl, 0.0, 0.0, False)
@@ -840,7 +841,7 @@ def compute_path_command(
     spin_blocked = False
     scan_spin_hit = (
         scan is not None
-        and spin_clearance_m(scan) < spin_radius + 0.05
+        and spin_clearance_m(scan) < spin_radius + SPIN_CLEAR_MARGIN_M
     )
     cost_spin_hit = (
         local_view is not None
@@ -880,14 +881,14 @@ def compute_path_command(
                     obstacle_state = "narrow_reverse"
                 else:
                     crawl = min(
-                        max(float(cfg.motion.min_linear_mps), 0.12),
+                        max(float(cfg.motion.min_linear_mps), SPIN_VX_FLOOR_MPS),
                         float(cfg.motion.max_linear_mps),
                     )
                     cmd = DriveCommand(crawl, 0.0, 0.0, False)
                     obstacle_state = "narrow"
             else:
                 crawl = min(
-                    max(float(cfg.motion.min_linear_mps), 0.12),
+                    max(float(cfg.motion.min_linear_mps), SPIN_VX_FLOOR_MPS),
                     float(cfg.motion.max_linear_mps),
                 )
                 cmd = DriveCommand(crawl, 0.0, 0.0, False)
@@ -922,7 +923,7 @@ def compute_path_command(
                     )
                 if nose_open:
                     crawl = min(
-                        max(float(cfg.motion.min_linear_mps), 0.12),
+                        max(float(cfg.motion.min_linear_mps), SPIN_VX_FLOOR_MPS),
                         float(cfg.motion.max_linear_mps),
                     )
                     cmd = DriveCommand(crawl, 0.0, 0.0, False)
@@ -998,7 +999,7 @@ def compute_path_command(
             )
             if roomy_nose and is_hard(ahead) and int(ahead) < int(LETHAL):
                 crawl = min(
-                    max(float(cfg.motion.min_linear_mps), 0.12),
+                    max(float(cfg.motion.min_linear_mps), SPIN_VX_FLOOR_MPS),
                     float(cfg.motion.max_linear_mps),
                 )
                 cmd = DriveCommand(crawl, 0.0, cmd.vtheta, False)
@@ -1039,7 +1040,7 @@ def compute_path_command(
                         obstacle_state = "narrow_reverse"
                     elif nose_open:
                         crawl = min(
-                            max(float(cfg.motion.min_linear_mps), 0.12),
+                            max(float(cfg.motion.min_linear_mps), SPIN_VX_FLOOR_MPS),
                             float(cfg.motion.max_linear_mps),
                         )
                         cmd = DriveCommand(crawl, 0.0, 0.0, False)

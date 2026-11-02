@@ -5,19 +5,16 @@ Does not call the planner — the supervisor acts on ``action == "replan"``.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..geom import conversions as conv
+from .thresholds import CORRIDOR_ALIGN_RAD
 
 if TYPE_CHECKING:
     from .goal_episode import GoalEpisode
     from .sense_tick import TickContext
     from .supervisor import NavSupervisor
-
-# Match supervisor: a few degrees is closed while a moving pursuit can finish.
-_CORRIDOR_ALIGN_RAD = math.radians(3.0)
 
 
 @dataclass
@@ -103,7 +100,7 @@ def run_block_policy(
             else None
         )
     if tick.corridor_yaw is not None:
-        if abs(tick.corridor_yaw) < _CORRIDOR_ALIGN_RAD and cooldown_ready:
+        if abs(tick.corridor_yaw) < CORRIDOR_ALIGN_RAD and cooldown_ready:
             action = "replan"
         elif action == "replan":
             action = "wait"

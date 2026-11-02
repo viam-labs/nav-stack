@@ -5,10 +5,10 @@ import threading
 from typing import Dict, Optional
 
 from ..config import NavConfig
-from ..geom import conversions as conv
-from .runtime_kwargs import builtin_nav_runtime_kwargs
+from .runtime_kwargs import resolve_nav_cfg
 from .supervisor import NavSupervisor
 from .types import Pose2D
+from ..geom import conversions as conv
 from .world_io import WorldIO
 
 
@@ -25,8 +25,8 @@ class BuiltinNavigator:
     ):
         self._world = world
         self._logger = logger
-        self._kwargs = builtin_nav_runtime_kwargs(nav_cfg, **overrides)
-        self._algorithm = self._kwargs["algorithm"]
+        self._cfg = resolve_nav_cfg(nav_cfg, **overrides)
+        self._algorithm = self._cfg.builtin.planner
         self._lock = threading.Lock()
         self._worker: Optional[threading.Thread] = None
         self._supervisor: Optional[NavSupervisor] = None
@@ -49,7 +49,7 @@ class BuiltinNavigator:
         # Fallback: no-op when no logger is wired.
 
     def _new_supervisor(self) -> NavSupervisor:
-        return NavSupervisor(self._world, **self._kwargs)
+        return NavSupervisor(self._world, self._cfg)
 
     def navigate(self, x: float, y: float, theta: float) -> None:
         """Start following a goal in a background thread (non-blocking)."""

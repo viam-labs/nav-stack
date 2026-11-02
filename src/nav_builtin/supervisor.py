@@ -10,7 +10,7 @@ from collections import deque
 from typing import Any, Optional
 
 from ..config import NavConfig
-from .runtime_kwargs import builtin_nav_runtime_kwargs
+from .runtime_kwargs import resolve_nav_cfg
 from ..nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
@@ -25,13 +25,24 @@ from .controller import (
     limit_twist_rate,
 )
 from .above_cart import AboveCartMemory
-from .base_envelope import lift_sub_deadband
+from .base_envelope import LIN_EPS_MPS, lift_sub_deadband
 from .depth_memory import DepthObstacleMemory
 from .escape import (
     UNSTICK_YAW_RATE as _NOSE_UNSTICK_YAW_RATE,
     blocked_nose_unstick,
     bumper_wants_reverse,
     undrivable_nose,
+)
+from .thresholds import (
+    AHEAD_HALF_WIDTH_PAD_M,
+    BLOCKED_REPLAN_FAIL_LIMIT,
+    CORRIDOR_ALIGN_RAD,
+    CORRIDOR_DRIVE_MPS,
+    CORRIDOR_MAX_YAW_RAD,
+    CORRIDOR_MIN_TRAVEL_M,
+    CORRIDOR_SPIN_RAD,
+    NOSE_STOP_MARGIN_M,
+    YAW_ALIGN_PROGRESS_RAD,
 )
 from .backup_recovery import run_backup_recovery
 from .final_gate import run_final_gate
@@ -66,21 +77,8 @@ from .types import NavStatus, Path2D, PlanResult, Pose2D
 from .world_io import WorldIO
 
 
-_BLOCKED_REPLAN_FAIL_LIMIT = 8
 # Nose-unstick yaw budget/rate live in ``escape`` (_NOSE_UNSTICK_* aliases).
-# Nose blocked, but some heading within 90° has a clear body-width corridor
-# on the raw scan. Prefer the path heading: the straight-line goal can sit
-# behind the obstacle while the route is open the other way.
-# Nav2 regulated pure pursuit only rotates in place above
-# rotate_to_heading_min_angle (~45°). A few degrees is closed while
-# translating. In-place only once the opening is far enough that a creep
-# would sweep the nose across the wall; a touching nose still spins,
-# because that arc is what the footprint guard zeroes.
-_CORRIDOR_ALIGN_RAD = math.radians(3.0)
-_CORRIDOR_SPIN_RAD = math.radians(20.0)
-_CORRIDOR_MIN_TRAVEL_M = 0.8
-_CORRIDOR_MAX_YAW_RAD = math.radians(90.0)
-_CORRIDOR_DRIVE_MPS = 0.15
+# Corridor / yaw-align / blocked-replan policy numbers live in ``thresholds``.
 
 # Last ~60 s of guarded control ticks (20 Hz), kept across goals so a graze
 # can be inspected after the operator cancels (``get_trace`` DoCommand).
@@ -93,11 +91,6 @@ def recent_trace(seconds: float = 30.0) -> list:
         return []
     cutoff = entries[-1]["t"] - max(0.0, float(seconds))
     return [e for e in entries if e["t"] >= cutoff]
-
-
-# Heading error must fall by this much to count the final spin as still working.
-# Smaller than yaw tolerance so jitter does not refresh the give-up clock.
-_YAW_ALIGN_PROGRESS_RAD = math.radians(6.0)
 
 
 def yaw_align_give_up(
@@ -115,7 +108,7 @@ def yaw_align_give_up(
     """
     if best_err is None or progress_at is None:
         return False, yaw_err_abs, now
-    if yaw_err_abs < best_err - _YAW_ALIGN_PROGRESS_RAD:
+    if yaw_err_abs < best_err - YAW_ALIGN_PROGRESS_RAD:
         best_err = yaw_err_abs
         progress_at = now
     stalled = timeout_s > 0.0 and (now - progress_at) >= timeout_s
@@ -131,110 +124,12 @@ class NavSupervisor:
         nav_cfg: Optional[NavConfig] = None,
         **overrides: Any,
     ):
-        kw = builtin_nav_runtime_kwargs(nav_cfg, **overrides)
-        inflation_radius_m = kw["inflation_radius_m"]
-        robot_radius_m = kw["robot_radius_m"]
-        spin_radius_m = kw["spin_radius_m"]
-        nose_offset_m = kw["nose_offset_m"]
-        wheel_half_track_m = kw["wheel_half_track_m"]
-        cost_scaling_factor = kw["cost_scaling_factor"]
-        clearance_preference_m = kw["clearance_preference_m"]
-        algorithm = kw["algorithm"]
-        replan_period_s = kw["replan_period_s"]
-        lookahead_m = kw["lookahead_m"]
-        min_lookahead_m = kw["min_lookahead_m"]
-        max_lookahead_m = kw["max_lookahead_m"]
-        approach_dist_m = kw["approach_dist_m"]
-        xy_tolerance_m = kw["xy_tolerance_m"]
-        yaw_tolerance_rad = kw["yaw_tolerance_rad"]
-        max_vel_x = kw["max_vel_x"]
-        max_vel_theta = kw["max_vel_theta"]
-        min_cmd_vel_x = kw["min_cmd_vel_x"]
-        min_cmd_vel_theta = kw["min_cmd_vel_theta"]
-        timeout_s = kw["timeout_s"]
-        poll_interval_s = kw["poll_interval_s"]
-        avoid_obstacles = kw["avoid_obstacles"]
-        stop_distance_m = kw["stop_distance_m"]
-        slow_distance_m = kw["slow_distance_m"]
-        scan_max_age_s = kw["scan_max_age_s"]
-        smooth_path = kw["smooth_path"]
-        smooth_sample_spacing_m = kw["smooth_sample_spacing_m"]
-        local_costmap_enabled = kw["local_costmap_enabled"]
-        local_costmap_width_m = kw["local_costmap_width_m"]
-        local_costmap_height_m = kw["local_costmap_height_m"]
-        local_costmap_resolution = kw["local_costmap_resolution"]
-        local_inflation_radius_m = kw["local_inflation_radius_m"]
-        local_costmap_rate_hz = kw["local_costmap_rate_hz"]
-        local_planner_enabled = kw["local_planner_enabled"]
-        local_planner_sim_time_s = kw["local_planner_sim_time_s"]
-        local_planner_activate_cost = kw["local_planner_activate_cost"]
-        local_planner_max_vel_x_mps = kw["local_planner_max_vel_x_mps"]
-        local_planner_max_vel_x_reverse_m = kw["local_planner_max_vel_x_reverse_m"]
-        backup_enabled = kw["backup_enabled"]
-        backup_stuck_time_s = kw["backup_stuck_time_s"]
-        backup_dist_m = kw["backup_dist_m"]
-        backup_speed_mps = kw["backup_speed_mps"]
-        backup_rear_clear_m = kw["backup_rear_clear_m"]
-        backup_max_attempts = kw["backup_max_attempts"]
-        backup_cooldown_s = kw["backup_cooldown_s"]
-        recovery_wait_duration_s = kw["recovery_wait_duration_s"]
-        replan_local_blocked_time_s = kw["replan_local_blocked_time_s"]
-        replan_local_min_period_s = kw["replan_local_min_period_s"]
-        replan_max_early_detour_ratio = kw["replan_max_early_detour_ratio"]
-        replan_allow_long_detour_after_fails = kw[
-            "replan_allow_long_detour_after_fails"
-        ]
-        detour_short_flip_budget = kw["detour_short_flip_budget"]
-        drive_timeout_streak = kw["drive_timeout_streak"]
-        yaw_align_timeout_s = kw["yaw_align_timeout_s"]
-        max_goal_snap_m = kw["max_goal_snap_m"]
-        max_linear_accel_mps2 = kw["max_linear_accel_mps2"]
-        max_linear_decel_mps2 = kw["max_linear_decel_mps2"]
-        max_angular_accel_rad_s2 = kw["max_angular_accel_rad_s2"]
-        self._nav_loc_refine = bool(kw.get("nav_loc_refine_on_disagree", True))
-        self._nav_loc_refine_margin_m = max(
-            0.1, float(kw.get("nav_loc_refine_margin_m", 0.8))
-        )
-        self._nav_loc_refine_map_max_m = max(
-            0.3, float(kw.get("nav_loc_refine_map_max_m", 2.5))
-        )
-        self._nav_loc_refine_lidar_min_m = max(
-            0.2, float(kw.get("nav_loc_refine_lidar_min_m", 1.2))
-        )
-        self._nav_loc_refine_min_frac = min(
-            1.0, max(0.05, float(kw.get("nav_loc_refine_min_frac", 0.22)))
-        )
-        self._nav_loc_refine_min_beams = max(
-            1, int(kw.get("nav_loc_refine_min_beams", 6))
-        )
-        self._nav_loc_refine_max_tries = max(
-            1, int(kw.get("nav_loc_refine_max_tries", 2))
-        )
-        self._nav_loc_refine_cooldown_s = max(
-            0.0, float(kw.get("nav_loc_refine_cooldown_s", 5.0))
-        )
-        self._nav_loc_refine_period_s = max(
-            0.0, float(kw.get("nav_loc_refine_period_s", 0.75))
-        )
-        self._nav_loc_refine_check_every_m = max(
-            0.0, float(kw.get("nav_loc_refine_check_every_m", 2.0))
-        )
-        self._nav_loc_refine_retry_travel_m = max(
-            self._nav_loc_refine_check_every_m,
-            float(kw.get("nav_loc_refine_retry_travel_m", 8.0)),
-        )
-        self._nav_loc_refine_apply_max_m = max(
-            0.2, float(kw.get("nav_loc_refine_apply_max_m", 1.0))
-        )
-        self._nav_loc_refine_apply_max_deg = max(
-            5.0, float(kw.get("nav_loc_refine_apply_max_deg", 30.0))
-        )
-        self._nav_loc_refine_apply_min_score = min(
-            1.0, max(0.0, float(kw.get("nav_loc_refine_apply_min_score", 0.35)))
-        )
-        self._nav_loc_refine_settle_s = max(
-            0.0, float(kw.get("nav_loc_refine_settle_s", 0.35))
-        )
+        # footprint_guard is supervisor-only; strip before resolve.
+        footprint_guard = bool(overrides.pop("footprint_guard", True))
+        self._cfg = resolve_nav_cfg(nav_cfg, **overrides)
+        cfg = self._cfg
+        b = cfg.builtin
+
         self._loc_refine_tries = 0
         self._loc_refine_cooldown_until = 0.0
         self._loc_refine_last_check = 0.0
@@ -264,118 +159,60 @@ class NavSupervisor:
         self._loc_probe_calm = False
         self._loc_verdict = None
         self._world = world
-        self._inflation = inflation_radius_m
-        # Driving clearance (half-width when a footprint is configured). Every
-        # costmap / path / footprint check uses this.
-        self._robot_radius = robot_radius_m
-        # Physical body (no clearance). Defaults to the hard radius so callers
-        # that only override robot_radius_m keep a single-ring costmap.
-        self._body_radius = min(
-            max(0.0, float(kw.get("body_radius_m", robot_radius_m))),
-            float(robot_radius_m),
-        )
-        # Rotation clearance (half-diagonal): what the body sweeps turning in
-        # place. Larger than _robot_radius on a non-square robot, so it gates
-        # spins without sealing gaps the robot can drive through.
-        self._spin_radius = max(
-            float(robot_radius_m),
-            float(spin_radius_m) if spin_radius_m else float(robot_radius_m),
-        )
-        # Centre-to-bumper distance for the forward stop bubble.
-        nose_offset = (
-            float(nose_offset_m) if nose_offset_m else float(robot_radius_m)
-        )
-        half_track = (
-            float(wheel_half_track_m)
-            if wheel_half_track_m
-            else 0.6 * float(robot_radius_m)
-        )
-        # Rectangular collision guard: exact body (half-length = nose offset,
-        # half-width = body radius); clearance_m sets the keep-out padding.
+
+        nose_offset = cfg.nose_offset_m()
+        half_track = cfg.wheel_half_track_m()
+        robot_radius_m = cfg.hard_clearance_radius_m()
+        body_radius_m = cfg.inscribed_radius_m()
+
+        # Rectangular collision guard: exact body; clearance_m sets keep-out pad.
         self._guard: Optional[FootprintGuard] = None
-        if bool(kw.get("footprint_guard", True)):
-            clearance = max(0.0, float(robot_radius_m) - float(self._body_radius))
+        if footprint_guard:
+            clearance = max(0.0, float(robot_radius_m) - float(body_radius_m))
             self._guard = FootprintGuard(
                 GuardConfig(
                     length_m=2.0 * nose_offset,
-                    width_m=2.0 * float(self._body_radius),
+                    width_m=2.0 * float(body_radius_m),
                     padding_m=min(max(clearance, 0.04), 0.15),
                 )
             )
         self._depth_memory = DepthObstacleMemory(
-            length_m=2.0 * nose_offset, width_m=2.0 * float(self._body_radius)
+            length_m=2.0 * nose_offset, width_m=2.0 * float(body_radius_m)
         )
-        self._avoid_above = bool(kw.get("avoid_obstacles_above_cart", True))
-        raw_height = kw.get("cart_height_m")
-        try:
-            self._cart_height_m = float(raw_height) if raw_height else 0.0
-        except (TypeError, ValueError):
-            self._cart_height_m = 0.0
         self._above_memory: Optional[AboveCartMemory] = None
-        if self._avoid_above:
-            # No cart height: the depth camera's own band, up to z_max.
+        if cfg.avoid_obstacles_above_cart:
+            cart_h = float(cfg.cart_height_m) if cfg.cart_height_m else 0.0
             self._above_memory = AboveCartMemory(
-                cart_height_m=self._cart_height_m if self._cart_height_m > 0.0 else None
+                cart_height_m=cart_h if cart_h > 0.0 else None
             )
         setter = getattr(self._world, "set_above_cart", None)
         if callable(setter):
+            cart_h = float(cfg.cart_height_m) if cfg.cart_height_m else 0.0
             setter(
                 self._above_memory is not None,
-                self._cart_height_m if self._cart_height_m > 0.0 else None,
+                cart_h if cart_h > 0.0 else None,
             )
-        self._cost_scaling = cost_scaling_factor
-        self._clearance_preference_m = max(0.0, float(clearance_preference_m))
-        self._yaw_align_timeout_s = max(0.0, float(yaw_align_timeout_s))
-        self._max_goal_snap_m = max(0.0, float(max_goal_snap_m))
-        self._algorithm = algorithm
-        self._replan_period = replan_period_s
-        self._timeout_s = timeout_s
-        self._max_vel_x = max(0.05, float(max_vel_x))
-        self._scan_max_age = scan_max_age_s
-        self._smooth_path = smooth_path
-        self._smooth_spacing = smooth_sample_spacing_m
-        self._local_costmap_enabled = local_costmap_enabled
-        self._drive_timeout_streak = max(1, int(drive_timeout_streak))
+
         self._local_planner = LocalPlannerConfig(
-            enabled=local_planner_enabled,
-            sim_time_s=local_planner_sim_time_s,
-            activate_cost_threshold=local_planner_activate_cost,
-            max_detour_forward_mps=local_planner_max_vel_x_mps,
-            max_vel_x_reverse_m=local_planner_max_vel_x_reverse_m,
+            enabled=b.local_planner_enabled,
+            sim_time_s=b.local_planner_sim_time_s,
+            activate_cost_threshold=b.local_planner_activate_cost,
+            max_detour_forward_mps=b.local_planner_max_vel_x_mps,
+            max_vel_x_reverse_m=b.local_planner_max_vel_x_reverse_m,
         )
-        self._backup_enabled = backup_enabled
-        self._backup_stuck_time_s = backup_stuck_time_s
-        self._backup_dist_m = backup_dist_m
-        self._backup_speed_mps = backup_speed_mps
-        self._backup_rear_clear_m = backup_rear_clear_m
-        self._backup_max_attempts = max(0, int(backup_max_attempts))
-        self._backup_cooldown_s = backup_cooldown_s
-        self._recovery_wait_duration_s = max(0.0, float(recovery_wait_duration_s))
-        self._replan_local_blocked_time_s = max(0.0, float(replan_local_blocked_time_s))
-        self._replan_local_min_period_s = max(
-            0.1, float(replan_local_min_period_s)
-        )
-        self._replan_max_early_detour_ratio = max(
-            1.0, float(replan_max_early_detour_ratio)
-        )
-        self._replan_allow_long_detour_after_fails = max(
-            0, int(replan_allow_long_detour_after_fails)
-        )
-        self._detour_short_flip_budget = max(0, int(detour_short_flip_budget))
-        self._local_planner_activate_cost = local_planner_activate_cost
         self._local_costmap = (
             LocalCostmap(
                 LocalCostmapConfig(
-                    width_m=local_costmap_width_m,
-                    height_m=local_costmap_height_m,
-                    resolution=local_costmap_resolution,
-                    inflation_radius_m=local_inflation_radius_m,
+                    width_m=b.local_costmap_width_m,
+                    height_m=b.local_costmap_height_m,
+                    resolution=b.local_costmap_resolution,
+                    inflation_radius_m=cfg.effective_local_inflation_radius_m(),
                     robot_radius_m=robot_radius_m,
-                    body_radius_m=self._body_radius,
-                    cost_scaling_factor=cost_scaling_factor,
+                    body_radius_m=body_radius_m,
+                    cost_scaling_factor=b.cost_scaling_factor,
                 )
             )
-            if local_costmap_enabled
+            if b.local_costmap_enabled
             else None
         )
         # Cached global costmap for local window. Full-map inflate is expensive;
@@ -390,9 +227,8 @@ class NavSupervisor:
         self._local_view_cache = None
         self._local_view_at = 0.0
         # Independent of control rate — lidar ~10 Hz; 5 Hz local is enough for DWA.
-        rate = max(0.5, float(local_costmap_rate_hz))
-        self._local_update_period_s = 1.0 / rate
-        self._local_scan_max_age_s = min(float(scan_max_age_s), 0.5)
+        self._local_update_period_s = 1.0 / float(b.local_costmap_rate_hz)
+        self._local_scan_max_age_s = min(float(cfg.simple_scan_max_age), 0.5)
         self._global_cache_period_s = 1.0
         self._local_costmap_updates = 0
         self._global_costmap_rebuilds = 0
@@ -419,57 +255,255 @@ class NavSupervisor:
         self._detour_ban_path: Optional[Path2D] = None
         self._detour_min_length_m = 0.0
         self._detour_short_ratio = 0.75
-        self._detour_short_flips_left = self._detour_short_flip_budget
+        self._detour_short_flips_left = b.detour_short_flip_budget
         self._io_timeout_streak = 0
         # Control-loop soak metrics (wall-clock tick vs configured period).
         self._control_ticks = 0
         self._control_overruns = 0
         self._control_tick_last_s: Optional[float] = None
         self._control_tick_ema_s: Optional[float] = None
-        self._control_period_s = max(1e-3, float(poll_interval_s))
+        self._control_period_s = max(1e-3, float(cfg.control_period_s()))
+
+        stop_m = max(float(cfg.simple_stop_distance), nose_offset + NOSE_STOP_MARGIN_M)
         self._follower = FollowerConfig(
-            lookahead_m=lookahead_m,
-            min_lookahead_m=min_lookahead_m,
-            max_lookahead_m=max_lookahead_m,
-            approach_dist_m=approach_dist_m,
-            waypoint_tolerance_m=max(0.1, xy_tolerance_m),
+            lookahead_m=b.lookahead_m,
+            min_lookahead_m=b.min_lookahead_m,
+            max_lookahead_m=b.max_lookahead_m,
+            approach_dist_m=b.approach_dist_m,
+            waypoint_tolerance_m=max(0.1, b.xy_goal_tolerance),
             # Keeps translating arcs above the base's inner-wheel "nearly 0 RPM"
             # rejection. From the footprint width when configured, else ≈0.6·r.
             wheel_half_track_m=max(0.08, half_track),
-            max_linear_accel_mps2=max(0.05, float(max_linear_accel_mps2)),
-            max_linear_decel_mps2=max(0.05, float(max_linear_decel_mps2)),
-            max_angular_accel_rad_s2=max(0.1, float(max_angular_accel_rad_s2)),
+            max_linear_accel_mps2=b.max_linear_accel_mps2,
+            max_linear_decel_mps2=b.max_linear_decel_mps2,
+            max_angular_accel_rad_s2=b.max_angular_accel_rad_s2,
             motion=SimpleMotionConfig(
-                poll_interval_s=poll_interval_s,
-                xy_tolerance_m=xy_tolerance_m,
-                yaw_tolerance_rad=yaw_tolerance_rad,
-                default_linear_mps=max_vel_x,
-                max_linear_mps=max_vel_x,
-                max_angular_rad_s=max_vel_theta,
-                min_linear_mps=min_cmd_vel_x,
-                min_angular_rad_s=min_cmd_vel_theta,
-                timeout_s=timeout_s,
+                poll_interval_s=cfg.control_period_s(),
+                xy_tolerance_m=b.xy_goal_tolerance,
+                yaw_tolerance_rad=b.yaw_goal_tolerance,
+                default_linear_mps=cfg.max_linear_velocity,
+                max_linear_mps=cfg.max_linear_velocity,
+                max_angular_rad_s=cfg.max_vel_theta,
+                min_linear_mps=cfg.min_cmd_vel_x,
+                min_angular_rad_s=cfg.min_cmd_vel_theta,
+                timeout_s=b.timeout_s,
             ),
             obstacle=ObstacleConfig(
-                enabled=avoid_obstacles,
+                enabled=cfg.simple_avoid_obstacles,
                 # Lidar stop must clear the bumper, which is a half-*length* out
                 # from the centre — not a half-diagonal disc, which stopped a
                 # 0.72 m robot 0.5 m short of everything.
-                stop_distance_m=max(float(stop_distance_m), nose_offset + 0.05),
+                stop_distance_m=stop_m,
                 slow_distance_m=max(
-                    float(slow_distance_m),
-                    max(float(stop_distance_m), nose_offset + 0.05) + 0.35,
+                    float(cfg.simple_slow_distance),
+                    stop_m + 0.35,
                 ),
                 # Anything inside the body's swept corridor counts as "ahead" —
                 # the ±35° cone alone let shoulder-side bins slide past.
                 # Padding beyond the inscribed radius covers light shoulder
                 # grazes (half-width + ~12 cm) without sealing every doorway.
-                footprint_half_width_m=float(robot_radius_m) + 0.12,
-                max_age_s=scan_max_age_s,
+                footprint_half_width_m=float(robot_radius_m) + AHEAD_HALF_WIDTH_PAD_M,
+                max_age_s=cfg.simple_scan_max_age,
             )
-            if avoid_obstacles
+            if cfg.simple_avoid_obstacles
             else ObstacleConfig(enabled=False),
         )
+
+    # -- Config accessors (read ``self._cfg``; no kwargs copy) ----------------
+    @property
+    def _inflation(self) -> float:
+        return self._cfg.effective_inflation_radius_m()
+
+    @property
+    def _robot_radius(self) -> float:
+        return self._cfg.hard_clearance_radius_m()
+
+    @property
+    def _body_radius(self) -> float:
+        return self._cfg.inscribed_radius_m()
+
+    @property
+    def _spin_radius(self) -> float:
+        return max(
+            self._cfg.hard_clearance_radius_m(),
+            self._cfg.circumscribed_radius_m(),
+        )
+
+    @property
+    def _cost_scaling(self) -> float:
+        return self._cfg.builtin.cost_scaling_factor
+
+    @property
+    def _clearance_preference_m(self) -> float:
+        return self._cfg.builtin.clearance_preference_m
+
+    @property
+    def _yaw_align_timeout_s(self) -> float:
+        return self._cfg.builtin.yaw_align_timeout_s
+
+    @property
+    def _max_goal_snap_m(self) -> float:
+        return self._cfg.builtin.max_goal_snap_m
+
+    @property
+    def _algorithm(self) -> str:
+        return self._cfg.builtin.planner
+
+    @property
+    def _replan_period(self) -> float:
+        return self._cfg.builtin.replan_period_s
+
+    @property
+    def _timeout_s(self) -> float:
+        return self._cfg.builtin.timeout_s
+
+    @property
+    def _max_vel_x(self) -> float:
+        return self._cfg.max_linear_velocity
+
+    @property
+    def _scan_max_age(self) -> float:
+        return self._cfg.simple_scan_max_age
+
+    @property
+    def _smooth_path(self) -> bool:
+        return self._cfg.builtin.smooth_path
+
+    @property
+    def _smooth_spacing(self) -> float:
+        return self._cfg.builtin.smooth_sample_spacing_m
+
+    @property
+    def _local_costmap_enabled(self) -> bool:
+        return self._cfg.builtin.local_costmap_enabled
+
+    @property
+    def _drive_timeout_streak(self) -> int:
+        return self._cfg.builtin.drive_timeout_streak
+
+    @property
+    def _backup_enabled(self) -> bool:
+        return self._cfg.builtin.backup_enabled
+
+    @property
+    def _backup_stuck_time_s(self) -> float:
+        return self._cfg.builtin.backup_stuck_time_s
+
+    @property
+    def _backup_dist_m(self) -> float:
+        return self._cfg.builtin.backup_dist_m
+
+    @property
+    def _backup_speed_mps(self) -> float:
+        return self._cfg.builtin.backup_speed_mps
+
+    @property
+    def _backup_rear_clear_m(self) -> float:
+        return self._cfg.builtin.backup_rear_clear_m
+
+    @property
+    def _backup_max_attempts(self) -> int:
+        return self._cfg.builtin.backup_max_attempts
+
+    @property
+    def _backup_cooldown_s(self) -> float:
+        return self._cfg.builtin.backup_cooldown_s
+
+    @property
+    def _recovery_wait_duration_s(self) -> float:
+        return self._cfg.builtin.recovery_wait_duration_s
+
+    @property
+    def _replan_local_blocked_time_s(self) -> float:
+        return self._cfg.builtin.replan_local_blocked_time_s
+
+    @property
+    def _replan_local_min_period_s(self) -> float:
+        return self._cfg.builtin.replan_local_min_period_s
+
+    @property
+    def _replan_max_early_detour_ratio(self) -> float:
+        return self._cfg.builtin.replan_max_early_detour_ratio
+
+    @property
+    def _replan_allow_long_detour_after_fails(self) -> int:
+        return self._cfg.builtin.replan_allow_long_detour_after_fails
+
+    @property
+    def _detour_short_flip_budget(self) -> int:
+        return self._cfg.builtin.detour_short_flip_budget
+
+    @property
+    def _local_planner_activate_cost(self) -> int:
+        return self._cfg.builtin.local_planner_activate_cost
+
+    @property
+    def _avoid_above(self) -> bool:
+        return self._cfg.avoid_obstacles_above_cart
+
+    @property
+    def _cart_height_m(self) -> float:
+        return float(self._cfg.cart_height_m) if self._cfg.cart_height_m else 0.0
+
+    @property
+    def _nav_loc_refine(self) -> bool:
+        return self._cfg.builtin.nav_loc_refine_on_disagree
+
+    @property
+    def _nav_loc_refine_margin_m(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_margin_m
+
+    @property
+    def _nav_loc_refine_map_max_m(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_map_max_m
+
+    @property
+    def _nav_loc_refine_lidar_min_m(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_lidar_min_m
+
+    @property
+    def _nav_loc_refine_min_frac(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_min_frac
+
+    @property
+    def _nav_loc_refine_min_beams(self) -> int:
+        return self._cfg.builtin.nav_loc_refine_min_beams
+
+    @property
+    def _nav_loc_refine_max_tries(self) -> int:
+        return self._cfg.builtin.nav_loc_refine_max_tries
+
+    @property
+    def _nav_loc_refine_cooldown_s(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_cooldown_s
+
+    @property
+    def _nav_loc_refine_period_s(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_period_s
+
+    @property
+    def _nav_loc_refine_check_every_m(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_check_every_m
+
+    @property
+    def _nav_loc_refine_retry_travel_m(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_retry_travel_m
+
+    @property
+    def _nav_loc_refine_apply_max_m(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_apply_max_m
+
+    @property
+    def _nav_loc_refine_apply_max_deg(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_apply_max_deg
+
+    @property
+    def _nav_loc_refine_apply_min_score(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_apply_min_score
+
+    @property
+    def _nav_loc_refine_settle_s(self) -> float:
+        return self._cfg.builtin.nav_loc_refine_settle_s
 
     @property
     def cancel_event(self) -> threading.Event:
@@ -1492,7 +1526,7 @@ class NavSupervisor:
         corridor is picked, ``commit_heading`` (its map heading) is preferred
         while it stays open.
 
-        None when no heading within 90° of the nose has ``_CORRIDOR_MIN_TRAVEL_M``
+        None when no heading within 90° of the nose has ``CORRIDOR_MIN_TRAVEL_M``
         of body-width clearance, or the rectangle cannot spin onto it. Uses
         raw returns, so inflated costmap cells cannot veto a geometrically
         clear turn.
@@ -1512,8 +1546,8 @@ class NavSupervisor:
             half_length_m=guard._hl,
             half_width_m=guard._hw + guard.cfg.padding_m,
             prefer_rad=bearing,
-            min_travel_m=_CORRIDOR_MIN_TRAVEL_M,
-            max_yaw_rad=_CORRIDOR_MAX_YAW_RAD,
+            min_travel_m=CORRIDOR_MIN_TRAVEL_M,
+            max_yaw_rad=CORRIDOR_MAX_YAW_RAD,
         )
         if yaw is None or abs(yaw) < 1e-3:
             return yaw
@@ -1573,12 +1607,12 @@ class NavSupervisor:
         """
         sign = math.copysign(1.0, yaw if abs(yaw) > 1e-6 else 1.0)
         spin = DriveCommand(0.0, 0.0, sign * _NOSE_UNSTICK_YAW_RATE, False)
-        if abs(yaw) < _CORRIDOR_ALIGN_RAD:
-            return DriveCommand(_CORRIDOR_DRIVE_MPS, 0.0, 0.0, False), "corridor"
-        if abs(yaw) >= _CORRIDOR_SPIN_RAD:
+        if abs(yaw) < CORRIDOR_ALIGN_RAD:
+            return DriveCommand(CORRIDOR_DRIVE_MPS, 0.0, 0.0, False), "corridor"
+        if abs(yaw) >= CORRIDOR_SPIN_RAD:
             return spin, "yaw_open"
         w = math.copysign(min(0.35, max(0.12, abs(yaw) / 0.5)), yaw)
-        arc = DriveCommand(_CORRIDOR_DRIVE_MPS, 0.0, w, False)
+        arc = DriveCommand(CORRIDOR_DRIVE_MPS, 0.0, w, False)
         guard = self._guard
         if guard is None or scan is None:
             return arc, "corridor"
@@ -1588,7 +1622,7 @@ class NavSupervisor:
         free = guard.free_distance(
             pose, arc.vx, arc.vtheta, pts, guard.cfg.horizon_m
         )
-        if guard._regulate(arc.vx, free) >= 0.05:
+        if guard._regulate(arc.vx, free) >= LIN_EPS_MPS:
             return arc, "corridor"
         return spin, "yaw_open"
 
@@ -1672,7 +1706,7 @@ class NavSupervisor:
 
     def _abort_blocked_replans(self, count: int, *, nose_clear: bool) -> bool:
         """Fail the goal once blocked-nose replans are exhausted."""
-        if count < _BLOCKED_REPLAN_FAIL_LIMIT or nose_clear:
+        if count < BLOCKED_REPLAN_FAIL_LIMIT or nose_clear:
             return False
         self._world.stop()
         with self._status_lock:

@@ -10,16 +10,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..nav.simple_motion import DriveCommand, distance_m
+from .base_envelope import LIN_EPS_MPS
 from .footprint_guard import obstacle_points
 from .replan_controller import apply_escape_post_replan
+from .thresholds import CORRIDOR_ALIGN_RAD
 
 if TYPE_CHECKING:
     from .goal_episode import GoalEpisode
     from .sense_tick import TickContext
     from .supervisor import NavSupervisor
-
-# Match supervisor: a few degrees is closed while a moving pursuit can finish.
-_CORRIDOR_ALIGN_RAD = math.radians(3.0)
 
 
 @dataclass
@@ -47,7 +46,7 @@ def run_final_gate(
 
     if corridor_yaw is not None and not tick.loc_hold_motion:
         ep.escape_m.yaw_sign = math.copysign(1.0, corridor_yaw)
-        if abs(corridor_yaw) >= _CORRIDOR_ALIGN_RAD or cmd.vx < 0.05:
+        if abs(corridor_yaw) >= CORRIDOR_ALIGN_RAD or cmd.vx < LIN_EPS_MPS:
             cmd, label = nav._corridor_motion(  # noqa: SLF001
                 tick.pose, tick.scan, corridor_yaw
             )

@@ -558,16 +558,14 @@ def test_supervisor_wires_footprint_derived_clearances():
             "robot_radius": 0.45,
             "footprint_width_m": 0.59,
             "footprint_length_m": 0.72,
+            "clearance_m": 0.0,
             "simple_stop_distance": 0.4,
         }
     )
+    # Pass the dataclass; derived clearances come from footprint methods.
     sup = NavSupervisor(
         _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map()),
-        robot_radius_m=cfg.inscribed_radius_m(),
-        spin_radius_m=cfg.circumscribed_radius_m(),
-        nose_offset_m=cfg.nose_offset_m(),
-        wheel_half_track_m=cfg.wheel_half_track_m(),
-        stop_distance_m=cfg.simple_stop_distance,
+        cfg,
     )
     assert sup._robot_radius == pytest.approx(0.295)
     assert sup._spin_radius == pytest.approx(0.4654, abs=0.001)

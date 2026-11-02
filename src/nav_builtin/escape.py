@@ -18,6 +18,13 @@ from typing import Any, Mapping, Optional, TYPE_CHECKING
 from ..geom import conversions as conv
 from ..nav.simple_motion import DriveCommand, rear_clearance_m
 from .local_costmap import LocalCostmapView, reverse_path_clear
+from .thresholds import (
+    REAR_CLEAR_FLOOR_M,
+    REAR_CLEAR_PAST_BODY_M,
+    RECTANGLE_REAR_MIN_FREE_M,
+    SPIN_CLEAR_MARGIN_M,
+    UNSTICK_REVERSE_NUDGE_M,
+)
 from .types import Pose2D
 
 if TYPE_CHECKING:
@@ -60,7 +67,9 @@ def rear_open(
     if scan is None:
         return False
     rear = rear_clearance_m(scan)
-    rear_need = max(0.25, float(robot_radius_m) + 0.08)
+    rear_need = max(
+        REAR_CLEAR_FLOOR_M, float(robot_radius_m) + REAR_CLEAR_PAST_BODY_M
+    )
     if math.isfinite(rear) and rear < rear_need:
         return False
     if local_view is not None:
@@ -82,7 +91,7 @@ def rectangle_rear_open(
     pts,
     *,
     distance_m: float,
-    min_free_m: float = 0.12,
+    min_free_m: float = RECTANGLE_REAR_MIN_FREE_M,
 ) -> bool:
     """True when the rectangle can back ``distance_m`` on raw obstacle points.
 
@@ -108,7 +117,13 @@ def reverse_clear(
     """Rectangle-first, cone/costmap-second rear clear for an escape reverse."""
     need = max(0.35, float(backup_dist_m))
     if guard is not None and guard_pts is not None:
-        if rectangle_rear_open(guard, pose, guard_pts, distance_m=need, min_free_m=0.12):
+        if rectangle_rear_open(
+            guard,
+            pose,
+            guard_pts,
+            distance_m=need,
+            min_free_m=RECTANGLE_REAR_MIN_FREE_M,
+        ):
             return True
     return rear_open(
         scan,
@@ -295,8 +310,7 @@ IDLE = "idle"
 MODE_REVERSE = "reverse"
 MODE_TURN = "turn"
 
-# Small reverse that counts as "we moved" before preferring a turn instead.
-_UNSTICK_REVERSE_NUDGE_M = 0.05
+# Small yaw that counts as turn progress (kept local — not a shared threshold).
 _UNSTICK_TURN_NUDGE_RAD = 0.2
 
 
@@ -398,7 +412,7 @@ class EscapeMachine:
                 sense.pose,
                 sense.guard_pts,
                 distance_m=remain_m,
-                min_free_m=min(remain_m, 0.12),
+                min_free_m=min(remain_m, RECTANGLE_REAR_MIN_FREE_M),
             )
         return rear_open(
             sense.scan,
@@ -416,7 +430,10 @@ class EscapeMachine:
         from ..nav.simple_motion import spin_clearance_m
         from .local_costmap import spin_disc_blocked
 
-        clear = spin_clearance_m(sense.scan) >= sense.spin_radius_m + 0.05
+        clear = (
+            spin_clearance_m(sense.scan)
+            >= sense.spin_radius_m + SPIN_CLEAR_MARGIN_M
+        )
         if (
             clear
             and sense.spin_radius_m > sense.robot_radius_m
@@ -457,7 +474,9 @@ class EscapeMachine:
         from ..nav.simple_motion import distance_m
 
         backed = distance_m(sense.pose, self.start)
-        remain = max(0.12, float(sense.backup_dist_m) - backed)
+        remain = max(
+            RECTANGLE_REAR_MIN_FREE_M, float(sense.backup_dist_m) - backed
+        )
         if backed >= sense.backup_dist_m or not self._rear_still_open(sense, remain):
             return self._finish(sense)
         cmd = reverse_command(sense.follower)
@@ -654,7 +673,7 @@ class EscapeMachine:
                 sense.pose,
                 sense.guard_pts,
                 distance_m=max(0.35, sense.backup_dist_m),
-                min_free_m=0.05,
+                min_free_m=UNSTICK_REVERSE_NUDGE_M,
             )
         choice = undrivable_nose(
             nose_clear=sense.nose_clear,
