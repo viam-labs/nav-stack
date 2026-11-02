@@ -26,6 +26,12 @@ from typing import Optional, Tuple
 import numpy as np
 
 from ..geom import conversions as conv
+from .base_envelope import (
+    ANG_EPS_RAD_S as BASE_ANG_EPS_RAD_S,
+    LIN_EPS_MPS as BASE_LIN_EPS_MPS,
+    keep_arc_inside_envelope,
+    twist_reaches_base,
+)
 from .costmap import LETHAL
 from .types import Pose2D
 
@@ -59,9 +65,10 @@ class GuardConfig:
     alt_min_free_m: float = 0.20
     alt_max_curvature: float = 2.5
     alt_samples: int = 21
-    # Base sanitizer: vx < 0.12 with |w| > 0.25 becomes a pure spin.
-    base_spin_vx_floor: float = 0.125
-    base_spin_w_cap: float = 0.25
+    # Base sanitizer: vx < SPIN_VX_FLOOR with |w| > SPIN_W_CAP becomes a spin.
+    # Defaults come from ``base_envelope`` so every layer agrees.
+    base_spin_vx_floor: float = 0.125  # CRAWL_FLOOR_MPS
+    base_spin_w_cap: float = 0.25  # SPIN_W_CAP_RAD_S
 
 
 @dataclass
@@ -71,17 +78,6 @@ class GuardResult:
     state: str  # clear | slow | steer | rotate | blocked
     free_m: float
     rotation_blocked: bool
-
-
-# Match ``ViamWorldIO._sanitize_base_cmd``. A slower twist is sent as a full
-# stop, so reporting it as "slow" parks the cart against the bumper.
-BASE_LIN_EPS_MPS = 0.05
-BASE_ANG_EPS_RAD_S = 0.08
-
-
-def twist_reaches_base(vx: float, vtheta: float) -> bool:
-    """False when the base driver will drop both axes."""
-    return abs(vx) >= BASE_LIN_EPS_MPS or abs(vtheta) >= BASE_ANG_EPS_RAD_S
 
 
 def open_corridor_yaw(
@@ -379,10 +375,9 @@ class FootprintGuard:
 
     def _drivable(self, v: float, w: float) -> Tuple[float, float]:
         """Keep an arc that the base sanitizer will not turn into a spin."""
-        cfg = self.cfg
-        if 0.0 < abs(v) < cfg.base_spin_vx_floor and abs(w) > cfg.base_spin_w_cap:
-            w = math.copysign(cfg.base_spin_w_cap, w)
-        return v, w
+        return keep_arc_inside_envelope(
+            v, w, spin_vx_floor=self.cfg.base_spin_vx_floor
+        )
 
     def guard(
         self,

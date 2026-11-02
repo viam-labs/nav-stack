@@ -18,7 +18,6 @@ from ..nav.simple_motion import (
     cone_min_range,
     distance_m,
     rear_clearance_m,
-    spin_clearance_m,
 )
 from ..nav.zones import apply_speed_zone_limit
 from ..geom import conversions as conv
@@ -30,7 +29,16 @@ from .controller import (
     update_speed_estimate,
 )
 from .above_cart import AboveCartMemory, above_cart_frames
+from .base_envelope import lift_sub_deadband
 from .depth_memory import DepthObstacleMemory, depth_frames
+from .escape import (
+    UNSTICK_YAW_RATE as _NOSE_UNSTICK_YAW_RATE,
+    EscapeMachine,
+    EscapeSense,
+    blocked_nose_unstick,
+    bumper_wants_reverse,
+    undrivable_nose,
+)
 from .footprint_guard import (
     FootprintGuard,
     GuardConfig,
@@ -42,8 +50,6 @@ from .local_costmap import (
     LocalCostmapConfig,
     footprint_max_cost,
     reverse_backup_feasible,
-    reverse_path_clear,
-    spin_disc_blocked,
 )
 from .local_planner import LocalPlannerConfig
 from .planner import (
@@ -60,10 +66,7 @@ from .world_io import WorldIO
 
 
 _BLOCKED_REPLAN_FAIL_LIMIT = 8
-# After a blocked-nose replan fails, turn this far (then replan) when the
-# rear is not open. ~46° is enough to face a different corridor.
-_NOSE_UNSTICK_YAW_RAD = 0.8
-_NOSE_UNSTICK_YAW_RATE = 0.45
+# Nose-unstick yaw budget/rate live in ``escape`` (_NOSE_UNSTICK_* aliases).
 # Nose blocked, but some heading within 90° has a clear body-width corridor
 # on the raw scan. Prefer the path heading: the straight-line goal can sit
 # behind the obstacle while the route is open the other way.
@@ -657,53 +660,16 @@ class NavSupervisor:
     def _lift_sub_deadband(
         self, cmd: DriveCommand, forward_clearance_m: Optional[float] = None
     ) -> DriveCommand:
-        """Make a nonzero twist survive ``_sanitize_base_cmd``.
-
-        A reverse of a few cm/s is what the cart was publishing while
-        ``last_drive`` stayed zero. Raise that reverse to the backup speed.
-        A tiny forward command into a blocked nose is a stop, not a crawl.
-        A forward arc whose yaw the base will drop is a straight drive into
-        the bumper — turn in place instead.
-        """
-        from .footprint_guard import (
-            BASE_ANG_EPS_RAD_S,
-            BASE_LIN_EPS_MPS,
-            twist_reaches_base,
+        """Make a nonzero twist survive ``sanitize_base_cmd`` (shared envelope)."""
+        guard = getattr(self, "_guard", None)
+        body_len = guard.cfg.length_m if guard is not None else None
+        lifted = lift_sub_deadband(
+            cmd,
+            forward_clearance_m=forward_clearance_m,
+            body_length_m=body_len,
         )
-
-        if (
-            not cmd.done
-            and cmd.vx > BASE_LIN_EPS_MPS
-            and 0.0 < abs(cmd.vtheta) < BASE_ANG_EPS_RAD_S
-            and self._guard is not None
-            and forward_clearance_m is not None
-            and forward_clearance_m
-            <= self._guard.cfg.length_m / 2.0 + 0.08
-        ):
-            lifted = DriveCommand(
-                0.0, 0.0, math.copysign(0.4, cmd.vtheta), False
-            )
+        if lifted is not cmd:
             self._last_sent_cmd = lifted
-            return lifted
-
-        if cmd.done or twist_reaches_base(cmd.vx, cmd.vtheta):
-            return cmd
-        if abs(cmd.vx) < 1e-6 and abs(cmd.vtheta) < 1e-6:
-            return cmd
-        if cmd.vx > 1e-6:
-            lifted = DriveCommand(0.0, 0.0, 0.0, False)
-        elif cmd.vx < -1e-6:
-            lifted = DriveCommand(
-                -max(0.10, abs(cmd.vx), BASE_LIN_EPS_MPS), 0.0, 0.0, False
-            )
-        else:
-            lifted = DriveCommand(
-                0.0,
-                0.0,
-                math.copysign(max(BASE_ANG_EPS_RAD_S, abs(cmd.vtheta)), cmd.vtheta),
-                False,
-            )
-        self._last_sent_cmd = lifted
         return lifted
 
     def _apply_speed_zone(self, pose: Pose2D, cmd: DriveCommand) -> DriveCommand:
@@ -1499,23 +1465,14 @@ class NavSupervisor:
         spin_clear: bool,
         heading_open: bool = False,
     ) -> str:
-        """Motion while a blocked nose waits out the replan cooldown.
-
-        ``hold`` for the first wait, so a person crossing can still move.
-        After a replan fails: turn toward a heading the rectangle can drive
-        when ``heading_open`` (raw scan, not the inflated spin disc).
-        Otherwise ``reverse`` when the rear is open, else ``turn`` when an
-        in-place spin would not sweep an obstacle.
-        """
-        if nose_clear or int(failed_replans) < 1:
-            return "hold"
-        if heading_open:
-            return "turn"
-        if rear_open:
-            return "reverse"
-        if spin_clear:
-            return "turn"
-        return "hold"
+        """Motion while a blocked nose waits out the replan cooldown."""
+        return blocked_nose_unstick(
+            failed_replans=failed_replans,
+            nose_clear=nose_clear,
+            rear_open=rear_open,
+            spin_clear=spin_clear,
+            heading_open=heading_open,
+        )
 
     def _corridor_escape_yaw(
         self,
@@ -1681,18 +1638,13 @@ class NavSupervisor:
         cmd_vtheta: float,
         rear_open: bool,
     ) -> bool:
-        """Back up when the bumper is against an obstacle and a spin would hit it.
-
-        The path centerline can still be cheap. The footprint guard will not
-        reverse, so the cart sits at cmd 0 an inch off the obstacle with open
-        space behind it.
-        """
-        return (
-            not nose_clear
-            and bool(spin_blocked)
-            and abs(float(cmd_vx)) < 1e-6
-            and abs(float(cmd_vtheta)) < 1e-6
-            and bool(rear_open)
+        """Back up when the bumper is against an obstacle and a spin would hit it."""
+        return bumper_wants_reverse(
+            nose_clear=nose_clear,
+            spin_blocked=spin_blocked,
+            cmd_vx=cmd_vx,
+            cmd_vtheta=cmd_vtheta,
+            rear_open=rear_open,
         )
 
     @staticmethod
@@ -1706,23 +1658,16 @@ class NavSupervisor:
         spin_clear: bool,
         bearing_rad: float,
     ) -> Optional[str]:
-        """Motion when the only forward command would be dropped by the base.
-
-        ``turn`` when a yaw toward the path is clear. ``reverse`` when the
-        rectangle can back off the bumper. ``None`` while a person-crossing
-        wait is still in its grace, or when neither escape is open.
-        """
-        from .footprint_guard import twist_reaches_base
-
-        if nose_clear or waiting or twist_reaches_base(vx, vtheta):
-            return None
-        if spin_clear and abs(float(bearing_rad)) >= math.radians(12.0):
-            return "turn"
-        if rear_open:
-            return "reverse"
-        if spin_clear:
-            return "turn"
-        return None
+        """Motion when the only forward command would be dropped by the base."""
+        return undrivable_nose(
+            nose_clear=nose_clear,
+            waiting=waiting,
+            vx=vx,
+            vtheta=vtheta,
+            rear_open=rear_open,
+            spin_clear=spin_clear,
+            bearing_rad=bearing_rad,
+        )
 
     def _abort_blocked_replans(self, count: int, *, nose_clear: bool) -> bool:
         """Fail the goal once blocked-nose replans are exhausted."""
@@ -2174,20 +2119,8 @@ class NavSupervisor:
             backup_start_cost = 0
             backup_attempts = 0
             backup_cooldown_until = 0.0
-            # Controller ``narrow_reverse`` is per-tick; bound it like backup so
-            # we reverse ~backup_dist then replan instead of driving forever.
-            narrow_rev_start: Optional[Pose2D] = None
-            narrow_rev_cooldown_until = 0.0
-            # Sub-deadband forward crawl (base drops it). Reverse or yaw from
-            # these poses, then replan — don't reset them when the guard
-            # reports "slow" again next tick.
-            deadband_rev_start: Optional[Pose2D] = None
-            deadband_turn_start: Optional[Pose2D] = None
-            # Blocked-nose unstick between replans: one reverse or turn, then
-            # a replan from the pose that motion reached.
-            nose_unstick_start: Optional[Pose2D] = None
-            nose_unstick_mode = ""
-            nose_unstick_yaw_sign = 1.0
+            # Bumper / wait-unstick / undrivable / narrow_reverse bound.
+            escape_m = EscapeMachine()
             # Map heading of the scan corridor picked for this blocked
             # episode. Two openings nearly tied either side of a centred
             # obstacle swapped winners every tick and the spin dithered.
@@ -2677,8 +2610,7 @@ class NavSupervisor:
                             rotate_active = False
                             blocked_fail_count = 0
                             blocked_fail_dist = None
-                            nose_unstick_start = None
-                            nose_unstick_mode = ""
+                            escape_m.clear_episode()
                             corridor_yaw = None
                             corridor_heading = None
                         else:
@@ -2698,8 +2630,7 @@ class NavSupervisor:
                 else:
                     local_blocked_since = None
                     failed_replan_while_blocked = 0
-                    nose_unstick_start = None
-                    nose_unstick_mode = ""
+                    escape_m.clear_episode()
                     corridor_heading = None
                     self._stuck_pose_refine_used = False
 
@@ -2785,298 +2716,40 @@ class NavSupervisor:
                     "distance_remaining_m": distance_m(pose, goal),
                 }
 
-                # Bumper against an obstacle, path itself still free: the
-                # footprint guard will not reverse, and the blocked-nose wait
-                # never starts because path cost is low. Spin is blocked, so
-                # back up when the rectangle itself can move backward. The
-                # rear lidar cone and the inflated costmap both treat the
-                # blob an inch ahead as occupying the reverse, which left
-                # this case at cmd 0 with obstacle "avoid".
-                if (
-                    now >= narrow_rev_cooldown_until
-                    and self._bumper_spin_reverse(
+                # Bumper adopt / narrow_reverse bound / wait inject / unstick.
+                escape_pre = escape_m.tick_pre(
+                    EscapeSense(
+                        now=now,
+                        pose=pose,
+                        cmd=cmd,
+                        progress=progress,
                         nose_clear=nose_clear,
+                        waiting=waiting_for_clear,
+                        failed_replans=failed_replan_while_blocked,
                         spin_blocked=bool(progress.get("spin_blocked")),
-                        cmd_vx=cmd.vx,
-                        cmd_vtheta=cmd.vtheta,
-                        rear_open=True,
+                        heading_open=corridor_yaw is not None,
+                        bearing_rad=float(progress.get("bearing_error_rad") or 0.0),
+                        scan=scan,
+                        local_view=local_view,
+                        guard=self._guard,
+                        guard_pts=guard_pts,
+                        robot_radius_m=self._robot_radius,
+                        spin_radius_m=self._spin_radius,
+                        follower=self._follower,
+                        backup_dist_m=float(self._backup_dist_m),
+                        backup_cooldown_s=float(self._backup_cooldown_s),
+                        loc_hold=loc_hold_motion,
+                        prefer_yaw_sign=(
+                            math.copysign(1.0, corridor_yaw)
+                            if corridor_yaw is not None
+                            else escape_m.yaw_sign
+                        ),
                     )
-                ):
-                    from .controller import _narrow_reverse_command, _try_narrow_reverse
-
-                    back_free = 0.0
-                    if self._guard is not None and guard_pts is not None:
-                        back_free = self._guard.free_distance(
-                            pose,
-                            -0.15,
-                            0.0,
-                            guard_pts,
-                            max(0.35, float(self._backup_dist_m)),
-                        )
-                    rectangle_clear = (
-                        not math.isfinite(back_free) or back_free >= 0.12
-                    )
-                    cone_clear = False
-                    if (
-                        not rectangle_clear
-                        and scan is not None
-                        and local_view is not None
-                    ):
-                        cone_clear = (
-                            _try_narrow_reverse(
-                                self._follower,
-                                scan,
-                                self._robot_radius,
-                                local_view=local_view,
-                                current=pose,
-                            )
-                            is not None
-                        )
-                    if rectangle_clear or cone_clear:
-                        cmd = _narrow_reverse_command(self._follower)
-                        progress = {
-                            **progress,
-                            "obstacle": "narrow_reverse",
-                            "local_planner": False,
-                            "cmd_vx_mps": cmd.vx,
-                            "cmd_vtheta_rad_s": 0.0,
-                        }
-
-                # Bound per-tick ``narrow_reverse``: reverse ~backup_dist, then
-                # replan. Without this the controller reverses forever while the
-                # spin disc stays occupied (rc16 nearly backed into a wall).
-                obs_state = str(progress.get("obstacle") or "")
-                if now < narrow_rev_cooldown_until and obs_state == "narrow_reverse":
-                    cmd = DriveCommand(0.0, 0.0, 0.0, False)
-                    progress = {
-                        **progress,
-                        "obstacle": "narrow_reverse_hold",
-                        "local_planner": False,
-                        "cmd_vx_mps": 0.0,
-                        "cmd_vtheta_rad_s": 0.0,
-                    }
-                    narrow_rev_start = None
-                elif obs_state == "narrow_reverse" and cmd.vx < -1e-6:
-                    if narrow_rev_start is None:
-                        narrow_rev_start = pose
-                    backed_m = distance_m(pose, narrow_rev_start)
-                    remain = max(0.12, float(self._backup_dist_m) - backed_m)
-                    rear_cost_ok = True
-                    if local_view is not None:
-                        rear_cost_ok = reverse_path_clear(
-                            local_view,
-                            pose.x,
-                            pose.y,
-                            pose.theta,
-                            robot_radius_m=self._robot_radius,
-                            distance_m=remain,
-                            ignore_ahead=True,
-                        )
-                    # Inflation of the blob on the nose reaches backward
-                    # through the body and fails the costmap check while the
-                    # rectangle still has room to back away from it.
-                    if (
-                        not rear_cost_ok
-                        and self._guard is not None
-                        and guard_pts is not None
-                    ):
-                        back_free = self._guard.free_distance(
-                            pose, -0.15, 0.0, guard_pts, remain
-                        )
-                        rear_cost_ok = (
-                            not math.isfinite(back_free)
-                            or back_free >= min(remain, 0.12)
-                        )
-                    if backed_m >= self._backup_dist_m or not rear_cost_ok:
-                        narrow_rev_start = None
-                        narrow_rev_cooldown_until = now + max(
-                            1.5, float(self._backup_cooldown_s)
-                        )
-                        self._stop_before_replan("narrow_reverse_done")
-                        new_path = self._try_replan(
-                            goal,
-                            pose,
-                            path,
-                            scan,
-                            failed_count=failed_replan_while_blocked,
-                            local_view=local_view,
-                            trigger="narrow_reverse_done",
-                        )
-                        replan_finished = time.monotonic()
-                        last_local_replan_at = replan_finished
-                        last_replan = replan_finished
-                        if new_path is not None:
-                            path = new_path
-                            last_progress_at = now
-                            local_blocked_since = None
-                            failed_replan_while_blocked = 0
-                            vx_sign_history.clear()
-                        cmd = DriveCommand(0.0, 0.0, 0.0, False)
-                        progress = {
-                            **progress,
-                            "obstacle": "narrow_reverse_done",
-                            "local_planner": False,
-                            "cmd_vx_mps": 0.0,
-                            "cmd_vtheta_rad_s": 0.0,
-                        }
-                else:
-                    narrow_rev_start = None
-
-                if waiting_for_clear:
-                    # Freeze forward motion for dynamic crossers, but keep a
-                    # spin-blocked reverse crawl (otherwise avoid→spin_block→
-                    # wait deadlocks with cmd stuck at zero). Still allow
-                    # rotate-to-heading when that is the only command.
-                    #
-                    # If the follower did not already reverse (fused phantom
-                    # nose held it), inject reverse when spin is blocked —
-                    # wait must not contradict the spin-gate escape.
-                    if (
-                        abs(cmd.vx) < 1e-6
-                        and abs(cmd.vtheta) < 1e-6
-                        and (
-                            bool(progress.get("spin_blocked"))
-                            or progress.get("obstacle") == "in_lethal"
-                        )
-                        and local_view is not None
-                    ):
-                        from .controller import _try_narrow_reverse
-
-                        # Same fused scan as nose_clear. Forward depth does
-                        # not invent rear hits; body-near phantoms are filtered.
-                        rev_scan = scan
-                        if rev_scan is not None:
-                            rev = _try_narrow_reverse(
-                                self._follower,
-                                rev_scan,
-                                self._robot_radius,
-                                local_view=local_view,
-                                current=pose,
-                            )
-                            if rev is not None:
-                                cmd = rev
-                    # After a blocked-nose replan fails, the cooldown wait
-                    # used to sit at cmd 0 until the next attempt. Back up
-                    # when the rear is open, otherwise turn when the spin
-                    # disc is clear, then replan from that new pose.
-                    unstick_done = False
-                    if (
-                        not nose_clear
-                        and failed_replan_while_blocked >= 1
-                        and scan is not None
-                        and local_view is not None
-                        and abs(cmd.vx) < 1e-6
-                        and abs(cmd.vtheta) < 1e-6
-                    ):
-                        from .controller import _try_narrow_reverse
-
-                        rev = _try_narrow_reverse(
-                            self._follower,
-                            scan,
-                            self._robot_radius,
-                            local_view=local_view,
-                            current=pose,
-                        )
-                        spin_clear = spin_clearance_m(scan) >= self._spin_radius + 0.05
-                        if (
-                            spin_clear
-                            and self._spin_radius > self._robot_radius
-                            and spin_disc_blocked(
-                                local_view,
-                                pose.x,
-                                pose.y,
-                                spin_radius_m=self._spin_radius,
-                                inscribed_radius_m=self._robot_radius,
-                            )
-                        ):
-                            spin_clear = False
-                        choice = self._blocked_nose_unstick(
-                            failed_replans=failed_replan_while_blocked,
-                            nose_clear=nose_clear,
-                            rear_open=rev is not None,
-                            spin_clear=spin_clear,
-                            heading_open=corridor_yaw is not None,
-                        )
-                        if choice == "reverse" and rev is not None:
-                            if nose_unstick_mode != "reverse":
-                                nose_unstick_start = pose
-                                nose_unstick_mode = "reverse"
-                            cmd = rev
-                        elif choice == "turn":
-                            backed = (
-                                distance_m(pose, nose_unstick_start)
-                                if nose_unstick_mode == "reverse"
-                                and nose_unstick_start is not None
-                                else 0.0
-                            )
-                            if backed >= 0.05:
-                                unstick_done = True
-                            else:
-                                if nose_unstick_mode != "turn":
-                                    nose_unstick_start = pose
-                                    nose_unstick_mode = "turn"
-                                cmd = DriveCommand(
-                                    0.0,
-                                    0.0,
-                                    nose_unstick_yaw_sign * _NOSE_UNSTICK_YAW_RATE,
-                                    False,
-                                )
-                        elif nose_unstick_start is not None:
-                            moved = False
-                            if nose_unstick_mode == "reverse":
-                                moved = (
-                                    distance_m(pose, nose_unstick_start) >= 0.05
-                                )
-                            elif nose_unstick_mode == "turn":
-                                moved = (
-                                    abs(
-                                        conv.normalize_angle(
-                                            pose.theta - nose_unstick_start.theta
-                                        )
-                                    )
-                                    >= 0.2
-                                )
-                            if moved:
-                                unstick_done = True
-                            else:
-                                nose_unstick_start = None
-                                nose_unstick_mode = ""
-                    if (
-                        not nose_clear
-                        and failed_replan_while_blocked >= 1
-                        and cmd.vx < -1e-6
-                        and nose_unstick_mode not in ("reverse", "turn")
-                    ):
-                        nose_unstick_start = pose
-                        nose_unstick_mode = "reverse"
-                    if (
-                        not unstick_done
-                        and nose_unstick_start is not None
-                        and nose_unstick_mode == "reverse"
-                        and cmd.vx < -1e-6
-                    ):
-                        if (
-                            distance_m(pose, nose_unstick_start)
-                            >= self._backup_dist_m
-                        ):
-                            unstick_done = True
-                    elif (
-                        not unstick_done
-                        and nose_unstick_start is not None
-                        and nose_unstick_mode == "turn"
-                        and abs(cmd.vtheta) > 1e-6
-                    ):
-                        if (
-                            abs(
-                                conv.normalize_angle(
-                                    pose.theta - nose_unstick_start.theta
-                                )
-                            )
-                            >= _NOSE_UNSTICK_YAW_RAD
-                        ):
-                            unstick_done = True
-                    if unstick_done:
-                        self._stop_before_replan("blocked_nose_unstick")
+                )
+                if escape_pre.replan_trigger is not None:
+                    trigger = escape_pre.replan_trigger
+                    self._stop_before_replan(trigger)
+                    if trigger == "blocked_nose_unstick":
                         new_path = self._try_replan(
                             goal,
                             pose,
@@ -3085,19 +2758,29 @@ class NavSupervisor:
                             failed_count=max(1, failed_replan_while_blocked),
                             require_different=failed_replan_while_blocked < 3,
                             local_view=local_view,
-                            trigger="blocked_nose_unstick",
+                            trigger=trigger,
                         )
-                        replan_finished = time.monotonic()
-                        last_local_replan_at = replan_finished
-                        last_replan = replan_finished
-                        nose_unstick_start = None
-                        nose_unstick_mode = ""
-                        if new_path is not None:
-                            path = new_path
-                            local_blocked_since = None
-                            failed_replan_while_blocked = 0
+                    else:
+                        new_path = self._try_replan(
+                            goal,
+                            pose,
+                            path,
+                            scan,
+                            failed_count=failed_replan_while_blocked,
+                            local_view=local_view,
+                            trigger=trigger,
+                        )
+                    replan_finished = time.monotonic()
+                    last_local_replan_at = replan_finished
+                    last_replan = replan_finished
+                    if new_path is not None:
+                        path = new_path
+                        last_progress_at = now
+                        local_blocked_since = None
+                        failed_replan_while_blocked = 0
+                        vx_sign_history.clear()
+                        if trigger == "blocked_nose_unstick":
                             backup_attempts = 0
-                            vx_sign_history.clear()
                             spin_stuck_since = None
                             reactive_avoid_since = None
                             last_obstacle_state = ""
@@ -3107,61 +2790,36 @@ class NavSupervisor:
                             rotate_active = False
                             blocked_fail_count = 0
                             blocked_fail_dist = None
-                        else:
-                            failed_replan_while_blocked += 1
-                            blocked_fail_count += 1
-                            if blocked_fail_dist is None:
-                                blocked_fail_dist = distance_m(pose, goal)
-                            if corridor_yaw is None and self._abort_blocked_replans(
-                                blocked_fail_count, nose_clear=nose_clear
-                            ):
-                                return
-                        cmd = DriveCommand(0.0, 0.0, 0.0, False)
-                        progress = {
-                            **progress,
-                            "obstacle": "planning",
-                            "local_planner": False,
-                            "nose_unstick": None,
-                            "cmd_vx_mps": 0.0,
-                            "cmd_vtheta_rad_s": 0.0,
-                        }
-                    elif cmd.vx < -1e-6 and abs(cmd.vtheta) < 1e-6:
-                        progress = {
-                            **progress,
-                            "obstacle": "wait_reverse",
-                            "local_planner": False,
-                            "nose_unstick": nose_unstick_mode or None,
-                            "cmd_vx_mps": cmd.vx,
-                            "cmd_vtheta_rad_s": 0.0,
-                        }
-                    elif (
-                        nose_unstick_mode == "turn" and abs(cmd.vtheta) > 1e-6
-                    ):
-                        progress = {
-                            **progress,
-                            "obstacle": "wait_turn",
-                            "local_planner": False,
-                            "nose_unstick": "turn",
-                            "cmd_vx_mps": 0.0,
-                            "cmd_vtheta_rad_s": cmd.vtheta,
-                        }
-                    else:
-                        keep_yaw = (
-                            abs(cmd.vx) < 1e-6
-                            and abs(cmd.vy) < 1e-6
-                            and abs(cmd.vtheta) > 1e-6
-                        )
-                        cmd = DriveCommand(
-                            0.0, 0.0, cmd.vtheta if keep_yaw else 0.0, False
-                        )
-                        progress = {
-                            **progress,
-                            "obstacle": "wait",
-                            "local_planner": False,
-                            "nose_unstick": None,
-                            "cmd_vx_mps": 0.0,
-                            "cmd_vtheta_rad_s": cmd.vtheta,
-                        }
+                    elif trigger == "blocked_nose_unstick":
+                        failed_replan_while_blocked += 1
+                        blocked_fail_count += 1
+                        if blocked_fail_dist is None:
+                            blocked_fail_dist = distance_m(pose, goal)
+                        if corridor_yaw is None and self._abort_blocked_replans(
+                            blocked_fail_count, nose_clear=nose_clear
+                        ):
+                            return
+                    cmd = escape_pre.cmd or DriveCommand(0.0, 0.0, 0.0, False)
+                    progress = {
+                        **progress,
+                        "obstacle": escape_pre.obstacle or "planning",
+                        "local_planner": False,
+                        "nose_unstick": None,
+                        "cmd_vx_mps": cmd.vx,
+                        "cmd_vtheta_rad_s": cmd.vtheta,
+                    }
+                elif escape_pre.cmd is not None:
+                    cmd = escape_pre.cmd
+                    progress = {
+                        **progress,
+                        "obstacle": escape_pre.obstacle
+                        or progress.get("obstacle"),
+                        "local_planner": False,
+                        "nose_unstick": escape_pre.active_mode,
+                        "cmd_vx_mps": cmd.vx,
+                        "cmd_vtheta_rad_s": cmd.vtheta,
+                    }
+                if waiting_for_clear:
                     last_progress_at = now
                     last_progress_pose = pose
                     last_progress_dist = distance_m(pose, goal)
@@ -3463,7 +3121,7 @@ class NavSupervisor:
                 # Applied after the blocked-nose wait, which otherwise relabels
                 # this yaw as "wait" and the inflated spin disc then zeroes it.
                 if corridor_yaw is not None and not loc_hold_motion:
-                    nose_unstick_yaw_sign = math.copysign(1.0, corridor_yaw)
+                    escape_m.yaw_sign = math.copysign(1.0, corridor_yaw)
                     # A moving pursuit command already closes a sub-3° error.
                     # Replace it when the opening is off the nose, or when
                     # the command has already stopped.
@@ -3536,103 +3194,38 @@ class NavSupervisor:
                     # The veto can leave a crawl the base sanitizer turns into
                     # a stop. That never ramps, so the bumper stays put. Yaw
                     # onto the path when the sweep is free; otherwise back up.
-                    if not loc_hold_motion and not cmd.done and now >= narrow_rev_cooldown_until:
-                        bearing = float(progress.get("bearing_error_rad") or 0.0)
-                        rear_open = False
-                        spin_clear = False
-                        if guard_pts is not None:
-                            back_free = self._guard.free_distance(
-                                pose,
-                                -0.15,
-                                0.0,
-                                guard_pts,
-                                max(0.35, float(self._backup_dist_m)),
-                            )
-                            rear_open = (
-                                not math.isfinite(back_free) or back_free >= 0.05
-                            )
-                            sign = 1.0 if bearing >= 0.0 else -1.0
-                            if abs(bearing) > 1e-3:
-                                spin_clear = (
-                                    self._guard.free_rotation(pose, sign, guard_pts)
-                                    >= self._guard.cfg.rot_horizon_rad * 0.5
-                                )
-                        if progress.get("obstacle") in ("yaw_open", "corridor"):
-                            choice = None
-                        else:
-                            choice = self._undrivable_nose_recovery(
+                    if not cmd.done:
+                        escape_post = escape_m.tick_post(
+                            EscapeSense(
+                                now=now,
+                                pose=pose,
+                                cmd=cmd,
+                                progress=progress,
                                 nose_clear=nose_clear,
                                 waiting=waiting_for_clear,
-                                vx=cmd.vx,
-                                vtheta=cmd.vtheta,
-                                rear_open=rear_open,
-                                spin_clear=spin_clear,
-                                bearing_rad=bearing,
+                                failed_replans=failed_replan_while_blocked,
+                                spin_blocked=bool(progress.get("spin_blocked")),
+                                heading_open=corridor_yaw is not None,
+                                bearing_rad=float(
+                                    progress.get("bearing_error_rad") or 0.0
+                                ),
+                                scan=scan,
+                                local_view=local_view,
+                                guard=self._guard,
+                                guard_pts=guard_pts,
+                                robot_radius_m=self._robot_radius,
+                                spin_radius_m=self._spin_radius,
+                                follower=self._follower,
+                                backup_dist_m=float(self._backup_dist_m),
+                                backup_cooldown_s=float(self._backup_cooldown_s),
+                                loc_hold=loc_hold_motion,
+                                corridor_active=progress.get("obstacle")
+                                in ("yaw_open", "corridor"),
+                                prefer_yaw_sign=escape_m.yaw_sign,
                             )
-                        finished_escape = False
-                        if choice == "turn":
-                            deadband_rev_start = None
-                            if deadband_turn_start is None:
-                                deadband_turn_start = pose
-                            turned = abs(
-                                conv.normalize_angle(
-                                    pose.theta - deadband_turn_start.theta
-                                )
-                            )
-                            if turned >= _NOSE_UNSTICK_YAW_RAD:
-                                finished_escape = True
-                                deadband_turn_start = None
-                            else:
-                                cmd = DriveCommand(
-                                    0.0,
-                                    0.0,
-                                    math.copysign(_NOSE_UNSTICK_YAW_RATE, bearing or 1.0),
-                                    False,
-                                )
-                                self._last_sent_cmd = cmd
-                                progress = {
-                                    **progress,
-                                    "obstacle": "avoid",
-                                    "cmd_vx_mps": 0.0,
-                                    "cmd_vtheta_rad_s": cmd.vtheta,
-                                }
-                        elif choice == "reverse":
-                            deadband_turn_start = None
-                            if deadband_rev_start is None:
-                                deadband_rev_start = pose
-                            if distance_m(pose, deadband_rev_start) >= self._backup_dist_m:
-                                finished_escape = True
-                                deadband_rev_start = None
-                            else:
-                                from .controller import _narrow_reverse_command
-
-                                cmd = _narrow_reverse_command(self._follower)
-                                # Pure reverse rocks straight into the same
-                                # bumper. Yaw toward the path while backing;
-                                # keep |w| <= 0.25 so the base does not drop vx.
-                                if abs(bearing) >= math.radians(12.0):
-                                    cmd = DriveCommand(
-                                        cmd.vx,
-                                        0.0,
-                                        math.copysign(0.20, bearing),
-                                        False,
-                                    )
-                                self._last_sent_cmd = cmd
-                                progress = {
-                                    **progress,
-                                    "obstacle": "narrow_reverse",
-                                    "local_planner": False,
-                                    "cmd_vx_mps": cmd.vx,
-                                    "cmd_vtheta_rad_s": cmd.vtheta,
-                                }
-                        elif nose_clear:
-                            deadband_rev_start = None
-                            deadband_turn_start = None
-                        if finished_escape:
-                            narrow_rev_cooldown_until = now + max(
-                                1.5, float(self._backup_cooldown_s)
-                            )
-                            self._stop_before_replan("undrivable_nose")
+                        )
+                        if escape_post.replan_trigger is not None:
+                            self._stop_before_replan(escape_post.replan_trigger)
                             new_path = self._try_replan(
                                 goal,
                                 pose,
@@ -3640,7 +3233,7 @@ class NavSupervisor:
                                 scan,
                                 failed_count=failed_replan_while_blocked,
                                 local_view=local_view,
-                                trigger="undrivable_nose",
+                                trigger=escape_post.replan_trigger,
                             )
                             replan_finished = time.monotonic()
                             last_local_replan_at = replan_finished
@@ -3651,14 +3244,28 @@ class NavSupervisor:
                                 local_blocked_since = None
                                 failed_replan_while_blocked = 0
                                 vx_sign_history.clear()
-                            cmd = DriveCommand(0.0, 0.0, 0.0, False)
+                            cmd = escape_post.cmd or DriveCommand(
+                                0.0, 0.0, 0.0, False
+                            )
                             self._last_sent_cmd = cmd
                             progress = {
                                 **progress,
-                                "obstacle": "narrow_reverse_done",
+                                "obstacle": escape_post.obstacle
+                                or "narrow_reverse_done",
                                 "local_planner": False,
                                 "cmd_vx_mps": 0.0,
                                 "cmd_vtheta_rad_s": 0.0,
+                            }
+                        elif escape_post.cmd is not None:
+                            cmd = escape_post.cmd
+                            self._last_sent_cmd = cmd
+                            progress = {
+                                **progress,
+                                "obstacle": escape_post.obstacle
+                                or progress.get("obstacle"),
+                                "local_planner": False,
+                                "cmd_vx_mps": cmd.vx,
+                                "cmd_vtheta_rad_s": cmd.vtheta,
                             }
                     near_d, near_x, near_y = self._guard.nearest(pose, guard_pts)
                     _TRACE.append(

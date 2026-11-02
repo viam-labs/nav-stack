@@ -17,82 +17,19 @@ from ..nav.simple_motion import (
     distance_m,
     forward_clearance_m,
     heading_error_rad,
-    rear_clearance_m,
     spin_clearance_m,
 )
 from ..geom import conversions as conv
+from .base_envelope import CRAWL_FLOOR_MPS, LIN_EPS_MPS
+from .escape import try_reverse as _try_narrow_reverse
+# Re-exports for tests / older call sites that imported these names here.
+from .escape import rear_open as _rear_open_for_unstick  # noqa: F401
+from .escape import reverse_command as _narrow_reverse_command  # noqa: F401
 from .footprint_guard import FootprintGuard, obstacle_points
 from .local_costmap import LocalCostmapView, reverse_path_clear, spin_disc_blocked
 from .local_planner import LocalPlannerConfig, compute_local_command
 from .path_utils import closest_point_on_path, signed_crosstrack_m
 from .types import Path2D, Pose2D
-
-
-def _rear_open_for_unstick(
-    scan: Optional[conv.LaserScan2D],
-    robot_radius_m: float,
-    *,
-    local_view: Optional[LocalCostmapView] = None,
-    x_m: float = 0.0,
-    y_m: float = 0.0,
-    theta_rad: float = 0.0,
-    reverse_dist_m: float = 0.30,
-) -> bool:
-    """True when a short reverse is safe per rear scan and local costmap.
-
-    ``rear_clearance_m`` returns +inf when the rear arc has no returns (fully
-    clear). That must count as open — requiring ``isfinite`` left the robot
-    frozen in avoid+spin_block with an empty rear.
-
-    When a local costmap is present, also require the reverse footprint path
-    to stay clear so we do not back into persisted / inflated blobs that
-    lidar is currently missing.
-    """
-    if scan is None:
-        return False
-    rear = rear_clearance_m(scan)
-    rear_need = max(0.25, float(robot_radius_m) + 0.08)
-    if math.isfinite(rear) and rear < rear_need:
-        return False
-    if local_view is not None:
-        return reverse_path_clear(
-            local_view,
-            x_m,
-            y_m,
-            theta_rad,
-            robot_radius_m=float(robot_radius_m),
-            distance_m=float(reverse_dist_m),
-            ignore_ahead=True,
-        )
-    return True
-
-
-def _narrow_reverse_command(cfg: "FollowerConfig") -> DriveCommand:
-    back = min(
-        max(float(cfg.motion.min_linear_mps), 0.10),
-        0.18,
-    )
-    return DriveCommand(-back, 0.0, 0.0, False)
-
-
-def _try_narrow_reverse(
-    cfg: "FollowerConfig",
-    scan: Optional[conv.LaserScan2D],
-    robot_radius_m: float,
-    *,
-    local_view: Optional[LocalCostmapView],
-    current: Pose2D,
-) -> Optional[DriveCommand]:
-    if _rear_open_for_unstick(
-        scan,
-        robot_radius_m,
-        local_view=local_view,
-        x_m=current.x,
-        y_m=current.y,
-        theta_rad=current.theta,
-    ):
-        return _narrow_reverse_command(cfg)
-    return None
 
 
 @dataclass
@@ -158,9 +95,8 @@ class FollowerConfig:
         return float(self.wheel_half_track_m) + 0.15
 
 
-# ``ViamWorldIO._sanitize_base_cmd`` zeroes ``vx < 0.12`` when ``|vθ| > 0.25``
-# (pure spin). Any translating arc we emit must clear that floor.
-_BASE_CRAWL_FLOOR_MPS = 0.125
+# Stay above the shared sanitizer floor so an arc is not turned into a spin.
+_BASE_CRAWL_FLOOR_MPS = CRAWL_FLOOR_MPS
 
 
 def _path_length(path: Path2D) -> float:
@@ -408,8 +344,8 @@ def limit_twist_rate(
         # The first step off zero is often ~accel·period (0.04 m/s), which the
         # base sanitizer drops. A replan stop resets the ramp every attempt,
         # so the cart never leaves the bumper. Jump to a speed the base keeps.
-        if 0.0 < abs(vx) < 0.05 <= abs(target_vx):
-            vx = math.copysign(0.05, target_vx)
+        if 0.0 < abs(vx) < LIN_EPS_MPS <= abs(target_vx):
+            vx = math.copysign(LIN_EPS_MPS, target_vx)
         # Preserve the requested arc while the speed ramps.
         w = target_w * (vx / target_vx)
     max_dw = dt * float(cfg.max_angular_accel_rad_s2)

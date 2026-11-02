@@ -1277,19 +1277,11 @@ def _sanitize_base_cmd(
     """Snap sub-deadband speeds to zero so Viam wheeled bases don't reject RPM.
 
     Diff-drive with tiny ``vx`` + large ``vtheta`` also drives one wheel through
-    ~0 RPM — prefer pure spin in that case.
+    ~0 RPM — prefer pure spin in that case. Numbers live in ``base_envelope``.
     """
-    lin_eps = 0.05  # m/s
-    ang_eps = 0.08  # rad/s
-    if abs(vx) < lin_eps:
-        vx = 0.0
-    if abs(vy) < lin_eps:
-        vy = 0.0
-    if abs(vtheta) < ang_eps:
-        vtheta = 0.0
-    if vx != 0.0 and abs(vx) < 0.12 and abs(vtheta) > 0.25:
-        vx = 0.0
-    return vx, vy, vtheta
+    from .base_envelope import sanitize_base_cmd
+
+    return sanitize_base_cmd(vx, vy, vtheta)
 
 
 def _is_near_zero_rpm_error(exc: BaseException) -> bool:
