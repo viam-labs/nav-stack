@@ -1152,11 +1152,9 @@ class BuiltinSlamEngine:
             run_match = self._occ_cache_known > 0.02
 
         lo_ok = False
-        turning = False
         if use_lo:
             gyro_rate = abs(float(odom.vtheta)) if odom is not None else 0.0
             lo_ok = self._lidar_odom_step(scan, now, gyro_rate=gyro_rate)
-            turning = max(gyro_rate, self._lo_turn_rate) > self._LO_MAX_INSERT_YAW_RATE
             if lo_ok and self._mode == MODE_MAPPING:
                 # The map is being built from these poses; the grid matcher
                 # only re-checks them against themselves.

@@ -1560,7 +1560,7 @@ def test_periodic_relocalize_bypasses_startup_when_tick_match_bad():
     )
     slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
 
-    result = _run_relocalize_until_settled(slam)
+    _run_relocalize_until_settled(slam)
 
     assert slam._startup_global_localize_task is None
     first = slam._global_localize.await_args_list[0].args[0]
