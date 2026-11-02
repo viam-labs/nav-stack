@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import numpy as np
@@ -25,6 +26,20 @@ if TYPE_CHECKING:
     from .goal_episode import GoalEpisode
     from .local_costmap import LocalCostmapView
     from .supervisor import NavSupervisor
+
+# Per-tick wall times (ms) for sense → costmap → guard → dwa → gate.
+PHASE_MS_KEYS = (
+    "sense_ms",
+    "costmap_ms",
+    "guard_ms",
+    "dwa_ms",
+    "gate_ms",
+)
+
+
+def elapsed_ms(started: float) -> float:
+    """Milliseconds since ``perf_counter()`` mark, rounded to 0.1 ms."""
+    return round((perf_counter() - started) * 1000.0, 1)
 
 
 def _mono() -> float:
@@ -60,6 +75,8 @@ class TickContext:
         default_factory=lambda: DriveCommand(0.0, 0.0, 0.0, False)
     )
     progress: Dict[str, Any] = field(default_factory=dict)
+    # Wall times (ms) for sense / costmap / guard / dwa / gate this tick.
+    phase_ms: Dict[str, float] = field(default_factory=dict)
     waiting_for_clear: bool = False
     corridor_yaw: Optional[float] = None
     loc_hold_motion: bool = False
@@ -125,6 +142,7 @@ def run_sense_tick(
         or nav._local_view_cache is None  # noqa: SLF001
     )
 
+    t_sense = perf_counter()
     scan = None
     if need_scan:
         try:
@@ -150,7 +168,9 @@ def run_sense_tick(
                 if mem_pts is None or not np.size(mem_pts)
                 else np.vstack([np.asarray(mem_pts), above_pts])
             )
+    sense_ms = elapsed_ms(t_sense)
 
+    t_costmap = perf_counter()
     local_view = nav._local_view_cache  # noqa: SLF001
     if refresh_local:
         nav._kick_global_costmap_refresh(allow_inline=True)  # noqa: SLF001
@@ -193,7 +213,9 @@ def run_sense_tick(
                     )
                 except Exception:  # noqa: BLE001 - viz is best-effort
                     pass
+    costmap_ms = elapsed_ms(t_costmap)
 
+    t_guard = perf_counter()
     path_ahead_cost = 0
     pose_cost = 0
     local_blocked = False
@@ -273,6 +295,7 @@ def run_sense_tick(
         local_blocked = True
         if ep.local_blocked_since is None:
             ep.local_blocked_since = now
+    guard_ms = elapsed_ms(t_guard)
 
     return TickContext(
         now=now,
@@ -290,4 +313,9 @@ def run_sense_tick(
         local_blocked=local_blocked,
         map_untrusted=map_untrusted,
         collision_view=collision_view,
+        phase_ms={
+            "sense_ms": sense_ms,
+            "costmap_ms": costmap_ms,
+            "guard_ms": guard_ms,
+        },
     )

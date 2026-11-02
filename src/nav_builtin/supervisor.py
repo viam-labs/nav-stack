@@ -52,7 +52,7 @@ from .loc_hold_tick import run_loc_hold_tick
 from .path_follow import run_path_follow
 from .periodic_replan import run_periodic_replan
 from .replan_controller import apply_blocked_replan
-from .sense_tick import run_sense_tick
+from .sense_tick import elapsed_ms, run_sense_tick
 from .stall_watch import run_stall_watch
 from .tick_output import finish_tick_output, send_tick_velocity
 from .footprint_guard import (
@@ -263,6 +263,8 @@ class NavSupervisor:
         self._control_tick_last_s: Optional[float] = None
         self._control_tick_ema_s: Optional[float] = None
         self._control_period_s = max(1e-3, float(cfg.control_period_s()))
+        # Last tick's sense/costmap/guard/dwa/gate wall times (ms).
+        self._phase_ms_last: dict[str, float] = {}
 
         stop_m = max(float(cfg.simple_stop_distance), nose_offset + NOSE_STOP_MARGIN_M)
         self._follower = FollowerConfig(
@@ -551,7 +553,12 @@ class NavSupervisor:
             "local_costmap_updates": self._local_costmap_updates,
             "global_costmap_rebuilds": self._global_costmap_rebuilds,
             "global_costmap_generation": global_gen,
+            "phase_ms": dict(self._phase_ms_last) if self._phase_ms_last else None,
         }
+
+    def _note_phase_ms(self, phase_ms: dict) -> None:
+        """Stash the latest per-phase tick timings for ``control_stats`` / GetStatus."""
+        self._phase_ms_last = {str(k): float(v) for k, v in phase_ms.items()}
 
     def _note_control_tick(self, work_s: float) -> None:
         self._control_ticks += 1
@@ -2230,13 +2237,17 @@ class NavSupervisor:
                     if apply_blocked_replan(self, ep, tick).abort:
                         return
 
+                t_dwa = time.perf_counter()
                 if run_path_follow(self, ep, tick).abort:
                     return
+                tick.phase_ms["dwa_ms"] = elapsed_ms(t_dwa)
                 run_backup_recovery(self, ep, tick)
                 if run_periodic_replan(self, ep, tick).abort:
                     return
 
+                t_gate = time.perf_counter()
                 gate = run_final_gate(self, ep, tick)
+                tick.phase_ms["gate_ms"] = elapsed_ms(t_gate)
                 out = finish_tick_output(
                     self,
                     tick,

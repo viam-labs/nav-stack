@@ -9,6 +9,7 @@ from typing import Any, Mapping, Optional, TYPE_CHECKING
 from ..geom import conversions as conv
 from ..nav.simple_motion import DriveCommand
 from .loc_hold_tick import overlay_loc_hold_progress
+from .sense_tick import PHASE_MS_KEYS
 
 if TYPE_CHECKING:
     from .final_gate import GateResult
@@ -43,6 +44,7 @@ _PROGRESS_KEYS = (
     "distance_remaining_m",
     "waypoint_index",
     "localization_hold",
+    *PHASE_MS_KEYS,
 )
 
 
@@ -92,12 +94,14 @@ def finish_tick_output(
         **tick.progress,
         "cmd_vx_mps": tick.cmd.vx,
         "cmd_vtheta_rad_s": tick.cmd.vtheta,
+        **{k: tick.phase_ms[k] for k in PHASE_MS_KEYS if k in tick.phase_ms},
     }
     tick.progress = overlay_loc_hold_progress(
         tick.progress,
         holding_for_localize=holding_for_localize,
         loc_hold=loc_hold,
     )
+    nav._note_phase_ms(tick.phase_ms)  # noqa: SLF001
 
     nav._set_status(  # noqa: SLF001
         pose={"x": tick.pose.x, "y": tick.pose.y, "theta": tick.pose.theta},
