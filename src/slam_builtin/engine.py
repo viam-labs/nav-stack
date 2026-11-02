@@ -132,6 +132,15 @@ class BuiltinSlamEngine:
         self._updates = 0
         self._match_accepts = 0
         self._match_rejects = 0
+        # Corrections applied while a goal was active.
+        self._drive_applies = 0
+        self._yaw_only_applies = 0
+        # Heading bookkeeping: sensor steps the body cannot have turned, and
+        # the signed yaw the scan has pulled the pose by since the last seed.
+        self._heading_snaps = 0
+        self._yaw_corr_sum = 0.0
+        self._yaw_corr_count = 0
+        self._yaw_corr_since: Optional[float] = None
         self._last_match_at = 0.0
         # Mapping inserts only after movement (or timeout).
         self._last_insert_pose: Optional[conv.Pose2D] = None
@@ -463,6 +472,7 @@ class BuiltinSlamEngine:
             self._pose_epoch += 1
             self._pending_match = None
             self._pending_count = 0
+            self._reset_yaw_ledger()
             # External relocalize / startup global_localize counts as seeded.
             self._seed_localize_pending = False
             self._last_odom_pose = None
@@ -490,6 +500,7 @@ class BuiltinSlamEngine:
         self._pose_epoch += 1
         self._pending_match = None
         self._pending_count = 0
+        self._reset_yaw_ledger()
         self._seed_localize_pending = False
         self._last_odom_pose = None
         self._last_odom_heading = None
@@ -984,6 +995,9 @@ class BuiltinSlamEngine:
                 "map_updates": self._updates,
                 "match_accepts": self._match_accepts,
                 "match_rejects": self._match_rejects,
+                "drive_applies": self._drive_applies,
+                "yaw_only_applies": self._yaw_only_applies,
+                "heading": self._heading_diagnostics(),
                 "pose": {
                     "x": self._pose.x,
                     "y": self._pose.y,
@@ -1169,6 +1183,12 @@ class BuiltinSlamEngine:
             )
             if matched is not None and capture_motion is not None:
                 matched = conv.compose_poses(matched, capture_motion)
+            # While driving, also ask the heading alone. Yaw is what a
+            # skid-steer loses in every turn, and a corridor that cannot
+            # place the body along the hall still fixes its heading.
+            yaw_fix = None
+            if self._navigation_active():
+                yaw_fix = self._yaw_only_fix(occ_map, scan, scan_pose)
             with self._lock:
                 self._last_match_at = now
                 self._last_match_score = score
@@ -1177,7 +1197,9 @@ class BuiltinSlamEngine:
                 if self._pose_epoch != epoch:
                     # Pose moved frame (loop closure) mid-match.
                     return
-                applied = self._apply_match(self._pose, matched, odom)
+                applied = self._apply_match(
+                    self._pose, matched, odom, yaw_fix=yaw_fix
+                )
                 if matched is not None and applied:
                     self._match_accepts += 1
                 else:
@@ -1801,6 +1823,39 @@ class BuiltinSlamEngine:
     # toward corridor twins (including while nav is suspended/paused).
     _PRIOR_TRUST_SCORE = 0.15
 
+    # While a goal is active the pose moves by at most a drift-sized step per
+    # match, and only when the published pose already fits the scan, the base
+    # is not turning hard, and no second wall scores almost as well. A flat
+    # corridor ridge ties with a cell 0.4 m away and the margin refuses it.
+    _DRIVE_TRUST_SCORE = 0.25
+    _RIVAL_MARGIN = 0.08
+    # A peak this strong with no rival is a fix even when the prior is lost:
+    # the wide refine window found the body up to ~0.6 m from its pose.
+    _RECOVER_MIN_SCORE = 0.45
+
+    def _peak_is_unique(self) -> bool:
+        """True when no other wall in the window scores close to the winner.
+
+        A window with one blob (or no recorded search) counts as unique.
+        """
+        best = float(self._last_match_score)
+        rival = float(self._last_match_rival_score)
+        if not math.isfinite(best) or not math.isfinite(rival):
+            return True
+        return best - rival >= self._RIVAL_MARGIN
+
+    def _match_is_strong(self) -> bool:
+        score = float(self._last_match_score)
+        return (
+            math.isfinite(score)
+            and score >= self._RECOVER_MIN_SCORE
+            and self._peak_is_unique()
+        )
+
+    def _calm_for_correction(self) -> bool:
+        """A smeared turning scan is never applied."""
+        return float(self._last_yaw_rate) <= _SPIN_HOLD_YAW_RATE
+
     def _navigation_active(self) -> bool:
         """True when builtin nav has an in-flight goal (MoveOnMap / route)."""
         try:
@@ -1810,41 +1865,149 @@ class BuiltinSlamEngine:
         except Exception:  # noqa: BLE001 - registry may be mid-reconfigure
             return False
 
+    # Heading-only step while driving. Lower score floor than a full match:
+    # XY may be off by a corridor length while the walls still fix the yaw.
+    # Each apply turns the pose a few degrees so the controller sees a drift,
+    # not a kick.
+    _YAW_ONLY_MIN_SCORE = 0.20
+    _YAW_ONLY_MAX_RAD = math.radians(24.0)
+    _YAW_ONLY_STEP_RAD = math.radians(4.0)
+    _YAW_ONLY_ALPHA = 0.5
+
+    def _yaw_only_fix(
+        self, occ_map, scan: conv.LaserScan2D, scan_pose: conv.Pose2D
+    ) -> Optional[tuple]:
+        """``(dyaw, best, prior, rival)`` from a heading search at the scan pose."""
+        try:
+            yaw, best, prior, rival = scan_match.refine_yaw(occ_map, scan, scan_pose)
+        except Exception:  # noqa: BLE001 - diagnostics only; never stall the tick
+            return None
+        if yaw is None:
+            return None
+        return (conv.normalize_angle(yaw - scan_pose.theta), best, prior, rival)
+
+    def _apply_yaw_only(self, predicted: conv.Pose2D, yaw_fix: tuple) -> bool:
+        dyaw, best, prior, rival = yaw_fix
+        if not math.isfinite(best) or best < self._YAW_ONLY_MIN_SCORE:
+            return False
+        if abs(dyaw) > self._YAW_ONLY_MAX_RAD:
+            return False
+        if math.isfinite(rival) and best - rival < self._RIVAL_MARGIN:
+            return False
+        if math.isfinite(prior) and best < prior + scan_match._required_improvement(  # noqa: SLF001
+            prior, 0.0, dyaw
+        ):
+            return False
+        step = max(
+            -self._YAW_ONLY_STEP_RAD,
+            min(self._YAW_ONLY_STEP_RAD, self._YAW_ONLY_ALPHA * dyaw),
+        )
+        if abs(step) < math.radians(0.25):
+            return False
+        self._pose = conv.Pose2D(
+            predicted.x, predicted.y, conv.normalize_angle(predicted.theta + step)
+        )
+        self._yaw_only_applies += 1
+        return True
+
+    def _note_yaw_correction(self, predicted: conv.Pose2D) -> None:
+        """Signed yaw the scan just pulled the pose by (heading drift ledger)."""
+        d = conv.normalize_angle(self._pose.theta - predicted.theta)
+        if self._yaw_corr_since is None:
+            self._yaw_corr_since = time.monotonic()
+        self._yaw_corr_sum += d
+        self._yaw_corr_count += 1
+
+    def _reset_yaw_ledger(self) -> None:
+        self._yaw_corr_sum = 0.0
+        self._yaw_corr_count = 0
+        self._yaw_corr_since = None
+
+    def _heading_diagnostics(self) -> dict:
+        """How the heading sensor and the scan have disagreed since the seed.
+
+        ``bias_deg_s`` is the net yaw the scan has corrected per second; a
+        steady value is a gyro/heading bias the odometry carries, and its
+        sign says which way the sensor under-reads.
+        """
+        elapsed = None
+        bias = None
+        if self._yaw_corr_since is not None:
+            elapsed = max(0.0, time.monotonic() - self._yaw_corr_since)
+            if elapsed >= 30.0:
+                bias = math.degrees(self._yaw_corr_sum) / elapsed
+        return {
+            "snaps_rejected": self._heading_snaps,
+            "scan_corrections": self._yaw_corr_count,
+            "scan_corrected_deg": round(math.degrees(self._yaw_corr_sum), 2),
+            "window_s": None if elapsed is None else round(elapsed, 1),
+            "bias_deg_s": None if bias is None else round(bias, 4),
+        }
+
     def _apply_match(
         self,
         predicted: conv.Pose2D,
         matched: Optional[conv.Pose2D],
         odom: Optional[conv.OdomReading],
+        *,
+        yaw_fix: Optional[tuple] = None,
     ) -> bool:
-        """Apply a blended match. Returns True if pose was corrected."""
-        del odom  # prediction is delta-based; no map->odom re-anchor needed
-        if matched is None:
-            self._pending_match = None
-            self._pending_count = 0
-            self._pose = predicted
-            return False
+        """Apply a blended match. Returns True if pose was corrected.
 
-        # During MoveOnMap / routes: odom-only. Scan matches stay diagnostic.
-        # Applying them while driving walked the pose onto a parallel wall.
-        if self._navigation_active():
-            self._pending_match = None
-            self._pending_count = 0
-            self._pose = predicted
-            return False
+        ``yaw_fix`` is the heading-only search for this scan; while driving it
+        is applied whenever the full match is held, so a heading slip closes
+        even when the position along a corridor cannot be trusted.
+        """
+        del odom  # prediction is delta-based; no map->odom re-anchor needed
+        driving = self._navigation_active()
+        if self._apply_full_match(predicted, matched, driving):
+            self._note_yaw_correction(predicted)
+            return True
+        if (
+            driving
+            and yaw_fix is not None
+            and self._calm_for_correction()
+            and self._apply_yaw_only(predicted, yaw_fix)
+        ):
+            self._note_yaw_correction(predicted)
+            return True
+        return False
+
+    def _apply_full_match(
+        self,
+        predicted: conv.Pose2D,
+        matched: Optional[conv.Pose2D],
+        driving: bool,
+    ) -> bool:
+        if matched is None:
+            return self._hold(predicted)
+
+        # A scan taken mid-spin is smeared and lags the wheels; matching it
+        # pulls the heading back toward where the turn started. Odometry
+        # carries the turn and the first still scan settles it.
+        if not self._calm_for_correction():
+            return self._hold(predicted)
+        # During MoveOnMap / routes the pose keeps following odometry and a
+        # match may pull it back by a drift-sized step. A wide sideways search
+        # applied while driving once walked the pose onto a parallel wall, so
+        # a driving step needs a fitting prior (or a strong lone peak) and a
+        # winner with no rival.
 
         dist = math.hypot(matched.x - predicted.x, matched.y - predicted.y)
         dyaw = abs(conv.normalize_angle(matched.theta - predicted.theta))
         small = dist <= self._SMALL_CORRECTION_M and dyaw <= self._SMALL_CORRECTION_RAD
         prior = float(self._last_prior_score)
         prior_ok = math.isfinite(prior) and prior >= self._PRIOR_TRUST_SCORE
+        strong = self._match_is_strong()
 
         if small:
             # Bad prior while idle/paused: never creep toward twins.
             if not prior_ok:
-                self._pending_match = None
-                self._pending_count = 0
-                self._pose = predicted
-                return False
+                return self._hold(predicted)
+            if driving and not (
+                prior >= self._DRIVE_TRUST_SCORE and self._peak_is_unique()
+            ):
+                return self._hold(predicted)
             # Continuous drift correction: no confirmation needed.
             self._pending_match = None
             self._pending_count = 0
@@ -1855,14 +2018,20 @@ class BuiltinSlamEngine:
                 max_xy=self._SMALL_CORRECTION_M,
                 max_yaw=self._SMALL_CORRECTION_RAD,
             )
+            if driving:
+                self._drive_applies += 1
             return True
 
-        # Large jump while idle: only with a trusted prior + two agreeing frames.
-        if not prior_ok:
-            self._pending_match = None
-            self._pending_count = 0
-            self._pose = predicted
-            return False
+        # Large jump: a lone peak and two agreeing frames, from a trusted prior
+        # or, when the prior is lost, a strong match. While driving only the
+        # strong case applies, walked in at the drift step so the controller
+        # sees no jump. Two near-equal peaks are a twin, never a direction.
+        if not self._peak_is_unique():
+            return self._hold(predicted)
+        if not prior_ok and not strong:
+            return self._hold(predicted)
+        if driving and not strong:
+            return self._hold(predicted)
 
         if self._pending_match is not None and self._poses_agree(
             matched, self._pending_match
@@ -1877,16 +2046,26 @@ class BuiltinSlamEngine:
             self._pose = predicted
             return False
 
+        if driving:
+            max_xy = self._SMALL_CORRECTION_M
+            max_yaw = self._SMALL_CORRECTION_RAD
+            self._drive_applies += 1
+        else:
+            max_xy = 0.25
+            max_yaw = math.radians(12.0)
         self._pose = self._blend_pose(
-            predicted,
-            matched,
-            alpha=0.6,
-            max_xy=0.25,
-            max_yaw=math.radians(12.0),
+            predicted, matched, alpha=0.6, max_xy=max_xy, max_yaw=max_yaw
         )
         # Keep the streak so a persistent target keeps applying every match.
         self._pending_count = 2
         return True
+
+    def _hold(self, predicted: conv.Pose2D) -> bool:
+        """Stay on odometry and forget any half-confirmed jump."""
+        self._pending_match = None
+        self._pending_count = 0
+        self._pose = predicted
+        return False
 
     # Ignore accel smaller than this so gravity leftover and sensor noise do
     # not walk the pose while the cart is sitting still.
@@ -1975,6 +2154,23 @@ class BuiltinSlamEngine:
     # inventing motion from the last twist, so a stalled read cannot justify
     # more yaw than that hold either.
     _ODOM_YAW_HOLD_MAX_S = 3.0
+    # Fastest turn either cart makes. A heading step past this rate over one
+    # sample (at least one nominal period, at most this window) is a sensor
+    # snap, not the body turning: 35° in 0.1 s is 350°/s.
+    _MAX_BODY_YAW_RATE = math.radians(120.0)
+    _YAW_STEP_WINDOW_S = 0.5
+
+    def _plausible_yaw_step(self, gap_s: float, prev_yaw_rate: float) -> float:
+        """Most yaw one odom sample can honestly carry.
+
+        The body's top rate over the sample gap (never less than a nominal
+        period, never more than half a second), or the turn already underway
+        held across a stalled read for as long as the reader holds it.
+        """
+        gap = max(0.0, float(gap_s))
+        window = min(max(gap, self._period), self._YAW_STEP_WINDOW_S)
+        hold = min(gap, self._ODOM_YAW_HOLD_MAX_S)
+        return max(self._MAX_BODY_YAW_RATE * window, abs(prev_yaw_rate) * hold)
 
     def _predict(
         self, odom: Optional[conv.OdomReading], now: float
@@ -2007,15 +2203,21 @@ class BuiltinSlamEngine:
                     self._last_odom_heading = odom.pose.theta
                 return self._pose
             delta = conv.compose_poses(conv.invert_pose(prev), odom.pose)
+            gap_s = (now - prev_at) if prev_at is not None else 0.0
+            max_yaw = self._plausible_yaw_step(gap_s, prev_yaw_rate)
             # Prefer dedicated heading_sensor deltas for yaw so velocity-only
             # wheel odom does not dead-reckon heading from gyro vtheta alone.
+            # A step the body cannot have turned is a magnetometer snap; the
+            # wheel delta stands in for it.
             if odom.heading_rad is not None:
                 if self._last_odom_heading is not None:
                     heading_delta = conv.normalize_angle(
                         odom.heading_rad - self._last_odom_heading
                     )
-                    if abs(heading_delta) <= math.radians(40.0):
+                    if abs(heading_delta) <= max_yaw:
                         delta = conv.Pose2D(delta.x, delta.y, heading_delta)
+                    else:
+                        self._heading_snaps += 1
                 self._last_odom_heading = odom.heading_rad
             else:
                 self._last_odom_heading = odom.pose.theta
@@ -2025,10 +2227,7 @@ class BuiltinSlamEngine:
             # honestly contain is the turn already underway, and only for as
             # long as that hold lasts. A parked cart cannot absorb a
             # magnetometer flip just because the read was late.
-            gap_s = (now - prev_at) if prev_at is not None else 0.0
             max_xy = max(0.5, 0.6 * gap_s)
-            yaw_hold_s = min(max(gap_s, 0.0), self._ODOM_YAW_HOLD_MAX_S)
-            max_yaw = max(math.radians(40.0), prev_yaw_rate * yaw_hold_s)
             if (
                 math.hypot(delta.x, delta.y) > max_xy
                 or abs(delta.theta) > max_yaw
@@ -2045,9 +2244,12 @@ class BuiltinSlamEngine:
         # absolute IMU/magnetometer heading — that frame is not map-aligned
         # and was yanking localization after every tick.
         dt = 0.0
+        gap_s = 0.0
         if self._last_odom_time is not None:
-            dt = max(0.0, min(now - self._last_odom_time, 0.5))
+            gap_s = max(0.0, now - self._last_odom_time)
+            dt = min(gap_s, 0.5)
         self._last_odom_time = now
+        prev_yaw_rate = abs(float(self._last_odom_twist[2]))
         if dt <= 0.0:
             if odom.heading_rad is not None and self._last_odom_heading is None:
                 self._last_odom_heading = odom.heading_rad
@@ -2061,8 +2263,12 @@ class BuiltinSlamEngine:
                     odom.heading_rad - self._last_odom_heading
                 )
                 # Reject magnetometer jumps; fall back to gyro integration.
-                if abs(heading_delta) <= math.radians(40.0):
+                if abs(heading_delta) <= self._plausible_yaw_step(
+                    gap_s, prev_yaw_rate
+                ):
                     dth = heading_delta
+                else:
+                    self._heading_snaps += 1
             self._last_odom_heading = odom.heading_rad
 
         if (

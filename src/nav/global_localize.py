@@ -56,6 +56,8 @@ class GlobalLocalizeResult:
     # Used to refuse applying an ambiguous full-map peak.
     second_best_score: float = float("-inf")
     ambiguous: bool = False
+    # Fraction of the scan the map could judge at the winning pose.
+    coverage: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,16 @@ class _PoseScore:
     score: float
     in_map_points: int
     hit_rate: float
+    # Fraction of the scan the map could judge (known cells).
+    coverage: float = 0.0
+
+
+# Below this judged fraction a whole-map candidate is penalised, so a pose
+# that parks most of the scan in unknown or off-grid cells cannot outscore
+# one that is actually inside the mapped area. Above it the score is the
+# same fraction-explained measure everywhere on the map.
+_COVERAGE_FLOOR = 0.6
+_COVERAGE_PENALTY = 1.2
 
 
 @dataclass(frozen=True)
@@ -244,21 +256,31 @@ def _score_pose(
     total_points = int(scan_xy.shape[0])
     min_points = max(min_in_map_points, int(total_points * min_in_map_ratio))
     if in_map_points < min_points:
-        return _PoseScore(float("-inf"), in_map_points, 0.0)
+        return _PoseScore(float("-inf"), in_map_points, 0.0, 0.0)
 
     rows_in = rows[inside]
     cols_in = cols[inside]
     hit_mask = occupied_lookup[rows_in, cols_in]
-    hit_rate = float(np.mean(hit_mask))
-
-    # Endpoints landing in known free space are a mismatch.
+    # Endpoints landing in known free space are a mismatch. Unknown cells
+    # and beams past the grid say nothing and are left out of the fraction,
+    # so the score reads the same next to unexplored space as in a finished
+    # room (see ``scan_match._candidate_scores_with_coverage``).
     cell_vals = grid[rows_in, cols_in]
-    free_rate = float(np.mean(cell_vals == 0))
-    out_of_map_rate = 1.0 - (in_map_points / total_points)
+    free_mask = (cell_vals >= 0) & (cell_vals < 50)
+    known = int(np.count_nonzero(hit_mask | free_mask))
+    if known < min_points:
+        return _PoseScore(float("-inf"), in_map_points, 0.0, known / total_points)
+    hits = int(np.count_nonzero(hit_mask))
+    hit_rate = hits / float(known)
+    free_rate = int(np.count_nonzero(free_mask)) / float(known)
+    coverage = known / float(total_points)
 
-    # Weight out-of-map heavily so edge/off-map poses cannot win.
-    score = hit_rate - 0.7 * free_rate - 1.2 * out_of_map_rate
-    return _PoseScore(score, in_map_points, hit_rate)
+    score = hit_rate - 0.7 * free_rate
+    # A whole-map candidate that hides most of the scan in unmapped cells
+    # cannot win on the few beams it does show.
+    if coverage < _COVERAGE_FLOOR:
+        score -= _COVERAGE_PENALTY * (_COVERAGE_FLOOR - coverage)
+    return _PoseScore(score, in_map_points, hit_rate, coverage)
 
 
 def _inflate_occupied(occupied: np.ndarray, radius_cells: int) -> np.ndarray:
@@ -656,6 +678,7 @@ def global_localize_scan(
             yaw_choice.score,
             best_eval.in_map_points,
             best_eval.hit_rate,
+            best_eval.coverage,
         )
         # Refresh ray quality at the flipped heading for status reporting.
         best_ray_score, best_ray_mae = _ray_alignment(
@@ -685,6 +708,7 @@ def global_localize_scan(
         ray_mae_m=best_ray_mae,
         second_best_score=second_best,
         ambiguous=ambiguous,
+        coverage=best_eval.coverage,
     )
 
 

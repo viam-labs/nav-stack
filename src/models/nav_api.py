@@ -157,6 +157,26 @@ def _localized(status: Mapping[str, Any]) -> bool:
     return True
 
 
+def not_localized_message(status: Mapping[str, Any]) -> str:
+    """Goal refusal that says why and what to do, when the watchdog knows."""
+    from ..nav.loc_state import describe_state
+
+    state = status.get("localization_state")
+    if not isinstance(state, Mapping):
+        check = status.get("localization_check")
+        state = check.get("state") if isinstance(check, Mapping) else None
+    text = describe_state(state)
+    if text:
+        return f"not localized ({text}); a new goal cannot start"
+    check = status.get("localization_check")
+    if isinstance(check, Mapping) and check.get("status"):
+        return (
+            f"not localized (last check: {check.get('status')}); "
+            "a new goal cannot start"
+        )
+    return "not localized; a new goal cannot start"
+
+
 def _position_from_xy(raw: Mapping[str, Any]) -> Position:
     return pose2d_to_position(
         conv.Pose2D(
@@ -369,11 +389,11 @@ class NavigationApi:
         return float(cfg.max_linear_velocity)
 
     async def _require_localized(self) -> None:
-        status = await self.get_navigation_status()
-        if not status.localized:
+        raw = await self._nav_call({"command": "get_status"})
+        if not _localized(raw):
             raise GRPCError(
                 Status.FAILED_PRECONDITION,
-                "not localized; a new goal cannot start",
+                not_localized_message(raw),
             )
 
     async def add_location(

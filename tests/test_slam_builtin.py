@@ -142,6 +142,8 @@ def test_refine_pose_tracks_prior():
         yaw_half_deg=12.0,
         min_score=-0.5,
     )
+    # Beams past this 4 m grid are unmapped, not wrong: the wide pass must
+    # not slide the pose back to keep them inside.
     # With distance-weighted gating a modest offset may be rejected; either a
     # clear improvement toward origin or an explicit reject is OK.
     if matched is not None:
@@ -241,19 +243,183 @@ def _nav_track_engine(monkeypatch, **cfg_extra):
     return engine
 
 
-def test_apply_match_holds_pose_during_nav(monkeypatch):
-    """During MoveOnMap the pose stays on odometry, including a small nudge."""
+def test_apply_match_tracks_drift_during_nav(monkeypatch):
+    """A fitting prior and a lone peak pull the pose back while driving."""
     engine = _nav_track_engine(monkeypatch)
     predicted = conv.Pose2D(0.0, 0.0, 0.0)
     small = conv.Pose2D(0.10, 0.04, math.radians(2.0))
+    assert engine._apply_match(predicted, small, None) is True  # noqa: SLF001
+    pose = engine.get_pose()
+    assert pose.x == pytest.approx(0.06, abs=1e-6)
+    assert pose.y == pytest.approx(0.024, abs=1e-6)
+    assert pose.theta == pytest.approx(math.radians(1.2), abs=1e-6)
+    assert engine.diagnostics()["drive_applies"] == 1
+
+
+def test_apply_match_holds_during_nav_without_a_clear_peak(monkeypatch):
+    """A spinning scan, a weak prior, or a close rival keeps odometry."""
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    small = conv.Pose2D(0.10, 0.0, 0.0)
+
+    turning = _nav_track_engine(monkeypatch)
+    turning._last_yaw_rate = math.radians(30.0)  # noqa: SLF001
+    assert turning._apply_match(predicted, small, None) is False  # noqa: SLF001
+
+    weak_prior = _nav_track_engine(monkeypatch)
+    weak_prior._last_prior_score = 0.20  # noqa: SLF001
+    assert weak_prior._apply_match(predicted, small, None) is False  # noqa: SLF001
+
+    # A corridor ridge: a cell 0.4 m away scores within 0.08 of the winner.
+    ridge = _nav_track_engine(monkeypatch)
+    ridge._last_match_rival_score = 0.56  # noqa: SLF001
+    assert ridge._apply_match(predicted, small, None) is False  # noqa: SLF001
+    for eng in (turning, weak_prior, ridge):
+        assert eng.get_pose().x == pytest.approx(0.0)
+        assert eng.diagnostics()["drive_applies"] == 0
+
+
+def test_apply_match_walks_a_strong_jump_in_while_driving(monkeypatch):
+    """A 0.4 m slip with a strong lone peak closes at the drift step."""
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.1  # noqa: SLF001 - the pose is off the wall
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
     large = conv.Pose2D(0.40, 0.0, 0.0)
-    assert engine._apply_match(predicted, small, None) is False  # noqa: SLF001
     assert engine._apply_match(predicted, large, None) is False  # noqa: SLF001
-    assert engine._apply_match(predicted, large, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, large, None) is True  # noqa: SLF001
+    # alpha 0.6 * 0.40 = 0.24 m, capped at the 0.15 m drift step while driving.
+    assert engine.get_pose().x == pytest.approx(0.15, abs=1e-6)
+
+    weak = _nav_track_engine(monkeypatch)
+    weak._last_match_score = 0.40  # noqa: SLF001 - under the recovery floor
+    assert weak._apply_match(predicted, large, None) is False  # noqa: SLF001
+    assert weak._apply_match(predicted, large, None) is False  # noqa: SLF001
+    assert weak.get_pose().x == pytest.approx(0.0)
+
+
+def test_predict_rejects_a_heading_step_the_body_cannot_turn():
+    """35 deg in one 10 Hz sample is a magnetometer snap; 8 deg is a turn."""
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
+    )
+    engine = BuiltinSlamEngine(
+        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=10.0
+    )  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 10.0
+    engine._predict(  # noqa: SLF001
+        conv.OdomReading(0.0, 0.0, 0.0, pose=conv.Pose2D(0.0, 0.0, 0.0), heading_rad=0.0),
+        t0,
+    )
+    # Wheels say 2 deg; the heading sensor jumps 35 deg. Wheels win.
+    pose = engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0, 0.0, 0.0,
+            pose=conv.Pose2D(0.0, 0.0, math.radians(2.0)),
+            heading_rad=math.radians(35.0),
+        ),
+        t0 + 0.1,
+    )
+    assert pose.theta == pytest.approx(math.radians(2.0), abs=1e-6)
+    assert engine.diagnostics()["heading"]["snaps_rejected"] == 1
+    # A real 80 deg/s turn is inside the body rate and is taken from the sensor.
+    engine._pose = pose  # noqa: SLF001
+    pose = engine._predict(  # noqa: SLF001
+        conv.OdomReading(
+            0.0, 0.0, 0.0,
+            pose=conv.Pose2D(0.0, 0.0, math.radians(9.0)),
+            heading_rad=math.radians(43.0),
+        ),
+        t0 + 0.2,
+    )
+    assert pose.theta == pytest.approx(math.radians(10.0), abs=1e-6)
+
+
+def test_predict_twist_path_rejects_a_heading_snap_and_keeps_the_gyro():
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
+    )
+    engine = BuiltinSlamEngine(
+        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=10.0
+    )  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(0.0, 0.0, 0.0))
+    t0 = 20.0
+    engine._predict(conv.OdomReading(0.0, 0.0, 0.1, heading_rad=0.0), t0)  # noqa: SLF001
+    pose = engine._predict(  # noqa: SLF001
+        conv.OdomReading(0.0, 0.0, 0.1, heading_rad=math.radians(30.0)), t0 + 0.1
+    )
+    # gyro 0.1 rad/s over 0.1 s
+    assert pose.theta == pytest.approx(0.01, abs=1e-6)
+    assert engine.diagnostics()["heading"]["snaps_rejected"] == 1
+
+
+def test_yaw_only_correction_turns_a_driving_pose_back(monkeypatch):
+    """A held full match still closes the heading while a goal is active."""
+    engine = _nav_track_engine(monkeypatch)
+    engine._last_prior_score = -0.2  # noqa: SLF001 - XY is off, full match held
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    far = conv.Pose2D(0.9, 0.0, math.radians(10.0))
+    engine._last_match_score = 0.30  # noqa: SLF001 - under the recovery floor
+    yaw_fix = (math.radians(10.0), 0.55, 0.10, 0.05)
+    assert engine._apply_match(predicted, far, None, yaw_fix=yaw_fix) is True  # noqa: SLF001
     pose = engine.get_pose()
     assert pose.x == pytest.approx(0.0)
-    assert pose.y == pytest.approx(0.0)
-    assert pose.theta == pytest.approx(0.0)
+    # alpha 0.5 * 10 deg, capped at the 4 deg step
+    assert pose.theta == pytest.approx(math.radians(4.0), abs=1e-6)
+    diag = engine.diagnostics()
+    assert diag["yaw_only_applies"] == 1
+    assert diag["heading"]["scan_corrections"] == 1
+    assert diag["heading"]["scan_corrected_deg"] == pytest.approx(4.0, abs=0.01)
+
+    # Two headings that score alike are not a direction.
+    tie = (math.radians(10.0), 0.55, 0.10, 0.50)
+    assert engine._apply_match(predicted, far, None, yaw_fix=tie) is False  # noqa: SLF001
+    assert engine.get_pose().theta == pytest.approx(0.0)
+    # Idle: the heading-only path stays off.
+    monkeypatch.setattr(engine, "_navigation_active", lambda: False)
+    assert engine._apply_match(predicted, far, None, yaw_fix=yaw_fix) is False  # noqa: SLF001
+
+
+def test_refine_yaw_finds_the_heading_in_a_corridor():
+    """Along a hall XY is a toss-up; the heading is still observable."""
+    res = 0.05
+    size = 160
+    grid = np.full((size, size), 0, dtype=np.int16)
+    origin = -size * res / 2
+    for col in range(size):
+        for wall_y in (-1.0, 1.0):
+            row = int(math.floor((wall_y - origin) / res))
+            grid[row, col] = 100
+    occ_map = scan_match.occupancy_map_from_int16(
+        grid, resolution=res, origin_x=origin, origin_y=origin
+    )
+    truth = conv.Pose2D(0.0, 0.0, 0.0)
+    scan = _room_scan(truth, half_x=3.9, half_y=1.0)
+    # The pose is 1.5 m down the hall and 12 deg off.
+    prior = conv.Pose2D(1.5, 0.0, math.radians(12.0))
+    yaw, best, prior_score, rival = scan_match.refine_yaw(occ_map, scan, prior)
+    assert yaw is not None
+    assert abs(conv.normalize_angle(yaw)) <= math.radians(2.0)
+    assert best > prior_score + 0.05
+    assert best - rival >= 0.08
+
+
+def test_apply_match_strong_lone_peak_recovers_a_lost_prior_when_idle():
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": "/tmp", "mode": "localizing"}
+    )
+    engine = BuiltinSlamEngine(
+        cfg, _FakeSensors(), MapStore("/tmp"), rate_hz=5.0
+    )  # type: ignore[arg-type]
+    engine._last_prior_score = -0.3  # noqa: SLF001
+    engine._last_match_score = 0.62  # noqa: SLF001
+    engine._last_match_rival_score = 0.21  # noqa: SLF001
+    predicted = conv.Pose2D(0.0, 0.0, 0.0)
+    peak = conv.Pose2D(0.0, 0.50, math.radians(15.0))
+    assert engine._apply_match(predicted, peak, None) is False  # noqa: SLF001
+    assert engine._apply_match(predicted, peak, None) is True  # noqa: SLF001
+    pose = engine.get_pose()
+    assert pose.y == pytest.approx(0.25, abs=1e-6)
+    assert pose.theta == pytest.approx(math.radians(9.0), abs=1e-6)
 
 
 def test_apply_match_odom_only_when_prior_untrusted(monkeypatch):
@@ -1208,12 +1374,13 @@ def test_engine_skips_insert_when_spinning_fast(tmp_path: Path):
     engine._tick()  # noqa: SLF001
     engine._tick()  # noqa: SLF001
     before = engine._updates  # noqa: SLF001
-    # ~30 deg in one 10 Hz tick ≈ 300 deg/s → insert skipped, pose still tracks.
-    engine._last_tick_at -= 0.1  # noqa: SLF001
-    heading["th"] = math.radians(30.0)
-    engine._tick()  # noqa: SLF001
+    # 10 deg per 10 Hz tick = 100 deg/s → insert skipped, pose still tracks.
+    for k in range(1, 4):
+        engine._last_tick_at -= 0.1  # noqa: SLF001
+        heading["th"] = math.radians(10.0 * k)
+        engine._tick()  # noqa: SLF001
     assert engine._updates == before  # noqa: SLF001
-    assert engine.diagnostics()["insert_skips_turning"] == 1
+    assert engine.diagnostics()["insert_skips_turning"] == 3
     assert engine.get_pose().theta == pytest.approx(math.radians(30.0), abs=1e-6)
 
 
@@ -1672,11 +1839,15 @@ def test_rewind_spin_poses_keeps_the_turn_and_takes_the_matched_heading():
     assert poses[0].theta == pytest.approx(-0.2)
 
 
-def test_mapping_does_not_paint_a_scan_that_misses_the_map(tmp_path: Path):
+def test_mapping_does_not_paint_a_scan_that_misses_the_map(tmp_path: Path, monkeypatch):
+    import src.slam_builtin.engine as engine_mod
+
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": str(tmp_path), "mode": "mapping"}
     )
     heading = {"th": 0.0}
+    clock = {"t": 100.0}
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: clock["t"])
 
     class _Sensors(_FakeSensors):
         def get_scan(self, max_age_s: float = 2.0, *, fresh: bool = False):
@@ -1695,11 +1866,12 @@ def test_mapping_does_not_paint_a_scan_that_misses_the_map(tmp_path: Path):
     )  # type: ignore[arg-type]
     engine._tick()  # noqa: SLF001
     assert engine._updates == 1  # noqa: SLF001
-    # 30 deg is inside the odom jump gate; 10 s keeps the yaw rate under the
-    # in-place spin hold, so this tick is judged against the map as-is.
-    engine._last_tick_at -= 10.0  # noqa: SLF001
+    # 30 deg over 10 s is a turn the body can make, and keeps the yaw rate
+    # under the in-place spin hold, so this tick is judged against the map.
+    clock["t"] += 10.0
     heading["th"] = math.radians(30.0)
     engine._tick()  # noqa: SLF001
+    assert engine.get_pose().theta == pytest.approx(math.radians(30.0), abs=1e-6)
     assert engine._updates == 1  # noqa: SLF001
     assert engine._insert_skips_unmatched == 1  # noqa: SLF001
 
@@ -1729,10 +1901,11 @@ def test_spin_is_painted_at_the_heading_that_matches(tmp_path: Path):
     assert engine._updates == 1  # noqa: SLF001
     # In-place spin. The scan is what the room looks like at the true heading,
     # which stays 0 while the wheels run 30 degrees ahead.
-    engine._last_tick_at -= 0.1  # noqa: SLF001
-    heading["th"] = math.radians(30.0)
     view["th"] = 0.0
-    engine._tick()  # noqa: SLF001
+    for k in range(1, 4):
+        engine._last_tick_at -= 0.1  # noqa: SLF001
+        heading["th"] = math.radians(10.0 * k)
+        engine._tick()  # noqa: SLF001
     assert engine._updates == 1  # noqa: SLF001
     assert engine._spin_hold  # noqa: SLF001
     engine._last_tick_at -= 2.0  # noqa: SLF001
@@ -1746,6 +1919,97 @@ def test_spin_is_painted_at_the_heading_that_matches(tmp_path: Path):
     assert not engine._spin_hold  # noqa: SLF001
     assert engine.get_pose().theta == pytest.approx(0.0, abs=math.radians(6.0))
     assert engine._updates >= painted  # noqa: SLF001
+
+
+def _room_occ_map(truth: conv.Pose2D, half_x: float = 3.0, half_y: float = 2.0):
+    grid = occ.empty_grid(resolution=0.05, size_m=10.0)
+    room = _room_scan(truth, half_x=half_x, half_y=half_y)
+    for _ in range(4):
+        grid = occ.insert_scan(
+            grid, truth.x, truth.y, truth.theta, room.ranges, room.angle_min,
+            room.angle_increment, range_min=0.1, range_max=10.0, max_beams=360,
+        )
+    return scan_match.occupancy_map_from_int16(
+        occ.to_occupancy_int16(grid),
+        resolution=grid.resolution,
+        origin_x=grid.origin_x,
+        origin_y=grid.origin_y,
+    )
+
+
+def test_score_reads_the_same_next_to_unexplored_space():
+    """Beams into unknown cells are left out of the fraction, not counted against it."""
+    truth = conv.Pose2D(0.0, 0.0, 0.0)
+    full = _room_occ_map(truth, half_x=3.0, half_y=2.0)
+    scan = _room_scan(truth, half_x=3.0, half_y=2.0)
+    g = full.grid.copy()
+    xs = full.origin_x + (np.arange(g.shape[1]) + 0.5) * full.resolution
+    g[:, xs > 0.5] = -1  # nothing mapped to the right of the robot yet
+    half = scan_match.occupancy_map_from_int16(
+        g, resolution=full.resolution, origin_x=full.origin_x, origin_y=full.origin_y
+    )
+    assert scan_match.score_at_pose(full, scan, truth) == pytest.approx(1.0)
+    assert scan_match.score_at_pose(half, scan, truth) == pytest.approx(1.0)
+    assert scan_match.scan_map_fit(half, scan, truth) == "fit"
+    # A heading that turns the mapped walls into free space is still a miss.
+    turned = conv.Pose2D(0.0, 0.0, math.radians(30.0))
+    assert scan_match.score_at_pose(half, scan, turned) < 0.0
+    assert scan_match.scan_map_fit(half, scan, turned) == "miss"
+
+
+def test_candidate_cannot_win_by_shedding_beams_into_unknown():
+    """Sliding toward the frontier hides misses; the coverage guard refuses it."""
+    truth = conv.Pose2D(0.0, 0.0, 0.0)
+    full = _room_occ_map(truth, half_x=3.0, half_y=2.0)
+    g = full.grid.copy()
+    xs = full.origin_x + (np.arange(g.shape[1]) + 0.5) * full.resolution
+    g[:, xs > 0.5] = -1
+    half = scan_match.occupancy_map_from_int16(
+        g, resolution=full.resolution, origin_x=full.origin_x, origin_y=full.origin_y
+    )
+    scan = _room_scan(truth, half_x=3.0, half_y=2.0)
+    xy = scan_match.scan_endpoints_base_link(scan)
+    lookup = scan_match._inflate_occupied(half.grid >= 50, 2)  # noqa: SLF001
+    _s, cov_truth = scan_match._prior_score_and_coverage(  # noqa: SLF001
+        half, xy, truth, occupied_lookup=lookup
+    )
+    _s, cov_shed = scan_match._prior_score_and_coverage(  # noqa: SLF001
+        half, xy, conv.Pose2D(0.6, 0.0, 0.0), occupied_lookup=lookup
+    )
+    assert cov_shed < cov_truth - 0.05
+    scores = scan_match._candidate_scores(  # noqa: SLF001
+        half, xy, np.array([0.6]), np.array([0.0]), 0.0,
+        occupied_lookup=lookup, min_coverage=cov_truth - 0.05,
+    )
+    assert scores[0] == float("-inf")
+
+
+def test_refine_pose_finds_a_slip_past_the_fine_window():
+    """A skid of 0.5 m and 18° is outside ±0.3 m / ±12°; the wide pass sees it."""
+    truth = conv.Pose2D(0.8, 0.4, 0.0)
+    occ_map = _room_occ_map(truth)
+    scan = _room_scan(truth, half_x=3.0, half_y=2.0)
+    prior = conv.Pose2D(truth.x + 0.45, truth.y - 0.30, math.radians(18.0))
+    matched, score, prior_score, rival = scan_match.refine_pose(occ_map, scan, prior)
+    assert matched is not None
+    assert prior_score < 0.35
+    assert math.hypot(matched.x - truth.x, matched.y - truth.y) < 0.08
+    assert abs(conv.normalize_angle(matched.theta)) < math.radians(3.0)
+    assert score >= 0.45
+    assert score - rival >= 0.08
+
+
+def test_refine_pose_keeps_the_tight_window_when_aligned():
+    """A fitting prior stays on the fine search (cost and alias guard)."""
+    truth = conv.Pose2D(0.8, 0.4, 0.0)
+    occ_map = _room_occ_map(truth)
+    scan = _room_scan(truth, half_x=3.0, half_y=2.0)
+    prior = conv.Pose2D(truth.x + 0.04, truth.y, math.radians(1.0))
+    matched, score, prior_score, _rival = scan_match.refine_pose(occ_map, scan, prior)
+    assert prior_score >= 0.35
+    if matched is not None:
+        assert math.hypot(matched.x - truth.x, matched.y - truth.y) < 0.06
+        assert score >= prior_score
 
 
 def test_match_scan_leaves_out_a_depth_camera(monkeypatch):

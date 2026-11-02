@@ -40,6 +40,7 @@ from ..nav.global_localize import (
     load_occupancy_from_map_dir,
 )
 from ..nav.localize_worker import LocalizeWorker
+from ..nav.loc_state import LocalizationStateTracker
 from ..nav import pause_keyframes, slice_match
 from ..nav.maps import MapStore, validate_map_name
 from ..nav.pose_jump_gate import (
@@ -106,6 +107,8 @@ class SlamService(SLAM):
         self._mapping_revisit_task: Optional[asyncio.Task] = None
         self._last_relocalize_check: dict = {"status": "idle"}
         self._last_revisit_check: dict = {"status": "idle"}
+        # Folds those checks into one state the operator can read.
+        self._loc_state = LocalizationStateTracker()
         # Soft-loc nav_hold started_at / released: resume driving on the published
         # pose after a short hold when there is no large jump to confirm.
         self._soft_nav_hold_since: Optional[float] = None
@@ -1282,9 +1285,18 @@ class SlamService(SLAM):
         }
 
     def _publish_relocalize_check(self, result: Mapping[str, ValueTypes]) -> dict:
+        self._loc_state.observe(result)
         self._last_relocalize_check.clear()
         self._last_relocalize_check.update(result)
+        # The shared dict is what builtin nav reads; the state rides along so
+        # a goal refusal can say how long and what to do.
+        self._last_relocalize_check["state"] = self._loc_state.snapshot()
         return dict(self._last_relocalize_check)
+
+    def _mark_pose_seeded(self, reason: str) -> None:
+        """A pose was placed by hand or by an applied search: tracking again."""
+        self._loc_state.seeded(reason)
+        self._last_relocalize_check["state"] = self._loc_state.snapshot()
 
     def _localization_match_quality(
         self, match: Mapping[str, ValueTypes], cfg: SlamConfig
@@ -3037,6 +3049,7 @@ class SlamService(SLAM):
                     for lidar in self._cfg.lidars
                 ]
             status["localization_check"] = dict(self._last_relocalize_check)
+            status["localization_state"] = self._loc_state.snapshot()
             status["revisit_check"] = dict(self._last_revisit_check)
             if self._pause_keyframes is not None:
                 status["pause_keyframes"] = self._pause_keyframes.status()
@@ -3115,6 +3128,7 @@ class SlamService(SLAM):
             # corridor twin — otherwise the next watchdog tick can finish the
             # confirm and yank the pose back across the map.
             self._pose_jump_gate.clear()
+            self._mark_pose_seeded("set_initial_pose")
             # Also cancel boot full-map localize: it can still finish after the
             # user has already placed the robot and overwrite a good seed.
             self._cancel_startup_global_localize_task()
@@ -3182,6 +3196,7 @@ class SlamService(SLAM):
                     yaw_variance_rad2=yaw_variance_rad2,
                 ),
             )
+            self._mark_pose_seeded(cmd)
             return {
                 "status": "relocalizing",
                 "seed_pose": {"x": pose.x, "y": pose.y, "theta": pose.theta},
@@ -3624,6 +3639,7 @@ class SlamService(SLAM):
                 ),
             )
             did_apply = True
+            self._mark_pose_seeded("global_localize")
         elif apply_pose and apply_blocked_reason is not None:
             LOGGER.warning(
                 "global_localize: not applying (%s) score=%.3f ray_mae=%s "
@@ -3652,6 +3668,7 @@ class SlamService(SLAM):
             "scan_points_used": result.scan_points_used,
             "in_map_points": result.in_map_points,
             "hit_rate": result.hit_rate,
+            "coverage": round(float(getattr(result, "coverage", 0.0)), 3),
             "ray_score": result.ray_score,
             "ray_mae_m": result.ray_mae_m,
             "second_best_score": getattr(result, "second_best_score", None),

@@ -105,6 +105,36 @@ def test_status_maps_active_goal_and_velocity():
     assert len(status.goal.progress.path) == 2
 
 
+def test_not_localized_message_says_how_long_and_what_to_do():
+    from src.models.nav_api import not_localized_message
+
+    status = {
+        "pose": {"x": 0.0, "y": 0.0, "theta": 0.0},
+        "localization_check": {"status": "ambiguous", "score": 0.31},
+        "localization_state": {
+            "state": "lost",
+            "since_s": 94.0,
+            "last_attempt": {
+                "status": "ambiguous", "score": 0.31, "shift_m": 3.3, "shift_deg": 24.0,
+            },
+            "suggested_action": "set an initial pose near the robot",
+        },
+    }
+    msg = not_localized_message(status)
+    assert msg.startswith("not localized (lost for 94 s (ambiguous, best match 0.31 at 3.3 m / 24 deg)")
+    assert "set an initial pose" in msg
+    # The state can also ride inside the check dict (shared with SLAM).
+    status.pop("localization_state")
+    status["localization_check"]["state"] = {"state": "lost", "since_s": 10.0}
+    assert "lost for 10 s" in not_localized_message(status)
+    # With no state the old message still names the last check.
+    status["localization_check"] = {"status": "refused_large"}
+    assert not_localized_message(status) == (
+        "not localized (last check: refused_large); a new goal cannot start"
+    )
+    assert not_localized_message({}) == "not localized; a new goal cannot start"
+
+
 def test_untrusted_pose_is_not_localized():
     status = status_from_dict(
         {

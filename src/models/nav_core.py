@@ -879,6 +879,9 @@ class NavServiceBase(NavigationApi, Navigation):
                     goal["name"] = self._active_goal_name
                     status["goal"] = goal
                 status["localization_check"] = dict(runtime.localization_check)
+                state = runtime.localization_check.get("state")
+                if isinstance(state, dict):
+                    status["localization_state"] = dict(state)
                 pose = status.get("pose")
                 if not isinstance(pose, dict) or "x" not in pose:
                     live = self._live_map_pose_dict(mgr)

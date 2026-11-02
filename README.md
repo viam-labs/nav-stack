@@ -166,7 +166,7 @@ circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
 | lidar `mount.pitch`, `mount.roll` | SLAM | Mount tilt in radians (positive pitch = forward axis tilted down). Levels the cloud before z filtering — even a ~2° mast tilt pulls floor returns into the z band at 15–20 m and imprints phantom borders at max range (default `0`) |
 | `base_velocity_convention` | SLAM | `viam` (default, Y-forward) or `ros` (X-forward); legacy `mir` accepted as alias for `viam` — maps builtin nav `cmd_vel` to Viam base `SetVelocity` axes |
 | `scan_max_age_s` | SLAM | Safety cutoff for the `/scan` publish path: if the lidar reports a cache age (`get_laser_scan` `age_s`) above this, skip publishing that cycle rather than feed SLAM/builtin nav a stale, misregistered scan (default `2.0`) |
-| `scan_rate_hz` / `odom_rate_hz` | SLAM | Builtin SLAM tick rate is `max(scan_rate_hz, odom_rate_hz)` (default `10` each). Scan matching stays throttled (~3 Hz) separately |
+| `scan_rate_hz` / `odom_rate_hz` | SLAM | Builtin SLAM tick rate is `max(scan_rate_hz, odom_rate_hz)` (default `10` each). Scan matching stays throttled (~3 Hz) separately. Each match searches ±0.2 m / ±8° around a pose that already fits the scan, and a coarse ±0.6 m / ±24° pass first when it does not (a skid or a spin). Idle, a drift-sized step (≤0.15 m / 8°) applies at once and a larger jump needs two agreeing frames with no rival peak. While a goal is active the same drift step applies when the pose fits (prior ≥ 0.25), the base is not turning hard, and no second wall scores within 0.08 of the winner; a larger slip is walked in at that step only from a strong lone peak (≥ 0.45). `slam_diagnostics.drive_applies` counts those |
 | `control_rate_hz` | Nav | Builtin nav control rate (default `10`). Local costmap refreshes separately (`builtin.local_costmap_rate_hz`, default `10`) so follower ticks stay cheap |
 | `localize_subprocess` | SLAM | Run `global_localize` / periodic relocalize scoring in a dedicated subprocess so the matcher never holds this process's GIL (default `true`). Falls back in-process on error; health in `status.localize_worker` |
 | `obstacles_only_rate_hz` | Nav | Background refresh rate for `obstacles_only` depth cams (default `5`). Control tick never awaits GetPointCloud; prefer POSIX `shm_name` for 10–20 Hz |
@@ -526,8 +526,28 @@ await slam.do_command({"command": "global_localize", "apply": False})
 ```
 
 Returned fields include `pose`, `score`, `candidates_evaluated`, `scan_points_used`,
-`in_map_points`, `hit_rate`, `ray_score`, and `ray_mae_m`. If `in_map_points` is
-low or `ray_mae_m` is high, the match is unreliable.
+`in_map_points`, `hit_rate`, `coverage`, `ray_score`, and `ray_mae_m`. `score` is
+the fraction of the beams the map could judge that it explains (wall hit +1,
+known free cell −0.7); beams ending in unknown or off-grid cells are left out,
+so the same pose scores the same next to unexplored space as in a finished
+room. `coverage` is the judged fraction of the scan; a low `coverage` or a high
+`ray_mae_m` means the match is unreliable. Every scan-match score in the
+module (tracking, the mapping paint gate, the spin heading search, loop
+detection aside) reads on this scale, and a candidate that judges 5% less of
+the scan than the prior is refused, so a pose cannot win by sliding its misses
+into unmapped cells.
+
+`get_status` on both services carries `localization_state`: `tracking`,
+`degraded` (the pose fits loosely), `lost` (two watchdog cycles could not
+place the robot), or `map_mismatch` (a full-map search fits nowhere), with
+`since_s`, the last attempt's mode / score / shift, and a `suggested_action`.
+A refused goal repeats that line: `not localized (lost for 94 s (ambiguous,
+best match 0.31 at 3.3 m / 24 deg); set an initial pose near the robot ...)`.
+`slam_diagnostics.heading` counts heading-sensor steps the body could not have
+turned (`snaps_rejected`, above 120°/s over one sample) and the net yaw the
+scan has corrected since the last seed (`bias_deg_s` once 30 s have passed),
+and `yaw_only_applies` counts the heading-only corrections made while driving.
+
 Speed/robustness knobs: `local_yaw_window_deg`, `coarse_position_step_m`,
 `coarse_yaw_step_deg`, `max_scan_points`, `min_in_map_points`,
 `min_in_map_ratio`, `hit_radius_cells`, `ray_refine_candidates`,
