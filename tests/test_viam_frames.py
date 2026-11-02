@@ -21,8 +21,8 @@ from src.config import NavConfig, SlamConfig
 from src.viam_frames import (
     apply_framesystem_to_nav_cfg,
     apply_framesystem_to_slam_cfg,
-    fetch_frame_system_config,
     base_box_forward_lateral,
+    fetch_frame_system_config,
     pose_of_frame_in_destination,
 )
 

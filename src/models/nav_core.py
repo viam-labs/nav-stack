@@ -26,8 +26,8 @@ from viam.components.base import Base
 from viam.logging import getLogger
 from viam.proto.common import (
     GeoGeometry,
-    GeoPoint,
     Geometry,
+    GeoPoint,
     Pose,
     PoseInFrame,
     Transform,
@@ -49,9 +49,8 @@ from viam.proto.service.motion import (
 from viam.services.navigation import Navigation
 from viam.utils import ValueTypes
 
-from .nav_api import NavigationApi
-
 from ..config import NavConfig, body_twist_to_viam_set_velocity
+from ..geom import conversions as conv
 from ..nav import zones as zones_mod
 from ..nav.locations import LocationStore
 from ..nav.maps import MapHandle
@@ -65,7 +64,7 @@ from ..nav.simple_motion import (
     drive_to_pose,
 )
 from ..nav.zones import ZoneStore
-from ..geom import conversions as conv
+from .nav_api import NavigationApi
 
 LOGGER = getLogger(__name__)
 

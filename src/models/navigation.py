@@ -11,7 +11,6 @@ import asyncio
 from typing import ClassVar, Mapping, Optional, Sequence, cast
 
 from typing_extensions import Self
-
 from viam.components.base import Base
 from viam.logging import getLogger
 from viam.proto.app.robot import ServiceConfig

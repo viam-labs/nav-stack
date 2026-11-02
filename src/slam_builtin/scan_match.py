@@ -7,13 +7,13 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ..geom import conversions as conv
 from ..nav.global_localize import (
     OccupancyMap,
     _inflate_occupied,
     _score_pose,
     scan_endpoints_base_link,
 )
-from ..geom import conversions as conv
 
 
 def occupancy_map_from_int16(

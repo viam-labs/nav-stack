@@ -15,7 +15,6 @@ from typing import ClassVar, Mapping, Optional, Sequence
 
 import numpy as np
 from typing_extensions import Self
-
 from viam.components.camera import Camera
 from viam.logging import getLogger
 from viam.proto.app.robot import ComponentConfig
@@ -25,10 +24,10 @@ from viam.resource.registry import Registry, ResourceCreatorRegistration
 from viam.resource.types import Model, ModelFamily
 from viam.utils import struct_to_dict
 
+from ..geom import conversions as conv
 from ..lidar.rplidar_protocol import RPLidarError, model_name, scan_to_xyz_m
 from ..lidar.rplidar_serial import RPLidarSerial
 from ..lidar.serial_ports import list_candidate_serial_ports, normalize_exclude_list
-from ..geom import conversions as conv
 from ..shm import pcshm
 
 LOGGER = getLogger(__name__)

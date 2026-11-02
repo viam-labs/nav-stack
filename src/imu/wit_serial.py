@@ -122,7 +122,6 @@ class WitSerial:
             raise WitError("pyserial is not installed")
         from ..lidar.serial_ports import (
             port_chip_family,
-            shares_usb_hub_with_can,
             usb_serial_open_lock,
         )
 

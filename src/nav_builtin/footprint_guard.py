@@ -29,7 +29,11 @@ import numpy as np
 from ..geom import conversions as conv
 from .base_envelope import (
     ANG_EPS_RAD_S as BASE_ANG_EPS_RAD_S,
+)
+from .base_envelope import (
     LIN_EPS_MPS as BASE_LIN_EPS_MPS,
+)
+from .base_envelope import (
     keep_arc_inside_envelope,
     twist_reaches_base,
 )

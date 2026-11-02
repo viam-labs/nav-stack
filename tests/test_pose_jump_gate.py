@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import math
 
-from src.nav.pose_jump_gate import PoseJumpGate, should_hold_drive_for_pose_jump
 from src.geom import conversions as conv
+from src.nav.pose_jump_gate import PoseJumpGate, should_hold_drive_for_pose_jump
 
 
 def test_should_hold_drive_for_awaiting_confirm():

@@ -15,7 +15,6 @@ import asyncio
 from typing import ClassVar, Mapping, Optional, Sequence, cast
 
 from typing_extensions import Self
-
 from viam.components.base import Base
 from viam.components.camera import Camera
 from viam.logging import getLogger
@@ -36,7 +35,6 @@ from ..nav_builtin import (
     ViamWorldIO,
     make_builtin_navigator,
 )
-from ..shm.lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
     get_parent_robot,
@@ -45,6 +43,7 @@ from ..runtime import (
     unregister_nav_host,
     unregister_nav_viz,
 )
+from ..shm.lidar import ShmPointCloudClient
 from ..viam_frames import (
     apply_framesystem_footprint_to_slam_cfg,
     apply_framesystem_to_nav_cfg,

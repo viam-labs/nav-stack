@@ -8,7 +8,6 @@ import os
 import threading
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-
 LOGGER = logging.getLogger(__name__)
 
 # In-process registry so lidar + IMU (same module process) don't steal each

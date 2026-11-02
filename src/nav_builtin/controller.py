@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ..geom import conversions as conv
 from ..nav.simple_motion import (
     DriveCommand,
     ObstacleConfig,
@@ -20,15 +21,14 @@ from ..nav.simple_motion import (
     heading_error_rad,
     spin_clearance_m,
 )
-from ..geom import conversions as conv
 from .base_envelope import CRAWL_FLOOR_MPS, LIN_EPS_MPS
-from .escape import try_reverse as _try_narrow_reverse
 
 # Re-exports for tests / older call sites that imported these names here.
 from .escape import rear_open as _rear_open_for_unstick  # noqa: F401
 from .escape import reverse_command as _narrow_reverse_command  # noqa: F401
+from .escape import try_reverse as _try_narrow_reverse
 from .footprint_guard import FootprintGuard, obstacle_points
-from .local_costmap import LocalCostmapView, reverse_path_clear, spin_disc_blocked
+from .local_costmap import LocalCostmapView, spin_disc_blocked
 from .local_planner import LocalPlannerConfig, compute_local_command
 from .path_utils import closest_point_on_path, signed_crosstrack_m
 from .types import Path2D, Pose2D

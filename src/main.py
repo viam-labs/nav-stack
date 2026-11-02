@@ -12,15 +12,14 @@ import sys
 
 from viam.module.module import Module
 
-from .models.shm_pointcloud import ShmPointCloud
-from .models.rplidar_shm import RPLidarShm
-from .models.wit_imu import WitImu
-from .models.navigation_external import ExternalNavigationService
-from .models.navigation import NavigationService
 from .models.nav_camera import NavCamera
+from .models.navigation import NavigationService
+from .models.navigation_external import ExternalNavigationService
+from .models.rplidar_shm import RPLidarShm
+from .models.shm_pointcloud import ShmPointCloud
 from .models.sim_base import SimBase
 from .models.slam import SlamService
-
+from .models.wit_imu import WitImu
 
 # SLAM ticks, nav, the lidar/IMU readers and the module event loop share one
 # GIL. A pure-Python planner flood holds it for seconds; at the default 5 ms

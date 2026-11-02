@@ -30,10 +30,12 @@ from viam.services.navigation import (
     Properties,
     Route,
     RouteProgress,
-    Status as NavStatus,
     Velocity,
     Waypoint,
     Zone,
+)
+from viam.services.navigation import (
+    Status as NavStatus,
 )
 from viam.utils import dict_to_struct
 

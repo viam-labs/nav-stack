@@ -11,13 +11,13 @@ from unittest.mock import AsyncMock, MagicMock
 import numpy as np
 import pytest
 
+from src.geom import conversions as conv
 from src.nav_builtin.viam_io import (
     ViamWorldIO,
-    map_dict_to_get_grid,
     get_grid_response_to_map,
+    map_dict_to_get_grid,
 )
 from src.nav_builtin.viz_store import NavVizStore
-from src.geom import conversions as conv
 
 
 def test_bridge_map_get_grid_roundtrip():

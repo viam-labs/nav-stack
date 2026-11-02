@@ -21,8 +21,8 @@ from ..config import (
     body_twist_to_viam_set_velocity,
 )
 from ..geom import conversions as conv
-from ..slam_client import parse_get_grid, slam_pose_to_pose2d
 from ..shm import pcshm
+from ..slam_client import parse_get_grid, slam_pose_to_pose2d
 from .viz_store import NavVizStore
 from .world_io import WorldIO
 

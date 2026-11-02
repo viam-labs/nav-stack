@@ -15,7 +15,6 @@ from typing import ClassVar, Dict, List, Mapping, Optional, Sequence, cast
 
 import numpy as np
 from typing_extensions import Self
-
 from viam.components.base import Base
 from viam.components.camera import Camera
 from viam.components.movement_sensor import MovementSensor
@@ -35,14 +34,15 @@ from ..config import (
     SlamConfig,
     resolve_footprint,
 )
+from ..geom import conversions as conv
+from ..nav import pause_keyframes, slice_match
 from ..nav.global_localize import (
     GlobalLocalizeResult,
     load_occupancy_from_map_dict,
     load_occupancy_from_map_dir,
 )
-from ..nav.localize_worker import LocalizeWorker
 from ..nav.loc_state import LocalizationStateTracker
-from ..nav import pause_keyframes, slice_match
+from ..nav.localize_worker import LocalizeWorker
 from ..nav.maps import MapStore, validate_map_name
 from ..nav.pose_jump_gate import (
     JumpDecision,
@@ -50,8 +50,6 @@ from ..nav.pose_jump_gate import (
     candidate_beats_previous,
     stuck_refine_decision,
 )
-from ..geom import conversions as conv
-from ..shm.lidar import ShmPointCloudClient
 from ..runtime import (
     SlamRuntime,
     active_navigation_status,
@@ -62,12 +60,13 @@ from ..runtime import (
     unregister_slam,
     unregister_slam_service,
 )
+from ..shm.lidar import ShmPointCloudClient
+from ..slam_builtin import BuiltinSlamEngine, BuiltinSlamHost
+from ..slam_builtin.io_sensors import BuiltinSensors
 from ..viam_frames import (
     apply_framesystem_to_slam_cfg,
     fetch_frame_system_config,
 )
-from ..slam_builtin import BuiltinSlamEngine, BuiltinSlamHost
-from ..slam_builtin.io_sensors import BuiltinSensors
 
 LOGGER = getLogger(__name__)
 
