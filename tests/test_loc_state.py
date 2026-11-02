@@ -53,6 +53,20 @@ def test_correction_or_seed_returns_to_tracking():
     assert tracker.reason == "set_initial_pose"
 
 
+def test_tick_prior_already_good_clears_lost():
+    """Engine hold when the published pose already fits must not stay lost."""
+    tracker, _ = _tracker()
+    tracker.observe({"status": "nav_hold", "score": 0.4})
+    tracker.observe({"status": "nav_hold", "score": 0.4})
+    assert tracker.state == LOC_LOST
+    tracker.observe(
+        {"status": "previous_better", "score": 0.52, "prior_score": 0.58}
+    )
+    assert tracker.state == LOC_TRACKING
+    assert tracker.reason == "previous_better"
+    assert tracker.snapshot()["bad_cycles"] == 0
+
+
 def test_weak_unshifted_match_is_degraded_not_lost():
     tracker, _ = _tracker()
     for _ in range(5):

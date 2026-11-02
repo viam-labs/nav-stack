@@ -258,6 +258,10 @@ class SlamService(SLAM):
             logger=LOGGER.info,
             rate_hz=cfg.tick_rate_hz(),
         )
+        # Tick match holds (prior already good) / applies clear ``lost`` on
+        # localization_state — watchdog-only observe left sticky lost while
+        # match_held climbed every cycle.
+        self._engine.set_match_outcome_hook(self._on_tick_match_outcome)
         if cfg.uses_sim():
             # SimWorld is ground truth: SLAM pose tracks the body each tick.
             # Do not teleport the body when localize jumps the estimate —
@@ -750,6 +754,11 @@ class SlamService(SLAM):
     def _mark_pose_seeded(self, reason: str) -> None:
         """A pose was placed by hand or by an applied search: tracking again."""
         self._loc_state.seeded(reason)
+        self._last_relocalize_check["state"] = self._loc_state.snapshot()
+
+    def _on_tick_match_outcome(self, result: Mapping[str, ValueTypes]) -> None:
+        """Engine tick applied/held-good → localization_state tracking."""
+        self._loc_state.observe(result)
         self._last_relocalize_check["state"] = self._loc_state.snapshot()
 
     def _localization_match_quality(
