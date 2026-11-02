@@ -69,7 +69,14 @@ class LocalPlannerConfig:
 
 
 def _normalize_angles(th: np.ndarray) -> np.ndarray:
-    return (th + math.pi) % (2.0 * math.pi) - math.pi
+    """Wrap to ``(-pi, pi]``, matching :func:`conv.normalize_angle`.
+
+    Plain ``(th + pi) % 2pi - pi`` yields ``[-pi, pi)`` and maps exact ``pi``
+    to ``-pi``; fold that endpoint so batch rollouts match the scalar path.
+    """
+    two_pi = 2.0 * math.pi
+    out = np.mod(np.asarray(th, dtype=np.float64) + math.pi, two_pi) - math.pi
+    return np.where(out <= -math.pi, math.pi, out)
 
 
 def _simulate_batch(
@@ -740,8 +747,11 @@ def compute_local_command(
     res = float(view.occ.resolution)
     ox = float(view.occ.origin_x)
     oy = float(view.occ.origin_y)
-    cols = np.floor((xs - ox) / res).astype(np.int32)
-    rows = np.floor((ys - oy) / res).astype(np.int32)
+    # OccupancyGrid.world_to_cell uses toward-zero truncate (``int``), not
+    # floor — they disagree for negative (x - origin) / res and would change
+    # which near-edge / OOB samples the pre-vectorize path treated as hits.
+    cols = ((xs - ox) / res).astype(np.int32)
+    rows = ((ys - oy) / res).astype(np.int32)
     oob = (rows < 0) | (rows >= h) | (cols < 0) | (cols >= w)
     safe_r = np.clip(rows, 0, h - 1)
     safe_c = np.clip(cols, 0, w - 1)
