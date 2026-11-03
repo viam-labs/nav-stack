@@ -626,10 +626,13 @@ def test_navigate_route_loop_wraps_until_cancel(monkeypatch):
         )
         assert started["loop"] is True
         # Wait until we've wrapped onto a second lap (3rd navigate = a again).
-        for _ in range(200):
-            await _real_sleep(0)
-            if mgr.navigate.call_count >= 3:
-                break
+        # Each leg crosses asyncio.to_thread, so give it real time rather
+        # than a fixed number of loop turns (see 409912d).
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while (
+            mgr.navigate.call_count < 3 and asyncio.get_running_loop().time() < deadline
+        ):
+            await _real_sleep(0.01)
         assert mgr.navigate.call_count >= 3
         assert nav._route_status.get("loop") is True
         assert int(nav._route_status.get("lap", 0)) >= 1
