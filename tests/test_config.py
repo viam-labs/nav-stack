@@ -172,7 +172,14 @@ def test_slam_config_map_when_still_livox_defaults():
     assert cfg.mapping_revisit_min_score == pytest.approx(0.6)
     assert cfg.mapping_revisit_full_map_min_score == pytest.approx(0.75)
     assert cfg.mapping_revisit_min_shift_m == pytest.approx(1.0)
-    assert cfg.mapping_revisit_max_shift_m == pytest.approx(10.0)
+    assert cfg.mapping_revisit_max_shift_m == pytest.approx(12.0)
+    assert cfg.mapping_revisit_max_shift_soft_m == pytest.approx(3.0)
+    # Soft band only opens above min_score; the 10.5 m near-miss clears the base.
+    assert cfg.mapping_revisit_allowed_shift_m(0.57) == pytest.approx(12.0)
+    assert cfg.mapping_revisit_allowed_shift_m(1.0) == pytest.approx(15.0)
+    assert cfg.builtin_loop_max_yaw_long_gap_deg == pytest.approx(8.0)
+    assert cfg.builtin_loop_pending_max_s == pytest.approx(8.0)
+    assert cfg.builtin_loop_pending_max_tries == 4
     assert cfg.mapping_revisit_full_map_fallback is False
     # Multi-height-slice verification defaults (3D lidar).
     assert cfg.mapping_revisit_slice_verify is True

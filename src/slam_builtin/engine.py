@@ -184,11 +184,15 @@ class BuiltinSlamEngine:
             search_radius_m=float(cfg.builtin_loop_search_radius_m),
             window_m=float(cfg.builtin_loop_search_window_m),
             window_deg=float(cfg.builtin_loop_search_window_deg),
+            max_yaw_long_gap_deg=float(cfg.builtin_loop_max_yaw_long_gap_deg),
             min_score=float(cfg.builtin_loop_min_score),
         )
+        self._loop_pending_max_s = float(cfg.builtin_loop_pending_max_s)
+        self._loop_pending_max_tries = max(2, int(cfg.builtin_loop_pending_max_tries))
         self._loop_event = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
         self._loop_last_attempt_at = 0.0
+        # (revision, node, corr, edge, started_at, tries) or None.
         self._loop_pending: Optional[tuple] = None
         self._loop_full_logged = False
         self._loop_stats: dict = {
@@ -196,6 +200,7 @@ class BuiltinSlamEngine:
             "closures": 0,
             "optimizations": 0,
             "rejected_inconsistent": 0,
+            "pending_expired": 0,
             "reasons": {},
             "last": None,
             "last_optimize_ms": None,
@@ -650,8 +655,11 @@ class BuiltinSlamEngine:
                 )
                 if anchor is None:
                     anchor = self._graph.earliest_node_near(target)
+                allowed_shift = cfg.mapping_revisit_allowed_shift_m(
+                    float(score) if score is not None else cfg.mapping_revisit_min_score
+                )
                 plausible = (
-                    shift_m <= float(cfg.mapping_revisit_max_shift_m)
+                    shift_m <= allowed_shift
                     and shift_deg <= self._GRAPH_CORRECTION_MAX_DEG
                 )
                 if anchor is not None and anchor < cur:
@@ -899,17 +907,52 @@ class BuiltinSlamEngine:
             prior = snap.pose(cur)
             corr = pg.world_correction(prior, match.pose)
             edge = self._loop_edge(snap, cur, match)
+            now_mono = time.monotonic()
             pending = self._loop_pending
-            if (
-                pending is None
-                or pending[0] != revision
-                or pending[1] == cur
-                or not self._corrections_agree(pending[2], corr, prior)
-            ):
-                self._loop_pending = (revision, cur, corr, edge)
+            # A pending match that never finds an agreeing second detection used
+            # to sit ``pending=true`` forever while the map kept tearing. Expire
+            # it so the next cycle starts clean — never apply a single unconfirmed
+            # edge (that is what the two-agree gate is for).
+            if pending is not None:
+                age_s = now_mono - pending[4]
+                if (
+                    age_s >= self._loop_pending_max_s
+                    or pending[5] >= self._loop_pending_max_tries
+                ):
+                    self._loop_pending = None
+                    stats["pending_expired"] += 1
+                    stats["reasons"]["pending_expired"] = (
+                        stats["reasons"].get("pending_expired", 0) + 1
+                    )
+                    pending = None
+            agree = (
+                pending is not None
+                and pending[0] == revision
+                and pending[1] != cur
+                and self._corrections_agree(pending[2], corr, prior)
+            )
+            if not agree:
+                if pending is None:
+                    self._loop_pending = (revision, cur, corr, edge, now_mono, 1)
+                    return {"status": "pending"}
+                tries = pending[5] + 1
+                if (
+                    tries >= self._loop_pending_max_tries
+                    or (now_mono - pending[4]) >= self._loop_pending_max_s
+                ):
+                    self._loop_pending = None
+                    stats["pending_expired"] += 1
+                    stats["reasons"]["pending_expired"] = (
+                        stats["reasons"].get("pending_expired", 0) + 1
+                    )
+                    # Arm a fresh pending from this match so the next agreeing
+                    # detection can still close; do not leave the old one hanging.
+                    self._loop_pending = (revision, cur, corr, edge, now_mono, 1)
+                    return {"status": "pending_expired"}
+                self._loop_pending = (revision, cur, corr, edge, pending[4], tries)
                 return {"status": "pending"}
-            self._loop_pending = None
             edges = [pending[3], edge]
+            self._loop_pending = None
             with self._lock:
                 if self._graph_revision != revision:
                     return {"status": "aborted"}
@@ -1151,10 +1194,21 @@ class BuiltinSlamEngine:
                     "loop_edges": self._graph.loop_edge_count(),
                     "graph_full": self._graph.full,
                     "pending": self._loop_pending is not None,
+                    "pending_age_s": (
+                        None
+                        if self._loop_pending is None
+                        else round(time.monotonic() - self._loop_pending[4], 2)
+                    ),
+                    "pending_tries": (
+                        None
+                        if self._loop_pending is None
+                        else int(self._loop_pending[5])
+                    ),
                     "attempts": self._loop_stats["attempts"],
                     "closures": self._loop_stats["closures"],
                     "optimizations": self._loop_stats["optimizations"],
                     "rejected_inconsistent": self._loop_stats["rejected_inconsistent"],
+                    "pending_expired": self._loop_stats["pending_expired"],
                     "reasons": dict(self._loop_stats["reasons"]),
                     "last": self._loop_stats["last"],
                     "last_optimize_ms": self._loop_stats["last_optimize_ms"],

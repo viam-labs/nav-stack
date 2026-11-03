@@ -35,12 +35,29 @@ class LoopClosureParams:
     query_max_range_m: float = 12.0
     window_m: float = 8.0
     window_deg: float = 45.0
+    # Yaw cap as gap → ∞. Short loops still use ``window_deg``; long returns
+    # must stay nearly parallel or the optimizer shears the corridor.
+    max_yaw_long_gap_deg: float = 8.0
     min_score: float = 0.55
     min_overlap: float = 0.3
     min_points: int = 60
     drift_fraction: float = 0.10
     max_std_m: float = 0.35
     max_std_deg: float = 4.0
+
+
+def allowed_yaw_deg(params: LoopClosureParams, gap_m: float) -> float:
+    """Max |Δyaw| for a loop of path length ``gap_m``.
+
+    Scales from ``window_deg`` at ``min_travel_gap_m`` down to
+    ``max_yaw_long_gap_deg`` for long returns.
+    """
+    span = max(float(gap_m), float(params.min_travel_gap_m))
+    scaled = float(params.window_deg) * (float(params.min_travel_gap_m) / span)
+    return min(
+        float(params.window_deg),
+        max(float(params.max_yaw_long_gap_deg), scaled),
+    )
 
 
 @dataclass
@@ -422,10 +439,10 @@ def detect(
     shift = math.hypot(dx, dy)
     if anchor is not None:
         allowed = max(0.3, params.drift_fraction * m.gap_m)
-        # Heading slip is not proportional to distance, so a spin can close
-        # inside the search window. Translation stays a fraction of the loop:
-        # a long loop may use the whole window, a short one may not.
-        allowed_deg = params.window_deg
+        # Heading slip is not proportional to distance on a short spin, but on
+        # a long return the corridors must stay nearly parallel — a 22° snap
+        # over a 60 m loop shears the map into a tear.
+        allowed_deg = allowed_yaw_deg(params, m.gap_m)
         if shift > allowed or abs(math.degrees(dth)) > allowed_deg:
             return m, "implausible_drift"
     return m, "ok"

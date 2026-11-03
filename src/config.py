@@ -810,7 +810,12 @@ class SlamConfig:
     # (below = normal jitter) and not absurdly far (above = likely false match).
     mapping_revisit_min_shift_m: float = 1.0
     mapping_revisit_min_shift_deg: float = 10.0
-    mapping_revisit_max_shift_m: float = 10.0
+    # Hard base cap. Soft excess (below) lets a strong match a bit past the
+    # base through — a 10.5 m rejoin used to die on a hard 10.0 m ceiling.
+    mapping_revisit_max_shift_m: float = 12.0
+    # Extra meters allowed as the match score rises above min_score, up to
+    # max_shift_m + soft. 0 disables the soft band.
+    mapping_revisit_max_shift_soft_m: float = 3.0
     # Full-map fallback needs a stronger score: self-similar offices produce
     # convincing wrong corridors at map scale.
     # Off: a mapping revisit already has a pose, so a weak local match stays
@@ -859,8 +864,16 @@ class SlamConfig:
     builtin_loop_search_radius_m: float = 4.0
     builtin_loop_search_window_m: float = 8.0
     builtin_loop_search_window_deg: float = 45.0
+    # On a long return the corridors should stay roughly parallel. A 22° snap
+    # over a 60 m loop shears the map; this floor is the yaw cap as gap → ∞.
+    # Short loops still use up to ``builtin_loop_search_window_deg``.
+    builtin_loop_max_yaw_long_gap_deg: float = 8.0
     builtin_loop_min_score: float = 0.55
     builtin_loop_check_interval_s: float = 2.0
+    # Two agreeing detections must land within this window; past it the
+    # pending match is dropped so ``pending`` cannot sit true forever.
+    builtin_loop_pending_max_s: float = 8.0
+    builtin_loop_pending_max_tries: int = 4
     # Newest nodes moved by one optimization (older ones stay fixed).
     builtin_loop_max_window_nodes: int = 900
     # Allow mapping revisit / loop-closure corrections while the robot is
@@ -1291,6 +1304,24 @@ class SlamConfig:
             if key in d:
                 overrides[key] = d[key] or defs[key]
         return _dataclass_from_dict(cls, d, overrides=overrides)
+
+    def mapping_revisit_allowed_shift_m(self, score: float) -> float:
+        """Max XY shift a mapping revisit may apply for this match score.
+
+        Below ``mapping_revisit_min_score`` the hard base cap applies. Above it
+        the allowed shift grows linearly toward
+        ``max_shift_m + max_shift_soft_m`` so a strong rejoin a bit past the
+        base (the 10.5 m / 10.0 m miss that left a doubled corridor) is kept.
+        """
+        base = float(self.mapping_revisit_max_shift_m)
+        soft = float(self.mapping_revisit_max_shift_soft_m)
+        if soft <= 0.0 or not math.isfinite(score):
+            return base
+        min_s = float(self.mapping_revisit_min_score)
+        if score <= min_s:
+            return base
+        t = min(1.0, (float(score) - min_s) / max(1e-6, 1.0 - min_s))
+        return base + soft * t
 
     def required_dependencies(self) -> List[str]:
         if self.sim.enabled:
