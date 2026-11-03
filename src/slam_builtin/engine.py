@@ -717,12 +717,14 @@ class BuiltinSlamEngine:
                     # drift happened after it. Move the live pose, not the map.
                     self._set_corrected_pose_locked(matched_pose)
                     method, first_free, live = "pose_only", None, None
-                elif self._graph_base is not None:
+                elif self._trusted_base_locked() is not None:
                     # Mapping resumed on a loaded map: the match is against
                     # geometry no node of this session drew, so the whole
                     # session moves together onto it.
                     self._graph.apply_world_correction_from(0, corr)
                     method, first_free, live = "rigid", None, corr
+                elif self._graph_base is not None:
+                    method, first_free, live = "rejected_untrusted_base", None, None
                 else:
                     method, first_free, live = "rejected_no_anchor", None, None
             if method == "pose_only":
@@ -884,6 +886,10 @@ class BuiltinSlamEngine:
         "degrading": 6.0,
     }
 
+    # A resumed map this torn holds two copies of some walls; matching the
+    # session against it picks one at random, so loop/revisit ignore it.
+    _BASE_DISTRUST_STATUSES = ("degrading",)
+
     def refresh_map_health(self, *, force: bool = False) -> dict:
         """Update cached occupancy health; no-op when not mapping or too soon."""
         now = time.monotonic()
@@ -895,6 +901,7 @@ class BuiltinSlamEngine:
             if (
                 not force
                 and gen == self._map_health_generation
+                and self._graph_base is self._map_health_base_src
                 and now - self._map_health_at < self._MAP_HEALTH_MIN_S
             ):
                 return dict(self._map_health)
@@ -921,8 +928,10 @@ class BuiltinSlamEngine:
                     origin_y=base_origin[1],
                 )
                 self._map_health_base_cells = base_cells
+                trusted = base_health.status not in self._BASE_DISTRUST_STATUSES
                 self._map_health_base = {
                     **base_health.as_dict(),
+                    "trusted": trusted,
                     "origin_x": base_origin[0],
                     "origin_y": base_origin[1],
                 }
@@ -932,6 +941,14 @@ class BuiltinSlamEngine:
                     f"angle_std={base_health.angle_std_deg:.1f}deg; "
                     "scoring only walls this session adds"
                 )
+                if not trusted:
+                    self._log(
+                        "WARNING: mapping resumed on a damaged map (ghost walls / "
+                        "skewed tiles); loop closure and revisit will not snap "
+                        "this session onto it. Scan tracking still uses it, so "
+                        "doubled areas can keep doubling: clear_map and remap "
+                        "is recommended"
+                    )
             baseline = None
             if self._map_health_base_cells is not None and self._map_health_base:
                 baseline = map_health.align_grid(
@@ -958,6 +975,8 @@ class BuiltinSlamEngine:
                 for k, v in self._map_health_base.items()
                 if k not in ("origin_x", "origin_y")
             }
+            if not self._map_health_base["trusted"]:
+                payload["recommendation"] = "clear_map"
         prev = self._map_health_last_status
         if health.status != prev and health.status in ("watch", "degrading"):
             self._map_health_boosts += 1
@@ -983,6 +1002,18 @@ class BuiltinSlamEngine:
 
     def _map_health_status(self) -> str:
         return str(self._map_health.get("status") or "cold")
+
+    def _trusted_base_locked(self) -> Optional[LogOddsGrid]:
+        """The resumed map, unless its health check found it torn."""
+        base = self._graph_base
+        if (
+            base is not None
+            and base is self._map_health_base_src
+            and self._map_health_base is not None
+            and not self._map_health_base["trusted"]
+        ):
+            return None
+        return base
 
     def _pending_limits(self) -> tuple[float, int]:
         """Effective (max_s, max_tries) for the two-agree loop gate."""
@@ -1041,7 +1072,7 @@ class BuiltinSlamEngine:
                         )
                     return {"status": "graph_full"}
                 snap = self._graph.snapshot()
-                base = self._graph_base
+                base = self._trusted_base_locked()
                 res = self._grid.resolution
                 revision = self._graph_revision
             match, reason = loop_closure.detect(

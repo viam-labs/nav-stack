@@ -179,6 +179,77 @@ def test_engine_scores_session_against_resumed_map(tmp_path):
     )
 
 
+def _resume_on(tmp_path, cells, res):
+    from src.slam_builtin import occupancy as occ
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine(tmp_path)
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        cells, resolution=res, origin_x=-2.0, origin_y=-3.0
+    )
+    engine._graph_base = occ.copy_grid(engine._grid)  # noqa: SLF001
+    engine.refresh_map_health(force=True)
+    return engine
+
+
+def _clean_hallway():
+    grid, res = _blank(220, 220)
+    grid[20:200, 20:200] = 0
+    for c in (60, 100, 140):
+        _paint_wall(grid, 30, 190, c, c + 2)
+    return grid, res
+
+
+def test_torn_resumed_map_is_not_used_by_loop_closure(tmp_path, monkeypatch):
+    from src.slam_builtin import loop_closure
+    from src.slam_builtin.engine import BuiltinSlamEngine
+
+    seen = []
+
+    def fake_detect(snap, params, *, resolution, base=None):
+        seen.append(base)
+        return None, "no_candidates"
+
+    monkeypatch.setattr(loop_closure, "detect", fake_detect)
+    monkeypatch.setattr(BuiltinSlamEngine, "_loop_closure_enabled", lambda self: True)
+
+    torn = _resume_on(tmp_path, *_ghost_hallway())
+    health = torn.map_health()
+    assert health["baseline"]["trusted"] is False
+    assert health["recommendation"] == "clear_map"
+    torn.run_loop_closure()
+    assert seen[-1] is None
+
+    clean = _resume_on(tmp_path, *_clean_hallway())
+    health = clean.map_health()
+    assert health["baseline"]["trusted"] is True
+    assert "recommendation" not in health
+    clean.run_loop_closure()
+    assert seen[-1] is clean._graph_base  # noqa: SLF001
+
+
+def test_revisit_does_not_snap_session_onto_torn_resumed_map(tmp_path):
+    import math
+
+    from src.geom import conversions as conv
+
+    scan = conv.LaserScan2D(np.full(80, 2.0), -math.pi, 2 * math.pi / 80, 0.1, 10.0)
+    start = conv.Pose2D(0.0, 0.0, 0.0)
+    target = conv.Pose2D(1.8, 0.0, 0.0)
+
+    torn = _resume_on(tmp_path, *_ghost_hallway())
+    torn._graph.add_scan(start, scan)  # noqa: SLF001
+    out = torn.apply_map_pose_correction(target, score=0.9)
+    assert out["method"] == "rejected_untrusted_base"
+    assert torn.get_pose() == start
+
+    clean = _resume_on(tmp_path, *_clean_hallway())
+    clean._graph.add_scan(start, scan)  # noqa: SLF001
+    out = clean.apply_map_pose_correction(target, score=0.9)
+    assert out["method"] == "rigid"
+
+
 def _engine(tmp_path):
     from src.config import SlamConfig
     from src.nav.stores.maps import MapStore
