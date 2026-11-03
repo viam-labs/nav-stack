@@ -18,7 +18,7 @@ import numpy as np
 from ..geom import conversions as conv
 from ..nav.localize.global_localize import _inflate_occupied
 from . import occupancy as occ
-from .pose_graph import GraphSnapshot, render_grid
+from .pose_graph import PRIOR_NODE, GraphEdge, GraphSnapshot, render_grid
 from .types import LogOddsGrid
 
 
@@ -93,12 +93,14 @@ def old_node_indices(
     min_travel_gap_m: float,
     radius_m: float,
     max_nodes: int = 0,
+    min_node: int = 0,
 ) -> List[int]:
     """Nodes far enough behind ``cur`` along the path and near it in space."""
     if cur <= 0:
         return []
     limit = snap.travel[cur] - float(min_travel_gap_m)
     old = np.nonzero(snap.travel[:cur] <= limit)[0]
+    old = old[old >= int(min_node)]
     if old.size == 0:
         return []
     d = np.hypot(
@@ -356,14 +358,30 @@ def match_against(
     )
 
 
+def edge_from_match(snap: GraphSnapshot, cur: int, match: LoopMatch) -> GraphEdge:
+    """Loop edge from ``match.anchor`` (or a prior when none) to node ``cur``."""
+    # Match covariance is map-frame; edge errors are in the matched pose frame.
+    c, s = math.cos(match.pose.theta), math.sin(match.pose.theta)
+    rot = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
+    info = np.linalg.inv(rot @ match.cov @ rot.T)
+    if match.anchor is None:
+        return GraphEdge(PRIOR_NODE, cur, match.pose, info, loop=True)
+    rel = conv.compose_poses(conv.invert_pose(snap.pose(match.anchor)), match.pose)
+    return GraphEdge(match.anchor, cur, rel, info, loop=True)
+
+
 def detect(
     snap: GraphSnapshot,
     params: LoopClosureParams,
     *,
     resolution: float,
     base: Optional[LogOddsGrid] = None,
+    min_node: int = 0,
 ) -> Tuple[Optional[LoopMatch], str]:
-    """Match the newest node against older keyframes. Returns ``(match, reason)``."""
+    """Match the newest node against older keyframes. Returns ``(match, reason)``.
+
+    Nodes below ``min_node`` are not used as reference geometry.
+    """
     cur = len(snap) - 1
     if cur < 1:
         return None, "no_nodes"
@@ -374,6 +392,7 @@ def detect(
         min_travel_gap_m=params.min_travel_gap_m,
         radius_m=params.submap_radius_m,
         max_nodes=params.submap_max_nodes,
+        min_node=min_node,
     )
     near = [
         i

@@ -876,6 +876,13 @@ class SlamConfig:
     builtin_loop_pending_max_tries: int = 4
     # Newest nodes moved by one optimization (older ones stay fixed).
     builtin_loop_max_window_nodes: int = 900
+    # Save the keyframe pose graph (``keyframes.npz``) with map.pgm so a later
+    # mapping session reloads it and repair can re-solve old geometry.
+    builtin_save_keyframes: bool = True
+    # After save_map while mapping, re-detect loops over the whole graph in the
+    # background and apply only if the map was torn and gets clearly healthier.
+    builtin_repair_on_save: bool = True
+    builtin_repair_max_s: float = 600.0
     # Allow mapping revisit / loop-closure corrections while the robot is
     # moving. Default on for continuous-scan backends (builtin); off when
     # map_when_still is on, where odom TF shifts mid-hop are unsafe.

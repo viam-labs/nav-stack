@@ -452,7 +452,7 @@ def test_loop_pending_expires_instead_of_hanging(monkeypatch):
 
     n = {"i": 0}
 
-    def fake_detect(snap, params, resolution=0.05, base=None):
+    def fake_detect(snap, params, resolution=0.05, base=None, **_kw):
         # Each call: ok match at a new node pose, yaw wobbling so they disagree.
         n["i"] += 1
         cur = len(snap) - 1

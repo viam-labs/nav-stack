@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -84,8 +85,11 @@ def save_occupancy(
     *,
     occupied_thresh: float = 0.65,
     free_thresh: float = 0.196,
-) -> None:
-    """Write Nav2-style ``map.yaml`` + ``map.pgm`` (image top-down)."""
+) -> str:
+    """Write Nav2-style ``map.yaml`` + ``map.pgm`` (image top-down).
+
+    Returns the SHA-1 of the written ``map.pgm`` bytes.
+    """
     map_dir.mkdir(parents=True, exist_ok=True)
     int16 = occ.to_occupancy_int16(grid)
     # OccupancyGrid is bottom-up; map_server PGM is top-down.
@@ -105,7 +109,8 @@ def save_occupancy(
     h, w = pixels.shape
     header = f"P5\n{w} {h}\n255\n".encode("ascii")
     pgm_path = map_dir / "map.pgm"
-    pgm_path.write_bytes(header + pixels.tobytes())
+    data = header + pixels.tobytes()
+    pgm_path.write_bytes(data)
 
     yaml_text = (
         f"image: map.pgm\n"
@@ -117,3 +122,4 @@ def save_occupancy(
         f"free_thresh: {free_thresh}\n"
     )
     (map_dir / "map.yaml").write_text(yaml_text, encoding="utf-8")
+    return hashlib.sha1(data).hexdigest()

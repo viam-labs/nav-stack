@@ -87,8 +87,23 @@ _SLAM_DO_ALIASES = build_alias_map(
         "relocalize": ("refine_localization",),
         "clear_obstacles": ("erase_obstacles",),
         "add_obstacles": ("mark_obstacles",),
+        "repair_map": ("repair",),
     }
 )
+
+
+def _repair_apply_arg(value) -> object:
+    """``repair_map`` ``apply``: ``"auto"`` (default), ``true``/``"force"``, ``false``."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("auto", ""):
+        return "auto"
+    if text in ("true", "force", "yes"):
+        return True
+    if text in ("false", "no", "dry_run", "never"):
+        return False
+    raise ValueError("apply must be 'auto', true/'force', or false/'dry_run'")
 
 
 class SlamService(SLAM):
@@ -1593,6 +1608,9 @@ class SlamService(SLAM):
             "start_localizing": self._cmd_start_localizing,
             "save_map": self._cmd_save_map,
             "optimize": self._cmd_optimize,
+            "repair_map": self._cmd_repair_map,
+            "repair_status": self._cmd_repair_status,
+            "undo_repair": self._cmd_undo_repair,
             "set_initial_pose": self._cmd_set_initial_pose,
             "relocalize": self._cmd_relocalize,
             "global_localize": self._cmd_global_localize,
@@ -1766,8 +1784,56 @@ class SlamService(SLAM):
             raise ValueError("no active map")
         # save_map runs ros2 CLI subprocesses (30-40s timeouts); keep the
         # event loop free so mapping TF/scans continue while saving.
-        await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
-        return {"status": "saved", "map": handle.name}
+        result = await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
+        out = {"status": "saved", "map": handle.name}
+        if isinstance(result, Mapping):
+            out.update({k: v for k, v in result.items() if k not in out})
+        return out
+
+    def _builtin_map_fn(self, name: str):
+        fn = getattr(self._manager, name, None)
+        if fn is None:
+            raise RuntimeError(f"{name} requires slam_backend=builtin")
+        return fn
+
+    async def _cmd_repair_map(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        assert store is not None
+        if self._cfg is not None and self._cfg.mode != MODE_MAPPING:
+            raise ValueError(
+                "repair_map requires SLAM mode mapping; call start_mapping on "
+                "this map first (its saved keyframes reload with it)"
+            )
+        handle = store.active_handle()
+        if not handle:
+            raise ValueError("no active map")
+        apply = _repair_apply_arg(command.get("apply", "auto"))
+        start = self._builtin_map_fn("start_repair")
+        out = dict(
+            await asyncio.to_thread(start, handle.serialization_stem, apply=apply)
+        )
+        out["map"] = handle.name
+        return out
+
+    async def _cmd_repair_status(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        return dict(self._builtin_map_fn("repair_status")())
+
+    async def _cmd_undo_repair(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        assert store is not None
+        handle = store.active_handle()
+        if not handle:
+            raise ValueError("no active map")
+        undo = self._builtin_map_fn("undo_repair")
+        out = dict(await asyncio.to_thread(undo, handle.serialization_stem))
+        out["map"] = handle.name
+        return out
 
     async def _cmd_optimize(
         self, command: Mapping[str, ValueTypes]

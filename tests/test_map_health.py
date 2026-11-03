@@ -155,6 +155,7 @@ def test_engine_scores_session_against_resumed_map(tmp_path):
         torn, resolution=res, origin_x=-2.0, origin_y=-3.0
     )
     engine._graph_base = occ.copy_grid(engine._grid)  # noqa: SLF001
+    engine._session_baseline = engine._graph_base  # noqa: SLF001
     out = engine.refresh_map_health(force=True)
     assert out["scope"] == "session"
     assert out["status"] == "cold"
@@ -189,6 +190,7 @@ def _resume_on(tmp_path, cells, res):
         cells, resolution=res, origin_x=-2.0, origin_y=-3.0
     )
     engine._graph_base = occ.copy_grid(engine._grid)  # noqa: SLF001
+    engine._session_baseline = engine._graph_base  # noqa: SLF001
     engine.refresh_map_health(force=True)
     return engine
 
@@ -207,7 +209,7 @@ def test_torn_resumed_map_is_not_used_by_loop_closure(tmp_path, monkeypatch):
 
     seen = []
 
-    def fake_detect(snap, params, *, resolution, base=None):
+    def fake_detect(snap, params, *, resolution, base=None, **_kw):
         seen.append(base)
         return None, "no_candidates"
 
