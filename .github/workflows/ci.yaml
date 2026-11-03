@@ -54,7 +54,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest pytest-asyncio pytest-timeout
+        run: pip install -r requirements.txt pytest pytest-asyncio pytest-timeout pytest-xdist
 
       # Catches syntax errors in files no test imports, such as the entrypoint.
       - name: Compile
@@ -62,5 +62,6 @@ jobs:
 
       # An explicit timeout so a test blocked on hardware that isn't there
       # fails fast instead of holding the runner until the job timeout.
+      # -n auto parallelizes across runner cores (posix SHM names in tests are unique).
       - name: Test
-        run: python -m pytest -q --timeout 300
+        run: python -m pytest -q --timeout 300 -n auto
