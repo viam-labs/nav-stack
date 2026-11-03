@@ -506,6 +506,17 @@ def test_navigate_route_suspend_resume(monkeypatch):
 
     monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
 
+    # The route task reaches the manager through asyncio.to_thread, so each
+    # step needs real time on a busy runner; a fixed number of loop turns is
+    # not enough.
+    async def _wait_for(check, what):
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            if check():
+                return
+            await _real_sleep(0.01)
+        raise AssertionError(f"timed out waiting for {what}")
+
     async def _run():
         await nav.do_command(
             {
@@ -514,13 +525,13 @@ def test_navigate_route_suspend_resume(monkeypatch):
                 "wait": False,
             }
         )
-        for _ in range(30):
-            await _real_sleep(0)
-            if (
+        await _wait_for(
+            lambda: (
                 nav._route_status.get("state") == "active"
                 and mgr.navigate.call_count >= 1
-            ):
-                break
+            ),
+            "the route to become active",
+        )
         suspended = await nav.do_command({"command": "suspend", "reason": "safety"})
         assert suspended["status"] == "suspended"
         assert suspended["goal"]["route"] == "inline"
@@ -550,11 +561,10 @@ def test_navigate_route_suspend_resume(monkeypatch):
         resumed = await nav.do_command({"command": "resume"})
         assert resumed["status"] == "navigating"
         assert resumed["motion"] == "route"
-        for _ in range(100):
-            await _real_sleep(0)
-            if nav._route_status.get("state") == "succeeded":
-                break
-        assert nav._route_status["state"] == "succeeded"
+        await _wait_for(
+            lambda: nav._route_status.get("state") == "succeeded",
+            "the route to succeed",
+        )
         assert mgr.navigate.call_count >= 2
 
     asyncio.run(_run())
