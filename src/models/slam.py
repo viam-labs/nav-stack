@@ -444,9 +444,19 @@ class SlamService(SLAM):
         current pose first, wider only when needed — and on a strong disagreeing
         match shifts the odom TF so the next scans link back to the original
         geometry.
+
+        When live ``map_health`` is watch/degrading the sleep shortens so a
+        doorway return can correct before another corridor copy is painted.
         """
         while True:
-            await asyncio.sleep(interval_s)
+            sleep_s = float(interval_s)
+            mgr = self._manager
+            if mgr is not None and hasattr(mgr, "mapping_revisit_interval_s"):
+                try:
+                    sleep_s = float(mgr.mapping_revisit_interval_s(interval_s))
+                except Exception:  # noqa: BLE001
+                    sleep_s = float(interval_s)
+            await asyncio.sleep(max(3.0, sleep_s))
             try:
                 await self._mapping_revisit_cycle()
             except asyncio.CancelledError:

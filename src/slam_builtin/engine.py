@@ -23,7 +23,7 @@ from ..geom import conversions as conv
 from ..nav.localize.global_localize import OccupancyMap
 from ..nav.localize.pose_jump_gate import PoseJumpGate
 from ..nav.stores.maps import MapStore
-from . import loop_closure, persistence, scan_match
+from . import loop_closure, map_health, persistence, scan_match
 from . import occupancy as occ
 from . import pose_graph as pg
 from .io_sensors import BuiltinSensors
@@ -217,6 +217,13 @@ class BuiltinSlamEngine:
                 "last": None,
             },
         }
+        # Live occupancy health (ghost walls / angle tear). Refreshed while
+        # mapping so loop + revisit can react before the floor is doubled.
+        self._map_health: dict = {"status": "cold"}
+        self._map_health_at = 0.0
+        self._map_health_generation = -1
+        self._map_health_boosts = 0
+        self._map_health_last_status = "cold"
         self._keyframe_hook = None
         # Optional: SlamService wires this into LocalizationStateTracker so a
         # tick that trusts the published pose clears / avoids ``lost``.
@@ -850,9 +857,97 @@ class BuiltinSlamEngine:
             if not self._running:
                 break
             try:
+                self.refresh_map_health()
                 self.run_loop_closure()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"builtin SLAM loop closure failed: {exc}")
+
+    # Recompute at most this often; also forced when the grid generation moves.
+    _MAP_HEALTH_MIN_S = 5.0
+    # When the map is tearing, give the two-agree loop gate more time and run
+    # mapping revisit more often so a doorway pass can still close.
+    _MAP_HEALTH_PENDING_SCALE = {
+        "ok": (1.0, 1.0),
+        "cold": (1.0, 1.0),
+        "watch": (1.5, 1.5),
+        "degrading": (2.5, 2.0),
+    }
+    _MAP_HEALTH_REVISIT_S = {
+        "ok": None,
+        "cold": None,
+        "watch": 10.0,
+        "degrading": 6.0,
+    }
+
+    def refresh_map_health(self, *, force: bool = False) -> dict:
+        """Update cached occupancy health; no-op when not mapping or too soon."""
+        now = time.monotonic()
+        with self._lock:
+            if self._mode != MODE_MAPPING:
+                self._map_health = {"status": "idle"}
+                return dict(self._map_health)
+            gen = self._generation
+            if (
+                not force
+                and gen == self._map_health_generation
+                and now - self._map_health_at < self._MAP_HEALTH_MIN_S
+            ):
+                return dict(self._map_health)
+            grid = occ.to_occupancy_int16(self._grid)
+            res = float(self._grid.resolution)
+            ox = float(self._grid.origin_x)
+            oy = float(self._grid.origin_y)
+        try:
+            health = map_health.assess_occupancy(
+                grid, resolution=res, origin_x=ox, origin_y=oy
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"map health assess failed: {exc}")
+            return dict(self._map_health)
+        payload = health.as_dict()
+        payload["age_s"] = 0.0
+        prev = self._map_health_last_status
+        if health.status != prev and health.status in ("watch", "degrading"):
+            self._map_health_boosts += 1
+            self._log(
+                "map health "
+                f"{prev}->{health.status} ghost={health.ghost_frac:.2f} "
+                f"angle_std={health.angle_std_deg:.1f}deg "
+                f"hotspots={len(health.hotspots)}"
+            )
+        self._map_health_last_status = health.status
+        self._map_health = payload
+        self._map_health_at = now
+        self._map_health_generation = gen
+        return dict(self._map_health)
+
+    def map_health(self) -> dict:
+        """Latest map-health snapshot (may be stale by a few seconds)."""
+        out = dict(self._map_health)
+        if self._map_health_at > 0.0:
+            out["age_s"] = round(time.monotonic() - self._map_health_at, 2)
+        out["boosts"] = self._map_health_boosts
+        return out
+
+    def _map_health_status(self) -> str:
+        return str(self._map_health.get("status") or "cold")
+
+    def _pending_limits(self) -> tuple[float, int]:
+        """Effective (max_s, max_tries) for the two-agree loop gate."""
+        scale_s, scale_t = self._MAP_HEALTH_PENDING_SCALE.get(
+            self._map_health_status(), (1.0, 1.0)
+        )
+        return (
+            float(self._loop_pending_max_s) * float(scale_s),
+            max(2, int(round(self._loop_pending_max_tries * float(scale_t)))),
+        )
+
+    def mapping_revisit_interval_s(self, default_s: float) -> float:
+        """Shorter revisit cadence while map health is watch/degrading."""
+        boost = self._MAP_HEALTH_REVISIT_S.get(self._map_health_status())
+        if boost is None:
+            return float(default_s)
+        return float(min(float(default_s), float(boost)))
 
     @staticmethod
     def _loop_edge(
@@ -912,16 +1007,16 @@ class BuiltinSlamEngine:
             edge = self._loop_edge(snap, cur, match)
             now_mono = time.monotonic()
             pending = self._loop_pending
+            pending_max_s, pending_max_tries = self._pending_limits()
             # A pending match that never finds an agreeing second detection used
             # to sit ``pending=true`` forever while the map kept tearing. Expire
             # it so the next cycle starts clean — never apply a single unconfirmed
-            # edge (that is what the two-agree gate is for).
+            # edge (that is what the two-agree gate is for). When map health is
+            # degrading the window is stretched so a doorway pass still has time
+            # to land the second agreeing hit.
             if pending is not None:
                 age_s = now_mono - pending[4]
-                if (
-                    age_s >= self._loop_pending_max_s
-                    or pending[5] >= self._loop_pending_max_tries
-                ):
+                if age_s >= pending_max_s or pending[5] >= pending_max_tries:
                     self._loop_pending = None
                     stats["pending_expired"] += 1
                     stats["reasons"]["pending_expired"] = (
@@ -940,8 +1035,8 @@ class BuiltinSlamEngine:
                     return {"status": "pending"}
                 tries = pending[5] + 1
                 if (
-                    tries >= self._loop_pending_max_tries
-                    or (now_mono - pending[4]) >= self._loop_pending_max_s
+                    tries >= pending_max_tries
+                    or (now_mono - pending[4]) >= pending_max_s
                 ):
                     self._loop_pending = None
                     stats["pending_expired"] += 1
@@ -1186,6 +1281,7 @@ class BuiltinSlamEngine:
                 "insert_skips_turning": self._insert_skips_turning,
                 "insert_skips_unmatched": self._insert_skips_unmatched,
                 "heading_recovers": self._heading_recovers,
+                "map_health": self.map_health(),
                 "generation": self._generation,
                 "seed_localize_pending": self._seed_localize_pending,
                 "pose_restored_from_disk": self._pose_restored_from_disk,

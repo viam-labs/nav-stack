@@ -132,6 +132,10 @@ class BuiltinSlamHost:
     def nav_status(self) -> Dict:
         return {"active": False, "number_of_recoveries": 0, "state": "idle"}
 
+    def mapping_revisit_interval_s(self, default_s: float) -> float:
+        """Health-aware revisit cadence (shorter while the map is tearing)."""
+        return float(self._engine.mapping_revisit_interval_s(default_s))
+
     def slam_diagnostics(self) -> Dict:
         d = self._engine.diagnostics()
         d["slam_backend"] = SLAM_BACKEND_BUILTIN
