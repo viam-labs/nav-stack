@@ -66,7 +66,191 @@ def test_rotated_tiles_increase_angle_std():
     assert h.angle_std_deg > 0.0
 
 
-def test_engine_pending_and_revisit_react_to_health(tmp_path):
+def _ghost_hallway(h: int = 220, w: int = 220):
+    grid, res = _blank(h, w)
+    grid[20:200, 20:200] = 0
+    for c in (60, 66, 100, 106, 140, 146):
+        _paint_wall(grid, 30, 190, c, c + 2)
+    return grid, res
+
+
+def test_baseline_hides_inherited_ghosts():
+    grid, res = _ghost_hallway()
+    whole = map_health.assess_occupancy(
+        grid, resolution=res, origin_x=0.0, origin_y=0.0
+    )
+    session = map_health.assess_occupancy(
+        grid, resolution=res, origin_x=0.0, origin_y=0.0, baseline=grid.copy()
+    )
+    assert whole.status in ("watch", "degrading")
+    assert session.status == "cold"
+    assert session.occupied_cells == 0
+
+
+def test_new_copy_beside_baseline_wall_is_flagged():
+    # Baseline: clean walls. Session repaints each one again 0.3 m over.
+    base, res = _blank(220, 220)
+    base[20:200, 20:200] = 0
+    for c in (60, 100, 140):
+        _paint_wall(base, 30, 190, c, c + 2)
+    live = base.copy()
+    for c in (66, 106, 146):
+        _paint_wall(live, 30, 190, c, c + 2)
+    h = map_health.assess_occupancy(
+        live, resolution=res, origin_x=0.0, origin_y=0.0, baseline=base
+    )
+    assert h.status in ("watch", "degrading")
+    assert h.ghost_frac >= map_health._WATCH_GHOST
+    assert h.hotspots
+
+
+def test_clean_new_walls_ok_on_a_torn_baseline():
+    base, res = _ghost_hallway(220, 440)
+    live = base.copy()
+    live[20:200, 220:420] = 0
+    _paint_wall(live, 30, 190, 260, 262)
+    _paint_wall(live, 30, 190, 320, 322)
+    h = map_health.assess_occupancy(
+        live, resolution=res, origin_x=0.0, origin_y=0.0, baseline=base
+    )
+    assert h.status == "ok"
+    assert h.ghost_frac < map_health._WATCH_GHOST
+
+
+def test_align_grid_reindexes_by_origin():
+    src = np.full((4, 5), -1, dtype=np.int16)
+    src[1, 2] = 100
+    out = map_health.align_grid(
+        src,
+        origin_x=1.0,
+        origin_y=0.5,
+        shape=(10, 10),
+        to_origin_x=0.0,
+        to_origin_y=0.0,
+        resolution=0.5,
+    )
+    assert out.shape == (10, 10)
+    assert out[2, 4] == 100
+    assert int((out == 100).sum()) == 1
+    clipped = map_health.align_grid(
+        src,
+        origin_x=-1.0,
+        origin_y=0.0,
+        shape=(3, 3),
+        to_origin_x=0.0,
+        to_origin_y=0.0,
+        resolution=0.5,
+    )
+    assert clipped[1, 0] == 100
+
+
+def test_engine_scores_session_against_resumed_map(tmp_path):
+    from src.slam_builtin import occupancy as occ
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine(tmp_path)
+    torn, res = _ghost_hallway()
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        torn, resolution=res, origin_x=-2.0, origin_y=-3.0
+    )
+    engine._graph_base = occ.copy_grid(engine._grid)  # noqa: SLF001
+    out = engine.refresh_map_health(force=True)
+    assert out["scope"] == "session"
+    assert out["status"] == "cold"
+    assert out["baseline"]["status"] in ("watch", "degrading")
+    assert engine._map_health_boosts == 0  # noqa: SLF001
+
+    # The session draws a ghost copy of the outer wall 0.3 m over.
+    live = torn.copy()
+    for c in (54, 94, 134):
+        _paint_wall(live, 30, 190, c, c + 2)
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        live, resolution=res, origin_x=-2.0, origin_y=-3.0
+    )
+    engine._generation += 1  # noqa: SLF001
+    out = engine.refresh_map_health(force=True)
+    assert out["scope"] == "session"
+    assert out["status"] in ("watch", "degrading")
+    assert engine._map_health_boosts == 1  # noqa: SLF001
+    assert (
+        engine.diagnostics()["map_health"]["baseline"]["status"]
+        == (out["baseline"]["status"])
+    )
+
+
+def _resume_on(tmp_path, cells, res):
+    from src.slam_builtin import occupancy as occ
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine(tmp_path)
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        cells, resolution=res, origin_x=-2.0, origin_y=-3.0
+    )
+    engine._graph_base = occ.copy_grid(engine._grid)  # noqa: SLF001
+    engine.refresh_map_health(force=True)
+    return engine
+
+
+def _clean_hallway():
+    grid, res = _blank(220, 220)
+    grid[20:200, 20:200] = 0
+    for c in (60, 100, 140):
+        _paint_wall(grid, 30, 190, c, c + 2)
+    return grid, res
+
+
+def test_torn_resumed_map_is_not_used_by_loop_closure(tmp_path, monkeypatch):
+    from src.slam_builtin import loop_closure
+    from src.slam_builtin.engine import BuiltinSlamEngine
+
+    seen = []
+
+    def fake_detect(snap, params, *, resolution, base=None):
+        seen.append(base)
+        return None, "no_candidates"
+
+    monkeypatch.setattr(loop_closure, "detect", fake_detect)
+    monkeypatch.setattr(BuiltinSlamEngine, "_loop_closure_enabled", lambda self: True)
+
+    torn = _resume_on(tmp_path, *_ghost_hallway())
+    health = torn.map_health()
+    assert health["baseline"]["trusted"] is False
+    assert health["recommendation"] == "clear_map"
+    torn.run_loop_closure()
+    assert seen[-1] is None
+
+    clean = _resume_on(tmp_path, *_clean_hallway())
+    health = clean.map_health()
+    assert health["baseline"]["trusted"] is True
+    assert "recommendation" not in health
+    clean.run_loop_closure()
+    assert seen[-1] is clean._graph_base  # noqa: SLF001
+
+
+def test_revisit_does_not_snap_session_onto_torn_resumed_map(tmp_path):
+    import math
+
+    from src.geom import conversions as conv
+
+    scan = conv.LaserScan2D(np.full(80, 2.0), -math.pi, 2 * math.pi / 80, 0.1, 10.0)
+    start = conv.Pose2D(0.0, 0.0, 0.0)
+    target = conv.Pose2D(1.8, 0.0, 0.0)
+
+    torn = _resume_on(tmp_path, *_ghost_hallway())
+    torn._graph.add_scan(start, scan)  # noqa: SLF001
+    out = torn.apply_map_pose_correction(target, score=0.9)
+    assert out["method"] == "rejected_untrusted_base"
+    assert torn.get_pose() == start
+
+    clean = _resume_on(tmp_path, *_clean_hallway())
+    clean._graph.add_scan(start, scan)  # noqa: SLF001
+    out = clean.apply_map_pose_correction(target, score=0.9)
+    assert out["method"] == "rigid"
+
+
+def _engine(tmp_path):
     from src.config import SlamConfig
     from src.nav.stores.maps import MapStore
     from src.slam_builtin.engine import BuiltinSlamEngine
@@ -81,7 +265,11 @@ def test_engine_pending_and_revisit_react_to_health(tmp_path):
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": str(tmp_path), "mode": "mapping"}
     )
-    engine = BuiltinSlamEngine(cfg, _Sensors(), MapStore(str(tmp_path)), rate_hz=5.0)  # type: ignore[arg-type]
+    return BuiltinSlamEngine(cfg, _Sensors(), MapStore(str(tmp_path)), rate_hz=5.0)  # type: ignore[arg-type]
+
+
+def test_engine_pending_and_revisit_react_to_health(tmp_path):
+    engine = _engine(tmp_path)
     base_s, base_tries = engine._pending_limits()  # noqa: SLF001
     assert engine.mapping_revisit_interval_s(20.0) == 20.0
 
