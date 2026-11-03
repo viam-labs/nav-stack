@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 
 from src.geom import conversions as conv
-from src.nav import global_localize as gl
-from src.nav.localize_worker import LocalizeWorker, map_token
+from src.nav.localize import global_localize as gl
+from src.nav.localize.localize_worker import LocalizeWorker, map_token
 
 
 def _room_map(size_m: float = 6.0, res: float = 0.05) -> gl.OccupancyMap:

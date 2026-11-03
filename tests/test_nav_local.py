@@ -6,18 +6,18 @@ import math
 import numpy as np
 import pytest
 
-from src.nav.simple_motion import DriveCommand, rear_clearance_m
-from src.nav_builtin.controller import FollowerConfig, compute_path_command
-from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
-from src.nav_builtin.local_costmap import (
+from src.nav.motion.simple_motion import DriveCommand, rear_clearance_m
+from src.nav.control.controller import FollowerConfig, compute_path_command
+from src.nav.planning.costmap import build_costmap, occupancy_from_map_dict
+from src.nav.planning.local_costmap import (
     LocalCostmap,
     LocalCostmapConfig,
     footprint_collides,
     reverse_backup_feasible,
 )
-from src.nav_builtin.local_planner import LocalPlannerConfig, compute_local_command
-from src.nav_builtin.smoother import smooth_path
-from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
+from src.nav.planning.local_planner import LocalPlannerConfig, compute_local_command
+from src.nav.planning.smoother import smooth_path
+from src.nav.types import OccupancyGrid, Path2D, Pose2D
 from src.geom import conversions as conv
 
 
@@ -139,7 +139,7 @@ def test_local_costmap_places_a_slightly_late_scan_where_it_was_taken():
 
     Small motions used to be painted as if seen from the current pose.
     """
-    from src.nav_builtin.costmap import scan_world_points
+    from src.nav.planning.costmap import scan_world_points
 
     lc = LocalCostmap(
         LocalCostmapConfig(
@@ -218,7 +218,7 @@ def test_local_costmap_persists_hits_after_scan_loses_them():
 
 def test_spin_gate_uses_persisted_costmap_when_scan_is_clear():
     """Rotate-to-heading must not swing through a just-seen, now-blind blob."""
-    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
+    from src.nav.motion.simple_motion import ObstacleConfig, SimpleMotionConfig
 
     inscribed = 0.59 / 2.0
     spin_r = math.hypot(0.72 / 2.0, 0.59 / 2.0)
@@ -284,10 +284,10 @@ def test_spin_gate_uses_persisted_costmap_when_scan_is_clear():
 
 def test_spin_gate_does_not_crawl_forward_into_costmap_disc():
     """clear+spin_block prefers reverse when the (extra) spin disc is occupied."""
-    from src.nav_builtin.costmap import INSCRIBED
-    from src.nav_builtin.local_costmap import LocalCostmapView
-    from src.nav_builtin.types import OccupancyGrid
-    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
+    from src.nav.planning.costmap import INSCRIBED
+    from src.nav.planning.local_costmap import LocalCostmapView
+    from src.nav.types import OccupancyGrid
+    from src.nav.motion.simple_motion import ObstacleConfig, SimpleMotionConfig
 
     res = 0.05
     h = w = 80
@@ -345,7 +345,7 @@ def test_spin_gate_does_not_crawl_forward_into_costmap_disc():
 
 def test_local_costmap_does_not_reinflate_global_static():
     """Global static in the local window must not get a second inflation pass."""
-    from src.nav_builtin.costmap import INSCRIBED, build_costmap, occupancy_from_map_dict
+    from src.nav.planning.costmap import INSCRIBED, build_costmap, occupancy_from_map_dict
 
     m = _empty_map(size=60, resolution=0.05)
     occ = occupancy_from_map_dict(m)
@@ -403,7 +403,7 @@ def test_local_costmap_marks_scan_hit():
 def test_fused_depth_hit_marks_local_costmap_and_fails_nose_clear():
     """Depth closer than lidar (outside the body-near phantom window)
     must paint the local costmap and fail the nose-clear gate."""
-    from src.nav.simple_motion import ObstacleConfig, cone_min_range
+    from src.nav.motion.simple_motion import ObstacleConfig, cone_min_range
 
     n = 8
     inc = math.pi / 4.0
@@ -456,12 +456,12 @@ def test_path_cost_ahead_centerline_allows_fit_doorway():
     footprint inflation. Centerline cost must stay below the block threshold;
     the old 0.18 m path-clearance disc falsely sealed this route.
     """
-    from src.nav_builtin.local_planner import (
+    from src.nav.planning.local_planner import (
         LocalPlannerConfig,
         path_cost_ahead,
         should_use_local_planner,
     )
-    from src.nav_builtin.planner import path_blocked_local
+    from src.nav.planning.planner import path_blocked_local
 
     robot_r = 0.59 / 2.0  # half-width / inscribed
     gap_m = 0.84
@@ -508,8 +508,8 @@ def test_path_cost_ahead_centerline_allows_fit_doorway():
 
 def test_path_cost_ahead_flags_obstacle_on_centerline():
     """A hit on the route itself still blocks once inflated by the footprint."""
-    from src.nav_builtin.local_planner import path_cost_ahead
-    from src.nav_builtin.planner import path_blocked_local
+    from src.nav.planning.local_planner import path_cost_ahead
+    from src.nav.planning.planner import path_blocked_local
 
     robot_r = 0.20
     lc = LocalCostmap(
@@ -751,7 +751,7 @@ def test_local_planner_closed_loop_detour_passes_bin(robot_r, bin_x):
 
 
 def path_point_ahead_for_test(path: Path2D, pose: Pose2D, ahead: float):
-    from src.nav_builtin.local_planner import path_point_ahead
+    from src.nav.planning.local_planner import path_point_ahead
 
     return path_point_ahead(path, pose.x, pose.y, ahead)
 
@@ -826,7 +826,7 @@ def _narrow_gap_scan(half_gap_m: float = 0.42) -> conv.LaserScan2D:
 
 def _footprint_cfg() -> FollowerConfig:
     """0.59 x 0.72 m robot: half-width drives, half-diagonal spins."""
-    from src.nav.simple_motion import ObstacleConfig
+    from src.nav.motion.simple_motion import ObstacleConfig
 
     inscribed = 0.59 / 2.0
     return FollowerConfig(
@@ -984,7 +984,7 @@ def test_spin_gate_stays_stopped_when_rear_is_blocked():
 
 def test_hold_from_flank_crawls_when_nose_is_open():
     """Flank hold during rotate-to-heading must not sit forever with fwd clear."""
-    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
+    from src.nav.motion.simple_motion import ObstacleConfig, SimpleMotionConfig
 
     n = 72
     ranges = np.full(n, 3.0)
@@ -1037,9 +1037,9 @@ def test_costmap_hard_stop_reverses_when_spin_disc_blocked():
     pursuit/DWA kept vx>0, skipped the vx≈0 spin-gate reverse, and the
     costmap hard stop zeroed cmd with spin_blocked.
     """
-    from src.nav_builtin.costmap import INSCRIBED
-    from src.nav_builtin.local_costmap import LocalCostmapView
-    from src.nav_builtin.types import OccupancyGrid
+    from src.nav.planning.costmap import INSCRIBED
+    from src.nav.planning.local_costmap import LocalCostmapView
+    from src.nav.types import OccupancyGrid
 
     res = 0.05
     h = w = 80
@@ -1092,10 +1092,10 @@ def test_costmap_hard_stop_reverses_when_spin_disc_clear():
     Live rc26: bearing≈0, spin_blocked=false, nose clear, rear open — hard-stop
     only attempted reverse when the spin disc was also hit, so cmd stayed 0.
     """
-    from src.nav_builtin.costmap import INSCRIBED
-    from src.nav_builtin.local_costmap import LocalCostmapView
-    from src.nav_builtin.types import OccupancyGrid
-    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
+    from src.nav.planning.costmap import INSCRIBED
+    from src.nav.planning.local_costmap import LocalCostmapView
+    from src.nav.types import OccupancyGrid
+    from src.nav.motion.simple_motion import ObstacleConfig, SimpleMotionConfig
 
     res = 0.05
     h = w = 80
@@ -1164,10 +1164,10 @@ def test_costmap_hard_stop_crawls_when_reverse_refused_and_nose_open():
     Live rc25: spin-gate crawled, then hard-stop re-zeroed every tick because
     reverse was refused — avoid + spin_blocked + pathc=0 forever.
     """
-    from src.nav_builtin.costmap import INSCRIBED
-    from src.nav_builtin.local_costmap import LocalCostmapView
-    from src.nav_builtin.types import OccupancyGrid
-    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
+    from src.nav.planning.costmap import INSCRIBED
+    from src.nav.planning.local_costmap import LocalCostmapView
+    from src.nav.types import OccupancyGrid
+    from src.nav.motion.simple_motion import ObstacleConfig, SimpleMotionConfig
 
     res = 0.05
     h = w = 80
@@ -1240,10 +1240,10 @@ def test_costmap_hard_stop_crawls_when_reverse_refused_and_nose_open():
 
 def test_unstick_reverse_refuses_costmap_rear_collision():
     """Lidar rear can look open while local costs already block reverse."""
-    from src.nav_builtin.costmap import INSCRIBED
-    from src.nav_builtin.local_costmap import LocalCostmapView
-    from src.nav_builtin.types import OccupancyGrid
-    from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
+    from src.nav.planning.costmap import INSCRIBED
+    from src.nav.planning.local_costmap import LocalCostmapView
+    from src.nav.types import OccupancyGrid
+    from src.nav.motion.simple_motion import ObstacleConfig, SimpleMotionConfig
 
     res = 0.05
     h = w = 80
@@ -1312,9 +1312,9 @@ def test_compute_path_command_reverses_when_pose_already_in_lethal():
     Inventing a freer-flank spin here rotated the corner into the obstacle;
     a short reverse (rear open) is the escape.
     """
-    from src.nav_builtin.costmap import LETHAL
-    from src.nav_builtin.local_costmap import LocalCostmapView
-    from src.nav_builtin.types import OccupancyGrid
+    from src.nav.planning.costmap import LETHAL
+    from src.nav.planning.local_costmap import LocalCostmapView
+    from src.nav.types import OccupancyGrid
 
     res = 0.05
     h = w = 80
@@ -1355,9 +1355,9 @@ def test_compute_path_command_reverses_when_pose_already_in_lethal():
 
 def test_compute_path_command_stops_in_lethal_when_rear_blocked():
     """in_lethal with no reverse room: full stop, no freer-flank spin."""
-    from src.nav_builtin.costmap import LETHAL
-    from src.nav_builtin.local_costmap import LocalCostmapView
-    from src.nav_builtin.types import OccupancyGrid
+    from src.nav.planning.costmap import LETHAL
+    from src.nav.planning.local_costmap import LocalCostmapView
+    from src.nav.types import OccupancyGrid
 
     res = 0.05
     h = w = 80
@@ -1398,7 +1398,7 @@ def test_compute_path_command_stops_in_lethal_when_rear_blocked():
 
 
 def _slew_cfg() -> FollowerConfig:
-    from src.nav.simple_motion import SimpleMotionConfig
+    from src.nav.motion.simple_motion import SimpleMotionConfig
 
     cfg = FollowerConfig()
     cfg.motion = SimpleMotionConfig(max_linear_mps=0.5, max_angular_rad_s=1.5)
@@ -1407,7 +1407,7 @@ def _slew_cfg() -> FollowerConfig:
 
 def test_slew_limit_first_reverse_step_clears_base_deadband():
     """A replan stop restarts the ramp. The first step must still move the base."""
-    from src.nav_builtin.controller import limit_twist_rate
+    from src.nav.control.controller import limit_twist_rate
 
     cfg = _slew_cfg()
     cfg.max_linear_accel_mps2 = 0.5
@@ -1419,7 +1419,7 @@ def test_slew_limit_first_reverse_step_clears_base_deadband():
 
 def test_slew_limit_ramps_forward_speed_from_rest():
     """No instant step from standstill to cruise (the visible jerk)."""
-    from src.nav_builtin.controller import limit_twist_rate
+    from src.nav.control.controller import limit_twist_rate
 
     cfg = _slew_cfg()
     target = DriveCommand(0.5, 0.0, 0.0, False)
@@ -1440,7 +1440,7 @@ def test_slew_limit_ramps_forward_speed_from_rest():
 
 def test_slew_limit_ramps_yaw_and_preserves_arc():
     """Yaw steps are bounded, and a ramping arc keeps its curvature."""
-    from src.nav_builtin.controller import limit_twist_rate
+    from src.nav.control.controller import limit_twist_rate
 
     cfg = _slew_cfg()
     spin = limit_twist_rate(
@@ -1459,7 +1459,7 @@ def test_slew_limit_ramps_yaw_and_preserves_arc():
 
 def test_slew_limit_never_delays_stopping():
     """Stop bubble / hard stop / wait must still take effect on the same tick."""
-    from src.nav_builtin.controller import limit_twist_rate
+    from src.nav.control.controller import limit_twist_rate
 
     cfg = _slew_cfg()
     cruising = DriveCommand(0.5, 0.0, 0.0, False)
@@ -1477,8 +1477,8 @@ def test_slew_limit_never_delays_stopping():
 
 def test_local_replan_paints_raw_hits_not_merged_static_inflation():
     """Do not turn an already-inflated mapped wall into new occupancy."""
-    from src.nav_builtin.costmap import mark_local_costmap_on_occupancy
-    from src.nav_builtin.local_costmap import LocalCostmapView
+    from src.nav.planning.costmap import mark_local_costmap_on_occupancy
+    from src.nav.planning.local_costmap import LocalCostmapView
 
     grid = np.zeros((40, 40), dtype=np.int16)
     grid[20, 20] = 100
@@ -1516,7 +1516,7 @@ def test_local_replan_paints_raw_hits_not_merged_static_inflation():
 
 def test_corridor_paint_preserves_requested_goal():
     """A short remaining route must keep paint/inflation away from its goal."""
-    from src.nav_builtin.planner import plan_path
+    from src.nav.planning.planner import plan_path
 
     m = _empty_map(size=80, resolution=0.05)
     start = Pose2D(0.5, 2.0, 0.0)
@@ -1546,8 +1546,8 @@ def test_corridor_paint_preserves_requested_goal():
 
 def test_plan_seals_blocked_path_samples_from_local():
     """Fat seal on path samples the local map flags must change the route."""
-    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
-    from src.nav_builtin.planner import plan_path, paths_meaningfully_differ
+    from src.nav.planning.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav.planning.planner import plan_path, paths_meaningfully_differ
 
     m = {
         "grid": np.zeros((80, 80), dtype=np.int16),
@@ -1620,10 +1620,10 @@ def test_smoothing_on_planning_costmap_keeps_detour_around_live_obstacle():
     """Regression: static-only smoothing string-pulled detours back through
     a live (scan-only) obstacle, so every replan was rejected as still-blocked
     and forced vias collapsed to 'same route'."""
-    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
-    from src.nav_builtin.local_planner import path_cost_in_local_window
-    from src.nav_builtin.planner import plan_path, paths_meaningfully_differ
-    from src.nav_builtin.smoother import smooth_path, smooth_plan_path
+    from src.nav.planning.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav.planning.local_planner import path_cost_in_local_window
+    from src.nav.planning.planner import plan_path, paths_meaningfully_differ
+    from src.nav.planning.smoother import smooth_path, smooth_plan_path
 
     m = _empty_map(size=100, resolution=0.05)
     start = Pose2D(0.6, 2.5, 0.0)
@@ -1676,7 +1676,7 @@ def test_smoothing_on_planning_costmap_keeps_detour_around_live_obstacle():
 
 def test_local_planner_avoids_marked_obstacle():
     """Fat seal on path samples the local map flags must change the route."""
-    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav.planning.local_costmap import LocalCostmap, LocalCostmapConfig
 
     m = _empty_map(size=80, resolution=0.05)
     start = Pose2D(0.5, 2.0, 0.0)
@@ -1812,10 +1812,10 @@ def test_compute_path_command_defers_local_planner_when_misaligned():
 
 def test_costmap_hard_stop_blocks_translate_into_inscribed():
     """Lidar nose clear but costmap inscribed ahead — must not translate."""
-    from src.nav.simple_motion import ObstacleConfig
-    from src.nav_builtin.costmap import LETHAL
-    from src.nav_builtin.local_costmap import LocalCostmapView
-    from src.nav_builtin.types import OccupancyGrid
+    from src.nav.motion.simple_motion import ObstacleConfig
+    from src.nav.planning.costmap import LETHAL
+    from src.nav.planning.local_costmap import LocalCostmapView
+    from src.nav.types import OccupancyGrid
 
     costs = np.zeros((40, 40), dtype=np.uint8)
     # Inscribed wall directly ahead of pose at (1.0, 1.0) facing +x.
@@ -1860,7 +1860,7 @@ def test_costmap_hard_stop_blocks_translate_into_inscribed():
 
 def test_hard_stop_blocks_local_planner_into_stop_bubble():
     """DWA must not translate forward through the reactive stop distance."""
-    from src.nav.simple_motion import ObstacleConfig
+    from src.nav.motion.simple_motion import ObstacleConfig
 
     lc = LocalCostmap(
         LocalCostmapConfig(
@@ -1961,7 +1961,7 @@ def test_footprint_collides_outside_map():
     costs = build_costmap(
         occ, inflation_radius_m=0.0, robot_radius_m=0.05, cost_scaling_factor=3.0
     )
-    from src.nav_builtin.local_costmap import LocalCostmapView
+    from src.nav.planning.local_costmap import LocalCostmapView
 
     view = LocalCostmapView(costs=costs, occ=occ, origin_x=0.0, origin_y=0.0)
     assert footprint_collides(view, -1.0, 0.5, robot_radius_m=0.05) is True

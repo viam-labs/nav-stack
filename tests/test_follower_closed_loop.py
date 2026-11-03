@@ -18,16 +18,16 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pytest
 
-from src.nav.simple_motion import ObstacleConfig, SimpleMotionConfig
-from src.nav_builtin.controller import (
+from src.nav.motion.simple_motion import ObstacleConfig, SimpleMotionConfig
+from src.nav.control.controller import (
     FollowerConfig,
     compute_path_command,
     limit_twist_rate,
     update_speed_estimate,
 )
-from src.nav_builtin.path_utils import signed_crosstrack_m
-from src.nav_builtin.types import Path2D, Pose2D
-from src.nav_builtin.viam_io import _sanitize_base_cmd
+from src.nav.planning.path_utils import signed_crosstrack_m
+from src.nav.types import Path2D, Pose2D
+from src.nav.io.viam_io import _sanitize_base_cmd
 from src.geom import conversions as conv
 
 

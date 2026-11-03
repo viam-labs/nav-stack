@@ -52,19 +52,19 @@ from .nav_api import NavigationApi
 from .do_command_util import build_alias_map, dispatch_do_command, require
 
 from ..config import NavConfig, body_twist_to_viam_set_velocity
-from ..nav import zones as zones_mod
-from ..nav.locations import LocationStore
-from ..nav.maps import MapHandle
-from ..nav.motion_summary import summarize_nav_motion
-from ..nav.routes import Route, RouteStore
-from ..nav.simple_motion import (
+from ..nav.stores import zones as zones_mod
+from ..nav.stores.locations import LocationStore
+from ..nav.stores.maps import MapHandle
+from ..nav.motion.motion_summary import summarize_nav_motion
+from ..nav.stores.routes import Route, RouteStore
+from ..nav.motion.simple_motion import (
     ObstacleConfig,
     SimpleMotionCanceled,
     SimpleMotionError,
     config_from_nav,
     drive_to_pose,
 )
-from ..nav.zones import ZoneStore
+from ..nav.stores.zones import ZoneStore
 from ..geom import conversions as conv
 
 LOGGER = getLogger(__name__)
@@ -1004,7 +1004,7 @@ class NavServiceBase(NavigationApi, Navigation):
 
 
     def _cmd_get_trace(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
-        from ..nav_builtin.supervisor import recent_trace
+        from ..nav.control.supervisor import recent_trace
 
         seconds = float(command.get("seconds", 30.0))
         return {"ticks": recent_trace(seconds)}
@@ -1167,7 +1167,7 @@ class NavServiceBase(NavigationApi, Navigation):
                 if mp is None or mp.get("grid") is None:
                     mp = snap.get("map")
                 if mp is not None and mp.get("grid") is not None:
-                    from ..nav_builtin.costmap import (
+                    from ..nav.planning.costmap import (
                         build_costmap,
                         costmap_viz_dict,
                         occupancy_from_map_dict,
@@ -1184,7 +1184,7 @@ class NavServiceBase(NavigationApi, Navigation):
                         except Exception:  # noqa: BLE001
                             masks = None
                     if masks is not None and masks.keepout.shape == occ.grid.shape:
-                        from ..nav_builtin.types import OccupancyGrid
+                        from ..nav.types import OccupancyGrid
 
                         occ = OccupancyGrid(
                             grid=zones_mod.apply_keepout_to_grid(
@@ -1307,12 +1307,12 @@ class NavServiceBase(NavigationApi, Navigation):
             except Exception:  # noqa: BLE001
                 scan = None
 
-        from ..nav_builtin.costmap import (
+        from ..nav.planning.costmap import (
             build_costmap,
             local_view_viz_dict,
             occupancy_from_map_dict,
         )
-        from ..nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+        from ..nav.planning.local_costmap import LocalCostmap, LocalCostmapConfig
 
         bcfg = cfg.builtin
         if self._idle_local_costmap is None:

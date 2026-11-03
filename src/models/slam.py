@@ -34,16 +34,16 @@ from ..config import (
     SlamConfig,
     resolve_footprint,
 )
-from ..nav.global_localize import (
+from ..nav.localize.global_localize import (
     GlobalLocalizeResult,
     load_occupancy_from_map_dict,
     load_occupancy_from_map_dir,
 )
-from ..nav.localize_worker import LocalizeWorker
-from ..nav.loc_state import LocalizationStateTracker
-from ..nav import pause_keyframes, slice_match
-from ..nav.maps import MapStore, validate_map_name
-from ..nav.pose_jump_gate import (
+from ..nav.localize.localize_worker import LocalizeWorker
+from ..nav.localize.loc_state import LocalizationStateTracker
+from ..nav.localize import pause_keyframes, slice_match
+from ..nav.stores.maps import MapStore, validate_map_name
+from ..nav.localize.pose_jump_gate import (
     JumpDecision,
     PoseJumpGate,
     candidate_beats_previous,
@@ -1639,7 +1639,7 @@ class SlamService(SLAM):
         map_data = await asyncio.to_thread(_grid)
         if map_data is None or map_data.get("grid") is None:
             return {"available": False, "reason": "no_map"}
-        from ..nav_builtin.viam_io import map_dict_to_get_grid
+        from ..nav.io.viam_io import map_dict_to_get_grid
 
         return map_dict_to_get_grid(map_data)
 
@@ -2075,7 +2075,7 @@ class SlamService(SLAM):
 
     def _resolve_pose(self, command: Mapping[str, ValueTypes]) -> conv.Pose2D:
         if "location" in command:
-            from ..nav.locations import LocationStore
+            from ..nav.stores.locations import LocationStore
 
             handle = self._map_store.active_handle()
             if handle is None:

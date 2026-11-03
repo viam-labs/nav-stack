@@ -4,12 +4,12 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 
-from src.nav.simple_motion import DriveCommand
-from src.nav_builtin import base_envelope as env
-from src.nav_builtin import escape
-from src.nav_builtin.controller import FollowerConfig
-from src.nav_builtin.types import Pose2D
-from src.nav_builtin.viam_io import _sanitize_base_cmd
+from src.nav.motion.simple_motion import DriveCommand
+from src.nav.motion import base_envelope as env
+from src.nav.control import escape
+from src.nav.control.controller import FollowerConfig
+from src.nav.types import Pose2D
+from src.nav.io.viam_io import _sanitize_base_cmd
 
 
 def test_sanitize_matches_envelope_constants():

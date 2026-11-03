@@ -18,9 +18,9 @@ from ..config import (
     MODE_MAPPING,
     SlamConfig,
 )
-from ..nav.global_localize import OccupancyMap
-from ..nav.maps import MapStore
-from ..nav.pose_jump_gate import PoseJumpGate
+from ..nav.localize.global_localize import OccupancyMap
+from ..nav.stores.maps import MapStore
+from ..nav.localize.pose_jump_gate import PoseJumpGate
 from ..geom import conversions as conv
 from . import occupancy as occ
 from . import persistence
@@ -1447,7 +1447,7 @@ class BuiltinSlamEngine:
 
     def _try_seed_global_localize(self, scan) -> bool:
         """Full-map match once scans are available; apply if score is trusted."""
-        from ..nav.global_localize import global_localize_scan
+        from ..nav.localize.global_localize import global_localize_scan
 
         try:
             occ_map = self._occupancy_for_match()

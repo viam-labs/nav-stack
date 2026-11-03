@@ -1,10 +1,10 @@
 import pytest
 
-from src.nav.locations import LocationStore
-from src.nav.maps import MapStore
-from src.nav.routes import RouteStore
-from src.nav import zones as zmod
-from src.nav.zones import ZoneStore
+from src.nav.stores.locations import LocationStore
+from src.nav.stores.maps import MapStore
+from src.nav.stores.routes import RouteStore
+from src.nav.stores import zones as zmod
+from src.nav.stores.zones import ZoneStore
 
 
 # -- locations ---------------------------------------------------------------
@@ -203,7 +203,7 @@ def test_apply_keepout_and_speed_pct_at():
 
 def test_apply_speed_zone_limit_caps_only_above_zone_max():
     """A zone caps linear speed. Slower commands, and yaw, are not scaled."""
-    from src.nav_builtin.viam_io import _sanitize_base_cmd
+    from src.nav.io.viam_io import _sanitize_base_cmd
 
     # 30% of 0.50 m/s is 0.15. 0.30 is over the cap; yaw stays.
     vx, vy, w = zmod.apply_speed_zone_limit(

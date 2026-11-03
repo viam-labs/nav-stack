@@ -11,9 +11,9 @@ import math
 import numpy as np
 
 from src.geom.conversions import LaserScan2D, Pose2D
-from src.nav_builtin.costmap import OccupancyGrid
-from src.nav_builtin.planner import plan_path
-from src.nav_builtin.supervisor import NavSupervisor
+from src.nav.planning.costmap import OccupancyGrid
+from src.nav.planning.planner import plan_path
+from src.nav.control.supervisor import NavSupervisor
 
 
 RES = 0.05
@@ -183,7 +183,7 @@ def test_blocked_nose_unstick_after_a_failed_replan():
 def test_corridor_escape_yaw_turns_ccw_on_the_raw_scan():
     """The inflated spin disc is not consulted. A clear rectangle may yaw."""
     from src.geom.conversions import points_to_scan
-    from src.nav_builtin.footprint_guard import FootprintGuard, GuardConfig
+    from src.nav.control.footprint_guard import FootprintGuard, GuardConfig
 
     xs = np.linspace(0.56, 0.77, 16)
     ys = np.linspace(-0.18, -0.01, 12)
@@ -203,9 +203,9 @@ def test_corridor_escape_yaw_turns_ccw_on_the_raw_scan():
 def test_corridor_escape_yaw_follows_the_path_not_the_goal():
     """A wide opening on the route beats a notch toward the straight-line goal."""
     from src.geom.conversions import points_to_scan
-    from src.nav_builtin.controller import FollowerConfig
-    from src.nav_builtin.footprint_guard import FootprintGuard, GuardConfig
-    from src.nav_builtin.types import Path2D
+    from src.nav.control.controller import FollowerConfig
+    from src.nav.control.footprint_guard import FootprintGuard, GuardConfig
+    from src.nav.types import Path2D
 
     xs = np.linspace(0.56, 0.77, 16)
     ys = np.linspace(-0.18, -0.01, 12)
@@ -242,7 +242,7 @@ def test_corridor_escape_yaw_follows_the_path_not_the_goal():
 
 
 def test_sub_deadband_reverse_is_lifted_to_backup_speed():
-    from src.nav.simple_motion import DriveCommand
+    from src.nav.motion.simple_motion import DriveCommand
 
     sup = NavSupervisor.__new__(NavSupervisor)
     sup._last_sent_cmd = None
@@ -499,7 +499,7 @@ def test_defer_periodic_replan_while_the_scan_can_continue():
 def test_small_corridor_yaw_steers_while_moving():
     """A few degrees is an arc. A heading the arc cannot enter is a spin."""
     from src.geom.conversions import points_to_scan
-    from src.nav_builtin.footprint_guard import FootprintGuard, GuardConfig
+    from src.nav.control.footprint_guard import FootprintGuard, GuardConfig
 
     sup = NavSupervisor.__new__(NavSupervisor)
     sup._guard = FootprintGuard(

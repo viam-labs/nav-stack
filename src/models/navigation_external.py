@@ -28,8 +28,8 @@ from viam.services.slam import SLAM
 from viam.utils import struct_to_dict
 
 from ..config import ExternalNavConfig
-from ..nav.maps import MapStore
-from ..nav_builtin import (
+from ..nav.stores.maps import MapStore
+from ..nav import (
     BuiltinNavHost,
     NavVizStore,
     ViamWorldIO,

@@ -15,7 +15,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from ..geom import conversions as conv
-from ..nav.global_localize import _inflate_occupied
+from ..nav.localize.global_localize import _inflate_occupied
 from . import occupancy as occ
 from .pose_graph import GraphSnapshot, render_grid
 from .types import LogOddsGrid

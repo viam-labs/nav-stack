@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 
 from src.geom import conversions as conv
-from src.nav_builtin.loc_consistency import (
+from src.nav.control.loc_consistency import (
     LocDisagreement,
     loc_blocks_forward,
     localization_looks_bad,
@@ -14,7 +14,7 @@ from src.nav_builtin.loc_consistency import (
     slam_pose_is_trusted,
     small_local_match_worth_applying,
 )
-from src.nav_builtin.types import OccupancyGrid, Pose2D
+from src.nav.types import OccupancyGrid, Pose2D
 
 
 def _scan(ranges: np.ndarray) -> conv.LaserScan2D:

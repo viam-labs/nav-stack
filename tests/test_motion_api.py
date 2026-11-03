@@ -350,7 +350,7 @@ def test_navigate_route_follows_waypoints_in_order(monkeypatch):
 
 
 def test_navigate_route_from_saved_route(monkeypatch, tmp_path):
-    from src.nav.routes import RouteStore
+    from src.nav.stores.routes import RouteStore
 
     nav, mgr = _configured_nav()
     _stub_locations(nav, {"a": (0.0, 0.0, 0.0), "b": (2.0, 0.0, 0.0)})

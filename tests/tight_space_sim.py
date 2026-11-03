@@ -17,8 +17,8 @@ import numpy as np
 
 from src.config import NavConfig
 from src.geom import conversions as conv
-from src.nav_builtin import supervisor as sup_mod
-from src.nav_builtin.supervisor import NavSupervisor
+from src.nav.control import supervisor as sup_mod
+from src.nav.control.supervisor import NavSupervisor
 
 RES = 0.05
 LENGTH = 0.72
@@ -489,7 +489,7 @@ class RectWorld:
         return [(self._depth_stamp, depth, cam)]
 
     def set_velocity(self, vx: float, vy: float, vtheta: float) -> None:
-        from src.nav_builtin.viam_io import _sanitize_base_cmd
+        from src.nav.io.viam_io import _sanitize_base_cmd
 
         vx, vy, vtheta = _sanitize_base_cmd(vx, vy, vtheta)
         self.cmd = (float(vx), float(vtheta))

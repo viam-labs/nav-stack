@@ -6,8 +6,8 @@ import math
 import numpy as np
 
 from src.geom import conversions as conv
-from src.nav_builtin.local_planner import _normalize_angles, _simulate, _simulate_batch
-from src.nav_builtin.types import OccupancyGrid, Pose2D
+from src.nav.planning.local_planner import _normalize_angles, _simulate, _simulate_batch
+from src.nav.types import OccupancyGrid, Pose2D
 
 
 def test_normalize_angles_matches_conv_at_pi_boundary():

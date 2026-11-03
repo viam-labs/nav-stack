@@ -7,7 +7,7 @@ import numpy as np
 
 from src.config import LidarConfig
 from src.geom import conversions as conv
-from src.nav_builtin.depth_memory import DepthObstacleMemory
+from src.nav.control.depth_memory import DepthObstacleMemory
 
 CAM = LidarConfig(
     name="camera", x=0.30, y=-0.15, min_range=0.2, max_range=2.0, obstacles_only=True

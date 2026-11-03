@@ -15,7 +15,7 @@ from src.config import (
     viam_set_velocity_to_body_twist,
 )
 from src.models.sim_base import SimBase
-from src.nav.maps import MapStore
+from src.nav.stores.maps import MapStore
 from src.geom import conversions as conv
 from src.sim import (
     SimSensors,

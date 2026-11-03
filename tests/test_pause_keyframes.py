@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 
-from src.nav import pause_keyframes
+from src.nav.localize import pause_keyframes
 from src.geom import conversions as conv
 
 

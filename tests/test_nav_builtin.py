@@ -6,8 +6,8 @@ import math
 import numpy as np
 import pytest
 
-from src.nav_builtin.controller import FollowerConfig, compute_path_command, lookahead_pose
-from src.nav_builtin.costmap import (
+from src.nav.control.controller import FollowerConfig, compute_path_command, lookahead_pose
+from src.nav.planning.costmap import (
     FREE,
     HARD_BUFFER,
     INSCRIBED,
@@ -18,16 +18,16 @@ from src.nav_builtin.costmap import (
     is_traversable,
     nearest_free_pose,
 )
-from src.nav_builtin.navigator import BuiltinNavigator
-from src.nav_builtin.supervisor import NavSupervisor, yaw_align_give_up
-from src.nav_builtin.planner import (
+from src.nav.control.navigator import BuiltinNavigator
+from src.nav.control.supervisor import NavSupervisor, yaw_align_give_up
+from src.nav.planning.planner import (
     connect_plan_start,
     path_blocked,
     paths_meaningfully_differ,
     plan_on_costmap,
     plan_path,
 )
-from src.nav_builtin.types import OccupancyGrid, Path2D, Pose2D
+from src.nav.types import OccupancyGrid, Path2D, Pose2D
 from src.geom import conversions as conv
 
 
@@ -122,7 +122,7 @@ def test_plan_start_next_to_live_obstacle_stays_feasible():
 
 def test_plan_path_avoids_keepout_mask():
     """Keepout cells are lethal for planning — path must detour around them."""
-    from src.nav.zones import Zone, KEEPOUT, rasterize_for_map
+    from src.nav.stores.zones import Zone, KEEPOUT, rasterize_for_map
 
     m = _empty_map(size=80, resolution=0.05)
     start = Pose2D(0.5, 2.0, 0.0)
@@ -231,7 +231,7 @@ def test_mark_path_ahead_keeps_robot_footprint_free():
     goal = Pose2D(5.0, 2.0, 0.0)
     baseline = plan_path(m, start, goal, inflation_radius_m=0.35, robot_radius_m=r)
     assert baseline.feasible
-    from src.nav_builtin.costmap import mark_path_ahead_on_occupancy, occupancy_from_map_dict
+    from src.nav.planning.costmap import mark_path_ahead_on_occupancy, occupancy_from_map_dict
 
     occ = occupancy_from_map_dict(m)
     painted = mark_path_ahead_on_occupancy(
@@ -308,7 +308,7 @@ def test_build_costmap_inflates_obstacles():
 
 
 def test_costmap_viz_dict_shows_inflation_gradient():
-    from src.nav_builtin.costmap import costmap_viz_dict, costs_to_occupancy_viz
+    from src.nav.planning.costmap import costmap_viz_dict, costs_to_occupancy_viz
 
     occ = OccupancyGrid(
         grid=np.zeros((21, 21), dtype=np.int16),
@@ -331,7 +331,7 @@ def test_costmap_viz_dict_shows_inflation_gradient():
 
 def test_costmap_soft_outer_matches_inflation_radius():
     """Soft halo ends at inflation_radius; preference past that is planner-only."""
-    from src.nav_builtin.costmap import costs_to_occupancy_viz
+    from src.nav.planning.costmap import costs_to_occupancy_viz
 
     occ = OccupancyGrid(
         grid=np.zeros((81, 81), dtype=np.int16),
@@ -368,7 +368,7 @@ def test_costmap_soft_outer_matches_inflation_radius():
 
 def test_costmap_viz_shows_workspace_clearance_hides_cspace_body():
     """Viz paints clearance_m from the wall; C-space body stay blocked but hidden."""
-    from src.nav_builtin.costmap import costs_to_occupancy_viz
+    from src.nav.planning.costmap import costs_to_occupancy_viz
 
     occ = OccupancyGrid(
         grid=np.zeros((81, 81), dtype=np.int16),
@@ -549,7 +549,7 @@ def test_supervisor_wires_footprint_derived_clearances():
     """Footprint dims must reach the follower: bumper stop, body-width corridor,
     drive radius on the half-width, spin radius on the half-diagonal."""
     from src.config import NavConfig
-    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav.control.supervisor import NavSupervisor
 
     cfg = NavConfig.from_dict(
         {
@@ -579,7 +579,7 @@ def test_supervisor_wires_footprint_derived_clearances():
 def test_supervisor_uses_hard_clearance_for_plan_and_local_costmap():
     """clearance_m is the same inscribed radius on both costmaps."""
     from src.config import NavConfig
-    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav.control.supervisor import NavSupervisor
 
     cfg = NavConfig.from_dict(
         {
@@ -605,7 +605,7 @@ def test_corner_path_stays_out_of_soft_halo():
     """Repro: round a pillar tip in clear space, not through the soft glow."""
     import numpy as np
 
-    from src.nav_builtin.smoother import smooth_path
+    from src.nav.planning.smoother import smooth_path
 
     grid = np.zeros((80, 80), dtype=np.int16)
     grid[20:55, 35:50] = 100  # vertical bar
@@ -792,8 +792,8 @@ def test_plan_fails_when_goal_in_lethal():
 
 def test_plan_rejects_large_goal_snap():
     """Live inflation must not silently move the goal a metre away."""
-    from src.nav_builtin.planner import plan_on_costmap
-    from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav.planning.planner import plan_on_costmap
+    from src.nav.planning.costmap import build_costmap, occupancy_from_map_dict
 
     m = _empty_map(size=60, resolution=0.1)
     # Block a wide region around the requested goal so nearest free is far.
@@ -811,8 +811,8 @@ def test_plan_rejects_large_goal_snap():
 
 def test_plan_start_snap_never_jumps_through_obstacle():
     """Start sealed in a dead-end corridor must fail, not snap past the plug."""
-    from src.nav_builtin.planner import plan_on_costmap
-    from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav.planning.planner import plan_on_costmap
+    from src.nav.planning.costmap import build_costmap, occupancy_from_map_dict
 
     grid = np.full((40, 120), 100, dtype=np.int16)
     grid[18:23, 5:115] = 0  # 0.25 m corridor: robot centre cells are inscribed
@@ -835,8 +835,8 @@ def test_plan_does_not_double_inflate_goal_snap():
     from the nearest free cell. Re-checking a full 0.40 m disc demanded ~0.65 m
     of snap and rejected the plan (live: dock2, 0.55 m > 0.50 m).
     """
-    from src.nav_builtin.planner import plan_on_costmap
-    from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav.planning.planner import plan_on_costmap
+    from src.nav.planning.costmap import build_costmap, occupancy_from_map_dict
 
     grid = np.zeros((80, 80), dtype=np.int16)
     grid[:, 0:2] = 100  # wall along x≈0
@@ -857,8 +857,8 @@ def test_plan_does_not_double_inflate_goal_snap():
 
 def test_path_blocked_on_costmap_matches_path_blocked():
     """Cached-costmap check must agree with a fresh inflate (control-loop path)."""
-    from src.nav_builtin.costmap import build_costmap, occupancy_from_map_dict
-    from src.nav_builtin.planner import path_blocked_on_costmap
+    from src.nav.planning.costmap import build_costmap, occupancy_from_map_dict
+    from src.nav.planning.planner import path_blocked_on_costmap
 
     m = _empty_map(size=40, resolution=0.1)
     m["grid"][20, 15] = 100
@@ -989,7 +989,7 @@ def test_lookahead_projects_onto_sparse_segment():
 
 
 def test_follow_command_translates_while_gently_turning():
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     current = Pose2D(0.0, 0.0, 0.0)
@@ -1004,7 +1004,7 @@ def test_follow_command_translates_while_gently_turning():
 
 
 def test_follow_command_cruises_when_aligned():
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.max_linear_mps = 0.6
@@ -1019,7 +1019,7 @@ def test_follow_command_cruises_when_aligned():
 
 def test_pursuit_is_geometric_omega_scales_with_speed():
     """ω = v·κ: halving max speed halves ω for the same lookahead point."""
-    from src.nav_builtin.controller import pursuit_command
+    from src.nav.control.controller import pursuit_command
 
     current = Pose2D(0.0, 0.0, 0.0)
     target = Pose2D(0.6, 0.1, 0.0)  # gentle: κ = 2·0.1/0.37 ≈ 0.54 (r ≈ 1.85 m)
@@ -1042,7 +1042,7 @@ def test_pursuit_is_geometric_omega_scales_with_speed():
 
 def test_pursuit_regulates_speed_by_curvature():
     """Tight lookahead arc → slow down (r/r_min), never below the regulated floor."""
-    from src.nav_builtin.controller import pursuit_command
+    from src.nav.control.controller import pursuit_command
 
     cfg = FollowerConfig()
     cfg.lookahead_time_s = 0.2  # bearing-rate cap off; this test is r/r_min
@@ -1065,7 +1065,7 @@ def test_pursuit_shallow_bend_does_not_yaw_at_min_radius():
     0.7 m. On the cart that was 0.714 rad/s, which carried a ~14° path bend
     about 70° past the heading and tripped rotate-to-heading three times.
     """
-    from src.nav_builtin.controller import DriveCommand, pursuit_command
+    from src.nav.control.controller import DriveCommand, pursuit_command
 
     cfg = FollowerConfig()
     cfg.motion.max_linear_mps = 0.5
@@ -1104,7 +1104,7 @@ def test_pursuit_shallow_bend_does_not_yaw_at_min_radius():
 
 def test_pursuit_corrects_crosstrack_toward_path():
     """Robot left of a straight path turns right back onto it, without Stanley."""
-    from src.nav_builtin.controller import pursuit_command
+    from src.nav.control.controller import pursuit_command
 
     cfg = FollowerConfig()
     cfg.motion.max_linear_mps = 0.6
@@ -1118,7 +1118,7 @@ def test_pursuit_corrects_crosstrack_toward_path():
 
 def test_pursuit_crosstrack_deadband_zeros_kappa():
     """Sub-deadband lateral error must not command a turn (pose-noise floor)."""
-    from src.nav_builtin.controller import pursuit_command
+    from src.nav.control.controller import pursuit_command
 
     cfg = FollowerConfig()
     cfg.crosstrack_deadband_m = 0.06
@@ -1136,7 +1136,7 @@ def test_pursuit_crosstrack_deadband_zeros_kappa():
 
 
 def test_pursuit_rotate_to_heading_has_hysteresis():
-    from src.nav_builtin.controller import pursuit_command
+    from src.nav.control.controller import pursuit_command
 
     cfg = FollowerConfig()
     current = Pose2D(0.0, 0.0, 0.0)
@@ -1162,7 +1162,7 @@ def test_pursuit_rotate_to_heading_has_hysteresis():
 
 
 def test_keep_arc_drivable_preserves_curvature_at_crawl():
-    from src.nav_builtin.controller import DriveCommand, keep_arc_drivable
+    from src.nav.control.controller import DriveCommand, keep_arc_drivable
 
     cfg = FollowerConfig()  # half_track 0.27, wheel_min 0.06, r_min 0.42
     # Slow-down produced 0.05 m/s with 0.10 rad/s (r = 0.5 m). Same arc, but
@@ -1185,7 +1185,7 @@ def test_keep_arc_drivable_preserves_curvature_at_crawl():
 
 def test_pursuit_respects_skid_steer_wheel_envelope():
     """No translating command may put the inner wheel under the base minimum."""
-    from src.nav_builtin.controller import pursuit_command
+    from src.nav.control.controller import pursuit_command
 
     cfg = FollowerConfig()
     cfg.motion.max_linear_mps = 0.4
@@ -1203,7 +1203,7 @@ def test_pursuit_respects_skid_steer_wheel_envelope():
 
 
 def test_follow_command_approach_cap_only_at_goal():
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.max_linear_mps = 0.6
@@ -1216,7 +1216,7 @@ def test_follow_command_approach_cap_only_at_goal():
 
 
 def test_follow_command_rotate_in_place_when_goal_behind():
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     current = Pose2D(0.0, 0.0, 0.0)
@@ -1228,7 +1228,7 @@ def test_follow_command_rotate_in_place_when_goal_behind():
 
 def test_follow_command_no_sign_flip_across_xy_tolerance():
     """XY jitter across settle must not reverse saturated turn direction."""
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.max_angular_rad_s = 1.5
@@ -1250,7 +1250,7 @@ def test_follow_command_no_sign_flip_across_xy_tolerance():
 
 def test_follow_command_yaw_settled_closes_xy_without_wiggle():
     """Repro: yaw already at goal θ, 0.38 m out — must drive, not creep+stall."""
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1268,7 +1268,7 @@ def test_follow_command_yaw_settled_closes_xy_without_wiggle():
 
 def test_follow_command_just_outside_2x_tol_no_full_spin():
     """Repro: ~0.53 m out, yaw nearly settled — must not ±max_vel_theta wiggle."""
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1293,8 +1293,8 @@ def test_follow_command_dock_end_no_point_facing_rip():
     Status dump: spinning |vθ|=0.4 with vx=0 while hunting point bearing,
     then crawl, then final-yaw the other way — endless end swing.
     """
-    from src.nav_builtin.controller import compute_follow_command
-    from src.nav_builtin.viam_io import _sanitize_base_cmd
+    from src.nav.control.controller import compute_follow_command
+    from src.nav.io.viam_io import _sanitize_base_cmd
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1319,7 +1319,7 @@ def test_follow_command_dock_end_no_point_facing_rip():
 
 def test_follow_command_inside_tol_soft_close_no_rip():
     """Inside XY tol with mid bearing: crawl, do not pure-spin to face point."""
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1335,8 +1335,8 @@ def test_follow_command_inside_tol_soft_close_no_rip():
 
 def test_follow_command_end_approach_no_tiny_reverse_yaw_hunt():
     """Repro: 0.29 m out, goal behind heading — don't emit vx=-0.06 + vθ=0.28."""
-    from src.nav_builtin.controller import compute_follow_command
-    from src.nav_builtin.viam_io import _sanitize_base_cmd
+    from src.nav.control.controller import compute_follow_command
+    from src.nav.io.viam_io import _sanitize_base_cmd
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1354,8 +1354,8 @@ def test_follow_command_end_approach_no_tiny_reverse_yaw_hunt():
 
 def test_follow_command_half_metre_final_yaw_closes_xy():
     """Repro: ~0.5 m out with ~35° final yaw must not pure-spin (stall)."""
-    from src.nav_builtin.controller import compute_follow_command
-    from src.nav_builtin.viam_io import _sanitize_base_cmd
+    from src.nav.control.controller import compute_follow_command
+    from src.nav.io.viam_io import _sanitize_base_cmd
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1375,8 +1375,8 @@ def test_follow_command_half_metre_final_yaw_closes_xy():
 
 def test_follow_command_large_yaw_outside_tol_closes_xy():
     """~140° final yaw at 0.3 m: close XY first; do not spin for goal θ yet."""
-    from src.nav_builtin.controller import compute_follow_command
-    from src.nav_builtin.viam_io import _sanitize_base_cmd
+    from src.nav.control.controller import compute_follow_command
+    from src.nav.io.viam_io import _sanitize_base_cmd
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1396,8 +1396,8 @@ def test_follow_command_edge_of_xy_tol_still_closes():
     """Inside xy_tol (~0.22 m) but outside settle: soft-close, don't yaw-spin."""
     import math
 
-    from src.nav_builtin.controller import compute_follow_command
-    from src.nav_builtin.viam_io import _sanitize_base_cmd
+    from src.nav.control.controller import compute_follow_command
+    from src.nav.io.viam_io import _sanitize_base_cmd
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1419,7 +1419,7 @@ def test_follow_command_edge_of_xy_tol_still_closes():
 
 def test_follow_command_large_yaw_inside_settle_spins():
     """Inside settle radius (~3 cm) with large final yaw: pure spin only."""
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1434,7 +1434,7 @@ def test_follow_command_large_yaw_inside_settle_spins():
 
 def test_follow_command_near_settle_large_yaw_spins():
     """Repro: ~4 cm out with ~134° final yaw must spin, not soft-crawl forever."""
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1453,7 +1453,7 @@ def test_follow_command_nine_cm_out_hands_off_to_final_yaw():
     """~9 cm out with final yaw still wrong: spin for θ, not soft-crawl forever."""
     import math
 
-    from src.nav_builtin.controller import compute_follow_command
+    from src.nav.control.controller import compute_follow_command
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1475,8 +1475,8 @@ def test_follow_command_nine_cm_out_hands_off_to_final_yaw():
 
 def test_follow_command_large_yaw_far_out_closes_xy_first():
     """Repro: ~0.75 m out with ~128° final yaw — must not spin in place forever."""
-    from src.nav_builtin.controller import compute_follow_command
-    from src.nav_builtin.viam_io import _sanitize_base_cmd
+    from src.nav.control.controller import compute_follow_command
+    from src.nav.io.viam_io import _sanitize_base_cmd
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1491,8 +1491,8 @@ def test_follow_command_large_yaw_far_out_closes_xy_first():
     assert abs(sx) >= 0.12 - 1e-6 or (abs(sx) < 1e-9 and abs(st) >= 0.08)
 
 def test_follow_command_overshoot_reverses_instead_of_spinning():
-    from src.nav_builtin.controller import compute_follow_command
-    from src.nav_builtin.viam_io import _sanitize_base_cmd
+    from src.nav.control.controller import compute_follow_command
+    from src.nav.io.viam_io import _sanitize_base_cmd
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25
@@ -1521,7 +1521,7 @@ def test_compute_path_command_holds_rotate_into_person():
     import numpy as np
 
     from src.geom import conversions as conv
-    from src.nav.simple_motion import ObstacleConfig
+    from src.nav.motion.simple_motion import ObstacleConfig
 
     path = Path2D(points=((0.0, 0.0), (3.0, 0.0)), goal_theta=0.0)
     # Facing ~120° off the path → rotate-to-heading (vx=0).
@@ -1623,7 +1623,7 @@ def test_builtin_navigator_compute_path_and_status():
 
 def test_try_replan_falls_back_to_scan_plan_and_records_reason():
     """Painted-corridor retry infeasible -> scan-only plan; reasons kept for status."""
-    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav.control.supervisor import NavSupervisor
 
     # 0.6 m-wide corridor: painting the route seals it, but a scan-only plan
     # past a bin hugging one wall still exists.
@@ -1679,9 +1679,9 @@ def test_try_replan_falls_back_to_scan_plan_and_records_reason():
 
 def test_try_replan_holds_detour_against_short_flip():
     """With flip budget spent, refuse flipping back to the abandoned short corridor."""
-    from src.nav_builtin.controller import _path_length
-    from src.nav_builtin.supervisor import NavSupervisor
-    from src.nav_builtin.types import PlanResult
+    from src.nav.control.controller import _path_length
+    from src.nav.control.supervisor import NavSupervisor
+    from src.nav.types import PlanResult
 
     m = _empty_map(size=120, resolution=0.05)
     world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
@@ -1744,9 +1744,9 @@ def test_try_replan_holds_detour_against_short_flip():
 
 def test_try_replan_rejects_too_long_early_detour():
     """First blocked-replans must not accept a room-scale loop."""
-    from src.nav_builtin.controller import _path_length
-    from src.nav_builtin.supervisor import NavSupervisor
-    from src.nav_builtin.types import PlanResult
+    from src.nav.control.controller import _path_length
+    from src.nav.control.supervisor import NavSupervisor
+    from src.nav.types import PlanResult
 
     m = _empty_map(size=120, resolution=0.05)
     world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
@@ -1806,9 +1806,9 @@ def test_try_replan_rejects_too_long_early_detour():
 
 def test_try_replan_allows_budgeted_short_flip():
     """Spend flip budget to return to a clear short corridor, then refuse thrash."""
-    from src.nav_builtin.controller import _path_length
-    from src.nav_builtin.supervisor import NavSupervisor
-    from src.nav_builtin.types import PlanResult
+    from src.nav.control.controller import _path_length
+    from src.nav.control.supervisor import NavSupervisor
+    from src.nav.types import PlanResult
 
     m = _empty_map(size=120, resolution=0.05)
     world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
@@ -1891,9 +1891,9 @@ def test_try_replan_allows_budgeted_short_flip():
 
 def test_try_replan_lifts_detour_ban_when_no_alternate():
     """If the detour dies and every banned attempt fails, lift once and take short."""
-    from src.nav_builtin.controller import _path_length
-    from src.nav_builtin.supervisor import NavSupervisor
-    from src.nav_builtin.types import PlanResult
+    from src.nav.control.controller import _path_length
+    from src.nav.control.supervisor import NavSupervisor
+    from src.nav.types import PlanResult
 
     m = _empty_map(size=120, resolution=0.05)
     world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
@@ -1952,9 +1952,9 @@ def test_try_replan_lifts_detour_ban_when_no_alternate():
 
 def test_try_replan_force_lifts_short_flip_when_path_blocked():
     """Static/pose recovery must not stay stuck forever on the detour ban."""
-    from src.nav_builtin.controller import _path_length
-    from src.nav_builtin.supervisor import NavSupervisor
-    from src.nav_builtin.types import PlanResult
+    from src.nav.control.controller import _path_length
+    from src.nav.control.supervisor import NavSupervisor
+    from src.nav.types import PlanResult
 
     m = _empty_map(size=120, resolution=0.05)
     world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
@@ -2016,7 +2016,7 @@ def test_try_replan_force_lifts_short_flip_when_path_blocked():
 
 def test_plan_path_marks_local_costmap_for_replan():
     """Local-costmap blob must force a different global path (scan can miss it)."""
-    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav.planning.local_costmap import LocalCostmap, LocalCostmapConfig
 
     m = _empty_map(size=80, resolution=0.05)
     start = Pose2D(0.5, 2.0, 0.0)
@@ -2080,8 +2080,8 @@ def test_plan_path_marks_local_costmap_for_replan():
 
 def test_plan_path_overlay_avoids_second_local_obstacle():
     """Peeling around one live blob must not thread a second blob in-window."""
-    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
-    from src.nav_builtin.local_planner import path_cost_in_local_window
+    from src.nav.planning.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav.planning.local_planner import path_cost_in_local_window
 
     m = _empty_map(size=120, resolution=0.05)
     start = Pose2D(1.0, 3.0, 0.0)
@@ -2143,9 +2143,9 @@ def test_plan_path_overlay_avoids_second_local_obstacle():
 
 def test_try_replan_rejects_path_still_hitting_local_cost():
     """Safety net: do not accept a 'different' route that is still local-lethal."""
-    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
-    from src.nav_builtin.supervisor import NavSupervisor
-    from src.nav_builtin.types import PlanResult
+    from src.nav.planning.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav.control.supervisor import NavSupervisor
+    from src.nav.types import PlanResult
 
     m = _empty_map(size=120, resolution=0.05)
     world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
@@ -2223,8 +2223,8 @@ def test_try_replan_rejects_path_still_hitting_local_cost():
 def test_builtin_navigator_cancel_sets_status():
     """Open room: scan peels around a bin; corridor paint must not replace it
     with a room-scale loop."""
-    from src.nav_builtin.controller import _path_length
-    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav.control.controller import _path_length
+    from src.nav.control.supervisor import NavSupervisor
 
     m = _empty_map(size=120, resolution=0.05)
     world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
@@ -2266,9 +2266,9 @@ def test_builtin_navigator_cancel_sets_status():
 
 def test_forced_side_detour_peels_around_blocked_sample():
     """Synthetic left/right via must leave the corridor without a room loop."""
-    from src.nav_builtin.controller import _path_length
-    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
-    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav.control.controller import _path_length
+    from src.nav.planning.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav.control.supervisor import NavSupervisor
 
     m = _empty_map(size=120, resolution=0.05)
     world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
@@ -2318,9 +2318,9 @@ def test_forced_side_detour_peels_around_blocked_sample():
 
 def test_try_replan_falls_to_forced_via_when_plans_identical():
     """If scan+local/paint keep returning the same path, use forced via."""
-    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
-    from src.nav_builtin.supervisor import NavSupervisor
-    from src.nav_builtin.types import PlanResult
+    from src.nav.planning.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav.control.supervisor import NavSupervisor
+    from src.nav.types import PlanResult
 
     m = _empty_map(size=120, resolution=0.05)
     world = _FakeWorld(Pose2D(1.0, 3.0, 0.0), m)
@@ -2646,7 +2646,7 @@ def test_nav_loc_refine_holds_when_residual_stays_lost():
 
 def test_nav_loc_refine_continues_when_residual_is_thin():
     """A 4/12 leftover is not localization_lost — keep the goal."""
-    from src.nav_builtin.loc_consistency import LocDisagreement
+    from src.nav.control.loc_consistency import LocDisagreement
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
     mild = LocDisagreement(
@@ -2696,8 +2696,8 @@ def test_loc_check_returns_before_a_slow_match():
     import threading
     import time
 
-    from src.nav_builtin.controller import DriveCommand
-    from src.nav_builtin.loc_consistency import LocDisagreement
+    from src.nav.control.controller import DriveCommand
+    from src.nav.control.loc_consistency import LocDisagreement
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
     started = threading.Event()
@@ -2734,8 +2734,8 @@ def test_loc_check_returns_before_a_slow_match():
 
 def test_nav_loc_refine_does_not_stop_while_driving_straight_mild():
     """A mild cruise residual can be checked without a full stop."""
-    from src.nav_builtin.controller import DriveCommand
-    from src.nav_builtin.loc_consistency import LocDisagreement
+    from src.nav.control.controller import DriveCommand
+    from src.nav.control.loc_consistency import LocDisagreement
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
     mild = LocDisagreement(
@@ -2766,7 +2766,7 @@ def test_nav_loc_refine_does_not_stop_while_driving_straight_mild():
 
 def test_nav_loc_refine_stops_when_loc_is_severely_bad():
     """High disagree_frac must stop even on a calm cruise command."""
-    from src.nav_builtin.controller import DriveCommand
+    from src.nav.control.controller import DriveCommand
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _left_wall_map())
     world.scan = _open_scan()
@@ -2793,8 +2793,8 @@ def test_nav_loc_refine_stops_when_loc_is_severely_bad():
 
 def test_nav_loc_refine_holds_after_refused_large_jump():
     """A refused jump is not applied, but the cart drives on and rechecks later."""
-    from src.nav_builtin.controller import DriveCommand
-    from src.nav_builtin.loc_consistency import LocDisagreement
+    from src.nav.control.controller import DriveCommand
+    from src.nav.control.loc_consistency import LocDisagreement
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
     severe = LocDisagreement(
@@ -2830,8 +2830,8 @@ def test_nav_loc_refine_holds_after_refused_large_jump():
 
 def test_nav_loc_refine_continues_when_slam_trusts_pose():
     """Beam residual high but SLAM good_match + shift 0 → resume, don't park."""
-    from src.nav_builtin.controller import DriveCommand
-    from src.nav_builtin.loc_consistency import LocDisagreement
+    from src.nav.control.controller import DriveCommand
+    from src.nav.control.loc_consistency import LocDisagreement
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
     residual = LocDisagreement(
@@ -2866,8 +2866,8 @@ def test_nav_loc_refine_continues_when_slam_trusts_pose():
 
 def test_nav_loc_refine_recovers_once_then_resumes():
     """Stopped recovery that corrects the pose should resume the goal."""
-    from src.nav_builtin.controller import DriveCommand
-    from src.nav_builtin.loc_consistency import LocDisagreement
+    from src.nav.control.controller import DriveCommand
+    from src.nav.control.loc_consistency import LocDisagreement
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
     severe = LocDisagreement(
@@ -2924,8 +2924,8 @@ def test_nav_loc_refine_recovers_once_then_resumes():
 
 
 def test_nav_loc_refine_stops_when_turning_hard():
-    from src.nav_builtin.controller import DriveCommand
-    from src.nav_builtin.loc_consistency import LocDisagreement
+    from src.nav.control.controller import DriveCommand
+    from src.nav.control.loc_consistency import LocDisagreement
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
     mild = LocDisagreement(
@@ -2963,8 +2963,8 @@ def test_nav_loc_refine_backs_off_after_unfixed_residual():
     """A leftover mismatch waits several metres, not another stop at 2 m."""
     import time
 
-    from src.nav_builtin.controller import DriveCommand
-    from src.nav_builtin.loc_consistency import LocDisagreement
+    from src.nav.control.controller import DriveCommand
+    from src.nav.control.loc_consistency import LocDisagreement
 
     world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
     mild = LocDisagreement(
@@ -3040,8 +3040,8 @@ def test_nav_loc_refine_applies_small_improving_match():
 
 
 def test_unreachable_start_refines_once_and_replans_same_corridor():
-    from src.nav_builtin.supervisor import NavSupervisor
-    from src.nav_builtin.types import Path2D
+    from src.nav.control.supervisor import NavSupervisor
+    from src.nav.types import Path2D
 
     world = _FakeWorld(Pose2D(0.0, 0.0, 0.0), _empty_map())
     sup = NavSupervisor(
@@ -3109,8 +3109,8 @@ def test_unreachable_start_refines_once_and_replans_same_corridor():
 
 
 def test_unreachable_start_skips_refine_for_a_real_block():
-    from src.nav_builtin.supervisor import NavSupervisor
-    from src.nav_builtin.types import Path2D
+    from src.nav.control.supervisor import NavSupervisor
+    from src.nav.types import Path2D
 
     world = _FakeWorld(Pose2D(0.0, 0.0, 0.0), _empty_map())
     sup = NavSupervisor(
@@ -3138,8 +3138,8 @@ def test_unreachable_start_skips_refine_for_a_real_block():
 
 
 def test_unreachable_start_keeps_pose_when_match_is_refused():
-    from src.nav_builtin.supervisor import NavSupervisor
-    from src.nav_builtin.types import Path2D
+    from src.nav.control.supervisor import NavSupervisor
+    from src.nav.types import Path2D
 
     world = _FakeWorld(Pose2D(0.0, 0.0, 0.0), _empty_map())
     sup = NavSupervisor(

@@ -150,7 +150,7 @@ def _localized(status: Mapping[str, Any]) -> bool:
         return True
     if status.get("map_pose_untrusted"):
         return False
-    from ..nav_builtin.loc_consistency import published_pose_misregistered
+    from ..nav.control.loc_consistency import published_pose_misregistered
 
     if published_pose_misregistered(check if isinstance(check, dict) else None):
         return False
@@ -159,7 +159,7 @@ def _localized(status: Mapping[str, Any]) -> bool:
 
 def not_localized_message(status: Mapping[str, Any]) -> str:
     """Goal refusal that says why and what to do, when the watchdog knows."""
-    from ..nav.loc_state import describe_state
+    from ..nav.localize.loc_state import describe_state
 
     state = status.get("localization_state")
     if not isinstance(state, Mapping):

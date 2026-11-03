@@ -1,6 +1,6 @@
 import math
 
-from src.nav.loc_state import (
+from src.nav.localize.loc_state import (
     LOC_DEGRADED,
     LOC_LOST,
     LOC_MAP_MISMATCH,

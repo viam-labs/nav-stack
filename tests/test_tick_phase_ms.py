@@ -1,8 +1,8 @@
 """Per-phase tick timers land in progress + control_loop."""
 from __future__ import annotations
 
-from src.nav_builtin.sense_tick import PHASE_MS_KEYS, elapsed_ms
-from src.nav_builtin.tick_output import _PROGRESS_KEYS
+from src.nav.control.sense_tick import PHASE_MS_KEYS, elapsed_ms
+from src.nav.control.tick_output import _PROGRESS_KEYS
 
 
 def test_phase_ms_keys_whitelisted_for_status():
@@ -20,7 +20,7 @@ def test_elapsed_ms_non_negative():
 
 
 def test_control_stats_includes_phase_ms():
-    from src.nav_builtin.supervisor import NavSupervisor
+    from src.nav.control.supervisor import NavSupervisor
 
     # Minimal stub: only the fields control_stats / _note_phase_ms need.
     class _Stub:

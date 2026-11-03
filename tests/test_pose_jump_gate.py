@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 
-from src.nav.pose_jump_gate import PoseJumpGate, should_hold_drive_for_pose_jump
+from src.nav.localize.pose_jump_gate import PoseJumpGate, should_hold_drive_for_pose_jump
 from src.geom import conversions as conv
 
 
@@ -21,7 +21,7 @@ def test_should_hold_drive_for_awaiting_confirm():
 
 
 def test_candidate_beats_previous_requires_margin_on_large_shift():
-    from src.nav.pose_jump_gate import candidate_beats_previous
+    from src.nav.localize.pose_jump_gate import candidate_beats_previous
 
     # 7.7 m false peak with similar/worse score must not win.
     assert not candidate_beats_previous(
@@ -83,7 +83,7 @@ def test_force_bypasses_confirm():
 
 
 def test_stuck_refine_applies_a_small_better_pose():
-    from src.nav.pose_jump_gate import stuck_refine_decision
+    from src.nav.localize.pose_jump_gate import stuck_refine_decision
 
     assert (
         stuck_refine_decision(
@@ -98,7 +98,7 @@ def test_stuck_refine_applies_a_small_better_pose():
 
 
 def test_stuck_refine_refuses_ambiguous_and_hallway_jumps():
-    from src.nav.pose_jump_gate import stuck_refine_decision
+    from src.nav.localize.pose_jump_gate import stuck_refine_decision
 
     assert (
         stuck_refine_decision(
@@ -123,7 +123,7 @@ def test_stuck_refine_refuses_ambiguous_and_hallway_jumps():
 
 
 def test_stuck_refine_refuses_when_pose_already_fits_or_does_not_improve():
-    from src.nav.pose_jump_gate import stuck_refine_decision
+    from src.nav.localize.pose_jump_gate import stuck_refine_decision
 
     assert (
         stuck_refine_decision(

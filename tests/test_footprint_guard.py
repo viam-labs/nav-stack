@@ -6,12 +6,12 @@ import math
 import numpy as np
 import pytest
 
-from src.nav_builtin.footprint_guard import (
+from src.nav.control.footprint_guard import (
     FootprintGuard,
     GuardConfig,
     open_corridor_yaw,
 )
-from src.nav_builtin.types import Pose2D
+from src.nav.types import Pose2D
 
 L, W = 0.72, 0.59
 HL, HW = L / 2, W / 2

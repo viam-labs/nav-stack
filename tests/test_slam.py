@@ -11,7 +11,7 @@ from src.config import MODE_LOCALIZING, MODE_MAPPING, SlamConfig
 pytest.importorskip("viam")
 
 from src.models.slam import SlamService
-from src.nav.maps import MapStore
+from src.nav.stores.maps import MapStore
 from src.geom import conversions as conv
 
 
@@ -88,7 +88,7 @@ def test_resolve_pose_by_location_uses_active_map(tmp_path: Path):
     store.set_active_map("floor1")
     slam._map_store = store
 
-    from src.nav.locations import LocationStore
+    from src.nav.stores.locations import LocationStore
 
     handle = store.active_handle()
     LocationStore(handle.locations_path).add("kitchen", 1.0, 2.0, 0.5)
@@ -423,7 +423,7 @@ def test_run_startup_global_localize_retries_then_succeeds():
 
 
 def test_run_startup_global_localize_runs_refinement_pass():
-    from src.nav.pose_jump_gate import PoseJumpGate
+    from src.nav.localize.pose_jump_gate import PoseJumpGate
 
     slam = SlamService("slam")
     slam._pose_jump_gate = PoseJumpGate(confirm_count=1)
@@ -476,7 +476,7 @@ def test_run_startup_global_localize_runs_refinement_pass():
 
 
 def test_run_startup_global_localize_runs_post_apply_refine_when_weak():
-    from src.nav.pose_jump_gate import PoseJumpGate
+    from src.nav.localize.pose_jump_gate import PoseJumpGate
 
     slam = SlamService("slam")
     slam._pose_jump_gate = PoseJumpGate(confirm_count=1)
@@ -741,7 +741,7 @@ def test_drive_base_sends_angular_z_to_viam_base():
 
 # -- periodic relocalize (drift watchdog) -----------------------------------
 def _relocalize_slam(**cfg_overrides):
-    from src.nav.pose_jump_gate import PoseJumpGate
+    from src.nav.localize.pose_jump_gate import PoseJumpGate
 
     d = {
         "base": "b",
@@ -940,7 +940,7 @@ def test_periodic_relocalize_keeps_previous_when_scan_still_fits():
     assert result["prefer_previous"] is True
     assert result["shift_m"] == pytest.approx(7.7)
     slam.do_command.assert_not_awaited()
-    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+    from src.nav.localize.pose_jump_gate import should_hold_drive_for_pose_jump
 
     assert not should_hold_drive_for_pose_jump(result)
 
@@ -977,7 +977,7 @@ def test_periodic_relocalize_holds_nav_on_large_uncertain_shift():
     assert result["navigation_active"] is True
     assert result["large_jump"] is True
     slam.do_command.assert_not_awaited()
-    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+    from src.nav.localize.pose_jump_gate import should_hold_drive_for_pose_jump
 
     assert should_hold_drive_for_pose_jump(result)
 
@@ -1015,7 +1015,7 @@ def test_periodic_relocalize_holds_nav_on_soft_loc_small_shift():
     assert result.get("large_jump") is False
     assert result["shift_m"] == pytest.approx(0.08)
     slam.do_command.assert_not_awaited()
-    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+    from src.nav.localize.pose_jump_gate import should_hold_drive_for_pose_jump
 
     assert should_hold_drive_for_pose_jump(result)
 
@@ -1052,7 +1052,7 @@ def test_periodic_relocalize_soft_hold_resumes_after_timeout():
     """No map jump: brief soft hold, then keep driving on the published pose."""
     import time
 
-    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+    from src.nav.localize.pose_jump_gate import should_hold_drive_for_pose_jump
 
     slam = _relocalize_slam(
         periodic_relocalize_min_score=0.5,
@@ -1117,7 +1117,7 @@ def test_periodic_relocalize_soft_candidate_keeps_driving_if_prior_ok():
     result = asyncio.run(slam._periodic_relocalize_cycle())
 
     assert result["status"] == "low_quality"
-    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+    from src.nav.localize.pose_jump_gate import should_hold_drive_for_pose_jump
 
     assert not should_hold_drive_for_pose_jump(result)
 
@@ -1284,7 +1284,7 @@ def test_periodic_relocalize_cycle_recovery_floor_blocks_garbage():
     assert result["status"] == "nav_hold"
     assert result["recovery_apply"] is False
     slam.do_command.assert_not_awaited()
-    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+    from src.nav.localize.pose_jump_gate import should_hold_drive_for_pose_jump
 
     assert should_hold_drive_for_pose_jump(result)
 
@@ -1451,7 +1451,7 @@ def test_allow_during_navigation_refuses_large_jump_without_hold():
     assert result["corrected"] is False
     assert result["large_jump"] is True
     slam.do_command.assert_not_awaited()
-    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+    from src.nav.localize.pose_jump_gate import should_hold_drive_for_pose_jump
 
     assert not should_hold_drive_for_pose_jump(result)
 
@@ -1485,7 +1485,7 @@ def test_allow_during_navigation_refuses_trusted_large_jump_without_await():
     assert result["status"] == "refused_large"
     assert result["corrected"] is False
     slam.do_command.assert_not_awaited()
-    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+    from src.nav.localize.pose_jump_gate import should_hold_drive_for_pose_jump
 
     assert not should_hold_drive_for_pose_jump(result)
 
@@ -1855,7 +1855,7 @@ def test_mid_nav_apply_override_refuses_teleport_past_cap():
     assert result["large_jump"] is True
     assert result.get("jump_status") != "forced"
     slam.do_command.assert_not_awaited()
-    from src.nav.pose_jump_gate import should_hold_drive_for_pose_jump
+    from src.nav.localize.pose_jump_gate import should_hold_drive_for_pose_jump
 
     assert not should_hold_drive_for_pose_jump(result)
 

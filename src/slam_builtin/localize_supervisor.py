@@ -16,8 +16,8 @@ from viam.utils import ValueTypes
 
 from ..config import MODE_LOCALIZING, MODE_MAPPING, SlamConfig
 from ..geom import conversions as conv
-from ..nav.global_localize import GlobalLocalizeResult
-from ..nav.pose_jump_gate import candidate_beats_previous, stuck_refine_decision
+from ..nav.localize.global_localize import GlobalLocalizeResult
+from ..nav.localize.pose_jump_gate import candidate_beats_previous, stuck_refine_decision
 
 LOGGER = getLogger(__name__)
 

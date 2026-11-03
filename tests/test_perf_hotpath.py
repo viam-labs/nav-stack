@@ -6,15 +6,15 @@ import math
 import numpy as np
 
 from src.geom.conversions import LaserScan2D, Pose2D, costmap_frame_to_map
-from src.nav_builtin.costmap import (
+from src.nav.planning.costmap import (
     FREE,
     HARD_BUFFER,
     LETHAL,
     footprint_max_cost,
     nearest_free_cell,
 )
-from src.nav_builtin.footprint_guard import obstacle_points, scan_to_world_points
-from src.nav_builtin.types import OccupancyGrid
+from src.nav.control.footprint_guard import obstacle_points, scan_to_world_points
+from src.nav.types import OccupancyGrid
 
 
 def test_footprint_max_cost_center_lethal_and_oob():

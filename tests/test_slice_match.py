@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 
-from src.nav import slice_match
+from src.nav.localize import slice_match
 from src.geom import conversions as conv
 
 

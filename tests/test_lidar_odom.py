@@ -10,7 +10,7 @@ import pytest
 
 from src.config import SlamConfig
 from src.geom import conversions as conv
-from src.nav.maps import MapStore
+from src.nav.stores.maps import MapStore
 from src.slam_builtin import engine as engine_mod
 from src.slam_builtin.engine import BuiltinSlamEngine
 from src.slam_builtin.lidar_odom import LidarOdometry, icp_2d

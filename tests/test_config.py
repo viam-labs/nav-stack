@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from src.geom import conversions as conv
-from src.nav_builtin.types import Pose2D
+from src.nav.types import Pose2D
 
 from src.config import (
     DIFFERENTIAL,
@@ -604,7 +604,7 @@ def test_removed_inflation_radius_keys_are_rejected():
 
 def test_local_inflation_knob_reaches_the_live_scan_layer():
     """``local_inflation_margin_m`` paints a soft band past the hard disk."""
-    from src.nav_builtin.local_costmap import LocalCostmap, LocalCostmapConfig
+    from src.nav.planning.local_costmap import LocalCostmap, LocalCostmapConfig
 
     cfg = NavConfig.from_dict(
         {

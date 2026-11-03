@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from ..nav.global_localize import (
+from ..nav.localize.global_localize import (
     OccupancyMap,
     _inflate_occupied,
     _score_pose,

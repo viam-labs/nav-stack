@@ -1,4 +1,4 @@
-from src.nav.motion_summary import describe_cmd_vel, summarize_nav_motion
+from src.nav.motion.motion_summary import describe_cmd_vel, summarize_nav_motion
 
 
 def test_describe_hard_right_turn_with_forward():
