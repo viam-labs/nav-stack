@@ -654,6 +654,9 @@ class BuiltinNavConfig:
     nav_loc_refine_apply_min_score: float = 0.35
     # Pause after SetVelocity(0) so yaw-rate preflight does not skip the check.
     nav_loc_refine_settle_s: float = 0.5
+    # SLAM ``localization_state`` ``lost`` mid-goal: stop and keep running the
+    # stopped recovery search; fail the goal if still lost after this long.
+    nav_loc_lost_fail_s: float = 30.0
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "BuiltinNavConfig":

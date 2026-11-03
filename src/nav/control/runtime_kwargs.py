@@ -176,6 +176,7 @@ def _sanitize_nav_cfg(cfg: NavConfig) -> NavConfig:
             1.0, max(0.0, float(b.nav_loc_refine_apply_min_score))
         ),
         nav_loc_refine_settle_s=max(0.0, float(b.nav_loc_refine_settle_s)),
+        nav_loc_lost_fail_s=max(0.0, float(b.nav_loc_lost_fail_s)),
         local_costmap_rate_hz=max(0.5, float(b.local_costmap_rate_hz)),
     )
     return replace(
