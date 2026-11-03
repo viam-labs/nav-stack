@@ -56,10 +56,15 @@ def assess_occupancy(
     resolution: float,
     origin_x: float,
     origin_y: float,
+    baseline: Optional[np.ndarray] = None,
     max_hotspots: int = 8,
     max_side: int = 800,
 ) -> MapHealth:
     """Score a Nav2-style occupancy grid (-1 unknown, 0 free, ≥50 occupied).
+
+    With ``baseline`` (same shape and frame as ``grid``, e.g. the map a mapping
+    session resumed on), only walls absent from the baseline are scored, so
+    damage inherited from the loaded map does not mask or fake new tearing.
 
     Large maps are downsampled so a live watchdog stays cheap (~tens of ms).
     """
@@ -71,7 +76,15 @@ def assess_occupancy(
         raise ValueError("resolution must be positive")
     occ = cells >= 50
     free = (cells >= 0) & (cells < 50)
-    n_occ = int(occ.sum())
+    if baseline is None:
+        focus = occ
+    else:
+        base = np.asarray(baseline)
+        if base.shape != cells.shape:
+            raise ValueError("baseline must match the grid shape")
+        # One-cell slack so re-observing a known wall is not "new".
+        focus = occ & ~_dilate(base >= 50)
+    n_occ = int(focus.sum())
     if n_occ < _MIN_OCC_CELLS:
         return MapHealth(
             status="cold",
@@ -82,14 +95,15 @@ def assess_occupancy(
             hotspots=(),
         )
 
-    ys, xs = np.where(occ)
-    pad = max(2, int(round(0.5 / res)))
+    ys, xs = np.where(focus)
+    pad = max(2, int(round((_GHOST_SEP_MAX_M + 0.1) / res)))
     r0 = max(0, int(ys.min()) - pad)
     r1 = min(cells.shape[0], int(ys.max()) + pad + 1)
     c0 = max(0, int(xs.min()) - pad)
     c1 = min(cells.shape[1], int(xs.max()) + pad + 1)
     sub = occ[r0:r1, c0:c1]
     free_sub = free[r0:r1, c0:c1]
+    focus_sub = focus[r0:r1, c0:c1]
     work_res = res
     # Coarsen big maps; keep world hotspot coords via the same origins.
     step = 1
@@ -98,17 +112,19 @@ def assess_occupancy(
         step = int(math.ceil(max(h, w) / float(max_side)))
         sub = sub[::step, ::step]
         free_sub = free_sub[::step, ::step]
+        focus_sub = focus_sub[::step, ::step]
         work_res = res * step
 
-    ghost = _ghost_mask(sub, free_sub, work_res)
-    thick = _thick_mask(sub)
-    n_sub = max(1, int(sub.sum()))
+    # Ghost pairs may straddle a baseline wall and a new one; count the new side.
+    ghost = _ghost_mask(sub, free_sub, work_res) & focus_sub
+    thick = _thick_mask(sub) & focus_sub
+    n_sub = max(1, int(focus_sub.sum()))
     ghost_frac = float(ghost.sum()) / float(n_sub)
     thick_frac = float(thick.sum()) / float(n_sub)
-    angle_std = _angle_std_deg(sub, work_res)
+    angle_std = _angle_std_deg(focus_sub, work_res)
     hotspots = _ghost_hotspots(
         ghost,
-        sub,
+        focus_sub,
         res=work_res,
         origin_x=origin_x + c0 * res,
         origin_y=origin_y + r0 * res,
@@ -171,6 +187,41 @@ def _ghost_mask(occ: np.ndarray, free: np.ndarray, res: float) -> np.ndarray:
                     out[r, c] = True
                     out[r2, c] = True
                     break
+    return out
+
+
+def align_grid(
+    cells: np.ndarray,
+    *,
+    origin_x: float,
+    origin_y: float,
+    shape: Tuple[int, int],
+    to_origin_x: float,
+    to_origin_y: float,
+    resolution: float,
+) -> np.ndarray:
+    """Re-index ``cells`` into another grid frame of the same resolution.
+
+    Cells outside ``cells`` come back unknown (-1).
+    """
+    src = np.asarray(cells)
+    out = np.full(shape, -1, dtype=src.dtype)
+    dc = int(round((float(origin_x) - float(to_origin_x)) / float(resolution)))
+    dr = int(round((float(origin_y) - float(to_origin_y)) / float(resolution)))
+    r0, c0 = max(0, dr), max(0, dc)
+    r1 = min(shape[0], dr + src.shape[0])
+    c1 = min(shape[1], dc + src.shape[1])
+    if r1 > r0 and c1 > c0:
+        out[r0:r1, c0:c1] = src[r0 - dr : r1 - dr, c0 - dc : c1 - dc]
+    return out
+
+
+def _dilate(mask: np.ndarray) -> np.ndarray:
+    out = mask.copy()
+    out[1:, :] |= mask[:-1, :]
+    out[:-1, :] |= mask[1:, :]
+    out[:, 1:] |= mask[:, :-1]
+    out[:, :-1] |= mask[:, 1:]
     return out
 
 

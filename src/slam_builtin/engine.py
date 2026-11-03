@@ -224,6 +224,11 @@ class BuiltinSlamEngine:
         self._map_health_generation = -1
         self._map_health_boosts = 0
         self._map_health_last_status = "cold"
+        # Map a mapping session resumed on: scored once, then excluded from
+        # live health so inherited ghosts don't read as new tearing.
+        self._map_health_base_src: Optional[LogOddsGrid] = None
+        self._map_health_base_cells: Optional[np.ndarray] = None
+        self._map_health_base: Optional[dict] = None
         self._keyframe_hook = None
         # Optional: SlamService wires this into LocalizationStateTracker so a
         # tick that trusts the published pose clears / avoids ``lost``.
@@ -897,20 +902,67 @@ class BuiltinSlamEngine:
             res = float(self._grid.resolution)
             ox = float(self._grid.origin_x)
             oy = float(self._grid.origin_y)
+            base = self._graph_base
+            base_cells = None
+            base_origin = (0.0, 0.0)
+            if base is not self._map_health_base_src:
+                self._map_health_base_src = base
+                self._map_health_base_cells = None
+                self._map_health_base = None
+                if base is not None and abs(float(base.resolution) - res) < 1e-9:
+                    base_cells = occ.to_occupancy_int16(base)
+                    base_origin = (float(base.origin_x), float(base.origin_y))
         try:
+            if base_cells is not None:
+                base_health = map_health.assess_occupancy(
+                    base_cells,
+                    resolution=res,
+                    origin_x=base_origin[0],
+                    origin_y=base_origin[1],
+                )
+                self._map_health_base_cells = base_cells
+                self._map_health_base = {
+                    **base_health.as_dict(),
+                    "origin_x": base_origin[0],
+                    "origin_y": base_origin[1],
+                }
+                self._log(
+                    f"map health baseline (loaded map) {base_health.status} "
+                    f"ghost={base_health.ghost_frac:.2f} "
+                    f"angle_std={base_health.angle_std_deg:.1f}deg; "
+                    "scoring only walls this session adds"
+                )
+            baseline = None
+            if self._map_health_base_cells is not None and self._map_health_base:
+                baseline = map_health.align_grid(
+                    self._map_health_base_cells,
+                    origin_x=self._map_health_base["origin_x"],
+                    origin_y=self._map_health_base["origin_y"],
+                    shape=grid.shape,
+                    to_origin_x=ox,
+                    to_origin_y=oy,
+                    resolution=res,
+                )
             health = map_health.assess_occupancy(
-                grid, resolution=res, origin_x=ox, origin_y=oy
+                grid, resolution=res, origin_x=ox, origin_y=oy, baseline=baseline
             )
         except Exception as exc:  # noqa: BLE001
             self._log(f"map health assess failed: {exc}")
             return dict(self._map_health)
         payload = health.as_dict()
         payload["age_s"] = 0.0
+        payload["scope"] = "session" if baseline is not None else "map"
+        if self._map_health_base is not None:
+            payload["baseline"] = {
+                k: v
+                for k, v in self._map_health_base.items()
+                if k not in ("origin_x", "origin_y")
+            }
         prev = self._map_health_last_status
         if health.status != prev and health.status in ("watch", "degrading"):
             self._map_health_boosts += 1
             self._log(
-                "map health "
+                f"map health ({payload['scope']}) "
                 f"{prev}->{health.status} ghost={health.ghost_frac:.2f} "
                 f"angle_std={health.angle_std_deg:.1f}deg "
                 f"hotspots={len(health.hotspots)}"
