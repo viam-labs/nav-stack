@@ -3,10 +3,11 @@
 Pose-jump ``awaiting_confirm`` and ``_maybe_pause_and_refine_localization``
 both force zero motion while the rest of the tick (sense / avoid) still runs.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from ..types import Pose2D
 
@@ -93,8 +94,7 @@ def run_loc_hold_tick(
                     "status": loc_hold.get("status"),
                     "confirm_count": loc_hold.get("confirm_count"),
                     "confirm_needed": loc_hold.get("confirm_needed"),
-                    "shift_m": loc_hold.get("shift_m")
-                    or loc_hold.get("jump_shift_m"),
+                    "shift_m": loc_hold.get("shift_m") or loc_hold.get("jump_shift_m"),
                     "shift_deg": loc_hold.get("shift_deg")
                     or loc_hold.get("jump_shift_deg"),
                 },

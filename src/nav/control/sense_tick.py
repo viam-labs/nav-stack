@@ -5,26 +5,27 @@ Fetches scan / depth / above-cart, refreshes the local costmap, builds
 the same ``TickContext`` (cmd / progress / path / pose / corridor) instead
 of re-threading those fields as kwargs.
 """
+
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 
 from ...geom import conversions as conv
 from ..motion.simple_motion import DriveCommand, cone_min_range
+from ..types import Path2D, Pose2D
 from .above_cart import above_cart_frames
 from .depth_memory import depth_frames
 from .escape import EscapeSense
 from .footprint_guard import obstacle_points, scan_to_world_points
-from ..types import Path2D, Pose2D
 
 if TYPE_CHECKING:
-    from .goal_episode import GoalEpisode
     from ..planning.local_costmap import LocalCostmapView
+    from .goal_episode import GoalEpisode
     from .supervisor import NavSupervisor
 
 # Per-tick wall times (ms) for sense → costmap → guard → dwa → gate.
@@ -95,9 +96,7 @@ class TickContext:
         yaw = self.corridor_yaw
         if prefer_yaw_sign is None:
             prefer_yaw_sign = (
-                math.copysign(1.0, yaw)
-                if yaw is not None
-                else ep.escape_m.yaw_sign
+                math.copysign(1.0, yaw) if yaw is not None else ep.escape_m.yaw_sign
             )
         return EscapeSense(
             now=self.now,
@@ -156,12 +155,16 @@ def run_sense_tick(
     mem_pts = None
     if nav._guard is not None:  # noqa: SLF001
         nav._depth_memory.update(  # noqa: SLF001
-            depth_frames(nav._world), pose, _mono()  # noqa: SLF001
+            depth_frames(nav._world),
+            pose,
+            _mono(),  # noqa: SLF001
         )
         mem_pts = nav._depth_memory.points()  # noqa: SLF001
     if nav._above_memory is not None:  # noqa: SLF001
         nav._above_memory.update(  # noqa: SLF001
-            above_cart_frames(nav._world), pose, _mono()  # noqa: SLF001
+            above_cart_frames(nav._world),
+            pose,
+            _mono(),  # noqa: SLF001
         )
         above_pts = nav._above_memory.points()  # noqa: SLF001
         if above_pts.size:
@@ -244,7 +247,11 @@ def run_sense_tick(
             forward_clearance_m = straight + nav._guard.cfg.length_m / 2.0  # noqa: SLF001
         nose_clear = straight >= nav._guard.cfg.alt_min_free_m or (  # noqa: SLF001
             nav._guard.best_forward_arc(  # noqa: SLF001
-                pose, guard_pts, None, nav._guard.cfg.horizon_m, 0.0  # noqa: SLF001
+                pose,
+                guard_pts,
+                None,
+                nav._guard.cfg.horizon_m,
+                0.0,  # noqa: SLF001
             )
             is not None
         )
@@ -254,8 +261,7 @@ def run_sense_tick(
         if math.isfinite(nose_range):
             forward_clearance_m = float(nose_range)
         nose_clear = (
-            forward_clearance_m is None
-            or forward_clearance_m > obs_cfg.stop_distance_m
+            forward_clearance_m is None or forward_clearance_m > obs_cfg.stop_distance_m
         )
     if local_view is not None:
         from ..planning.local_planner import path_cost_ahead as _path_cost_ahead

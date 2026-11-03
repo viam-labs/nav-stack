@@ -5,6 +5,7 @@ as one scan lets the lidar, after the camera looks away, mark free every cell
 up to its own farther hit. Each height band is raytraced alone. The published
 grid is occupied wherever any band is occupied.
 """
+
 from __future__ import annotations
 
 import math
@@ -95,8 +96,7 @@ def cover_bands(bands: Mapping[int, LogOddsGrid]) -> Dict[int, LogOddsGrid]:
     width = max(1, int(round((max_x - min_x) / res)))
     height = max(1, int(round((max_y - min_y) / res)))
     return {
-        band: rebase(grid, min_x, min_y, height, width)
-        for band, grid in bands.items()
+        band: rebase(grid, min_x, min_y, height, width) for band, grid in bands.items()
     }
 
 

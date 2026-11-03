@@ -1,4 +1,5 @@
 """Periodic / pose-jump / oscillation replan decision for one tick."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -83,17 +84,12 @@ def run_periodic_replan(
     backup_exhausted = (
         ep.backup_attempts >= nav._backup_max_attempts and tick.local_blocked  # noqa: SLF001
     )
-    osc_replan = bool(
-        oscillating and tick.local_blocked and not tick.nose_clear
-    )
+    osc_replan = bool(oscillating and tick.local_blocked and not tick.nose_clear)
     spin_rock = bool(
         progress.get("spin_blocked") and oscillating and not tick.nose_clear
     )
     should_replan = (replan_due or pose_jumped) and (
-        static_blocked
-        or osc_replan
-        or spin_rock
-        or backup_exhausted
+        static_blocked or osc_replan or spin_rock or backup_exhausted
     )
     if replan_due and not should_replan:
         ep.last_replan = tick.now
@@ -126,13 +122,8 @@ def run_periodic_replan(
         clearance = progress.get("forward_clearance_m")
         has_room = clearance is None or float(clearance) >= 0.35
         obstacle = str(progress.get("obstacle") or "")
-        lidar_open = (
-            obstacle not in ("stop", "hold", "no_scan") and has_room
-        )
-        if (
-            ep.failed_static_replan >= ep.static_replan_fail_limit
-            and not lidar_open
-        ):
+        lidar_open = obstacle not in ("stop", "hold", "no_scan") and has_room
+        if ep.failed_static_replan >= ep.static_replan_fail_limit and not lidar_open:
             nav._world.stop()  # noqa: SLF001
             nav._set_status(  # noqa: SLF001
                 state="failed",

@@ -1,4 +1,5 @@
 """Golden checks for disk-offset fancy-index + scan cache + viz vectorize."""
+
 from __future__ import annotations
 
 import math
@@ -6,6 +7,7 @@ import math
 import numpy as np
 
 from src.geom.conversions import LaserScan2D, Pose2D, costmap_frame_to_map
+from src.nav.control.footprint_guard import obstacle_points, scan_to_world_points
 from src.nav.planning.costmap import (
     FREE,
     HARD_BUFFER,
@@ -13,7 +15,6 @@ from src.nav.planning.costmap import (
     footprint_max_cost,
     nearest_free_cell,
 )
-from src.nav.control.footprint_guard import obstacle_points, scan_to_world_points
 from src.nav.types import OccupancyGrid
 
 
@@ -22,26 +23,21 @@ def test_footprint_max_cost_center_lethal_and_oob():
     costs[10, 10] = LETHAL
     occ = OccupancyGrid(grid=costs, resolution=0.1, origin_x=0.0, origin_y=0.0)
     # Cell center (10,10) → world 1.05, 1.05
-    assert footprint_max_cost(
-        costs, occ, 1.05, 1.05, robot_radius_m=0.05
-    ) == LETHAL
+    assert footprint_max_cost(costs, occ, 1.05, 1.05, robot_radius_m=0.05) == LETHAL
     # Near map edge: disk reaches outside → LETHAL
-    assert footprint_max_cost(
-        costs, occ, 0.05, 0.05, robot_radius_m=0.2
-    ) == LETHAL
+    assert footprint_max_cost(costs, occ, 0.05, 0.05, robot_radius_m=0.2) == LETHAL
     # Clear interior far from lethal
-    assert footprint_max_cost(
-        costs, occ, 0.55, 0.55, robot_radius_m=0.05
-    ) == FREE
+    assert footprint_max_cost(costs, occ, 0.55, 0.55, robot_radius_m=0.05) == FREE
 
 
 def test_footprint_max_cost_soft_ring():
     costs = np.zeros((20, 20), dtype=np.uint8)
     costs[10, 10] = HARD_BUFFER - 1  # soft, still traversable as a cell
     occ = OccupancyGrid(grid=costs, resolution=0.1, origin_x=0.0, origin_y=0.0)
-    assert footprint_max_cost(
-        costs, occ, 1.05, 1.05, robot_radius_m=0.05
-    ) == HARD_BUFFER - 1
+    assert (
+        footprint_max_cost(costs, occ, 1.05, 1.05, robot_radius_m=0.05)
+        == HARD_BUFFER - 1
+    )
 
 
 def test_nearest_free_cell_snaps_off_lethal():
@@ -67,9 +63,7 @@ def test_obstacle_points_scan_world_pts_cache_equivalence():
     )
     cached = scan_to_world_points(pose, scan)
     fresh = obstacle_points(pose, scan, None, radius_m=5.0)
-    reused = obstacle_points(
-        pose, scan, None, radius_m=5.0, scan_world_pts=cached
-    )
+    reused = obstacle_points(pose, scan, None, radius_m=5.0, scan_world_pts=cached)
     assert fresh.shape == reused.shape
     np.testing.assert_allclose(fresh, reused, atol=1e-9)
     # Passing empty cache must not fall back to re-transforming the scan.

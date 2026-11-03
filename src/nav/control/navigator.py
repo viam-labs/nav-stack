@@ -1,15 +1,16 @@
 """BuiltinNavigator: navigate / compute_path / cancel / status (no Nav2)."""
+
 from __future__ import annotations
 
 import threading
 from typing import Dict, Optional
 
 from ...config import NavConfig
-from .runtime_kwargs import resolve_nav_cfg
-from .supervisor import NavSupervisor
-from ..types import Pose2D
 from ...geom import conversions as conv
 from ..io.world_io import WorldIO
+from ..types import Pose2D
+from .runtime_kwargs import resolve_nav_cfg
+from .supervisor import NavSupervisor
 
 
 class BuiltinNavigator:

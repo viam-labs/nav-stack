@@ -33,6 +33,7 @@ dead-reckons an odom ``pose`` from twist (so ``has_pose`` is true for
 velocity-only wheeled sensors). Integration uses a world frame where
 theta=0 faces +X, with convention-aware body→world kinematics.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -201,9 +202,7 @@ class TypedMovementSensorOdom:
         # Orientation is needed to remove gravity from accel, to snap heading, or
         # to orient a trusted pose.
         need_orientation = p.orientation_supported and (
-            use_accel
-            or cfg.snap_heading
-            or (cfg.trust_pose and p.position_supported)
+            use_accel or cfg.snap_heading or (cfg.trust_pose and p.position_supported)
         )
 
         # Fire every needed typed getter concurrently (one round-trip).

@@ -20,10 +20,14 @@ def _tracker():
 def test_two_bad_cycles_make_lost_and_skips_keep_it():
     tracker, clock = _tracker()
     assert tracker.state == LOC_UNKNOWN
-    tracker.observe({"status": "ambiguous", "score": -0.03, "shift_m": 3.274, "shift_deg": 23.96})
+    tracker.observe(
+        {"status": "ambiguous", "score": -0.03, "shift_m": 3.274, "shift_deg": 23.96}
+    )
     assert tracker.state == LOC_DEGRADED
     clock["t"] += 20.0
-    tracker.observe({"status": "ambiguous", "score": -0.01, "shift_m": 3.1, "shift_deg": 22.0})
+    tracker.observe(
+        {"status": "ambiguous", "score": -0.01, "shift_m": 3.1, "shift_deg": 22.0}
+    )
     assert tracker.state == LOC_LOST
     # The robot starts driving; skipped checks say nothing about the pose.
     clock["t"] += 74.0
@@ -35,7 +39,9 @@ def test_two_bad_cycles_make_lost_and_skips_keep_it():
     assert snap["last_attempt"]["age_s"] == 74.0
     assert "initial pose" in snap["suggested_action"]
     text = tracker.describe()
-    assert text.startswith("lost for 74 s (ambiguous, best match -0.01 at 3.1 m / 22 deg)")
+    assert text.startswith(
+        "lost for 74 s (ambiguous, best match -0.01 at 3.1 m / 22 deg)"
+    )
 
 
 def test_correction_or_seed_returns_to_tracking():
@@ -43,7 +49,9 @@ def test_correction_or_seed_returns_to_tracking():
     tracker.observe({"status": "low_quality", "score": 0.2})
     tracker.observe({"status": "low_quality", "score": 0.2})
     assert tracker.state == LOC_LOST
-    tracker.observe({"status": "ok", "corrected": True, "good_match": True, "score": 0.7})
+    tracker.observe(
+        {"status": "ok", "corrected": True, "good_match": True, "score": 0.7}
+    )
     assert tracker.state == LOC_TRACKING
     assert tracker.snapshot()["bad_cycles"] == 0
     tracker.observe({"status": "refused_large", "score": 0.3})
@@ -59,9 +67,7 @@ def test_tick_prior_already_good_clears_lost():
     tracker.observe({"status": "nav_hold", "score": 0.4})
     tracker.observe({"status": "nav_hold", "score": 0.4})
     assert tracker.state == LOC_LOST
-    tracker.observe(
-        {"status": "previous_better", "score": 0.52, "prior_score": 0.58}
-    )
+    tracker.observe({"status": "previous_better", "score": 0.52, "prior_score": 0.58})
     assert tracker.state == LOC_TRACKING
     assert tracker.reason == "previous_better"
     assert tracker.snapshot()["bad_cycles"] == 0
@@ -70,7 +76,9 @@ def test_tick_prior_already_good_clears_lost():
 def test_weak_unshifted_match_is_degraded_not_lost():
     tracker, _ = _tracker()
     for _ in range(5):
-        tracker.observe({"status": "ok", "good_match": False, "drifted": False, "score": 0.4})
+        tracker.observe(
+            {"status": "ok", "good_match": False, "drifted": False, "score": 0.4}
+        )
     assert tracker.state == LOC_DEGRADED
     assert tracker.snapshot()["bad_cycles"] == 0
 
@@ -89,7 +97,12 @@ def test_describe_state_from_a_published_snapshot():
         {
             "state": "lost",
             "since_s": 94.2,
-            "last_attempt": {"status": "ambiguous", "score": 0.31, "shift_m": 3.3, "shift_deg": 24.0},
+            "last_attempt": {
+                "status": "ambiguous",
+                "score": 0.31,
+                "shift_m": 3.3,
+                "shift_deg": 24.0,
+            },
             "suggested_action": "set an initial pose near the robot",
         }
     )

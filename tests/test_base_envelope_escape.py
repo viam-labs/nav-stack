@@ -1,15 +1,15 @@
 """Shared base envelope + nose-escape policy."""
+
 from __future__ import annotations
 
-import math
 from dataclasses import replace
 
-from src.nav.motion.simple_motion import DriveCommand
-from src.nav.motion import base_envelope as env
 from src.nav.control import escape
 from src.nav.control.controller import FollowerConfig
-from src.nav.types import Pose2D
 from src.nav.io.viam_io import _sanitize_base_cmd
+from src.nav.motion import base_envelope as env
+from src.nav.motion.simple_motion import DriveCommand
+from src.nav.types import Pose2D
 
 
 def test_sanitize_matches_envelope_constants():
@@ -149,9 +149,7 @@ def test_escape_machine_bumper_reverse_then_replan(monkeypatch):
 def test_escape_machine_wait_freeze_and_unstick_turn(monkeypatch):
     monkeypatch.setattr(escape, "try_reverse", lambda *a, **k: None)
     monkeypatch.setattr(escape, "bumper_wants_reverse", lambda **k: False)
-    monkeypatch.setattr(
-        escape.EscapeMachine, "_spin_clear", lambda self, s: False
-    )
+    monkeypatch.setattr(escape.EscapeMachine, "_spin_clear", lambda self, s: False)
     m = escape.EscapeMachine()
     # Idle wait with no unstick path → freeze.
     r = m.tick_pre(
@@ -200,9 +198,7 @@ def test_escape_machine_wait_unstick_despite_follower_crawl(monkeypatch):
     rev = DriveCommand(-0.12, 0.0, 0.0, False)
     monkeypatch.setattr(escape, "try_reverse", lambda *a, **k: rev)
     monkeypatch.setattr(escape, "bumper_wants_reverse", lambda **k: False)
-    monkeypatch.setattr(
-        escape.EscapeMachine, "_spin_clear", lambda self, s: False
-    )
+    monkeypatch.setattr(escape.EscapeMachine, "_spin_clear", lambda self, s: False)
     m = escape.EscapeMachine()
     r = m.tick_pre(
         _sense(

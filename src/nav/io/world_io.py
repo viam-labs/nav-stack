@@ -1,4 +1,5 @@
 """World I/O protocol for the builtin navigator (map / pose / scan / drive)."""
+
 from __future__ import annotations
 
 from typing import Optional, Protocol, runtime_checkable
@@ -17,20 +18,17 @@ class WorldIO(Protocol):
         """Bridge-style map dict: grid, resolution, origin_x, origin_y."""
         ...
 
-    def get_pose(self) -> Optional[conv.Pose2D]:
-        ...
+    def get_pose(self) -> Optional[conv.Pose2D]: ...
 
     def get_scan(
         self, max_age_s: float = 2.0, *, include_obstacles_only: bool = True
-    ) -> Optional[conv.LaserScan2D]:
-        ...
+    ) -> Optional[conv.LaserScan2D]: ...
 
     def set_velocity(self, vx: float, vy: float, vtheta: float) -> None:
         """Body-frame cmd (m/s, rad/s), ROS convention (+x forward)."""
         ...
 
-    def stop(self) -> None:
-        ...
+    def stop(self) -> None: ...
 
     def set_viz_plan(
         self,
@@ -67,7 +65,9 @@ class WorldIO(Protocol):
         """Optional SLAM local refine. Implementations may return None."""
         return None
 
-    def set_above_cart(self, enabled: bool, cart_height_m: Optional[float] = None) -> None:
+    def set_above_cart(
+        self, enabled: bool, cart_height_m: Optional[float] = None
+    ) -> None:
         """Remember depth returns that leave the vertical view. Default no-op."""
         return None
 

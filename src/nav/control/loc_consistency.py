@@ -1,4 +1,5 @@
 """Scan-vs-map consistency at the published pose (mid-nav loc refine)."""
+
 from __future__ import annotations
 
 import math
@@ -179,16 +180,10 @@ def published_pose_misregistered(result: Optional[Mapping]) -> bool:
     except (TypeError, ValueError):
         return False
     if not (
-        math.isfinite(shift_m)
-        and math.isfinite(shift_deg)
-        and math.isfinite(ray_mae_m)
+        math.isfinite(shift_m) and math.isfinite(shift_deg) and math.isfinite(ray_mae_m)
     ):
         return False
-    large = (
-        bool(result.get("large_jump"))
-        or shift_m >= 0.75
-        or shift_deg >= 25.0
-    )
+    large = bool(result.get("large_jump")) or shift_m >= 0.75 or shift_deg >= 25.0
     return large and ray_mae_m >= 0.45
 
 
@@ -341,11 +336,7 @@ def localization_looks_bad(
 
     for i in range(0, len(ranges), step):
         raw = float(ranges[i])
-        lidar_m = (
-            raw
-            if math.isfinite(raw) and raw >= scan.range_min
-            else float("inf")
-        )
+        lidar_m = raw if math.isfinite(raw) and raw >= scan.range_min else float("inf")
         body_ang = scan.angle_min + i * inc
         map_m = _raycast_occupied_m(
             occ,
@@ -398,7 +389,8 @@ def localization_looks_bad(
             lidar_m=None if lidar_m is None else round(float(lidar_m), 3),
             map_m=None if map_m is None else round(float(map_m), 3),
             gap_m=None if gap is None else round(float(gap), 3),
-            disagree=st["compared"] > 0 and st["bad"] / st["compared"] >= float(min_frac),
+            disagree=st["compared"] > 0
+            and st["bad"] / st["compared"] >= float(min_frac),
             compared=int(st["compared"]),
             disagree_beams=int(st["bad"]),
         )

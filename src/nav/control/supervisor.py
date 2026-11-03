@@ -1,38 +1,37 @@
 """Goal lifecycle: plan → follow → replan → succeed / fail / cancel."""
+
 from __future__ import annotations
 
 import math
 import threading
 import time
-
-import numpy as np
 from collections import deque
 from typing import Any, Optional
 
+import numpy as np
+
 from ...config import NavConfig
-from .runtime_kwargs import resolve_nav_cfg
+from ...geom import conversions as conv
+from ..io.world_io import WorldIO
+from ..motion.base_envelope import LIN_EPS_MPS, lift_sub_deadband
 from ..motion.simple_motion import (
     DriveCommand,
     ObstacleConfig,
     SimpleMotionConfig,
     distance_m,
 )
+from ..planning.local_costmap import (
+    LocalCostmap,
+    LocalCostmapConfig,
+)
+from ..planning.local_planner import LocalPlannerConfig
+from ..planning.planner import (
+    connect_plan_start,
+    paths_meaningfully_differ,
+    plan_path,
+)
+from ..planning.smoother import smooth_path, smooth_plan_path
 from ..stores.zones import apply_speed_zone_limit
-from ...geom import conversions as conv
-from .controller import (
-    FollowerConfig,
-    lookahead_pose,
-    limit_twist_rate,
-)
-from .above_cart import AboveCartMemory
-from ..motion.base_envelope import LIN_EPS_MPS, lift_sub_deadband
-from .depth_memory import DepthObstacleMemory
-from .escape import (
-    UNSTICK_YAW_RATE as _NOSE_UNSTICK_YAW_RATE,
-    blocked_nose_unstick,
-    bumper_wants_reverse,
-    undrivable_nose,
-)
 from ..thresholds import (
     AHEAD_HALF_WIDTH_PAD_M,
     BLOCKED_REPLAN_FAIL_LIMIT,
@@ -44,38 +43,40 @@ from ..thresholds import (
     NOSE_STOP_MARGIN_M,
     YAW_ALIGN_PROGRESS_RAD,
 )
+from ..types import NavStatus, Path2D, PlanResult, Pose2D
+from .above_cart import AboveCartMemory
 from .backup_recovery import run_backup_recovery
-from .final_gate import run_final_gate
-from .goal_episode import GoalEpisode
 from .block_policy import run_block_policy
-from .loc_hold_tick import run_loc_hold_tick
-from .path_follow import run_path_follow
-from .periodic_replan import run_periodic_replan
-from .replan_controller import apply_blocked_replan
-from .sense_tick import elapsed_ms, run_sense_tick
-from .stall_watch import run_stall_watch
-from .tick_output import finish_tick_output, send_tick_velocity
+from .controller import (
+    FollowerConfig,
+    limit_twist_rate,
+    lookahead_pose,
+)
+from .depth_memory import DepthObstacleMemory
+from .escape import (
+    UNSTICK_YAW_RATE as _NOSE_UNSTICK_YAW_RATE,
+)
+from .escape import (
+    blocked_nose_unstick,
+    bumper_wants_reverse,
+    undrivable_nose,
+)
+from .final_gate import run_final_gate
 from .footprint_guard import (
     FootprintGuard,
     GuardConfig,
     obstacle_points,
     open_corridor_yaw,
 )
-from ..planning.local_costmap import (
-    LocalCostmap,
-    LocalCostmapConfig,
-)
-from ..planning.local_planner import LocalPlannerConfig
-from ..planning.planner import (
-    path_blocked_local,
-    paths_meaningfully_differ,
-    plan_path,
-    connect_plan_start,
-)
-from ..planning.smoother import smooth_path, smooth_plan_path
-from ..types import NavStatus, Path2D, PlanResult, Pose2D
-from ..io.world_io import WorldIO
-
+from .goal_episode import GoalEpisode
+from .loc_hold_tick import run_loc_hold_tick
+from .path_follow import run_path_follow
+from .periodic_replan import run_periodic_replan
+from .replan_controller import apply_blocked_replan
+from .runtime_kwargs import resolve_nav_cfg
+from .sense_tick import elapsed_ms, run_sense_tick
+from .stall_watch import run_stall_watch
+from .tick_output import finish_tick_output, send_tick_velocity
 
 # Nose-unstick yaw budget/rate live in ``escape`` (_NOSE_UNSTICK_* aliases).
 # Corridor / yaw-align / blocked-replan policy numbers live in ``thresholds``.
@@ -650,9 +651,7 @@ class NavSupervisor:
         if allow_inline and not have_cache:
             _job()
             return
-        threading.Thread(
-            target=_job, name="nav-global-costmap", daemon=True
-        ).start()
+        threading.Thread(target=_job, name="nav-global-costmap", daemon=True).start()
 
     def _xy_at_nav_goal(self, pose: Pose2D, goal: Pose2D, path: Path2D) -> bool:
         """True when XY is close enough to the *requested* goal (not a far snap)."""
@@ -819,10 +818,10 @@ class NavSupervisor:
             result.path = smoothed
         return result
 
-    def _publish_plan_viz(self, result: PlanResult, goal: Pose2D, start: Optional[Pose2D]) -> None:
-        preview = result.to_preview_dict(
-            goal=(goal.x, goal.y, goal.theta), start=start
-        )
+    def _publish_plan_viz(
+        self, result: PlanResult, goal: Pose2D, start: Optional[Pose2D]
+    ) -> None:
+        preview = result.to_preview_dict(goal=(goal.x, goal.y, goal.theta), start=start)
         try:
             if result.costmap_viz is not None:
                 self._world.set_viz_costmap(result.costmap_viz)
@@ -1074,9 +1073,7 @@ class NavSupervisor:
             if now < self._loc_settle_until:
                 return "hold"
             self._loc_phase = "idle"
-            return self._launch_loc_check(
-                self._loc_next_step, **self._loc_next_kwargs
-            )
+            return self._launch_loc_check(self._loc_next_step, **self._loc_next_kwargs)
         # The check compares the live scan to a finished map. While mapping,
         # new rays disagree with the partial grid and check_localization
         # returns not_localizing, so the pause never corrects the pose.
@@ -1107,9 +1104,6 @@ class NavSupervisor:
 
         from .loc_consistency import (
             loc_blocks_forward,
-            residual_is_lost,
-            slam_pose_is_trusted,
-            small_local_match_worth_applying,
         )
 
         verdict = self._measure_loc_disagreement(pose)
@@ -1166,10 +1160,7 @@ class NavSupervisor:
         if result is None:
             return "hold" if self._loc_refine_tries > 0 else None
         status = str(result.get("status") or "")
-        if (
-            status == "awaiting_confirm"
-            and step in ("probe", "recovery")
-        ):
+        if status == "awaiting_confirm" and step in ("probe", "recovery"):
             self._loc_refine_force_stop = True
             if calm or step == "recovery":
                 self._pause_for_loc_refine(pose, dist_goal, verdict, settle=False)
@@ -1194,9 +1185,11 @@ class NavSupervisor:
             )
             return self._launch_loc_check("apply", apply=True)
 
-        if step == "recovery" and (
-            status not in ("corrected", "ok") or not result.get("corrected")
-        ) and bool(result.get("good_match")):
+        if (
+            step == "recovery"
+            and (status not in ("corrected", "ok") or not result.get("corrected"))
+            and bool(result.get("good_match"))
+        ):
             return self._launch_loc_check(
                 "recovery_apply", apply=True, stopped_recovery=True
             )
@@ -1361,10 +1354,10 @@ class NavSupervisor:
         """Plan pose → side via → goal when corridor seals keep returning the
         same route. Picks the shorter left/right peel that stays moderate.
         """
-        from .controller import _path_length
         from ..planning.local_costmap import footprint_collides
         from ..planning.local_planner import path_block_distance_m, path_point_ahead
         from ..planning.planner import _merge_path_prefix
+        from .controller import _path_length
 
         if path.empty or len(path.points) < 2:
             return None
@@ -1583,11 +1576,7 @@ class NavSupervisor:
     ) -> float:
         """Body-frame bearing of the route, else the straight-line goal."""
         follower = getattr(self, "_follower", None)
-        if (
-            path is not None
-            and follower is not None
-            and len(path.points) >= 2
-        ):
+        if path is not None and follower is not None and len(path.points) >= 2:
             target, _, _ = lookahead_pose(
                 pose,
                 path,
@@ -1634,9 +1623,7 @@ class NavSupervisor:
             radius_m=guard.cfg.obstacle_radius_m,
             scan_world_pts=scan_world_pts,
         )
-        free = guard.free_distance(
-            pose, arc.vx, arc.vtheta, pts, guard.cfg.horizon_m
-        )
+        free = guard.free_distance(pose, arc.vx, arc.vtheta, pts, guard.cfg.horizon_m)
         if guard._regulate(arc.vx, free) >= LIN_EPS_MPS:
             return arc, "corridor"
         return spin, "yaw_open"
@@ -1732,8 +1719,7 @@ class NavSupervisor:
             state="failed",
             active=False,
             error_msg=(
-                "path blocked: no route around obstacle "
-                f"({count} replans failed)"
+                f"path blocked: no route around obstacle ({count} replans failed)"
             ),
             progress=prev_progress or None,
         )
@@ -1775,9 +1761,9 @@ class NavSupervisor:
           A small per-goal short-flip budget allows returning to a clear short
           corridor a few times; after that, lift only when the detour is dead.
         """
-        from .controller import _path_length
         from ..planning.local_planner import path_cost_in_local_window
         from ..planning.path_utils import closest_point_on_path
+        from .controller import _path_length
 
         old_len = _path_length(path)
         self._last_replan_trigger = str(trigger or "")
@@ -1822,10 +1808,7 @@ class NavSupervisor:
             if not hold_active:
                 return None
             reason: Optional[str] = None
-            if (
-                self._detour_min_length_m > 0.0
-                and new_len < self._detour_min_length_m
-            ):
+            if self._detour_min_length_m > 0.0 and new_len < self._detour_min_length_m:
                 reason = (
                     f"short-flip hysteresis ({new_len:.1f} m < "
                     f"{self._detour_min_length_m:.1f} m ban)"
@@ -1851,9 +1834,7 @@ class NavSupervisor:
                 )
             # Prefer a milder peel when one already exists.
             if paint and best is not None and new_len > early_limit:
-                return (
-                    f"too long ({new_len:.1f} m > {early_limit:.1f} m)"
-                )
+                return f"too long ({new_len:.1f} m > {early_limit:.1f} m)"
             return None
 
         for label, paint in attempts:
@@ -1882,9 +1863,7 @@ class NavSupervisor:
                 continue
             stuck_cost = _still_local_blocked(replanned.path)
             if stuck_cost is not None:
-                reasons.append(
-                    f"{label}: still local-blocked (cost={stuck_cost})"
-                )
+                reasons.append(f"{label}: still local-blocked (cost={stuck_cost})")
                 continue
             new_len = _path_length(replanned.path)
             flip = _reject_short_flip(replanned.path, new_len)
@@ -1905,9 +1884,7 @@ class NavSupervisor:
                 new_path, result, label = forced
                 stuck_cost = _still_local_blocked(new_path)
                 if stuck_cost is not None:
-                    reasons.append(
-                        f"{label}: still local-blocked (cost={stuck_cost})"
-                    )
+                    reasons.append(f"{label}: still local-blocked (cost={stuck_cost})")
                 else:
                     new_len = _path_length(new_path)
                     flip = _reject_short_flip(new_path, new_len)
@@ -1919,7 +1896,12 @@ class NavSupervisor:
                             reasons.append(f"{label}: {too_long}")
                         else:
                             self._commit_replan_path(
-                                path, new_path, new_len, old_len, label, reasons,
+                                path,
+                                new_path,
+                                new_len,
+                                old_len,
+                                label,
+                                reasons,
                                 require_different=require_different,
                                 result=result,
                                 goal=goal,
@@ -1934,8 +1916,10 @@ class NavSupervisor:
             # (that is the thrash). Exception: path is actually blocked /
             # pose-jump recovery needs any escape (force_lift_short_flip).
             ban_was_only_reason = any("short-flip" in r for r in reasons)
-            if hold_active and allow_lift_ban and (
-                not ban_was_only_reason or force_lift_short_flip
+            if (
+                hold_active
+                and allow_lift_ban
+                and (not ban_was_only_reason or force_lift_short_flip)
             ):
                 reasons.append("detour-ban: lifting (no alternate)")
                 self._detour_ban_path = None
@@ -1965,7 +1949,12 @@ class NavSupervisor:
             return None
         new_len, new_path, result, label = best
         self._commit_replan_path(
-            path, new_path, new_len, old_len, label, reasons,
+            path,
+            new_path,
+            new_len,
+            old_len,
+            label,
+            reasons,
             require_different=require_different,
             result=result,
             goal=goal,
@@ -1999,8 +1988,7 @@ class NavSupervisor:
                 )
             )
             under_min = (
-                self._detour_min_length_m > 0.0
-                and new_len < self._detour_min_length_m
+                self._detour_min_length_m > 0.0 and new_len < self._detour_min_length_m
             )
             if matches_ban or under_min:
                 # Budgeted return to the abandoned short corridor.
@@ -2037,10 +2025,7 @@ class NavSupervisor:
 
     def _replan_blocked_at_start(self) -> bool:
         err = self._last_replan_error or ""
-        return (
-            "cannot reach plan start" in err
-            or "start pose is in lethal" in err
-        )
+        return "cannot reach plan start" in err or "start pose is in lethal" in err
 
     def _refine_stuck_pose(self) -> Optional[Pose2D]:
         """Ask SLAM for one small local match. Returns the pose when it moved."""
@@ -2167,7 +2152,9 @@ class NavSupervisor:
                 tick_started = time.monotonic()
                 if self._cancel.is_set():
                     self._world.stop()
-                    self._set_status(state="canceled", active=False, error_msg="canceled")
+                    self._set_status(
+                        state="canceled", active=False, error_msg="canceled"
+                    )
                     return
 
                 pose = self._world.get_pose()
@@ -2185,9 +2172,7 @@ class NavSupervisor:
                 ):
                     ep.on_goal_progress()
 
-                self._set_status(
-                    pose={"x": pose.x, "y": pose.y, "theta": pose.theta}
-                )
+                self._set_status(pose={"x": pose.x, "y": pose.y, "theta": pose.theta})
 
                 # Goal reached? Use the *requested* goal — path[-1] can be a
                 # free-cell snap that used to let us "succeed" a metre away.
@@ -2204,12 +2189,14 @@ class NavSupervisor:
                 # stops reducing the error. A rotation that is still closing
                 # the gap keeps going past the stall window.
                 if xy_ok:
-                    give_up, ep.align_best_err, ep.align_progress_at = yaw_align_give_up(
-                        now,
-                        yaw_err_abs,
-                        self._yaw_align_timeout_s,
-                        ep.align_best_err,
-                        ep.align_progress_at,
+                    give_up, ep.align_best_err, ep.align_progress_at = (
+                        yaw_align_give_up(
+                            now,
+                            yaw_err_abs,
+                            self._yaw_align_timeout_s,
+                            ep.align_best_err,
+                            ep.align_progress_at,
+                        )
                     )
                     if give_up:
                         self._world.stop()
@@ -2273,9 +2260,7 @@ class NavSupervisor:
                 if run_stall_watch(self, ep, tick).abort:
                     return
 
-                if send_tick_velocity(
-                    self, ep, tick, tick_started=tick_started
-                ):
+                if send_tick_velocity(self, ep, tick, tick_started=tick_started):
                     path = tick.path
                     continue
                 path = tick.path

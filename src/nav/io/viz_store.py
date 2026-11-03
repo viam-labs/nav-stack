@@ -1,4 +1,5 @@
 """In-process viz snapshot for builtin nav (nav-camera / get_costmap)."""
+
 from __future__ import annotations
 
 import threading

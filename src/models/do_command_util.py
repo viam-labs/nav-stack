@@ -4,6 +4,7 @@ Both ``SlamService`` and ``NavServiceBase`` used long ``if cmd == ...`` chains.
 Handlers live in a dict; ``require`` is the one place that pulls typed fields
 out of the command payload.
 """
+
 from __future__ import annotations
 
 import inspect

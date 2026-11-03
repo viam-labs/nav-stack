@@ -1,4 +1,5 @@
 """Lightweight DWA-style local planner on the rolling local costmap."""
+
 from __future__ import annotations
 
 import math
@@ -7,12 +8,12 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from ..motion.simple_motion import DriveCommand, apply_velocity_floor
 from ...geom import conversions as conv
-from .path_utils import closest_point_on_path
+from ..motion.simple_motion import DriveCommand, apply_velocity_floor
+from ..types import Path2D, Pose2D
 from .costmap import HARD_BUFFER, LETHAL
 from .local_costmap import LocalCostmapView, max_cost_along_segment
-from ..types import Path2D, Pose2D
+from .path_utils import closest_point_on_path
 
 # Set to a dict (tests / offline debugging) to capture per-tick scoring.
 _DEBUG: Optional[dict] = None
@@ -157,7 +158,9 @@ def _path_distance_m(path: Path2D, x: float, y: float) -> float:
     return math.hypot(x - px, y - py)
 
 
-def path_point_ahead(path: Path2D, x: float, y: float, ahead_m: float) -> Tuple[float, float]:
+def path_point_ahead(
+    path: Path2D, x: float, y: float, ahead_m: float
+) -> Tuple[float, float]:
     """Point on ``path`` ``ahead_m`` past the closest projection of (x, y)."""
     pts = path.points
     if not pts:
@@ -203,7 +206,9 @@ class DetourField:
             return math.inf
         return float(self.dist_m[row, col])
 
-    def descent_heading(self, x: float, y: float, *, ring_m: float = 0.28) -> Optional[float]:
+    def descent_heading(
+        self, x: float, y: float, *, ring_m: float = 0.28
+    ) -> Optional[float]:
         """Heading (rad) toward the lowest field value on a ring around (x, y).
 
         This is the local geodesic direction around the blockage — sideways
@@ -636,17 +641,6 @@ def compute_local_command(
         lookahead_m=cfg.path_clearance_lookahead_m,
     )
     path_blocked_ahead = ahead_cost >= cfg.activate_cost_threshold
-    block_dist = (
-        path_block_distance_m(
-            pose,
-            path,
-            view,
-            threshold=cfg.activate_cost_threshold,
-            lookahead_m=cfg.path_clearance_lookahead_m,
-        )
-        if path_blocked_ahead
-        else None
-    )
     # Costs already encode the footprint; ``robot_radius_m`` is kept for API
     # compatibility and only bounds the margin.
     collision_r = max(
@@ -701,9 +695,7 @@ def compute_local_command(
             dd_pose=detour.at(pose.x, pose.y) if detour else None,
             blocked=path_blocked_ahead,
         )
-    field_far_m = (
-        float(max(detour.dist_m.shape)) * detour.resolution if detour else 0.0
-    )
+    field_far_m = float(max(detour.dist_m.shape)) * detour.resolution if detour else 0.0
     path_dist_now = _path_distance_m(path, pose.x, pose.y)
     goal_dist_now = math.hypot(pose.x - gx, pose.y - gy)
     pose_heading_err = abs(conv.normalize_angle(heading_ref - pose.theta))
@@ -716,9 +708,9 @@ def compute_local_command(
         vxs = -max_reverse + (forward_max + max_reverse) * np.arange(
             n_vx, dtype=np.float64
         ) / (n_vx - 1)
-    vts = -max_vel_theta + (2.0 * max_vel_theta) * np.arange(
-        n_vt, dtype=np.float64
-    ) / (n_vt - 1)
+    vts = -max_vel_theta + (2.0 * max_vel_theta) * np.arange(n_vt, dtype=np.float64) / (
+        n_vt - 1
+    )
     vx_grid, vt_grid = np.meshgrid(vxs, vts, indexing="ij")
     vx_flat = vx_grid.ravel()
     vt_flat = vt_grid.ravel()

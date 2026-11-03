@@ -5,6 +5,7 @@ numbers discovered in the field, not operator settings. Deadband / crawl
 floors that the base sanitizer already names live in ``base_envelope``;
 import those rather than duplicating.
 """
+
 from __future__ import annotations
 
 import math

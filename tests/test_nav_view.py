@@ -1,4 +1,5 @@
 """Tests for the nav-camera renderer (src/viz/nav_view.py)."""
+
 import io
 
 import numpy as np
@@ -177,10 +178,15 @@ def test_window_region_bbox_normalized():
     cm = _costmap()
     opts = NavViewOptions(
         window_mode="region",
-        window_min_x=1.6, window_min_y=2.4, window_max_x=1.2, window_max_y=2.1,
+        window_min_x=1.6,
+        window_min_y=2.4,
+        window_max_x=1.2,
+        window_max_y=2.1,
     )
     # min/max get sorted regardless of input order.
-    assert _compute_window({"costmap": cm}, opts, cm) == pytest.approx((1.2, 2.1, 1.6, 2.4))
+    assert _compute_window({"costmap": cm}, opts, cm) == pytest.approx(
+        (1.2, 2.1, 1.6, 2.4)
+    )
 
 
 def test_window_region_missing_bounds_falls_back_to_full():
@@ -209,7 +215,9 @@ def test_window_outside_grid_is_padded_not_crashing():
     _img, _frame = _build_frame(cm, 200, (100.0, 100.0, 101.0, 101.0))
     # follow mode render end-to-end with a pose near an edge.
     snap = {"costmap": cm, "pose": (1.0, 2.0, 0.0)}
-    _decode(render_nav_view(snap, NavViewOptions(window_mode="follow", window_size_m=2.0)))
+    _decode(
+        render_nav_view(snap, NavViewOptions(window_mode="follow", window_size_m=2.0))
+    )
 
 
 def test_footprint_fallback_circle_uses_pose():

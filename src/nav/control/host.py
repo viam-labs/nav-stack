@@ -1,4 +1,5 @@
 """Duck-typed nav host for builtin navigation."""
+
 from __future__ import annotations
 
 from typing import Dict, Optional, Sequence
@@ -7,10 +8,10 @@ import numpy as np
 
 from ...config import NAV_BACKEND_BUILTIN, NavConfig
 from ...geom import conversions as conv
-from ..stores.zones import Zone, ZoneMaskPublisher, ZoneMaskSet
-from .navigator import BuiltinNavigator
 from ..io.viz_store import NavVizStore
 from ..io.world_io import WorldIO
+from ..stores.zones import Zone, ZoneMaskPublisher, ZoneMaskSet
+from .navigator import BuiltinNavigator
 
 
 def make_builtin_navigator(
@@ -57,7 +58,9 @@ class BuiltinNavHost:
         # Rebuild navigator with updated limits/planner if config changes.
         self._builtin_nav.cancel()
         self._builtin_nav = make_builtin_navigator(
-            self._world, nav_cfg, logger=self._builtin_nav._logger  # noqa: SLF001
+            self._world,
+            nav_cfg,
+            logger=self._builtin_nav._logger,  # noqa: SLF001
         )
 
     def nav_backend(self) -> str:

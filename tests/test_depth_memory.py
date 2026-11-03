@@ -1,4 +1,5 @@
 """Depth-camera obstacle memory: keep what left the camera's narrow view."""
+
 from __future__ import annotations
 
 import math
@@ -21,7 +22,12 @@ def _frame(pose: conv.Pose2D, world_pts) -> conv.LaserScan2D:
     dx, dy = pts[:, 0] - pose.x, pts[:, 1] - pose.y
     body = np.stack([c * dx + s * dy, -s * dx + c * dy], axis=1)
     scan = conv.points_to_scan(
-        body, angle_min=-math.pi, angle_max=math.pi, num_bins=360, range_min=0.0, range_max=2.0
+        body,
+        angle_min=-math.pi,
+        angle_max=math.pi,
+        num_bins=360,
+        range_min=0.0,
+        range_max=2.0,
     )
     return conv.LaserScan2D(
         scan.ranges,

@@ -8,13 +8,13 @@ the built-in SLAM model's in-process runtime it drives navigation from an
 ROS-free: map and pose come from the SLAM service (``get_grid`` / ``GetPosition``),
 scans from lidar cameras / shm, and drive from ``Base.SetVelocity``.
 """
+
 from __future__ import annotations
 
 import asyncio
 from typing import ClassVar, Mapping, Optional, Sequence, cast
 
 from typing_extensions import Self
-
 from viam.components.base import Base
 from viam.components.camera import Camera
 from viam.logging import getLogger
@@ -28,14 +28,13 @@ from viam.services.slam import SLAM
 from viam.utils import struct_to_dict
 
 from ..config import ExternalNavConfig
-from ..nav.stores.maps import MapStore
 from ..nav import (
     BuiltinNavHost,
     NavVizStore,
     ViamWorldIO,
     make_builtin_navigator,
 )
-from ..shm.lidar import ShmPointCloudClient
+from ..nav.stores.maps import MapStore
 from ..runtime import (
     SlamRuntime,
     get_parent_robot,
@@ -44,6 +43,7 @@ from ..runtime import (
     unregister_nav_host,
     unregister_nav_viz,
 )
+from ..shm.lidar import ShmPointCloudClient
 from ..viam_frames import (
     apply_framesystem_footprint_to_slam_cfg,
     apply_framesystem_to_nav_cfg,
@@ -120,9 +120,7 @@ class ExternalNavigationService(NavServiceBase):
         self._base = cast(Base, dependencies[Base.get_resource_name(ext.nav.base)])
         slam = cast(SLAM, dependencies[SLAM.get_resource_name(ext.slam_service)])
         cameras = {
-            lidar.name: cast(
-                Camera, dependencies[Camera.get_resource_name(lidar.name)]
-            )
+            lidar.name: cast(Camera, dependencies[Camera.get_resource_name(lidar.name)])
             for lidar in bridge_cfg.lidars
         }
 
@@ -162,7 +160,9 @@ class ExternalNavigationService(NavServiceBase):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - keep the config footprint
-            LOGGER.warning("framesystem footprint resolve failed; using config: %s", exc)
+            LOGGER.warning(
+                "framesystem footprint resolve failed; using config: %s", exc
+            )
 
     def _configure_builtin(
         self,

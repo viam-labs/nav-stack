@@ -8,6 +8,7 @@ reverse vs freeze, wait vs replan thrash, loc-hold vs driving through a jump.
 Each row is one closed-loop story: build a world, run a goal, require an
 obstacle-state subsequence (and forbid a few bad ones).
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

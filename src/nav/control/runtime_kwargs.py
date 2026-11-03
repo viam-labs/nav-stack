@@ -4,6 +4,7 @@ Supervisor stores the dataclass and reads ``self._cfg`` / ``self._cfg.builtin``.
 Legacy kwargs (``max_vel_x``, ``robot_radius_m``, …) still work for unit tests;
 prefer ``dataclasses.replace`` on ``NavConfig`` / ``BuiltinNavConfig`` for new code.
 """
+
 from __future__ import annotations
 
 from dataclasses import fields, replace
@@ -36,9 +37,7 @@ def default_nav_cfg() -> NavConfig:
     return NavConfig(slam_service="slam", base="base")
 
 
-def resolve_nav_cfg(
-    nav_cfg: Optional[NavConfig] = None, **overrides: Any
-) -> NavConfig:
+def resolve_nav_cfg(nav_cfg: Optional[NavConfig] = None, **overrides: Any) -> NavConfig:
     """Apply overrides onto a NavConfig via ``dataclasses.replace``.
 
     Derived footprint kwargs used by older tests:
@@ -95,12 +94,16 @@ def resolve_nav_cfg(
     half_track = overrides.pop("wheel_half_track_m", None)
     if nose is not None or spin is not None:
         # Build a rectangle whose half-length ≈ nose and half-diagonal ≈ spin.
-        nose_v = float(nose) if nose is not None else float(
-            top.get("robot_radius", cfg.robot_radius)
+        nose_v = (
+            float(nose)
+            if nose is not None
+            else float(top.get("robot_radius", cfg.robot_radius))
         )
         if spin is not None:
             spin_v = float(spin)
-            half_w = max(0.01, (spin_v**2 - nose_v**2) ** 0.5) if spin_v > nose_v else nose_v
+            half_w = (
+                max(0.01, (spin_v**2 - nose_v**2) ** 0.5) if spin_v > nose_v else nose_v
+            )
         else:
             half_w = float(top.get("robot_radius", cfg.robot_radius))
         top["footprint_length_m"] = 2.0 * nose_v

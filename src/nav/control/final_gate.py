@@ -3,17 +3,18 @@
 Last motion shaping before status / stall / set_velocity. Mutates the
 ``TickContext`` command and progress.
 """
+
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..motion.simple_motion import DriveCommand, distance_m
 from ..motion.base_envelope import LIN_EPS_MPS
+from ..motion.simple_motion import DriveCommand, distance_m
+from ..thresholds import CORRIDOR_ALIGN_RAD
 from .footprint_guard import obstacle_points
 from .replan_controller import apply_escape_post_replan
-from ..thresholds import CORRIDOR_ALIGN_RAD
 
 if TYPE_CHECKING:
     from .goal_episode import GoalEpisode
@@ -92,9 +93,7 @@ def run_final_gate(
             )
 
         def _reduced(c: DriveCommand, v) -> bool:
-            return abs(v.vx) < abs(c.vx) - 1e-9 or abs(v.vtheta) < abs(
-                c.vtheta
-            ) - 1e-9
+            return abs(v.vx) < abs(c.vx) - 1e-9 or abs(v.vtheta) < abs(c.vtheta) - 1e-9
 
         veto = _veto(cmd)
         if _reduced(cmd, veto) and abs(pre_limit.vx) > 1e-6:
@@ -140,8 +139,7 @@ def run_final_gate(
                 nav._last_sent_cmd = tick.cmd  # noqa: SLF001
                 tick.progress = {
                     **tick.progress,
-                    "obstacle": escape_post.obstacle
-                    or tick.progress.get("obstacle"),
+                    "obstacle": escape_post.obstacle or tick.progress.get("obstacle"),
                     "local_planner": False,
                     "cmd_vx_mps": tick.cmd.vx,
                     "cmd_vtheta_rad_s": tick.cmd.vtheta,
@@ -151,6 +149,4 @@ def run_final_gate(
         )
         traced = True
 
-    return GateResult(
-        traced=traced, near_d=near_d, near_x=near_x, near_y=near_y
-    )
+    return GateResult(traced=traced, near_d=near_d, near_x=near_x, near_y=near_y)

@@ -5,6 +5,7 @@ odometry, drive, and stop. When ``odom_reader`` is supplied it uses the typed
 MovementSensor API; otherwise ``get_readings`` is parsed. Mount-yaw / upside-down
 / heading-sensor corrections apply either way.
 """
+
 from __future__ import annotations
 
 import math
@@ -20,7 +21,6 @@ from ..config import (
 )
 from ..geom import conversions as conv
 from ..shm import pcshm
-from ..shm.lidar import ShmPointCloudClient
 from .io_provider import IOProvider
 
 
@@ -124,7 +124,9 @@ def build_io_provider(
                     raise RuntimeError(
                         f"lidar {name} has shm_name={shm_name!r} but no shm client"
                     )
-                max_age = float(cfg.scan_max_age_s) if cfg.scan_max_age_s > 0.0 else None
+                max_age = (
+                    float(cfg.scan_max_age_s) if cfg.scan_max_age_s > 0.0 else None
+                )
                 got = client.try_read(
                     shm_name,
                     lidar_cfg.shm_region_size,

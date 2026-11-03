@@ -1,4 +1,5 @@
 """Path-following controller built on simple_motion P-control + obstacle cone."""
+
 from __future__ import annotations
 
 import math
@@ -7,6 +8,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ...geom import conversions as conv
+from ..motion.base_envelope import CRAWL_FLOOR_MPS, LIN_EPS_MPS, SPIN_VX_FLOOR_MPS
 from ..motion.simple_motion import (
     DriveCommand,
     ObstacleConfig,
@@ -19,18 +22,20 @@ from ..motion.simple_motion import (
     heading_error_rad,
     spin_clearance_m,
 )
-from ...geom import conversions as conv
-from ..motion.base_envelope import CRAWL_FLOOR_MPS, LIN_EPS_MPS, SPIN_VX_FLOOR_MPS
-from .escape import try_reverse as _try_narrow_reverse
+from ..planning.local_costmap import (
+    LocalCostmapView,
+    spin_disc_blocked,
+)
+from ..planning.local_planner import LocalPlannerConfig, compute_local_command
+from ..planning.path_utils import closest_point_on_path, signed_crosstrack_m
+from ..thresholds import SPIN_CLEAR_MARGIN_M, TRANSLATE_YAW_CAP_RAD_S
+from ..types import Path2D, Pose2D
+
 # Re-exports for tests / older call sites that imported these names here.
 from .escape import rear_open as _rear_open_for_unstick  # noqa: F401
 from .escape import reverse_command as _narrow_reverse_command  # noqa: F401
+from .escape import try_reverse as _try_narrow_reverse
 from .footprint_guard import FootprintGuard, obstacle_points
-from ..planning.local_costmap import LocalCostmapView, reverse_path_clear, spin_disc_blocked
-from ..planning.local_planner import LocalPlannerConfig, compute_local_command
-from ..thresholds import SPIN_CLEAR_MARGIN_M, TRANSLATE_YAW_CAP_RAD_S
-from ..planning.path_utils import closest_point_on_path, signed_crosstrack_m
-from ..types import Path2D, Pose2D
 
 
 @dataclass
@@ -281,7 +286,9 @@ def drivable_min_speed(kappa: float, cfg: FollowerConfig) -> float:
     return max(_BASE_CRAWL_FLOOR_MPS, float(cfg.wheel_min_speed_mps) / denom)
 
 
-def keep_arc_drivable(cmd: DriveCommand, cfg: Optional[FollowerConfig] = None) -> DriveCommand:
+def keep_arc_drivable(
+    cmd: DriveCommand, cfg: Optional[FollowerConfig] = None
+) -> DriveCommand:
     """Keep a translating arc inside the region the base will actually execute.
 
     Obstacle slow-down scales ``vx`` toward zero; below the crawl floor the
@@ -630,9 +637,7 @@ def compute_path_command(
         cfg.approach_dist_m * 2.0,
         0.8,
     )
-    lookahead = _effective_lookahead(
-        cfg, speed_mps=est_speed, near_goal=near_goal
-    )
+    lookahead = _effective_lookahead(cfg, speed_mps=est_speed, near_goal=near_goal)
     target, idx, is_final = lookahead_pose(
         current,
         path,
@@ -791,11 +796,7 @@ def compute_path_command(
                     obstacle_state = "narrow_reverse"
     elif local_active:
         obstacle_state = "local_planner"
-        if (
-            scan is not None
-            and cfg.obstacle is not None
-            and cfg.obstacle.enabled
-        ):
+        if scan is not None and cfg.obstacle is not None and cfg.obstacle.enabled:
             forward_clearance = forward_clearance_m(scan, cfg.obstacle)
     elif (
         cfg.obstacle is not None
@@ -842,8 +843,7 @@ def compute_path_command(
     )
     spin_blocked = False
     scan_spin_hit = (
-        scan is not None
-        and spin_clearance_m(scan) < spin_radius + SPIN_CLEAR_MARGIN_M
+        scan is not None and spin_clearance_m(scan) < spin_radius + SPIN_CLEAR_MARGIN_M
     )
     cost_spin_hit = (
         local_view is not None
@@ -982,11 +982,7 @@ def compute_path_command(
             nose_m = float("inf")
             nose_open = True
             slow_m = stop_m + 0.35
-            if (
-                cfg.obstacle is not None
-                and cfg.obstacle.enabled
-                and scan is not None
-            ):
+            if cfg.obstacle is not None and cfg.obstacle.enabled and scan is not None:
                 half = float(cfg.obstacle.front_cone_half_rad)
                 nose_m = cone_min_range(scan, -half, half)
                 stop_lim = float(cfg.obstacle.stop_distance_m)
@@ -1061,7 +1057,9 @@ def compute_path_command(
         "path_length_m": _path_length(path),
         "obstacle": obstacle_state,
         "spin_blocked": spin_blocked,
-        "forward_clearance_m": None if math.isinf(forward_clearance) else forward_clearance,
+        "forward_clearance_m": None
+        if math.isinf(forward_clearance)
+        else forward_clearance,
         "bearing_error_rad": bearing,
         "crosstrack_m": crosstrack,
         "lookahead_m": lookahead,

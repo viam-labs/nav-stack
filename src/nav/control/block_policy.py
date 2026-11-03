@@ -3,6 +3,7 @@
 Owns corridor yaw commit and ``waiting_for_clear`` on the ``TickContext``.
 Does not call the planner — the supervisor acts on ``action == "replan"``.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -56,9 +57,7 @@ def run_block_policy(
         nav._replan_local_min_period_s  # noqa: SLF001
         * (2.0 ** min(ep.blocked_fail_count, 4)),
     )
-    peel_stuck_s = (
-        max(0.0, now - ep.last_progress_at) if nose_clear else 0.0
-    )
+    peel_stuck_s = max(0.0, now - ep.last_progress_at) if nose_clear else 0.0
     action = nav._local_block_action(  # noqa: SLF001
         nose_clear=nose_clear,
         blocked_for_s=blocked_for,
@@ -68,8 +67,7 @@ def run_block_policy(
     )
     # Path centerline free but "wait for nose" — prefer DWA peel.
     if (
-        action == "wait"
-        and path_ahead_cost < nav._local_planner_activate_cost  # noqa: SLF001
+        action == "wait" and path_ahead_cost < nav._local_planner_activate_cost  # noqa: SLF001
     ):
         action = "keep_dwa"
     if (

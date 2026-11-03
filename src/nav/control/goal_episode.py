@@ -4,14 +4,15 @@ Episode-lifetime counters and machines used to live as ~40 locals inside
 ``run_goal``. Named reset packs encode today's asymmetric clear sites so a
 blocked-replan success does not silently match a backup-done success.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from ..motion.simple_motion import DriveCommand
-from .escape import EscapeMachine
 from ..types import Pose2D
+from .escape import EscapeMachine
 
 
 @dataclass

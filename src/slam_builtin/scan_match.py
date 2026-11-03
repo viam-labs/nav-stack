@@ -1,4 +1,5 @@
 """Local correlative scan-to-map matching for continuous tracking."""
+
 from __future__ import annotations
 
 import math
@@ -6,13 +7,13 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from ..geom import conversions as conv
 from ..nav.localize.global_localize import (
     OccupancyMap,
     _inflate_occupied,
     _score_pose,
     scan_endpoints_base_link,
 )
-from ..geom import conversions as conv
 
 
 def occupancy_map_from_int16(
@@ -47,9 +48,7 @@ def score_pose(
     ).score
 
 
-def _required_improvement(
-    prior_score: float, dist_m: float, dyaw_rad: float
-) -> float:
+def _required_improvement(prior_score: float, dist_m: float, dyaw_rad: float) -> float:
     """Larger jumps and already-good priors need a clearer score win.
 
     Prevents A↔B peak flipping when two discrete poses score within noise.
@@ -311,9 +310,10 @@ def search_heading(
     chosen = conv.Pose2D(pose.x, pose.y, best_yaw)
     # Points past the grid edge lower every heading by about the same amount.
     # Keep a heading whose overlap sits on the walls.
-    if best_score < min_score and scan_map_fit(
-        occ_map, scan, chosen, min_score=min_score
-    ) != "fit":
+    if (
+        best_score < min_score
+        and scan_map_fit(occ_map, scan, chosen, min_score=min_score) != "fit"
+    ):
         return None, best_score
     return chosen, best_score
 
@@ -354,8 +354,13 @@ def _search_window(
         dth = -yaw_half + it * yaw_step
         yaw = conv.normalize_angle(center.theta + dth)
         scores = _candidate_scores(
-            occ_map, scan_xy, cand_x, cand_y, yaw,
-            occupied_lookup=lookup, min_coverage=min_coverage,
+            occ_map,
+            scan_xy,
+            cand_x,
+            cand_y,
+            yaw,
+            occupied_lookup=lookup,
+            min_coverage=min_coverage,
         )
         idx = int(np.argmax(scores))
         local_score = float(scores[idx])
@@ -419,8 +424,13 @@ def refine_yaw(
     def score(yaw: float) -> float:
         return float(
             _candidate_scores(
-                occ_map, scan_xy, cx, cy, yaw,
-                occupied_lookup=lookup, min_coverage=min_cov,
+                occ_map,
+                scan_xy,
+                cx,
+                cy,
+                yaw,
+                occupied_lookup=lookup,
+                min_coverage=min_cov,
             )[0]
         )
 

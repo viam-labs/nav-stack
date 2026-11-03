@@ -10,6 +10,7 @@ prefer ``viam-labs:nav-stack:rplidar``, which talks UART and writes shm directly
 
 Wire format matches ``viam-shared-memory-test`` (see :mod:`~..ros.pcshm`).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +19,6 @@ import time
 from typing import ClassVar, Mapping, Optional, Sequence
 
 from typing_extensions import Self
-
 from viam.components.camera import Camera
 from viam.logging import getLogger
 from viam.proto.app.robot import ComponentConfig
@@ -196,7 +196,11 @@ class ShmPointCloud(Camera):
         return Camera.Properties(supports_pcd=True, mime_types=["pointcloud/pcd"])
 
     async def do_command(
-        self, command: Mapping[str, object], *, timeout: Optional[float] = None, **kwargs
+        self,
+        command: Mapping[str, object],
+        *,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> Mapping[str, object]:
         return {
             "source": self._source_name,

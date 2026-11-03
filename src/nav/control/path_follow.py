@@ -1,4 +1,5 @@
 """Path pursuit + progress enrich + EscapeMachine.tick_pre for one tick."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -34,10 +35,7 @@ def run_path_follow(
     allow_local_planner = (
         nav._local_costmap_enabled  # noqa: SLF001
         and not tick.waiting_for_clear
-        and (
-            tick.local_blocked
-            or ep.failed_replan_while_blocked >= 1
-        )
+        and (tick.local_blocked or ep.failed_replan_while_blocked >= 1)
     )
     force_local = bool(tick.local_blocked and allow_local_planner)
     cmd, progress = compute_path_command(

@@ -9,6 +9,7 @@ over. That logic lives here in ``NavServiceBase``; the concrete models differ
 only in how they obtain a ``SlamRuntime`` (``_resolve_runtime``) and how they
 stand it up (``reconfigure``).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -25,8 +26,8 @@ from viam.components.base import Base
 from viam.logging import getLogger
 from viam.proto.common import (
     GeoGeometry,
-    GeoPoint,
     Geometry,
+    GeoPoint,
     Pose,
     PoseInFrame,
     Transform,
@@ -48,15 +49,9 @@ from viam.proto.service.motion import (
 from viam.services.navigation import Navigation
 from viam.utils import ValueTypes
 
-from .nav_api import NavigationApi
-from .do_command_util import build_alias_map, dispatch_do_command, require
-
 from ..config import NavConfig, body_twist_to_viam_set_velocity
-from ..nav.stores import zones as zones_mod
-from ..nav.stores.locations import LocationStore
-from ..nav.stores.maps import MapHandle
+from ..geom import conversions as conv
 from ..nav.motion.motion_summary import summarize_nav_motion
-from ..nav.stores.routes import Route, RouteStore
 from ..nav.motion.simple_motion import (
     ObstacleConfig,
     SimpleMotionCanceled,
@@ -64,8 +59,13 @@ from ..nav.motion.simple_motion import (
     config_from_nav,
     drive_to_pose,
 )
+from ..nav.stores import zones as zones_mod
+from ..nav.stores.locations import LocationStore
+from ..nav.stores.maps import MapHandle
+from ..nav.stores.routes import Route, RouteStore
 from ..nav.stores.zones import ZoneStore
-from ..geom import conversions as conv
+from .do_command_util import build_alias_map, dispatch_do_command, require
+from .nav_api import NavigationApi
 
 LOGGER = getLogger(__name__)
 
@@ -162,17 +162,19 @@ class _SuspendedNav:
         return out
 
 
-_NAV_DO_ALIASES = build_alias_map({
-    "delete_location": ("remove_location",),
-    "delete_route": ("remove_route",),
-    "get_last_plan": ("get_preview_plan",),
-    "get_status": ("describe_motion", "what_am_i_doing"),
-    "plan_to_location": ("compute_path_to_location",),
-    "plan_to_point": ("compute_path_to_point",),
-    "remove_waypoint": ("delete_waypoint",),
-    "resume": ("resume_nav",),
-    "suspend": ("pause_nav", "suspend_nav"),
-})
+_NAV_DO_ALIASES = build_alias_map(
+    {
+        "delete_location": ("remove_location",),
+        "delete_route": ("remove_route",),
+        "get_last_plan": ("get_preview_plan",),
+        "get_status": ("describe_motion", "what_am_i_doing"),
+        "plan_to_location": ("compute_path_to_location",),
+        "plan_to_point": ("compute_path_to_point",),
+        "remove_waypoint": ("delete_waypoint",),
+        "resume": ("resume_nav",),
+        "suspend": ("pause_nav", "suspend_nav"),
+    }
+)
 
 
 class NavServiceBase(NavigationApi, Navigation):
@@ -296,7 +298,9 @@ class NavServiceBase(NavigationApi, Navigation):
             )
             self._logged_motion_ignored = True
 
-        pose2d = conv.viam_pose_to_pose2d(destination.x, destination.y, destination.theta)
+        pose2d = conv.viam_pose_to_pose2d(
+            destination.x, destination.y, destination.theta
+        )
         runtime = self._require_runtime()
         mgr = runtime.manager
 
@@ -441,7 +445,9 @@ class NavServiceBase(NavigationApi, Navigation):
                 Status.INVALID_ARGUMENT,
                 f"only destination_frame='map' is supported (got {destination_frame!r})",
             )
-        pose2d = await asyncio.to_thread(self._require_runtime().manager.get_pose_in_map)
+        pose2d = await asyncio.to_thread(
+            self._require_runtime().manager.get_pose_in_map
+        )
         if pose2d is None:
             raise GRPCError(Status.FAILED_PRECONDITION, "current map pose unavailable")
         return PoseInFrame(reference_frame="map", pose=_pose2d_to_viam_pose_msg(pose2d))
@@ -597,13 +603,19 @@ class NavServiceBase(NavigationApi, Navigation):
             if node is not None and hasattr(node, "get_map"):
                 grid = node.get_map()
         if not grid:
-            LOGGER.warning("no map yet; zone masks will publish once a map is available")
+            LOGGER.warning(
+                "no map yet; zone masks will publish once a map is available"
+            )
             return
         h, w = grid["grid"].shape
         res = grid["resolution"]
         ox, oy = grid["origin_x"], grid["origin_y"]
-        keepout = zones_mod.rasterize_zones(zone_list, zones_mod.KEEPOUT, w, h, res, ox, oy)
-        speed = zones_mod.rasterize_zones(zone_list, zones_mod.SPEED_LIMIT, w, h, res, ox, oy)
+        keepout = zones_mod.rasterize_zones(
+            zone_list, zones_mod.KEEPOUT, w, h, res, ox, oy
+        )
+        speed = zones_mod.rasterize_zones(
+            zone_list, zones_mod.SPEED_LIMIT, w, h, res, ox, oy
+        )
         publish = getattr(mgr, "publish_zone_masks", None)
         if callable(publish):
             publish(keepout, speed, res, ox, oy)
@@ -655,7 +667,11 @@ class NavServiceBase(NavigationApi, Navigation):
         }
 
     async def do_command(
-        self, command: Mapping[str, ValueTypes], *, timeout: Optional[float] = None, **kwargs
+        self,
+        command: Mapping[str, ValueTypes],
+        *,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> Mapping[str, ValueTypes]:
         self._require_runtime()
         return await dispatch_do_command(
@@ -664,22 +680,27 @@ class NavServiceBase(NavigationApi, Navigation):
             aliases=_NAV_DO_ALIASES,
         )
 
-    def _cmd_add_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_add_location(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         runtime = self._require_runtime()
         loc = self._add_location(command, runtime)
         return {"location": loc.to_dict()}
 
-
-    def _cmd_get_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_get_location(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         name = require(command, "name", str)
         return {"location": self._locations().get(name).to_dict()}
 
+    def _cmd_list_locations(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        return {"locations": [loc.to_dict() for loc in self._locations().list()]}
 
-    def _cmd_list_locations(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
-        return {"locations": [l.to_dict() for l in self._locations().list()]}
-
-
-    def _cmd_update_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_update_location(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         old_name = str(command["name"])
         loc = self._locations().update(
             old_name,
@@ -693,15 +714,17 @@ class NavServiceBase(NavigationApi, Navigation):
             self._routes().rename_location_refs(old_name, str(new_name))
         return {"location": loc.to_dict()}
 
-
-    def _cmd_delete_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_delete_location(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         name = str(command["name"])
         self._locations().delete(name)
         self._routes().remove_location_refs(name)
         return {"status": "deleted"}
 
-
-    def _cmd_delete_all_locations(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_delete_all_locations(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         self._locations().delete_all()
         # Empty locations → clear every route's waypoints (routes remain).
         routes = self._routes()
@@ -709,75 +732,84 @@ class NavServiceBase(NavigationApi, Navigation):
             routes.clear_waypoints(route.name)
         return {"status": "deleted"}
 
-
-    def _cmd_add_route(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_add_route(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         name = str(command["name"])
         raw_wps = command.get("waypoints") or []
         if not isinstance(raw_wps, (list, tuple)):
             raise ValueError("waypoints must be a list of location names")
         waypoints = [
-            str(w.get("location", w) if isinstance(w, Mapping) else w)
-            for w in raw_wps
+            str(w.get("location", w) if isinstance(w, Mapping) else w) for w in raw_wps
         ]
         self._require_location_names(waypoints)
         route = self._routes().add(name, waypoints)
         return {"route": self._route_to_dict(route)}
 
-
-    def _cmd_get_route(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_get_route(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         route = self._routes().get(str(command["name"]))
         return {"route": self._route_to_dict(route)}
 
+    def _cmd_list_routes(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        return {"routes": [self._route_to_dict(r) for r in self._routes().list()]}
 
-    def _cmd_list_routes(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
-        return {
-            "routes": [self._route_to_dict(r) for r in self._routes().list()]
-        }
-
-
-    def _cmd_update_route(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_update_route(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         route = self._routes().update(
             str(command["name"]),
             new_name=command.get("new_name"),
         )
         return {"route": self._route_to_dict(route)}
 
-
-    def _cmd_delete_route(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_delete_route(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         self._routes().delete(str(command["name"]))
         return {"status": "deleted"}
 
-
-    def _cmd_delete_all_routes(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_delete_all_routes(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         self._routes().delete_all()
         return {"status": "deleted"}
 
-
-    def _cmd_list_waypoints(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_list_waypoints(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         route = self._routes().get(str(command["route"]))
-        return {"route": route.name, "waypoints": self._route_to_dict(route)["waypoints"]}
+        return {
+            "route": route.name,
+            "waypoints": self._route_to_dict(route)["waypoints"],
+        }
 
-
-    def _cmd_set_waypoints(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_set_waypoints(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         route_name = str(command["route"])
         raw_wps = command.get("waypoints") or []
         if not isinstance(raw_wps, (list, tuple)):
             raise ValueError("waypoints must be a list of location names")
         waypoints = [
-            str(w.get("location", w) if isinstance(w, Mapping) else w)
-            for w in raw_wps
+            str(w.get("location", w) if isinstance(w, Mapping) else w) for w in raw_wps
         ]
         self._require_location_names(waypoints)
         route = self._routes().set_waypoints(route_name, waypoints)
         return {"route": self._route_to_dict(route)}
 
-
-    def _cmd_clear_waypoints(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_clear_waypoints(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         route = self._routes().clear_waypoints(str(command["route"]))
         return {"route": self._route_to_dict(route)}
 
-
-    def _cmd_add_waypoint(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_add_waypoint(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         route_name = str(command["route"])
         location = str(command["location"])
         self._require_location_names([location])
@@ -789,8 +821,9 @@ class NavServiceBase(NavigationApi, Navigation):
         )
         return {"route": self._route_to_dict(route)}
 
-
-    def _cmd_update_waypoint(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_update_waypoint(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         route_name = str(command["route"])
         location = str(command["location"])
         self._require_location_names([location])
@@ -799,8 +832,9 @@ class NavServiceBase(NavigationApi, Navigation):
         )
         return {"route": self._route_to_dict(route)}
 
-
-    def _cmd_remove_waypoint(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_remove_waypoint(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         route_name = str(command["route"])
         index = command.get("index")
         location = command.get("location")
@@ -811,8 +845,9 @@ class NavServiceBase(NavigationApi, Navigation):
         )
         return {"route": self._route_to_dict(route)}
 
-
-    def _cmd_move_waypoint(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_move_waypoint(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         route = self._routes().move_waypoint(
             str(command["route"]),
             int(command["from_index"]),
@@ -820,8 +855,9 @@ class NavServiceBase(NavigationApi, Navigation):
         )
         return {"route": self._route_to_dict(route)}
 
-
-    def _cmd_add_zone(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_add_zone(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         zone = self._zones().add(
             str(command["name"]),
             str(command["type"]),
@@ -831,17 +867,20 @@ class NavServiceBase(NavigationApi, Navigation):
         self._refresh_zone_masks()
         return {"zone": zone.to_dict()}
 
-
-    def _cmd_get_zone(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_get_zone(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         return {"zone": self._zones().get(str(command["name"])).to_dict()}
 
-
-    def _cmd_list_zones(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_list_zones(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         zlist = self._zones().list(command.get("type"))
         return {"zones": [z.to_dict() for z in zlist]}
 
-
-    def _cmd_update_zone(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_update_zone(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         zone = self._zones().update(
             str(command["name"]),
             type=command.get("type"),
@@ -852,14 +891,16 @@ class NavServiceBase(NavigationApi, Navigation):
         self._refresh_zone_masks()
         return {"zone": zone.to_dict()}
 
-
-    def _cmd_delete_zone(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_delete_zone(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         self._zones().delete(str(command["name"]))
         self._refresh_zone_masks()
         return {"status": "deleted"}
 
-
-    def _cmd_delete_all_zones(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_delete_all_zones(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         self._zones().delete_all(command.get("type"))
         self._refresh_zone_masks()
         return {"status": "deleted"}
@@ -867,8 +908,9 @@ class NavServiceBase(NavigationApi, Navigation):
         # navigate/cancel/status may block (planning / drive). Keep them off the
         # module event loop so Base.SetVelocity and sensor reads stay responsive.
 
-
-    async def _cmd_navigate_to_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_navigate_to_location(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         runtime = self._require_runtime()
         mgr = runtime.manager
         loc = self._locations().get(require(command, "name", str))
@@ -879,8 +921,9 @@ class NavServiceBase(NavigationApi, Navigation):
         await asyncio.to_thread(mgr.navigate, loc.x, loc.y, loc.theta)
         return {"status": "navigating", "target": loc.to_dict()}
 
-
-    async def _cmd_navigate_to_point(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_navigate_to_point(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         runtime = self._require_runtime()
         mgr = runtime.manager
         x = require(command, "x", float)
@@ -893,18 +936,21 @@ class NavServiceBase(NavigationApi, Navigation):
         await asyncio.to_thread(mgr.navigate, x, y, theta)
         return {"status": "navigating", "target": {"x": x, "y": y, "theta": theta}}
 
-
-    async def _cmd_navigate_route(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_navigate_route(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         return await self._start_navigate_route(command)
 
-
-    async def _cmd_plan_to_point(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_plan_to_point(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         runtime = self._require_runtime()
         mgr = runtime.manager
         return await self._plan_preview(command, mgr)
 
-
-    async def _cmd_plan_to_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_plan_to_location(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         runtime = self._require_runtime()
         mgr = runtime.manager
         loc = self._locations().get(str(command["name"]))
@@ -917,8 +963,9 @@ class NavServiceBase(NavigationApi, Navigation):
         self._last_preview_plan = preview
         return preview
 
-
-    def _cmd_get_last_plan(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_get_last_plan(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         runtime = self._require_runtime()
         mgr = runtime.manager
         preview = self._last_preview_plan or mgr.last_preview_plan()
@@ -926,8 +973,9 @@ class NavServiceBase(NavigationApi, Navigation):
             raise ValueError("no preview plan; call plan_to_point first")
         return {"plan": preview}
 
-
-    async def _cmd_execute_plan(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_execute_plan(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         runtime = self._require_runtime()
         mgr = runtime.manager
         preview = self._last_preview_plan or mgr.last_preview_plan()
@@ -942,7 +990,11 @@ class NavServiceBase(NavigationApi, Navigation):
         x = float(goal["x"])
         y = float(goal["y"])
         theta = float(goal.get("theta", 0.0))
-        name = preview.get("location", {}).get("name") if isinstance(preview.get("location"), dict) else None
+        name = (
+            preview.get("location", {}).get("name")
+            if isinstance(preview.get("location"), dict)
+            else None
+        )
         self._suspended = None
         self._active_goal_name = name
         await self._cancel_route()
@@ -950,21 +1002,28 @@ class NavServiceBase(NavigationApi, Navigation):
         await asyncio.to_thread(mgr.navigate, x, y, theta)
         return {
             "status": "navigating",
-            "target": {"x": x, "y": y, "theta": theta, **({"name": name} if name else {})},
+            "target": {
+                "x": x,
+                "y": y,
+                "theta": theta,
+                **({"name": name} if name else {}),
+            },
             "from_preview": True,
             "length_m": preview.get("length_m"),
         }
 
-
-    async def _cmd_go_to_location(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_go_to_location(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         loc = self._locations().get(str(command["name"]))
         self._suspended = None
         self._active_goal_name = loc.name
         await self._cancel_route()
         return await self._start_simple_go(loc.x, loc.y, loc.theta, command)
 
-
-    async def _cmd_go_to_point(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_go_to_point(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         x = require(command, "x", float)
         y = require(command, "y", float)
         theta = require(command, "theta", float, default=0.0)
@@ -973,16 +1032,19 @@ class NavServiceBase(NavigationApi, Navigation):
         await self._cancel_route()
         return await self._start_simple_go(x, y, theta, command)
 
-
-    async def _cmd_suspend(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_suspend(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         return await self._suspend_nav(command)
 
-
-    async def _cmd_resume(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_resume(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         return await self._resume_nav(command)
 
-
-    async def _cmd_cancel(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_cancel(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         runtime = self._require_runtime()
         mgr = runtime.manager
         self._active_goal_name = None
@@ -998,22 +1060,26 @@ class NavServiceBase(NavigationApi, Navigation):
             )
         return {"status": "canceled"}
 
-
-    async def _cmd_test_drive(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_test_drive(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         return await self._test_drive(command)
 
-
-    def _cmd_get_trace(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    def _cmd_get_trace(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         from ..nav.control.supervisor import recent_trace
 
         seconds = float(command.get("seconds", 30.0))
         return {"ticks": recent_trace(seconds)}
 
-
-    async def _cmd_get_status(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_get_status(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         cmd = str(command.get("command"))
         runtime = self._require_runtime()
         mgr = runtime.manager
+
         def _status():
             status = mgr.nav_status()
             simple = dict(self._simple_nav_status)
@@ -1075,8 +1141,9 @@ class NavServiceBase(NavigationApi, Navigation):
             max_vel_theta=float(cfg.max_vel_theta),
         )
 
-
-    async def _cmd_get_costmap(self, command: Mapping[str, ValueTypes]) -> Mapping[str, ValueTypes]:
+    async def _cmd_get_costmap(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
         runtime = self._require_runtime()
         # Inflated costmap for operator UIs (nav-stack-ui Costmap toggle).
         # ``layer``: ``auto`` (local while navigating, else global), ``local``
@@ -1109,9 +1176,7 @@ class NavServiceBase(NavigationApi, Navigation):
                 nav_active = bool(runtime.manager.nav_status().get("active"))
             except Exception:  # noqa: BLE001
                 pass
-            use_local = layer_req == "local" or (
-                layer_req == "auto" and nav_active
-            )
+            use_local = layer_req == "local" or (layer_req == "auto" and nav_active)
             layer_used = "global"
             cm = None
 
@@ -1119,16 +1184,12 @@ class NavServiceBase(NavigationApi, Navigation):
                 # Follower only refreshes snap["local_costmap"] while a plan
                 # is active. Prefer that live map when navigating; when idle,
                 # never reuse a stale snap — rebuild the rolling window.
-                local_cm = (
-                    snap.get("local_costmap") if nav_active else None
-                )
+                local_cm = snap.get("local_costmap") if nav_active else None
                 if local_cm is not None and local_cm.get("grid") is not None:
                     cm = local_cm
                     layer_used = "local"
                 elif layer_req == "local":
-                    idle = self._build_idle_local_costmap(
-                        runtime, view, cfg
-                    )
+                    idle = self._build_idle_local_costmap(runtime, view, cfg)
                     if idle is not None:
                         cm = idle
                         layer_used = "local"
@@ -1138,10 +1199,7 @@ class NavServiceBase(NavigationApi, Navigation):
             if layer_used == "global":
                 now = _time.monotonic()
                 cached = self._builtin_costmap_cache
-                if (
-                    cached is not None
-                    and now - self._builtin_costmap_cache_at < 0.2
-                ):
+                if cached is not None and now - self._builtin_costmap_cache_at < 0.2:
                     return cached, layer_used
                 # Always refresh from the live SLAM/world map — never prefer
                 # snap["map"], which is only updated when something else
@@ -1201,9 +1259,7 @@ class NavServiceBase(NavigationApi, Navigation):
                         inflation_radius_m=cfg.effective_inflation_radius_m(),
                         robot_radius_m=cfg.hard_clearance_radius_m(),
                         body_radius_m=cfg.inscribed_radius_m(),
-                        cost_scaling_factor=float(
-                            cfg.builtin.cost_scaling_factor
-                        ),
+                        cost_scaling_factor=float(cfg.builtin.cost_scaling_factor),
                         mapping=_world_is_mapping(world),
                     )
                     cm = costmap_viz_dict(occ, costs)
@@ -1259,7 +1315,6 @@ class NavServiceBase(NavigationApi, Navigation):
             "data_b64": base64.b64encode(u8.tobytes()).decode("ascii"),
             "nav_backend": cfg.nav_backend,
         }
-
 
     def _build_idle_local_costmap(self, runtime, view, cfg: NavConfig):
         """Rolling local costmap while idle (UI Local layer / get_costmap).
@@ -1321,9 +1376,7 @@ class NavServiceBase(NavigationApi, Navigation):
                     width_m=float(bcfg.local_costmap_width_m),
                     height_m=float(bcfg.local_costmap_height_m),
                     resolution=float(bcfg.local_costmap_resolution),
-                    inflation_radius_m=float(
-                        cfg.effective_local_inflation_radius_m()
-                    ),
+                    inflation_radius_m=float(cfg.effective_local_inflation_radius_m()),
                     robot_radius_m=float(cfg.hard_clearance_radius_m()),
                     body_radius_m=float(cfg.inscribed_radius_m()),
                     cost_scaling_factor=float(bcfg.cost_scaling_factor),
@@ -1514,7 +1567,9 @@ class NavServiceBase(NavigationApi, Navigation):
                 "goal": self._suspended.to_dict(),
             }
         if snapshot is None:
-            raise ValueError("nothing to suspend (no active builtin or simple-nav goal)")
+            raise ValueError(
+                "nothing to suspend (no active builtin or simple-nav goal)"
+            )
 
         snapshot.reason = reason_s
         runtime = self._require_runtime()
@@ -1732,8 +1787,7 @@ class NavServiceBase(NavigationApi, Navigation):
             start_index = self._nearest_route_index(waypoints, pose)
         elif start_index >= len(waypoints):
             raise ValueError(
-                f"start_index {start_index} out of range "
-                f"(0..{len(waypoints) - 1})"
+                f"start_index {start_index} out of range (0..{len(waypoints) - 1})"
             )
 
         self._suspended = None
@@ -1756,9 +1810,7 @@ class NavServiceBase(NavigationApi, Navigation):
         }
 
         async def _run() -> None:
-            await self._run_route(
-                route_name, waypoints, start_index, cancel, loop=loop
-            )
+            await self._run_route(route_name, waypoints, start_index, cancel, loop=loop)
 
         if wait:
             await _run()
@@ -1942,7 +1994,9 @@ class NavServiceBase(NavigationApi, Navigation):
                     verify = await self._verify_pose_between_route_legs()
                     self._route_status = {
                         **self._route_status,
-                        "pose_verify": dict(verify) if isinstance(verify, Mapping) else {"status": "unknown"},
+                        "pose_verify": dict(verify)
+                        if isinstance(verify, Mapping)
+                        else {"status": "unknown"},
                     }
 
                 idx += 1
@@ -2000,7 +2054,9 @@ class NavServiceBase(NavigationApi, Navigation):
         if cfg is None:
             return {"status": "skipped", "reason": "no_cfg"}
         builtin = getattr(cfg, "builtin", None)
-        if builtin is not None and not bool(getattr(builtin, "route_verify_pose", True)):
+        if builtin is not None and not bool(
+            getattr(builtin, "route_verify_pose", True)
+        ):
             return {"status": "skipped", "reason": "disabled"}
         slam_name = str(getattr(cfg, "slam_service", "") or "")
         if not slam_name:
@@ -2056,9 +2112,7 @@ class NavServiceBase(NavigationApi, Navigation):
             return False
 
     @staticmethod
-    def _route_pose_near_wp(
-        status: Mapping, wp: Mapping, *, tol: float = 0.35
-    ) -> bool:
+    def _route_pose_near_wp(status: Mapping, wp: Mapping, *, tol: float = 0.35) -> bool:
         pose = status.get("pose") if isinstance(status.get("pose"), Mapping) else None
         if pose is None:
             return False
@@ -2141,7 +2195,11 @@ class NavServiceBase(NavigationApi, Navigation):
         node = getattr(runtime.manager, "node", None)
         io = node._io if node is not None else None
 
-        vx = float(command.get("vx", command.get("body_vx_mps", command.get("ros_vx_mps", 0.0))))
+        vx = float(
+            command.get(
+                "vx", command.get("body_vx_mps", command.get("ros_vx_mps", 0.0))
+            )
+        )
         vy = float(command.get("vy", command.get("body_vy_mps", 0.0)))
         vtheta = float(command.get("vtheta", command.get("body_vtheta_rad_s", 0.0)))
         if (
@@ -2199,7 +2257,9 @@ class NavServiceBase(NavigationApi, Navigation):
         start = None
         if "start" in command and isinstance(command["start"], Mapping):
             s = command["start"]
-            start = conv.Pose2D(float(s["x"]), float(s["y"]), float(s.get("theta", 0.0)))
+            start = conv.Pose2D(
+                float(s["x"]), float(s["y"]), float(s.get("theta", 0.0))
+            )
         preview = await asyncio.to_thread(
             mgr.compute_path,
             x,
@@ -2211,7 +2271,10 @@ class NavServiceBase(NavigationApi, Navigation):
             max_points=max_points,
         )
         self._last_preview_plan = preview
-        return {"status": "planned" if preview.get("feasible") else "infeasible", **preview}
+        return {
+            "status": "planned" if preview.get("feasible") else "infeasible",
+            **preview,
+        }
 
     async def _simple_go_to(
         self,
@@ -2255,7 +2318,9 @@ class NavServiceBase(NavigationApi, Navigation):
             node = getattr(runtime.manager, "node", None)
             if node is not None:
                 node.record_cmd_vel(vx, vy, vtheta, source="simple")
-            lx, ly, ang_deg_s = body_twist_to_viam_set_velocity(vx, vy, vtheta, convention)
+            lx, ly, ang_deg_s = body_twist_to_viam_set_velocity(
+                vx, vy, vtheta, convention
+            )
             await base.set_velocity(
                 linear=Vector3(x=lx, y=ly, z=0),
                 angular=Vector3(x=0, y=0, z=ang_deg_s),
@@ -2328,4 +2393,3 @@ class NavServiceBase(NavigationApi, Navigation):
                 self._simple_nav_cancel = None
             if self._simple_nav_task is asyncio.current_task():
                 self._simple_nav_task = None
-

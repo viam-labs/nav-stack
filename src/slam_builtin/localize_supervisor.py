@@ -3,11 +3,13 @@
 Owns refine / recover / startup-global / mapping-revisit cycles. The Viam
 ``SlamService`` remains the resource adapter and schedules these via the host.
 """
+
 from __future__ import annotations
 
 import asyncio
 import math
 import time
+from dataclasses import replace
 from typing import Any, Mapping, Optional
 
 import numpy as np
@@ -17,7 +19,10 @@ from viam.utils import ValueTypes
 from ..config import MODE_LOCALIZING, MODE_MAPPING, SlamConfig
 from ..geom import conversions as conv
 from ..nav.localize.global_localize import GlobalLocalizeResult
-from ..nav.localize.pose_jump_gate import candidate_beats_previous, stuck_refine_decision
+from ..nav.localize.pose_jump_gate import (
+    candidate_beats_previous,
+    stuck_refine_decision,
+)
 
 LOGGER = getLogger(__name__)
 
@@ -63,7 +68,6 @@ class LocalizeSupervisor:
             )
         return self.host._publish_revisit_check(out)
 
-
     def _revisit_match_quality(
         self, result, cfg: SlamConfig
     ) -> tuple[bool, float, Optional[float]]:
@@ -73,7 +77,6 @@ class LocalizeSupervisor:
             ray_mae is None or ray_mae <= cfg.mapping_revisit_max_ray_mae_m
         )
         return good, score, ray_mae
-
 
     async def _mapping_revisit_cycle(
         self,
@@ -114,9 +117,7 @@ class LocalizeSupervisor:
         except Exception:  # noqa: BLE001
             bridge_status = {}
         vel = bridge_status.get("odom_velocity") or {}
-        linear_speed = math.hypot(
-            float(vel.get("vx", 0.0)), float(vel.get("vy", 0.0))
-        )
+        linear_speed = math.hypot(float(vel.get("vx", 0.0)), float(vel.get("vy", 0.0)))
         yaw_rate = abs(float(vel.get("vtheta", 0.0)))
         moving = (
             linear_speed >= cfg.map_when_still_linear_speed_m_s
@@ -215,16 +216,12 @@ class LocalizeSupervisor:
                         search_radius_m=radius,
                     )
 
-            kf = await asyncio.to_thread(
-                _kf_match, cfg.mapping_revisit_wide_radius_m
-            )
+            kf = await asyncio.to_thread(_kf_match, cfg.mapping_revisit_wide_radius_m)
             scope = "near"
             if kf is None or kf.score < cfg.mapping_revisit_keyframe_min_score:
                 kf_all = await asyncio.to_thread(_kf_match, None)
                 scope = "all"
-                if kf_all is not None and (
-                    kf is None or kf_all.score > kf.score
-                ):
+                if kf_all is not None and (kf is None or kf_all.score > kf.score):
                     kf = kf_all
             if kf is not None:
                 tiers_tried.append(
@@ -266,13 +263,9 @@ class LocalizeSupervisor:
                         ray_mae_m=yaw_probe.ray_mae_m,
                     )
                     match_mode = "keyframe"
-                    good = (
-                        kf.score >= cfg.mapping_revisit_keyframe_min_score
-                        and (
-                            not math.isfinite(yaw_probe.ray_mae_m)
-                            or yaw_probe.ray_mae_m
-                            <= cfg.mapping_revisit_max_ray_mae_m
-                        )
+                    good = kf.score >= cfg.mapping_revisit_keyframe_min_score and (
+                        not math.isfinite(yaw_probe.ray_mae_m)
+                        or yaw_probe.ray_mae_m <= cfg.mapping_revisit_max_ray_mae_m
                     )
                     score = float(kf.score)
                     ray_mae = (
@@ -307,9 +300,7 @@ class LocalizeSupervisor:
                 pose=chosen_pose,
                 ray_mae_m=chosen_mae,
             )
-            ray_mae = (
-                float(chosen_mae) if math.isfinite(chosen_mae) else None
-            )
+            ray_mae = float(chosen_mae) if math.isfinite(chosen_mae) else None
             good = score >= cfg.mapping_revisit_keyframe_min_score and (
                 ray_mae is None or ray_mae <= cfg.mapping_revisit_max_ray_mae_m
             )
@@ -383,9 +374,7 @@ class LocalizeSupervisor:
         # height bands we have reference geometry for (recorded from earlier
         # trusted pause scans). An explicit apply_override skips the veto.
         if should_apply and drifted and library is not None:
-            verdict = await asyncio.to_thread(
-                library.verify, band_points, result.pose
-            )
+            verdict = await asyncio.to_thread(library.verify, band_points, result.pose)
             out["slice_verify"] = verdict
             if verdict.get("pass") is False and apply_override is not True:
                 out["status"] = "slice_verify_failed"
@@ -453,7 +442,6 @@ class LocalizeSupervisor:
                 await asyncio.to_thread(library.record, band_points, record_pose)
                 out["slice_scans_recorded"] = library.scans_recorded
         return self.host._publish_revisit_check(out)
-
 
     async def _stuck_pose_refine(self) -> Mapping[str, ValueTypes]:
         """One local scan match around the current pose, for a stuck navigator.
@@ -547,7 +535,9 @@ class LocalizeSupervisor:
             "map_source": map_source,
             "score": round(score, 3) if math.isfinite(score) else None,
             "prior_score": (
-                round(prior_f, 3) if prior_f is not None and math.isfinite(prior_f) else None
+                round(prior_f, 3)
+                if prior_f is not None and math.isfinite(prior_f)
+                else None
             ),
             "ray_mae_m": None if ray_mae is None else round(ray_mae, 3),
             "shift_m": round(shift_m, 3),
@@ -598,7 +588,6 @@ class LocalizeSupervisor:
             )
         return out
 
-
     async def _relocalize_cycle_guarded(self) -> None:
         try:
             await self.host._periodic_relocalize_cycle()
@@ -608,7 +597,6 @@ class LocalizeSupervisor:
             LOGGER.warning("periodic relocalize cycle failed: %s", exc)
             self.host._publish_relocalize_check({"status": "error", "error": str(exc)})
 
-
     def _publish_relocalize_check(self, result: Mapping[str, ValueTypes]) -> dict:
         self.host._loc_state.observe(result)
         self.host._last_relocalize_check.clear()
@@ -617,7 +605,6 @@ class LocalizeSupervisor:
         # a goal refusal can say how long and what to do.
         self.host._last_relocalize_check["state"] = self.host._loc_state.snapshot()
         return dict(self.host._last_relocalize_check)
-
 
     def _periodic_relocalize_preflight(
         self, cfg: SlamConfig
@@ -642,9 +629,7 @@ class LocalizeSupervisor:
                 if age_raw is not None:
                     scan_age = float(age_raw)
                 if yaw_rate <= 1e-9:
-                    yaw_rate = abs(
-                        math.radians(float(diag.get("yaw_rate_deg_s", 0.0)))
-                    )
+                    yaw_rate = abs(math.radians(float(diag.get("yaw_rate_deg_s", 0.0))))
         except Exception:  # noqa: BLE001
             pass
 
@@ -683,19 +668,14 @@ class LocalizeSupervisor:
         bad, tick_score = self.host._published_pose_is_bad(cfg)
         bypass_after = float(cfg.periodic_relocalize_bypass_startup_after_s)
         started = self.host._startup_localize_started_at
-        age_s = (
-            (time.monotonic() - float(started)) if started is not None else None
-        )
-        timed_out = (
-            bypass_after > 0.0 and age_s is not None and age_s >= bypass_after
-        )
+        age_s = (time.monotonic() - float(started)) if started is not None else None
+        timed_out = bypass_after > 0.0 and age_s is not None and age_s >= bypass_after
         # A restored-pose startup searches locally. Once that has had time for
         # one match, a score under the trusted bar should not keep the parked
         # check waiting through the rest of the refine loop. 0.007 was just
         # above the "still bad" line and therefore waited out the whole cap.
-        soft = (
-            tick_score is not None
-            and tick_score < float(cfg.periodic_relocalize_min_score)
+        soft = tick_score is not None and tick_score < float(
+            cfg.periodic_relocalize_min_score
         )
         local_grace_s = 15.0
         early = (
@@ -720,7 +700,6 @@ class LocalizeSupervisor:
         )
         self.host._cancel_startup_global_localize_task()
         return None
-
 
     async def _periodic_relocalize_cycle(
         self,
@@ -858,12 +837,8 @@ class LocalizeSupervisor:
         # ``_global_localize``, treat it as full-map for ambiguity / recovery
         # gates. Leaving match_mode as ``local`` previously skipped the
         # ambiguous-twin refuse and let the jump gate confirm a 30 m yank.
-        if (
-            match_mode == "local"
-            and (
-                bool(match.get("fallback_used"))
-                or bool(match.get("full_map"))
-            )
+        if match_mode == "local" and (
+            bool(match.get("fallback_used")) or bool(match.get("full_map"))
         ):
             match_mode = "full_map_via_local_fallback"
 
@@ -943,8 +918,7 @@ class LocalizeSupervisor:
         # full-map match was correct (and manual apply fixed it) but ray_mae was
         # above periodic_relocalize_max_ray_mae_m so good_match was False.
         recovery_apply = (
-            full_map_recovery
-            and score >= cfg.periodic_relocalize_recovery_min_score
+            full_map_recovery and score >= cfg.periodic_relocalize_recovery_min_score
         )
         stopped_local = self.host._stopped_local_beats_published(
             cfg,
@@ -987,27 +961,23 @@ class LocalizeSupervisor:
             result["previous_ray_mae_m"] = prior_ray_mae
 
         large_jump = (
-            (not math.isinf(shift_m) and shift_m >= cfg.localize_jump_large_m)
-            or (
-                not math.isinf(shift_deg)
-                and shift_deg >= cfg.localize_jump_large_deg
-            )
-        )
+            not math.isinf(shift_m) and shift_m >= cfg.localize_jump_large_m
+        ) or (not math.isinf(shift_deg) and shift_deg >= cfg.localize_jump_large_deg)
         prefer_previous = False
-        if (
-            large_jump
-            and prior_score is not None
-            and math.isfinite(float(prior_score))
-        ):
+        if large_jump and prior_score is not None and math.isfinite(float(prior_score)):
             # Only treat "still at previous" when the prior itself is plausible —
             # two equally bad scores must not resume driving (nav_hold instead).
-            previous_ok = float(prior_score) >= cfg.periodic_relocalize_recovery_min_score
+            previous_ok = (
+                float(prior_score) >= cfg.periodic_relocalize_recovery_min_score
+            )
             if (
                 not previous_ok
                 and prior_ray_mae is not None
                 and math.isfinite(float(prior_ray_mae))
             ):
-                previous_ok = float(prior_ray_mae) <= cfg.periodic_relocalize_max_ray_mae_m
+                previous_ok = (
+                    float(prior_ray_mae) <= cfg.periodic_relocalize_max_ray_mae_m
+                )
             prefer_previous = previous_ok and not candidate_beats_previous(
                 previous_score=float(prior_score),
                 candidate_score=float(score),
@@ -1051,7 +1021,9 @@ class LocalizeSupervisor:
                     # Use the *good_match* bars, not the lower recovery floor —
                     # recovery is for applying a full-map fix, not for deciding
                     # that it is safe to keep driving.
-                    previous_ok = float(prior_score) >= cfg.periodic_relocalize_min_score
+                    previous_ok = (
+                        float(prior_score) >= cfg.periodic_relocalize_min_score
+                    )
                     if previous_ok and prior_ray_mae is not None:
                         previous_ok = (
                             math.isfinite(float(prior_ray_mae))
@@ -1278,7 +1250,6 @@ class LocalizeSupervisor:
         ray_mae = float(ray_mae_raw)
         return score >= target_score and ray_mae <= target_ray_mae_m
 
-
     async def _wait_for_startup_localize_ready(
         self, *, timeout_s: float = 90.0, poll_interval_s: float = 2.0
     ) -> bool:
@@ -1320,7 +1291,6 @@ class LocalizeSupervisor:
                 timeout_s,
             )
         return False
-
 
     async def _run_startup_global_localize(
         self,
@@ -1423,8 +1393,7 @@ class LocalizeSupervisor:
             decision = self.host._confirm_pose_jump(current, candidate, force=False)
             if not decision.should_apply:
                 LOGGER.info(
-                    "startup global_localize: large jump %.2f m awaiting "
-                    "confirm %d/%d",
+                    "startup global_localize: large jump %.2f m awaiting confirm %d/%d",
                     decision.shift_m,
                     decision.confirm_count,
                     decision.confirm_needed,
@@ -1488,9 +1457,7 @@ class LocalizeSupervisor:
                         if refine_options:
                             refine_command.update(dict(refine_options))
                         best_pose = (
-                            best_result.get("pose")
-                            if best_result is not None
-                            else None
+                            best_result.get("pose") if best_result is not None else None
                         )
                         if isinstance(best_pose, Mapping):
                             refine_command["pose"] = {
@@ -1499,10 +1466,9 @@ class LocalizeSupervisor:
                                 "theta": float(best_pose.get("theta", 0.0)),
                             }
                         refine_result = await self.host.do_command(refine_command)
-                        if (
-                            self.host._startup_global_localize_quality(refine_result)
-                            > self.host._startup_global_localize_quality(best_result)
-                        ):
+                        if self.host._startup_global_localize_quality(
+                            refine_result
+                        ) > self.host._startup_global_localize_quality(best_result):
                             best_result = refine_result
                         LOGGER.info(
                             "startup global_localize refinement pass %d/%d: "

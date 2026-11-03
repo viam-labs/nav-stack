@@ -8,15 +8,17 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from src.geom import conversions as conv
 from src.lidar import rplidar_protocol as proto
 from src.lidar.rplidar_serial import RPLidarSerial
-from src.geom import conversions as conv
 from src.shm import pcshm
 from src.shm.lidar import ShmPointCloudClient
 
 
 def test_node_round_trip():
-    raw = proto.encode_node(new_scan=True, quality=15, angle_deg=90.0, distance_mm=1000.0)
+    raw = proto.encode_node(
+        new_scan=True, quality=15, angle_deg=90.0, distance_mm=1000.0
+    )
     new_scan, quality, angle, dist = proto.decode_node(raw)
     assert new_scan is True
     assert quality == 15
@@ -93,7 +95,9 @@ class JunkPrefixSerial(ScriptedSerial):
         return len(data)
 
 
-def _circle_scan(n: int = 36, radius_mm: float = 2000.0) -> List[Tuple[int, float, float]]:
+def _circle_scan(
+    n: int = 36, radius_mm: float = 2000.0
+) -> List[Tuple[int, float, float]]:
     step = 360.0 / n
     return [(20, i * step, radius_mm) for i in range(n)]
 

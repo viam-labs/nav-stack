@@ -1,4 +1,5 @@
 """Stall detection + recovery replan for one ``run_goal`` tick."""
+
 from __future__ import annotations
 
 import math
@@ -39,8 +40,7 @@ def run_stall_watch(
     if tick.local_blocked:
         stall_scale = max(stall_scale, 4.0)
     elif (
-        tick.nose_clear
-        and tick.path_ahead_cost >= nav._local_planner_activate_cost  # noqa: SLF001
+        tick.nose_clear and tick.path_ahead_cost >= nav._local_planner_activate_cost  # noqa: SLF001
     ):
         from ..planning.costmap import LETHAL
 
@@ -48,10 +48,7 @@ def run_stall_watch(
             stall_scale = max(stall_scale, 4.0)
     stall_limit_s = nav._follower.motion.stall_timeout_s * stall_scale  # noqa: SLF001
     bearing_err = abs(float(progress.get("bearing_error_rad", 0.0)))
-    spinning = (
-        abs(float(cmd.vtheta)) >= 0.08
-        and abs(float(cmd.vx)) < translating_floor
-    )
+    spinning = abs(float(cmd.vtheta)) >= 0.08 and abs(float(cmd.vx)) < translating_floor
 
     def _mark_progress() -> None:
         ep.last_progress_pose = pose
@@ -78,14 +75,11 @@ def run_stall_watch(
     closing = dist_goal < ep.last_progress_dist - 0.01
     translating = abs(float(cmd.vx)) >= translating_floor
     bearing_improved = bearing_err < ep.last_progress_bearing - math.radians(3.0)
-    turned = abs(
-        conv.normalize_angle(pose.theta - ep.last_progress_pose.theta)
-    )
+    turned = abs(conv.normalize_angle(pose.theta - ep.last_progress_pose.theta))
     if closing or (
         moved >= nav._follower.motion.stall_progress_m  # noqa: SLF001
         and (
-            translating
-            or moved >= nav._follower.motion.stall_progress_m * 2  # noqa: SLF001
+            translating or moved >= nav._follower.motion.stall_progress_m * 2  # noqa: SLF001
         )
     ):
         _mark_progress()

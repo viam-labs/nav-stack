@@ -4,6 +4,7 @@ Centralizes ``_try_replan`` call sites so each trigger applies the matching
 ``GoalEpisode`` reset method. Call sites pass a ``TickContext``; path/pose
 updates land back on the tick.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -120,11 +121,8 @@ def apply_escape_pre_replan(
         from ..motion.simple_motion import distance_m
 
         ep.on_unstick_replan_fail(goal_dist_m=distance_m(tick.pose, tick.goal))
-        abort = (
-            tick.corridor_yaw is None
-            and nav._abort_blocked_replans(  # noqa: SLF001
-                ep.blocked_fail_count, nose_clear=tick.nose_clear
-            )
+        abort = tick.corridor_yaw is None and nav._abort_blocked_replans(  # noqa: SLF001
+            ep.blocked_fail_count, nose_clear=tick.nose_clear
         )
         return ReplanOutcome(abort=abort, abort_msg="unstick_replan")
     return ReplanOutcome()

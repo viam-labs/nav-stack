@@ -3,6 +3,7 @@
 Owns backup active/start/cost/attempts/cooldown. On completion, asks
 ``apply_backup_done_replan`` for a fresh path. Mutates ``TickContext``.
 """
+
 from __future__ import annotations
 
 import math
@@ -36,10 +37,7 @@ def run_backup_recovery(
         and ep.backup_attempts < nav._backup_max_attempts  # noqa: SLF001
         and tick.now >= ep.backup_cooldown_until
         and not tick.waiting_for_clear
-        and (
-            not tick.local_blocked
-            or ep.failed_replan_while_blocked >= 2
-        )
+        and (not tick.local_blocked or ep.failed_replan_while_blocked >= 2)
     )
 
     if ep.backup_active and ep.backup_start is not None:
@@ -54,13 +52,8 @@ def run_backup_recovery(
             if tick.local_view is not None
             else 0
         )
-        rear = (
-            rear_clearance_m(tick.scan) if tick.scan is not None else math.inf
-        )
-        worse = (
-            tick.local_view is not None
-            and pose_cost > ep.backup_start_cost + 5
-        )
+        rear = rear_clearance_m(tick.scan) if tick.scan is not None else math.inf
+        worse = tick.local_view is not None and pose_cost > ep.backup_start_cost + 5
         if (
             backed_m >= nav._backup_dist_m  # noqa: SLF001
             or rear < nav._backup_rear_clear_m * 0.85  # noqa: SLF001
@@ -74,7 +67,10 @@ def run_backup_recovery(
             tick.cmd = DriveCommand(0.0, 0.0, 0.0, False)
         else:
             tick.cmd = DriveCommand(
-                -nav._backup_speed_mps, 0.0, 0.0, False  # noqa: SLF001
+                -nav._backup_speed_mps,
+                0.0,
+                0.0,
+                False,  # noqa: SLF001
             )
             tick.progress = {
                 **progress,
@@ -110,7 +106,10 @@ def run_backup_recovery(
                 ep.backup_attempts += 1
                 ep.spin_stuck_since = None
                 tick.cmd = DriveCommand(
-                    -nav._backup_speed_mps, 0.0, 0.0, False  # noqa: SLF001
+                    -nav._backup_speed_mps,
+                    0.0,
+                    0.0,
+                    False,  # noqa: SLF001
                 )
                 tick.progress = {
                     **progress,

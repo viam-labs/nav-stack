@@ -1,10 +1,11 @@
 """Post-gate status publish, TRACE, speed-zone, and base command for one tick."""
+
 from __future__ import annotations
 
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from ...geom import conversions as conv
 from ..motion.simple_motion import DriveCommand

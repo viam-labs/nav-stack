@@ -1,4 +1,5 @@
 """Inflated costmap from an occupancy grid (pure numpy, no ROS)."""
+
 from __future__ import annotations
 
 import math
@@ -140,8 +141,8 @@ def mark_path_block_from_local(
     (``same route``). Marking the blocked *path samples* with a fat disk forces
     a real peel.
     """
-    from .path_utils import closest_point_on_path
     from .local_costmap import max_cost_along_segment
+    from .path_utils import closest_point_on_path
 
     pts = path.points
     if len(pts) < 2:
@@ -534,9 +535,7 @@ def build_costmap(
     # Planner-only preference past inflation (not shown in costmap viz).
     if prefer_m > 1e-6:
         prefer = (
-            free
-            & (dist_all_m > inflate_m + eps)
-            & (dist_all_m <= prefer_outer_m + eps)
+            free & (dist_all_m > inflate_m + eps) & (dist_all_m <= prefer_outer_m + eps)
         )
         if prefer.any():
             dist_m = dist_all_m[prefer]
@@ -545,9 +544,9 @@ def build_costmap(
             pref_costs = np.rint(
                 _PREF_COST_HI - (_PREF_COST_HI - _PREF_COST_LO) * frac
             ).astype(np.int32)
-            costs[prefer] = np.clip(
-                pref_costs, _PREF_COST_LO, _PREF_COST_HI
-            ).astype(np.uint8)
+            costs[prefer] = np.clip(pref_costs, _PREF_COST_LO, _PREF_COST_HI).astype(
+                np.uint8
+            )
 
     return costs
 
@@ -701,9 +700,7 @@ def footprint_traversable(
 ) -> bool:
     """True when the full robot disk at ``(x_m, y_m)`` is traversable."""
     return is_traversable(
-        footprint_max_cost(
-            costs, occ, x_m, y_m, robot_radius_m=robot_radius_m
-        )
+        footprint_max_cost(costs, occ, x_m, y_m, robot_radius_m=robot_radius_m)
     )
 
 
@@ -717,9 +714,7 @@ def nearest_free_pose(
     max_radius_cells: int = 40,
 ) -> Optional[Tuple[float, float]]:
     """Find a nearby pose whose full footprint is traversable."""
-    if footprint_traversable(
-        costs, occ, x_m, y_m, robot_radius_m=robot_radius_m
-    ):
+    if footprint_traversable(costs, occ, x_m, y_m, robot_radius_m=robot_radius_m):
         return x_m, y_m
     row, col = occ.world_to_cell(x_m, y_m)
     h, w = costs.shape
@@ -730,8 +725,6 @@ def nearest_free_pose(
             if not (0 <= yy < h and 0 <= xx < w):
                 continue
             wx, wy = occ.cell_to_world(yy, xx)
-            if footprint_traversable(
-                costs, occ, wx, wy, robot_radius_m=robot_radius_m
-            ):
+            if footprint_traversable(costs, occ, wx, wy, robot_radius_m=robot_radius_m):
                 return wx, wy
     return None

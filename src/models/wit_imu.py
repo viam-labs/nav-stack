@@ -8,6 +8,7 @@ Autodetect listens for streaming ``0x55`` frames; silent RPLIDARs are skipped,
 which avoids the CP2102 ``by-id`` collision when lidar and IMU share serial
 ``0001``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +19,6 @@ import time
 from typing import Any, ClassVar, Dict, Mapping, Optional, Sequence, Tuple
 
 from typing_extensions import Self
-
 from viam.components.movement_sensor import MovementSensor
 from viam.logging import getLogger
 from viam.proto.app.robot import ComponentConfig
@@ -32,7 +32,6 @@ from viam.utils import struct_to_dict
 from ..imu.wit_protocol import (
     ALGORITHMS,
     GYRO_STILL_THRESHOLD_MAX_DPS,
-    WitError,
     WitSample,
 )
 from ..imu.wit_serial import WitSerial
@@ -97,7 +96,9 @@ class WitImu(MovementSensor):
         self._include_tty_acm = False
         self._algorithm = "6axis"
         self._zero_yaw_on_start = False
-        self._gyro_still_threshold_dps: Optional[float] = DEFAULT_GYRO_STILL_THRESHOLD_DPS
+        self._gyro_still_threshold_dps: Optional[float] = (
+            DEFAULT_GYRO_STILL_THRESHOLD_DPS
+        )
         self._config_sent = 0
         self._config_error: Optional[str] = None
         self._raw = WitSample()
@@ -121,7 +122,9 @@ class WitImu(MovementSensor):
             raise ValueError(
                 "wit-imu requires attributes.serial_path or serial_autodetect=true"
             )
-        baud = attrs.get("serial_baud_rate", attrs.get("baud_rate", attrs.get("baudrate")))
+        baud = attrs.get(
+            "serial_baud_rate", attrs.get("baud_rate", attrs.get("baudrate"))
+        )
         if baud is not None and int(baud) not in (0, 9600, 115200):
             raise ValueError("wit-imu serial_baud_rate must be 9600 or 115200")
         chip = str(attrs.get("serial_chip") or "").strip().lower() or None
@@ -141,7 +144,9 @@ class WitImu(MovementSensor):
         attrs = struct_to_dict(config.attributes)
         serial_path = str(attrs.get("serial_path") or "").strip()
         self._serial_autodetect = bool(attrs.get("serial_autodetect", False))
-        baud = attrs.get("serial_baud_rate", attrs.get("baud_rate", attrs.get("baudrate")))
+        baud = attrs.get(
+            "serial_baud_rate", attrs.get("baud_rate", attrs.get("baudrate"))
+        )
         self._baudrate = int(baud) if baud else None
         if self._baudrate == 0:
             self._baudrate = None
@@ -155,7 +160,9 @@ class WitImu(MovementSensor):
             raise ValueError("wit-imu serial_chip must be cp210, ch340, or omitted")
         self._serial_chip = chip
         self._include_tty_acm = bool(attrs.get("include_tty_acm", False))
-        self._algorithm = str(attrs.get("algorithm", "6axis") or "6axis").strip().lower()
+        self._algorithm = (
+            str(attrs.get("algorithm", "6axis") or "6axis").strip().lower()
+        )
         self._zero_yaw_on_start = bool(attrs.get("zero_yaw_on_start", False))
         self._gyro_still_threshold_dps = _parse_gyro_still_threshold(attrs)
         self._stop.clear()
@@ -308,21 +315,33 @@ class WitImu(MovementSensor):
         await asyncio.to_thread(self.close_sync)
 
     async def get_angular_velocity(
-        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs
+        self,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> Vector3:
         del extra, timeout, kwargs
         with self._lock:
             return Vector3(x=self._gx, y=self._gy, z=self._gz)
 
     async def get_linear_acceleration(
-        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs
+        self,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> Vector3:
         del extra, timeout, kwargs
         with self._lock:
             return Vector3(x=self._ax, y=self._ay, z=self._az)
 
     async def get_orientation(
-        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs
+        self,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
     ):
         """Return orientation as a Viam OrientationVector protobuf.
 
@@ -346,31 +365,49 @@ class WitImu(MovementSensor):
         return ea.to_quaternion().to_orientation_vector().to_proto()
 
     async def get_compass_heading(
-        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs
+        self,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> float:
         del extra, timeout, kwargs
         with self._lock:
             if not self._has_mag:
-                raise NotImplementedError("compass heading requires magnetometer packets")
+                raise NotImplementedError(
+                    "compass heading requires magnetometer packets"
+                )
             # π/2 - atan2(y, x) identity used by wit-motion (North = 0).
             rad = math.atan2(self._my, self._mx)
             compass = math.degrees(rad) % 360.0
             return compass
 
     async def get_linear_velocity(
-        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs
+        self,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> Vector3:
         del extra, timeout, kwargs
         raise NotImplementedError("wit-imu does not provide linear velocity")
 
     async def get_position(
-        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs
+        self,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> Tuple[Any, float]:
         del extra, timeout, kwargs
         raise NotImplementedError("wit-imu does not provide position")
 
     async def get_properties(
-        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs
+        self,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> MovementSensor.Properties:
         del extra, timeout, kwargs
         with self._lock:
@@ -385,7 +422,11 @@ class WitImu(MovementSensor):
         )
 
     async def get_accuracy(
-        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs
+        self,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> MovementSensor.Accuracy:
         del extra, timeout, kwargs
         # Datasheet compass accuracy for supported WitMotion models (~0.5 deg)
@@ -398,7 +439,11 @@ class WitImu(MovementSensor):
         return MovementSensor.Accuracy(compass_degrees_error=float("nan"))
 
     async def get_readings(
-        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None, **kwargs
+        self,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs,
     ) -> Mapping[str, Any]:
         del extra, timeout, kwargs
         with self._lock:

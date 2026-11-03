@@ -1,4 +1,5 @@
 """Post-process global plans for the builtin path follower."""
+
 from __future__ import annotations
 
 import math
@@ -6,8 +7,8 @@ from typing import List, Sequence, Tuple
 
 import numpy as np
 
-from .planner import line_of_sight, world_segment_traversable
 from ..types import OccupancyGrid, Path2D
+from .planner import line_of_sight, world_segment_traversable
 
 # Reject string-pull shortcuts through preference / soft inflation so the
 # smoothed path keeps the clear-space bias Lazy Theta* paid for.
@@ -122,8 +123,8 @@ def smooth_plan_path(
         return path
     import numpy as np
 
-    from .costmap import build_costmap, occupancy_from_map_dict
     from ..types import OccupancyGrid
+    from .costmap import build_costmap, occupancy_from_map_dict
 
     occ = occupancy_from_map_dict(map_data)
     if keepout_mask is not None and np.asarray(keepout_mask).shape == occ.grid.shape:
