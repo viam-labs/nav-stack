@@ -325,7 +325,8 @@ class LocalizeSupervisor:
             shift_m >= cfg.mapping_revisit_min_shift_m
             or shift_deg >= cfg.mapping_revisit_min_shift_deg
         )
-        sane = shift_m <= cfg.mapping_revisit_max_shift_m
+        allowed_shift_m = cfg.mapping_revisit_allowed_shift_m(score)
+        sane = shift_m <= allowed_shift_m
 
         out: dict = {
             "status": "ok",
@@ -335,6 +336,7 @@ class LocalizeSupervisor:
             "ray_mae_m": None if ray_mae is None else round(ray_mae, 3),
             "shift_m": round(shift_m, 3),
             "shift_deg": round(shift_deg, 2),
+            "allowed_shift_m": round(allowed_shift_m, 3),
             "good_match": good,
             "drifted": drifted,
             "pose": {
@@ -361,9 +363,10 @@ class LocalizeSupervisor:
         if not sane and apply_override is not True:
             out["status"] = "rejected_shift"
             LOGGER.warning(
-                "mapping revisit: match %.1f m away exceeds "
-                "mapping_revisit_max_shift_m=%.1f; not correcting (score=%.2f)",
+                "mapping revisit: match %.1f m away exceeds allowed "
+                "shift %.1f m (base %.1f + soft); not correcting (score=%.2f)",
                 shift_m,
+                allowed_shift_m,
                 cfg.mapping_revisit_max_shift_m,
                 score,
             )

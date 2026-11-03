@@ -241,15 +241,18 @@ def test_match_against_recovers_offset():
 
 
 def test_long_loop_recovers_a_several_meter_drift():
-    """A return several meters and tens of degrees off is inside the search.
+    """A return several meters off (with modest yaw) is inside the search.
 
     The old ±1.5 m / ±15° window could not see this. Translation still has to
-    stay under about 10% of the loop, which a long loop allows.
+    stay under about 10% of the loop, which a long loop allows. Yaw on a long
+    return is capped near ``max_yaw_long_gap_deg`` so a 22° snap cannot shear
+    the corridor — inject only a few degrees here.
     """
     truth = _truth_world()
     graph = pg.PoseGraph(node_spacing_m=0.5)
     poses = _path()
-    shift = conv.Pose2D(1.4, 1.2, math.radians(25.0))
+    # Keep yaw inside the long-gap cap; lean on XY for the multi-meter drift.
+    shift = conv.Pose2D(2.2, 1.6, math.radians(6.0))
     cut = len(poses) - 40
     for i, pose in enumerate(poses):
         stored = pose if i < cut else conv.compose_poses(shift, pose)
@@ -374,6 +377,124 @@ def test_revisit_large_yaw_is_rejected_unless_forced():
     assert out["status"] == "rebuilt"
     end = engine.get_pose()
     assert abs(conv.normalize_angle(end.theta - flipped.theta)) < 1e-6
+
+
+def test_allowed_yaw_tightens_on_long_gap():
+    """A long return must stay nearly parallel; short loops keep the window."""
+    params = loop_closure.LoopClosureParams()
+    assert loop_closure.allowed_yaw_deg(
+        params, params.min_travel_gap_m
+    ) == pytest.approx(params.window_deg)
+    # The tear on tracer2a was 22.5° over a 64 m gap — that must not pass.
+    assert loop_closure.allowed_yaw_deg(params, 64.0) == pytest.approx(
+        params.max_yaw_long_gap_deg
+    )
+    assert loop_closure.allowed_yaw_deg(params, 64.0) < 22.5
+
+
+def test_long_gap_large_yaw_is_implausible_drift():
+    """Detect rejects a long-gap match whose yaw would shear the corridor."""
+    truth = _truth_world()
+    graph = pg.PoseGraph(node_spacing_m=0.5)
+    poses = _path()
+    # Drive the loop with a large yaw error on the return so the prior is off
+    # by more than the long-gap yaw cap but still inside the search window.
+    shift = conv.Pose2D(0.4, 0.3, math.radians(22.5))
+    cut = len(poses) - 40
+    for i, pose in enumerate(poses):
+        stored = pose if i < cut else conv.compose_poses(shift, pose)
+        graph.add_scan(stored, _raycast(truth, pose))
+    snap = graph.snapshot()
+    assert float(snap.travel[-1]) > 35.0
+    match, reason = loop_closure.detect(
+        snap,
+        loop_closure.LoopClosureParams(max_yaw_long_gap_deg=8.0),
+        resolution=RES,
+    )
+    # Either the matcher never finds this (low_score / ambiguous) or it finds
+    # it and the yaw/gap gate rejects it. A rebuild with 22° must not pass.
+    if reason == "ok":
+        assert match is not None
+        prior = snap.pose(len(snap) - 1)
+        dth = abs(math.degrees(conv.normalize_angle(match.pose.theta - prior.theta)))
+        assert dth <= 8.0 + 1e-6
+    else:
+        assert reason in {
+            "implausible_drift",
+            "low_score",
+            "ambiguous",
+            "ambiguous_yaw",
+            "window_edge",
+            "no_match",
+            "low_overlap",
+        }
+
+
+def test_loop_pending_expires_instead_of_hanging(monkeypatch):
+    """Disagreeing ok-matches must expire pending, not leave it true forever."""
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "maps_dir": "/tmp",
+            "mode": "mapping",
+            "builtin_loop_closure": True,
+            "builtin_loop_pending_max_tries": 3,
+            "builtin_loop_pending_max_s": 60.0,
+        }
+    )
+    engine = BuiltinSlamEngine(cfg, _Sensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    scan = conv.LaserScan2D(np.full(180, 2.0), -math.pi, 2 * math.pi / 180, 0.05, 8.0)
+    # Enough travel that detect would normally run; we stub detect itself.
+    for i in range(20):
+        engine._graph.add_scan(conv.Pose2D(0.5 * i, 0.0, 0.0), scan)  # noqa: SLF001
+    engine._pose = conv.Pose2D(9.5, 0.0, 0.0)  # noqa: SLF001
+
+    n = {"i": 0}
+
+    def fake_detect(snap, params, resolution=0.05, base=None):
+        # Each call: ok match at a new node pose, yaw wobbling so they disagree.
+        n["i"] += 1
+        cur = len(snap) - 1
+        prior = snap.pose(cur)
+        yaw = math.radians(3.0 * ((n["i"] % 3) - 1))  # -3°, 0°, +3° — >2° apart
+        matched = conv.Pose2D(
+            prior.x + 0.05, prior.y, conv.normalize_angle(prior.theta + yaw)
+        )
+        cov = np.diag([0.05**2, 0.05**2, math.radians(1.0) ** 2])
+        m = loop_closure.LoopMatch(
+            pose=matched,
+            fit=0.7,
+            overlap=0.8,
+            prior_fit=0.4,
+            cov=cov,
+            points=100,
+            anchor=0,
+            gap_m=10.0,
+        )
+        return m, "ok"
+
+    monkeypatch.setattr(loop_closure, "detect", fake_detect)
+
+    statuses = []
+    for _ in range(6):
+        # Advance a node each attempt so pending[1] != cur can be satisfied
+        # structurally; the yaw wobble still prevents agreement.
+        engine._graph.add_scan(  # noqa: SLF001
+            conv.Pose2D(0.5 * (20 + n["i"]), 0.0, 0.0), scan
+        )
+        statuses.append(engine.run_loop_closure().get("status"))
+
+    assert "pending" in statuses
+    assert "pending_expired" in statuses
+    diag = engine.diagnostics()["loop_closure"]
+    assert diag["pending_expired"] >= 1
+    assert diag["closures"] == 0
+    # After expiry a fresh pending may be armed, but it must not be ancient.
+    if diag["pending"]:
+        assert diag["pending_age_s"] is not None
+        assert diag["pending_age_s"] < 1.0
+        assert diag["pending_tries"] < cfg.builtin_loop_pending_max_tries
 
 
 def test_set_pose_jump_does_not_become_odometry():
