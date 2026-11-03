@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 
 import numpy as np
 import pytest
@@ -13,7 +14,7 @@ from src.nav.stores.maps import MapStore
 from src.slam_builtin import graph_store, repair
 from src.slam_builtin import occupancy as occ
 from src.slam_builtin import pose_graph as pg
-from src.slam_builtin.engine import MODE_MAPPING, BuiltinSlamEngine
+from src.slam_builtin.engine import MODE_LOCALIZING, MODE_MAPPING, BuiltinSlamEngine
 from src.slam_builtin.map_health import MapHealth
 
 from .test_loop_closure import (
@@ -131,6 +132,12 @@ def test_resume_reloads_saved_keyframes_as_fixed_nodes(tmp_path):
     assert len(graph) == n
     assert resumed._graph_frozen == n  # noqa: SLF001
     assert resumed._graph_base is None  # noqa: SLF001
+    baseline = resumed._session_baseline  # noqa: SLF001
+    assert baseline is not None
+    assert np.array_equal(baseline.log_odds, resumed._grid.log_odds)  # noqa: SLF001
+    health = resumed.refresh_map_health(force=True)
+    assert health["scope"] == "session"
+    assert "trusted" in health["baseline"]
     assert resumed.diagnostics()["loop_closure"]["saved_nodes"] == n
     assert resumed._live_first_free(1) == n  # noqa: SLF001
 
@@ -224,6 +231,34 @@ def test_repair_fixes_a_torn_loop_then_undo_restores_it(tmp_path):
     assert _ghost_fraction(engine._grid, truth) > 0.3  # noqa: SLF001
     assert engine._graph_frozen == len(engine._graph) > 0  # noqa: SLF001
     assert engine.undo_repair(map_dir)["status"] == "no_backup"
+
+
+def test_switching_to_localize_right_after_save_lets_the_repair_land(tmp_path):
+    engine, truth, poses = _torn_loop(tmp_path, gyro_scale=1.04)
+    map_dir = tmp_path / "m"
+    assert engine.save_map(map_dir)["repair"] == {"status": "started"}
+    engine.configure_mode(MODE_LOCALIZING, map_dir)
+    out = engine.repair_status()
+    assert out["state"] == "done"
+    assert out["status"] == "applied", out
+    assert engine._mode == MODE_LOCALIZING  # noqa: SLF001
+    assert _ghost_fraction(engine._grid, truth) < 0.08  # noqa: SLF001
+    assert _end_error(engine, poses) < 0.2
+
+
+def test_switching_to_another_map_cancels_the_repair(tmp_path):
+    engine = _engine(tmp_path)
+    release = threading.Event()
+    job = threading.Thread(
+        target=lambda: engine._repair_cancel.wait(5.0) or release.wait(5.0)  # noqa: SLF001
+    )
+    job.start()
+    engine._repair_thread = job  # noqa: SLF001
+    engine._repair_map_dir = tmp_path / "m"  # noqa: SLF001
+    engine.configure_mode(MODE_MAPPING, tmp_path / "other")
+    assert engine._repair_cancel.is_set()  # noqa: SLF001
+    job.join(timeout=5.0)
+    assert not job.is_alive()
 
 
 def test_repair_leaves_a_healthy_map_alone(tmp_path):

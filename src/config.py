@@ -886,6 +886,9 @@ class SlamConfig:
     # background and apply only if the map was torn and gets clearly healthier.
     builtin_repair_on_save: bool = True
     builtin_repair_max_s: float = 600.0
+    # start_localizing / start_mapping on the map a repair is still working
+    # on waits this long for it to land; past that the repair is cancelled.
+    builtin_repair_switch_wait_s: float = 120.0
     # Allow mapping revisit / loop-closure corrections while the robot is
     # moving. Default on for continuous-scan backends (builtin); off when
     # map_when_still is on, where odom TF shifts mid-hop are unsafe.
