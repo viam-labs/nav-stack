@@ -123,6 +123,9 @@ class BuiltinSlamEngine:
         self._last_lin_rate = 0.0
         self._insert_skips_unmatched = 0
         self._insert_skips_turning = 0
+        # Last time we ran a full-circle heading search to unstick paint.
+        self._last_heading_recover_at = 0.0
+        self._heading_recovers = 0
         self._ticks = 0
         self._updates = 0
         # Match outcomes: applied = pose corrected; held = ran match but kept
@@ -1182,6 +1185,7 @@ class BuiltinSlamEngine:
                 "yaw_rate_deg_s": round(math.degrees(self._last_yaw_rate), 2),
                 "insert_skips_turning": self._insert_skips_turning,
                 "insert_skips_unmatched": self._insert_skips_unmatched,
+                "heading_recovers": self._heading_recovers,
                 "generation": self._generation,
                 "seed_localize_pending": self._seed_localize_pending,
                 "pose_restored_from_disk": self._pose_restored_from_disk,
@@ -1405,7 +1409,15 @@ class BuiltinSlamEngine:
             elif self._spin_hold:
                 self._flush_spin_hold(scan, now, capture_motion)
             elif not self._scan_fits_map(scan, scan_pose):
-                self._insert_skips_unmatched += 1
+                # Pose often only slipped in yaw (skid / delayed match). A
+                # full-circle heading search can put the scan back on the
+                # walls so mapping keeps growing instead of freezing.
+                if self._try_recover_heading_for_paint(
+                    scan, scan_pose, capture_motion, now
+                ):
+                    self._maybe_insert_scan(scan, now, capture_motion=capture_motion)
+                else:
+                    self._insert_skips_unmatched += 1
             else:
                 self._maybe_insert_scan(scan, now, capture_motion=capture_motion)
 
@@ -1762,6 +1774,69 @@ class BuiltinSlamEngine:
         """True when the map does not yet constrain ``pose``, or the scan lands on it."""
         return self._scan_map_fit(scan, pose) != "miss"
 
+    # Full-circle heading search is a few ms; do not run it on every refused
+    # paint tick while the robot is stuck in a featureless area.
+    _HEADING_RECOVER_MIN_S = 0.4
+
+    def _search_heading_for_scan(
+        self, scan: conv.LaserScan2D, pose: conv.Pose2D
+    ) -> tuple[Optional[conv.Pose2D], float]:
+        try:
+            occ_map = self._occupancy_for_match()
+        except Exception:  # noqa: BLE001
+            return None, float("-inf")
+        return scan_match.search_heading(
+            occ_map,
+            scan,
+            pose,
+            min_score=_MAP_INSERT_MIN_SCORE,
+            occupied_lookup=self._occupied_lookup_for(occ_map),
+        )
+
+    def _snap_pose_yaw(self, yaw: float, *, clear_yaw_rate: bool = False) -> None:
+        with self._lock:
+            self._pose = conv.Pose2D(self._pose.x, self._pose.y, yaw)
+            # The tick already stored the wheel heading. Leaving it there
+            # makes the next sample look like another spin.
+            if self._last_tick_pose is not None:
+                self._last_tick_pose = conv.Pose2D(
+                    self._last_tick_pose.x,
+                    self._last_tick_pose.y,
+                    yaw,
+                )
+            if clear_yaw_rate:
+                self._last_yaw_rate = 0.0
+
+    def _try_recover_heading_for_paint(
+        self,
+        scan: conv.LaserScan2D,
+        scan_pose: conv.Pose2D,
+        capture_motion: Optional[conv.Pose2D],
+        now: float,
+    ) -> bool:
+        """Snap yaw to a map-fitting heading so a miss can still paint.
+
+        XY is left alone — translation slip needs revisit / loop closure.
+        Returns True when a heading was applied and the caller should paint.
+        """
+        if now - self._last_heading_recover_at < self._HEADING_RECOVER_MIN_S:
+            return False
+        self._last_heading_recover_at = now
+        found, found_score = self._search_heading_for_scan(scan, scan_pose)
+        if found is None:
+            return False
+        live = found
+        if capture_motion is not None:
+            live = conv.compose_poses(found, capture_motion)
+        self._snap_pose_yaw(live.theta)
+        self._heading_recovers += 1
+        self._log(
+            "mapping heading recover "
+            f"dtheta={math.degrees(conv.normalize_angle(found.theta - scan_pose.theta)):.1f}deg "
+            f"score={found_score:.2f}"
+        )
+        return True
+
     def _flush_spin_hold(
         self,
         scan: conv.LaserScan2D,
@@ -1782,19 +1857,7 @@ class BuiltinSlamEngine:
         end = pose
         fit = self._scan_map_fit(scan, pose)
         if fit == "miss":
-            try:
-                occ_map = self._occupancy_for_match()
-            except Exception:  # noqa: BLE001
-                occ_map = None
-            found, found_score = (None, float("-inf"))
-            if occ_map is not None:
-                found, found_score = scan_match.search_heading(
-                    occ_map,
-                    scan,
-                    pose,
-                    min_score=_MAP_INSERT_MIN_SCORE,
-                    occupied_lookup=self._occupied_lookup_for(occ_map),
-                )
+            found, found_score = self._search_heading_for_scan(scan, pose)
             if found is None:
                 self._insert_skips_unmatched += len(held)
                 self._log(
@@ -1803,17 +1866,9 @@ class BuiltinSlamEngine:
                 )
                 return
             end = found
-            with self._lock:
-                self._pose = conv.Pose2D(self._pose.x, self._pose.y, found.theta)
-                # The tick already stored the wheel heading. Leaving it there
-                # makes the next sample look like another spin.
-                if self._last_tick_pose is not None:
-                    self._last_tick_pose = conv.Pose2D(
-                        self._last_tick_pose.x,
-                        self._last_tick_pose.y,
-                        found.theta,
-                    )
-                self._last_yaw_rate = 0.0
+            # Spin-held poses are already in the capture frame; paint rewind
+            # uses ``end`` directly, so snap the live pose the same way.
+            self._snap_pose_yaw(found.theta, clear_yaw_rate=True)
         corrected = rewind_spin_poses([item[1] for item in held], end)
         for (held_scan, _pose, frames, held_now), paint_at in zip(held, corrected):
             self._paint_mapping_scan(held_scan, paint_at, held_now, frames=frames)
