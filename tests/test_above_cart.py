@@ -7,7 +7,7 @@ import pytest
 
 from src.config import LidarConfig, NavConfig
 from src.geom.conversions import Pose2D
-from src.nav_builtin.above_cart import AboveCartMemory
+from src.nav.control.above_cart import AboveCartMemory
 
 CAM = LidarConfig(
     name="camera",

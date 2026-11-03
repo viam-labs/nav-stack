@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from src.geom import conversions as conv
-from src.nav.global_localize import (
+from src.nav.localize.global_localize import (
     OccupancyMap,
     global_localize_scan,
     load_occupancy_from_map_dir,
@@ -183,7 +183,7 @@ def _corridor_map() -> OccupancyMap:
 
 
 def test_choose_yaw_or_flip_prefers_reference_on_near_tie():
-    from src.nav.global_localize import choose_yaw_or_flip
+    from src.nav.localize.global_localize import choose_yaw_or_flip
 
     occ = _corridor_map()
     true = conv.Pose2D(5.0, 10.0, math.pi / 2)  # facing +Y along corridor

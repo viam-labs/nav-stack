@@ -169,13 +169,7 @@ CONDITIONS = {
 
 
 def _detail(r: sim.RunResult) -> str:
-    return (
-        f"state={r.state} err={r.error!r} t={r.sim_s:.1f}s contacts={r.contacts} "
-        f"first={r.first_contact} flips={r.length_flips()} "
-        f"lens={[round(x, 1) for x in r.path_lengths][:12]} "
-        f"states={r.obstacle_states[:16]} rev={r.reversing_s:.1f}s "
-        f"end=({r.final_pose.x:.2f},{r.final_pose.y:.2f})"
-    )
+    return r.detail()
 
 
 @pytest.mark.parametrize("cond", list(CONDITIONS))

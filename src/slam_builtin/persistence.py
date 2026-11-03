@@ -11,7 +11,7 @@ from typing import Optional
 import numpy as np
 
 from ..geom import conversions as conv
-from ..nav.global_localize import OccupancyMap, load_occupancy_from_map_dir
+from ..nav.localize.global_localize import OccupancyMap, load_occupancy_from_map_dir
 from . import occupancy as occ
 from .types import LogOddsGrid
 

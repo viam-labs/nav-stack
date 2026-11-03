@@ -13,8 +13,8 @@ from src.config import (
     SlamConfig,
 )
 from src.geom import conversions as conv
-from src.nav.maps import MapStore
-from src.nav_builtin.viam_io import get_grid_response_to_map, map_dict_to_get_grid
+from src.nav.io.viam_io import get_grid_response_to_map, map_dict_to_get_grid
+from src.nav.stores.maps import MapStore
 from src.slam_builtin import occupancy as occ
 from src.slam_builtin import persistence, scan_match
 from src.slam_builtin.engine import BuiltinSlamEngine
@@ -475,8 +475,8 @@ def test_predict_absolute_odom_uses_deltas_and_gates_jumps():
 
 
 def test_follow_command_intermediate_target_never_marks_done():
-    from src.nav_builtin.controller import FollowerConfig, compute_follow_command
-    from src.nav_builtin.types import Pose2D
+    from src.nav.control.controller import FollowerConfig, compute_follow_command
+    from src.nav.types import Pose2D
 
     cfg = FollowerConfig()
     cfg.motion.xy_tolerance_m = 0.25

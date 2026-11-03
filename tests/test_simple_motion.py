@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from src.geom import conversions as conv
-from src.nav.simple_motion import (
+from src.nav.motion.simple_motion import (
     DriveCommand,
     ObstacleConfig,
     SimpleMotionCanceled,
@@ -216,7 +216,7 @@ def test_avoidance_slows_in_band():
 
 def test_spin_clearance_measures_nearest_return_in_any_direction():
     """Rotation sweeps a disc, so side walls matter even with a clear front."""
-    from src.nav.simple_motion import spin_clearance_m
+    from src.nav.motion.simple_motion import spin_clearance_m
 
     # 0.84 m gap: walls 0.42 m to each side, nothing ahead.
     gap = _scan_with({math.radians(90): 0.42, math.radians(-90): 0.42})
@@ -227,7 +227,7 @@ def test_spin_clearance_measures_nearest_return_in_any_direction():
 
 def test_arc_clearance_ignores_wall_the_turn_curves_away_from():
     """Corridor corner: wall ahead, tight turn — the arc misses it."""
-    from src.nav.simple_motion import arc_clearance_m
+    from src.nav.motion.simple_motion import arc_clearance_m
 
     scan = _scan_with({0.0: 0.68})
     straight = arc_clearance_m(
@@ -309,7 +309,7 @@ def test_avoidance_stop_bubble_unchanged_by_arc_relaxation():
 
 
 def test_velocity_floor_skips_angular_when_translating():
-    from src.nav.simple_motion import apply_velocity_floor
+    from src.nav.motion.simple_motion import apply_velocity_floor
 
     cfg = SimpleMotionConfig(
         max_linear_mps=0.6,

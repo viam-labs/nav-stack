@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.nav_builtin.viam_io import _is_near_zero_rpm_error, _sanitize_base_cmd
+from src.nav.io.viam_io import _is_near_zero_rpm_error, _sanitize_base_cmd
 
 
 def test_sanitize_snaps_tiny_linear_to_zero():

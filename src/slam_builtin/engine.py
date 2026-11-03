@@ -20,9 +20,9 @@ from ..config import (
     SlamConfig,
 )
 from ..geom import conversions as conv
-from ..nav.global_localize import OccupancyMap
-from ..nav.maps import MapStore
-from ..nav.pose_jump_gate import PoseJumpGate
+from ..nav.localize.global_localize import OccupancyMap
+from ..nav.localize.pose_jump_gate import PoseJumpGate
+from ..nav.stores.maps import MapStore
 from . import loop_closure, persistence, scan_match
 from . import occupancy as occ
 from . import pose_graph as pg
@@ -125,8 +125,11 @@ class BuiltinSlamEngine:
         self._insert_skips_turning = 0
         self._ticks = 0
         self._updates = 0
-        self._match_accepts = 0
-        self._match_rejects = 0
+        # Match outcomes: applied = pose corrected; held = ran match but kept
+        # odom (prior already good / apply refused on purpose); failed = real miss.
+        self._match_accepts = 0  # == applied (legacy name)
+        self._match_held = 0
+        self._match_failed = 0
         # Corrections applied while a goal was active.
         self._drive_applies = 0
         self._yaw_only_applies = 0
@@ -196,6 +199,9 @@ class BuiltinSlamEngine:
             "last_render_ms": None,
         }
         self._keyframe_hook = None
+        # Optional: SlamService wires this into LocalizationStateTracker so a
+        # tick that trusts the published pose clears / avoids ``lost``.
+        self._match_outcome_hook = None
         self._pose_listeners: list = []
         self._last_odom_twist = (0.0, 0.0, 0.0)
         # Forward speed (m/s) guessed from IMU accel when wheel velocity is absent.
@@ -982,7 +988,12 @@ class BuiltinSlamEngine:
                 "ticks": self._ticks,
                 "map_updates": self._updates,
                 "match_accepts": self._match_accepts,
-                "match_rejects": self._match_rejects,
+                "match_applied": self._match_accepts,
+                "match_held": self._match_held,
+                "match_failed": self._match_failed,
+                # Legacy total of non-applied outcomes (held + failed). Prefer
+                # match_held / match_failed — "rejects climbing" is not dying.
+                "match_rejects": self._match_held + self._match_failed,
                 "drive_applies": self._drive_applies,
                 "yaw_only_applies": self._yaw_only_applies,
                 "heading": self._heading_diagnostics(),
@@ -1183,10 +1194,12 @@ class BuiltinSlamEngine:
                     # Pose moved frame (loop closure) mid-match.
                     return
                 applied = self._apply_match(self._pose, matched, odom, yaw_fix=yaw_fix)
-                if matched is not None and applied:
-                    self._match_accepts += 1
-                else:
-                    self._match_rejects += 1
+                self._note_match_outcome(
+                    applied=applied,
+                    matched=matched,
+                    score=score,
+                    prior_score=prior_score,
+                )
 
         if self._mode == MODE_MAPPING:
             with self._lock:
@@ -1401,18 +1414,20 @@ class BuiltinSlamEngine:
                 self._last_match_rival_score = rival_score
                 # Do not apply match to pose (would fight SimWorld). Count how
                 # often the map agrees with ground truth for status.
+                agreed = False
                 if matched is not None:
                     dist = math.hypot(matched.x - pose.x, matched.y - pose.y)
                     dyaw = abs(conv.normalize_angle(matched.theta - pose.theta))
-                    if (
+                    agreed = (
                         dist <= self._SMALL_CORRECTION_M
                         and dyaw <= self._SMALL_CORRECTION_RAD
-                    ):
-                        self._match_accepts += 1
-                    else:
-                        self._match_rejects += 1
-                else:
-                    self._match_rejects += 1
+                    )
+                self._note_match_outcome(
+                    applied=agreed,
+                    matched=matched,
+                    score=score,
+                    prior_score=prior_score,
+                )
 
         if self._mode == MODE_MAPPING:
             if yaw_rate > self._MAX_INSERT_YAW_RATE:
@@ -1426,7 +1441,7 @@ class BuiltinSlamEngine:
 
     def _try_seed_global_localize(self, scan) -> bool:
         """Full-map match once scans are available; apply if score is trusted."""
-        from ..nav.global_localize import global_localize_scan
+        from ..nav.localize.global_localize import global_localize_scan
 
         try:
             occ_map = self._occupancy_for_match()
@@ -1940,6 +1955,58 @@ class BuiltinSlamEngine:
             "window_s": None if elapsed is None else round(elapsed, 1),
             "bias_deg_s": None if bias is None else round(bias, 4),
         }
+
+    def set_match_outcome_hook(self, hook) -> None:
+        self._match_outcome_hook = hook
+
+    def _emit_match_outcome(self, result: dict) -> None:
+        hook = self._match_outcome_hook
+        if hook is None:
+            return
+        try:
+            hook(result)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _note_match_outcome(
+        self,
+        *,
+        applied: bool,
+        matched: Optional[conv.Pose2D],
+        score: float,
+        prior_score: float,
+    ) -> None:
+        """Split match results so UI does not treat 'prior already good' as reject."""
+        if applied:
+            self._match_accepts += 1
+            self._emit_match_outcome(
+                {
+                    "status": "corrected",
+                    "corrected": True,
+                    "score": score,
+                    "prior_score": prior_score,
+                }
+            )
+            return
+        # Held: usable prior / candidate that we chose not to apply. Failed:
+        # no peak or dead score (real miss).
+        prior_ok = math.isfinite(prior_score) and prior_score >= 0.35
+        score_ok = math.isfinite(score)
+        if matched is not None or (prior_ok and score_ok):
+            self._match_held += 1
+            # Published pose already fits the scan — not lost. Watchdog
+            # nav_hold / low_quality must not keep advertising lost while
+            # every tick is holding for this reason.
+            if prior_ok and score_ok:
+                self._emit_match_outcome(
+                    {
+                        "status": "previous_better",
+                        "score": score if score_ok else prior_score,
+                        "prior_score": prior_score,
+                    }
+                )
+            return
+        self._match_failed += 1
 
     def _apply_match(
         self,

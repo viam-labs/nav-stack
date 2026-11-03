@@ -294,7 +294,7 @@ await nav.do_command({"command": "resume"})
 
 ### `get_status`
 
-Includes (among other fields): `state`, `active`, `motion`, `goal`, `pose`, progress / error fields from the follower, `simple_nav`, `route`, `localization_check`, `suspended` / `suspended_goal`, footprint (`footprint_length_m`, `footprint_width_m`, `robot_radius_m`), and when available drive / control-loop stats (`last_drive`, `drive`, `control_loop`, `pose_source`, `nav_backend`).
+Includes (among other fields): `state`, `active`, `motion`, `goal`, `pose`, progress / error fields from the follower, `simple_nav`, `route`, `localization_check`, `suspended` / `suspended_goal`, footprint (`footprint_length_m`, `footprint_width_m`, `robot_radius_m`), and when available drive / control-loop stats (`last_drive`, `drive`, `control_loop`, `pose_source`, `nav_backend`). While following, `progress` includes per-phase tick wall times in ms (`sense_ms`, `costmap_ms`, `guard_ms`, `dwa_ms`, `gate_ms`); the same snapshot is mirrored under `control_loop.phase_ms`.
 
 ### `test_drive`
 

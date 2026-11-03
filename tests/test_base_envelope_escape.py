@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from src.nav.simple_motion import DriveCommand
-from src.nav_builtin import base_envelope as env
-from src.nav_builtin import escape
-from src.nav_builtin.controller import FollowerConfig
-from src.nav_builtin.types import Pose2D
-from src.nav_builtin.viam_io import _sanitize_base_cmd
+from src.nav.control import escape
+from src.nav.control.controller import FollowerConfig
+from src.nav.io.viam_io import _sanitize_base_cmd
+from src.nav.motion import base_envelope as env
+from src.nav.motion.simple_motion import DriveCommand
+from src.nav.types import Pose2D
 
 
 def test_sanitize_matches_envelope_constants():
@@ -191,6 +191,29 @@ def test_escape_machine_wait_freeze_and_unstick_turn(monkeypatch):
         )
     )
     assert r3.replan_trigger == "blocked_nose_unstick"
+
+
+def test_escape_machine_wait_unstick_despite_follower_crawl(monkeypatch):
+    """Wait must unstick even when the follower still offers a slow forward."""
+    rev = DriveCommand(-0.12, 0.0, 0.0, False)
+    monkeypatch.setattr(escape, "try_reverse", lambda *a, **k: rev)
+    monkeypatch.setattr(escape, "bumper_wants_reverse", lambda **k: False)
+    monkeypatch.setattr(escape.EscapeMachine, "_spin_clear", lambda self, s: False)
+    m = escape.EscapeMachine()
+    r = m.tick_pre(
+        _sense(
+            waiting=True,
+            failed_replans=2,
+            nose_clear=False,
+            cmd=DriveCommand(0.11, 0.0, 0.0, False),
+            scan=object(),
+            local_view=object(),
+            progress={"obstacle": "slow"},
+        )
+    )
+    assert r.active_mode == escape.MODE_REVERSE
+    assert r.obstacle == "wait_reverse"
+    assert r.cmd is not None and r.cmd.vx < 0.0
 
 
 def test_escape_machine_undrivable_post(monkeypatch):

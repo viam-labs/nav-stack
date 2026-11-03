@@ -17,7 +17,7 @@ from src.config import (
 )
 from src.geom import conversions as conv
 from src.models.sim_base import SimBase
-from src.nav.maps import MapStore
+from src.nav.stores.maps import MapStore
 from src.sim import (
     SimSensors,
     SimWorld,

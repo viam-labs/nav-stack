@@ -9,8 +9,8 @@ import pytest
 
 from src.config import SlamConfig
 from src.geom import conversions as conv
-from src.nav.global_localize import _inflate_occupied
-from src.nav.maps import MapStore
+from src.nav.localize.global_localize import _inflate_occupied
+from src.nav.stores.maps import MapStore
 from src.slam_builtin import loop_closure
 from src.slam_builtin import occupancy as occ
 from src.slam_builtin import pose_graph as pg

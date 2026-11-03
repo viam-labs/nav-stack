@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from src.geom import conversions as conv
-from src.nav import slice_match
+from src.nav.localize import slice_match
 
 
 def _wall_points(x0, y0, x1, y1, n=80):

@@ -12,12 +12,12 @@ import numpy as np
 import pytest
 
 from src.geom import conversions as conv
-from src.nav_builtin.viam_io import (
+from src.nav.io.viam_io import (
     ViamWorldIO,
     get_grid_response_to_map,
     map_dict_to_get_grid,
 )
-from src.nav_builtin.viz_store import NavVizStore
+from src.nav.io.viz_store import NavVizStore
 
 
 def test_bridge_map_get_grid_roundtrip():
@@ -119,7 +119,7 @@ def test_nav_viz_store_snapshot_shape():
 
 def test_builtin_nav_host_status():
     from src.config import NavConfig
-    from src.nav_builtin.host import BuiltinNavHost, make_builtin_navigator
+    from src.nav.control.host import BuiltinNavHost, make_builtin_navigator
 
     class _World:
         def get_map(self):
@@ -149,16 +149,16 @@ def test_builtin_nav_host_status():
     nav = make_builtin_navigator(world, cfg)
     host = BuiltinNavHost(nav, world, viz, nav_cfg=cfg)
     assert host.nav_backend() == "builtin"
-    assert nav._kwargs["poll_interval_s"] == pytest.approx(0.1)  # noqa: SLF001
-    assert nav._kwargs["local_costmap_rate_hz"] == pytest.approx(10.0)  # noqa: SLF001
+    assert nav._cfg.control_period_s() == pytest.approx(0.1)  # noqa: SLF001
+    assert nav._cfg.builtin.local_costmap_rate_hz == pytest.approx(10.0)  # noqa: SLF001
 
     fast = NavConfig.from_dict(
         {"slam_service": "s", "base": "b", "control_rate_hz": 20.0}
     )
     fast_nav = make_builtin_navigator(world, fast)
-    assert fast_nav._kwargs["poll_interval_s"] == pytest.approx(0.05)  # noqa: SLF001
+    assert fast_nav._cfg.control_period_s() == pytest.approx(0.05)  # noqa: SLF001
     # Local costmap rate stays independent of control rate.
-    assert fast_nav._kwargs["local_costmap_rate_hz"] == pytest.approx(10.0)  # noqa: SLF001
+    assert fast_nav._cfg.builtin.local_costmap_rate_hz == pytest.approx(10.0)  # noqa: SLF001
     tuned = NavConfig.from_dict(
         {
             "slam_service": "s",
@@ -168,7 +168,7 @@ def test_builtin_nav_host_status():
         }
     )
     tuned_nav = make_builtin_navigator(world, tuned)
-    assert tuned_nav._kwargs["local_costmap_rate_hz"] == pytest.approx(2.0)  # noqa: SLF001
+    assert tuned_nav._cfg.builtin.local_costmap_rate_hz == pytest.approx(2.0)  # noqa: SLF001
     status = host.nav_status()
     assert status["nav_backend"] == "builtin"
 
