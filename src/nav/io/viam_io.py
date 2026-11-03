@@ -6,7 +6,6 @@ import asyncio
 import base64
 import concurrent.futures
 import math
-import struct
 import time
 from typing import Callable, Mapping, Optional, Sequence, Set
 
@@ -77,8 +76,12 @@ def map_dict_to_get_grid(map_data: dict) -> dict:
     """Encode a bridge-style map dict as a ``get_grid`` DoCommand payload."""
     grid = np.asarray(map_data["grid"], dtype=np.int16)
     rows, cols = int(grid.shape[0]), int(grid.shape[1])
-    flat = np.clip(grid.reshape(-1), -1, 100).astype(np.int8)
-    raw = struct.pack(f"{flat.size}b", *flat.tolist())
+    # int8 little/big endian are identical, so the raw buffer is the packed
+    # signed-byte stream (the old ``struct.pack(*tolist())`` built a Python
+    # int per cell).
+    raw = np.ascontiguousarray(
+        np.clip(grid.reshape(-1), -1, 100).astype(np.int8)
+    ).tobytes()
     return {
         "rows": rows,
         "cols": cols,

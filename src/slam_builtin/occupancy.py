@@ -73,18 +73,31 @@ def from_occupancy_int16(
     )
 
 
+# Log-odds equivalents of the probability thresholds. The sigmoid is
+# monotonic, so comparing log-odds against these picks the same cells as
+# comparing probabilities, without an ``exp`` over the whole grid.
+_OCC_THRESH_LO = _prob_to_logodds(OCC_THRESH)
+_FREE_THRESH_LO = _prob_to_logodds(FREE_THRESH)
+
+
 def to_occupancy_int16(grid: LogOddsGrid) -> np.ndarray:
-    """Convert log-odds to ROS OccupancyGrid values (-1 unknown, 0 free, 100 occ)."""
+    """Convert log-odds to ROS OccupancyGrid values (-1 unknown, 0 free, 100 occ).
+
+    Called for every ``get_map`` and every scan-match cache rebuild, so the
+    full-grid work is three comparisons; only the (small) mid-probability band
+    pays for the sigmoid.
+    """
     lo = grid.log_odds
     out = np.full(lo.shape, -1, dtype=np.int16)
-    # Treat near-zero as unknown until observed.
-    observed = np.abs(lo) > 0.05
-    p = 1.0 / (1.0 + np.exp(-lo))
-    out[observed & (p > OCC_THRESH)] = 100
-    out[observed & (p < FREE_THRESH)] = 0
+    # Treat near-zero as unknown until observed (both thresholds sit well
+    # outside the +-0.05 unobserved band).
+    out[lo > _OCC_THRESH_LO] = 100
+    out[lo < _FREE_THRESH_LO] = 0
     # Mid-probability observed cells -> free-ish for nav (costmap treats >0 as occupied)
-    mid = observed & (p >= FREE_THRESH) & (p <= OCC_THRESH)
-    out[mid] = np.clip((p[mid] * 100.0).astype(np.int16), 1, 99)
+    mid = (np.abs(lo) > 0.05) & (lo >= _FREE_THRESH_LO) & (lo <= _OCC_THRESH_LO)
+    if mid.any():
+        p = 1.0 / (1.0 + np.exp(-lo[mid]))
+        out[mid] = np.clip((p * 100.0).astype(np.int16), 1, 99)
     return out
 
 

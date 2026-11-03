@@ -31,6 +31,32 @@ def occupancy_map_from_int16(
     )
 
 
+# Endpoints within this many cells of a wall count as hits.
+_INFLATE_CELLS = 2
+
+
+def occupied_lookup(
+    occ_map: OccupancyMap, inflate_cells: int = _INFLATE_CELLS
+) -> np.ndarray:
+    """Dilated wall mask every matcher here scores against.
+
+    A full-grid dilation per call was the single largest cost of the SLAM tick
+    (``scan_map_fit`` runs on every scan, ``refine_pose`` on every match). The
+    engine computes this once per occupancy-cache epoch and passes it in.
+    """
+    return _inflate_occupied(occ_map.grid >= 50, int(inflate_cells))
+
+
+def _lookup_or_build(
+    occ_map: OccupancyMap,
+    lookup: Optional[np.ndarray],
+    inflate_cells: int = _INFLATE_CELLS,
+) -> np.ndarray:
+    if lookup is not None and lookup.shape == occ_map.grid.shape:
+        return lookup
+    return occupied_lookup(occ_map, inflate_cells)
+
+
 def score_pose(
     occ_map: OccupancyMap,
     scan_xy: np.ndarray,
@@ -184,11 +210,13 @@ def scan_map_fit(
     pose: conv.Pose2D,
     *,
     min_score: float = 0.5,
+    occupied_lookup: Optional[np.ndarray] = None,
 ) -> str:
     """``open`` when the map cannot judge ``pose``, else ``fit`` or ``miss``.
 
     Unknown cells do not count. A heading that drops returns into empty space
     the map already knows is a miss, even if part of the scan is new ground.
+    ``occupied_lookup`` is the cached ``occupied_lookup(occ_map)``.
     """
     scan_xy = scan_endpoints_base_link(scan)
     if scan_xy.shape[0] < 20:
@@ -207,7 +235,7 @@ def scan_map_fit(
         return "open"
     rows_c = np.clip(rows, 0, height - 1)
     cols_c = np.clip(cols, 0, width - 1)
-    lookup = _inflate_occupied(grid >= 50, 2)
+    lookup = _lookup_or_build(occ_map, occupied_lookup)
     hits = lookup[rows_c, cols_c] & inside
     free = (grid[rows_c, cols_c] >= 0) & (grid[rows_c, cols_c] < 50) & inside
     known = hits | free
@@ -224,7 +252,11 @@ def scan_map_fit(
 
 
 def score_at_pose(
-    occ_map: OccupancyMap, scan: conv.LaserScan2D, pose: conv.Pose2D
+    occ_map: OccupancyMap,
+    scan: conv.LaserScan2D,
+    pose: conv.Pose2D,
+    *,
+    occupied_lookup: Optional[np.ndarray] = None,
 ) -> float:
     """How well ``scan`` lands on ``occ_map`` at ``pose``.
 
@@ -238,8 +270,7 @@ def score_at_pose(
     if scan_xy.shape[0] > 120:
         pick = np.linspace(0, scan_xy.shape[0] - 1, 120, dtype=np.int32)
         scan_xy = scan_xy[pick]
-    occupied = occ_map.grid >= 50
-    lookup = _inflate_occupied(occupied, 2)
+    lookup = _lookup_or_build(occ_map, occupied_lookup)
     return float(
         _candidate_scores(
             occ_map,
@@ -259,6 +290,7 @@ def search_heading(
     *,
     yaw_step_deg: float = 4.0,
     min_score: float = 0.5,
+    occupied_lookup: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[conv.Pose2D], float]:
     """Best heading at ``pose``'s position. XY stays put.
 
@@ -271,8 +303,7 @@ def search_heading(
     if scan_xy.shape[0] > 120:
         pick = np.linspace(0, scan_xy.shape[0] - 1, 120, dtype=np.int32)
         scan_xy = scan_xy[pick]
-    occupied = occ_map.grid >= 50
-    lookup = _inflate_occupied(occupied, 2)
+    lookup = _lookup_or_build(occ_map, occupied_lookup)
     _wheel_score, wheel_cov = _prior_score_and_coverage(
         occ_map, scan_xy, pose, occupied_lookup=lookup
     )
@@ -312,7 +343,10 @@ def search_heading(
     # Keep a heading whose overlap sits on the walls.
     if (
         best_score < min_score
-        and scan_map_fit(occ_map, scan, chosen, min_score=min_score) != "fit"
+        and scan_map_fit(
+            occ_map, scan, chosen, min_score=min_score, occupied_lookup=lookup
+        )
+        != "fit"
     ):
         return None, best_score
     return chosen, best_score
@@ -395,8 +429,9 @@ def refine_yaw(
     *,
     yaw_half_deg: float = 24.0,
     yaw_step_deg: float = 2.0,
-    inflate_cells: int = 2,
+    inflate_cells: int = _INFLATE_CELLS,
     max_scan_points: int = 120,
+    occupied_lookup: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[float], float, float, float]:
     """Heading that best explains ``scan`` with XY held at ``prior``.
 
@@ -412,8 +447,7 @@ def refine_yaw(
     if max_scan_points > 0 and scan_xy.shape[0] > max_scan_points:
         pick = np.linspace(0, scan_xy.shape[0] - 1, max_scan_points, dtype=np.int32)
         scan_xy = scan_xy[pick]
-    occupied = occ_map.grid >= 50
-    lookup = _inflate_occupied(occupied, inflate_cells)
+    lookup = _lookup_or_build(occ_map, occupied_lookup, inflate_cells)
     cx = np.array([prior.x])
     cy = np.array([prior.y])
     prior_score, prior_cov = _prior_score_and_coverage(
@@ -473,9 +507,10 @@ def refine_pose(
     wide_xy_step_m: float = 0.10,
     wide_yaw_half_deg: float = 24.0,
     wide_yaw_step_deg: float = 4.0,
-    inflate_cells: int = 2,
+    inflate_cells: int = _INFLATE_CELLS,
     min_score: float = 0.08,
     max_scan_points: int = 120,
+    occupied_lookup: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[conv.Pose2D], float, float, float]:
     """Search around ``prior`` for the pose that explains ``scan``.
 
@@ -496,8 +531,7 @@ def refine_pose(
         pick = np.linspace(0, scan_xy.shape[0] - 1, max_scan_points, dtype=np.int32)
         scan_xy = scan_xy[pick]
 
-    occupied = occ_map.grid >= 50
-    lookup = _inflate_occupied(occupied, inflate_cells)
+    lookup = _lookup_or_build(occ_map, occupied_lookup, inflate_cells)
     prior_score, prior_cov = _prior_score_and_coverage(
         occ_map, scan_xy, prior, occupied_lookup=lookup
     )

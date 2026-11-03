@@ -151,6 +151,9 @@ class BuiltinSlamEngine:
         self._occ_cache_epoch = -1
         self._match_epoch = 0
         self._occ_cache_known = 0.0
+        # Dilated wall mask for ``_occ_cache``; built once per epoch instead
+        # of once per scan_match call (each was a full-grid dilation).
+        self._occ_cache_lookup: Optional[np.ndarray] = None
         # Localizing mode: do not odom-track from (0,0) until a full-map seed
         # succeeds. Without this the robot "assumes start" until the async
         # startup global_localize task eventually fires.
@@ -969,6 +972,7 @@ class BuiltinSlamEngine:
     def _invalidate_occ_cache(self) -> None:
         self._match_epoch += 1
         self._occ_cache = None
+        self._occ_cache_lookup = None
         self._occ_cache_epoch = -1
 
     def _occupancy_for_match(self) -> OccupancyMap:
@@ -988,15 +992,24 @@ class BuiltinSlamEngine:
             origin_x=grid.origin_x,
             origin_y=grid.origin_y,
         )
+        lookup = scan_match.occupied_lookup(occ_map)
         known = float(np.mean(int16 >= 0))
         with self._lock:
             if self._grid is grid and self._match_epoch == epoch:
                 self._occ_cache = occ_map
+                self._occ_cache_lookup = lookup
                 self._occ_cache_epoch = epoch
                 self._occ_cache_known = known
             elif self._occ_cache is None:
                 self._occ_cache_known = known
         return occ_map
+
+    def _occupied_lookup_for(self, occ_map: OccupancyMap) -> Optional[np.ndarray]:
+        """Cached wall mask for ``occ_map`` when it is the current cache entry."""
+        with self._lock:
+            if occ_map is self._occ_cache:
+                return self._occ_cache_lookup
+        return None
 
     # -- queries -------------------------------------------------------------
     def get_pose(self) -> conv.Pose2D:
@@ -1293,7 +1306,10 @@ class BuiltinSlamEngine:
         # blocked every get_pose/get_map (nav planning + pose reads stalled).
         if run_match:
             matched, score, prior_score, rival_score = scan_match.refine_pose(
-                occ_map, scan, scan_pose
+                occ_map,
+                scan,
+                scan_pose,
+                occupied_lookup=self._occupied_lookup_for(occ_map),
             )
             if matched is not None and capture_motion is not None:
                 matched = conv.compose_poses(matched, capture_motion)
@@ -1523,7 +1539,10 @@ class BuiltinSlamEngine:
 
         if run_match:
             matched, score, prior_score, rival_score = scan_match.refine_pose(
-                occ_map, scan, pose
+                occ_map,
+                scan,
+                pose,
+                occupied_lookup=self._occupied_lookup_for(occ_map),
             )
             with self._lock:
                 self._last_match_at = now
@@ -1678,7 +1697,11 @@ class BuiltinSlamEngine:
         except Exception:  # noqa: BLE001
             return "open"
         return scan_match.scan_map_fit(
-            occ_map, scan, pose, min_score=_MAP_INSERT_MIN_SCORE
+            occ_map,
+            scan,
+            pose,
+            min_score=_MAP_INSERT_MIN_SCORE,
+            occupied_lookup=self._occupied_lookup_for(occ_map),
         )
 
     def _scan_fits_map(self, scan: conv.LaserScan2D, pose: conv.Pose2D) -> bool:
@@ -1712,7 +1735,11 @@ class BuiltinSlamEngine:
             found, found_score = (None, float("-inf"))
             if occ_map is not None:
                 found, found_score = scan_match.search_heading(
-                    occ_map, scan, pose, min_score=_MAP_INSERT_MIN_SCORE
+                    occ_map,
+                    scan,
+                    pose,
+                    min_score=_MAP_INSERT_MIN_SCORE,
+                    occupied_lookup=self._occupied_lookup_for(occ_map),
                 )
             if found is None:
                 self._insert_skips_unmatched += len(held)
@@ -2009,7 +2036,12 @@ class BuiltinSlamEngine:
     ) -> Optional[tuple]:
         """``(dyaw, best, prior, rival)`` from a heading search at the scan pose."""
         try:
-            yaw, best, prior, rival = scan_match.refine_yaw(occ_map, scan, scan_pose)
+            yaw, best, prior, rival = scan_match.refine_yaw(
+                occ_map,
+                scan,
+                scan_pose,
+                occupied_lookup=self._occupied_lookup_for(occ_map),
+            )
         except Exception:  # noqa: BLE001 - diagnostics only; never stall the tick
             return None
         if yaw is None:

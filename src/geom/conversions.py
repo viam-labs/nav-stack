@@ -947,10 +947,10 @@ def points_to_scan(
     ang = ang[valid]
     bins = ((ang - angle_min) / angle_increment).astype(int)
     bins = np.clip(bins, 0, num_bins - 1)
-    # Keep the minimum range per bin.
-    for b, rng in zip(bins, r):
-        if rng < ranges[b]:
-            ranges[b] = rng
+    # Keep the minimum range per bin. Runs for every lidar frame on both the
+    # SLAM and nav ingest paths; the unbuffered ufunc replaces a per-point
+    # Python loop.
+    np.minimum.at(ranges, bins, r)
     return LaserScan2D(ranges, angle_min, angle_increment, range_min, range_max)
 
 
