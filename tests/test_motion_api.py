@@ -427,6 +427,35 @@ def test_navigate_route_async_exposes_status(monkeypatch):
 
     monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
 
+    # The route task reaches the manager through asyncio.to_thread, so each
+    # step needs real time on a busy runner; a fixed number of loop turns is
+    # not enough.
+    async def _wait_for(check, what):
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            if await check():
+                return
+            await _real_sleep(0.01)
+        raise AssertionError(f"timed out waiting for {what}")
+
+    async def _route_active():
+        status = await nav.do_command({"command": "get_status"})
+        return (
+            status.get("motion") == "route"
+            and status.get("route", {}).get("state") == "active"
+        )
+
+    async def _second_leg_active():
+        return (
+            mgr.navigate.call_count >= 2
+            and held["x"] == 3.0
+            and bool(queue)
+            and queue[0]["state"] == "active"
+        )
+
+    async def _route_succeeded():
+        return nav._route_status.get("state") == "succeeded"
+
     async def _run():
         started = await nav.do_command(
             {
@@ -437,31 +466,16 @@ def test_navigate_route_async_exposes_status(monkeypatch):
         )
         assert started["status"] == "navigating"
         assert started["motion"] == "route"
-        # Let the route task issue the first navigate + status poll.
-        for _ in range(20):
-            await _real_sleep(0)
-            status = await nav.do_command({"command": "get_status"})
-            if (
-                status.get("motion") == "route"
-                and status.get("route", {}).get("state") == "active"
-            ):
-                assert status["active"] is True
-                assert status["route"]["location"] == "dock"
-                break
-        else:
-            raise AssertionError("route never became active")
+        await _wait_for(_route_active, "the route to become active")
+        status = await nav.do_command({"command": "get_status"})
+        assert status["active"] is True
+        assert status["route"]["location"] == "dock"
         release()
-        # Finish first leg; second leg will hold active again via on_navigate.
-        for _ in range(50):
-            await _real_sleep(0)
-            if mgr.navigate.call_count >= 2:
-                break
+        # Releasing before on_navigate has queued the second leg would be
+        # overwritten by it, leaving that leg active forever.
+        await _wait_for(_second_leg_active, "the second leg to become active")
         release()
-        for _ in range(50):
-            await _real_sleep(0)
-            if nav._route_status.get("state") == "succeeded":
-                break
-        assert nav._route_status["state"] == "succeeded"
+        await _wait_for(_route_succeeded, "the route to succeed")
 
     asyncio.run(_run())
 
