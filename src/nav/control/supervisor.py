@@ -13,6 +13,7 @@ import numpy as np
 from ...config import NavConfig
 from ...geom import conversions as conv
 from ..io.world_io import WorldIO
+from ..localize.loc_state import LOC_LOST, describe_state
 from ..motion.base_envelope import LIN_EPS_MPS, lift_sub_deadband
 from ..motion.simple_motion import (
     DriveCommand,
@@ -159,6 +160,9 @@ class NavSupervisor:
         self._loc_probe_severe = False
         self._loc_probe_calm = False
         self._loc_verdict = None
+        # Monotonic time SLAM first reported ``lost`` during this goal.
+        self._loc_lost_since: Optional[float] = None
+        self._loc_lost_next_search = 0.0
         self._world = world
 
         nose_offset = cfg.nose_offset_m()
@@ -507,6 +511,10 @@ class NavSupervisor:
     @property
     def _nav_loc_refine_settle_s(self) -> float:
         return self._cfg.builtin.nav_loc_refine_settle_s
+
+    @property
+    def _nav_loc_lost_fail_s(self) -> float:
+        return self._cfg.builtin.nav_loc_lost_fail_s
 
     @property
     def cancel_event(self) -> threading.Event:
@@ -1046,6 +1054,76 @@ class NavSupervisor:
             return False
 
     def _maybe_pause_and_refine_localization(
+        self, pose: Pose2D, now: float, dist_goal: float
+    ) -> Optional[str]:
+        """Loc check for one tick: ``None`` / ``hold`` / ``resume`` / ``continue`` / ``fail``."""
+        if not self._nav_loc_refine:
+            return None
+        lost = self._slam_lost_state()
+        if lost is not None:
+            return self._hold_while_lost(lost, pose, now, dist_goal)
+        outcome = self._refine_on_disagreement(pose, now, dist_goal)
+        if self._loc_lost_since is not None:
+            # Whatever placed the robot again also moved the pose: replan.
+            self._loc_lost_since = None
+            if outcome != "hold":
+                outcome = "resume"
+        return outcome
+
+    def _slam_lost_state(self) -> Optional[dict]:
+        """SLAM's ``localization_state`` snapshot while it reports ``lost``."""
+        if self._slam_is_mapping():
+            return None
+        getter = getattr(self._world, "get_localization_check", None)
+        if not callable(getter):
+            return None
+        try:
+            check = getter()
+        except Exception:  # noqa: BLE001 - a status read must not stop the tick
+            return None
+        state = check.get("state") if isinstance(check, dict) else None
+        if isinstance(state, dict) and state.get("state") == LOC_LOST:
+            return state
+        return None
+
+    # Between stopped searches while lost; each search is a widened local match.
+    _LOC_LOST_SEARCH_PERIOD_S = 2.0
+
+    def _hold_while_lost(
+        self, state: dict, pose: Pose2D, now: float, dist_goal: float
+    ) -> str:
+        """Stop and search while SLAM reports ``lost``; fail if it stays lost.
+
+        An unfixed scan/map residual alone keeps driving (hallways often read
+        wrong). ``lost`` means the watchdog failed cycle after cycle; driving
+        on that pose ends with the map placing the robot inside a wall.
+        """
+        if self._loc_lost_since is None:
+            self._loc_lost_since = now
+            self._loc_lost_next_search = now
+            self._world.stop()
+            self._note_base_stopped()
+        self._loc_refine_force_stop = True
+        if self._loc_phase != "idle":
+            # Finish the running match; a good recovery match is applied there.
+            self._refine_on_disagreement(pose, now, dist_goal)
+        elif now >= self._loc_lost_next_search:
+            self._loc_lost_next_search = now + self._LOC_LOST_SEARCH_PERIOD_S
+            self._launch_loc_check("recovery", stopped_recovery=True)
+        if now - self._loc_lost_since >= self._nav_loc_lost_fail_s:
+            self._world.stop()
+            self._note_base_stopped()
+            text = describe_state(state) or "lost"
+            self._set_status(
+                state="failed",
+                active=False,
+                error_msg=f"localization lost: {text}",
+            )
+            return "fail"
+        self._publish_loc_refine_progress(pose, dist_goal, verdict=None, status="lost")
+        return "hold"
+
+    def _refine_on_disagreement(
         self, pose: Pose2D, now: float, dist_goal: float
     ) -> Optional[str]:
         """Local refine when the scan is a poor fit for the published pose.
@@ -2116,6 +2194,7 @@ class NavSupervisor:
         self._loc_job_gen += 1
         self._loc_phase = "idle"
         self._loc_refine_force_stop = False
+        self._loc_lost_since = None
         goal_dict = {"x": float(goal.x), "y": float(goal.y), "theta": float(goal.theta)}
         self._set_status(
             state="active",

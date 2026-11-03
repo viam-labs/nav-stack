@@ -189,6 +189,7 @@ class BuiltinSlamEngine:
         # Background map repair (save_map / repair_map DoCommand).
         self._repair_lock = threading.Lock()
         self._repair_thread: Optional[threading.Thread] = None
+        self._repair_map_dir: Optional[Path] = None
         self._repair_cancel = threading.Event()
         self._repair_status: dict = {"state": "idle"}
         # Live-pose correction of the last applied repair (undo_repair).
@@ -321,7 +322,7 @@ class BuiltinSlamEngine:
         self._loop_thread = None
 
     def configure_mode(self, mode: str, map_dir: Optional[Path] = None) -> None:
-        self._repair_cancel.set()
+        self._finish_or_cancel_repair(map_dir)
         with self._lock:
             self._mode = mode
             self._pose_restored_from_disk = False
@@ -601,6 +602,9 @@ class BuiltinSlamEngine:
             session_gap_m=self._loop_params.min_travel_gap_m,
         )
         self._graph_frozen = len(saved.nodes)
+        # Render base only (map under the oldest keyframes, often None).
+        # _session_baseline stays the loaded image: health and trust score
+        # the map this session resumed on.
         self._graph_base = saved.base
         self._grid_edits = list(saved.edits)
         self._grid_edits_saved = len(self._grid_edits)
@@ -1371,11 +1375,43 @@ class BuiltinSlamEngine:
                 daemon=True,
             )
             self._repair_thread = thread
+            self._repair_map_dir = Path(map_dir) if map_dir is not None else None
             thread.start()
         return {"status": "started"}
 
     def repair_status(self) -> dict:
         return dict(self._repair_status)
+
+    def _finish_or_cancel_repair(self, map_dir: Optional[Path]) -> None:
+        """Before a mode switch: let a running repair of the map being loaded land.
+
+        Reloading that map mid-repair would drop the repair and load the torn
+        files. Any other switch (another map, a fresh session) cancels it.
+        """
+        thread = self._repair_thread
+        if thread is None or not thread.is_alive():
+            return
+        if thread is threading.current_thread():
+            return
+        target = self._repair_map_dir
+        wait_s = float(getattr(self._cfg, "builtin_repair_switch_wait_s", 120.0))
+        same_map = (
+            map_dir is not None
+            and target is not None
+            and Path(map_dir).resolve() == target.resolve()
+        )
+        if same_map and wait_s > 0.0:
+            self._log(
+                f"waiting up to {wait_s:.0f} s for map repair to finish "
+                f"before reloading {target.name}"
+            )
+            thread.join(wait_s)
+            if not thread.is_alive():
+                # The repair moved the live pose with the map; reload from it.
+                self._persist_pose(force=True)
+                return
+            self._log("map repair still running; cancelling it for the switch")
+        self._repair_cancel.set()
 
     def _repair_job(self, map_dir: Optional[Path], apply, reason: str) -> None:
         try:

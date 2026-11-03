@@ -1564,10 +1564,14 @@ class _FakeWorld:
         self.scan_calls = []
         self.loc_checks = 0
         self.on_loc_check = None
+        self.loc_check = None
         self._slam_mode = None
 
     def slam_mode(self):
         return self._slam_mode
+
+    def get_localization_check(self):
+        return self.loc_check
 
     def get_map(self):
         return self.map_data
@@ -2507,7 +2511,7 @@ def _settle_loc_refine(sup, pose, now, dist, rounds=8):
     return out
 
 
-def _loc_refine_supervisor(world: _FakeWorld) -> NavSupervisor:
+def _loc_refine_supervisor(world: _FakeWorld, **extra) -> NavSupervisor:
     return NavSupervisor(
         world,
         inflation_radius_m=0.15,
@@ -2523,6 +2527,7 @@ def _loc_refine_supervisor(world: _FakeWorld) -> NavSupervisor:
         nav_loc_refine_period_s=0.0,
         nav_loc_refine_cooldown_s=0.0,
         nav_loc_refine_max_tries=2,
+        **extra,
     )
 
 
@@ -3032,6 +3037,78 @@ def test_nav_loc_refine_applies_small_improving_match():
     assert True in applies
     assert sup.status().state == "succeeded"
     assert sup.status().error_msg == ""
+
+
+def _lost_check(since_s: float = 12.0) -> dict:
+    return {
+        "status": "ambiguous",
+        "state": {
+            "state": "lost",
+            "reason": "ambiguous",
+            "since_s": since_s,
+            "last_attempt": {"status": "ambiguous", "score": 0.13},
+            "suggested_action": "set an initial pose near the robot",
+        },
+    }
+
+
+def test_nav_stops_and_searches_while_slam_is_lost_then_resumes():
+    from src.nav.control.loc_consistency import LocDisagreement
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    world.loc_check = _lost_check()
+    recoveries = []
+
+    def _check(w: _FakeWorld, **kw):
+        recoveries.append(kw.get("stopped_recovery"))
+        w.pose = Pose2D(1.5, 1.2, 0.3)
+        w.loc_check = {"status": "corrected", "state": {"state": "tracking"}}
+        return {"status": "corrected", "corrected": True, "good_match": True}
+
+    world.on_loc_check = _check
+    sup = _loc_refine_supervisor(world)
+    sup._measure_loc_disagreement = lambda _p: LocDisagreement(disagree=False)  # noqa: SLF001
+    first = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
+    )
+    assert first == "hold"
+    assert world.stop_calls == 1
+    assert sup.status().progress["localization_refine"]["status"] == "lost"
+    out = _settle_loc_refine(sup, Pose2D(1.0, 1.0, 0.0), 1000.1, 4.0)
+    assert out == "resume"
+    assert recoveries == [True]
+
+
+def test_nav_fails_the_goal_when_slam_stays_lost():
+    from src.nav.control.loc_consistency import LocDisagreement
+
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    world.loc_check = _lost_check()
+    world.on_loc_check = lambda _w, **_kw: {"status": "ambiguous", "corrected": False}
+    sup = _loc_refine_supervisor(world, nav_loc_lost_fail_s=5.0)
+    sup._measure_loc_disagreement = lambda _p: LocDisagreement(disagree=False)  # noqa: SLF001
+    pose = Pose2D(1.0, 1.0, 0.0)
+    assert _settle_loc_refine(sup, pose, 1000.0, 4.0) == "hold"
+    assert _settle_loc_refine(sup, pose, 1002.5, 4.0) == "hold"
+    assert world.loc_checks == 2
+    assert sup._maybe_pause_and_refine_localization(pose, 1005.0, 4.0) == "fail"  # noqa: SLF001
+    st = sup.status()
+    assert st.state == "failed"
+    assert st.error_msg.startswith("localization lost: lost for 12 s")
+    assert "set an initial pose" in st.error_msg
+
+
+def test_nav_ignores_lost_while_mapping():
+    world = _FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map(size=80))
+    world.loc_check = _lost_check()
+    world._slam_mode = "mapping"  # noqa: SLF001
+    sup = _loc_refine_supervisor(world)
+    out = sup._maybe_pause_and_refine_localization(  # noqa: SLF001
+        Pose2D(1.0, 1.0, 0.0), 1000.0, 4.0
+    )
+    assert out is None
+    assert world.stop_calls == 0
+    assert world.loc_checks == 0
 
 
 def test_unreachable_start_refines_once_and_replans_same_corridor():
