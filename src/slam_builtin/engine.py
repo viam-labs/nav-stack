@@ -197,6 +197,14 @@ class BuiltinSlamEngine:
             "last": None,
             "last_optimize_ms": None,
             "last_render_ms": None,
+            # Mapping-revisit corrections (apply_map_pose_correction).
+            "revisit": {
+                "attempts": 0,
+                "corrections": 0,
+                "rejected": 0,
+                "reasons": {},
+                "last": None,
+            },
         }
         self._keyframe_hook = None
         # Optional: SlamService wires this into LocalizationStateTracker so a
@@ -532,16 +540,60 @@ class BuiltinSlamEngine:
     # Corrections up to this yaw are spread along the loop by the pose graph;
     # bigger ones (yaw flip, far relocalize) shift the trailing path rigidly.
     _GRAPH_CORRECTION_MAX_DEG = 30.0
+    # Revisit edge uncertainty at a perfect match; it grows with a weaker
+    # score (``_revisit_edge_sigmas``). The old fixed 5 cm / 1 deg made every
+    # revisit a near-rigid constraint the optimizer could not argue with.
     _REVISIT_EDGE_SIGMA_M = 0.05
     _REVISIT_EDGE_SIGMA_DEG = 1.0
+    _REVISIT_EDGE_SIGMA_M_SPAN = 0.30
+    _REVISIT_EDGE_SIGMA_DEG_SPAN = 6.0
+    # Revisit callers that do not report a score are treated as this good.
+    _REVISIT_DEFAULT_SCORE = 0.7
     # A new loop edge still this far off after optimizing disagrees with the
     # rest of the graph (likely a false match) and is dropped.
     _LOOP_MAX_CHI2 = 25.0
     _LOOP_REBUILD_MIN_M = 0.08
     _LOOP_REBUILD_MIN_DEG = 1.0
 
-    def apply_map_pose_correction(self, matched_pose: conv.Pose2D) -> dict:
-        """Correct pose drift during mapping; re-render the grid from the graph."""
+    @classmethod
+    def _revisit_edge_sigmas(cls, score: Optional[float]) -> tuple[float, float]:
+        """``(sigma_m, sigma_rad)`` for a revisit edge from its match score."""
+        s = cls._REVISIT_DEFAULT_SCORE if score is None else float(score)
+        if not math.isfinite(s):
+            s = cls._REVISIT_DEFAULT_SCORE
+        weak = 1.0 - max(0.0, min(1.0, s))
+        return (
+            cls._REVISIT_EDGE_SIGMA_M + cls._REVISIT_EDGE_SIGMA_M_SPAN * weak,
+            math.radians(
+                cls._REVISIT_EDGE_SIGMA_DEG + cls._REVISIT_EDGE_SIGMA_DEG_SPAN * weak
+            ),
+        )
+
+    def _note_revisit(self, status: str, detail: dict) -> None:
+        stats = self._loop_stats["revisit"]
+        stats["attempts"] += 1
+        if status in ("rebuilt", "pose_only"):
+            stats["corrections"] += 1
+        elif status.startswith("rejected"):
+            stats["rejected"] += 1
+        stats["reasons"][status] = stats["reasons"].get(status, 0) + 1
+        stats["last"] = {"at": time.time(), "status": status, **detail}
+
+    def apply_map_pose_correction(
+        self,
+        matched_pose: conv.Pose2D,
+        *,
+        score: Optional[float] = None,
+        force: bool = False,
+    ) -> dict:
+        """Correct pose drift during mapping; re-render the grid from the graph.
+
+        ``score`` is the revisit match quality (0..1); a weaker match becomes
+        a softer graph edge. The edge then has to agree with the rest of the
+        graph after optimizing (``_LOOP_MAX_CHI2``) or it is dropped and the
+        pose is left alone. ``force`` is for explicit operator commands (yaw
+        flip): the correction is applied rigidly without those checks.
+        """
         cfg = self._cfg
         with self._lock:
             current = self._pose
@@ -569,7 +621,16 @@ class BuiltinSlamEngine:
             "shift_deg": round(shift_deg, 2),
             "slam_backend": "builtin",
         }
+        sigma_m, sigma_rad = self._revisit_edge_sigmas(score)
+        detail = {
+            "shift_m": round(shift_m, 3),
+            "shift_deg": round(shift_deg, 2),
+            "score": None if score is None else round(float(score), 3),
+            "sigma_m": round(sigma_m, 3),
+            "sigma_deg": round(math.degrees(sigma_rad), 2),
+        }
         if not should_rebuild:
+            self._note_revisit("pose_only", detail)
             self._notify_pose_listeners(matched_pose)
             self._persist_pose(force=True)
             return out
@@ -590,34 +651,83 @@ class BuiltinSlamEngine:
                     shift_m <= float(cfg.mapping_revisit_max_shift_m)
                     and shift_deg <= self._GRAPH_CORRECTION_MAX_DEG
                 )
-                if plausible and anchor is not None and anchor < cur:
-                    self._graph.add_edge(
-                        pg.GraphEdge(
-                            anchor,
-                            cur,
-                            conv.compose_poses(
-                                conv.invert_pose(self._graph.nodes[anchor].pose), target
-                            ),
-                            pg.info_from_sigmas(
-                                self._REVISIT_EDGE_SIGMA_M,
-                                math.radians(self._REVISIT_EDGE_SIGMA_DEG),
-                            ),
-                            loop=True,
-                        )
+                if anchor is not None and anchor < cur:
+                    # Same bar as the loop detector: drift since the anchor
+                    # cannot exceed a fraction of the path driven since then.
+                    gap_m = (
+                        self._graph.nodes[cur].travel_m
+                        - self._graph.nodes[anchor].travel_m
                     )
-                    method, first_free, live = "pose_graph", anchor + 1, None
-                else:
+                    allowed_m = max(0.3, self._loop_params.drift_fraction * gap_m)
+                    detail["gap_m"] = round(gap_m, 2)
+                    detail["allowed_m"] = round(allowed_m, 2)
+                    plausible = plausible and shift_m <= allowed_m
+                new_edges = None
+                if force:
+                    # Operator command (yaw flip): move the trailing path as one.
                     start = anchor + 1 if anchor is not None else 0
                     self._graph.apply_world_correction_from(start, corr)
                     method, first_free, live = "rigid", None, corr
-            result = self._optimize_and_render(first_free, live_correction=live)
+                elif not plausible:
+                    # A revisit this far off is a yaw flip or a wrong wall. The
+                    # old rigid tail shift here is what slid a whole stretch of
+                    # map sideways on a false match.
+                    method, first_free, live = "rejected_implausible", None, None
+                elif anchor is not None and anchor < cur:
+                    edge = pg.GraphEdge(
+                        anchor,
+                        cur,
+                        conv.compose_poses(
+                            conv.invert_pose(self._graph.nodes[anchor].pose), target
+                        ),
+                        pg.info_from_sigmas(sigma_m, sigma_rad),
+                        loop=True,
+                    )
+                    self._graph.add_edge(edge)
+                    new_edges = [edge]
+                    method, first_free, live = "pose_graph", anchor + 1, None
+                elif anchor is not None:
+                    # The nearest old geometry is the newest node itself: the
+                    # drift happened after it. Move the live pose, not the map.
+                    self._set_corrected_pose_locked(matched_pose)
+                    method, first_free, live = "pose_only", None, None
+                elif self._graph_base is not None:
+                    # Mapping resumed on a loaded map: the match is against
+                    # geometry no node of this session drew, so the whole
+                    # session moves together onto it.
+                    self._graph.apply_world_correction_from(0, corr)
+                    method, first_free, live = "rigid", None, corr
+                else:
+                    method, first_free, live = "rejected_no_anchor", None, None
+            if method == "pose_only":
+                result = {"status": "pose_only"}
+            elif method.startswith("rejected"):
+                result = {"status": method}
+            else:
+                result = self._optimize_and_render(
+                    first_free, new_edges=new_edges, live_correction=live
+                )
+        status = str(result.get("status"))
         out.update(result)
         out["method"] = method
         out["anchor"] = anchor
-        out["rebuilt"] = result.get("status") == "rebuilt"
+        out["rebuilt"] = status == "rebuilt"
+        # A rejected / aborted correction left the pose alone and the caller
+        # must not report it as applied.
+        out["applied"] = status in ("rebuilt", "pose_only")
+        detail.update(method=method, anchor=anchor)
+        if "loop_chi2" in result:
+            detail["loop_chi2"] = result["loop_chi2"]
+        self._note_revisit(status, detail)
+        if status == "pose_only":
+            self._notify_pose_listeners(matched_pose)
+            self._persist_pose(force=True)
         self._log(
             f"builtin SLAM revisit correction ({method}, anchor={anchor}): "
-            f"{result.get('status')} shift={shift_m:.2f} m {shift_deg:.1f} deg"
+            f"{status} shift={shift_m:.2f} m {shift_deg:.1f} deg "
+            f"score={'n/a' if score is None else f'{float(score):.2f}'} "
+            f"sigma={sigma_m:.2f} m {math.degrees(sigma_rad):.1f} deg "
+            f"chi2={result.get('loop_chi2', 'n/a')}"
         )
         return out
 
@@ -1036,6 +1146,14 @@ class BuiltinSlamEngine:
                     "last": self._loop_stats["last"],
                     "last_optimize_ms": self._loop_stats["last_optimize_ms"],
                     "last_render_ms": self._loop_stats["last_render_ms"],
+                    "revisit": {
+                        **{
+                            k: v
+                            for k, v in self._loop_stats["revisit"].items()
+                            if k != "reasons"
+                        },
+                        "reasons": dict(self._loop_stats["revisit"]["reasons"]),
+                    },
                 },
                 "lidar_odometry": {
                     "enabled": self._lidar_odom_enabled(),

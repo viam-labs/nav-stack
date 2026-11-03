@@ -1050,7 +1050,10 @@ def test_apply_map_pose_correction_rebuilds_grid():
 
     result = host.apply_map_pose_correction(conv.Pose2D(0.0, 0.0, 0.0))
     assert result["applied"] is True
-    assert result["rebuilt"] is True
+    # The only node is the newest one: the drift is after it, so the pose
+    # moves and the map (one keyframe) is left as drawn.
+    assert result["rebuilt"] is False
+    assert result["method"] == "pose_only"
     assert engine.get_pose().y == pytest.approx(0.0)
     with engine._lock:  # noqa: SLF001
         int16 = occ.to_occupancy_int16(engine._grid)  # noqa: SLF001
