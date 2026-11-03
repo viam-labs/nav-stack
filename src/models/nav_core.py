@@ -207,6 +207,10 @@ class NavServiceBase(NavigationApi, Navigation):
         # Builtin get_costmap cache (nav-stack-ui polls while Costmap is on).
         self._builtin_costmap_cache: Optional[dict] = None
         self._builtin_costmap_cache_at: float = 0.0
+        # (map generation, zone revision) the cache was built from. While the
+        # robot sits still the map generation only moves on heartbeat inserts,
+        # so UI polls reuse the costmap instead of re-inflating the full grid.
+        self._builtin_costmap_cache_key: Optional[tuple] = None
         # Idle local costmap (built on demand when UI asks for Local while not
         # navigating — the follower only refreshes local while a plan is active).
         self._idle_local_costmap = None
@@ -1225,6 +1229,29 @@ class NavServiceBase(NavigationApi, Navigation):
                 if mp is None or mp.get("grid") is None:
                     mp = snap.get("map")
                 if mp is not None and mp.get("grid") is not None:
+                    generation = mp.get("generation")
+                    zone_rev = 0
+                    rev_fn = (
+                        getattr(world, "zone_mask_revision", None) if world else None
+                    )
+                    if not callable(rev_fn):
+                        rev_fn = getattr(runtime.manager, "zone_mask_revision", None)
+                    if callable(rev_fn):
+                        try:
+                            zone_rev = int(rev_fn())
+                        except Exception:  # noqa: BLE001
+                            zone_rev = 0
+                    mapping = _world_is_mapping(world)
+                    key = (generation, zone_rev, mapping)
+                    if (
+                        cached is not None
+                        and generation is not None
+                        and key == self._builtin_costmap_cache_key
+                    ):
+                        # Same map + zones: the inflated costmap is unchanged.
+                        self._builtin_costmap_cache_at = now
+                        return cached, layer_used
+
                     from ..nav.planning.costmap import (
                         build_costmap,
                         costmap_viz_dict,
@@ -1260,11 +1287,12 @@ class NavServiceBase(NavigationApi, Navigation):
                         robot_radius_m=cfg.hard_clearance_radius_m(),
                         body_radius_m=cfg.inscribed_radius_m(),
                         cost_scaling_factor=float(cfg.builtin.cost_scaling_factor),
-                        mapping=_world_is_mapping(world),
+                        mapping=mapping,
                     )
                     cm = costmap_viz_dict(occ, costs)
                     self._builtin_costmap_cache = cm
                     self._builtin_costmap_cache_at = now
+                    self._builtin_costmap_cache_key = key
                     # Keep nav-camera / viz store in sync with the live map.
                     try:
                         if hasattr(view, "set_map"):
