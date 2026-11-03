@@ -119,7 +119,7 @@ def _ghost_fraction(grid, truth: np.ndarray) -> float:
     return float(1.0 - ok.mean())
 
 
-def _drive(loop_closure_on: bool):
+def _drive(loop_closure_on: bool, **extra):
     cfg = SlamConfig.from_dict(
         {
             "base": "b",
@@ -127,6 +127,7 @@ def _drive(loop_closure_on: bool):
             "maps_dir": "/tmp",
             "mode": "mapping",
             "builtin_loop_closure": loop_closure_on,
+            **extra,
         }
     )
     engine = BuiltinSlamEngine(cfg, _Sensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
@@ -285,6 +286,94 @@ def test_detect_rejects_when_no_old_geometry():
     )
     assert m is None
     assert reason == "no_candidates"
+
+
+# Let a sub-meter revisit shift go through the graph instead of pose-only.
+_REVISIT_CFG = {
+    "mapping_revisit_min_shift_m": 0.05,
+    "mapping_revisit_min_shift_deg": 1.0,
+}
+
+
+def test_revisit_correction_with_true_pose_fixes_drifted_loop():
+    """A mapping-revisit match at the true pose goes in as a scored graph edge
+    (not the old rigid 5 cm / 1 deg one) and un-doubles the walls."""
+    engine, ghosts_before, err_before, _ = _drive(False, **_REVISIT_CFG)
+    assert err_before > 0.4 and ghosts_before > 0.05
+    truth = _truth_world()
+    true_end = _path()[-1]
+    out = engine.apply_map_pose_correction(true_end, score=0.8)
+    assert out["applied"] is True
+    assert out["method"] == "pose_graph"
+    assert out["status"] == "rebuilt"
+    assert "loop_chi2" in out
+    end = engine.get_pose()
+    assert math.hypot(end.x - true_end.x, end.y - true_end.y) < 0.15
+    with engine._lock:  # noqa: SLF001
+        assert _ghost_fraction(engine._grid, truth) < 0.03  # noqa: SLF001
+    edge = engine._graph.edges[-1]  # noqa: SLF001
+    assert edge.loop
+    sigma_m, _ = engine._revisit_edge_sigmas(0.8)  # noqa: SLF001
+    assert edge.info[0, 0] == pytest.approx(1.0 / sigma_m**2)
+    revisit = engine.diagnostics()["loop_closure"]["revisit"]
+    assert revisit["corrections"] == 1
+    assert revisit["last"]["status"] == "rebuilt"
+
+
+def test_revisit_edge_softens_with_weaker_score():
+    weak_m, weak_rad = BuiltinSlamEngine._revisit_edge_sigmas(0.55)  # noqa: SLF001
+    strong_m, strong_rad = BuiltinSlamEngine._revisit_edge_sigmas(0.95)  # noqa: SLF001
+    default_m, _ = BuiltinSlamEngine._revisit_edge_sigmas(None)  # noqa: SLF001
+    assert weak_m > default_m > strong_m
+    assert weak_rad > strong_rad
+    assert strong_m == pytest.approx(0.05 + 0.30 * 0.05)
+    assert BuiltinSlamEngine._revisit_edge_sigmas(float("nan")) == (  # noqa: SLF001
+        BuiltinSlamEngine._revisit_edge_sigmas(None)  # noqa: SLF001
+    )
+
+
+def test_revisit_correction_far_off_is_rejected_not_shifted_rigidly():
+    """A match that would move the robot farther than the drift the path could
+    have accrued is a wrong wall; the graph and pose stay put."""
+    engine, _, _, _ = _drive(False, **_REVISIT_CFG)
+    before_pose = engine.get_pose()
+    with engine._lock:  # noqa: SLF001
+        before_nodes = [n.pose for n in engine._graph.nodes]  # noqa: SLF001
+        before_edges = len(engine._graph.edges)  # noqa: SLF001
+    bogus = conv.Pose2D(before_pose.x + 4.0, before_pose.y + 3.0, before_pose.theta)
+    out = engine.apply_map_pose_correction(bogus, score=0.7)
+    assert out["applied"] is False
+    assert out["rebuilt"] is False
+    assert out["method"] == "rejected_implausible"
+    assert out["status"] == "rejected_implausible"
+    assert engine.get_pose() == before_pose
+    with engine._lock:  # noqa: SLF001
+        assert [n.pose for n in engine._graph.nodes] == before_nodes  # noqa: SLF001
+        assert len(engine._graph.edges) == before_edges  # noqa: SLF001
+    revisit = engine.diagnostics()["loop_closure"]["revisit"]
+    assert revisit["rejected"] == 1
+    assert revisit["reasons"] == {"rejected_implausible": 1}
+
+
+def test_revisit_large_yaw_is_rejected_unless_forced():
+    """A 180 deg revisit answer is a corridor flip. Only the operator's flip
+    command applies it, and then rigidly."""
+    engine, _, _, _ = _drive(False, **_REVISIT_CFG)
+    before = engine.get_pose()
+    flipped = conv.Pose2D(
+        before.x, before.y, conv.normalize_angle(before.theta + math.pi)
+    )
+    out = engine.apply_map_pose_correction(flipped)
+    assert out["applied"] is False
+    assert out["method"] == "rejected_implausible"
+    assert engine.get_pose() == before
+
+    out = engine.apply_map_pose_correction(flipped, force=True)
+    assert out["applied"] is True
+    assert out["method"] == "rigid"
+    assert out["status"] == "rebuilt"
+    end = engine.get_pose()
+    assert abs(conv.normalize_angle(end.theta - flipped.theta)) < 1e-6
 
 
 def test_set_pose_jump_does_not_become_odometry():

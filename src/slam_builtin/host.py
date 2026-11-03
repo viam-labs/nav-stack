@@ -101,8 +101,14 @@ class BuiltinSlamHost:
     def pose_restored_from_disk(self) -> bool:
         return self._engine.pose_restored_from_disk()
 
-    def apply_map_pose_correction(self, pose: conv.Pose2D) -> Dict:
-        return self._engine.apply_map_pose_correction(pose)
+    def apply_map_pose_correction(
+        self,
+        pose: conv.Pose2D,
+        *,
+        score: Optional[float] = None,
+        force: bool = False,
+    ) -> Dict:
+        return self._engine.apply_map_pose_correction(pose, score=score, force=force)
 
     def set_still_keyframe_hook(self, hook) -> None:
         self._still_keyframe_hook = hook

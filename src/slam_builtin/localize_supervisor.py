@@ -7,6 +7,7 @@ Owns refine / recover / startup-global / mapping-revisit cycles. The Viam
 from __future__ import annotations
 
 import asyncio
+import functools
 import math
 import time
 from dataclasses import replace
@@ -51,7 +52,10 @@ class LocalizeSupervisor:
         flipped = conv.Pose2D(
             current.x, current.y, conv.normalize_angle(current.theta + math.pi)
         )
-        applied = await asyncio.to_thread(mgr.apply_map_pose_correction, flipped)
+        # Operator-requested: applied rigidly, bypassing the revisit gates.
+        applied = await asyncio.to_thread(
+            functools.partial(mgr.apply_map_pose_correction, force=True), flipped
+        )
         out: dict = {
             "status": "corrected" if applied.get("applied") else "correction_failed",
             "flip_yaw_only": True,
@@ -406,8 +410,11 @@ class LocalizeSupervisor:
                     score,
                 )
                 return self.host._publish_revisit_check(out)
+            # The match quality sizes the graph edge; a weak match may be
+            # overruled by the rest of the graph instead of bending it.
             applied = await asyncio.to_thread(
-                mgr.apply_map_pose_correction, result.pose
+                functools.partial(mgr.apply_map_pose_correction, score=score),
+                result.pose,
             )
             out["correction"] = applied
             if applied.get("applied"):
@@ -569,7 +576,9 @@ class LocalizeSupervisor:
             out["status"] = "correction_failed"
             out["reason"] = "no_apply"
             return out
-        applied = await asyncio.to_thread(apply, result.pose)
+        applied = await asyncio.to_thread(
+            functools.partial(apply, score=score), result.pose
+        )
         self.host._pose_jump_gate.clear()
         did = bool(isinstance(applied, Mapping) and applied.get("applied"))
         out["corrected"] = did
