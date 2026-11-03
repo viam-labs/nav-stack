@@ -1846,7 +1846,10 @@ def test_rewind_spin_poses_keeps_the_turn_and_takes_the_matched_heading():
     assert poses[0].theta == pytest.approx(-0.2)
 
 
-def test_mapping_does_not_paint_a_scan_that_misses_the_map(tmp_path: Path, monkeypatch):
+def test_mapping_recovers_heading_when_scan_fits_another_yaw(
+    tmp_path: Path, monkeypatch
+):
+    """Wheel yaw slipped, but the scan still matches the map at the true heading."""
     import src.slam_builtin.engine as engine_mod
 
     cfg = SlamConfig.from_dict(
@@ -1878,9 +1881,54 @@ def test_mapping_does_not_paint_a_scan_that_misses_the_map(tmp_path: Path, monke
     clock["t"] += 10.0
     heading["th"] = math.radians(30.0)
     engine._tick()  # noqa: SLF001
-    assert engine.get_pose().theta == pytest.approx(math.radians(30.0), abs=1e-6)
+    assert engine.get_pose().theta == pytest.approx(0.0, abs=math.radians(6.0))
+    assert engine._updates >= 2  # noqa: SLF001
+    assert engine._heading_recovers == 1  # noqa: SLF001
+    assert engine._insert_skips_unmatched == 0  # noqa: SLF001
+
+
+def test_mapping_does_not_paint_a_scan_that_misses_every_heading(
+    tmp_path: Path, monkeypatch
+):
+    """No yaw recovers a scan that does not belong on this map — still refuse."""
+    import src.slam_builtin.engine as engine_mod
+
+    cfg = SlamConfig.from_dict(
+        {"base": "b", "lidar": "front", "maps_dir": str(tmp_path), "mode": "mapping"}
+    )
+    clock = {"t": 100.0}
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: clock["t"])
+    pose = {"p": conv.Pose2D(0.0, 0.0, 0.0)}
+    use_junk = {"v": False}
+
+    class _Sensors(_FakeSensors):
+        def get_scan(self, max_age_s: float = 2.0, *, fresh: bool = False):
+            if use_junk["v"]:
+                # Ranges that never line up with the painted room walls.
+                n = 72
+                return conv.LaserScan2D(
+                    ranges=np.full(n, 0.35, dtype=float),
+                    angle_min=-math.pi,
+                    angle_increment=2 * math.pi / n,
+                    range_min=0.1,
+                    range_max=10.0,
+                )
+            return _room_scan(pose["p"])
+
+        def get_odom(self):
+            p = pose["p"]
+            return conv.OdomReading(0.0, 0.0, 0.0, pose=p, heading_rad=p.theta)
+
+    engine = BuiltinSlamEngine(cfg, _Sensors(), MapStore(str(tmp_path)), rate_hz=10.0)  # type: ignore[arg-type]
+    engine._tick()  # noqa: SLF001
+    assert engine._updates == 1  # noqa: SLF001
+    clock["t"] += 10.0
+    pose["p"] = conv.Pose2D(0.4, 0.0, 0.0)
+    use_junk["v"] = True
+    engine._tick()  # noqa: SLF001
     assert engine._updates == 1  # noqa: SLF001
     assert engine._insert_skips_unmatched == 1  # noqa: SLF001
+    assert engine._heading_recovers == 0  # noqa: SLF001
 
 
 def test_spin_is_painted_at_the_heading_that_matches(tmp_path: Path):
