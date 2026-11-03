@@ -115,6 +115,9 @@ class PoseGraph:
         # Map-frame jump of the live pose since the last node (set_pose); keeps
         # the next odometry edge from encoding the jump as motion.
         self._rebase = conv.Pose2D(0.0, 0.0, 0.0)
+        # Set by ``load``: path added to the next node's travel so reloaded
+        # keyframes already count as old geometry for loop detection.
+        self._session_gap_m: Optional[float] = None
 
     def __len__(self) -> int:
         return len(self.nodes)
@@ -134,6 +137,27 @@ class PoseGraph:
         self.edges.clear()
         self.full = False
         self._rebase = conv.Pose2D(0.0, 0.0, 0.0)
+        self._session_gap_m = None
+
+    def load(
+        self,
+        nodes: Sequence[GraphNode],
+        edges: Sequence[GraphEdge],
+        last_seq: int,
+        *,
+        session_gap_m: float = 0.0,
+    ) -> None:
+        """Replace the graph with saved keyframes; the next insert starts a node.
+
+        The robot may have moved between sessions, so the link from the last
+        saved node to the first new one is near-free (like a ``set_pose`` jump).
+        """
+        self.clear()
+        self.nodes = list(nodes)
+        self.edges = list(edges)
+        self._seq = max(int(last_seq), self._seq)
+        if self.nodes:
+            self._session_gap_m = max(0.0, float(session_gap_m))
 
     def rebase(self, correction: conv.Pose2D) -> None:
         """The live pose was moved by ``correction`` (map frame) without the graph."""
@@ -194,7 +218,12 @@ class PoseGraph:
         rel = conv.compose_poses(conv.invert_pose(last_live), pose)
         moved = math.hypot(rel.x, rel.y)
         turned = abs(rel.theta)
-        if moved >= self.node_spacing_m or turned >= self.node_spacing_rad:
+        session_gap = self._session_gap_m
+        if (
+            moved >= self.node_spacing_m
+            or turned >= self.node_spacing_rad
+            or session_gap is not None
+        ):
             if len(self.nodes) >= self.max_nodes:
                 self.full = True
                 return False
@@ -202,7 +231,7 @@ class PoseGraph:
             if gs is None:
                 return False
             info = odometry_info(rel)
-            if (
+            if session_gap is not None or (
                 abs(self._rebase.x) > 1e-9
                 or abs(self._rebase.y) > 1e-9
                 or abs(self._rebase.theta) > 1e-9
@@ -212,10 +241,11 @@ class PoseGraph:
                 # map to absorb it.
                 info = info * 1e-4
                 self._rebase = conv.Pose2D(0.0, 0.0, 0.0)
+            self._session_gap_m = None
             self.nodes.append(
                 GraphNode(
                     pose=pose,
-                    travel_m=last.travel_m + moved,
+                    travel_m=last.travel_m + moved + (session_gap or 0.0),
                     scans=[gs, *self._extra_scans(conv.Pose2D(0.0, 0.0, 0.0), also)],
                     inserts=1,
                 )

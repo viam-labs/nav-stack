@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import shutil
 import threading
 import time
 from collections import deque
@@ -23,7 +24,7 @@ from ..geom import conversions as conv
 from ..nav.localize.global_localize import OccupancyMap
 from ..nav.localize.pose_jump_gate import PoseJumpGate
 from ..nav.stores.maps import MapStore
-from . import loop_closure, map_health, persistence, scan_match
+from . import graph_store, loop_closure, map_health, persistence, repair, scan_match
 from . import occupancy as occ
 from . import pose_graph as pg
 from .io_sensors import BuiltinSensors
@@ -174,10 +175,24 @@ class BuiltinSlamEngine:
         )
         # Map loaded when mapping resumed on it; renders start from it.
         self._graph_base: Optional[LogOddsGrid] = None
+        # Grid as this mapping session found it (health scores against it).
+        self._session_baseline: Optional[LogOddsGrid] = None
+        # Keyframes reloaded from the saved map: nodes [0, frozen) are fixed
+        # reference geometry for live loop closure / revisit.
+        self._graph_frozen = 0
         # Manual erase/paint edits, replayed onto every re-rendered grid.
         self._grid_edits: list = []
+        # Edits already written to keyframes.npz by a non-mapping save.
+        self._grid_edits_saved = 0
         # One optimize + re-render at a time (worker, revisit, DoCommand).
         self._graph_job = threading.Lock()
+        # Background map repair (save_map / repair_map DoCommand).
+        self._repair_lock = threading.Lock()
+        self._repair_thread: Optional[threading.Thread] = None
+        self._repair_cancel = threading.Event()
+        self._repair_status: dict = {"state": "idle"}
+        # Live-pose correction of the last applied repair (undo_repair).
+        self._last_repair_tail: Optional[conv.Pose2D] = None
         self._graph_revision = 0
         # Bumped whenever the pose jumps frame (correction / set_pose) so an
         # in-flight match computed in the old frame is not applied.
@@ -297,6 +312,7 @@ class BuiltinSlamEngine:
     def stop(self) -> None:
         self._persist_pose(force=True)
         self._running = False
+        self._repair_cancel.set()
         self._loop_event.set()
         for thr in (self._thread, self._loop_thread):
             if thr is not None and thr.is_alive():
@@ -305,6 +321,7 @@ class BuiltinSlamEngine:
         self._loop_thread = None
 
     def configure_mode(self, mode: str, map_dir: Optional[Path] = None) -> None:
+        self._repair_cancel.set()
         with self._lock:
             self._mode = mode
             self._pose_restored_from_disk = False
@@ -330,6 +347,8 @@ class BuiltinSlamEngine:
                     self._invalidate_occ_cache()
                     self._generation += 1
             self._reset_graph_locked()
+            if mode == MODE_MAPPING and loaded is not None and map_dir is not None:
+                self._resume_keyframes_locked(Path(map_dir))
             self._reset_lidar_odom_locked()
             if mode == MODE_LOCALIZING:
                 self._seed_localize_pending = True
@@ -412,6 +431,7 @@ class BuiltinSlamEngine:
         return bool(self._pose_restored_from_disk)
 
     def reset_map(self) -> None:
+        self._repair_cancel.set()
         with self._lock:
             self._grid = occ.empty_grid(resolution=self._cfg.map.resolution)
             self._height_bands = {}
@@ -542,7 +562,9 @@ class BuiltinSlamEngine:
 
     def _reset_graph_locked(self) -> None:
         self._graph.clear()
+        self._graph_frozen = 0
         self._grid_edits = []
+        self._grid_edits_saved = 0
         self._loop_pending = None
         self._loop_full_logged = False
         self._graph_revision += 1
@@ -551,6 +573,41 @@ class BuiltinSlamEngine:
             occ.copy_grid(self._grid)
             if self._mode == MODE_MAPPING and observed
             else None
+        )
+        self._session_baseline = self._graph_base
+
+    def _resume_keyframes_locked(self, map_dir: Path) -> None:
+        """Reload saved keyframes as fixed graph nodes (mapping resume)."""
+        if not bool(getattr(self._cfg, "builtin_save_keyframes", True)):
+            return
+        path = graph_store.keyframes_path(map_dir)
+        if not path.is_file():
+            return
+        saved = graph_store.load_graph(
+            map_dir,
+            image_sha1=graph_store.file_sha1(Path(map_dir) / "map.pgm"),
+            resolution=float(self._grid.resolution),
+        )
+        if saved is None:
+            self._log(
+                f"{path.name} does not match map.pgm; resuming on the flat map "
+                "(saved geometry cannot be re-solved this session)"
+            )
+            return
+        self._graph.load(
+            saved.nodes,
+            saved.edges,
+            saved.last_seq,
+            session_gap_m=self._loop_params.min_travel_gap_m,
+        )
+        self._graph_frozen = len(saved.nodes)
+        self._graph_base = saved.base
+        self._grid_edits = list(saved.edits)
+        self._grid_edits_saved = len(self._grid_edits)
+        self._graph_revision += 1
+        self._log(
+            f"resumed {len(saved.nodes)} keyframes / {len(saved.edges)} edges "
+            f"from {path.name}"
         )
 
     def _replay_grid_edits_locked(self, grid: LogOddsGrid) -> None:
@@ -670,6 +727,10 @@ class BuiltinSlamEngine:
                 )
                 if anchor is None:
                     anchor = self._graph.earliest_node_near(target)
+                trusted = self._baseline_trusted_locked()
+                frozen = self._graph_frozen
+                if not trusted and anchor is not None and anchor < frozen:
+                    anchor = None
                 allowed_shift = cfg.mapping_revisit_allowed_shift_m(
                     float(score) if score is not None else cfg.mapping_revisit_min_score
                 )
@@ -692,13 +753,17 @@ class BuiltinSlamEngine:
                 if force:
                     # Operator command (yaw flip): move the trailing path as one.
                     start = anchor + 1 if anchor is not None else 0
-                    self._graph.apply_world_correction_from(start, corr)
+                    self._graph.apply_world_correction_from(max(start, frozen), corr)
                     method, first_free, live = "rigid", None, corr
                 elif not plausible:
                     # A revisit this far off is a yaw flip or a wrong wall. The
                     # old rigid tail shift here is what slid a whole stretch of
                     # map sideways on a false match.
                     method, first_free, live = "rejected_implausible", None, None
+                elif cur < frozen:
+                    # No keyframe of this session yet; only the live pose moves.
+                    self._set_corrected_pose_locked(matched_pose)
+                    method, first_free, live = "pose_only", None, None
                 elif anchor is not None and anchor < cur:
                     edge = pg.GraphEdge(
                         anchor,
@@ -711,19 +776,23 @@ class BuiltinSlamEngine:
                     )
                     self._graph.add_edge(edge)
                     new_edges = [edge]
-                    method, first_free, live = "pose_graph", anchor + 1, None
+                    method, first_free, live = (
+                        "pose_graph",
+                        self._live_first_free(anchor + 1),
+                        None,
+                    )
                 elif anchor is not None:
                     # The nearest old geometry is the newest node itself: the
                     # drift happened after it. Move the live pose, not the map.
                     self._set_corrected_pose_locked(matched_pose)
                     method, first_free, live = "pose_only", None, None
-                elif self._trusted_base_locked() is not None:
+                elif trusted and self._graph_base is not None:
                     # Mapping resumed on a loaded map: the match is against
                     # geometry no node of this session drew, so the whole
                     # session moves together onto it.
-                    self._graph.apply_world_correction_from(0, corr)
+                    self._graph.apply_world_correction_from(frozen, corr)
                     method, first_free, live = "rigid", None, corr
-                elif self._graph_base is not None:
+                elif not trusted and (self._graph_base is not None or frozen > 0):
                     method, first_free, live = "rejected_untrusted_base", None, None
                 else:
                     method, first_free, live = "rejected_no_anchor", None, None
@@ -901,7 +970,7 @@ class BuiltinSlamEngine:
             if (
                 not force
                 and gen == self._map_health_generation
-                and self._graph_base is self._map_health_base_src
+                and self._session_baseline is self._map_health_base_src
                 and now - self._map_health_at < self._MAP_HEALTH_MIN_S
             ):
                 return dict(self._map_health)
@@ -909,7 +978,7 @@ class BuiltinSlamEngine:
             res = float(self._grid.resolution)
             ox = float(self._grid.origin_x)
             oy = float(self._grid.origin_y)
-            base = self._graph_base
+            base = self._session_baseline
             base_cells = None
             base_origin = (0.0, 0.0)
             if base is not self._map_health_base_src:
@@ -1003,17 +1072,19 @@ class BuiltinSlamEngine:
     def _map_health_status(self) -> str:
         return str(self._map_health.get("status") or "cold")
 
-    def _trusted_base_locked(self) -> Optional[LogOddsGrid]:
-        """The resumed map, unless its health check found it torn."""
-        base = self._graph_base
-        if (
-            base is not None
-            and base is self._map_health_base_src
+    def _baseline_trusted_locked(self) -> bool:
+        """False when the map this session resumed on was scored as torn."""
+        baseline = self._session_baseline
+        return not (
+            baseline is not None
+            and baseline is self._map_health_base_src
             and self._map_health_base is not None
             and not self._map_health_base["trusted"]
-        ):
-            return None
-        return base
+        )
+
+    def _live_first_free(self, first_free: int) -> int:
+        """Live corrections never move keyframes reloaded from the saved map."""
+        return max(int(first_free), self._graph_frozen)
 
     def _pending_limits(self) -> tuple[float, int]:
         """Effective (max_s, max_tries) for the two-agree loop gate."""
@@ -1036,14 +1107,7 @@ class BuiltinSlamEngine:
     def _loop_edge(
         snap: pg.GraphSnapshot, cur: int, match: loop_closure.LoopMatch
     ) -> pg.GraphEdge:
-        # Match covariance is map-frame; edge errors are in the matched pose frame.
-        c, s = math.cos(match.pose.theta), math.sin(match.pose.theta)
-        rot = np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
-        info = np.linalg.inv(rot @ match.cov @ rot.T)
-        if match.anchor is None:
-            return pg.GraphEdge(pg.PRIOR_NODE, cur, match.pose, info, loop=True)
-        rel = conv.compose_poses(conv.invert_pose(snap.pose(match.anchor)), match.pose)
-        return pg.GraphEdge(match.anchor, cur, rel, info, loop=True)
+        return loop_closure.edge_from_match(snap, cur, match)
 
     @staticmethod
     def _corrections_agree(a: conv.Pose2D, b: conv.Pose2D, at: conv.Pose2D) -> bool:
@@ -1072,11 +1136,15 @@ class BuiltinSlamEngine:
                         )
                     return {"status": "graph_full"}
                 snap = self._graph.snapshot()
-                base = self._trusted_base_locked()
+                trusted = self._baseline_trusted_locked()
+                base = self._graph_base if trusted else None
+                min_node = 0 if trusted else self._graph_frozen
                 res = self._grid.resolution
                 revision = self._graph_revision
+            if self._graph_frozen and len(snap) <= self._graph_frozen:
+                return {"status": "no_nodes"}
             match, reason = loop_closure.detect(
-                snap, self._loop_params, resolution=res, base=base
+                snap, self._loop_params, resolution=res, base=base, min_node=min_node
             )
             stats = self._loop_stats
             stats["attempts"] += 1
@@ -1163,7 +1231,7 @@ class BuiltinSlamEngine:
                 # optimization but skip a full re-render now.
                 return {"status": "constrained", **stats["last"]}
             anchors = [e.i for e in edges if e.i >= 0]
-            first_free = min(anchors) + 1 if anchors else 1
+            first_free = self._live_first_free(min(anchors) + 1 if anchors else 1)
             result = self._optimize_and_render(first_free, new_edges=edges)
             stats["last"]["result"] = result.get("status")
             self._log(
@@ -1177,13 +1245,33 @@ class BuiltinSlamEngine:
         finally:
             self._graph_job.release()
 
-    def save_map(self, map_dir: Path) -> None:
+    def save_map(self, map_dir: Path, *, repair: bool = True) -> dict:
+        """Write map.pgm/yaml (+ keyframes.npz) and, when mapping, check repair."""
+        map_dir = Path(map_dir)
+        keep_keyframes = bool(getattr(self._cfg, "builtin_save_keyframes", True))
         with self._lock:
-            persistence.save_occupancy(map_dir, self._grid)
-            self._map_dir = Path(map_dir)
+            old_sha = graph_store.file_sha1(map_dir / "map.pgm")
+            sha = persistence.save_occupancy(map_dir, self._grid)
+            self._map_dir = map_dir
             pose = self._pose
             seed_pending = self._seed_localize_pending
             mode = self._mode
+            res = float(self._grid.resolution)
+            payload = (
+                self._graph_payload_locked()
+                if keep_keyframes and mode == MODE_MAPPING and len(self._graph) > 0
+                else None
+            )
+            new_edits = list(self._grid_edits[self._grid_edits_saved :])
+        out: dict = {"keyframes": "none"}
+        if keep_keyframes:
+            try:
+                out["keyframes"] = self._write_keyframes(
+                    map_dir, sha, old_sha, res, payload, new_edits, mode
+                )
+            except Exception as exc:  # noqa: BLE001
+                out["keyframes"] = "failed"
+                self._log(f"save keyframes failed: {exc}")
         if bool(getattr(self._cfg, "persist_pose", True)) and not (
             mode == MODE_LOCALIZING and seed_pending
         ):
@@ -1192,6 +1280,281 @@ class BuiltinSlamEngine:
                 self._last_pose_save_at = time.monotonic()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"persist last pose failed: {exc}")
+        if (
+            repair
+            and mode == MODE_MAPPING
+            and bool(getattr(self._cfg, "builtin_repair_on_save", True))
+        ):
+            out["repair"] = self.start_repair(map_dir, apply="auto", reason="save")
+        return out
+
+    def _graph_payload_locked(self) -> dict:
+        snap = self._graph.snapshot()
+        nodes = [
+            pg.GraphNode(
+                pose=snap.pose(i),
+                travel_m=float(snap.travel[i]),
+                scans=list(snap.scans[i]),
+                inserts=int(self._graph.nodes[i].inserts),
+            )
+            for i in range(len(snap))
+        ]
+        return {
+            "nodes": nodes,
+            "edges": list(snap.edges),
+            "last_seq": int(snap.last_seq),
+            "base": self._graph_base,
+            "edits": list(self._grid_edits),
+        }
+
+    def _write_keyframes(
+        self,
+        map_dir: Path,
+        sha: str,
+        old_sha: Optional[str],
+        res: float,
+        payload: Optional[dict],
+        new_edits: list,
+        mode: str,
+    ) -> str:
+        if payload is not None:
+            graph_store.save_graph(map_dir, image_sha1=sha, resolution=res, **payload)
+            self._grid_edits_saved = len(payload["edits"])
+            return "saved"
+        if mode == MODE_MAPPING:
+            return "none"
+        # Not mapping: keep saved keyframes valid for the re-saved image and
+        # carry over obstacle edits made since the map was loaded.
+        saved = graph_store.load_graph(map_dir, image_sha1=old_sha, resolution=res)
+        if saved is None:
+            return "none"
+        graph_store.save_graph(
+            map_dir,
+            image_sha1=sha,
+            resolution=res,
+            nodes=saved.nodes,
+            edges=saved.edges,
+            last_seq=saved.last_seq,
+            base=saved.base,
+            edits=saved.edits + new_edits,
+        )
+        self._grid_edits_saved += len(new_edits)
+        return "updated"
+
+    # -- map repair ------------------------------------------------------------
+    _REPAIR_MIN_NODES = 12
+    _REPAIR_BACKUP_DIR = "pre_repair"
+    _REPAIR_FILES = ("map.pgm", "map.yaml", graph_store.KEYFRAMES_FILENAME)
+
+    def start_repair(
+        self, map_dir: Optional[Path], *, apply="auto", reason: str = "manual"
+    ) -> dict:
+        """Run ``run_repair`` on a background thread; see ``repair_status``."""
+        with self._repair_lock:
+            running = self._repair_thread
+            if running is not None and running.is_alive():
+                return {"status": "running"}
+            with self._lock:
+                skip = self._repair_skip_reason_locked()
+            if skip is not None:
+                return {"status": "skipped", "reason": skip}
+            self._repair_status = {
+                "state": "running",
+                "reason": reason,
+                "apply": apply,
+                "started_at": time.time(),
+            }
+            thread = threading.Thread(
+                target=self._repair_job,
+                args=(map_dir, apply, reason),
+                name="slam-map-repair",
+                daemon=True,
+            )
+            self._repair_thread = thread
+            thread.start()
+        return {"status": "started"}
+
+    def repair_status(self) -> dict:
+        return dict(self._repair_status)
+
+    def _repair_job(self, map_dir: Optional[Path], apply, reason: str) -> None:
+        try:
+            result = self.run_repair(apply=apply, map_dir=map_dir, reason=reason)
+        except Exception as exc:  # noqa: BLE001
+            result = {"status": "failed", "error": str(exc)}
+            self._log(f"map repair ({reason}) failed: {exc}")
+        result.update(state="done", reason=reason, finished_at=time.time())
+        self._repair_status = result
+
+    def _repair_skip_reason_locked(self) -> Optional[str]:
+        if self._mode != MODE_MAPPING:
+            return "not_mapping"
+        if len(self._graph) < self._REPAIR_MIN_NODES:
+            return "too_few_keyframes"
+        return None
+
+    def run_repair(
+        self,
+        *,
+        apply="auto",
+        map_dir: Optional[Path] = None,
+        reason: str = "manual",
+    ) -> dict:
+        """Re-detect loops over the whole graph; apply when ``apply`` allows.
+
+        ``apply``: ``"auto"`` only when ``repair.verdict`` is confident,
+        ``True`` / ``"force"`` when nothing gets worse, ``False`` plans only.
+        With ``map_dir`` an applied repair backs up the saved files and
+        re-saves. Blocks; on a large map this takes minutes.
+        """
+        self._repair_cancel.clear()
+        with self._lock:
+            skip = self._repair_skip_reason_locked()
+        if skip is not None:
+            return {"status": "skipped", "reason": skip}
+        cfg = self._cfg
+        params = repair.RepairParams(
+            loop=repair.relaxed_loop_params(self._loop_params),
+            max_chi2=self._LOOP_MAX_CHI2,
+            window_nodes=max(1, int(cfg.builtin_loop_max_window_nodes)),
+            max_s=float(getattr(cfg, "builtin_repair_max_s", 600.0)),
+        )
+        with self._graph_job:
+            with self._lock:
+                snap = self._graph.snapshot()
+                trusted = self._baseline_trusted_locked()
+                base = self._graph_base
+                res = float(self._grid.resolution)
+                revision = self._graph_revision
+                edits = list(self._grid_edits)
+            plan = repair.plan_repair(
+                snap,
+                resolution=res,
+                params=params,
+                base=base if trusted else None,
+                should_stop=self._repair_cancel.is_set,
+            )
+            out: dict = {"status": "no_corrections", **plan.summary()}
+            if not plan.clusters:
+                self._log(
+                    f"map repair ({reason}): nothing to correct "
+                    f"({plan.matched}/{plan.examined} keyframes matched, "
+                    f"{plan.rejected} rejected)"
+                )
+                return out
+            before = self._assess_render(snap, snap.poses, base, edits, res)
+            after = self._assess_render(snap, plan.poses, base, edits, res)
+            confident, not_confident = repair.verdict(before, after, plan, params)
+            out.update(
+                before=before.as_dict(),
+                after=after.as_dict(),
+                confident=confident,
+                not_confident=not_confident,
+            )
+            if apply == "auto":
+                do_apply = confident
+            elif apply is True or apply == "force":
+                do_apply = repair.acceptable(before, after, plan)
+            else:
+                do_apply = False
+            if not do_apply:
+                out["status"] = "planned" if apply in (False, "never") else "kept"
+                self._log(
+                    f"map repair ({reason}): not applied "
+                    f"({', '.join(not_confident) or 'dry run'}); "
+                    f"ghost {before.ghost_frac:.2f}->{after.ghost_frac:.2f} "
+                    f"angle_std {before.angle_std_deg:.1f}->"
+                    f"{after.angle_std_deg:.1f}deg"
+                )
+                return out
+            backup = self._backup_map_files(map_dir) if map_dir is not None else False
+            with self._lock:
+                if self._graph_revision != revision or self._mode != MODE_MAPPING:
+                    out["status"] = "aborted"
+                    return out
+                for e in plan.edges:
+                    self._graph.add_edge(e)
+                tail = self._graph.apply_poses(snap, plan.poses)
+            rendered = self._optimize_and_render(None, live_correction=tail)
+            if rendered.get("status") != "rebuilt":
+                out["status"] = "aborted"
+                return out
+            self._last_repair_tail = tail
+        out.update(status="applied", backup=backup, render_ms=rendered.get("render_ms"))
+        self._log(
+            f"map repair ({reason}): applied {len(plan.clusters)} corrections "
+            f"(max {plan.max_shift_m:.2f} m / {plan.max_shift_deg:.1f} deg); "
+            f"ghost {before.ghost_frac:.2f}->{after.ghost_frac:.2f} "
+            f"angle_std {before.angle_std_deg:.1f}->{after.angle_std_deg:.1f}deg"
+            + ("; previous files in pre_repair/ (undo_repair)" if backup else "")
+        )
+        if map_dir is not None:
+            self.save_map(map_dir, repair=False)
+            out["saved"] = True
+        return out
+
+    def _assess_render(
+        self,
+        snap: pg.GraphSnapshot,
+        poses: np.ndarray,
+        base: Optional[LogOddsGrid],
+        edits: list,
+        res: float,
+    ) -> map_health.MapHealth:
+        grid = pg.render_grid(snap, resolution=res, poses=poses, base=base)
+        for kind, x, y, r in edits:
+            if kind == "clear":
+                occ.clear_disk(grid, x, y, r)
+            else:
+                occ.mark_disk(grid, x, y, r)
+        return map_health.assess_occupancy(
+            occ.to_occupancy_int16(grid),
+            resolution=res,
+            origin_x=float(grid.origin_x),
+            origin_y=float(grid.origin_y),
+        )
+
+    def _backup_map_files(self, map_dir: Path) -> bool:
+        src = Path(map_dir)
+        files = [src / f for f in self._REPAIR_FILES if (src / f).is_file()]
+        if not files:
+            return False
+        dst = src / self._REPAIR_BACKUP_DIR
+        tmp = src / (self._REPAIR_BACKUP_DIR + ".tmp")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        for f in files:
+            shutil.copy2(f, tmp / f.name)
+        shutil.rmtree(dst, ignore_errors=True)
+        tmp.rename(dst)
+        return True
+
+    def undo_repair(self, map_dir: Path) -> dict:
+        """Restore the files saved before the last applied repair and reload them.
+
+        Mapping done since that repair and not saved is dropped with it.
+        """
+        src = Path(map_dir)
+        backup = src / self._REPAIR_BACKUP_DIR
+        if not backup.is_dir():
+            return {"status": "no_backup"}
+        with self._graph_job:
+            for name in self._REPAIR_FILES:
+                saved = backup / name
+                if saved.is_file():
+                    shutil.copy2(saved, src / name)
+                else:
+                    (src / name).unlink(missing_ok=True)
+            shutil.rmtree(backup, ignore_errors=True)
+            with self._lock:
+                mode = self._mode
+                pose = self._pose
+            tail, self._last_repair_tail = self._last_repair_tail, None
+        self.configure_mode(mode, src)
+        if tail is not None:
+            self.set_pose(conv.compose_poses(conv.invert_pose(tail), pose))
+        self._log(f"map repair undone; restored files from {backup.name}/")
+        return {"status": "restored", "mode": mode}
 
     def _invalidate_occ_cache(self) -> None:
         self._match_epoch += 1
@@ -1365,6 +1728,7 @@ class BuiltinSlamEngine:
                 "insert_skips_unmatched": self._insert_skips_unmatched,
                 "heading_recovers": self._heading_recovers,
                 "map_health": self.map_health(),
+                "repair": self.repair_status(),
                 "generation": self._generation,
                 "seed_localize_pending": self._seed_localize_pending,
                 "pose_restored_from_disk": self._pose_restored_from_disk,
@@ -1373,6 +1737,7 @@ class BuiltinSlamEngine:
                 "loop_closure": {
                     "enabled": self._loop_closure_enabled(),
                     "nodes": len(self._graph),
+                    "saved_nodes": self._graph_frozen,
                     "edges": len(self._graph.edges),
                     "loop_edges": self._graph.loop_edge_count(),
                     "graph_full": self._graph.full,

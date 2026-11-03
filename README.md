@@ -155,6 +155,8 @@ circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
 | `builtin_loop_closure` | SLAM | Builtin automatic loop closure while mapping. Keyframes (every `builtin_loop_node_spacing_m` `0.5` m / `_deg` `20°`) form a pose graph; each new keyframe's last ~2 m of scans is matched against a submap rendered from **older keyframes only** (≥ `builtin_loop_min_travel_m` `6` m of path behind), so the drifted copy being painted now cannot confirm itself. Two consecutive agreeing matches add loop edges, the graph is optimized (error spread along the loop, not dumped on the last pose), and the grid is re-rendered from the corrected keyframes — removing doubled walls. Revisit-watchdog corrections and `optimize_pose_graph` use the same graph. Status: `slam_diagnostics.loop_closure`. Default `true` |
 | `builtin_loop_search_radius_m` / `_search_window_m` / `_search_window_deg` / `_min_score` | SLAM | Loop detection: correlative search ±`8` m / ±`45°` around the current estimate, accept fit ≥ `0.55`. A long loop can use that whole window; translation larger than ~10% of the distance driven since the old place is still refused. Matches at the window edge or ambiguous in both axes are rejected; along a featureless corridor only the sideways correction carries weight |
 | `builtin_loop_check_interval_s` / `_scans_per_node` / `_max_window_nodes` / `builtin_mapping_keyframe_max` | SLAM | Detection at most every `2` s; scans kept per keyframe for re-rendering (`2`); newest keyframes moved per optimization (`900`); keyframes per mapping session (`2000`, ~1 km — past that loop closure stops for the session but the map is kept) |
+| `builtin_save_keyframes` | SLAM | `save_map` also writes the keyframe pose graph (`keyframes.npz`: node poses, kept scans, edges, obstacle edits) tied to that `map.pgm` by hash. `start_mapping` on the map reloads them as graph nodes that live loop closure / revisit anchor to but do not move; `repair_map` can re-solve them. Ignored if `map.pgm` changed without it (older maps resume on the flat image as before). Default `true` |
+| `builtin_repair_on_save` / `builtin_repair_max_s` | SLAM | After `save_map` while mapping, run map repair in the background (`repair_status`) and apply it only when the map was torn (health `watch`/`degrading`), every correction was confirmed by ≥3 consecutive agreeing keyframes and fit the graph, ghost walls drop by ≥25%, and wall angles / health did not get worse. Applying backs up the previous files to `pre_repair/` (`undo_repair`) and re-saves. Time budget `600` s. Default `true` |
 | `mapping_revisit_slice_verify` | SLAM | Multi-height-slice veto for revisit corrections (3D lidar only). The 2D map holds one z-band silhouette and desk clutter is self-similar in it; this records sparse per-band grids (knee + head height by default) from trusted pause scans and rejects a proposed correction whose pose disagrees with any band that has reference data there. Default `true` |
 | `mapping_revisit_slice_bands` / `_slice_min_hit_rate` / `_slice_resolution_m` | SLAM | Extra height bands as `[z_min, z_max]` pairs in meters (default `[[0.15, 0.45], [1.6, 2.4]]`), per-band hit-rate gate (default `0.4`), and grid cell size (default `0.15` m) |
 | `mapping_revisit_keyframes` | SLAM | Store a pause keyframe (2D endpoints + height slices + map pose) on every accepted `map_when_still` `/scan` publish, and match against those views when occupancy revisit scores are weak — helps when you stop at different places/angles than the first visit. Default `true` |
@@ -487,7 +489,9 @@ Until a costmap is available, the camera returns a placeholder frame.
 3. Optionally force a pose-graph optimization mid-map (serialize → reload so
    useful after closing a loop that looks bent):
    `do_command({"command": "optimize"})`.
-4. Save when done: `do_command({"command": "save_map"})`.
+4. Save when done: `do_command({"command": "save_map"})`. With builtin SLAM
+   this also checks the whole map for tears in the background and repairs it
+   when that is clearly an improvement; see `repair_status`.
 
 ### 2. Localize on a saved map
 
@@ -685,7 +689,15 @@ is inside them.
 disk — builtin SLAM; args `x`/`y` or `pose`, `radius_m`, optional `save`),
 `start_mapping`, `start_localizing`, `save_map`,
 `optimize` (alias `optimize_graph`; mapping mode — force pose-graph SPA via
-serialize/deserialize reload), `get_mode`, `get_status`
+serialize/deserialize reload),
+`repair_map` (alias `repair`; builtin, mapping mode — background re-detection
+of loops over every saved and new keyframe with looser drift/yaw caps but ≥3
+agreeing keyframes per correction; `apply`: `"auto"` (default, only when
+confident), `true`/`"force"` (when nothing gets worse), `false`/`"dry_run"`),
+`repair_status` (last repair: corrections, before/after `map_health`,
+`confident` / `not_confident` reasons, `applied`), `undo_repair` (restore the
+files from before the last applied repair and reload them; unsaved mapping
+since is dropped), `get_mode`, `get_status`
 (SLAM health; optional `probe_sensors: false` to skip a
 one-shot lidar/odom read; includes measured `scan_hz` / `lidar_read_hz` over
 the last ~2 s plus configured `scan_rate_hz` — with `map_when_still`, expect low

@@ -60,8 +60,19 @@ class BuiltinSlamHost:
     def add_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
         return self._engine.add_obstacles(x_m, y_m, radius_m)
 
-    def save_map(self, map_stem: Path) -> None:
-        self._engine.save_map(Path(map_stem).parent)
+    def save_map(self, map_stem: Path) -> Dict:
+        return self._engine.save_map(Path(map_stem).parent)
+
+    def start_repair(self, map_stem: Path, *, apply="auto") -> Dict:
+        return self._engine.start_repair(
+            Path(map_stem).parent, apply=apply, reason="manual"
+        )
+
+    def repair_status(self) -> Dict:
+        return self._engine.repair_status()
+
+    def undo_repair(self, map_stem: Path) -> Dict:
+        return self._engine.undo_repair(Path(map_stem).parent)
 
     def optimize_pose_graph(self, map_stem: Path) -> Dict:
         del map_stem
