@@ -86,6 +86,7 @@ _SLAM_DO_ALIASES = build_alias_map(
         "optimize": ("optimize_graph",),
         "relocalize": ("refine_localization",),
         "clear_obstacles": ("erase_obstacles",),
+        "clear_region": ("erase_region",),
         "add_obstacles": ("mark_obstacles",),
         "repair_map": ("repair",),
     }
@@ -1625,6 +1626,7 @@ class SlamService(SLAM):
             "rename_map": self._cmd_rename_map,
             "clear_map": self._cmd_clear_map,
             "clear_obstacles": self._cmd_clear_obstacles,
+            "clear_region": self._cmd_clear_region,
             "add_obstacles": self._cmd_add_obstacles,
             "delete_map": self._cmd_delete_map,
         }
@@ -2065,6 +2067,57 @@ class SlamService(SLAM):
         self, command: Mapping[str, ValueTypes]
     ) -> Mapping[str, ValueTypes]:
         return await self._cmd_paint_obstacles(command, adding=True)
+
+    async def _cmd_clear_region(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        store = self._map_store
+        mgr = self._manager
+        assert store is not None and mgr is not None
+        missing = [
+            k
+            for k in ("x_min", "y_min", "x_max", "y_max")
+            if command.get(k) is None
+        ]
+        if missing:
+            raise ValueError(
+                "clear_region requires x_min, y_min, x_max, y_max "
+                f"(missing: {', '.join(missing)})"
+            )
+        try:
+            x_min = float(command["x_min"])
+            y_min = float(command["y_min"])
+            x_max = float(command["x_max"])
+            y_max = float(command["y_max"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "x_min, y_min, x_max, y_max must be numbers"
+            ) from exc
+
+        def _clear():
+            clear_fn = getattr(mgr, "clear_region", None)
+            if clear_fn is None and getattr(mgr, "node", None) is not None:
+                clear_fn = getattr(mgr.node, "clear_region", None)
+            if clear_fn is None:
+                raise RuntimeError(
+                    "clear_region requires slam_backend=builtin "
+                    "(no live region editor on this SLAM host)"
+                )
+            return clear_fn(x_min, y_min, x_max, y_max)
+
+        result = await asyncio.to_thread(_clear)
+        save = command.get("save", False)
+        out = dict(result) if isinstance(result, Mapping) else {"result": result}
+        out["status"] = "ok"
+        out["map"] = store.get_active_map_name()
+        out["saved"] = False
+        if save:
+            handle = store.active_handle()
+            if not handle:
+                raise ValueError("no active map")
+            await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
+            out["saved"] = True
+        return out
 
     async def _cmd_paint_obstacles(
         self, command: Mapping[str, ValueTypes], *, adding: bool

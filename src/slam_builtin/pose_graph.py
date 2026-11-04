@@ -139,6 +139,49 @@ class PoseGraph:
         self._rebase = conv.Pose2D(0.0, 0.0, 0.0)
         self._session_gap_m = None
 
+    def remove_nodes(
+        self, drop: Callable[[int, GraphNode], bool]
+    ) -> Tuple[List[int], int]:
+        """Drop nodes where ``drop(index, node)`` is true; renumber edges.
+
+        Edges that referenced a removed node (including prior pins onto one)
+        are discarded. Returns ``(removed_indices, edges_removed)``.
+        """
+        keep_old: List[int] = []
+        removed: List[int] = []
+        for i, node in enumerate(self.nodes):
+            if drop(i, node):
+                removed.append(i)
+            else:
+                keep_old.append(i)
+        if not removed:
+            return [], 0
+        remap = {old: new for new, old in enumerate(keep_old)}
+        self.nodes = [self.nodes[i] for i in keep_old]
+        kept_edges: List[GraphEdge] = []
+        edges_removed = 0
+        for e in self.edges:
+            j = int(e.j)
+            i = int(e.i)
+            if j not in remap:
+                edges_removed += 1
+                continue
+            if i == PRIOR_NODE:
+                kept_edges.append(
+                    GraphEdge(PRIOR_NODE, remap[j], e.rel, e.info, loop=e.loop)
+                )
+                continue
+            if i not in remap:
+                edges_removed += 1
+                continue
+            kept_edges.append(
+                GraphEdge(remap[i], remap[j], e.rel, e.info, loop=e.loop)
+            )
+        self.edges = kept_edges
+        if len(self.nodes) < self.max_nodes:
+            self.full = False
+        return removed, edges_removed
+
     def load(
         self,
         nodes: Sequence[GraphNode],

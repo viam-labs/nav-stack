@@ -26,6 +26,7 @@ import numpy as np
 
 from ..geom import conversions as conv
 from . import loop_closure, map_health
+from . import occupancy as occ
 from . import pose_graph as pg
 from .map_health import MapHealth
 from .types import LogOddsGrid
@@ -46,12 +47,34 @@ class RepairParams:
     max_chi2: float = 25.0
     window_nodes: int = 900
     max_s: float = 600.0
+    # Large absolute snaps need a longer agreeing chain (twin corridors often
+    # look consistent for ~3 frames; a true multi-meter weld lasts longer).
+    large_shift_m: float = 1.0
+    large_shift_min_run: int = 5
+    xlarge_shift_m: float = 2.5
+    xlarge_shift_min_run: int = 7
+    # After optimizing a large-shift cluster, require a local ghost drop in a
+    # crop around the corrected stretch (whole-map ghost can stay flat while a
+    # false twin weld slides the hallway).
+    local_ghost_radius_m: float = 8.0
+    local_ghost_min_drop: float = 0.02
     # ``verdict`` gates.
     min_ghost_drop_abs: float = 0.03
     min_ghost_drop_frac: float = 0.25
     # Tile wall-angle spread is noisy on small maps (pillars, clutter); only a
     # big rise that ends in the degrading band vetoes an otherwise clear win.
     max_angle_std_rise_deg: float = 5.0
+
+
+def required_run(params: RepairParams, shift_m: float) -> int:
+    """How many agreeing keyframes a correction of ``shift_m`` must collect."""
+    s = float(shift_m)
+    base = max(1, int(params.min_run))
+    if s >= float(params.xlarge_shift_m):
+        return max(base, int(params.xlarge_shift_min_run))
+    if s >= float(params.large_shift_m):
+        return max(base, int(params.large_shift_min_run))
+    return base
 
 
 def relaxed_loop_params(
@@ -127,6 +150,58 @@ def _prefix(snap: pg.GraphSnapshot, poses: np.ndarray, j: int) -> pg.GraphSnapsh
     )
 
 
+def _local_ghost_frac(
+    snap: pg.GraphSnapshot,
+    poses: np.ndarray,
+    *,
+    resolution: float,
+    center: Tuple[float, float],
+    radius_m: float,
+    base: Optional[LogOddsGrid],
+) -> MapHealth:
+    """Map-health on a crop around ``center`` rendered from ``poses``."""
+    grid = pg.render_grid(
+        snap,
+        resolution=resolution,
+        poses=poses,
+        base=base,
+        center=center,
+    )
+    # render_grid with center seeds a fixed-size window; keep the crop tight.
+    half = max(2.0, float(radius_m))
+    ox = float(center[0]) - half
+    oy = float(center[1]) - half
+    cells = occ.to_occupancy_int16(grid)
+    # Mask cells outside the radius box to unknown so distant walls don't
+    # dilute a hallway-local ghost score.
+    res = float(grid.resolution)
+    rows = np.arange(cells.shape[0], dtype=np.int32)[:, None]
+    cols = np.arange(cells.shape[1], dtype=np.int32)[None, :]
+    cx = grid.origin_x + (cols + 0.5) * res
+    cy = grid.origin_y + (rows + 0.5) * res
+    inside = (cx >= ox) & (cx <= ox + 2 * half) & (cy >= oy) & (cy <= oy + 2 * half)
+    cropped = np.where(inside, cells, np.int16(-1))
+    return map_health.assess_occupancy(
+        cropped,
+        resolution=res,
+        origin_x=float(grid.origin_x),
+        origin_y=float(grid.origin_y),
+    )
+
+
+def _local_ghost_improved(
+    before: MapHealth, after: MapHealth, params: RepairParams
+) -> bool:
+    """True when a large-shift crop is healthier (or was too cold to judge)."""
+    if before.occupied_cells < 200 or after.occupied_cells < 200:
+        return True
+    drop = float(params.local_ghost_min_drop)
+    if before.status in ("watch", "degrading"):
+        return after.ghost_frac <= before.ghost_frac - drop
+    # Wasn't ghosty: still refuse if the weld made it worse.
+    return after.ghost_frac <= before.ghost_frac + drop
+
+
 def plan_repair(
     snap: pg.GraphSnapshot,
     *,
@@ -179,7 +254,8 @@ def plan_repair(
         if run and not _agree(run[-1].corr, corr, prior, params):
             run = []
         run.append(hit)
-        if len(run) < params.min_run:
+        batch_shift = max(h.shift_m for h in run)
+        if len(run) < required_run(params, batch_shift):
             continue
         batch, run = run, []
         if all(
@@ -195,11 +271,35 @@ def plan_repair(
         first_free = max(
             1, (min(anchors) + 1) if anchors else 1, n - params.window_nodes
         )
+        poses_before = np.array(poses, dtype=float, copy=True)
         res = pg.optimize(poses, edges + trial, first_free=first_free, iterations=8)
         worst = max(pg.edge_chi2(res.poses, e) for e in trial)
         if not math.isfinite(worst) or worst > params.max_chi2:
             plan.rejected += 1
             continue
+        batch_shift = max(h.shift_m for h in batch)
+        if batch_shift >= float(params.large_shift_m):
+            cx = float(np.mean([poses_before[h.node, 0] for h in batch]))
+            cy = float(np.mean([poses_before[h.node, 1] for h in batch]))
+            before_h = _local_ghost_frac(
+                snap,
+                poses_before,
+                resolution=resolution,
+                center=(cx, cy),
+                radius_m=params.local_ghost_radius_m,
+                base=base,
+            )
+            after_h = _local_ghost_frac(
+                snap,
+                res.poses,
+                resolution=resolution,
+                center=(cx, cy),
+                radius_m=params.local_ghost_radius_m,
+                base=base,
+            )
+            if not _local_ghost_improved(before_h, after_h, params):
+                plan.rejected += 1
+                continue
         poses = res.poses
         edges.extend(trial)
         plan.edges.extend(trial)
@@ -207,7 +307,7 @@ def plan_repair(
             {
                 "nodes": [batch[0].node, batch[-1].node],
                 "anchor": min(anchors) if anchors else None,
-                "shift_m": round(max(h.shift_m for h in batch), 3),
+                "shift_m": round(batch_shift, 3),
                 "shift_deg": round(max(h.shift_deg for h in batch), 2),
                 "chi2": round(worst, 2),
             }
