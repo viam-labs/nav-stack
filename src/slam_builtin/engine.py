@@ -494,6 +494,9 @@ class BuiltinSlamEngine:
         Remap a torn hallway without clearing the whole map: occupancy is
         painted free, in-box pose-graph nodes (and their edges) are removed,
         and a ``clear_box`` edit is recorded so later re-renders keep the hole.
+        When keyframes remain, the graph is re-rendered so paint from the
+        dropped nodes disappears everywhere (not only inside the box), then
+        ``clear_box`` is replayed so kept nodes cannot refill the AABB.
         Session baseline / map-health cache are refreshed so trust can recover.
         """
         xa, xb = sorted((float(x_min), float(x_max)))
@@ -522,20 +525,15 @@ class BuiltinSlamEngine:
                 self._graph_revision += 1
                 self._loop_pending = None
 
-            # Post-clear grid is the new session truth so health/trust can recover.
-            self._session_baseline = occ.copy_grid(self._grid)
-            self._map_health_base_src = None
-            self._map_health_base_cells = None
-            self._map_health_base = None
-            self._map_health_at = 0.0
-
             self._invalidate_occ_cache()
             self._generation += 1
-            return {
+            n_removed = int(len(removed))
+            remaining = int(len(self._graph))
+            out = {
                 "cleared_cells": int(cleared),
-                "removed_nodes": int(len(removed)),
+                "removed_nodes": n_removed,
                 "removed_edges": int(edges_removed),
-                "remaining_nodes": int(len(self._graph)),
+                "remaining_nodes": remaining,
                 "frozen": int(self._graph_frozen),
                 "x_min": xa,
                 "y_min": ya,
@@ -543,7 +541,30 @@ class BuiltinSlamEngine:
                 "y_max": yb,
                 "generation": int(self._generation),
                 "resolution": float(self._grid.resolution),
+                "rebuilt": False,
             }
+
+        # Re-render outside the lock when nodes were dropped: their scans still
+        # paint the live grid (including outside the AABB) until a rebuild.
+        # clear_box is replayed so kept nodes cannot refill the hole.
+        if n_removed > 0 and remaining > 0:
+            try:
+                rendered = self._optimize_and_render(None)
+                out["rebuilt"] = rendered.get("status") == "rebuilt"
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"clear_region re-render failed: {exc}")
+
+        with self._lock:
+            # Post-clear (and post-render) grid is the new session truth.
+            self._session_baseline = occ.copy_grid(self._grid)
+            self._map_health_base_src = None
+            self._map_health_base_cells = None
+            self._map_health_base = None
+            self._map_health_at = 0.0
+            out["generation"] = int(self._generation)
+            out["remaining_nodes"] = int(len(self._graph))
+            out["frozen"] = int(self._graph_frozen)
+        return out
 
     def add_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
         """Paint occupied cells in a disk (map frame meters). Builtin only."""
@@ -675,6 +696,12 @@ class BuiltinSlamEngine:
         self._graph_base = saved.base
         self._grid_edits = list(saved.edits)
         self._grid_edits_saved = len(self._grid_edits)
+        # Re-apply clears/marks onto the loaded PGM. Save may have written a
+        # grid that lidar refilled after clear_region; clear_box must stick.
+        if self._grid_edits:
+            self._replay_grid_edits_locked(self._grid)
+            self._invalidate_occ_cache()
+            self._generation += 1
         self._graph_revision += 1
         self._log(
             f"resumed {len(saved.nodes)} keyframes / {len(saved.edges)} edges "
