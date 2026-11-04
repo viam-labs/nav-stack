@@ -213,6 +213,77 @@ def test_clear_region_rejects_empty_box(tmp_path):
         engine.clear_region(1.0, 0.0, 1.0, 2.0)
 
 
+def test_clear_region_enables_full_paint_despite_untrusted_baseline(tmp_path):
+    """After clear_region, remapping must rewrite free cells (not extend_only)."""
+    engine = _engine(tmp_path, builtin_loop_closure=False)
+    with engine._lock:  # noqa: SLF001
+        grid = engine._grid  # noqa: SLF001
+        # Seed a wall inside the upcoming clear box so clear paints it free.
+        r_hole, c_hole = grid.world_to_cell(0.0, 0.0)
+        grid.log_odds[r_hole, c_hole] = occ.L_MAX
+        engine._session_baseline = occ.copy_grid(grid)  # noqa: SLF001
+        engine._map_health_base_src = engine._session_baseline  # noqa: SLF001
+        engine._map_health_base = {"trusted": False}  # noqa: SLF001
+        engine._mode = MODE_MAPPING  # noqa: SLF001
+
+    assert engine.diagnostics()["paint"]["extend_only"] is True
+
+    out = engine.clear_region(-0.5, -0.5, 0.5, 0.5)
+    assert out["operator_trusted_paint"] is True
+    paint = engine.diagnostics()["paint"]
+    assert paint["baseline_trusted"] is True
+    assert paint["extend_only"] is False
+    assert paint["operator_trusted"] is True
+    guide = engine.diagnostics()["mapping_guidance"]
+    assert guide["operator_trusted_paint"] is True
+    assert guide["suggested_action"]
+    assert (
+        "drive" in guide["suggested_action"].lower()
+        or "remap" in guide["suggested_action"].lower()
+    )
+
+    with engine._lock:  # noqa: SLF001
+        assert float(engine._grid.log_odds[r_hole, c_hole]) == float(occ.L_MIN)  # noqa: SLF001
+
+    # Full paint can rewrite the free hole; extend_only would leave L_MIN alone.
+    scan = conv.LaserScan2D(
+        ranges=np.array([1.0], dtype=float),
+        angle_min=0.0,
+        angle_increment=0.0,
+        range_min=0.05,
+        range_max=5.0,
+    )
+    engine._paint_mapping_scan(scan, conv.Pose2D(-1.0, 0.0, 0.0), now=1.0)  # noqa: SLF001
+    with engine._lock:  # noqa: SLF001
+        # One hit may not cross free→occupied; it must still move off L_MIN.
+        assert float(engine._grid.log_odds[r_hole, c_hole]) > float(occ.L_MIN)  # noqa: SLF001
+    assert engine.diagnostics()["paint"]["state"] == "painting"
+
+
+def test_mapping_guidance_warns_when_tearing(tmp_path):
+    engine = _engine(tmp_path)
+    with engine._lock:  # noqa: SLF001
+        engine._mode = MODE_MAPPING  # noqa: SLF001
+        engine._map_health = {  # noqa: SLF001
+            "status": "degrading",
+            "ghost_frac": 0.4,
+            "hotspots": [{"frac": 0.7, "x": 12.0, "y": -3.0}],
+        }
+        engine._map_health_base = {"trusted": False}  # noqa: SLF001
+        engine._session_baseline = occ.copy_grid(engine._grid)  # noqa: SLF001
+        engine._map_health_base_src = engine._session_baseline  # noqa: SLF001
+        engine._operator_trusted_paint = False  # noqa: SLF001
+    guide = engine.diagnostics()["mapping_guidance"]
+    assert guide["health_status"] == "degrading"
+    assert guide["extend_only"] is True
+    assert guide["suggested_action"]
+    assert (
+        "tear" in guide["suggested_action"].lower()
+        or "clear" in guide["suggested_action"].lower()
+    )
+    assert guide["hotspot_count"] == 1
+
+
 def test_clear_box_edit_survives_refill_then_reload(tmp_path):
     """Lidar may refill the hole before save; clear_box must still apply on load."""
     engine = _engine(tmp_path)
