@@ -233,6 +233,72 @@ def test_clear_map_requires_active_map(tmp_path: Path):
         asyncio.run(slam.do_command({"command": "clear_map"}))
 
 
+def test_clear_region_do_command_and_erase_region_alias(tmp_path: Path):
+    slam = SlamService("slam")
+    store = MapStore(str(tmp_path))
+    store.create_map("floor1")
+    store.set_active_map("floor1")
+    slam._map_store = store
+    mgr = MagicMock()
+    mgr.clear_region.return_value = {
+        "cleared_cells": 12,
+        "removed_nodes": 3,
+        "removed_edges": 4,
+        "remaining_nodes": 10,
+        "frozen": 10,
+        "generation": 7,
+    }
+    slam._manager = mgr
+
+    out = asyncio.run(
+        slam.do_command(
+            {
+                "command": "clear_region",
+                "x_min": 26.0,
+                "y_min": -20.0,
+                "x_max": 32.0,
+                "y_max": -11.0,
+                "save": True,
+            }
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["saved"] is True
+    assert out["removed_nodes"] == 3
+    mgr.clear_region.assert_called_once_with(26.0, -20.0, 32.0, -11.0)
+    handle = store.active_handle()
+    mgr.save_map.assert_called_once_with(handle.serialization_stem)
+
+    mgr.reset_mock()
+    mgr.clear_region.return_value = {"cleared_cells": 0, "removed_nodes": 0}
+    aliased = asyncio.run(
+        slam.do_command(
+            {
+                "command": "erase_region",
+                "x_min": 1.0,
+                "y_min": 2.0,
+                "x_max": 3.0,
+                "y_max": 4.0,
+            }
+        )
+    )
+    assert aliased["status"] == "ok"
+    assert aliased["saved"] is False
+    mgr.clear_region.assert_called_once_with(1.0, 2.0, 3.0, 4.0)
+    mgr.save_map.assert_not_called()
+
+
+def test_clear_region_do_command_requires_box(tmp_path: Path):
+    slam = SlamService("slam")
+    store = MapStore(str(tmp_path))
+    store.create_map("floor1")
+    store.set_active_map("floor1")
+    slam._map_store = store
+    slam._manager = MagicMock()
+    with pytest.raises(ValueError, match="x_min"):
+        asyncio.run(slam.do_command({"command": "clear_region", "x_min": 0.0}))
+
+
 def test_optimize_do_command_requires_mapping_mode(tmp_path: Path):
     slam = SlamService("slam")
     slam._cfg = SlamConfig.from_dict(

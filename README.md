@@ -689,6 +689,10 @@ is inside them.
 `list_maps`, `get_active_map`, `set_active_map`, `rename_map`, `delete_map`,
 `clear_map`, `clear_obstacles` (alias `erase_obstacles`; paint free space in a
 disk — builtin SLAM; args `x`/`y` or `pose`, `radius_m`, optional `save`),
+`clear_region` (alias `erase_region`; blank an axis-aligned box and drop
+keyframes whose poses fall inside it — builtin SLAM; args `x_min`/`y_min`/
+`x_max`/`y_max`, optional `save`; remaps a torn hallway without clearing the
+whole map),
 `start_mapping`, `start_localizing`, `save_map`,
 `optimize` (alias `optimize_graph`; mapping mode — force pose-graph SPA via
 serialize/deserialize reload),
@@ -703,7 +707,11 @@ since is dropped), `get_mode`, `get_status`
 (SLAM health; optional `probe_sensors: false` to skip a
 one-shot lidar/odom read; includes measured `scan_hz` / `lidar_read_hz` over
 the last ~2 s plus configured `scan_rate_hz` — with `map_when_still`, expect low
-`scan_hz` while driving), `set_initial_pose`,
+`scan_hz` while driving; builtin `paint` reports
+`painting` / `extend_only` / `held_turning` / `held_unmatched` / `held_lidar_odom`
+plus match score and whether the resumed baseline is trusted — while untrusted,
+mapping only paints into unknown cells so a torn prior cannot thicken),
+`set_initial_pose`,
 `global_localize` (lidar scan match against saved map; optional `full_map`,
 `search_radius_m`, `apply`, `local_yaw_window_deg`, `max_scan_points`,
 `auto_full_map_fallback`),

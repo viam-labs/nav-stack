@@ -57,6 +57,11 @@ class BuiltinSlamHost:
     def clear_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
         return self._engine.clear_obstacles(x_m, y_m, radius_m)
 
+    def clear_region(
+        self, x_min: float, y_min: float, x_max: float, y_max: float
+    ) -> dict:
+        return self._engine.clear_region(x_min, y_min, x_max, y_max)
+
     def add_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
         return self._engine.add_obstacles(x_m, y_m, radius_m)
 

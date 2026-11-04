@@ -178,6 +178,57 @@ def clear_disk(
     return cleared
 
 
+def clear_rect(
+    grid: LogOddsGrid,
+    x_min: float,
+    y_min: float,
+    x_max: float,
+    y_max: float,
+    *,
+    free_log_odds: Optional[float] = None,
+) -> int:
+    """Paint an axis-aligned box of free space (mutates in place).
+
+    Returns the number of cells written. Cells outside the current grid are
+    ignored. ``x_min``/``y_min`` need not be ordered relative to max.
+    """
+    res = float(grid.resolution)
+    if res <= 0:
+        raise ValueError("grid resolution must be > 0")
+    xa, xb = sorted((float(x_min), float(x_max)))
+    ya, yb = sorted((float(y_min), float(y_max)))
+    if xb <= xa or yb <= ya:
+        raise ValueError("clear_rect needs a non-empty box")
+
+    target = float(L_MIN) if free_log_odds is None else float(free_log_odds)
+    target = float(np.clip(target, L_MIN, L_MAX))
+
+    r0, c0 = grid.world_to_cell(xa, ya)
+    r1, c1 = grid.world_to_cell(xb, yb)
+    lo = grid.log_odds
+    h, w = lo.shape
+    # world_to_cell can flip when axes disagree with array layout — normalize.
+    rr0, rr1 = sorted((r0, r1))
+    cc0, cc1 = sorted((c0, c1))
+    rr0 = max(0, rr0)
+    rr1 = min(h - 1, rr1)
+    cc0 = max(0, cc0)
+    cc1 = min(w - 1, cc1)
+    if rr1 < rr0 or cc1 < cc0:
+        return 0
+
+    # Keep cells whose centers lie inside the world box (matches clear_disk).
+    rows = np.arange(rr0, rr1 + 1, dtype=np.int32)[:, None]
+    cols = np.arange(cc0, cc1 + 1, dtype=np.int32)[None, :]
+    cx = grid.origin_x + (cols + 0.5) * res
+    cy = grid.origin_y + (rows + 0.5) * res
+    mask = (cx >= xa) & (cx <= xb) & (cy >= ya) & (cy <= yb)
+    cleared = int(np.count_nonzero(mask))
+    if cleared:
+        lo[rr0 : rr1 + 1, cc0 : cc1 + 1][mask] = target
+    return cleared
+
+
 def mark_disk(
     grid: LogOddsGrid,
     x_m: float,
@@ -222,6 +273,10 @@ def mark_disk(
     return marked
 
 
+# Unobserved band used by ``to_occupancy_int16`` and extend-only paint.
+_UNKNOWN_ABS_LO = 0.05
+
+
 def insert_scan(
     grid: LogOddsGrid,
     pose_x: float,
@@ -234,8 +289,14 @@ def insert_scan(
     range_min: float,
     range_max: float,
     max_beams: int = 180,
+    extend_only: bool = False,
 ) -> LogOddsGrid:
-    """Ray-cast a lidar scan into the log-odds grid (mutates + may expand)."""
+    """Ray-cast a lidar scan into the log-odds grid (mutates + may expand).
+
+    With ``extend_only``, only unobserved cells are written — already free or
+    occupied cells stay put. Used when the resumed map baseline is untrusted
+    so a bad pose cannot thicken a twin wall or carve through a good one.
+    """
     ranges = np.asarray(ranges, dtype=float)
     if ranges.size == 0:
         return grid
@@ -267,7 +328,7 @@ def insert_scan(
     cols1 = np.floor((ex - grid.origin_x) / res).astype(np.int32)
     rows1 = np.floor((ey - grid.origin_y) / res).astype(np.int32)
     row0, col0 = grid.world_to_cell(float(pose_x), float(pose_y))
-    _paint_rays(grid.log_odds, row0, col0, rows1, cols1)
+    _paint_rays(grid.log_odds, row0, col0, rows1, cols1, extend_only=bool(extend_only))
     return grid
 
 
@@ -277,6 +338,8 @@ def _paint_rays(
     col0: int,
     rows1: np.ndarray,
     cols1: np.ndarray,
+    *,
+    extend_only: bool = False,
 ) -> None:
     """Mark Bresenham-like rays free, and their endpoints occupied.
 
@@ -291,10 +354,21 @@ def _paint_rays(
     steps = np.maximum(np.abs(dr), np.abs(dc))
     max_steps = int(steps.max())
     h, w = lo.shape
+
+    def _add(rows: np.ndarray, cols: np.ndarray, delta: float) -> None:
+        if rows.size == 0:
+            return
+        if extend_only:
+            keep = np.abs(lo[rows, cols]) <= _UNKNOWN_ABS_LO
+            rows, cols = rows[keep], cols[keep]
+            if rows.size == 0:
+                return
+        np.add.at(lo, (rows, cols), np.float32(delta))
+
     if max_steps <= 0:
         inside = (rows1 >= 0) & (rows1 < h) & (cols1 >= 0) & (cols1 < w)
         if np.any(inside):
-            np.add.at(lo, (rows1[inside], cols1[inside]), np.float32(L_OCC))
+            _add(rows1[inside], cols1[inside], L_OCC)
             np.clip(lo, L_MIN, L_MAX, out=lo)
         return
 
@@ -312,8 +386,8 @@ def _paint_rays(
     is_hit = (rr == rows1[:, None]) & (cc == cols1[:, None])
     free = valid & ~is_hit
     if np.any(free):
-        np.add.at(lo, (rr[free], cc[free]), np.float32(L_FREE))
+        _add(rr[free], cc[free], L_FREE)
     hit = (rows1 >= 0) & (rows1 < h) & (cols1 >= 0) & (cols1 < w)
     if np.any(hit):
-        np.add.at(lo, (rows1[hit], cols1[hit]), np.float32(L_OCC))
+        _add(rows1[hit], cols1[hit], L_OCC)
     np.clip(lo, L_MIN, L_MAX, out=lo)

@@ -261,3 +261,105 @@ def test_repeat_path_resets_pose_ten_times():
     # All runs should advance similarly from the same seed.
     assert min(ends) > 1.05
     assert max(ends) - min(ends) < 0.15
+
+
+def test_sim_clear_region_drops_keyframes_and_allows_remap(tmp_path: Path):
+    """Map a stretch, blank a box (occupancy + nodes), drive again into the hole."""
+    unregister_sim_world("clear-remap")
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "sim-base",
+            "sim": {
+                "enabled": True,
+                "world_name": "clear-remap",
+                "seed_x": 1.0,
+                "seed_y": 1.0,
+                "seed_theta": 0.0,
+            },
+            "maps_dir": str(tmp_path),
+            "mode": "mapping",
+            "builtin_loop_closure": False,
+            "builtin_repair_on_save": False,
+        }
+    )
+    world = ensure_sim_world_from_slam_cfg(cfg)
+    sensors = SimSensors(world)
+    store = MapStore(str(tmp_path))
+    store.get_or_create_map("default", resolution=0.05)
+    store.set_active_map("default")
+    engine = BuiltinSlamEngine(cfg, sensors, store, rate_hz=20.0)  # type: ignore[arg-type]
+    engine.set_pose(conv.Pose2D(1.0, 1.0, 0.0))
+    host = BuiltinSlamHost(engine)
+    host.start()
+    try:
+        world.set_velocity_ros(0.35, 0.0, 0.0)
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+            if len(engine._graph) >= 5:  # noqa: SLF001
+                break
+        world.stop()
+        time.sleep(0.3)
+        n_before = len(engine._graph)  # noqa: SLF001
+        assert n_before >= 3, f"expected keyframes, got {n_before}"
+
+        # Cover the middle keyframe(s) with a generous AABB.
+        xs = [n.pose.x for n in engine._graph.nodes]  # noqa: SLF001
+        ys = [n.pose.y for n in engine._graph.nodes]  # noqa: SLF001
+        mid_i = n_before // 2
+        box = (
+            xs[mid_i] - 0.8,
+            min(ys) - 1.0,
+            xs[mid_i] + 0.8,
+            max(ys) + 1.0,
+        )
+        # Ensure the box has something to clear.
+        m = host.get_map()
+        assert m is not None
+        grid = np.asarray(m["grid"])
+        res = float(m["resolution"])
+        ox, oy = float(m["origin_x"]), float(m["origin_y"])
+
+        def _cell(x, y):
+            return int((y - oy) / res), int((x - ox) / res)
+
+        r0, c0 = _cell(box[0], box[1])
+        r1, c1 = _cell(box[2], box[3])
+        rr0, rr1 = sorted((r0, r1))
+        cc0, cc1 = sorted((c0, c1))
+        before_occ = int(np.sum(grid[rr0 : rr1 + 1, cc0 : cc1 + 1] >= 50))
+
+        out = host.clear_region(*box)
+        assert out["removed_nodes"] >= 1
+        assert out["remaining_nodes"] < n_before
+        paint = engine.diagnostics()["paint"]
+        assert "state" in paint
+
+        m2 = host.get_map()
+        assert m2 is not None
+        grid2 = np.asarray(m2["grid"])
+        after_occ = int(np.sum(grid2[rr0 : rr1 + 1, cc0 : cc1 + 1] >= 50))
+        if before_occ > 0:
+            assert after_occ < before_occ
+
+        # Remap: drive through the cleared stretch again.
+        updates_before = int(engine.diagnostics()["paint"]["map_updates"])
+        world.set_velocity_ros(0.3, 0.0, 0.0)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+            if int(engine.diagnostics()["paint"]["map_updates"]) > updates_before:
+                break
+        world.stop()
+        assert int(engine.diagnostics()["paint"]["map_updates"]) > updates_before
+
+        map_dir = store.active_handle().root
+        saved = engine.save_map(map_dir, repair=False)
+        assert saved["keyframes"] in ("saved", "none")
+        if saved["keyframes"] == "saved":
+            resumed = BuiltinSlamEngine(cfg, sensors, store, rate_hz=5.0)  # type: ignore[arg-type]
+            resumed.configure_mode("mapping", map_dir)
+            assert len(resumed._graph) == out["remaining_nodes"]  # noqa: SLF001
+    finally:
+        host.shutdown()
+        unregister_sim_world("clear-remap")

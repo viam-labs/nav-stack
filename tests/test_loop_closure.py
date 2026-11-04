@@ -497,6 +497,70 @@ def test_loop_pending_expires_instead_of_hanging(monkeypatch):
         assert diag["pending_tries"] < cfg.builtin_loop_pending_max_tries
 
 
+def test_large_shift_loop_needs_three_agreeing_detections(monkeypatch):
+    """A ≥1 m snap stays pending after the second agree; closes on the third."""
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "maps_dir": "/tmp",
+            "mode": "mapping",
+            "builtin_loop_closure": True,
+            "builtin_loop_pending_max_tries": 10,
+            "builtin_loop_pending_max_s": 60.0,
+        }
+    )
+    engine = BuiltinSlamEngine(cfg, _Sensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    scan = conv.LaserScan2D(np.full(180, 2.0), -math.pi, 2 * math.pi / 180, 0.05, 8.0)
+    for i in range(20):
+        engine._graph.add_scan(conv.Pose2D(0.5 * i, 0.0, 0.0), scan)  # noqa: SLF001
+    engine._pose = conv.Pose2D(9.5, 0.0, 0.0)  # noqa: SLF001
+
+    n = {"i": 0}
+
+    def fake_detect(snap, params, resolution=0.05, base=None, **_kw):
+        n["i"] += 1
+        cur = len(snap) - 1
+        prior = snap.pose(cur)
+        # Stable 1.5 m XY correction — large enough to need 3 agrees.
+        matched = conv.Pose2D(prior.x + 1.5, prior.y, prior.theta)
+        cov = np.diag([0.05**2, 0.05**2, math.radians(1.0) ** 2])
+        return (
+            loop_closure.LoopMatch(
+                pose=matched,
+                fit=0.8,
+                overlap=0.8,
+                prior_fit=0.4,
+                cov=cov,
+                points=100,
+                anchor=0,
+                gap_m=20.0,
+            ),
+            "ok",
+        )
+
+    monkeypatch.setattr(loop_closure, "detect", fake_detect)
+
+    # Bypass optimize/render: we only care that the agree gate holds.
+    monkeypatch.setattr(
+        engine,
+        "_optimize_and_render",
+        lambda *a, **k: {"status": "rebuilt", "optimize_ms": 0, "render_ms": 0},
+    )
+
+    statuses = []
+    for _ in range(3):
+        engine._graph.add_scan(  # noqa: SLF001
+            conv.Pose2D(0.5 * (20 + n["i"]), 0.0, 0.0), scan
+        )
+        statuses.append(engine.run_loop_closure().get("status"))
+
+    assert statuses[0] == "pending"
+    assert statuses[1] == "pending"  # second agree still shy of 3
+    assert statuses[2] == "rebuilt"
+    assert engine.diagnostics()["loop_closure"]["closures"] == 1
+
+
 def test_set_pose_jump_does_not_become_odometry():
     graph = pg.PoseGraph(node_spacing_m=0.5)
     scan = conv.LaserScan2D(np.array([2.0]), 0.0, 0.0, 0.1, 10.0)

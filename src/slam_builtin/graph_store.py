@@ -14,7 +14,7 @@ import hashlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -23,9 +23,18 @@ from .pose_graph import GraphEdge, GraphNode, GraphScan
 from .types import LogOddsGrid
 
 KEYFRAMES_FILENAME = "keyframes.npz"
-FORMAT_VERSION = 1
+# v1: edit_xyr (N,3) for clear/mark disks. v2: edit_params (N,4) also holds
+# clear_box as (x_min, y_min, x_max, y_max); disks pad the 4th column with 0.
+FORMAT_VERSION = 2
+_SUPPORTED_VERSIONS = frozenset({1, 2})
 
-_EDIT_KINDS = ("clear", "mark")
+_EDIT_KINDS = ("clear", "mark", "clear_box")
+
+# Disk erase/paint: (kind, x, y, radius). Box erase: (kind, x0, y0, x1, y1).
+GridEdit = Union[
+    Tuple[str, float, float, float],
+    Tuple[str, float, float, float, float],
+]
 
 
 @dataclass
@@ -35,7 +44,7 @@ class SavedGraph:
     last_seq: int
     resolution: float
     base: Optional[LogOddsGrid] = None
-    edits: List[Tuple[str, float, float, float]] = field(default_factory=list)
+    edits: List[GridEdit] = field(default_factory=list)
 
 
 def keyframes_path(map_dir: Path) -> Path:
@@ -49,6 +58,28 @@ def file_sha1(path: Path) -> Optional[str]:
         return None
 
 
+def _edit_params_row(edit: GridEdit) -> List[float]:
+    kind = edit[0]
+    if kind == "clear_box":
+        if len(edit) != 5:
+            raise ValueError("clear_box edit needs x_min,y_min,x_max,y_max")
+        return [float(edit[1]), float(edit[2]), float(edit[3]), float(edit[4])]
+    if len(edit) < 4:
+        raise ValueError(f"{kind} edit needs x,y,radius")
+    return [float(edit[1]), float(edit[2]), float(edit[3]), 0.0]
+
+
+def _decode_edit(kind_i: int, row: Sequence[float], *, version: int) -> GridEdit:
+    kind = _EDIT_KINDS[int(kind_i)] if int(kind_i) < len(_EDIT_KINDS) else None
+    if kind is None:
+        raise ValueError(f"unknown edit kind {kind_i}")
+    if kind == "clear_box":
+        if version < 2 or len(row) < 4:
+            raise ValueError("clear_box requires format v2")
+        return (kind, float(row[0]), float(row[1]), float(row[2]), float(row[3]))
+    return (kind, float(row[0]), float(row[1]), float(row[2]))
+
+
 def save_graph(
     map_dir: Path,
     *,
@@ -58,7 +89,7 @@ def save_graph(
     resolution: float,
     image_sha1: str,
     base: Optional[LogOddsGrid] = None,
-    edits: Optional[List[Tuple[str, float, float, float]]] = None,
+    edits: Optional[List[GridEdit]] = None,
 ) -> Path:
     """Atomically write ``keyframes.npz`` for the image hashed ``image_sha1``."""
     scans = [(k, s) for k, n in enumerate(nodes) for s in n.scans]
@@ -105,9 +136,9 @@ def save_graph(
         "edit_kind": np.array(
             [_EDIT_KINDS.index(k) for k, *_ in edit_list], dtype=np.int8
         ),
-        "edit_xyr": np.array(
-            [[x, y, r] for _, x, y, r in edit_list], dtype=np.float64
-        ).reshape(-1, 3),
+        "edit_params": np.array(
+            [_edit_params_row(e) for e in edit_list], dtype=np.float64
+        ).reshape(-1, 4),
     }
     if base is not None:
         arrays["base_log_odds"] = np.asarray(base.log_odds, dtype=np.float16)
@@ -136,18 +167,19 @@ def load_graph(
         return None
     try:
         with np.load(path, allow_pickle=False) as z:
-            if int(z["version"]) != FORMAT_VERSION:
+            version = int(z["version"])
+            if version not in _SUPPORTED_VERSIONS:
                 return None
             if str(z["image_sha1"]) != image_sha1:
                 return None
             if abs(float(z["resolution"]) - float(resolution)) > 1e-9:
                 return None
-            return _decode(z)
+            return _decode(z, version=version)
     except (OSError, KeyError, ValueError, IndexError):
         return None
 
 
-def _decode(z) -> SavedGraph:
+def _decode(z, *, version: int) -> SavedGraph:
     node_pose = z["node_pose"]
     nodes = [
         GraphNode(
@@ -198,9 +230,13 @@ def _decode(z) -> SavedGraph:
                 loop=bool(loop),
             )
         )
+    if version >= 2 and "edit_params" in z.files:
+        rows = z["edit_params"]
+    else:
+        rows = z["edit_xyr"]
     edits = [
-        (_EDIT_KINDS[int(kind)], float(x), float(y), float(r))
-        for kind, (x, y, r) in zip(z["edit_kind"], z["edit_xyr"])
+        _decode_edit(int(kind), row, version=version)
+        for kind, row in zip(z["edit_kind"], rows)
     ]
     base = None
     if "base_log_odds" in z.files:

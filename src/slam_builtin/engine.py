@@ -124,6 +124,10 @@ class BuiltinSlamEngine:
         self._last_lin_rate = 0.0
         self._insert_skips_unmatched = 0
         self._insert_skips_turning = 0
+        # Operator-facing paint status (see diagnostics ``paint``).
+        self._paint_state = "idle"
+        self._paint_last_fit: Optional[str] = None
+        self._paint_last_at = 0.0
         # Last time we ran a full-circle heading search to unstick paint.
         self._last_heading_recover_at = 0.0
         self._heading_recovers = 0
@@ -478,6 +482,69 @@ class BuiltinSlamEngine:
                 "resolution": float(self._grid.resolution),
             }
 
+    def clear_region(
+        self,
+        x_min: float,
+        y_min: float,
+        x_max: float,
+        y_max: float,
+    ) -> dict:
+        """Blank an AABB in occupancy and drop keyframes whose pose lies inside.
+
+        Remap a torn hallway without clearing the whole map: occupancy is
+        painted free, in-box pose-graph nodes (and their edges) are removed,
+        and a ``clear_box`` edit is recorded so later re-renders keep the hole.
+        Session baseline / map-health cache are refreshed so trust can recover.
+        """
+        xa, xb = sorted((float(x_min), float(x_max)))
+        ya, yb = sorted((float(y_min), float(y_max)))
+        if xb <= xa or yb <= ya:
+            raise ValueError("clear_region needs a non-empty box")
+        with self._lock:
+            updated = occ.copy_grid(self._grid)
+            cleared = occ.clear_rect(updated, xa, ya, xb, yb)
+            self._grid = updated
+            self._grid_edits.append(("clear_box", xa, ya, xb, yb))
+
+            frozen = int(self._graph_frozen)
+
+            def _in_box(_i: int, node: pg.GraphNode) -> bool:
+                return xa <= float(node.pose.x) <= xb and ya <= float(node.pose.y) <= yb
+
+            kept_frozen = sum(
+                1
+                for i, node in enumerate(self._graph.nodes)
+                if i < frozen and not _in_box(i, node)
+            )
+            removed, edges_removed = self._graph.remove_nodes(_in_box)
+            self._graph_frozen = kept_frozen
+            if removed:
+                self._graph_revision += 1
+                self._loop_pending = None
+
+            # Post-clear grid is the new session truth so health/trust can recover.
+            self._session_baseline = occ.copy_grid(self._grid)
+            self._map_health_base_src = None
+            self._map_health_base_cells = None
+            self._map_health_base = None
+            self._map_health_at = 0.0
+
+            self._invalidate_occ_cache()
+            self._generation += 1
+            return {
+                "cleared_cells": int(cleared),
+                "removed_nodes": int(len(removed)),
+                "removed_edges": int(edges_removed),
+                "remaining_nodes": int(len(self._graph)),
+                "frozen": int(self._graph_frozen),
+                "x_min": xa,
+                "y_min": ya,
+                "x_max": xb,
+                "y_max": yb,
+                "generation": int(self._generation),
+                "resolution": float(self._grid.resolution),
+            }
+
     def add_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
         """Paint occupied cells in a disk (map frame meters). Builtin only."""
         with self._lock:
@@ -615,11 +682,14 @@ class BuiltinSlamEngine:
         )
 
     def _replay_grid_edits_locked(self, grid: LogOddsGrid) -> None:
-        for kind, x, y, r in self._grid_edits:
+        for edit in self._grid_edits:
+            kind = edit[0]
             if kind == "clear":
-                occ.clear_disk(grid, x, y, r)
+                occ.clear_disk(grid, edit[1], edit[2], edit[3])
+            elif kind == "clear_box":
+                occ.clear_rect(grid, edit[1], edit[2], edit[3], edit[4])
             else:
-                occ.mark_disk(grid, x, y, r)
+                occ.mark_disk(grid, edit[1], edit[2], edit[3])
 
     # Corrections up to this yaw are spread along the loop by the pose graph;
     # bigger ones (yaw flip, far relocalize) shift the trailing path rigidly.
@@ -638,6 +708,11 @@ class BuiltinSlamEngine:
     _LOOP_MAX_CHI2 = 25.0
     _LOOP_REBUILD_MIN_M = 0.08
     _LOOP_REBUILD_MIN_DEG = 1.0
+    # Small snaps close after two agreeing detections; multi-meter corridor
+    # twins need a longer chain (same idea as repair.required_run).
+    _LOOP_AGREE_DEFAULT = 2
+    _LOOP_LARGE_SHIFT_M = 1.0
+    _LOOP_AGREE_LARGE = 3
 
     @classmethod
     def _revisit_edge_sigmas(cls, score: Optional[float]) -> tuple[float, float]:
@@ -1121,8 +1196,18 @@ class BuiltinSlamEngine:
             conv.normalize_angle(pa.theta - pb.theta)
         ) <= math.radians(2.0)
 
+    def _loop_agrees_needed(self, shift_m: float) -> int:
+        """Agreeing detections required before committing a loop of this size."""
+        if float(shift_m) >= self._LOOP_LARGE_SHIFT_M:
+            return int(self._LOOP_AGREE_LARGE)
+        return int(self._LOOP_AGREE_DEFAULT)
+
     def run_loop_closure(self) -> dict:
-        """One detection pass on the newest keyframe; closes after two agree."""
+        """One detection pass on the newest keyframe; closes after N agree.
+
+        Small snaps need two agreeing detections; multi-meter shifts need three
+        so a twin-corridor hit cannot weld aisles on a short streak.
+        """
         if not self._loop_closure_enabled():
             return {"status": "disabled"}
         if not self._graph_job.acquire(blocking=False):
@@ -1160,15 +1245,17 @@ class BuiltinSlamEngine:
             prior = snap.pose(cur)
             corr = pg.world_correction(prior, match.pose)
             edge = self._loop_edge(snap, cur, match)
+            shift_m = math.hypot(match.pose.x - prior.x, match.pose.y - prior.y)
+            need = self._loop_agrees_needed(shift_m)
             now_mono = time.monotonic()
             pending = self._loop_pending
             pending_max_s, pending_max_tries = self._pending_limits()
-            # A pending match that never finds an agreeing second detection used
+            # Pending tuple: (revision, cur, corr, edges, t0, tries, need).
+            # A pending match that never finds enough agreeing detections used
             # to sit ``pending=true`` forever while the map kept tearing. Expire
             # it so the next cycle starts clean — never apply a single unconfirmed
-            # edge (that is what the two-agree gate is for). When map health is
-            # degrading the window is stretched so a doorway pass still has time
-            # to land the second agreeing hit.
+            # edge. When map health is degrading the window is stretched so a
+            # doorway pass still has time to land the remaining agreeing hits.
             if pending is not None:
                 age_s = now_mono - pending[4]
                 if age_s >= pending_max_s or pending[5] >= pending_max_tries:
@@ -1186,7 +1273,15 @@ class BuiltinSlamEngine:
             )
             if not agree:
                 if pending is None:
-                    self._loop_pending = (revision, cur, corr, edge, now_mono, 1)
+                    self._loop_pending = (
+                        revision,
+                        cur,
+                        corr,
+                        [edge],
+                        now_mono,
+                        1,
+                        need,
+                    )
                     return {"status": "pending"}
                 tries = pending[5] + 1
                 if (
@@ -1200,18 +1295,47 @@ class BuiltinSlamEngine:
                     )
                     # Arm a fresh pending from this match so the next agreeing
                     # detection can still close; do not leave the old one hanging.
-                    self._loop_pending = (revision, cur, corr, edge, now_mono, 1)
+                    self._loop_pending = (
+                        revision,
+                        cur,
+                        corr,
+                        [edge],
+                        now_mono,
+                        1,
+                        need,
+                    )
                     return {"status": "pending_expired"}
-                self._loop_pending = (revision, cur, corr, edge, pending[4], tries)
+                self._loop_pending = (
+                    revision,
+                    cur,
+                    corr,
+                    [edge],
+                    pending[4],
+                    tries,
+                    need,
+                )
                 return {"status": "pending"}
-            edges = [pending[3], edge]
+            edges = list(pending[3]) + [edge]
+            chain_need = max(int(pending[6]), need)
+            if len(edges) < chain_need:
+                # Agreeing hits do not burn the expiry try budget — only
+                # disagreeing replacements do (above).
+                self._loop_pending = (
+                    revision,
+                    cur,
+                    corr,
+                    edges,
+                    pending[4],
+                    pending[5],
+                    chain_need,
+                )
+                return {"status": "pending"}
             self._loop_pending = None
             with self._lock:
                 if self._graph_revision != revision:
                     return {"status": "aborted"}
                 for e in edges:
                     self._graph.add_edge(e)
-            shift_m = math.hypot(match.pose.x - prior.x, match.pose.y - prior.y)
             shift_deg = abs(
                 math.degrees(conv.normalize_angle(match.pose.theta - prior.theta))
             )
@@ -1261,9 +1385,13 @@ class BuiltinSlamEngine:
             seed_pending = self._seed_localize_pending
             mode = self._mode
             res = float(self._grid.resolution)
+            # Write the live graph whenever it has nodes (mapping, or
+            # localizing after resume / clear_region node drops). Flat
+            # localizing with an empty graph still falls through to the
+            # append-edits path below.
             payload = (
                 self._graph_payload_locked()
-                if keep_keyframes and mode == MODE_MAPPING and len(self._graph) > 0
+                if keep_keyframes and len(self._graph) > 0
                 else None
             )
             new_edits = list(self._grid_edits[self._grid_edits_saved :])
@@ -1538,11 +1666,14 @@ class BuiltinSlamEngine:
         res: float,
     ) -> map_health.MapHealth:
         grid = pg.render_grid(snap, resolution=res, poses=poses, base=base)
-        for kind, x, y, r in edits:
+        for edit in edits:
+            kind = edit[0]
             if kind == "clear":
-                occ.clear_disk(grid, x, y, r)
+                occ.clear_disk(grid, edit[1], edit[2], edit[3])
+            elif kind == "clear_box":
+                occ.clear_rect(grid, edit[1], edit[2], edit[3], edit[4])
             else:
-                occ.mark_disk(grid, x, y, r)
+                occ.mark_disk(grid, edit[1], edit[2], edit[3])
         return map_health.assess_occupancy(
             occ.to_occupancy_int16(grid),
             resolution=res,
@@ -1763,6 +1894,22 @@ class BuiltinSlamEngine:
                 "insert_skips_turning": self._insert_skips_turning,
                 "insert_skips_unmatched": self._insert_skips_unmatched,
                 "heading_recovers": self._heading_recovers,
+                "paint": {
+                    "state": self._paint_state,
+                    "last_fit": self._paint_last_fit,
+                    "age_s": (
+                        None
+                        if self._paint_last_at <= 0.0
+                        else round(time.monotonic() - self._paint_last_at, 2)
+                    ),
+                    "last_score": self._last_match_score,
+                    "prior_score": self._last_prior_score,
+                    "skips_turning": self._insert_skips_turning,
+                    "skips_unmatched": self._insert_skips_unmatched,
+                    "map_updates": self._updates,
+                    "baseline_trusted": self._baseline_trusted_locked(),
+                    "extend_only": not self._baseline_trusted_locked(),
+                },
                 "map_health": self.map_health(),
                 "repair": self.repair_status(),
                 "generation": self._generation,
@@ -1980,12 +2127,14 @@ class BuiltinSlamEngine:
             if use_lo and not lo_ok and self._last_insert_pose is not None:
                 # No scan match: the pose is a guess. Painting there doubles walls.
                 self._lo_inserts_held += 1
+                self._note_paint("held_lidar_odom", now)
             elif self._spinning(yaw_rate, lin_rate):
                 # A turn smears a scan and the wheel heading is the part that
                 # slips. Hold the frames and draw them once a still scan lines
                 # up with the map.
                 self._remember_spin_scan(scan, now, capture_motion)
                 self._insert_skips_turning += 1
+                self._note_paint("held_turning", now)
             elif self._spin_hold:
                 self._flush_spin_hold(scan, now, capture_motion)
             elif not self._scan_fits_map(scan, scan_pose):
@@ -1998,6 +2147,7 @@ class BuiltinSlamEngine:
                     self._maybe_insert_scan(scan, now, capture_motion=capture_motion)
                 else:
                     self._insert_skips_unmatched += 1
+                    self._note_paint("held_unmatched", now, fit="miss")
             else:
                 self._maybe_insert_scan(scan, now, capture_motion=capture_motion)
 
@@ -2336,6 +2486,13 @@ class BuiltinSlamEngine:
             self._spin_hold.clear()
             self._log("dropped mapping spin buffer; the turn ran too long")
 
+    def _note_paint(self, state: str, now: float, *, fit: Optional[str] = None) -> None:
+        """Record the latest mapping-paint decision for ``get_status``."""
+        self._paint_state = str(state)
+        self._paint_last_at = float(now)
+        if fit is not None:
+            self._paint_last_fit = str(fit)
+
     def _scan_map_fit(self, scan: conv.LaserScan2D, pose: conv.Pose2D) -> str:
         """``open``, ``fit``, or ``miss`` for painting ``scan`` at ``pose``."""
         try:
@@ -2440,6 +2597,7 @@ class BuiltinSlamEngine:
             found, found_score = self._search_heading_for_scan(scan, pose)
             if found is None:
                 self._insert_skips_unmatched += len(held)
+                self._note_paint("held_unmatched", now, fit="miss")
                 self._log(
                     "dropped mapping spin; stopped scan does not match "
                     f"the map (score={found_score:.2f})"
@@ -2466,11 +2624,12 @@ class BuiltinSlamEngine:
             frames = self._mapping_frames()
         with self._lock:
             src = self._grid
+            extend_only = not self._baseline_trusted_locked()
         band_scans = self._band_scans(frames)
         primary_band = 0
         if band_scans:
             painted, bands, primary, extras, primary_band = self._paint_height_bands(
-                pose_snap, band_scans, src
+                pose_snap, band_scans, src, extend_only=extend_only
             )
         else:
             painted = occ.insert_scan(
@@ -2485,6 +2644,7 @@ class BuiltinSlamEngine:
                 range_max=float(scan.range_max)
                 if math.isfinite(scan.range_max)
                 else 30.0,
+                extend_only=extend_only,
             )
             bands = None
             primary, extras = scan, None
@@ -2498,6 +2658,9 @@ class BuiltinSlamEngine:
             self._last_insert_pose = pose_snap
             self._last_insert_at = now
             self._updates += 1
+            self._note_paint(
+                "extend_only" if extend_only else "painting", now, fit="fit"
+            )
             if self._mode == MODE_MAPPING:
                 hook = self._keyframe_hook
                 nodes = len(self._graph)
@@ -2559,7 +2722,14 @@ class BuiltinSlamEngine:
             range_max=range_max,
         )
 
-    def _paint_height_bands(self, pose: conv.Pose2D, scans: dict, src: LogOddsGrid):
+    def _paint_height_bands(
+        self,
+        pose: conv.Pose2D,
+        scans: dict,
+        src: LogOddsGrid,
+        *,
+        extend_only: bool = False,
+    ):
         from .height_bands import compress_bands, cover_bands
 
         with self._lock:
@@ -2587,6 +2757,7 @@ class BuiltinSlamEngine:
                 float(scan.angle_increment),
                 range_min=float(scan.range_min),
                 range_max=limit if math.isfinite(limit) else 30.0,
+                extend_only=extend_only,
             )
         bands = cover_bands(bands)
         fused = compress_bands(bands)
