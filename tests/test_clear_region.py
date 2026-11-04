@@ -41,13 +41,9 @@ def _node(x: float, y: float, travel: float = 0.0) -> pg.GraphNode:
 
 def _chain_edges(n: int) -> list:
     info = np.eye(3) * 10.0
-    edges = [
-        pg.GraphEdge(pg.PRIOR_NODE, 0, conv.Pose2D(0.0, 0.0, 0.0), info.copy())
-    ]
+    edges = [pg.GraphEdge(pg.PRIOR_NODE, 0, conv.Pose2D(0.0, 0.0, 0.0), info.copy())]
     for i in range(n - 1):
-        edges.append(
-            pg.GraphEdge(i, i + 1, conv.Pose2D(1.0, 0.0, 0.0), info.copy())
-        )
+        edges.append(pg.GraphEdge(i, i + 1, conv.Pose2D(1.0, 0.0, 0.0), info.copy()))
     # Loop that will be dropped when a middle node is removed.
     if n >= 4:
         edges.append(
@@ -61,9 +57,7 @@ def test_pose_graph_remove_nodes_renumbers_edges():
     graph.nodes = [_node(float(i), 0.0, float(i)) for i in range(5)]
     graph.edges = _chain_edges(5)
     # Drop nodes at x=1 and x=2 (indices 1, 2).
-    removed, n_edges = graph.remove_nodes(
-        lambda _i, node: 0.5 <= node.pose.x <= 2.5
-    )
+    removed, n_edges = graph.remove_nodes(lambda _i, node: 0.5 <= node.pose.x <= 2.5)
     assert removed == [1, 2]
     assert n_edges >= 3  # chain edges into/out of 1,2 plus loop 0->3
     assert [(n.pose.x, n.pose.y) for n in graph.nodes] == [
@@ -189,7 +183,8 @@ def test_clear_region_drops_inbox_nodes_and_persists(tmp_path):
     assert engine._map_health_base is None  # noqa: SLF001
     assert engine._session_baseline is not None  # noqa: SLF001
     assert np.array_equal(  # noqa: SLF001
-        engine._session_baseline.log_odds, engine._grid.log_odds  # noqa: SLF001
+        engine._session_baseline.log_odds,
+        engine._grid.log_odds,  # noqa: SLF001
     )
 
     map_dir = tmp_path / "m"

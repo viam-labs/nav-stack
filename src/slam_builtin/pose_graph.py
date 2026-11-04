@@ -174,9 +174,7 @@ class PoseGraph:
             if i not in remap:
                 edges_removed += 1
                 continue
-            kept_edges.append(
-                GraphEdge(remap[i], remap[j], e.rel, e.info, loop=e.loop)
-            )
+            kept_edges.append(GraphEdge(remap[i], remap[j], e.rel, e.info, loop=e.loop))
         self.edges = kept_edges
         if len(self.nodes) < self.max_nodes:
             self.full = False

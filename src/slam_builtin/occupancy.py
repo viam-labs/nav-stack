@@ -328,9 +328,7 @@ def insert_scan(
     cols1 = np.floor((ex - grid.origin_x) / res).astype(np.int32)
     rows1 = np.floor((ey - grid.origin_y) / res).astype(np.int32)
     row0, col0 = grid.world_to_cell(float(pose_x), float(pose_y))
-    _paint_rays(
-        grid.log_odds, row0, col0, rows1, cols1, extend_only=bool(extend_only)
-    )
+    _paint_rays(grid.log_odds, row0, col0, rows1, cols1, extend_only=bool(extend_only))
     return grid
 
 

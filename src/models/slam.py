@@ -2075,9 +2075,7 @@ class SlamService(SLAM):
         mgr = self._manager
         assert store is not None and mgr is not None
         missing = [
-            k
-            for k in ("x_min", "y_min", "x_max", "y_max")
-            if command.get(k) is None
+            k for k in ("x_min", "y_min", "x_max", "y_max") if command.get(k) is None
         ]
         if missing:
             raise ValueError(
@@ -2090,9 +2088,7 @@ class SlamService(SLAM):
             x_max = float(command["x_max"])
             y_max = float(command["y_max"])
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "x_min, y_min, x_max, y_max must be numbers"
-            ) from exc
+            raise ValueError("x_min, y_min, x_max, y_max must be numbers") from exc
 
         def _clear():
             clear_fn = getattr(mgr, "clear_region", None)

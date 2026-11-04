@@ -2486,9 +2486,7 @@ class BuiltinSlamEngine:
             self._spin_hold.clear()
             self._log("dropped mapping spin buffer; the turn ran too long")
 
-    def _note_paint(
-        self, state: str, now: float, *, fit: Optional[str] = None
-    ) -> None:
+    def _note_paint(self, state: str, now: float, *, fit: Optional[str] = None) -> None:
         """Record the latest mapping-paint decision for ``get_status``."""
         self._paint_state = str(state)
         self._paint_last_at = float(now)
