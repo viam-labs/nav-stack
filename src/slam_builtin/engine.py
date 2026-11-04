@@ -249,6 +249,9 @@ class BuiltinSlamEngine:
         self._map_health_base_src: Optional[LogOddsGrid] = None
         self._map_health_base_cells: Optional[np.ndarray] = None
         self._map_health_base: Optional[dict] = None
+        # After clear_region the operator intends to remap the hole: keep full
+        # paint even if residual map_health still scores the baseline torn.
+        self._operator_trusted_paint = False
         self._keyframe_hook = None
         # Optional: SlamService wires this into LocalizationStateTracker so a
         # tick that trusts the published pose clears / avoids ``lost``.
@@ -330,6 +333,7 @@ class BuiltinSlamEngine:
         with self._lock:
             self._mode = mode
             self._pose_restored_from_disk = False
+            self._operator_trusted_paint = False
             loaded = None
             if map_dir is not None:
                 self._map_dir = Path(map_dir)
@@ -450,6 +454,7 @@ class BuiltinSlamEngine:
             self._invalidate_occ_cache()
             self._generation += 1
             self._pose_restored_from_disk = False
+            self._operator_trusted_paint = False
             self._reset_lidar_odom_locked()
             map_dir = self._map_dir
         if map_dir is not None:
@@ -561,9 +566,18 @@ class BuiltinSlamEngine:
             self._map_health_base_cells = None
             self._map_health_base = None
             self._map_health_at = 0.0
+            # Free cells in the hole need full paint to grow walls again;
+            # residual ghosts elsewhere must not trap us in extend_only.
+            self._operator_trusted_paint = True
             out["generation"] = int(self._generation)
             out["remaining_nodes"] = int(len(self._graph))
             out["frozen"] = int(self._graph_frozen)
+            out["operator_trusted_paint"] = True
+            self._log(
+                "clear_region: full paint enabled for remap "
+                f"(box=[{xa:.1f},{ya:.1f}]–[{xb:.1f},{yb:.1f}], "
+                f"removed={n_removed} nodes)"
+            )
         return out
 
     def add_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
@@ -1116,7 +1130,7 @@ class BuiltinSlamEngine:
                     f"angle_std={base_health.angle_std_deg:.1f}deg; "
                     "scoring only walls this session adds"
                 )
-                if not trusted:
+                if not trusted and not self._operator_trusted_paint:
                     self._log(
                         "WARNING: mapping resumed on a damaged map (ghost walls / "
                         "skewed tiles); loop closure and revisit will not snap "
@@ -1150,8 +1164,12 @@ class BuiltinSlamEngine:
                 for k, v in self._map_health_base.items()
                 if k not in ("origin_x", "origin_y")
             }
-            if not self._map_health_base["trusted"]:
+            if self._operator_trusted_paint:
+                payload["recommendation"] = "remap_cleared_region"
+            elif not self._map_health_base["trusted"]:
                 payload["recommendation"] = "clear_map"
+        elif self._operator_trusted_paint:
+            payload["recommendation"] = "remap_cleared_region"
         prev = self._map_health_last_status
         if health.status != prev and health.status in ("watch", "degrading"):
             self._map_health_boosts += 1
@@ -1179,7 +1197,14 @@ class BuiltinSlamEngine:
         return str(self._map_health.get("status") or "cold")
 
     def _baseline_trusted_locked(self) -> bool:
-        """False when the map this session resumed on was scored as torn."""
+        """False when the map this session resumed on was scored as torn.
+
+        ``clear_region`` sets ``_operator_trusted_paint`` so the cleared hole
+        can be remapped with full paint even if leftover ghosts still make
+        the baseline health look ``degrading``.
+        """
+        if self._operator_trusted_paint:
+            return True
         baseline = self._session_baseline
         return not (
             baseline is not None
@@ -1187,6 +1212,83 @@ class BuiltinSlamEngine:
             and self._map_health_base is not None
             and not self._map_health_base["trusted"]
         )
+
+    def _mapping_guidance_locked(self) -> dict:
+        """Mid-session coach for drive-around map quality (operator UX)."""
+        health = self._map_health if isinstance(self._map_health, dict) else {}
+        status = str(health.get("status") or "cold")
+        trusted = self._baseline_trusted_locked()
+        extend_only = not trusted
+        operator = bool(self._operator_trusted_paint)
+        hotspots = health.get("hotspots") or []
+        repair = (
+            dict(self._repair_status) if isinstance(self._repair_status, dict) else {}
+        )
+        reasons: list[str] = []
+        actions: list[str] = []
+
+        if status in ("watch", "degrading"):
+            reasons.append(f"map_health={status}")
+            if status == "degrading":
+                actions.append(
+                    "Map is tearing — clear the doubled stretch before you rely on Save"
+                )
+            else:
+                actions.append(
+                    "Map health is watch — revisit doorways or clear hotspots if walls look doubled"
+                )
+            if isinstance(hotspots, list) and hotspots:
+                top = hotspots[0] if isinstance(hotspots[0], dict) else None
+                if top and top.get("x") is not None and top.get("y") is not None:
+                    actions.append(
+                        f"Clear region around ({float(top['x']):.1f}, "
+                        f"{float(top['y']):.1f}) then re-drive that corridor"
+                    )
+
+        if operator:
+            reasons.append("remap_after_clear")
+            actions.append(
+                "Cleared region is ready — drive it to remap (full paint enabled)"
+            )
+        elif extend_only:
+            reasons.append("untrusted_baseline")
+            actions.append(
+                "Paint is extend-only on an untrusted map — clear_region torn areas "
+                "(or clear_map) so walls can be rewritten"
+            )
+
+        repair_state = str(repair.get("state") or "")
+        repair_status = str(repair.get("status") or "")
+        if repair_state in ("running", "started") or repair_status in (
+            "running",
+            "started",
+        ):
+            reasons.append("repair_running")
+            actions.append(
+                "Map repair is running — wait before navigating on this save"
+            )
+        elif repair_status == "kept":
+            reasons.append("repair_kept")
+            actions.append(
+                "Save-time repair did not apply — clear_region hotspots or keep mapping"
+            )
+
+        # Dedupe while preserving order.
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for a in actions:
+            if a not in seen:
+                seen.add(a)
+                uniq.append(a)
+        return {
+            "suggested_action": uniq[0] if uniq else None,
+            "actions": uniq[:4],
+            "reasons": reasons,
+            "operator_trusted_paint": operator,
+            "extend_only": extend_only,
+            "health_status": status,
+            "hotspot_count": (len(hotspots) if isinstance(hotspots, list) else 0),
+        }
 
     def _live_first_free(self, first_free: int) -> int:
         """Live corrections never move keyframes reloaded from the saved map."""
@@ -1936,8 +2038,10 @@ class BuiltinSlamEngine:
                     "map_updates": self._updates,
                     "baseline_trusted": self._baseline_trusted_locked(),
                     "extend_only": not self._baseline_trusted_locked(),
+                    "operator_trusted": bool(self._operator_trusted_paint),
                 },
                 "map_health": self.map_health(),
+                "mapping_guidance": self._mapping_guidance_locked(),
                 "repair": self.repair_status(),
                 "generation": self._generation,
                 "seed_localize_pending": self._seed_localize_pending,
