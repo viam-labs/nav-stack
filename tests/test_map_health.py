@@ -287,3 +287,147 @@ def test_engine_pending_and_revisit_react_to_health(tmp_path):
     assert deg_tries >= watch_tries
     assert engine.mapping_revisit_interval_s(20.0) == 6.0
     assert "map_health" in engine.diagnostics()
+
+
+def _engine_heal(tmp_path, **extra):
+    from src.config import SlamConfig
+    from src.nav.stores.maps import MapStore
+    from src.slam_builtin.engine import BuiltinSlamEngine
+
+    class _Sensors:
+        def get_scan(self, max_age_s: float = 2.0, *, fresh: bool = False):
+            return None
+
+        def get_odom(self):
+            return None
+
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "maps_dir": str(tmp_path),
+            "mode": "mapping",
+            "map_health_auto_heal": True,
+            "map_health_auto_clear": True,
+            "map_health_hotspot_persist_n": 2,
+            "map_health_auto_clear_cooldown_s": 0.0,
+            "map_health_auto_clear_pad_m": 2.5,
+            "builtin_repair_on_save": False,
+            **extra,
+        }
+    )
+    return BuiltinSlamEngine(cfg, _Sensors(), MapStore(str(tmp_path)), rate_hz=5.0)  # type: ignore[arg-type]
+
+
+def test_hotspot_auto_heal_tracks_then_clears(tmp_path):
+    from src.slam_builtin import occupancy as occ
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine_heal(tmp_path)
+    torn, res = _ghost_hallway()
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        torn, resolution=res, origin_x=0.0, origin_y=0.0
+    )
+    engine._session_baseline = None  # noqa: SLF001
+
+    first = engine.refresh_map_health(force=True)
+    assert first["status"] == "degrading"
+    assert first["hotspots"]
+    tracked = first["hotspot_heal"]["tracked"]
+    assert tracked is not None
+    assert tracked["streak"] == 1
+    assert first["hotspot_heal"]["clears"] == 0
+    assert engine.mapping_revisit_interval_s(20.0) == 6.0
+
+    engine._generation += 1  # noqa: SLF001
+    second = engine.refresh_map_health(force=True)
+    assert second["hotspot_heal"]["clears"] == 1
+    assert second.get("auto_cleared") is not None
+    assert engine._operator_trusted_paint is True  # noqa: SLF001
+    assert second["recommendation"] == "remap_cleared_region"
+    # Track reset after clear so the next clear needs a fresh streak.
+    assert second["hotspot_heal"]["tracked"] is None
+    assert engine.diagnostics()["hotspot_heal"]["clears"] == 1
+
+
+def test_hotspot_auto_heal_watch_does_not_clear(tmp_path):
+    from src.slam_builtin import occupancy as occ
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine_heal(tmp_path, map_health_hotspot_persist_n=1)
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    # Inject a watch payload path by stubbing assess to return watch+hotspot.
+    cells = np.full((80, 80), 0, dtype=np.int16)
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        cells, resolution=0.05, origin_x=0.0, origin_y=0.0
+    )
+    engine._session_baseline = None  # noqa: SLF001
+
+    def fake_assess(*_a, **_kw):
+        return map_health.MapHealth(
+            status="watch",
+            ghost_frac=0.15,
+            thick_frac=0.0,
+            angle_std_deg=5.0,
+            occupied_cells=500,
+            hotspots=((0.4, 1.0, 2.0),),
+        )
+
+    import src.slam_builtin.map_health as mh
+
+    orig = mh.assess_occupancy
+    mh.assess_occupancy = fake_assess  # type: ignore[assignment]
+    try:
+        out = engine.refresh_map_health(force=True)
+    finally:
+        mh.assess_occupancy = orig  # type: ignore[assignment]
+    assert out["status"] == "watch"
+    assert out["hotspot_heal"]["tracked"]["streak"] == 1
+    assert out["hotspot_heal"]["clears"] == 0
+    assert "auto_cleared" not in out
+
+
+def test_hotspot_auto_clear_respects_cooldown(tmp_path):
+    import time
+
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine_heal(
+        tmp_path,
+        map_health_hotspot_persist_n=1,
+        map_health_auto_clear_cooldown_s=999.0,
+    )
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    # Simulate a clear that just fired; the next degrading hit must wait.
+    engine._hotspot_last_clear_at = time.monotonic()  # noqa: SLF001
+    health = {
+        "status": "degrading",
+        "hotspots": [{"frac": 0.5, "x": 1.0, "y": 2.0}],
+    }
+    out = engine._maybe_auto_heal_hotspot(health, now=time.monotonic())  # noqa: SLF001
+    assert out is None
+    assert engine._hotspot_heal["skips"].get("cooldown", 0) >= 1  # noqa: SLF001
+    assert engine._hotspot_heal["clears"] == 0  # noqa: SLF001
+
+
+def test_hotspot_auto_clear_can_be_disabled(tmp_path):
+    from src.slam_builtin import occupancy as occ
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine_heal(
+        tmp_path,
+        map_health_auto_clear=False,
+        map_health_hotspot_persist_n=1,
+    )
+    torn, res = _ghost_hallway()
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        torn, resolution=res, origin_x=0.0, origin_y=0.0
+    )
+    engine._session_baseline = None  # noqa: SLF001
+    out = engine.refresh_map_health(force=True)
+    assert out["hotspot_heal"]["tracked"]["streak"] == 1
+    assert out["hotspot_heal"]["auto_clear"] is False
+    assert out["hotspot_heal"]["clears"] == 0
+    assert engine._operator_trusted_paint is False  # noqa: SLF001

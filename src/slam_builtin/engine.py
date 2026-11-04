@@ -252,6 +252,16 @@ class BuiltinSlamEngine:
         # After clear_region the operator intends to remap the hole: keep full
         # paint even if residual map_health still scores the baseline torn.
         self._operator_trusted_paint = False
+        # Mid-session hotspot auto-heal (map_health_auto_heal / _auto_clear).
+        self._hotspot_track: Optional[dict] = None
+        self._hotspot_last_clear_at = 0.0
+        self._hotspot_heal_busy = False
+        self._hotspot_heal: dict = {
+            "clears": 0,
+            "last": None,
+            "tracked": None,
+            "skips": {},
+        }
         self._keyframe_hook = None
         # Optional: SlamService wires this into LocalizationStateTracker so a
         # tick that trusts the published pose clears / avoids ``lost``.
@@ -334,6 +344,14 @@ class BuiltinSlamEngine:
             self._mode = mode
             self._pose_restored_from_disk = False
             self._operator_trusted_paint = False
+            self._hotspot_track = None
+            self._hotspot_last_clear_at = 0.0
+            self._hotspot_heal = {
+                "clears": 0,
+                "last": None,
+                "tracked": None,
+                "skips": {},
+            }
             loaded = None
             if map_dir is not None:
                 self._map_dir = Path(map_dir)
@@ -569,6 +587,9 @@ class BuiltinSlamEngine:
             # Free cells in the hole need full paint to grow walls again;
             # residual ghosts elsewhere must not trap us in extend_only.
             self._operator_trusted_paint = True
+            # Manual or auto clear: drop the streak so we do not clear again
+            # until a new hotspot persists.
+            self._hotspot_track = None
             out["generation"] = int(self._generation)
             out["remaining_nodes"] = int(len(self._graph))
             out["frozen"] = int(self._graph_frozen)
@@ -1180,6 +1201,24 @@ class BuiltinSlamEngine:
                 f"hotspots={len(health.hotspots)}"
             )
         self._map_health_last_status = health.status
+        auto_cleared = None
+        if not self._hotspot_heal_busy:
+            self._hotspot_heal_busy = True
+            try:
+                auto_cleared = self._maybe_auto_heal_hotspot(payload, now=now)
+            finally:
+                self._hotspot_heal_busy = False
+        payload["hotspot_heal"] = self._hotspot_heal_snapshot()
+        if auto_cleared is not None:
+            payload["recommendation"] = "remap_cleared_region"
+            payload["auto_cleared"] = {
+                "cleared_cells": auto_cleared.get("cleared_cells"),
+                "removed_nodes": auto_cleared.get("removed_nodes"),
+                "x_min": auto_cleared.get("x_min"),
+                "y_min": auto_cleared.get("y_min"),
+                "x_max": auto_cleared.get("x_max"),
+                "y_max": auto_cleared.get("y_max"),
+            }
         self._map_health = payload
         self._map_health_at = now
         self._map_health_generation = gen
@@ -1192,6 +1231,146 @@ class BuiltinSlamEngine:
             out["age_s"] = round(time.monotonic() - self._map_health_at, 2)
         out["boosts"] = self._map_health_boosts
         return out
+
+    def _hotspot_heal_snapshot(self) -> dict:
+        track = self._hotspot_track
+        tracked = None
+        if isinstance(track, dict):
+            tracked = {
+                "x": round(float(track["x"]), 1),
+                "y": round(float(track["y"]), 1),
+                "frac": round(float(track.get("frac") or 0.0), 2),
+                "status": str(track.get("status") or ""),
+                "streak": int(track.get("streak") or 0),
+            }
+        heal = self._hotspot_heal
+        return {
+            "enabled": bool(getattr(self._cfg, "map_health_auto_heal", False)),
+            "auto_clear": bool(getattr(self._cfg, "map_health_auto_clear", False)),
+            "clears": int(heal.get("clears") or 0),
+            "last": heal.get("last"),
+            "tracked": tracked,
+            "skips": dict(heal.get("skips") or {}),
+        }
+
+    def _hotspot_heal_note_skip(self, reason: str) -> None:
+        skips = self._hotspot_heal.setdefault("skips", {})
+        skips[reason] = int(skips.get(reason) or 0) + 1
+
+    def _maybe_auto_heal_hotspot(self, health: dict, *, now: float) -> Optional[dict]:
+        """Track sustained ghost hotspots; auto ``clear_region`` when degrading.
+
+        Returns the ``clear_region`` result when a clear fired, else ``None``.
+        Revisit cadence already tightens via ``mapping_revisit_interval_s`` while
+        status is watch/degrading; this only adds streak tracking + optional clear.
+        """
+        cfg = self._cfg
+        if not bool(getattr(cfg, "map_health_auto_heal", False)):
+            self._hotspot_track = None
+            return None
+        if self._mode != MODE_MAPPING:
+            self._hotspot_track = None
+            return None
+
+        status = str(health.get("status") or "cold")
+        hotspots = health.get("hotspots") or []
+        top: Optional[tuple[float, float, float]] = None
+        if isinstance(hotspots, list) and hotspots:
+            h0 = hotspots[0]
+            if (
+                isinstance(h0, dict)
+                and h0.get("x") is not None
+                and h0.get("y") is not None
+            ):
+                top = (
+                    float(h0["x"]),
+                    float(h0["y"]),
+                    float(h0.get("frac") or 0.0),
+                )
+
+        match_m = max(0.5, float(cfg.map_health_hotspot_match_m))
+        persist_n = max(1, int(cfg.map_health_hotspot_persist_n))
+        track = self._hotspot_track
+
+        if top is None or status not in ("watch", "degrading"):
+            self._hotspot_track = None
+            return None
+
+        tx, ty, tfrac = top
+        if (
+            track is not None
+            and math.hypot(tx - float(track["x"]), ty - float(track["y"])) <= match_m
+        ):
+            track["x"] = 0.7 * float(track["x"]) + 0.3 * tx
+            track["y"] = 0.7 * float(track["y"]) + 0.3 * ty
+            track["frac"] = tfrac
+            track["status"] = status
+            track["streak"] = int(track.get("streak") or 0) + 1
+            track["last_at"] = now
+        else:
+            track = {
+                "x": tx,
+                "y": ty,
+                "frac": tfrac,
+                "status": status,
+                "streak": 1,
+                "last_at": now,
+            }
+            self._hotspot_track = track
+
+        if not bool(getattr(cfg, "map_health_auto_clear", False)):
+            return None
+        if status != "degrading":
+            return None
+        if int(track["streak"]) < persist_n:
+            return None
+
+        cooldown = max(0.0, float(cfg.map_health_auto_clear_cooldown_s))
+        if (
+            self._hotspot_last_clear_at > 0.0
+            and now - self._hotspot_last_clear_at < cooldown
+        ):
+            self._hotspot_heal_note_skip("cooldown")
+            return None
+
+        repair = self._repair_status if isinstance(self._repair_status, dict) else {}
+        repair_state = str(repair.get("state") or repair.get("status") or "")
+        if repair_state in ("running", "started"):
+            self._hotspot_heal_note_skip("repair_running")
+            return None
+
+        pad = max(0.5, float(cfg.map_health_auto_clear_pad_m))
+        cx = float(track["x"])
+        cy = float(track["y"])
+        xa, ya, xb, yb = cx - pad, cy - pad, cx + pad, cy + pad
+        try:
+            result = self.clear_region(xa, ya, xb, yb)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"map health auto clear failed: {exc}")
+            self._hotspot_heal_note_skip("clear_failed")
+            return None
+
+        self._hotspot_last_clear_at = now
+        self._hotspot_heal["clears"] = int(self._hotspot_heal.get("clears") or 0) + 1
+        self._hotspot_heal["last"] = {
+            "cleared_cells": result.get("cleared_cells"),
+            "removed_nodes": result.get("removed_nodes"),
+            "x_min": result.get("x_min"),
+            "y_min": result.get("y_min"),
+            "x_max": result.get("x_max"),
+            "y_max": result.get("y_max"),
+            "rebuilt": result.get("rebuilt"),
+            "center": {"x": round(cx, 1), "y": round(cy, 1)},
+            "streak": persist_n,
+            "trigger": "degrading_hotspot",
+        }
+        self._log(
+            "map health auto clear "
+            f"center=({cx:.1f},{cy:.1f}) pad={pad:.1f}m "
+            f"removed={result.get('removed_nodes')} "
+            f"cells={result.get('cleared_cells')}"
+        )
+        return result
 
     def _map_health_status(self) -> str:
         return str(self._map_health.get("status") or "cold")
@@ -1227,17 +1406,43 @@ class BuiltinSlamEngine:
         reasons: list[str] = []
         actions: list[str] = []
 
+        heal = health.get("hotspot_heal") if isinstance(health, dict) else None
+        if not isinstance(heal, dict):
+            heal = self._hotspot_heal_snapshot()
+        tracked = heal.get("tracked") if isinstance(heal, dict) else None
+        auto_heal_on = bool(heal.get("enabled")) if isinstance(heal, dict) else False
+        auto_clear_on = (
+            bool(heal.get("auto_clear")) if isinstance(heal, dict) else False
+        )
+
         if status in ("watch", "degrading"):
             reasons.append(f"map_health={status}")
             if status == "degrading":
-                actions.append(
-                    "Map is tearing — clear the doubled stretch before you rely on Save"
-                )
+                if auto_heal_on and auto_clear_on:
+                    actions.append(
+                        "Map is tearing — auto-heal will clear a sustained hotspot; "
+                        "revisit doorways meanwhile"
+                    )
+                else:
+                    actions.append(
+                        "Map is tearing — clear the doubled stretch before you rely on Save"
+                    )
             else:
                 actions.append(
                     "Map health is watch — revisit doorways or clear hotspots if walls look doubled"
                 )
-            if isinstance(hotspots, list) and hotspots:
+            if isinstance(tracked, dict) and tracked.get("x") is not None:
+                streak = int(tracked.get("streak") or 0)
+                actions.append(
+                    f"Hotspot tracked at ({float(tracked['x']):.1f}, "
+                    f"{float(tracked['y']):.1f}) streak={streak}"
+                    + (
+                        " — auto clear pending"
+                        if auto_clear_on and status == "degrading"
+                        else ""
+                    )
+                )
+            elif isinstance(hotspots, list) and hotspots:
                 top = hotspots[0] if isinstance(hotspots[0], dict) else None
                 if top and top.get("x") is not None and top.get("y") is not None:
                     actions.append(
@@ -1288,6 +1493,7 @@ class BuiltinSlamEngine:
             "extend_only": extend_only,
             "health_status": status,
             "hotspot_count": (len(hotspots) if isinstance(hotspots, list) else 0),
+            "hotspot_heal": heal if isinstance(heal, dict) else None,
         }
 
     def _live_first_free(self, first_free: int) -> int:
@@ -1307,9 +1513,19 @@ class BuiltinSlamEngine:
     def mapping_revisit_interval_s(self, default_s: float) -> float:
         """Shorter revisit cadence while map health is watch/degrading."""
         boost = self._MAP_HEALTH_REVISIT_S.get(self._map_health_status())
-        if boost is None:
-            return float(default_s)
-        return float(min(float(default_s), float(boost)))
+        interval = float(default_s)
+        if boost is not None:
+            interval = min(interval, float(boost))
+        # Sustained hotspot under auto-heal: check even sooner so a doorway
+        # pass can correct before auto-clear fires.
+        track = self._hotspot_track
+        if (
+            bool(getattr(self._cfg, "map_health_auto_heal", False))
+            and isinstance(track, dict)
+            and int(track.get("streak") or 0) >= 2
+        ):
+            interval = min(interval, 5.0)
+        return float(interval)
 
     @staticmethod
     def _loop_edge(
@@ -2042,6 +2258,7 @@ class BuiltinSlamEngine:
                 },
                 "map_health": self.map_health(),
                 "mapping_guidance": self._mapping_guidance_locked(),
+                "hotspot_heal": self._hotspot_heal_snapshot(),
                 "repair": self.repair_status(),
                 "generation": self._generation,
                 "seed_localize_pending": self._seed_localize_pending,

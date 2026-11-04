@@ -882,6 +882,15 @@ class SlamConfig:
     # Save the keyframe pose graph (``keyframes.npz``) with map.pgm so a later
     # mapping session reloads it and repair can re-solve old geometry.
     builtin_save_keyframes: bool = True
+    # Mid-session map-health heal: track sustained ghost hotspots, tighten
+    # revisit while tearing, and optionally auto ``clear_region`` when a
+    # hotspot stays ``degrading`` across several health samples.
+    map_health_auto_heal: bool = True
+    map_health_auto_clear: bool = True
+    map_health_hotspot_persist_n: int = 3
+    map_health_hotspot_match_m: float = 3.0
+    map_health_auto_clear_pad_m: float = 2.5
+    map_health_auto_clear_cooldown_s: float = 90.0
     # After save_map while mapping, re-detect loops over the whole graph in the
     # background and apply only if the map was torn and gets clearly healthier.
     builtin_repair_on_save: bool = True
@@ -1236,6 +1245,15 @@ class SlamConfig:
                 or (slam_backend == SLAM_BACKEND_BUILTIN and mode == MODE_MAPPING),
             )
         )
+        map_health_auto_heal = bool(
+            d.get(
+                "map_health_auto_heal",
+                slam_backend == SLAM_BACKEND_BUILTIN and mode == MODE_MAPPING,
+            )
+        )
+        map_health_auto_clear = bool(
+            d.get("map_health_auto_clear", map_health_auto_heal)
+        )
         mapping_revisit_while_moving = bool(
             d.get(
                 "mapping_revisit_while_moving",
@@ -1287,6 +1305,8 @@ class SlamConfig:
             "wall_yaw_correction": wall_yaw_correction,
             "mapping_revisit_check": mapping_revisit_check,
             "mapping_revisit_while_moving": mapping_revisit_while_moving,
+            "map_health_auto_heal": map_health_auto_heal,
+            "map_health_auto_clear": map_health_auto_clear,
             "base_velocity_convention": convention,
             "map": MapSettings.from_dict(stb_raw),
             "slam_params": slam_params_raw,
