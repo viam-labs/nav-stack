@@ -148,19 +148,23 @@ def assess_occupancy(
     )
     mature = n_occ >= _MATURE_OCC_CELLS
     raw = _status(ghost_frac, angle_std)
-    # Immature maps often look doubled while the first room is still filling
-    # in. Live status stays watch; raw_status keeps the true score for trust.
-    if not mature and raw == "degrading":
-        status = "watch"
+    # Immature / first-room maps: lidar thickness and partial paint look like
+    # ghosts. Suppress watch/degrading (+ hotspots) so the UI does not scream
+    # before the operator has even driven; clean immature maps still report ok.
+    # raw_status keeps the true score for resumed-baseline trust.
+    if not mature and raw in ("watch", "degrading"):
+        status = "cold"
+        live_hotspots: Tuple[Tuple[float, float, float], ...] = ()
     else:
         status = raw
+        live_hotspots = () if not mature else tuple(hotspots)
     return MapHealth(
         status=status,
         ghost_frac=ghost_frac,
         thick_frac=thick_frac,
         angle_std_deg=angle_std,
         occupied_cells=n_occ,
-        hotspots=tuple(hotspots),
+        hotspots=live_hotspots,
         mature=mature,
         raw_status=raw,
     )
