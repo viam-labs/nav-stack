@@ -191,13 +191,30 @@ class VisionSupervisor:
             return None
         color_blob, depth_blob = pick_named_images(images)
         if color_blob is None or depth_blob is None:
-            self._last_error = f"{lidar.name}: need color+depth in get_images"
+            summary = []
+            for im in images:
+                n = getattr(im, "name", "?")
+                m = getattr(im, "mime_type", getattr(im, "mimeType", "?"))
+                d = getattr(im, "data", b"")
+                summary.append(f"{n}:{m}:{len(d) if d is not None else 0}B")
+            self._last_error = (
+                f"{lidar.name}: need color+depth in get_images "
+                f"(got [{', '.join(summary)}])"
+            )
             return None
         try:
             color = decode_color_image(color_blob["data"], color_blob["mime"])
-            depth = decode_depth_image(depth_blob["data"], depth_blob["mime"])
+            depth = decode_depth_image(
+                depth_blob["data"],
+                depth_blob["mime"],
+                named_image=depth_blob.get("raw"),
+            )
         except Exception as exc:  # noqa: BLE001
-            self._last_error = f"decode({lidar.name}): {exc}"
+            self._last_error = (
+                f"decode({lidar.name}): color={color_blob['name']}/"
+                f"{color_blob['mime']} depth={depth_blob['name']}/"
+                f"{depth_blob['mime']}: {exc}"
+            )
             return None
         if color.shape[:2] != depth.shape[:2]:
             # Resize depth with nearest neighbor to color size.
