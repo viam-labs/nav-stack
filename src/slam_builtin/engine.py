@@ -249,6 +249,10 @@ class BuiltinSlamEngine:
         self._map_health_base_src: Optional[LogOddsGrid] = None
         self._map_health_base_cells: Optional[np.ndarray] = None
         self._map_health_base: Optional[dict] = None
+        # Fresh mapping has no loaded-map baseline; snapshot the grid whenever
+        # health is ok so re-driving known walls is not scored as tearing.
+        self._map_health_ok_cells: Optional[np.ndarray] = None
+        self._map_health_ok_origin: tuple[float, float] = (0.0, 0.0)
         # After clear_region the operator intends to remap the hole: keep full
         # paint even if residual map_health still scores the baseline torn.
         self._operator_trusted_paint = False
@@ -352,6 +356,8 @@ class BuiltinSlamEngine:
                 "tracked": None,
                 "skips": {},
             }
+            self._map_health_ok_cells = None
+            self._map_health_ok_origin = (0.0, 0.0)
             loaded = None
             if map_dir is not None:
                 self._map_dir = Path(map_dir)
@@ -584,6 +590,10 @@ class BuiltinSlamEngine:
             self._map_health_base_cells = None
             self._map_health_base = None
             self._map_health_at = 0.0
+            # Cleared hole is new truth — drop the ok-checkpoint so health
+            # re-learns from the remapped walls.
+            self._map_health_ok_cells = None
+            self._map_health_ok_origin = (0.0, 0.0)
             # Free cells in the hole need full paint to grow walls again;
             # residual ghosts elsewhere must not trap us in extend_only.
             self._operator_trusted_paint = True
@@ -1167,6 +1177,7 @@ class BuiltinSlamEngine:
                         "is recommended"
                     )
             baseline = None
+            scope = "map"
             if self._map_health_base_cells is not None and self._map_health_base:
                 baseline = map_health.align_grid(
                     self._map_health_base_cells,
@@ -1177,6 +1188,20 @@ class BuiltinSlamEngine:
                     to_origin_y=oy,
                     resolution=res,
                 )
+                scope = "session"
+            elif self._map_health_ok_cells is not None:
+                # Fresh map: score only walls added since the last ok snapshot
+                # so re-driving known territory does not look like tearing.
+                baseline = map_health.align_grid(
+                    self._map_health_ok_cells,
+                    origin_x=self._map_health_ok_origin[0],
+                    origin_y=self._map_health_ok_origin[1],
+                    shape=grid.shape,
+                    to_origin_x=ox,
+                    to_origin_y=oy,
+                    resolution=res,
+                )
+                scope = "since_ok"
             health = map_health.assess_occupancy(
                 grid, resolution=res, origin_x=ox, origin_y=oy, baseline=baseline
             )
@@ -1185,7 +1210,7 @@ class BuiltinSlamEngine:
             return dict(self._map_health)
         payload = health.as_dict()
         payload["age_s"] = 0.0
-        payload["scope"] = "session" if baseline is not None else "map"
+        payload["scope"] = scope
         if self._map_health_base is not None:
             payload["baseline"] = {
                 k: v
@@ -1208,6 +1233,19 @@ class BuiltinSlamEngine:
                 f"hotspots={len(health.hotspots)}"
             )
         self._map_health_last_status = health.status
+        # Advance the fresh-map ok checkpoint when the live map looks clean
+        # (including early ``cold`` that is actually clean). Do not advance
+        # while raw watch/degrading so a real tear stays visible against the
+        # last good snapshot — and so re-driving known walls is excluded.
+        raw = str(getattr(health, "raw_status", None) or health.status)
+        if (
+            self._map_health_base_cells is None
+            and health.status in ("ok", "cold")
+            and raw in ("ok", "cold")
+            and int(health.occupied_cells) >= int(map_health._MIN_OCC_CELLS)
+        ):
+            self._map_health_ok_cells = np.array(grid, copy=True)
+            self._map_health_ok_origin = (ox, oy)
         auto_cleared = None
         if not self._hotspot_heal_busy:
             self._hotspot_heal_busy = True

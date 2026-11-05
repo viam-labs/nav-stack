@@ -94,8 +94,9 @@ def assess_occupancy(
         base = np.asarray(baseline)
         if base.shape != cells.shape:
             raise ValueError("baseline must match the grid shape")
-        # One-cell slack so re-observing a known wall is not "new".
-        focus = occ & ~_dilate(base >= 50)
+        # Two-cell slack (~10 cm at 5 cm res) so re-driving a known wall with
+        # normal pose jitter is not scored as a brand-new ridge.
+        focus = occ & ~_dilate_n(base >= 50, 2)
     n_occ = int(focus.sum())
     if n_occ < _MIN_OCC_CELLS:
         return MapHealth(
@@ -249,6 +250,13 @@ def _dilate(mask: np.ndarray) -> np.ndarray:
     out[:-1, :] |= mask[1:, :]
     out[:, 1:] |= mask[:, :-1]
     out[:, :-1] |= mask[:, 1:]
+    return out
+
+
+def _dilate_n(mask: np.ndarray, n: int) -> np.ndarray:
+    out = np.asarray(mask, dtype=bool)
+    for _ in range(max(0, int(n))):
+        out = _dilate(out)
     return out
 
 
