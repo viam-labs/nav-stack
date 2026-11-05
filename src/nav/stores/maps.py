@@ -116,6 +116,7 @@ class MapHandle:
             self.occupancy_yaml_path,
             self.root / "map.pgm",
             self.root / "keyframes.npz",
+            self.root / "embedding_landmarks.npz",
             self.last_pose_path,
         ):
             if path.exists():

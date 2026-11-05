@@ -1,0 +1,394 @@
+"""Embedding landmark map: candidates, promotion, demotion, visible set."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from ..geom import conversions as conv
+from .types import LandmarkStatus
+
+
+@dataclass
+class EmbeddingLandmark:
+    landmark_id: int
+    anchor_node: int
+    # Position relative to the anchor keyframe pose (base_link of that node).
+    rel_xyz: np.ndarray  # (3,)
+    normal_rel: np.ndarray  # (3,) facing outward-ish in anchor frame
+    descriptors: List[np.ndarray] = field(default_factory=list)  # up to 3 (D,)
+    observations: int = 0
+    view_poses_xy: List[Tuple[float, float]] = field(default_factory=list)
+    position_std_m: float = float("inf")
+    status: LandmarkStatus = LandmarkStatus.CANDIDATE
+    # Running mean in map frame while candidate (for std); cleared on confirm.
+    _map_samples: List[np.ndarray] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class EmbeddingLandmarkMap:
+    """Session landmark store keyed by integer id."""
+
+    associate_radius_m: float = 0.10
+    promote_min_obs: int = 3
+    promote_min_views: int = 2
+    promote_min_view_gap_m: float = 0.5
+    promote_max_std_m: float = 0.05
+    demote_offset_m: float = 0.15
+    demote_passes: int = 3
+    max_descriptors: int = 3
+    cell_m: float = 0.15
+    cosine_threshold: float = 0.55
+
+    def __post_init__(self) -> None:
+        self._next_id = 1
+        self._landmarks: Dict[int, EmbeddingLandmark] = {}
+        self._cell_index: Dict[Tuple[int, int, int], List[int]] = {}
+        self._demote_strikes: Dict[int, int] = {}
+
+    def __len__(self) -> int:
+        return len(self._landmarks)
+
+    def get(self, landmark_id: int) -> Optional[EmbeddingLandmark]:
+        return self._landmarks.get(int(landmark_id))
+
+    def all_landmarks(self) -> List[EmbeddingLandmark]:
+        return list(self._landmarks.values())
+
+    def confirmed(self) -> List[EmbeddingLandmark]:
+        return [
+            lm
+            for lm in self._landmarks.values()
+            if lm.status == LandmarkStatus.CONFIRMED
+        ]
+
+    @staticmethod
+    def _cell(xyz: np.ndarray, cell_m: float) -> Tuple[int, int, int]:
+        c = max(1e-6, float(cell_m))
+        return (
+            int(math.floor(float(xyz[0]) / c)),
+            int(math.floor(float(xyz[1]) / c)),
+            int(math.floor(float(xyz[2]) / c)),
+        )
+
+    def _index_add(self, lm: EmbeddingLandmark, map_xyz: np.ndarray) -> None:
+        cell = self._cell(map_xyz, self.cell_m)
+        self._cell_index.setdefault(cell, []).append(lm.landmark_id)
+
+    def _neighbors(
+        self, map_xyz: np.ndarray, *, radius_m: Optional[float] = None
+    ) -> List[EmbeddingLandmark]:
+        base = self._cell(map_xyz, self.cell_m)
+        reach = 1
+        if radius_m is not None and radius_m > 0.0:
+            reach = max(1, int(math.ceil(float(radius_m) / max(1e-6, float(self.cell_m)))))
+        out: List[EmbeddingLandmark] = []
+        seen: set = set()
+        for dx in range(-reach, reach + 1):
+            for dy in range(-reach, reach + 1):
+                for dz in range(-reach, reach + 1):
+                    key = (base[0] + dx, base[1] + dy, base[2] + dz)
+                    for lid in self._cell_index.get(key, ()):
+                        if lid in seen:
+                            continue
+                        lm = self._landmarks.get(lid)
+                        if lm is not None and lm.status != LandmarkStatus.MOVED:
+                            seen.add(lid)
+                            out.append(lm)
+        return out
+
+    @staticmethod
+    def map_point_from_rel(anchor_pose: conv.Pose2D, rel_xyz: np.ndarray) -> np.ndarray:
+        c, s = math.cos(anchor_pose.theta), math.sin(anchor_pose.theta)
+        x = anchor_pose.x + c * float(rel_xyz[0]) - s * float(rel_xyz[1])
+        y = anchor_pose.y + s * float(rel_xyz[0]) + c * float(rel_xyz[1])
+        return np.array([x, y, float(rel_xyz[2])], dtype=float)
+
+    @staticmethod
+    def rel_from_map_point(anchor_pose: conv.Pose2D, map_xyz: np.ndarray) -> np.ndarray:
+        dx = float(map_xyz[0]) - anchor_pose.x
+        dy = float(map_xyz[1]) - anchor_pose.y
+        c, s = math.cos(anchor_pose.theta), math.sin(anchor_pose.theta)
+        return np.array(
+            [c * dx + s * dy, -s * dx + c * dy, float(map_xyz[2])], dtype=float
+        )
+
+    @staticmethod
+    def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+        a = np.asarray(a, dtype=float).reshape(-1)
+        b = np.asarray(b, dtype=float).reshape(-1)
+        na = float(np.linalg.norm(a))
+        nb = float(np.linalg.norm(b))
+        if na < 1e-12 or nb < 1e-12:
+            return -1.0
+        return float(np.dot(a, b) / (na * nb))
+
+    def _best_desc_cosine(self, lm: EmbeddingLandmark, desc: np.ndarray) -> float:
+        if not lm.descriptors:
+            return -1.0
+        return max(self._cosine(d, desc) for d in lm.descriptors)
+
+    def observe(
+        self,
+        *,
+        map_xyz: np.ndarray,
+        descriptor: np.ndarray,
+        normal_map: np.ndarray,
+        anchor_node: int,
+        anchor_pose: conv.Pose2D,
+        view_xy: Tuple[float, float],
+    ) -> EmbeddingLandmark:
+        """Associate or create a landmark from one measured map-frame point."""
+        map_xyz = np.asarray(map_xyz, dtype=float).reshape(3)
+        descriptor = np.asarray(descriptor, dtype=np.float32).reshape(-1)
+        normal_map = np.asarray(normal_map, dtype=float).reshape(3)
+
+        search_r = max(
+            float(self.associate_radius_m), 3.0 * float(self.demote_offset_m)
+        )
+        best: Optional[EmbeddingLandmark] = None
+        best_d = float("inf")
+        for lm in self._neighbors(map_xyz, radius_m=search_r):
+            # Same-anchor path; cross-anchor uses observe_with_poses.
+            if lm.anchor_node != anchor_node:
+                continue
+            lm_map = self.map_point_from_rel(anchor_pose, lm.rel_xyz)
+            dist = float(np.linalg.norm(lm_map - map_xyz))
+            # Confirmed landmarks may be matched farther out so demotion can fire.
+            radius = float(self.associate_radius_m)
+            if lm.status == LandmarkStatus.CONFIRMED:
+                radius = max(radius, 3.0 * float(self.demote_offset_m))
+            if dist > radius:
+                continue
+            if self._best_desc_cosine(lm, descriptor) < float(self.cosine_threshold):
+                continue
+            if dist < best_d:
+                best_d = dist
+                best = lm
+
+        if best is None:
+            lid = self._next_id
+            self._next_id += 1
+            rel = self.rel_from_map_point(anchor_pose, map_xyz)
+            # Normal into anchor frame.
+            n_rel = self.rel_from_map_point(
+                conv.Pose2D(0.0, 0.0, anchor_pose.theta),
+                normal_map,
+            )
+            # The above mis-handles normals; rotate only:
+            c, s = math.cos(anchor_pose.theta), math.sin(anchor_pose.theta)
+            n_rel = np.array(
+                [
+                    c * float(normal_map[0]) + s * float(normal_map[1]),
+                    -s * float(normal_map[0]) + c * float(normal_map[1]),
+                    float(normal_map[2]),
+                ],
+                dtype=float,
+            )
+            nn = float(np.linalg.norm(n_rel))
+            if nn > 1e-9:
+                n_rel = n_rel / nn
+            lm = EmbeddingLandmark(
+                landmark_id=lid,
+                anchor_node=int(anchor_node),
+                rel_xyz=rel,
+                normal_rel=n_rel,
+                descriptors=[descriptor.copy()],
+                observations=1,
+                view_poses_xy=[(float(view_xy[0]), float(view_xy[1]))],
+                _map_samples=[map_xyz.copy()],
+            )
+            self._landmarks[lid] = lm
+            self._index_add(lm, map_xyz)
+            return lm
+
+        return self._update_existing(best, map_xyz, descriptor, view_xy, anchor_pose)
+
+    def observe_with_poses(
+        self,
+        *,
+        map_xyz: np.ndarray,
+        descriptor: np.ndarray,
+        normal_map: np.ndarray,
+        anchor_node: int,
+        anchor_pose: conv.Pose2D,
+        pose_of_node: Dict[int, conv.Pose2D],
+        view_xy: Tuple[float, float],
+    ) -> EmbeddingLandmark:
+        """Like ``observe`` but resolves map positions via ``pose_of_node``."""
+        map_xyz = np.asarray(map_xyz, dtype=float).reshape(3)
+        descriptor = np.asarray(descriptor, dtype=np.float32).reshape(-1)
+
+        search_r = max(
+            float(self.associate_radius_m), 3.0 * float(self.demote_offset_m)
+        )
+        best: Optional[EmbeddingLandmark] = None
+        best_d = float("inf")
+        for lm in self._neighbors(map_xyz, radius_m=search_r):
+            ap = pose_of_node.get(lm.anchor_node)
+            if ap is None:
+                continue
+            lm_map = self.map_point_from_rel(ap, lm.rel_xyz)
+            dist = float(np.linalg.norm(lm_map - map_xyz))
+            radius = float(self.associate_radius_m)
+            if lm.status == LandmarkStatus.CONFIRMED:
+                radius = max(radius, 3.0 * float(self.demote_offset_m))
+            if dist > radius:
+                continue
+            if self._best_desc_cosine(lm, descriptor) < float(self.cosine_threshold):
+                continue
+            if dist < best_d:
+                best_d = dist
+                best = lm
+
+        if best is None:
+            return self.observe(
+                map_xyz=map_xyz,
+                descriptor=descriptor,
+                normal_map=normal_map,
+                anchor_node=anchor_node,
+                anchor_pose=anchor_pose,
+                view_xy=view_xy,
+            )
+        # Demotion needs the landmark's own anchor pose when available.
+        update_pose = pose_of_node.get(best.anchor_node, anchor_pose)
+        return self._update_existing(best, map_xyz, descriptor, view_xy, update_pose)
+
+    def _update_existing(
+        self,
+        lm: EmbeddingLandmark,
+        map_xyz: np.ndarray,
+        descriptor: np.ndarray,
+        view_xy: Tuple[float, float],
+        anchor_pose: conv.Pose2D,
+    ) -> EmbeddingLandmark:
+        lm.observations += 1
+        lm._map_samples.append(map_xyz.copy())
+        # Keep at most 32 samples for std.
+        if len(lm._map_samples) > 32:
+            lm._map_samples = lm._map_samples[-32:]
+        samples = np.stack(lm._map_samples, axis=0)
+        mean = samples.mean(axis=0)
+        lm.position_std_m = float(samples.std(axis=0).mean())
+        # Refresh rel from mean while still a candidate on this anchor.
+        if lm.status == LandmarkStatus.CANDIDATE and lm.anchor_node >= 0:
+            lm.rel_xyz = self.rel_from_map_point(anchor_pose, mean)
+
+        if len(lm.descriptors) < int(self.max_descriptors):
+            if all(self._cosine(d, descriptor) < 0.95 for d in lm.descriptors):
+                lm.descriptors.append(descriptor.copy())
+        elif self._best_desc_cosine(lm, descriptor) < float(self.cosine_threshold) + 0.1:
+            # Replace weakest (lowest mean self-sim) — keep simple: replace last.
+            lm.descriptors[-1] = descriptor.copy()
+
+        vx, vy = float(view_xy[0]), float(view_xy[1])
+        if all(math.hypot(vx - px, vy - py) >= 0.15 for px, py in lm.view_poses_xy):
+            lm.view_poses_xy.append((vx, vy))
+
+        if lm.status == LandmarkStatus.CANDIDATE:
+            self._try_promote(lm)
+        elif lm.status == LandmarkStatus.CONFIRMED:
+            self._check_moved(lm, map_xyz, pose_hint=anchor_pose)
+        return lm
+
+    def _try_promote(self, lm: EmbeddingLandmark) -> None:
+        if lm.observations < int(self.promote_min_obs):
+            return
+        if len(lm.view_poses_xy) < int(self.promote_min_views):
+            return
+        # Max pairwise view gap.
+        gap = 0.0
+        for i, (x0, y0) in enumerate(lm.view_poses_xy):
+            for x1, y1 in lm.view_poses_xy[i + 1 :]:
+                gap = max(gap, math.hypot(x0 - x1, y0 - y1))
+        if gap < float(self.promote_min_view_gap_m):
+            return
+        if lm.position_std_m > float(self.promote_max_std_m):
+            return
+        lm.status = LandmarkStatus.CONFIRMED
+        lm._map_samples.clear()
+
+    def _check_moved(
+        self, lm: EmbeddingLandmark, map_xyz: np.ndarray, *, pose_hint: conv.Pose2D
+    ) -> None:
+        expected = self.map_point_from_rel(pose_hint, lm.rel_xyz)
+        # Only meaningful when pose_hint is the landmark's anchor.
+        if lm.anchor_node < 0:
+            return
+        offset = float(np.linalg.norm(expected - map_xyz))
+        if offset > float(self.demote_offset_m):
+            strikes = self._demote_strikes.get(lm.landmark_id, 0) + 1
+            self._demote_strikes[lm.landmark_id] = strikes
+            if strikes >= int(self.demote_passes):
+                lm.status = LandmarkStatus.MOVED
+        else:
+            self._demote_strikes[lm.landmark_id] = 0
+
+    def visible_set(
+        self,
+        robot_pose: conv.Pose2D,
+        pose_of_node: Dict[int, conv.Pose2D],
+        *,
+        camera_xy: Tuple[float, float],
+        camera_yaw: float,
+        fov_deg: float = 87.0,
+        max_range_m: float = 4.0,
+        max_facing_deg: float = 70.0,
+    ) -> List[Tuple[EmbeddingLandmark, np.ndarray]]:
+        """Confirmed landmarks predicted in the camera frustum.
+
+        Returns ``(landmark, map_xyz)`` pairs.
+        """
+        half = math.radians(float(fov_deg)) * 0.5
+        max_facing = math.radians(float(max_facing_deg))
+        cx = robot_pose.x + math.cos(robot_pose.theta) * camera_xy[0] - math.sin(
+            robot_pose.theta
+        ) * camera_xy[1]
+        cy = robot_pose.y + math.sin(robot_pose.theta) * camera_xy[0] + math.cos(
+            robot_pose.theta
+        ) * camera_xy[1]
+        cyaw = conv.normalize_angle(robot_pose.theta + float(camera_yaw))
+        out: List[Tuple[EmbeddingLandmark, np.ndarray]] = []
+        for lm in self.confirmed():
+            ap = pose_of_node.get(lm.anchor_node)
+            if ap is None:
+                continue
+            mxyz = self.map_point_from_rel(ap, lm.rel_xyz)
+            dx = float(mxyz[0]) - cx
+            dy = float(mxyz[1]) - cy
+            dist = math.hypot(dx, dy)
+            if dist < 0.2 or dist > float(max_range_m):
+                continue
+            bearing = math.atan2(dy, dx)
+            if abs(conv.normalize_angle(bearing - cyaw)) > half:
+                continue
+            # Normal in map frame.
+            c, s = math.cos(ap.theta), math.sin(ap.theta)
+            nx = c * float(lm.normal_rel[0]) - s * float(lm.normal_rel[1])
+            ny = s * float(lm.normal_rel[0]) + c * float(lm.normal_rel[1])
+            # Facing camera: normal · toward_camera > cos(max_facing)
+            toward_x = cx - float(mxyz[0])
+            toward_y = cy - float(mxyz[1])
+            tn = math.hypot(toward_x, toward_y)
+            if tn < 1e-9:
+                continue
+            toward_x /= tn
+            toward_y /= tn
+            nn = math.hypot(nx, ny)
+            if nn < 1e-9:
+                continue
+            nx /= nn
+            ny /= nn
+            if nx * toward_x + ny * toward_y < math.cos(max_facing):
+                continue
+            out.append((lm, mxyz))
+        return out
+
+    def status_dict(self) -> dict:
+        counts = {s.value: 0 for s in LandmarkStatus}
+        for lm in self._landmarks.values():
+            counts[lm.status.value] += 1
+        return {"total": len(self._landmarks), **counts}

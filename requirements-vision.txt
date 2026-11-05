@@ -1,0 +1,8 @@
+# Optional vision / embedding-landmark deps (Phase 0+).
+# Install on Meerkat: pip install -r requirements-vision.txt
+#
+# Prefer OpenVINO EP on Intel Arc iGPU:
+#   pip install onnxruntime-openvino
+# CPU-only fallback:
+#   pip install onnxruntime
+onnxruntime-openvino>=1.17.0

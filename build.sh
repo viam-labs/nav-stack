@@ -7,10 +7,12 @@ cd "$(dirname "$0")"
 tar -czf module.tar.gz \
     meta.json \
     requirements.txt \
+    requirements-vision.txt \
     setup.sh \
     run.sh \
     src \
     sample_configs \
-    scripts
+    scripts \
+    tools
 
 echo "Wrote module.tar.gz"

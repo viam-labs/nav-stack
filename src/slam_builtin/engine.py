@@ -2256,6 +2256,23 @@ class BuiltinSlamEngine:
         with self._lock:
             return self._pose
 
+    def vision_anchor(self) -> tuple:
+        """Latest pose-graph node for embedding-landmark anchoring.
+
+        Returns ``(node_index, node_pose, {index: pose})``. When the graph is
+        empty, ``node_index`` is ``-1`` and the pose table is empty — callers
+        should fall back to the live pose.
+        """
+        with self._lock:
+            poses = {
+                i: conv.Pose2D(float(n.pose.x), float(n.pose.y), float(n.pose.theta))
+                for i, n in enumerate(self._graph.nodes)
+            }
+            if not poses:
+                return -1, self._pose, {}
+            idx = len(self._graph.nodes) - 1
+            return idx, poses[idx], poses
+
     def get_pose_at(self, t: float) -> Optional[conv.Pose2D]:
         """Map pose at monotonic time ``t``, in the current map frame.
 

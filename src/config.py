@@ -1056,6 +1056,22 @@ class SlamConfig:
     robot_radius: Optional[float] = None
     # Builtin simulation: raycast floorplan + in-process SimSensors (see ``sim``).
     sim: SimConfig = field(default_factory=SimConfig)
+    # ---- Vision / embedding landmarks (RGB-D side-channel) ----------------
+    # Off by default. When enabled, each name in ``vision_cameras`` must match
+    # an existing ``lidars[]`` entry with ``obstacles_only: true`` and
+    # ``cloud_frame: camera_optical`` (the RealSense depth cams already used
+    # for avoidance). Mount comes from that entry.
+    vision_enabled: bool = False
+    vision_cameras: List[str] = field(default_factory=list)
+    vision_rate_hz: float = 2.0
+    vision_dinov2_onnx: str = ""
+    vision_yolo_onnx: str = ""
+    vision_head_onnx: str = ""  # optional site-finetuned projection head
+    vision_synthetic: bool = False  # bench/tests without ONNX weights
+    landmark_fix_max_range_m: float = 4.0
+    landmark_fix_max_jump_m: float = 1.5
+    # Survey-only: build landmarks but do not write pose corrections / loops.
+    vision_survey_only: bool = False
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "SlamConfig":
@@ -1074,6 +1090,32 @@ class SlamConfig:
             else:
                 raise ValueError("at least one lidar is required ('lidars' or 'lidar')")
         lidars = [LidarConfig.from_dict(x) for x in lidars_raw]
+        vision_enabled = bool(d.get("vision_enabled", False))
+        vision_cameras_raw = d.get("vision_cameras") or []
+        if isinstance(vision_cameras_raw, str):
+            vision_cameras = [vision_cameras_raw.strip()] if vision_cameras_raw.strip() else []
+        else:
+            vision_cameras = [str(name).strip() for name in vision_cameras_raw if str(name).strip()]
+        if vision_enabled and vision_cameras:
+            by_name = {lidar.name: lidar for lidar in lidars}
+            for name in vision_cameras:
+                lidar = by_name.get(name)
+                if lidar is None:
+                    raise ValueError(
+                        f"vision_cameras entry {name!r} must match a lidars[] name"
+                    )
+                if not lidar.obstacles_only:
+                    raise ValueError(
+                        f"vision camera {name!r} must have obstacles_only=true "
+                        "(depth cams used for embedding landmarks, not SLAM paint)"
+                    )
+                if lidar.cloud_frame != CLOUD_FRAME_CAMERA_OPTICAL:
+                    raise ValueError(
+                        f"vision camera {name!r} must use "
+                        f"cloud_frame={CLOUD_FRAME_CAMERA_OPTICAL!r}"
+                    )
+        elif vision_enabled and not vision_cameras:
+            raise ValueError("vision_enabled requires at least one vision_cameras entry")
         footprint = resolve_footprint(d)
         if bool(d.get("crop_inside_footprint", True)):
             stamp_lidar_footprint(lidars, footprint)
@@ -1321,7 +1363,13 @@ class SlamConfig:
                 d.get("global_localize_on_start", not sim.enabled)
             ),
             "sim": sim,
+            "vision_enabled": vision_enabled,
+            "vision_cameras": vision_cameras,
         }
+        if "vision_rate_hz" in d:
+            overrides["vision_rate_hz"] = _positive_hz(
+                d["vision_rate_hz"], "vision_rate_hz"
+            )
         if "scan_rate_hz" in d:
             overrides["scan_rate_hz"] = _positive_hz(d["scan_rate_hz"], "scan_rate_hz")
         if "odom_rate_hz" in d:
@@ -1379,6 +1427,18 @@ class SlamConfig:
     def slam_lidars(self) -> List[LidarConfig]:
         """Lidars used for SLAM matching/mapping (excludes ``obstacles_only``)."""
         return [lidar for lidar in self.lidars if not lidar.obstacles_only]
+
+    def vision_lidar_configs(self) -> List[LidarConfig]:
+        """``lidars[]`` entries selected as RGB-D vision cameras."""
+        if not self.vision_enabled or not self.vision_cameras:
+            return []
+        by_name = {lidar.name: lidar for lidar in self.lidars}
+        out: List[LidarConfig] = []
+        for name in self.vision_cameras:
+            lidar = by_name.get(name)
+            if lidar is not None:
+                out.append(lidar)
+        return out
 
     def uses_builtin_slam(self) -> bool:
         return self.slam_backend == SLAM_BACKEND_BUILTIN

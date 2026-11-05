@@ -89,6 +89,8 @@ _SLAM_DO_ALIASES = build_alias_map(
         "clear_region": ("erase_region",),
         "add_obstacles": ("mark_obstacles",),
         "repair_map": ("repair",),
+        "vision_status": ("get_vision_status",),
+        "list_landmarks": ("get_landmarks",),
     }
 )
 
@@ -147,6 +149,8 @@ class SlamService(SLAM):
         # Scan-to-map matcher subprocess (keeps the heavy search off this GIL).
         self._localizer = LocalizeWorker(enabled=True, logger=LOGGER)
         self._localize = LocalizeSupervisor(self)
+        # RGB-D embedding landmarks (survey / exact-localize side-channel).
+        self._vision = None
         self._framesystem_task: Optional[asyncio.Task] = None
         self._framesystem_gen = 0
         self._framesystem_raw_attrs: Optional[Mapping] = None
@@ -176,6 +180,7 @@ class SlamService(SLAM):
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
         self._cancel_framesystem_task()
+        self._stop_vision()
         self._skip_get_laser_scan = set()
         attrs = struct_to_dict(config.attributes)
         cfg = SlamConfig.from_dict(attrs)
@@ -283,6 +288,7 @@ class SlamService(SLAM):
         self._manager.start()
         self._start_mode(cfg.mode)
         self._wire_still_keyframe_hook()
+        self._start_vision(loop)
         backend = "builtin+sim" if cfg.uses_sim() else "builtin"
 
         self._schedule_startup_global_localize(loop)
@@ -1629,6 +1635,8 @@ class SlamService(SLAM):
             "clear_region": self._cmd_clear_region,
             "add_obstacles": self._cmd_add_obstacles,
             "delete_map": self._cmd_delete_map,
+            "vision_status": self._cmd_vision_status,
+            "list_landmarks": self._cmd_list_landmarks,
         }
 
     async def do_command(
@@ -1719,6 +1727,13 @@ class SlamService(SLAM):
         status["localization_check"] = dict(self._last_relocalize_check)
         status["localization_state"] = self._loc_state.snapshot()
         status["revisit_check"] = dict(self._last_revisit_check)
+        if self._vision is not None:
+            status["vision"] = self._vision.status()
+        elif self._cfg is not None:
+            status["vision"] = {
+                "enabled": bool(self._cfg.vision_enabled),
+                "reason": "not_running",
+            }
         if self._pause_keyframes is not None:
             status["pause_keyframes"] = self._pause_keyframes.status()
         shm_status = self._shm_lidar.status()
@@ -1790,6 +1805,14 @@ class SlamService(SLAM):
         out = {"status": "saved", "map": handle.name}
         if isinstance(result, Mapping):
             out.update({k: v for k, v in result.items() if k not in out})
+        vision = self._vision
+        if vision is not None:
+            try:
+                path = vision.save_to_map_dir(handle.root)
+                if path:
+                    out["embedding_landmarks"] = path
+            except Exception as exc:  # noqa: BLE001
+                out["embedding_landmarks_error"] = repr(exc)
         return out
 
     def _builtin_map_fn(self, name: str):
@@ -2575,11 +2598,85 @@ class SlamService(SLAM):
             "or call set_initial_pose with a rough estimate first"
         )
 
+    def _cmd_vision_status(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        del command
+        vision = self._vision
+        if vision is None:
+            return {"enabled": False, "reason": "vision not running"}
+        return vision.status()
+
+    def _cmd_list_landmarks(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        del command
+        vision = self._vision
+        if vision is None:
+            return {"landmarks": [], "enabled": False}
+        confirmed = vision.landmarks.confirmed()
+        rows = []
+        for lm in confirmed[:200]:
+            rows.append(
+                {
+                    "id": int(lm.landmark_id),
+                    "anchor_node": int(lm.anchor_node),
+                    "rel_xyz": [float(x) for x in lm.rel_xyz],
+                    "observations": int(lm.observations),
+                    "status": lm.status.value,
+                    "std_m": float(lm.position_std_m)
+                    if lm.position_std_m == lm.position_std_m
+                    else None,
+                }
+            )
+        return {
+            "enabled": True,
+            "count": len(confirmed),
+            "landmarks": rows,
+            **vision.landmarks.status_dict(),
+        }
+
+    def _stop_vision(self) -> None:
+        vision = self._vision
+        self._vision = None
+        if vision is not None:
+            try:
+                vision.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _start_vision(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._stop_vision()
+        cfg = self._cfg
+        engine = self._engine
+        if cfg is None or engine is None or not cfg.vision_enabled:
+            return
+        from ..semantic.supervisor import VisionSupervisor
+
+        def _anchor():
+            return engine.vision_anchor()
+
+        vision = VisionSupervisor(
+            cfg=cfg,
+            cameras=self._cameras,
+            get_pose=engine.get_pose,
+            get_pose_at=engine.get_pose_at,
+            get_anchor=_anchor,
+            logger=LOGGER.info,
+        )
+        store = self._map_store
+        handle = store.active_handle() if store is not None else None
+        if handle is not None:
+            vision.load_from_map_dir(handle.root)
+        vision.start(loop)
+        self._vision = vision
+
     async def close(self) -> None:
         self._cancel_startup_global_localize_task()
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
         self._cancel_framesystem_task()
+        self._stop_vision()
         unregister_slam(self.name)
         unregister_slam_service(self.name)
         self._shm_lidar.close()
