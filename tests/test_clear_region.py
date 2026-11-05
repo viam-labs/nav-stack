@@ -284,6 +284,80 @@ def test_mapping_guidance_warns_when_tearing(tmp_path):
     assert guide["hotspot_count"] == 1
 
 
+def _banded_wall_scan(wall_x: float) -> conv.LaserScan2D:
+    """A wall ``wall_x`` m ahead seen by a low and a high lidar (two bands)."""
+    ang = np.radians(np.linspace(-30.0, 30.0, 61))
+    r = wall_x / np.cos(ang)
+    xyz = np.vstack(
+        [
+            np.stack([r * np.cos(ang), r * np.sin(ang), np.full_like(ang, z)], 1)
+            for z in (0.21, 1.2)
+        ]
+    )
+    scan = conv.points_to_scan(xyz, num_bins=360, range_min=0.05, range_max=20.0)
+    scan.cloud_xyz = xyz
+    scan.cloud_xy = xyz[:, :2]
+    return scan
+
+
+def _paint_banded(engine, pose: conv.Pose2D, wall_x: float, now: float) -> None:
+    scan = _banded_wall_scan(wall_x)
+    engine._paint_mapping_scan(scan, pose, now=now, frames=[(None, scan)])  # noqa: SLF001
+
+
+def _odds(engine, x: float, y: float) -> float:
+    grid = engine._grid  # noqa: SLF001
+    r, c = grid.world_to_cell(x, y)
+    return float(grid.log_odds[r, c])
+
+
+def _banded_engine(tmp_path):
+    engine = _engine(tmp_path, builtin_loop_closure=False)
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    for i in range(3):
+        _paint_banded(engine, conv.Pose2D(0.0, 0.0, 0.0), 2.0, now=float(i))
+    assert len(engine._height_bands) == 2  # noqa: SLF001
+    assert _odds(engine, 2.0, 0.0) > 0.5
+    return engine
+
+
+def test_clear_region_sticks_after_next_banded_paint(tmp_path):
+    """Live paint rebuilds the grid from height bands; the clear must be in them."""
+    engine = _banded_engine(tmp_path)
+    engine.clear_region(1.5, -1.0, 2.5, 1.0)
+    assert _odds(engine, 2.0, 0.0) < 0.0
+
+    _paint_banded(engine, conv.Pose2D(0.0, 3.0, 0.0), 4.0, now=10.0)
+    assert _odds(engine, 2.0, 0.0) < 0.0
+
+
+def test_clear_obstacles_sticks_after_next_banded_paint(tmp_path):
+    engine = _banded_engine(tmp_path)
+    engine.clear_obstacles(2.0, 0.0, 0.3)
+    assert _odds(engine, 2.0, 0.0) < 0.0
+
+    _paint_banded(engine, conv.Pose2D(0.0, 3.0, 0.0), 4.0, now=10.0)
+    assert _odds(engine, 2.0, 0.0) < 0.0
+
+
+def test_rerender_sticks_after_next_banded_paint(tmp_path):
+    """A loop-closure render that moves walls must not be undone by the next scan."""
+    engine = _banded_engine(tmp_path)
+    with engine._lock:  # noqa: SLF001
+        assert len(engine._graph) >= 1  # noqa: SLF001
+        engine._graph.apply_world_correction_from(  # noqa: SLF001
+            0, conv.Pose2D(-1.0, 0.0, 0.0)
+        )
+    out = engine._optimize_and_render(None)  # noqa: SLF001
+    assert out["status"] == "rebuilt"
+    assert _odds(engine, 1.0, 0.0) > 0.5
+    assert _odds(engine, 2.0, 0.0) <= 0.5
+
+    _paint_banded(engine, conv.Pose2D(0.0, 6.0, 0.0), 4.0, now=10.0)
+    assert _odds(engine, 1.0, 0.0) > 0.5
+    assert _odds(engine, 2.0, 0.0) <= 0.5
+
+
 def test_clear_box_edit_survives_refill_then_reload(tmp_path):
     """Lidar may refill the hole before save; clear_box must still apply on load."""
     engine = _engine(tmp_path)

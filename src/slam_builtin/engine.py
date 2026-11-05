@@ -364,6 +364,7 @@ class BuiltinSlamEngine:
                 loaded = persistence.load_log_odds(map_dir)
                 if loaded is not None:
                     self._grid = loaded
+                    self._height_bands = {}
                     self._invalidate_occ_cache()
                     self._generation += 1
                     self._log(f"loaded occupancy map from {map_dir}")
@@ -374,6 +375,7 @@ class BuiltinSlamEngine:
                 elif mode == MODE_MAPPING:
                     # Fresh mapping session.
                     self._grid = occ.empty_grid(resolution=self._cfg.map.resolution)
+                    self._height_bands = {}
                     self._pose = conv.Pose2D(0.0, 0.0, 0.0)
                     self._last_odom_pose = None
                     self._last_odom_heading = None
@@ -492,14 +494,10 @@ class BuiltinSlamEngine:
     def clear_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
         """Erase occupied cells in a disk (map frame meters). Builtin only."""
         with self._lock:
-            # Copy first: get_map reads the published array off this lock.
-            updated = occ.copy_grid(self._grid)
-            cleared = occ.clear_disk(updated, x_m, y_m, radius_m)
+            edit = ("clear", float(x_m), float(y_m), float(radius_m))
+            cleared = self._edit_live_grid_locked(edit)
             if cleared:
-                self._grid_edits.append(
-                    ("clear", float(x_m), float(y_m), float(radius_m))
-                )
-                self._grid = updated
+                self._grid_edits.append(edit)
                 self._invalidate_occ_cache()
                 self._generation += 1
             return {
@@ -533,10 +531,9 @@ class BuiltinSlamEngine:
         if xb <= xa or yb <= ya:
             raise ValueError("clear_region needs a non-empty box")
         with self._lock:
-            updated = occ.copy_grid(self._grid)
-            cleared = occ.clear_rect(updated, xa, ya, xb, yb)
-            self._grid = updated
-            self._grid_edits.append(("clear_box", xa, ya, xb, yb))
+            edit = ("clear_box", xa, ya, xb, yb)
+            cleared = self._edit_live_grid_locked(edit)
+            self._grid_edits.append(edit)
 
             frozen = int(self._graph_frozen)
 
@@ -614,13 +611,10 @@ class BuiltinSlamEngine:
     def add_obstacles(self, x_m: float, y_m: float, radius_m: float) -> dict:
         """Paint occupied cells in a disk (map frame meters). Builtin only."""
         with self._lock:
-            updated = occ.copy_grid(self._grid)
-            marked = occ.mark_disk(updated, x_m, y_m, radius_m)
+            edit = ("mark", float(x_m), float(y_m), float(radius_m))
+            marked = self._edit_live_grid_locked(edit)
             if marked:
-                self._grid_edits.append(
-                    ("mark", float(x_m), float(y_m), float(radius_m))
-                )
-                self._grid = updated
+                self._grid_edits.append(edit)
                 self._invalidate_occ_cache()
                 self._generation += 1
             return {
@@ -753,15 +747,36 @@ class BuiltinSlamEngine:
             f"from {path.name}"
         )
 
+    @staticmethod
+    def _apply_grid_edit(grid: LogOddsGrid, edit: tuple) -> int:
+        kind = edit[0]
+        if kind == "clear":
+            return occ.clear_disk(grid, edit[1], edit[2], edit[3])
+        if kind == "clear_box":
+            return occ.clear_rect(grid, edit[1], edit[2], edit[3], edit[4])
+        return occ.mark_disk(grid, edit[1], edit[2], edit[3])
+
     def _replay_grid_edits_locked(self, grid: LogOddsGrid) -> None:
         for edit in self._grid_edits:
-            kind = edit[0]
-            if kind == "clear":
-                occ.clear_disk(grid, edit[1], edit[2], edit[3])
-            elif kind == "clear_box":
-                occ.clear_rect(grid, edit[1], edit[2], edit[3], edit[4])
-            else:
-                occ.mark_disk(grid, edit[1], edit[2], edit[3])
+            self._apply_grid_edit(grid, edit)
+
+    def _edit_live_grid_locked(self, edit: tuple) -> int:
+        """Apply ``edit`` to the published grid and to every height band.
+
+        Band painting rebuilds ``_grid`` from the bands, so an edit made to
+        ``_grid`` alone came back with the next scan.
+        """
+        updated = occ.copy_grid(self._grid)
+        changed = self._apply_grid_edit(updated, edit)
+        if changed:
+            self._grid = updated
+            bands = {}
+            for band, grid in self._height_bands.items():
+                copy = occ.copy_grid(grid)
+                self._apply_grid_edit(copy, edit)
+                bands[band] = copy
+            self._height_bands = bands
+        return changed
 
     # Corrections up to this yaw are spread along the loop by the pose graph;
     # bigger ones (yaw flip, far relocalize) shift the trailing path rigidly.
@@ -1035,7 +1050,10 @@ class BuiltinSlamEngine:
         with self._lock:
             extra = self._graph.scans_after(snap.last_seq)
         started = perf_counter()
-        grid = pg.render_grid(snap, resolution=res, poses=poses, base=base, extra=extra)
+        bands: dict = {}
+        grid = pg.render_grid(
+            snap, resolution=res, poses=poses, base=base, extra=extra, bands_out=bands
+        )
         render_ms = (perf_counter() - started) * 1000.0
         self._loop_stats["last_render_ms"] = round(render_ms, 1)
         info["render_ms"] = round(render_ms, 1)
@@ -1048,10 +1066,20 @@ class BuiltinSlamEngine:
             newer = self._graph.scans_after(snap.last_seq)
             if len(newer) != len(extra):
                 grid = pg.render_grid(
-                    snap, resolution=res, poses=poses, base=base, extra=newer
+                    snap,
+                    resolution=res,
+                    poses=poses,
+                    base=base,
+                    extra=newer,
+                    bands_out=bands,
                 )
             self._replay_grid_edits_locked(grid)
+            for band_grid in bands.values():
+                self._replay_grid_edits_locked(band_grid)
             self._grid = grid
+            # Live paint rebuilds ``_grid`` from these; the old bands would
+            # put back the walls this render moved.
+            self._height_bands = bands
             self._generation += 1
             self._invalidate_occ_cache()
             self._last_loop_rebuild_at = time.monotonic()
