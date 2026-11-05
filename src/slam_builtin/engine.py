@@ -1108,11 +1108,13 @@ class BuiltinSlamEngine:
                 self._map_health = {"status": "idle"}
                 return dict(self._map_health)
             gen = self._generation
+            # Rate-limit even when generation bumps: every paint used to
+            # re-score and race auto-heal / revisit boosts in a few seconds.
             if (
                 not force
-                and gen == self._map_health_generation
-                and self._session_baseline is self._map_health_base_src
+                and self._map_health_at > 0.0
                 and now - self._map_health_at < self._MAP_HEALTH_MIN_S
+                and self._session_baseline is self._map_health_base_src
             ):
                 return dict(self._map_health)
             grid = occ.to_occupancy_int16(self._grid)
@@ -1138,7 +1140,12 @@ class BuiltinSlamEngine:
                     origin_y=base_origin[1],
                 )
                 self._map_health_base_cells = base_cells
-                trusted = base_health.status not in self._BASE_DISTRUST_STATUSES
+                # Use unclamped score so a small but clearly doubled resume is
+                # still untrusted even when live status was capped at watch.
+                base_raw = str(
+                    getattr(base_health, "raw_status", None) or base_health.status
+                )
+                trusted = base_raw not in self._BASE_DISTRUST_STATUSES
                 self._map_health_base = {
                     **base_health.as_dict(),
                     "trusted": trusted,
@@ -1290,6 +1297,7 @@ class BuiltinSlamEngine:
 
         match_m = max(0.5, float(cfg.map_health_hotspot_match_m))
         persist_n = max(1, int(cfg.map_health_hotspot_persist_n))
+        min_streak_s = float(self._MAP_HEALTH_MIN_S)
         track = self._hotspot_track
 
         if top is None or status not in ("watch", "degrading"):
@@ -1305,7 +1313,11 @@ class BuiltinSlamEngine:
             track["y"] = 0.7 * float(track["y"]) + 0.3 * ty
             track["frac"] = tfrac
             track["status"] = status
-            track["streak"] = int(track.get("streak") or 0) + 1
+            last_count = float(track.get("last_count_at") or 0.0)
+            # Time-space streak samples so generation churn cannot race clear.
+            if last_count <= 0.0 or now - last_count >= min_streak_s:
+                track["streak"] = int(track.get("streak") or 0) + 1
+                track["last_count_at"] = now
             track["last_at"] = now
         else:
             track = {
@@ -1315,6 +1327,7 @@ class BuiltinSlamEngine:
                 "status": status,
                 "streak": 1,
                 "last_at": now,
+                "last_count_at": now,
             }
             self._hotspot_track = track
 
@@ -1323,6 +1336,22 @@ class BuiltinSlamEngine:
         if status != "degrading":
             return None
         if int(track["streak"]) < persist_n:
+            return None
+
+        min_kf = max(0, int(getattr(cfg, "map_health_auto_clear_min_keyframes", 40)))
+        if len(self._graph) < min_kf:
+            self._hotspot_heal_note_skip("too_few_keyframes")
+            return None
+
+        near_m = max(0.5, float(getattr(cfg, "map_health_auto_clear_near_m", 6.0)))
+        pose = self._pose
+        if (
+            math.hypot(
+                float(pose.x) - float(track["x"]), float(pose.y) - float(track["y"])
+            )
+            > near_m
+        ):
+            self._hotspot_heal_note_skip("too_far")
             return None
 
         cooldown = max(0.0, float(cfg.map_health_auto_clear_cooldown_s))

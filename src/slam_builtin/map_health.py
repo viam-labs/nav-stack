@@ -13,37 +13,48 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-# Ghost = two occupied ridges with a thin free gap between them (0.15–0.55 m).
-_GHOST_SEP_MIN_M = 0.15
+# Ghost = two occupied ridges with a thin free gap between them (0.20–0.55 m).
+# Min 0.20 m avoids thick single walls / adjacent furniture faces.
+_GHOST_SEP_MIN_M = 0.20
 _GHOST_SEP_MAX_M = 0.55
 # Tile size for local wall-angle / hotspot estimates.
 _TILE_M = 2.0
 # Status thresholds on the occupied-cell ghost fraction and angle std (deg).
 _WATCH_GHOST = 0.12
-_DEGRADING_GHOST = 0.22
+# Degrading needs clear doubling — 0.22 fired on early/noisy corridors.
+_DEGRADING_GHOST = 0.35
 _WATCH_ANGLE_STD = 12.0
 _DEGRADING_ANGLE_STD = 20.0
 DEGRADING_ANGLE_STD = _DEGRADING_ANGLE_STD
 # Ignore maps that are still too small to judge.
 _MIN_OCC_CELLS = 400
+# Below this, never report ``degrading`` (partial first-room maps look torn).
+_MATURE_OCC_CELLS = 2500
 
 
 @dataclass(frozen=True)
 class MapHealth:
-    status: str  # ok | watch | degrading | cold
+    status: str  # ok | watch | degrading | cold (live; may clamp immature)
     ghost_frac: float
     thick_frac: float
     angle_std_deg: float
     occupied_cells: int
     hotspots: Tuple[Tuple[float, float, float], ...]  # (frac, x_m, y_m)
+    mature: bool = True
+    # Unclamped score — resumed-baseline trust uses this so a small torn map
+    # is still marked untrusted even when live status stays ``watch``.
+    raw_status: str = ""
 
     def as_dict(self) -> dict:
+        raw = self.raw_status or self.status
         return {
             "status": self.status,
+            "raw_status": raw,
             "ghost_frac": round(self.ghost_frac, 3),
             "thick_frac": round(self.thick_frac, 3),
             "angle_std_deg": round(self.angle_std_deg, 1),
             "occupied_cells": int(self.occupied_cells),
+            "mature": bool(self.mature),
             "hotspots": [
                 {"frac": round(f, 2), "x": round(x, 1), "y": round(y, 1)}
                 for f, x, y in self.hotspots
@@ -94,6 +105,8 @@ def assess_occupancy(
             angle_std_deg=0.0,
             occupied_cells=n_occ,
             hotspots=(),
+            mature=False,
+            raw_status="cold",
         )
 
     ys, xs = np.where(focus)
@@ -133,7 +146,14 @@ def assess_occupancy(
         col0=0,
         max_hotspots=max_hotspots,
     )
-    status = _status(ghost_frac, angle_std)
+    mature = n_occ >= _MATURE_OCC_CELLS
+    raw = _status(ghost_frac, angle_std)
+    # Immature maps often look doubled while the first room is still filling
+    # in. Live status stays watch; raw_status keeps the true score for trust.
+    if not mature and raw == "degrading":
+        status = "watch"
+    else:
+        status = raw
     return MapHealth(
         status=status,
         ghost_frac=ghost_frac,
@@ -141,6 +161,8 @@ def assess_occupancy(
         angle_std_deg=angle_std,
         occupied_cells=n_occ,
         hotspots=tuple(hotspots),
+        mature=mature,
+        raw_status=raw,
     )
 
 
