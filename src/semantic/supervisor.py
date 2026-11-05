@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -48,7 +49,16 @@ class VisionSupervisor:
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         dinov2_path = _resolve_model_path(str(cfg.vision_dinov2_onnx or ""))
-        want_synthetic = bool(cfg.vision_synthetic) or not bool(dinov2_path)
+        if not str(cfg.vision_dinov2_onnx or "").strip() and not bool(
+            cfg.vision_synthetic
+        ):
+            # setup.sh / run.sh fetch default weights next to this package.
+            candidate = _resolve_model_path("dinov2_vits14_patches_448.onnx")
+            if candidate and Path(candidate).is_file():
+                dinov2_path = candidate
+        want_synthetic = bool(cfg.vision_synthetic) or not (
+            dinov2_path and Path(dinov2_path).is_file()
+        )
         self._dinov2_path = dinov2_path
         self._landmarks = EmbeddingLandmarkMap(
             associate_radius_m=float(cfg.vision_associate_radius_m),
@@ -374,8 +384,6 @@ def _resolve_model_path(raw: str) -> str:
     text = (raw or "").strip()
     if not text:
         return ""
-    from pathlib import Path
-
     p = Path(text).expanduser()
     if p.is_file():
         return str(p.resolve())

@@ -11,34 +11,31 @@ Weights are **not** committed to git and are excluded from `module.tar.gz`.
 | YOLOv8n | `yolov8n.onnx` | Paint-gate only (`ultralytics` export) |
 | Site head (phase 7) | `head.onnx` | Optional; replaces per-map PCA |
 
-## Fetch / export on the robot
+## Auto-install
+
+`setup.sh` (and `run.sh` on upgrade) install `requirements-vision.txt` and
+fetch `dinov2_vits14_patches_448.onnx` when missing. No manual
+`NAV_STACK_VISION` flag.
+
+To re-fetch / export by hand:
 
 ```bash
-# After pinning 1.2.0-rc3+ and restarting once (so tools/ is present):
-cd /path/to/nav-stack-module   # or wherever the module unpacked
-NAV_STACK_VISION=1 ./setup.sh   # installs onnxruntime-openvino
 python tools/fetch_dinov2_onnx.py
-# → src/semantic/models/dinov2_vits14_patches_448.onnx
-
-# Or export from torch yourself (needs network + torch):
-python tools/export_dinov2_onnx.py --size 448
+python tools/export_dinov2_onnx.py --size 448   # needs torch + network
 ```
 
-Point config at the file (absolute path is safest):
+Point config at the file (relative name resolves under `src/semantic/models/`):
 
 ```json
 "vision_enabled": true,
 "vision_survey_only": true,
 "vision_cameras": ["camera-top"],
-"vision_dinov2_onnx": "/absolute/path/to/dinov2_vits14_patches_448.onnx",
+"vision_dinov2_onnx": "dinov2_vits14_patches_448.onnx",
 "vision_input_size": 448
 ```
 
 Omit `vision_synthetic` (or set `false`). `vision_status.provider` should show
 `OpenVINOExecutionProvider` (or `CPUExecutionProvider`), **not** `synthetic`.
-
-Relative names like `dinov2_vits14_patches_448.onnx` resolve against
-`src/semantic/models/` next to the running module.
 
 ## Survey density / nav load (rc2+)
 
