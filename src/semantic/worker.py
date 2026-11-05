@@ -79,20 +79,30 @@ class VisionWorker:
         if color.ndim != 3 or color.shape[2] != 3:
             raise ValueError(f"color_rgb must be HxWx3, got {color.shape}")
         h, w = color.shape[:2]
-        short = int(self.cfg.input_short_side)
-        scale = short / float(min(h, w))
-        new_h = max(self.cfg.patch, int(round(h * scale)))
-        new_w = max(self.cfg.patch, int(round(w * scale)))
-        # Align to patch multiples.
-        new_h = max(self.cfg.patch, (new_h // self.cfg.patch) * self.cfg.patch)
-        new_w = max(self.cfg.patch, (new_w // self.cfg.patch) * self.cfg.patch)
-        resized = _resize_rgb(color, new_h, new_w)
 
         if self.cfg.synthetic or self._dino is None:
-            tokens, place = self._synthetic_tokens(resized, scale_u=w / new_w, scale_v=h / new_h)
+            # Aspect-preserving resize is fine for synthetic RGB-stat descriptors.
+            short = int(self.cfg.input_short_side)
+            scale = short / float(min(h, w))
+            new_h = max(self.cfg.patch, int(round(h * scale)))
+            new_w = max(self.cfg.patch, int(round(w * scale)))
+            new_h = max(self.cfg.patch, (new_h // self.cfg.patch) * self.cfg.patch)
+            new_w = max(self.cfg.patch, (new_w // self.cfg.patch) * self.cfg.patch)
+            resized = _resize_rgb(color, new_h, new_w)
+            tokens, place = self._synthetic_tokens(
+                resized, scale_u=w / new_w, scale_v=h / new_h
+            )
             provider = "synthetic"
         else:
-            tokens, place = self._dino_tokens(resized, scale_u=w / new_w, scale_v=h / new_h)
+            # Static ONNX exports require a fixed square; letterbox and map UVs
+            # back into the original image for depth back-projection.
+            size = int(self.cfg.input_short_side)
+            if size % self.cfg.patch != 0:
+                size = max(self.cfg.patch, (size // self.cfg.patch) * self.cfg.patch)
+            canvas, scale, pad_x, pad_y = _letterbox(color, size)
+            tokens, place = self._dino_tokens(
+                canvas, scale=scale, pad_x=pad_x, pad_y=pad_y
+            )
             provider = self._provider
 
         detections: List[Detection] = []
@@ -104,7 +114,14 @@ class VisionWorker:
         if tokens and not self.cfg.synthetic:
             desc = np.stack([t.descriptor for t in tokens], axis=0)
             keep = distinctiveness_mask(desc)
-            tokens = [t for t, k in zip(tokens, keep) if k]
+            filtered = [t for t, k in zip(tokens, keep) if k]
+            if filtered:
+                tokens = filtered
+            else:
+                # Uniform / repeating texture: keep a sparse spatial subsample
+                # so survey still gets geometry instead of an empty frame.
+                step = max(1, len(tokens) // 64)
+                tokens = tokens[::step][:64]
 
         infer_ms = (time.perf_counter() - t0) * 1000.0
         self.stats["frames"] += 1
@@ -181,16 +198,21 @@ class VisionWorker:
         return tokens, place
 
     def _dino_tokens(
-        self, resized: np.ndarray, *, scale_u: float, scale_v: float
+        self,
+        letterboxed: np.ndarray,
+        *,
+        scale: float,
+        pad_x: float,
+        pad_y: float,
     ) -> Tuple[List[PatchToken], np.ndarray]:
-        """Run DINOv2 ONNX. Expects NCHW float input; returns patch tokens.
+        """Run DINOv2 ONNX on a square letterboxed RGB; map UVs to source image.
 
         ONNX export layouts vary; we accept:
         - output (1, N, D) patch tokens
         - output (1, D, H, W) spatial map
         """
         assert self._dino is not None
-        img = resized.astype(np.float32) / 255.0
+        img = letterboxed.astype(np.float32) / 255.0
         # ImageNet normalize.
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -201,10 +223,18 @@ class VisionWorker:
         outs = self._dino.run(None, {input_name: nchw})
         feat = np.asarray(outs[0])
         tokens: List[PatchToken] = []
+        inv = 1.0 / max(1e-9, float(scale))
+
+        def _to_source(u_net: float, v_net: float) -> Tuple[float, float]:
+            # Undo letterbox pad, then undo resize scale → original pixels.
+            return (float(u_net) - float(pad_x)) * inv, (
+                float(v_net) - float(pad_y)
+            ) * inv
+
         if feat.ndim == 3:
             # (1, N, D) — drop CLS if N = 1 + H*W
             patches = feat[0]
-            h, w = resized.shape[:2]
+            h, w = letterboxed.shape[:2]
             grid_h = h // self.cfg.patch
             grid_w = w // self.cfg.patch
             expected = grid_h * grid_w
@@ -213,11 +243,24 @@ class VisionWorker:
             patches = l2_normalize(patches)
             for i in range(min(len(patches), expected)):
                 r, c = divmod(i, grid_w) if grid_w else (0, 0)
-                u = (c + 0.5) * self.cfg.patch * scale_u
-                v = (r + 0.5) * self.cfg.patch * scale_v
+                u_net = (c + 0.5) * self.cfg.patch
+                v_net = (r + 0.5) * self.cfg.patch
+                # Skip patches whose centers fall in the letterbox padding.
+                if (
+                    u_net < pad_x
+                    or v_net < pad_y
+                    or u_net >= (w - pad_x)
+                    or v_net >= (h - pad_y)
+                ):
+                    continue
+                u, v = _to_source(u_net, v_net)
                 tokens.append(
                     PatchToken(
-                        row=r, col=c, u=u, v=v, descriptor=patches[i].astype(np.float32)
+                        row=r,
+                        col=c,
+                        u=u,
+                        v=v,
+                        descriptor=patches[i].astype(np.float32),
                     )
                 )
             place = l2_normalize(patches.mean(axis=0))
@@ -229,11 +272,23 @@ class VisionWorker:
             flat = l2_normalize(flat)
             for i in range(flat.shape[0]):
                 r, c = divmod(i, gw)
-                u = (c + 0.5) * (resized.shape[1] / gw) * scale_u
-                v = (r + 0.5) * (resized.shape[0] / gh) * scale_v
+                u_net = (c + 0.5) * (letterboxed.shape[1] / gw)
+                v_net = (r + 0.5) * (letterboxed.shape[0] / gh)
+                if (
+                    u_net < pad_x
+                    or v_net < pad_y
+                    or u_net >= (letterboxed.shape[1] - pad_x)
+                    or v_net >= (letterboxed.shape[0] - pad_y)
+                ):
+                    continue
+                u, v = _to_source(u_net, v_net)
                 tokens.append(
                     PatchToken(
-                        row=r, col=c, u=u, v=v, descriptor=flat[i].astype(np.float32)
+                        row=r,
+                        col=c,
+                        u=u,
+                        v=v,
+                        descriptor=flat[i].astype(np.float32),
                     )
                 )
             place = l2_normalize(flat.mean(axis=0))

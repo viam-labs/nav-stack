@@ -41,6 +41,23 @@ def preferred_providers(
     return ordered
 
 
+def _provider_options(providers: Sequence[str]) -> List[dict]:
+    """Per-provider options. Prefer Intel Arc GPU FP16 when OpenVINO is first."""
+    opts: List[dict] = []
+    for name in providers:
+        if name == "OpenVINOExecutionProvider":
+            opts.append(
+                {
+                    "device_type": "GPU",
+                    "precision": "FP16",
+                    "num_of_threads": "1",
+                }
+            )
+        else:
+            opts.append({})
+    return opts
+
+
 def make_session(
     model_path: str,
     *,
@@ -65,9 +82,14 @@ def make_session(
     session = None
     used: List[str] = []
     for i in range(len(prov)):
-        try_list = prov[i:]
+        try_list = list(prov[i:])
         try:
-            session = ort.InferenceSession(path, sess_options=opts, providers=try_list)
+            session = ort.InferenceSession(
+                path,
+                sess_options=opts,
+                providers=try_list,
+                provider_options=_provider_options(try_list),
+            )
             used = list(session.get_providers())
             break
         except Exception as exc:  # noqa: BLE001

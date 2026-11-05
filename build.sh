@@ -4,7 +4,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Exclude large ONNX weights from the module archive (fetch separately on the
+# robot via tools/fetch_dinov2_onnx.py / GitHub release assets).
 tar -czf module.tar.gz \
+    --exclude='src/semantic/models/*.onnx' \
+    --exclude='**/__pycache__' \
+    --exclude='*.pyc' \
     meta.json \
     requirements.txt \
     requirements-vision.txt \

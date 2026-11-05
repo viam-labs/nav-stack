@@ -26,8 +26,19 @@ ensure_python_venv() {
     source "${VENV_NAME}/bin/activate"
     pip install --upgrade pip -q
     pip install -r requirements.txt -q
+    if [ "${NAV_STACK_VISION:-0}" = "1" ] && [ -f requirements-vision.txt ]; then
+        log "installing vision deps (NAV_STACK_VISION=1)"
+        # Prefer OpenVINO EP; fall back to CPU onnxruntime if the meta package fails.
+        if ! pip install -r requirements-vision.txt -q; then
+            log "onnxruntime-openvino failed; trying onnxruntime (CPU)"
+            pip install "onnxruntime>=1.17.0" -q || die "failed to install onnxruntime"
+        fi
+    fi
     log "Python dependencies installed"
 }
 
 ensure_python_venv
 log "setup complete (builtin slam + nav)"
+if [ "${NAV_STACK_VISION:-0}" = "1" ]; then
+    log "vision enabled: run tools/fetch_dinov2_onnx.py after setup if needed"
+fi

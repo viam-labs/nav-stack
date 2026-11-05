@@ -47,14 +47,16 @@ class VisionSupervisor:
         self._lock = threading.Lock()
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
-        synthetic = bool(cfg.vision_synthetic) or not bool(cfg.vision_dinov2_onnx)
+        dinov2_path = _resolve_model_path(str(cfg.vision_dinov2_onnx or ""))
+        want_synthetic = bool(cfg.vision_synthetic) or not bool(dinov2_path)
+        self._dinov2_path = dinov2_path
         self._landmarks = EmbeddingLandmarkMap(
             associate_radius_m=float(cfg.vision_associate_radius_m),
             cell_m=float(cfg.vision_cell_m),
             # Synthetic RGB-stat descriptors are not re-id stable; merge by
             # distance so the density pilot is not drowned in one-per-patch IDs.
-            require_descriptor_match=not synthetic,
-            demote_passes=5 if synthetic else 3,
+            require_descriptor_match=not want_synthetic,
+            demote_passes=5 if want_synthetic else 3,
         )
         self._last_result: Optional[VisionResult] = None
         self._last_frame_age_s: Optional[float] = None
@@ -64,15 +66,27 @@ class VisionSupervisor:
         self._inflight: set = set()
         self._rr_index = 0
 
+        input_size = int(cfg.vision_input_size) if not want_synthetic else 224
+        if input_size < 14:
+            input_size = 224
         worker_cfg = WorkerConfig(
-            dinov2_onnx=str(cfg.vision_dinov2_onnx or ""),
-            yolo_onnx=str(cfg.vision_yolo_onnx or ""),
-            synthetic=synthetic,
+            dinov2_onnx=dinov2_path,
+            yolo_onnx=_resolve_model_path(str(cfg.vision_yolo_onnx or "")),
+            synthetic=want_synthetic,
             # One thread — leave cores for SLAM/nav; dual-cam was hesitant.
             cpu_threads=1,
-            input_short_side=224 if not cfg.vision_dinov2_onnx else 448,
+            input_short_side=input_size,
         )
         self._worker = VisionWorker(worker_cfg)
+        # If ONNX failed to load, worker flips to synthetic — keep landmark
+        # association policy in sync (spatial merge, softer demotion).
+        if self._worker.cfg.synthetic and not want_synthetic:
+            self._landmarks.require_descriptor_match = False
+            self._landmarks.demote_passes = 5
+            self._log(
+                f"vision: DINOv2 load failed ({self._worker.stats.get('last_error')}); "
+                "falling back to synthetic"
+            )
 
     def _log(self, msg: str) -> None:
         if self._logger is None:
@@ -108,9 +122,7 @@ class VisionSupervisor:
 
     def reset_landmarks(self) -> None:
         """Drop the in-memory landmark map (e.g. after ``clear_map``)."""
-        synthetic = bool(self._cfg.vision_synthetic) or not bool(
-            self._cfg.vision_dinov2_onnx
-        )
+        synthetic = bool(self._worker.cfg.synthetic)
         with self._lock:
             self._landmarks = EmbeddingLandmarkMap(
                 associate_radius_m=float(self._cfg.vision_associate_radius_m),
@@ -168,6 +180,11 @@ class VisionSupervisor:
                 "max_patches_per_frame": int(self._cfg.vision_max_patches_per_frame),
                 "round_robin": bool(self._cfg.vision_round_robin),
                 "associate_radius_m": float(self._landmarks.associate_radius_m),
+                "dinov2_onnx": self._dinov2_path or None,
+                "input_size": int(self._worker.cfg.input_short_side),
+                "require_descriptor_match": bool(
+                    self._landmarks.require_descriptor_match
+                ),
             }
 
     def ingest_frame(self, frame: VisionFrame, *, mapping: bool = True) -> VisionResult:
@@ -350,3 +367,24 @@ def _resize_nearest(img: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
     ys = (np.linspace(0, h - 1, new_h)).astype(np.int32)
     xs = (np.linspace(0, w - 1, new_w)).astype(np.int32)
     return img[ys][:, xs]
+
+
+def _resolve_model_path(raw: str) -> str:
+    """Absolute path, cwd-relative, or package ``semantic/models/`` relative."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    from pathlib import Path
+
+    p = Path(text).expanduser()
+    if p.is_file():
+        return str(p.resolve())
+    if not p.is_absolute():
+        pkg = Path(__file__).resolve().parent / "models" / text
+        if pkg.is_file():
+            return str(pkg.resolve())
+        cwd = Path.cwd() / text
+        if cwd.is_file():
+            return str(cwd.resolve())
+    # Keep the configured string so the worker surfaces FileNotFoundError.
+    return str(p)

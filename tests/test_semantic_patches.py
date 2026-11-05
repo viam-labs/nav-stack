@@ -135,3 +135,54 @@ def test_subsample_observations_caps_count():
     ]
     out = subsample_observations(toks, 5)
     assert len(out) == 5
+
+
+def test_dinov2_onnx_letterbox_smoke():
+    """If the exported ViT-S ONNX is present, run one real inference frame."""
+    from pathlib import Path
+
+    onnx = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "semantic"
+        / "models"
+        / "dinov2_vits14_patches_448.onnx"
+    )
+    if not onnx.is_file():
+        pytest.skip("dinov2 onnx not present (fetch/export first)")
+    try:
+        import onnxruntime  # noqa: F401
+    except ImportError:
+        pytest.skip("onnxruntime not installed")
+
+    # Richer texture than _wall_frame so distinctiveness keeps some patches.
+    frame = _wall_frame(depth_m=2.0)
+    h, w = frame.color_rgb.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w]
+    frame.color_rgb[:] = np.stack(
+        [
+            (xx * 3) % 255,
+            (yy * 5) % 255,
+            ((xx + yy) * 7) % 255,
+        ],
+        axis=-1,
+    ).astype(np.uint8)
+    worker = VisionWorker(
+        WorkerConfig(
+            dinov2_onnx=str(onnx),
+            synthetic=False,
+            input_short_side=448,
+            cpu_threads=1,
+        )
+    )
+    assert worker.stats["provider"] != "synthetic"
+    result = worker.process(frame)
+    assert result.provider != "synthetic"
+    assert len(result.patches) > 0
+    # Patch UVs must land inside the source image (letterbox undone).
+    for tok in result.patches[:20]:
+        assert 0.0 <= tok.u < w
+        assert 0.0 <= tok.v < h
+    obs = backproject_patches(frame, result.patches, z_min_m=0.25, z_max_m=2.0)
+    assert len(obs) > 0
+    worker.close()

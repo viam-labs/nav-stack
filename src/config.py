@@ -1069,6 +1069,8 @@ class SlamConfig:
     vision_yolo_onnx: str = ""
     vision_head_onnx: str = ""  # optional site-finetuned projection head
     vision_synthetic: bool = False  # bench/tests without ONNX weights
+    # Square letterbox side for DINOv2 ONNX (must match the exported model).
+    vision_input_size: int = 448
     landmark_fix_max_range_m: float = 4.0
     landmark_fix_max_jump_m: float = 1.5
     # Survey-only: build landmarks but do not write pose corrections / loops.
