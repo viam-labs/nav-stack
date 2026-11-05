@@ -45,12 +45,13 @@ def test_ghost_parallel_walls_raise_health():
     h = map_health.assess_occupancy(grid, resolution=res, origin_x=0.0, origin_y=0.0)
     assert h.ghost_frac >= map_health._WATCH_GHOST
     assert h.ghost_frac >= map_health._DEGRADING_GHOST
-    # Immature maps clamp live status to watch; raw stays degrading.
+    # Immature maps stay cold with no live hotspots; raw still flags tear.
     assert h.mature is False
-    assert h.status == "watch"
+    assert h.status == "cold"
     assert h.raw_status == "degrading"
+    assert h.hotspots == ()
     assert h.as_dict()["status"] == h.status
-    assert isinstance(h.as_dict()["hotspots"], list)
+    assert h.as_dict()["hotspots"] == []
 
 
 def test_mature_severe_ghost_is_degrading():
@@ -98,26 +99,35 @@ def test_baseline_hides_inherited_ghosts():
     session = map_health.assess_occupancy(
         grid, resolution=res, origin_x=0.0, origin_y=0.0, baseline=grid.copy()
     )
-    assert whole.status in ("watch", "degrading")
+    assert whole.mature is False
+    assert whole.status == "cold"
+    assert whole.raw_status == "degrading"
     assert session.status == "cold"
     assert session.occupied_cells == 0
 
 
 def test_new_copy_beside_baseline_wall_is_flagged():
     # Baseline: clean walls. Session repaints each one again 0.3 m over.
-    base, res = _blank(220, 220)
-    base[20:200, 20:200] = 0
-    for c in (60, 100, 140):
-        _paint_wall(base, 30, 190, c, c + 2)
+    # Use a mature-sized map so live status can escalate past cold.
+    base, res = _blank(400, 400)
+    base[20:380, 20:380] = 0
+    for c in (60, 100, 140, 200, 260):
+        _paint_wall(base, 30, 370, c, c + 2)
     live = base.copy()
-    for c in (66, 106, 146):
-        _paint_wall(live, 30, 190, c, c + 2)
+    for c in (66, 106, 146, 206, 266):
+        _paint_wall(live, 30, 370, c, c + 2)
     h = map_health.assess_occupancy(
         live, resolution=res, origin_x=0.0, origin_y=0.0, baseline=base
     )
-    assert h.status in ("watch", "degrading")
     assert h.ghost_frac >= map_health._WATCH_GHOST
-    assert h.hotspots
+    assert h.raw_status in ("watch", "degrading")
+    # Session-only cells can still be below mature; live may stay cold.
+    if h.mature:
+        assert h.status in ("watch", "degrading")
+        assert h.hotspots
+    else:
+        assert h.status == "cold"
+        assert h.hotspots == ()
 
 
 def test_clean_new_walls_ok_on_a_torn_baseline():
@@ -175,7 +185,8 @@ def test_engine_scores_session_against_resumed_map(tmp_path):
     out = engine.refresh_map_health(force=True)
     assert out["scope"] == "session"
     assert out["status"] == "cold"
-    assert out["baseline"]["status"] in ("watch", "degrading")
+    assert out["baseline"]["raw_status"] == "degrading"
+    assert out["baseline"]["trusted"] is False
     assert engine._map_health_boosts == 0  # noqa: SLF001
 
     # The session draws a ghost copy of the outer wall 0.3 m over.
@@ -188,11 +199,13 @@ def test_engine_scores_session_against_resumed_map(tmp_path):
     engine._generation += 1  # noqa: SLF001
     out = engine.refresh_map_health(force=True)
     assert out["scope"] == "session"
-    assert out["status"] in ("watch", "degrading")
-    assert engine._map_health_boosts == 1  # noqa: SLF001
+    # Session-only new cells on a small map stay cold (no premature watch).
+    assert out["status"] == "cold"
+    assert out["raw_status"] in ("watch", "degrading", "cold", "ok")
+    assert engine._map_health_boosts == 0  # noqa: SLF001
     assert (
-        engine.diagnostics()["map_health"]["baseline"]["status"]
-        == (out["baseline"]["status"])
+        engine.diagnostics()["map_health"]["baseline"]["raw_status"]
+        == out["baseline"]["raw_status"]
     )
 
 
@@ -545,6 +558,25 @@ def test_hotspot_auto_clear_can_be_disabled(tmp_path):
         map_health_auto_clear=False,
         map_health_hotspot_persist_n=1,
     )
+    torn, res = _mature_ghost_hallway()
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        torn, resolution=res, origin_x=0.0, origin_y=0.0
+    )
+    engine._session_baseline = None  # noqa: SLF001
+    out = engine.refresh_map_health(force=True)
+    assert out["status"] == "degrading"
+    assert out["hotspot_heal"]["tracked"]["streak"] == 1
+    assert out["hotspot_heal"]["auto_clear"] is False
+    assert out["hotspot_heal"]["clears"] == 0
+    assert engine._operator_trusted_paint is False  # noqa: SLF001
+
+
+def test_immature_map_stays_cold_without_hotspots(tmp_path):
+    from src.slam_builtin import occupancy as occ
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine(tmp_path)
     torn, res = _ghost_hallway()
     engine._mode = MODE_MAPPING  # noqa: SLF001
     engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
@@ -552,7 +584,8 @@ def test_hotspot_auto_clear_can_be_disabled(tmp_path):
     )
     engine._session_baseline = None  # noqa: SLF001
     out = engine.refresh_map_health(force=True)
-    assert out["hotspot_heal"]["tracked"]["streak"] == 1
-    assert out["hotspot_heal"]["auto_clear"] is False
-    assert out["hotspot_heal"]["clears"] == 0
-    assert engine._operator_trusted_paint is False  # noqa: SLF001
+    assert out["mature"] is False
+    assert out["status"] == "cold"
+    assert out["hotspots"] == []
+    assert out["raw_status"] == "degrading"
+    assert out["hotspot_heal"]["tracked"] is None
