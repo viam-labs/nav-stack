@@ -14,7 +14,7 @@ from ..geom import conversions as conv
 from .decode import decode_color_image, decode_depth_image, pick_named_images
 from .frames import intrinsics_from_size, vision_frame_from_arrays
 from .landmarks import EmbeddingLandmarkMap
-from .patches import backproject_patches
+from .patches import backproject_patches, subsample_observations
 from .persist import load_landmarks, save_landmarks
 from .types import VisionFrame, VisionResult
 from .worker import VisionWorker, WorkerConfig
@@ -47,19 +47,29 @@ class VisionSupervisor:
         self._lock = threading.Lock()
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
-        self._landmarks = EmbeddingLandmarkMap()
+        synthetic = bool(cfg.vision_synthetic) or not bool(cfg.vision_dinov2_onnx)
+        self._landmarks = EmbeddingLandmarkMap(
+            associate_radius_m=float(cfg.vision_associate_radius_m),
+            cell_m=float(cfg.vision_cell_m),
+            # Synthetic RGB-stat descriptors are not re-id stable; merge by
+            # distance so the density pilot is not drowned in one-per-patch IDs.
+            require_descriptor_match=not synthetic,
+            demote_passes=5 if synthetic else 3,
+        )
         self._last_result: Optional[VisionResult] = None
         self._last_frame_age_s: Optional[float] = None
         self._last_error: Optional[str] = None
         self._frames = 0
         self._observations = 0
         self._inflight: set = set()
+        self._rr_index = 0
 
         worker_cfg = WorkerConfig(
             dinov2_onnx=str(cfg.vision_dinov2_onnx or ""),
             yolo_onnx=str(cfg.vision_yolo_onnx or ""),
-            synthetic=bool(cfg.vision_synthetic) or not bool(cfg.vision_dinov2_onnx),
-            cpu_threads=2,
+            synthetic=synthetic,
+            # One thread — leave cores for SLAM/nav; dual-cam was hesitant.
+            cpu_threads=1,
             input_short_side=224 if not cfg.vision_dinov2_onnx else 448,
         )
         self._worker = VisionWorker(worker_cfg)
@@ -81,6 +91,12 @@ class VisionSupervisor:
         if loaded is None:
             return False
         with self._lock:
+            # Keep live merge / height settings; only restore landmark rows.
+            loaded.associate_radius_m = self._landmarks.associate_radius_m
+            loaded.cell_m = self._landmarks.cell_m
+            loaded.require_descriptor_match = self._landmarks.require_descriptor_match
+            loaded.demote_passes = self._landmarks.demote_passes
+            loaded.rebuild_cell_index()
             self._landmarks = loaded
         self._log(f"vision: loaded {len(loaded)} landmarks from {map_dir}")
         return True
@@ -89,6 +105,23 @@ class VisionSupervisor:
         with self._lock:
             path = save_landmarks(map_dir, self._landmarks)
         return str(path) if path is not None else None
+
+    def reset_landmarks(self) -> None:
+        """Drop the in-memory landmark map (e.g. after ``clear_map``)."""
+        synthetic = bool(self._cfg.vision_synthetic) or not bool(
+            self._cfg.vision_dinov2_onnx
+        )
+        with self._lock:
+            self._landmarks = EmbeddingLandmarkMap(
+                associate_radius_m=float(self._cfg.vision_associate_radius_m),
+                cell_m=float(self._cfg.vision_cell_m),
+                require_descriptor_match=not synthetic,
+                demote_passes=5 if synthetic else 3,
+            )
+            self._observations = 0
+            self._frames = 0
+            self._last_result = None
+            self._last_error = None
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         if not self._cfg.vision_enabled:
@@ -100,6 +133,9 @@ class VisionSupervisor:
             f"vision: started cameras={list(self._cfg.vision_cameras)} "
             f"rate={self._cfg.vision_rate_hz}Hz "
             f"survey_only={self._cfg.vision_survey_only} "
+            f"round_robin={self._cfg.vision_round_robin} "
+            f"z=[{self._cfg.vision_z_min_m},{self._cfg.vision_z_max_m}] "
+            f"max_patches={self._cfg.vision_max_patches_per_frame} "
             f"provider={self._worker.stats.get('provider')}"
         )
 
@@ -127,6 +163,11 @@ class VisionSupervisor:
                 "last_frame_age_s": self._last_frame_age_s,
                 "last_error": self._last_error,
                 "worker": dict(self._worker.stats),
+                "z_min_m": float(self._cfg.vision_z_min_m),
+                "z_max_m": float(self._cfg.vision_z_max_m),
+                "max_patches_per_frame": int(self._cfg.vision_max_patches_per_frame),
+                "round_robin": bool(self._cfg.vision_round_robin),
+                "associate_radius_m": float(self._landmarks.associate_radius_m),
             }
 
     def ingest_frame(self, frame: VisionFrame, *, mapping: bool = True) -> VisionResult:
@@ -153,8 +194,18 @@ class VisionSupervisor:
             elapsed = time.monotonic() - t0
             await asyncio.sleep(max(0.0, period - elapsed))
 
+    def _cameras_this_tick(self) -> List[LidarConfig]:
+        cams = self._cfg.vision_lidar_configs()
+        if not cams:
+            return []
+        if not self._cfg.vision_round_robin or len(cams) == 1:
+            return cams
+        idx = self._rr_index % len(cams)
+        self._rr_index += 1
+        return [cams[idx]]
+
     async def _tick_once(self) -> None:
-        for lidar in self._cfg.vision_lidar_configs():
+        for lidar in self._cameras_this_tick():
             name = lidar.name
             if name in self._inflight:
                 continue
@@ -234,7 +285,13 @@ class VisionSupervisor:
 
     def _survey(self, frame: VisionFrame, result: VisionResult) -> None:
         """Associate patches into the landmark map (no pose writeback)."""
-        obs = backproject_patches(frame, result.patches)
+        obs = backproject_patches(
+            frame,
+            result.patches,
+            z_min_m=float(self._cfg.vision_z_min_m),
+            z_max_m=float(self._cfg.vision_z_max_m),
+        )
+        obs = subsample_observations(obs, int(self._cfg.vision_max_patches_per_frame))
         if not obs:
             return
         try:

@@ -32,7 +32,7 @@ class EmbeddingLandmark:
 class EmbeddingLandmarkMap:
     """Session landmark store keyed by integer id."""
 
-    associate_radius_m: float = 0.10
+    associate_radius_m: float = 0.25
     promote_min_obs: int = 3
     promote_min_views: int = 2
     promote_min_view_gap_m: float = 0.5
@@ -40,14 +40,24 @@ class EmbeddingLandmarkMap:
     demote_offset_m: float = 0.15
     demote_passes: int = 3
     max_descriptors: int = 3
-    cell_m: float = 0.15
+    cell_m: float = 0.30
     cosine_threshold: float = 0.55
+    # When False (synthetic RGB stats), associate by distance only so nearby
+    # patches collapse instead of spawning one landmark per grid cell.
+    require_descriptor_match: bool = True
 
     def __post_init__(self) -> None:
         self._next_id = 1
         self._landmarks: Dict[int, EmbeddingLandmark] = {}
         self._cell_index: Dict[Tuple[int, int, int], List[int]] = {}
         self._demote_strikes: Dict[int, int] = {}
+
+    def rebuild_cell_index(self) -> None:
+        """Re-hash landmarks after ``cell_m`` changes (load / config apply)."""
+        self._cell_index = {}
+        for lm in self._landmarks.values():
+            # Persist load indexes by rel_xyz (anchor-identity); keep that contract.
+            self._index_add(lm, np.asarray(lm.rel_xyz, dtype=float))
 
     def __len__(self) -> int:
         return len(self._landmarks)
@@ -163,7 +173,9 @@ class EmbeddingLandmarkMap:
                 radius = max(radius, 3.0 * float(self.demote_offset_m))
             if dist > radius:
                 continue
-            if self._best_desc_cosine(lm, descriptor) < float(self.cosine_threshold):
+            if self.require_descriptor_match and (
+                self._best_desc_cosine(lm, descriptor) < float(self.cosine_threshold)
+            ):
                 continue
             if dist < best_d:
                 best_d = dist
@@ -173,12 +185,7 @@ class EmbeddingLandmarkMap:
             lid = self._next_id
             self._next_id += 1
             rel = self.rel_from_map_point(anchor_pose, map_xyz)
-            # Normal into anchor frame.
-            n_rel = self.rel_from_map_point(
-                conv.Pose2D(0.0, 0.0, anchor_pose.theta),
-                normal_map,
-            )
-            # The above mis-handles normals; rotate only:
+            # Normal into anchor frame (rotate only):
             c, s = math.cos(anchor_pose.theta), math.sin(anchor_pose.theta)
             n_rel = np.array(
                 [
@@ -238,7 +245,9 @@ class EmbeddingLandmarkMap:
                 radius = max(radius, 3.0 * float(self.demote_offset_m))
             if dist > radius:
                 continue
-            if self._best_desc_cosine(lm, descriptor) < float(self.cosine_threshold):
+            if self.require_descriptor_match and (
+                self._best_desc_cosine(lm, descriptor) < float(self.cosine_threshold)
+            ):
                 continue
             if dist < best_d:
                 best_d = dist

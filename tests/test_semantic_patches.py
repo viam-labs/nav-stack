@@ -102,3 +102,36 @@ def test_synthetic_worker_runs():
     assert result.infer_ms >= 0.0
     obs = backproject_patches(frame, result.patches)
     assert len(obs) > 0
+
+
+def test_backproject_height_gate():
+    frame = _wall_frame(depth_m=2.0)  # mount_z=0.5 → center hit z≈0.5
+    tok = PatchToken(
+        row=0,
+        col=0,
+        u=frame.intrinsics.cx,
+        v=frame.intrinsics.cy,
+        descriptor=np.ones(8, dtype=np.float32),
+    )
+    kept = backproject_patches(frame, [tok], z_min_m=0.25, z_max_m=2.0)
+    assert len(kept) == 1
+    assert kept[0].point_base[2] == pytest.approx(0.5, abs=0.05)
+    # Treat the wall hit as "floor" by raising z_min above mount height.
+    dropped = backproject_patches(frame, [tok], z_min_m=0.6, z_max_m=2.0)
+    assert dropped == []
+
+
+def test_subsample_observations_caps_count():
+    from src.semantic.patches import PatchObservation, subsample_observations
+
+    toks = [
+        PatchObservation(
+            token=PatchToken(row=i, col=0, u=float(i), v=0.0, descriptor=np.ones(2)),
+            point_base=np.array([1.0, 0.0, 1.0]),
+            normal_base=np.array([-1.0, 0.0, 0.0]),
+            sigma_m=0.01 * (i + 1),
+        )
+        for i in range(20)
+    ]
+    out = subsample_observations(toks, 5)
+    assert len(out) == 5

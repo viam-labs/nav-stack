@@ -2077,6 +2077,9 @@ class SlamService(SLAM):
             handle.clear_serialized_data()
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._reset_live_slam, MODE_MAPPING)
+            vision = self._vision
+            if vision is not None:
+                vision.reset_landmarks()
         finally:
             self._end_map_reset()
         return {"status": "cleared", "map": handle.name, "mode": MODE_MAPPING}

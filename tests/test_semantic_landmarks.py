@@ -12,6 +12,35 @@ from src.semantic.place import PlaceIndex, fit_pca, fit_vocabulary, l2_normalize
 from src.semantic.types import LandmarkStatus
 
 
+def test_spatial_merge_without_descriptor_match():
+    """Synthetic mode: nearby patches collapse by distance alone."""
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        cell_m=0.30,
+        require_descriptor_match=False,
+        promote_min_obs=99,  # stay candidate
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    # Two unrelated descriptors within 10 cm → one landmark.
+    for i, desc in enumerate(
+        [
+            l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)),
+            l2_normalize(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)),
+        ]
+    ):
+        store.observe(
+            map_xyz=np.array([2.0, 0.05 * i, 1.0], dtype=float),
+            descriptor=desc,
+            normal_map=normal,
+            anchor_node=0,
+            anchor_pose=anchor,
+            view_xy=(0.0, 0.0),
+        )
+    assert len(store) == 1
+    assert store.all_landmarks()[0].observations == 2
+
+
 def test_landmark_promotion_and_demotion():
     store = EmbeddingLandmarkMap(
         promote_min_obs=3,

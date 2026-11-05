@@ -131,8 +131,13 @@ def backproject_patches(
     min_valid_frac: float = 0.5,
     max_spread_frac: float = 0.1,
     window_half: int = 2,
+    z_min_m: Optional[float] = None,
+    z_max_m: Optional[float] = None,
 ) -> List[PatchObservation]:
-    """Fill ``point_base`` / validity on tokens; return only valid observations."""
+    """Fill ``point_base`` / validity on tokens; return only valid observations.
+
+    ``z_min_m`` / ``z_max_m`` gate height in base_link (drop floor/ceiling).
+    """
     depth = np.asarray(frame.depth_m, dtype=float)
     if depth.ndim != 2:
         raise ValueError(f"depth_m must be HxW, got shape {depth.shape}")
@@ -166,6 +171,11 @@ def backproject_patches(
             roll=frame.mount_roll,
         )
         point = base[0].astype(float)
+        z = float(point[2])
+        if z_min_m is not None and z < float(z_min_m):
+            continue
+        if z_max_m is not None and z > float(z_max_m):
+            continue
 
         n_opt = _plane_normal_optical(depth, K, tok.u, tok.v, half=window_half)
         n_sensor = camera_optical_to_sensor_frame(n_opt.reshape(1, 3))[0]
@@ -200,6 +210,32 @@ def backproject_patches(
             )
         )
     return out
+
+
+def subsample_observations(
+    observations: Sequence[PatchObservation],
+    max_count: int,
+) -> List[PatchObservation]:
+    """Uniform stride subsample so a frame cannot flood the landmark map."""
+    obs = list(observations)
+    limit = int(max_count)
+    if limit <= 0 or len(obs) <= limit:
+        return obs
+    # Prefer lower range uncertainty, then stride through the ranked list so
+    # we keep spatial coverage instead of only the closest patches.
+    ranked = sorted(obs, key=lambda o: float(o.sigma_m))
+    step = max(1, int(math.ceil(len(ranked) / float(limit))))
+    picked = ranked[::step][:limit]
+    if len(picked) < limit:
+        # Fill remaining from the unpicked front of the ranked list.
+        seen = {id(p) for p in picked}
+        for o in ranked:
+            if id(o) in seen:
+                continue
+            picked.append(o)
+            if len(picked) >= limit:
+                break
+    return picked
 
 
 def distinctiveness_mask(

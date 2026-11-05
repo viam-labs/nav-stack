@@ -46,6 +46,17 @@ def test_vision_enabled_ok():
     assert cams[0].obstacles_only is True
 
 
+def test_vision_density_defaults():
+    cfg = SlamConfig.from_dict({"base": "b", "lidars": _base_lidars()})
+    assert cfg.vision_rate_hz == 1.0
+    assert cfg.vision_z_min_m == 0.25
+    assert cfg.vision_z_max_m == 2.0
+    assert cfg.vision_associate_radius_m == 0.25
+    assert cfg.vision_cell_m == 0.30
+    assert cfg.vision_max_patches_per_frame == 64
+    assert cfg.vision_round_robin is True
+
+
 def test_vision_requires_obstacles_only_optical():
     with pytest.raises(ValueError, match="obstacles_only"):
         SlamConfig.from_dict(

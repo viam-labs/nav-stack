@@ -13,6 +13,20 @@ Weights are **not** committed to git.
 
 Point `SlamConfig.vision_dinov2_onnx` / `vision_yolo_onnx` at absolute paths on the robot.
 
+## Survey density / nav load (rc2+)
+
+Defaults assume a density pilot, not pose writeback:
+
+| Attribute | Default | Why |
+| --- | --- | --- |
+| `vision_rate_hz` | `1.0` | Leave CPU for SLAM/nav |
+| `vision_round_robin` | `true` | One camera per tick when multiple are listed |
+| `vision_z_min_m` / `vision_z_max_m` | `0.25` / `2.0` | Drop floor/ceiling |
+| `vision_max_patches_per_frame` | `64` | Cap associations per frame |
+| `vision_associate_radius_m` / `vision_cell_m` | `0.25` / `0.30` | Merge nearby patches |
+
+Wipe `embedding_landmarks.npz` (or `clear_map`) before re-surveying after upgrading. Prefer a single camera in `vision_cameras` while measuring density.
+
 ## Meerkat GPU runtime
 
 ```bash

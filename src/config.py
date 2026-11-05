@@ -1063,7 +1063,8 @@ class SlamConfig:
     # for avoidance). Mount comes from that entry.
     vision_enabled: bool = False
     vision_cameras: List[str] = field(default_factory=list)
-    vision_rate_hz: float = 2.0
+    # Keep ≤1 Hz while surveying — dual RealSense grab+infer was starving nav.
+    vision_rate_hz: float = 1.0
     vision_dinov2_onnx: str = ""
     vision_yolo_onnx: str = ""
     vision_head_onnx: str = ""  # optional site-finetuned projection head
@@ -1072,6 +1073,18 @@ class SlamConfig:
     landmark_fix_max_jump_m: float = 1.5
     # Survey-only: build landmarks but do not write pose corrections / loops.
     vision_survey_only: bool = False
+    # Height band in base_link (reject floor/ceiling spam). Floor hits from a
+    # chest-height RealSense sit near z≈0; keep wall/artwork band only.
+    vision_z_min_m: float = 0.25
+    vision_z_max_m: float = 2.0
+    # Spatial merge: larger radius/cell collapses dense patch grids into fewer
+    # landmarks (Phase 0.5 density fix).
+    vision_associate_radius_m: float = 0.25
+    vision_cell_m: float = 0.30
+    # Cap observations ingested per camera frame (after height gate).
+    vision_max_patches_per_frame: int = 64
+    # One camera per tick (round-robin) when multiple vision_cameras are set.
+    vision_round_robin: bool = True
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "SlamConfig":
