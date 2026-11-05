@@ -104,6 +104,35 @@ def test_supervisor_ingest_builds_landmarks(tmp_path: Path):
     assert len(loaded) >= 1
 
 
+def test_start_does_not_drop_dinov2_session():
+    """Regression: start() used to close() the worker and force synthetic."""
+    import asyncio
+
+    cfg = _cfg(vision_synthetic=True)
+    pose = Pose2D(0.0, 0.0, 0.0)
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: pose,
+        get_pose_at=lambda _t: pose,
+        get_anchor=lambda: (0, pose, {0: pose}),
+    )
+    # Pretend a real ONNX session is loaded.
+    vision._worker.cfg.synthetic = False  # noqa: SLF001
+    sentinel = object()
+    vision._worker._dino = sentinel  # noqa: SLF001
+    vision._worker.stats["provider"] = "CPUExecutionProvider"
+
+    loop = asyncio.new_event_loop()
+    try:
+        vision.start(loop)
+        assert vision._worker._dino is sentinel  # noqa: SLF001
+        assert vision._worker.stats["provider"] == "CPUExecutionProvider"
+        vision.stop()
+    finally:
+        loop.close()
+
+
 def test_save_load_roundtrip(tmp_path: Path):
     from src.semantic.landmarks import EmbeddingLandmarkMap
     from src.semantic.place import l2_normalize

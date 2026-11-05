@@ -148,8 +148,12 @@ class VisionSupervisor:
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         if not self._cfg.vision_enabled:
             return
-        self.stop()
+        # Stop the async loop only — do NOT close the worker. Closing drops the
+        # loaded DINOv2 session and every later frame silently falls back to
+        # synthetic (provider=synthetic, last_error=null).
+        self._stop_loop()
         self._stop = asyncio.Event()
+        self._ensure_worker_loaded()
         self._task = loop.create_task(self._run(), name="vision-supervisor")
         self._log(
             f"vision: started cameras={list(self._cfg.vision_cameras)} "
@@ -158,15 +162,35 @@ class VisionSupervisor:
             f"round_robin={self._cfg.vision_round_robin} "
             f"z=[{self._cfg.vision_z_min_m},{self._cfg.vision_z_max_m}] "
             f"max_patches={self._cfg.vision_max_patches_per_frame} "
-            f"provider={self._worker.stats.get('provider')}"
+            f"provider={self._worker.stats.get('provider')} "
+            f"dinov2={self._dinov2_path or 'none'}"
         )
 
-    def stop(self) -> None:
+    def _stop_loop(self) -> None:
         task = self._task
         self._task = None
         if task is not None and not task.done():
             self._stop.set()
             task.cancel()
+
+    def _ensure_worker_loaded(self) -> None:
+        """Reload ONNX if stop/close cleared the session."""
+        worker = self._worker
+        if worker.cfg.synthetic:
+            return
+        if worker._dino is not None:  # noqa: SLF001
+            return
+        worker._load_models()  # noqa: SLF001
+        if worker.cfg.synthetic:
+            self._landmarks.require_descriptor_match = False
+            self._landmarks.demote_passes = 5
+            self._log(
+                f"vision: DINOv2 reload failed ({worker.stats.get('last_error')}); "
+                "falling back to synthetic"
+            )
+
+    def stop(self) -> None:
+        self._stop_loop()
         self._worker.close()
 
     def status(self) -> dict:
