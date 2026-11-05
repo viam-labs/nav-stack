@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import shutil
 import threading
@@ -531,7 +532,8 @@ class BuiltinSlamEngine:
         if xb <= xa or yb <= ya:
             raise ValueError("clear_region needs a non-empty box")
         with self._lock:
-            edit = ("clear_box", xa, ya, xb, yb)
+            # Re-renders erase scans up to this seq; later ones remap the hole.
+            edit = ("clear_box", xa, ya, xb, yb, int(self._graph.last_seq))
             cleared = self._edit_live_grid_locked(edit)
             self._grid_edits.append(edit)
 
@@ -733,12 +735,25 @@ class BuiltinSlamEngine:
         # _session_baseline stays the loaded image: health and trust score
         # the map this session resumed on.
         self._graph_base = saved.base
-        self._grid_edits = list(saved.edits)
+        # Re-apply clears/marks onto the loaded PGM.
+        edits = []
+        for edit in saved.edits:
+            if edit[0] == "clear_box" and len(edit) == 5:
+                # Saved before clears carried a seq, when band paint could
+                # refill the hole with the old walls: wipe it, and erase every
+                # loaded keyframe there on re-render.
+                occ.clear_rect(self._grid, *edit[1:5])
+                edit = (*edit, int(saved.last_seq))
+            elif edit[0] == "clear_box":
+                # Walls in the hole were remapped after the clear. Only its
+                # free cells go back to unjudged for scan matching.
+                occ.clear_rect(self._grid, *edit[1:5], keep_walls=True)
+            else:
+                self._apply_grid_edit(self._grid, edit)
+            edits.append(edit)
+        self._grid_edits = edits
         self._grid_edits_saved = len(self._grid_edits)
-        # Re-apply clears/marks onto the loaded PGM. Save may have written a
-        # grid that lidar refilled after clear_region; clear_box must stick.
         if self._grid_edits:
-            self._replay_grid_edits_locked(self._grid)
             self._invalidate_occ_cache()
             self._generation += 1
         self._graph_revision += 1
@@ -756,9 +771,24 @@ class BuiltinSlamEngine:
             return occ.clear_rect(grid, edit[1], edit[2], edit[3], edit[4])
         return occ.mark_disk(grid, edit[1], edit[2], edit[3])
 
-    def _replay_grid_edits_locked(self, grid: LogOddsGrid) -> None:
-        for edit in self._grid_edits:
-            self._apply_grid_edit(grid, edit)
+    @staticmethod
+    def _seq_scoped(edit: tuple) -> bool:
+        return edit[0] == "clear_box" and len(edit) > 5
+
+    @classmethod
+    def _render_clears(cls, edits: list) -> list:
+        """Box clears for ``render_grid``: drawn after the scans they erase."""
+        return [
+            (int(e[5]), functools.partial(cls._apply_grid_edit, edit=e))
+            for e in edits
+            if cls._seq_scoped(e)
+        ]
+
+    def _replay_after_render_locked(self, grid: LogOddsGrid, rendered: int) -> None:
+        """Edits the render did not place: disks, marks, and any made since."""
+        for k, edit in enumerate(self._grid_edits):
+            if k >= rendered or not self._seq_scoped(edit):
+                self._apply_grid_edit(grid, edit)
 
     def _edit_live_grid_locked(self, edit: tuple) -> int:
         """Apply ``edit`` to the published grid and to every height band.
@@ -1049,10 +1079,18 @@ class BuiltinSlamEngine:
             poses = res_opt.poses
         with self._lock:
             extra = self._graph.scans_after(snap.last_seq)
+            rendered_edits = len(self._grid_edits)
+            clears = self._render_clears(self._grid_edits)
         started = perf_counter()
         bands: dict = {}
         grid = pg.render_grid(
-            snap, resolution=res, poses=poses, base=base, extra=extra, bands_out=bands
+            snap,
+            resolution=res,
+            poses=poses,
+            base=base,
+            extra=extra,
+            clears=clears,
+            bands_out=bands,
         )
         render_ms = (perf_counter() - started) * 1000.0
         self._loop_stats["last_render_ms"] = round(render_ms, 1)
@@ -1071,11 +1109,12 @@ class BuiltinSlamEngine:
                     poses=poses,
                     base=base,
                     extra=newer,
+                    clears=clears,
                     bands_out=bands,
                 )
-            self._replay_grid_edits_locked(grid)
+            self._replay_after_render_locked(grid, rendered_edits)
             for band_grid in bands.values():
-                self._replay_grid_edits_locked(band_grid)
+                self._replay_after_render_locked(band_grid, rendered_edits)
             self._grid = grid
             # Live paint rebuilds ``_grid`` from these; the old bands would
             # put back the walls this render moved.
@@ -2105,15 +2144,16 @@ class BuiltinSlamEngine:
         edits: list,
         res: float,
     ) -> map_health.MapHealth:
-        grid = pg.render_grid(snap, resolution=res, poses=poses, base=base)
+        grid = pg.render_grid(
+            snap,
+            resolution=res,
+            poses=poses,
+            base=base,
+            clears=self._render_clears(edits),
+        )
         for edit in edits:
-            kind = edit[0]
-            if kind == "clear":
-                occ.clear_disk(grid, edit[1], edit[2], edit[3])
-            elif kind == "clear_box":
-                occ.clear_rect(grid, edit[1], edit[2], edit[3], edit[4])
-            else:
-                occ.mark_disk(grid, edit[1], edit[2], edit[3])
+            if not self._seq_scoped(edit):
+                self._apply_grid_edit(grid, edit)
         return map_health.assess_occupancy(
             occ.to_occupancy_int16(grid),
             resolution=res,
@@ -2179,7 +2219,13 @@ class BuiltinSlamEngine:
                 return self._occ_cache
             grid = self._grid
             epoch = self._match_epoch
+            has_clears = any(e[0] == "clear_box" for e in self._grid_edits)
         int16 = occ.to_occupancy_int16(grid)
+        if has_clears:
+            # A cleared hole is free to the planner but says nothing about
+            # where the walls are. Judged as free, every return from a wall
+            # inside it counted against the scan and painting never resumed.
+            int16[grid.log_odds == np.float32(occ.CLEARED_LOG_ODDS)] = -1
         occ_map = scan_match.occupancy_map_from_int16(
             int16,
             resolution=grid.resolution,

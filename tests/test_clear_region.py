@@ -82,6 +82,7 @@ def test_graph_store_clear_box_v2_roundtrip(tmp_path):
         ("clear", 1.0, 2.0, 0.3),
         ("clear_box", 26.0, -20.0, 32.0, -11.0),
         ("mark", -1.0, 0.5, 0.2),
+        ("clear_box", 1.0, 1.0, 2.0, 2.0, 7),
     ]
     graph_store.save_graph(
         tmp_path,
@@ -94,7 +95,8 @@ def test_graph_store_clear_box_v2_roundtrip(tmp_path):
     )
     with np.load(tmp_path / "keyframes.npz", allow_pickle=False) as z:
         assert int(z["version"]) == 2
-        assert z["edit_params"].shape == (3, 4)
+        assert z["edit_params"].shape == (4, 4)
+        assert z["edit_seq"].tolist() == [-1, -1, -1, 7]
         assert "edit_xyr" not in z.files
     loaded = graph_store.load_graph(tmp_path, image_sha1="abc", resolution=RES)
     assert loaded is not None
@@ -181,7 +183,8 @@ def test_clear_region_drops_inbox_nodes_and_persists(tmp_path):
     # unknown (-1) rather than the pre-seeded occupied cell.
     assert out.get("rebuilt") in (True, False)
 
-    assert ("clear_box", 1.5, -1.0, 4.5, 1.0) in engine._grid_edits  # noqa: SLF001
+    boxes = [e[:5] for e in engine._grid_edits if e[0] == "clear_box"]  # noqa: SLF001
+    assert boxes == [("clear_box", 1.5, -1.0, 4.5, 1.0)]
     assert engine._map_health_base is None  # noqa: SLF001
     assert engine._session_baseline is not None  # noqa: SLF001
     assert np.array_equal(  # noqa: SLF001
@@ -201,7 +204,7 @@ def test_clear_region_drops_inbox_nodes_and_persists(tmp_path):
         (0.0, 0.0),
         (7.0, 0.0),
     ]
-    assert ("clear_box", 1.5, -1.0, 4.5, 1.0) in resumed._grid_edits  # noqa: SLF001
+    assert resumed._grid_edits == engine._grid_edits  # noqa: SLF001
     reloaded = occ.to_occupancy_int16(resumed._grid)  # noqa: SLF001
     r_in, c_in = resumed._grid.world_to_cell(3.0, 0.0)  # noqa: SLF001
     assert reloaded[r_in, c_in] == 0
@@ -243,9 +246,10 @@ def test_clear_region_enables_full_paint_despite_untrusted_baseline(tmp_path):
     )
 
     with engine._lock:  # noqa: SLF001
-        assert float(engine._grid.log_odds[r_hole, c_hole]) == float(occ.L_MIN)  # noqa: SLF001
+        hole = float(engine._grid.log_odds[r_hole, c_hole])  # noqa: SLF001
+    assert hole == occ.CLEARED_LOG_ODDS
 
-    # Full paint can rewrite the free hole; extend_only would leave L_MIN alone.
+    # Full paint can rewrite the free hole; extend_only would leave it alone.
     scan = conv.LaserScan2D(
         ranges=np.array([1.0], dtype=float),
         angle_min=0.0,
@@ -255,8 +259,9 @@ def test_clear_region_enables_full_paint_despite_untrusted_baseline(tmp_path):
     )
     engine._paint_mapping_scan(scan, conv.Pose2D(-1.0, 0.0, 0.0), now=1.0)  # noqa: SLF001
     with engine._lock:  # noqa: SLF001
-        # One hit may not cross free→occupied; it must still move off L_MIN.
-        assert float(engine._grid.log_odds[r_hole, c_hole]) > float(occ.L_MIN)  # noqa: SLF001
+        # One hit may not cross free→occupied; it must still move off the hole.
+        hole = float(engine._grid.log_odds[r_hole, c_hole])  # noqa: SLF001
+    assert hole > occ.CLEARED_LOG_ODDS
     assert engine.diagnostics()["paint"]["state"] == "painting"
 
 
@@ -286,7 +291,7 @@ def test_mapping_guidance_warns_when_tearing(tmp_path):
 
 def _banded_wall_scan(wall_x: float) -> conv.LaserScan2D:
     """A wall ``wall_x`` m ahead seen by a low and a high lidar (two bands)."""
-    ang = np.radians(np.linspace(-30.0, 30.0, 61))
+    ang = np.radians(np.linspace(-30.0, 30.0, 721))
     r = wall_x / np.cos(ang)
     xyz = np.vstack(
         [
@@ -306,9 +311,10 @@ def _paint_banded(engine, pose: conv.Pose2D, wall_x: float, now: float) -> None:
 
 
 def _odds(engine, x: float, y: float) -> float:
+    """Strongest cell within two cells: keyframes keep a thinned scan."""
     grid = engine._grid  # noqa: SLF001
     r, c = grid.world_to_cell(x, y)
-    return float(grid.log_odds[r, c])
+    return float(grid.log_odds[r - 2 : r + 3, c - 2 : c + 3].max())
 
 
 def _banded_engine(tmp_path):
@@ -358,8 +364,7 @@ def test_rerender_sticks_after_next_banded_paint(tmp_path):
     assert _odds(engine, 2.0, 0.0) <= 0.5
 
 
-def test_clear_box_edit_survives_refill_then_reload(tmp_path):
-    """Lidar may refill the hole before save; clear_box must still apply on load."""
+def _hallway_engine(tmp_path):
     engine = _engine(tmp_path)
     grid = occ.empty_grid(resolution=RES, size_m=20.0, origin_x=-2.0, origin_y=-2.0)
     for x in np.linspace(0.0, 8.0, 41):
@@ -376,29 +381,140 @@ def test_clear_box_edit_survives_refill_then_reload(tmp_path):
         ]
         engine._graph.edges = _chain_edges(3)  # noqa: SLF001
         engine._graph_frozen = 3  # noqa: SLF001
+    return engine
 
-    engine.clear_region(1.5, -1.0, 4.5, 1.0)
-    # Simulate mapping lidar re-painting the cleared hallway before Save.
+
+def _refill(engine, x0: float, x1: float) -> None:
     with engine._lock:  # noqa: SLF001
-        for x in np.linspace(2.0, 4.0, 21):
+        for x in np.linspace(x0, x1, 21):
             for y in np.linspace(-0.4, 0.4, 9):
                 r, c = engine._grid.world_to_cell(float(x), float(y))  # noqa: SLF001
                 h, w = engine._grid.log_odds.shape  # noqa: SLF001
                 if 0 <= r < h and 0 <= c < w:
                     engine._grid.log_odds[r, c] = occ.L_MAX  # noqa: SLF001
 
+
+def test_walls_remapped_after_clear_survive_reload(tmp_path):
+    engine = _hallway_engine(tmp_path)
+    engine.clear_region(1.5, -1.0, 4.5, 1.0)
+    # Mapping lidar draws the hallway again before Save.
+    _refill(engine, 2.0, 3.0)
+
     map_dir = tmp_path / "m"
     engine.save_map(map_dir, repair=False)
-    # PGM on disk is refilled, but keyframes.npz still has clear_box.
+    resumed = _engine(tmp_path)
+    resumed.configure_mode(MODE_MAPPING, map_dir)
+    reloaded = occ.to_occupancy_int16(resumed._grid)  # noqa: SLF001
+    r_wall, c_wall = resumed._grid.world_to_cell(2.5, 0.0)  # noqa: SLF001
+    assert reloaded[r_wall, c_wall] == 100
+    # The rest of the hole is still free and unjudged by matching.
+    r_free, c_free = resumed._grid.world_to_cell(4.0, 0.0)  # noqa: SLF001
+    assert reloaded[r_free, c_free] == 0
+    hole = float(resumed._grid.log_odds[r_free, c_free])  # noqa: SLF001
+    assert hole == occ.CLEARED_LOG_ODDS
+    assert resumed._grid_edits == engine._grid_edits  # noqa: SLF001
+
+
+def test_clear_box_saved_without_seq_still_wipes_on_reload(tmp_path):
+    """Older saves could hold walls band paint put back; keep wiping those."""
+    engine = _hallway_engine(tmp_path)
+    engine.clear_region(1.5, -1.0, 4.5, 1.0)
+    _refill(engine, 2.0, 4.0)
+    with engine._lock:  # noqa: SLF001
+        engine._grid_edits = [e[:5] for e in engine._grid_edits]  # noqa: SLF001
+
+    map_dir = tmp_path / "m"
+    engine.save_map(map_dir, repair=False)
     on_disk = persistence.load_log_odds(map_dir)
     assert on_disk is not None
-    dirty = occ.to_occupancy_int16(on_disk)
     r_in, c_in = on_disk.world_to_cell(3.0, 0.0)
-    assert dirty[r_in, c_in] == 100
+    assert occ.to_occupancy_int16(on_disk)[r_in, c_in] == 100
 
     resumed = _engine(tmp_path)
     resumed.configure_mode(MODE_MAPPING, map_dir)
     reloaded = occ.to_occupancy_int16(resumed._grid)  # noqa: SLF001
     r_in, c_in = resumed._grid.world_to_cell(3.0, 0.0)  # noqa: SLF001
     assert reloaded[r_in, c_in] == 0
-    assert ("clear_box", 1.5, -1.0, 4.5, 1.0) in resumed._grid_edits  # noqa: SLF001
+    # Re-renders this session erase every loaded keyframe in the box.
+    last_seq = resumed._graph.last_seq  # noqa: SLF001
+    assert ("clear_box", 1.5, -1.0, 4.5, 1.0, last_seq) in resumed._grid_edits  # noqa: SLF001
+
+
+def _two_wall_scan() -> conv.LaserScan2D:
+    """Walls 3 m behind and 2 m ahead of the robot."""
+    ranges = np.full(360, np.inf)
+    angles = -np.pi + np.arange(360) * (2 * np.pi / 360)
+    ahead = np.abs(angles) <= np.radians(30)
+    behind = np.abs(np.abs(angles) - np.pi) <= np.radians(30)
+    ranges[ahead] = 2.0 / np.cos(angles[ahead])
+    ranges[behind] = 3.0 / np.abs(np.cos(angles[behind]))
+    return conv.LaserScan2D(ranges, -np.pi, 2 * np.pi / 360, 0.05, 20.0)
+
+
+def test_scan_into_cleared_hole_still_fits(tmp_path):
+    """Returns from walls inside a cleared hole must not count as misses."""
+    engine = _engine(tmp_path, builtin_loop_closure=False)
+    grid = occ.empty_grid(resolution=RES, size_m=12.0, origin_x=-6.0, origin_y=-6.0)
+    lo = grid.log_odds
+    lo[:] = occ.L_MIN
+    r, c = grid.world_to_cell(-3.0, 0.0)
+    lo[:, c - 1 : c + 2] = occ.L_MAX
+    with engine._lock:  # noqa: SLF001
+        engine._grid = grid  # noqa: SLF001
+        engine._invalidate_occ_cache()  # noqa: SLF001
+    scan = _two_wall_scan()
+    pose = conv.Pose2D(0.0, 0.0, 0.0)
+    # No wall at x=2 on the map yet: those returns land in known free space.
+    assert not engine._scan_fits_map(scan, pose)  # noqa: SLF001
+
+    engine.clear_region(1.0, -3.0, 3.0, 3.0)
+    assert engine._scan_fits_map(scan, pose)  # noqa: SLF001
+
+
+def test_rerender_keeps_walls_painted_after_clear(tmp_path):
+    """A re-render erases only the scans from before the clear."""
+    engine = _banded_engine(tmp_path)
+    engine.clear_region(1.5, -1.0, 2.5, 1.0)
+    # Far enough from the first keyframe that the graph keeps these scans.
+    for i in range(3):
+        _paint_banded(engine, conv.Pose2D(0.0, 0.62, 0.0), 2.33, now=10.0 + i)
+    assert _odds(engine, 2.33, 0.62) > 0.5
+
+    out = engine._optimize_and_render(None)  # noqa: SLF001
+    assert out["status"] == "rebuilt"
+    assert _odds(engine, 2.33, 0.62) > 0.5
+    assert _odds(engine, 2.0, 0.0) <= 0.5
+
+
+def test_cleared_value_is_not_reachable_by_paint():
+    """Live paint must never land on the sentinel matching treats as unjudged."""
+    f = np.float32
+    loaded = occ.from_occupancy_int16(
+        np.array([[-1, 0, 100]], dtype=np.int16),
+        resolution=RES,
+        origin_x=0.0,
+        origin_y=0.0,
+    ).log_odds.ravel()
+    seen = {f(v) for v in loaded} | {f(0.0), f(occ.L_MIN), f(occ.L_MAX)}
+    frontier = set(seen)
+    for _ in range(120):
+        nxt = set()
+        for v in frontier:
+            for d in (f(occ.L_OCC), f(occ.L_FREE)):
+                w = f(np.clip(f(v + d), f(occ.L_MIN), f(occ.L_MAX)))
+                if w not in seen:
+                    seen.add(w)
+                    nxt.add(w)
+        frontier = nxt
+    assert f(occ.CLEARED_LOG_ODDS) not in seen
+    assert (
+        occ.to_occupancy_int16(
+            occ.LogOddsGrid(
+                log_odds=np.array([[occ.CLEARED_LOG_ODDS]], dtype=np.float32),
+                resolution=RES,
+                origin_x=0.0,
+                origin_y=0.0,
+            )
+        )[0, 0]
+        == 0
+    )
