@@ -589,3 +589,85 @@ def test_immature_map_stays_cold_without_hotspots(tmp_path):
     assert out["hotspots"] == []
     assert out["raw_status"] == "degrading"
     assert out["hotspot_heal"]["tracked"] is None
+
+
+def test_baseline_two_cell_slack_ignores_revisit_jitter():
+    base, res = _blank(400, 400)
+    base[20:380, 20:380] = 0
+    for c in (60, 100, 140, 200, 260):
+        _paint_wall(base, 30, 370, c, c + 2)
+    # ~10 cm offset (2 cells) — normal re-drive jitter, should not be "new".
+    live = base.copy()
+    for c in (62, 102, 142, 202, 262):
+        _paint_wall(live, 30, 370, c, c + 2)
+    h = map_health.assess_occupancy(
+        live, resolution=res, origin_x=0.0, origin_y=0.0, baseline=base
+    )
+    assert h.status in ("ok", "cold")
+    assert h.ghost_frac < map_health._WATCH_GHOST
+
+
+def test_fresh_map_ok_checkpoint_ignores_revisit_jitter(tmp_path):
+    from src.slam_builtin import occupancy as occ
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine(tmp_path)
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    engine._session_baseline = None  # noqa: SLF001
+
+    clean, res = _blank(400, 400)
+    clean[20:380, 20:380] = 0
+    for c in (60, 100, 140, 200, 260):
+        _paint_wall(clean, 30, 370, c, c + 2)
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        clean, resolution=res, origin_x=0.0, origin_y=0.0
+    )
+    first = engine.refresh_map_health(force=True)
+    assert first["status"] == "ok"
+    assert first["scope"] == "map"
+    assert engine._map_health_ok_cells is not None  # noqa: SLF001
+
+    # ~10 cm revisit thickening — full-map can look busier, but against the
+    # ok checkpoint (+ 2-cell dilate) it must stay quiet.
+    slipped = clean.copy()
+    for c in (62, 102, 142, 202, 262):
+        _paint_wall(slipped, 30, 370, c, c + 2)
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        slipped, resolution=res, origin_x=0.0, origin_y=0.0
+    )
+    engine._generation += 1  # noqa: SLF001
+    second = engine.refresh_map_health(force=True)
+    assert second["scope"] == "since_ok"
+    assert second["status"] in ("ok", "cold")
+    assert second["hotspots"] == []
+
+
+def test_fresh_map_ok_checkpoint_still_flags_new_double(tmp_path):
+    from src.slam_builtin import occupancy as occ
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine(tmp_path)
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    engine._session_baseline = None  # noqa: SLF001
+
+    clean, res = _blank(400, 400)
+    clean[20:380, 20:380] = 0
+    for c in (60, 100, 140, 200, 260):
+        _paint_wall(clean, 30, 370, c, c + 2)
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        clean, resolution=res, origin_x=0.0, origin_y=0.0
+    )
+    assert engine.refresh_map_health(force=True)["status"] == "ok"
+
+    # Clear ~30 cm double beyond dilate slack — real tear vs last ok snapshot.
+    doubled = clean.copy()
+    for c in (66, 106, 146, 206, 266):
+        _paint_wall(doubled, 30, 370, c, c + 2)
+    engine._grid = occ.from_occupancy_int16(  # noqa: SLF001
+        doubled, resolution=res, origin_x=0.0, origin_y=0.0
+    )
+    engine._generation += 1  # noqa: SLF001
+    out = engine.refresh_map_health(force=True)
+    assert out["scope"] == "since_ok"
+    assert out["status"] in ("watch", "degrading")
+    assert out["hotspots"]
