@@ -345,14 +345,24 @@ def _mature_ghost_hallway():
     return grid, res
 
 
-def test_default_auto_clear_is_off(tmp_path):
+def test_default_auto_clear_follows_heal(tmp_path):
     from src.config import SlamConfig
 
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "front", "maps_dir": str(tmp_path), "mode": "mapping"}
     )
     assert cfg.map_health_auto_heal is True
-    assert cfg.map_health_auto_clear is False
+    assert cfg.map_health_auto_clear is True
+    off = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "maps_dir": str(tmp_path),
+            "mode": "mapping",
+            "map_health_auto_heal": False,
+        }
+    )
+    assert off.map_health_auto_clear is False
 
 
 def test_hotspot_auto_heal_tracks_then_clears(tmp_path):

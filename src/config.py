@@ -883,10 +883,11 @@ class SlamConfig:
     # mapping session reloads it and repair can re-solve old geometry.
     builtin_save_keyframes: bool = True
     # Mid-session map-health heal: track sustained ghost hotspots, tighten
-    # revisit while tearing. Auto ``clear_region`` is opt-in — default off so
-    # noisy early health cannot wipe a fresh map.
+    # revisit while tearing, and auto ``clear_region`` when a mature map stays
+    # ``degrading`` near the robot long enough (see persist / keyframe / near
+    # gates — early noisy health must not wipe a fresh map).
     map_health_auto_heal: bool = True
-    map_health_auto_clear: bool = False
+    map_health_auto_clear: bool = True
     map_health_hotspot_persist_n: int = 6
     map_health_hotspot_match_m: float = 3.0
     map_health_auto_clear_pad_m: float = 2.5
@@ -1253,8 +1254,11 @@ class SlamConfig:
                 slam_backend == SLAM_BACKEND_BUILTIN and mode == MODE_MAPPING,
             )
         )
-        # Never follow heal: clear is destructive and must be explicit.
-        map_health_auto_clear = bool(d.get("map_health_auto_clear", False))
+        # Follow heal by default, but only after the engine's maturity /
+        # keyframe / near-robot gates — not the old "clear in seconds" path.
+        map_health_auto_clear = bool(
+            d.get("map_health_auto_clear", map_health_auto_heal)
+        )
         mapping_revisit_while_moving = bool(
             d.get(
                 "mapping_revisit_while_moving",
