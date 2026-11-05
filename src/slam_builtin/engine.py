@@ -3114,11 +3114,12 @@ class BuiltinSlamEngine:
         with self._lock:
             src = self._grid
             extend_only = not self._baseline_trusted_locked()
+            protect = self._session_baseline if extend_only else None
         band_scans = self._band_scans(frames)
         primary_band = 0
         if band_scans:
             painted, bands, primary, extras, primary_band = self._paint_height_bands(
-                pose_snap, band_scans, src, extend_only=extend_only
+                pose_snap, band_scans, src, extend_only=extend_only, protect=protect
             )
         else:
             painted = occ.insert_scan(
@@ -3134,6 +3135,7 @@ class BuiltinSlamEngine:
                 if math.isfinite(scan.range_max)
                 else 30.0,
                 extend_only=extend_only,
+                protect=protect,
             )
             bands = None
             primary, extras = scan, None
@@ -3218,6 +3220,7 @@ class BuiltinSlamEngine:
         src: LogOddsGrid,
         *,
         extend_only: bool = False,
+        protect: Optional[LogOddsGrid] = None,
     ):
         from .height_bands import compress_bands, cover_bands
 
@@ -3247,6 +3250,7 @@ class BuiltinSlamEngine:
                 range_min=float(scan.range_min),
                 range_max=limit if math.isfinite(limit) else 30.0,
                 extend_only=extend_only,
+                protect=protect,
             )
         bands = cover_bands(bands)
         fused = compress_bands(bands)

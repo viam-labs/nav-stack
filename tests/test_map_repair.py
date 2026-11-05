@@ -225,6 +225,40 @@ def test_untrusted_baseline_paints_extend_only_and_status_reports_it(tmp_path):
     assert paint["map_updates"] >= 1
 
 
+def test_untrusted_baseline_still_grows_walls_in_new_territory(tmp_path):
+    engine = _engine(tmp_path, builtin_loop_closure=False)
+    with engine._lock:  # noqa: SLF001
+        grid = engine._grid  # noqa: SLF001
+        r, c = grid.world_to_cell(1.025, 0.025)
+        grid.log_odds[r, c] = occ.L_MAX
+        engine._session_baseline = occ.copy_grid(grid)  # noqa: SLF001
+        engine._map_health_base_src = engine._session_baseline  # noqa: SLF001
+        engine._map_health_base = {"trusted": False}  # noqa: SLF001
+        engine._mode = MODE_MAPPING  # noqa: SLF001
+
+    def scan(rng):
+        return conv.LaserScan2D(
+            ranges=np.array([rng], dtype=float),
+            angle_min=0.0,
+            angle_increment=0.0,
+            range_min=0.05,
+            range_max=10.0,
+        )
+
+    # First seen from afar (a free ray through y=3), then driven up to.
+    far = conv.Pose2D(0.025, 0.025, math.pi / 2)
+    engine._paint_mapping_scan(scan(5.0), far, now=1.0)  # noqa: SLF001
+    near = conv.Pose2D(0.025, 2.025, math.pi / 2)
+    for t in (2.0, 3.0):
+        engine._paint_mapping_scan(scan(1.0), near, now=t)  # noqa: SLF001
+    with engine._lock:  # noqa: SLF001
+        g = engine._grid  # noqa: SLF001
+        cells = occ.to_occupancy_int16(g)
+        assert cells[g.world_to_cell(0.025, 3.025)] == 100
+        assert float(g.log_odds[g.world_to_cell(1.025, 0.025)]) == occ.L_MAX
+    assert engine.diagnostics()["paint"]["state"] == "extend_only"
+
+
 def test_repair_fixes_a_torn_loop_then_undo_restores_it(tmp_path):
     engine, truth, poses = _torn_loop(tmp_path, gyro_scale=1.04)
     torn = _ghost_fraction(engine._grid, truth)  # noqa: SLF001

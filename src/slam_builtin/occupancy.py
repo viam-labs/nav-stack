@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -301,12 +301,17 @@ def insert_scan(
     range_max: float,
     max_beams: int = 180,
     extend_only: bool = False,
+    protect: Optional[LogOddsGrid] = None,
 ) -> LogOddsGrid:
     """Ray-cast a lidar scan into the log-odds grid (mutates + may expand).
 
     With ``extend_only``, only unobserved cells are written — already free or
     occupied cells stay put. Used when the resumed map baseline is untrusted
     so a bad pose cannot thicken a twin wall or carve through a good one.
+
+    ``protect`` narrows ``extend_only`` to the cells that grid knows: cells it
+    left unobserved keep normal log-odds updates, so territory first seen this
+    session still grows walls after its first long-range glance.
     """
     ranges = np.asarray(ranges, dtype=float)
     if ranges.size == 0:
@@ -339,8 +344,44 @@ def insert_scan(
     cols1 = np.floor((ex - grid.origin_x) / res).astype(np.int32)
     rows1 = np.floor((ey - grid.origin_y) / res).astype(np.int32)
     row0, col0 = grid.world_to_cell(float(pose_x), float(pose_y))
-    _paint_rays(grid.log_odds, row0, col0, rows1, cols1, extend_only=bool(extend_only))
+    protect_lo = None
+    protect_offset = (0, 0)
+    if (
+        extend_only
+        and protect is not None
+        and abs(float(protect.resolution) - res) < 1e-9
+    ):
+        protect_lo = protect.log_odds
+        protect_offset = (
+            int(round((grid.origin_y - protect.origin_y) / res)),
+            int(round((grid.origin_x - protect.origin_x) / res)),
+        )
+    _paint_rays(
+        grid.log_odds,
+        row0,
+        col0,
+        rows1,
+        cols1,
+        extend_only=bool(extend_only),
+        protect_lo=protect_lo,
+        protect_offset=protect_offset,
+    )
     return grid
+
+
+def _protected(
+    protect_lo: np.ndarray, offset: Tuple[int, int], rows: np.ndarray, cols: np.ndarray
+) -> np.ndarray:
+    """Cells observed in ``protect_lo``; a cleared cell counts as unobserved."""
+    pr = rows + int(offset[0])
+    pc = cols + int(offset[1])
+    ph, pw = protect_lo.shape
+    inside = (pr >= 0) & (pr < ph) & (pc >= 0) & (pc < pw)
+    known = np.zeros(rows.shape, dtype=bool)
+    if np.any(inside):
+        vals = protect_lo[pr[inside], pc[inside]]
+        known[inside] = (np.abs(vals) > _UNKNOWN_ABS_LO) & (vals != _CLEARED_F32)
+    return known
 
 
 def _paint_rays(
@@ -351,6 +392,8 @@ def _paint_rays(
     cols1: np.ndarray,
     *,
     extend_only: bool = False,
+    protect_lo: Optional[np.ndarray] = None,
+    protect_offset: Tuple[int, int] = (0, 0),
 ) -> None:
     """Mark Bresenham-like rays free, and their endpoints occupied.
 
@@ -376,6 +419,8 @@ def _paint_rays(
             lo[rows[cleared], cols[cleared]] = 0.0
         if extend_only:
             keep = np.abs(lo[rows, cols]) <= _UNKNOWN_ABS_LO
+            if protect_lo is not None:
+                keep |= ~_protected(protect_lo, protect_offset, rows, cols)
             rows, cols = rows[keep], cols[keep]
             if rows.size == 0:
                 return
