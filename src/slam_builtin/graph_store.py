@@ -25,15 +25,18 @@ from .types import LogOddsGrid
 KEYFRAMES_FILENAME = "keyframes.npz"
 # v1: edit_xyr (N,3) for clear/mark disks. v2: edit_params (N,4) also holds
 # clear_box as (x_min, y_min, x_max, y_max); disks pad the 4th column with 0.
+# Optional edit_seq (N,) is the last scan seq a box clear erases, -1 if none.
 FORMAT_VERSION = 2
 _SUPPORTED_VERSIONS = frozenset({1, 2})
 
 _EDIT_KINDS = ("clear", "mark", "clear_box")
 
-# Disk erase/paint: (kind, x, y, radius). Box erase: (kind, x0, y0, x1, y1).
+# Disk erase/paint: (kind, x, y, radius). Box erase: (kind, x0, y0, x1, y1),
+# plus the last erased scan seq when known.
 GridEdit = Union[
     Tuple[str, float, float, float],
     Tuple[str, float, float, float, float],
+    Tuple[str, float, float, float, float, int],
 ]
 
 
@@ -61,7 +64,7 @@ def file_sha1(path: Path) -> Optional[str]:
 def _edit_params_row(edit: GridEdit) -> List[float]:
     kind = edit[0]
     if kind == "clear_box":
-        if len(edit) != 5:
+        if len(edit) not in (5, 6):
             raise ValueError("clear_box edit needs x_min,y_min,x_max,y_max")
         return [float(edit[1]), float(edit[2]), float(edit[3]), float(edit[4])]
     if len(edit) < 4:
@@ -69,14 +72,21 @@ def _edit_params_row(edit: GridEdit) -> List[float]:
     return [float(edit[1]), float(edit[2]), float(edit[3]), 0.0]
 
 
-def _decode_edit(kind_i: int, row: Sequence[float], *, version: int) -> GridEdit:
+def _edit_seq(edit: GridEdit) -> int:
+    return int(edit[5]) if edit[0] == "clear_box" and len(edit) > 5 else -1
+
+
+def _decode_edit(
+    kind_i: int, row: Sequence[float], *, version: int, seq: int = -1
+) -> GridEdit:
     kind = _EDIT_KINDS[int(kind_i)] if int(kind_i) < len(_EDIT_KINDS) else None
     if kind is None:
         raise ValueError(f"unknown edit kind {kind_i}")
     if kind == "clear_box":
         if version < 2 or len(row) < 4:
             raise ValueError("clear_box requires format v2")
-        return (kind, float(row[0]), float(row[1]), float(row[2]), float(row[3]))
+        box = (kind, float(row[0]), float(row[1]), float(row[2]), float(row[3]))
+        return box + (int(seq),) if seq >= 0 else box
     return (kind, float(row[0]), float(row[1]), float(row[2]))
 
 
@@ -139,6 +149,7 @@ def save_graph(
         "edit_params": np.array(
             [_edit_params_row(e) for e in edit_list], dtype=np.float64
         ).reshape(-1, 4),
+        "edit_seq": np.array([_edit_seq(e) for e in edit_list], dtype=np.int64),
     }
     if base is not None:
         arrays["base_log_odds"] = np.asarray(base.log_odds, dtype=np.float16)
@@ -234,9 +245,11 @@ def _decode(z, *, version: int) -> SavedGraph:
         rows = z["edit_params"]
     else:
         rows = z["edit_xyr"]
+    kinds = z["edit_kind"]
+    seqs = z["edit_seq"] if "edit_seq" in z.files else np.full(len(kinds), -1)
     edits = [
-        _decode_edit(int(kind), row, version=version)
-        for kind, row in zip(z["edit_kind"], rows)
+        _decode_edit(int(kind), row, version=version, seq=int(seq))
+        for kind, row, seq in zip(kinds, rows, seqs)
     ]
     base = None
     if "base_log_odds" in z.files:

@@ -430,13 +430,19 @@ def render_grid(
     center: Optional[Tuple[float, float]] = None,
     progress: Optional[Callable[[int, int], None]] = None,
     extra: Optional[Sequence[Tuple[conv.Pose2D, GraphScan]]] = None,
+    clears: Sequence[Tuple[int, Callable[[LogOddsGrid], object]]] = (),
+    bands_out: Optional[dict] = None,
 ) -> LogOddsGrid:
     """Ray-cast stored scans at (optimized) node poses into a fresh grid.
 
     Scans tagged with a height ``band`` are drawn into that band only, then
     collapsed so a cell stays occupied while any band still sees it.
+
+    ``clears`` are ``(seq, apply)`` edits. ``apply`` runs on every band once
+    the scans up to ``seq`` are drawn, so only later scans paint over it.
+    ``bands_out`` receives the per-band grids when there is more than one.
     """
-    from .height_bands import compress_bands
+    from .height_bands import compress_bands, cover_bands
 
     if base is not None:
         seed = occ.copy_grid(base)
@@ -454,8 +460,18 @@ def render_grid(
     poses = snap.poses if poses is None else poses
     order = range(len(snap)) if nodes is None else nodes
     total = len(order)
+    pending = sorted(clears, key=lambda item: item[0])
+    next_clear = 0
+
+    def _clear_before(seq: float) -> None:
+        nonlocal next_clear
+        while next_clear < len(pending) and pending[next_clear][0] < seq:
+            for grid in bands.values():
+                pending[next_clear][1](grid)
+            next_clear += 1
 
     def _paint(pose: conv.Pose2D, scan: GraphScan) -> None:
+        _clear_before(scan.seq)
         band = int(getattr(scan, "band", 0))
         grid = bands.get(band)
         if grid is None:
@@ -476,9 +492,15 @@ def render_grid(
             progress(k + 1, total)
     for pose, scan in extra or []:
         _paint(pose, scan)
+    _clear_before(math.inf)
+    if bands_out is not None:
+        bands_out.clear()
     if len(bands) == 1:
         return bands[0]
-    return compress_bands(bands)
+    aligned = cover_bands(bands)
+    if bands_out is not None:
+        bands_out.update(aligned)
+    return compress_bands(aligned)
 
 
 # -- optimization -------------------------------------------------------------

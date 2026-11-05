@@ -17,6 +17,10 @@ L_MAX = 4.0
 # Unobserved cells stay at 0; clamp after updates.
 OCC_THRESH = 0.65  # P(occ) threshold -> 100
 FREE_THRESH = 0.35  # P(occ) below -> 0
+# Box clears write this. The planner reads it as free. No run of L_OCC /
+# L_FREE updates from 0, the clamps or a loaded image lands on it, so scan
+# matching can tell a cleared cell that no ray has crossed since.
+CLEARED_LOG_ODDS = -2.125
 
 
 def _prob_to_logodds(p: float) -> float:
@@ -186,11 +190,15 @@ def clear_rect(
     y_max: float,
     *,
     free_log_odds: Optional[float] = None,
+    keep_walls: bool = False,
 ) -> int:
-    """Paint an axis-aligned box of free space (mutates in place).
+    """Mark an axis-aligned box cleared (mutates in place).
 
-    Returns the number of cells written. Cells outside the current grid are
-    ignored. ``x_min``/``y_min`` need not be ordered relative to max.
+    Cells default to ``CLEARED_LOG_ODDS``: free for planning, unjudged by
+    scan matching until a ray crosses them. ``keep_walls`` leaves occupied
+    cells alone. Returns the number of cells written. Cells outside the
+    current grid are ignored. ``x_min``/``y_min`` need not be ordered
+    relative to max.
     """
     res = float(grid.resolution)
     if res <= 0:
@@ -200,7 +208,7 @@ def clear_rect(
     if xb <= xa or yb <= ya:
         raise ValueError("clear_rect needs a non-empty box")
 
-    target = float(L_MIN) if free_log_odds is None else float(free_log_odds)
+    target = float(CLEARED_LOG_ODDS) if free_log_odds is None else float(free_log_odds)
     target = float(np.clip(target, L_MIN, L_MAX))
 
     r0, c0 = grid.world_to_cell(xa, ya)
@@ -223,6 +231,8 @@ def clear_rect(
     cx = grid.origin_x + (cols + 0.5) * res
     cy = grid.origin_y + (rows + 0.5) * res
     mask = (cx >= xa) & (cx <= xb) & (cy >= ya) & (cy <= yb)
+    if keep_walls:
+        mask &= lo[rr0 : rr1 + 1, cc0 : cc1 + 1] <= _OCC_THRESH_LO
     cleared = int(np.count_nonzero(mask))
     if cleared:
         lo[rr0 : rr1 + 1, cc0 : cc1 + 1][mask] = target
@@ -275,6 +285,7 @@ def mark_disk(
 
 # Unobserved band used by ``to_occupancy_int16`` and extend-only paint.
 _UNKNOWN_ABS_LO = 0.05
+_CLEARED_F32 = np.float32(CLEARED_LOG_ODDS)
 
 
 def insert_scan(
@@ -358,6 +369,11 @@ def _paint_rays(
     def _add(rows: np.ndarray, cols: np.ndarray, delta: float) -> None:
         if rows.size == 0:
             return
+        # A cleared cell has not been seen: its first ray starts it from
+        # unknown, so one hit draws a wall as it would on a fresh map.
+        cleared = lo[rows, cols] == _CLEARED_F32
+        if cleared.any():
+            lo[rows[cleared], cols[cleared]] = 0.0
         if extend_only:
             keep = np.abs(lo[rows, cols]) <= _UNKNOWN_ABS_LO
             rows, cols = rows[keep], cols[keep]
