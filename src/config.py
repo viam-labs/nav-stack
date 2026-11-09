@@ -1079,7 +1079,8 @@ class SlamConfig:
     # Soft landmark pose writeback via apply_map_pose_correction (force=False).
     # Requires vision_survey_only=false and a real (non-synthetic) DINOv2 provider.
     vision_pose_writeback: bool = False
-    vision_pose_writeback_min_inliers: int = 8
+    # Indoor FOV rarely sees ≥8 landmarks at once; 3 is enough for a 2D rigid fit.
+    vision_pose_writeback_min_inliers: int = 3
     vision_pose_writeback_cooldown_s: float = 2.0
     # Height band in base_link (reject floor/ceiling spam). Floor hits from a
     # chest-height RealSense sit near z≈0; keep wall/artwork band only.

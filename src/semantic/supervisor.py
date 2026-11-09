@@ -21,7 +21,7 @@ from .frames import (
 )
 from .detect_landmarks import observations_from_detections
 from .landmarks import EmbeddingLandmarkMap
-from .localize import estimate_landmark_fix
+from .localize import estimate_landmark_fix, match_live_to_landmarks
 from .patches import PatchObservation, backproject_patches, subsample_observations
 from .persist import load_landmarks, save_landmarks
 from .types import CameraIntrinsics, Detection, PatchToken, VisionFrame, VisionResult
@@ -652,17 +652,33 @@ class VisionSupervisor:
             )
             cosine_thr = float(self._landmarks.cosine_threshold)
 
+        min_inliers = int(self._cfg.vision_pose_writeback_min_inliers)
         fix = estimate_landmark_fix(
             obs,
             visible,
             robot_pose=pose,
             cosine_threshold=cosine_thr,
-            min_inliers=int(self._cfg.vision_pose_writeback_min_inliers),
+            min_inliers=min_inliers,
             max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
         )
         if fix is None:
+            live_xy, _, _ = match_live_to_landmarks(
+                obs,
+                visible,
+                robot_pose=pose,
+                cosine_threshold=cosine_thr,
+            )
+            pairs = int(live_xy.shape[0])
+            reason = (
+                "few_pairs"
+                if pairs < min_inliers
+                else "fit_or_jump_gate"
+            )
             self._last_writeback = {
                 "status": "rejected_fit",
+                "reason": reason,
+                "pairs": pairs,
+                "min_inliers": min_inliers,
                 "visible": len(visible),
                 "confirmed": confirmed,
             }
