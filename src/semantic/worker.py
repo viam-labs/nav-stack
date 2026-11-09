@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -11,6 +11,90 @@ import numpy as np
 from .patches import patch_grid, select_survey_tokens
 from .place import l2_normalize
 from .types import Detection, PatchToken, VisionFrame, VisionResult
+
+# Standard COCO-80 order (YOLOv8 class ids). Used when detector_classes is empty.
+COCO80_CLASSES: Tuple[str, ...] = (
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
+)
 
 
 @dataclass
@@ -22,8 +106,15 @@ class WorkerConfig:
     cpu_threads: int = 2
     # When True (or no dinov2 path), emit synthetic descriptors for benches/tests.
     synthetic: bool = False
-    yolo_input: int = 320
+    yolo_input: int = 640
+    yolo_conf: float = 0.35
+    # Class-id → name for the loaded ONNX. Empty → COCO-80 (standard YOLOv8).
+    # YOLO-World exports must pass the same prompt list used at export time.
+    detector_classes: Tuple[str, ...] = ()
+    # Paint-gate / dynamic obstacle labels (always kept when detected).
     dynamic_labels: Tuple[str, ...] = ("person", "bicycle", "car", "motorcycle")
+    # When non-empty, also keep these labels (landmark proposals). Empty = keep all.
+    landmark_labels: Tuple[str, ...] = field(default_factory=tuple)
 
 
 class VisionWorker:
@@ -286,8 +377,28 @@ class VisionWorker:
             return tokens, place
         raise RuntimeError(f"unexpected DINOv2 output shape {feat.shape}")
 
+    def _class_names(self) -> Tuple[str, ...]:
+        if self.cfg.detector_classes:
+            return tuple(self.cfg.detector_classes)
+        return COCO80_CLASSES
+
+    def _keep_detection_label(self, label: str) -> bool:
+        """Keep dynamics always; landmark labels when configured; else all."""
+        lab = str(label).strip().lower()
+        if lab in {x.lower() for x in self.cfg.dynamic_labels}:
+            return True
+        if not self.cfg.landmark_labels:
+            return True
+        allowed = {str(x).strip().lower() for x in self.cfg.landmark_labels}
+        if lab in allowed:
+            return True
+        for a in allowed:
+            if lab in a or a in lab:
+                return True
+        return False
+
     def _run_yolo(self, color: np.ndarray) -> List[Detection]:
-        """Minimal YOLOv8 ONNX postprocess (xyxy + conf + cls)."""
+        """Minimal YOLOv8 / YOLO-World ONNX postprocess (xyxy + conf + cls)."""
         assert self._yolo is not None
         size = int(self.cfg.yolo_input)
         img, scale, pad_x, pad_y = _letterbox(color, size)
@@ -295,7 +406,7 @@ class VisionWorker:
         blob = np.transpose(blob, (2, 0, 1))[None, ...]
         name = self._yolo.get_inputs()[0].name
         out = np.asarray(self._yolo.run(None, {name: blob})[0])
-        # YOLOv8: (1, 84, N) or (1, N, 84)
+        # YOLOv8: (1, 4+nc, N) or (1, N, 4+nc)
         if out.ndim != 3:
             return []
         if out.shape[1] < out.shape[2]:
@@ -309,25 +420,14 @@ class VisionWorker:
         scores = pred[:, 4:]
         cls_ids = np.argmax(scores, axis=1)
         confs = scores[np.arange(len(scores)), cls_ids]
-        keep = confs >= 0.35
+        keep = confs >= float(self.cfg.yolo_conf)
         detections: List[Detection] = []
-        coco = (
-            "person",
-            "bicycle",
-            "car",
-            "motorcycle",
-            "airplane",
-            "bus",
-            "train",
-            "truck",
-        )
+        names = self._class_names()
         for i in np.where(keep)[0]:
             cid = int(cls_ids[i])
-            label = coco[cid] if cid < len(coco) else str(cid)
-            if label not in self.cfg.dynamic_labels and cid != 0:
-                # Always keep person (0); other dynamic labels if named.
-                if label not in self.cfg.dynamic_labels:
-                    continue
+            label = names[cid] if 0 <= cid < len(names) else str(cid)
+            if not self._keep_detection_label(label):
+                continue
             cx, cy, bw, bh = boxes[i]
             # Undo letterbox to original pixels.
             x0 = (cx - bw / 2.0 - pad_x) / scale

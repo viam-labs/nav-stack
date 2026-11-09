@@ -1093,6 +1093,58 @@ class SlamConfig:
     vision_max_patches_per_frame: int = 64
     # One camera per tick (round-robin) when multiple vision_cameras are set.
     vision_round_robin: bool = True
+    # Detector-anchored landmarks (YOLO-World / COCO): pool DINO inside boxes.
+    # Empty detector_classes → COCO-80 names (standard YOLOv8). For YOLO-World
+    # ONNX, set detector_classes to the same prompt list used at export.
+    vision_prefer_detections: bool = True
+    vision_dense_fallback_patches: int = 16
+    vision_yolo_conf: float = 0.35
+    vision_detector_classes: List[str] = field(default_factory=list)
+    vision_landmark_labels: List[str] = field(
+        default_factory=lambda: [
+            "painting",
+            "poster",
+            "picture",
+            "picture frame",
+            "framed picture",
+            "artwork",
+            "tv",
+            "television",
+            "monitor",
+            "door",
+            "fire extinguisher",
+            "clock",
+            "whiteboard",
+            "sign",
+            "exit sign",
+            "potted plant",
+            "plant",
+            "bookshelf",
+            "cabinet",
+            "poster board",
+            "book",
+            "laptop",
+            "vase",
+            "bottle",
+            "cup",
+            "chair",
+            "couch",
+            "bed",
+            "dining table",
+            "toilet",
+            "sink",
+            "refrigerator",
+            "microwave",
+            "oven",
+            "keyboard",
+            "mouse",
+            "remote",
+            "cell phone",
+            "backpack",
+            "handbag",
+            "suitcase",
+        ]
+    )
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "SlamConfig":

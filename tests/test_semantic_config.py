@@ -58,6 +58,29 @@ def test_vision_density_defaults():
     assert cfg.vision_input_size == 448
     assert cfg.vision_survey_only is True
     assert cfg.vision_pose_writeback is False
+    assert cfg.vision_prefer_detections is True
+    assert cfg.vision_dense_fallback_patches == 16
+    assert cfg.vision_yolo_conf == 0.35
+    assert cfg.vision_detector_classes == []
+    assert "painting" in cfg.vision_landmark_labels
+    assert "tv" in cfg.vision_landmark_labels
+
+
+def test_vision_detector_classes_from_config():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidars": _base_lidars(),
+            "vision_detector_classes": ["painting", "door", "clock"],
+            "vision_landmark_labels": ["painting", "door"],
+            "vision_prefer_detections": False,
+            "vision_dense_fallback_patches": 8,
+        }
+    )
+    assert cfg.vision_detector_classes == ["painting", "door", "clock"]
+    assert cfg.vision_landmark_labels == ["painting", "door"]
+    assert cfg.vision_prefer_detections is False
+    assert cfg.vision_dense_fallback_patches == 8
 
 
 def test_vision_requires_obstacles_only_optical():

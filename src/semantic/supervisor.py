@@ -6,7 +6,7 @@ import asyncio
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -18,11 +18,12 @@ from .frames import (
     intrinsics_from_size,
     vision_frame_from_arrays,
 )
+from .detect_landmarks import observations_from_detections
 from .landmarks import EmbeddingLandmarkMap
 from .localize import estimate_landmark_fix
 from .patches import PatchObservation, backproject_patches, subsample_observations
 from .persist import load_landmarks, save_landmarks
-from .types import CameraIntrinsics, VisionFrame, VisionResult
+from .types import CameraIntrinsics, Detection, PatchToken, VisionFrame, VisionResult
 from .worker import VisionWorker, WorkerConfig
 
 
@@ -105,6 +106,13 @@ class VisionSupervisor:
             # One thread — leave cores for SLAM/nav; dual-cam was hesitant.
             cpu_threads=1,
             input_short_side=input_size,
+            yolo_conf=float(cfg.vision_yolo_conf),
+            detector_classes=tuple(
+                str(x).strip() for x in (cfg.vision_detector_classes or []) if str(x).strip()
+            ),
+            landmark_labels=tuple(
+                str(x).strip() for x in (cfg.vision_landmark_labels or []) if str(x).strip()
+            ),
         )
         self._worker = VisionWorker(worker_cfg)
         # If ONNX failed to load, worker flips to synthetic — keep landmark
@@ -240,6 +248,10 @@ class VisionSupervisor:
                 "round_robin": bool(self._cfg.vision_round_robin),
                 "associate_radius_m": float(self._landmarks.associate_radius_m),
                 "dinov2_onnx": self._dinov2_path or None,
+                "yolo_onnx": self._worker.cfg.yolo_onnx or None,
+                "prefer_detections": bool(self._cfg.vision_prefer_detections),
+                "dense_fallback_patches": int(self._cfg.vision_dense_fallback_patches),
+                "last_detections": 0 if last is None else len(last.detections),
                 "input_size": int(self._worker.cfg.input_short_side),
                 "require_descriptor_match": bool(
                     self._landmarks.require_descriptor_match
@@ -447,14 +459,42 @@ class VisionSupervisor:
         )
 
     def _survey(self, frame: VisionFrame, result: VisionResult) -> None:
-        """Associate patches into the landmark map; optionally soft-correct pose."""
-        obs = backproject_patches(
-            frame,
+        """Associate patches into the landmark map; optionally soft-correct pose.
+
+        Prefer detector boxes (YOLO-World / COCO): pool DINOv2 tokens inside each
+        allowed box into one landmark observation. Dense texture patches remain as
+        a capped fallback when the detector is quiet or missing.
+        """
+        z_min = float(self._cfg.vision_z_min_m)
+        z_max = float(self._cfg.vision_z_max_m)
+        prefer = bool(self._cfg.vision_prefer_detections)
+        det_obs: List[PatchObservation] = []
+        if prefer and result.detections and result.patches:
+            det_obs = observations_from_detections(
+                frame,
+                result.patches,
+                result.detections,
+                landmark_labels=self._cfg.vision_landmark_labels,
+                z_min_m=z_min,
+                z_max_m=z_max,
+            )
+
+        dense_cap = int(self._cfg.vision_max_patches_per_frame)
+        if det_obs and prefer:
+            dense_cap = int(self._cfg.vision_dense_fallback_patches)
+        dense_tokens = _tokens_outside_detections(
             result.patches,
-            z_min_m=float(self._cfg.vision_z_min_m),
-            z_max_m=float(self._cfg.vision_z_max_m),
+            result.detections if prefer else (),
+            landmark_labels=self._cfg.vision_landmark_labels if prefer else (),
         )
-        obs = subsample_observations(obs, int(self._cfg.vision_max_patches_per_frame))
+        dense_obs = backproject_patches(
+            frame,
+            dense_tokens,
+            z_min_m=z_min,
+            z_max_m=z_max,
+        )
+        dense_obs = subsample_observations(dense_obs, dense_cap)
+        obs = list(det_obs) + list(dense_obs)
         if not obs:
             return
         try:
@@ -596,6 +636,36 @@ class VisionSupervisor:
             f"jump={fix.jump_m:.2f}m/{fix.jump_deg:.1f}deg "
             f"score={fix.score:.2f} inliers={int(fix.fit.inliers.sum())}"
         )
+
+
+def _tokens_outside_detections(
+    patches: Sequence[PatchToken],
+    detections: Sequence[Detection],
+    *,
+    landmark_labels: Sequence[str],
+) -> List[PatchToken]:
+    """Drop dense tokens that already sit inside a landmark detector box."""
+    if not detections or not landmark_labels:
+        return list(patches)
+    from .detect_landmarks import label_allowed
+
+    allowed = {str(x).strip().lower() for x in landmark_labels if str(x).strip()}
+    boxes = []
+    for det in detections:
+        if not label_allowed(det.label, allowed):
+            continue
+        x0, x1 = sorted((float(det.x0), float(det.x1)))
+        y0, y1 = sorted((float(det.y0), float(det.y1)))
+        boxes.append((x0, y0, x1, y1))
+    if not boxes:
+        return list(patches)
+    out: List[PatchToken] = []
+    for tok in patches:
+        u, v = float(tok.u), float(tok.v)
+        if any(x0 <= u <= x1 and y0 <= v <= y1 for x0, y0, x1, y1 in boxes):
+            continue
+        out.append(tok)
+    return out
 
 
 def _resize_nearest(img: np.ndarray, new_h: int, new_w: int) -> np.ndarray:

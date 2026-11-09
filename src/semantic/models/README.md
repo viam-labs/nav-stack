@@ -8,7 +8,8 @@ Weights are **not** committed to git and are excluded from `module.tar.gz`.
 | Role | Example path | Notes |
 | --- | --- | --- |
 | DINOv2 ViT-S/14 patch tokens | `dinov2_vits14_patches_448.onnx` | Square 448 input → `(1, 1024, 384)` |
-| YOLOv8n | `yolov8n.onnx` | Paint-gate only (`ultralytics` export) |
+| YOLO-Worldv2 (indoor) | `yolov8s-worldv2-indoor.onnx` | Open-vocab boxes → pooled DINO landmarks |
+| YOLOv8n (COCO) | `yolov8n.onnx` | Works too: `tv`/`clock`/`book`/… as interim |
 | Site head (phase 7) | `head.onnx` | Optional; replaces per-map PCA |
 
 ## Auto-install
@@ -22,6 +23,7 @@ To re-fetch / export by hand:
 ```bash
 python tools/fetch_dinov2_onnx.py
 python tools/export_dinov2_onnx.py --size 448   # needs torch + network
+python tools/export_yolo_world_onnx.py          # needs ultralytics; writes indoor ONNX
 ```
 
 Point config at the file (relative name resolves under `src/semantic/models/`):
@@ -31,8 +33,18 @@ Point config at the file (relative name resolves under `src/semantic/models/`):
 "vision_survey_only": true,
 "vision_cameras": ["camera-top"],
 "vision_dinov2_onnx": "dinov2_vits14_patches_448.onnx",
-"vision_input_size": 448
+"vision_input_size": 448,
+"vision_yolo_onnx": "yolov8s-worldv2-indoor.onnx",
+"vision_detector_classes": ["painting", "poster", "picture frame", "artwork", "tv", "monitor", "door", "fire extinguisher", "clock", "whiteboard", "sign", "exit sign", "potted plant", "bookshelf", "cabinet", "laptop", "book", "chair", "couch", "bed", "dining table", "refrigerator", "sink", "bottle", "vase"],
+"vision_prefer_detections": true
 ```
+
+Survey prefers detector boxes: each allowed YOLO box pools DINOv2 patch
+tokens into one landmark (much stabler re-ID than dense 14×14 tokens). Dense
+texture patches remain as a small fallback (`vision_dense_fallback_patches`,
+default 16). Omit `vision_detector_classes` when using a standard COCO YOLOv8
+ONNX — class names come from COCO-80. `vision_landmark_labels` filters which
+detections become landmarks (defaults cover indoor artwork + furniture).
 
 Omit `vision_synthetic` (or set `false`). `vision_status.provider` should show
 `OpenVINOExecutionProvider` (or `CPUExecutionProvider`), **not** `synthetic`.
@@ -83,7 +95,9 @@ Defaults assume a density pilot, not pose writeback:
 | `vision_rate_hz` | `1.0` | Leave CPU for SLAM/nav |
 | `vision_round_robin` | `true` | One camera per tick when multiple are listed |
 | `vision_z_min_m` / `vision_z_max_m` | `0.25` / `2.0` | Drop floor/ceiling |
-| `vision_max_patches_per_frame` | `64` | Cap associations per frame |
+| `vision_max_patches_per_frame` | `64` | Cap dense associations per frame |
+| `vision_prefer_detections` | `true` | Pool DINO inside YOLO boxes first |
+| `vision_dense_fallback_patches` | `16` | Dense tokens when boxes fire |
 | `vision_associate_radius_m` / `vision_cell_m` | `0.25` / `0.30` | Merge nearby patches |
 | `vision_input_size` | `448` | Must match the ONNX export |
 

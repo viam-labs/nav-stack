@@ -158,3 +158,48 @@ def test_save_load_roundtrip(tmp_path: Path):
     loaded = load_landmarks(tmp_path)
     assert loaded is not None
     assert len(loaded.confirmed()) >= 1
+
+
+def test_survey_prefers_detector_boxes():
+    """Injected YOLO boxes should yield fewer, box-pooled observations."""
+    from src.semantic.types import Detection, VisionResult
+    from src.semantic.worker import VisionWorker
+
+    cfg = _cfg(
+        vision_prefer_detections=True,
+        vision_dense_fallback_patches=4,
+        vision_max_patches_per_frame=64,
+        vision_landmark_labels=["painting"],
+    )
+    pose = Pose2D(0.0, 0.0, 0.0)
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: pose,
+        get_pose_at=lambda _t: pose,
+        get_anchor=lambda: (0, pose, {0: pose}),
+    )
+    vision._worker = VisionWorker(WorkerConfig(synthetic=True, input_short_side=112))  # noqa: SLF001
+
+    frame = _frame()
+    base = vision._worker.process(frame)  # noqa: SLF001
+    # One painting covering most of the textured wall.
+    det = Detection(label="painting", conf=0.95, x0=20.0, y0=20.0, x1=140.0, y1=100.0)
+    result = VisionResult(
+        camera_name=base.camera_name,
+        stamp=base.stamp,
+        captured_at=base.captured_at,
+        patches=base.patches,
+        detections=[det],
+        place_descriptor=base.place_descriptor,
+        infer_ms=base.infer_ms,
+        provider=base.provider,
+    )
+    with vision._lock:  # noqa: SLF001
+        vision._last_result = result  # noqa: SLF001
+        vision._frames += 1  # noqa: SLF001
+    vision._survey(frame, result)  # noqa: SLF001
+    # Detector pooling + tiny dense fallback ≪ full dense grid.
+    assert vision.status()["observations"] <= 12
+    assert vision.status()["landmarks"]["total"] >= 1
+    assert vision.status()["prefer_detections"] is True
