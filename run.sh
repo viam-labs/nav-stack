@@ -15,11 +15,16 @@ if ! python -c "import onnxruntime" >/dev/null 2>&1; then
         pip install "onnxruntime>=1.17.0" -q || true
     fi
 fi
-# Pull DINOv2 weights once if the default export is absent (non-fatal).
+# Pull vision ONNX weights once if the defaults are absent (non-fatal).
 DINOV2_ONNX="src/semantic/models/dinov2_vits14_patches_448.onnx"
 if [ ! -f "$DINOV2_ONNX" ] && [ -f tools/fetch_dinov2_onnx.py ]; then
     echo "[nav-stack] fetching DINOv2 ONNX…"
     python tools/fetch_dinov2_onnx.py || true
+fi
+YOLO_WORLD_ONNX="src/semantic/models/yolov8s-worldv2-indoor.onnx"
+if [ ! -f "$YOLO_WORLD_ONNX" ] && [ -f tools/fetch_yolo_world_onnx.py ]; then
+    echo "[nav-stack] fetching YOLO-World ONNX…"
+    python tools/fetch_yolo_world_onnx.py || true
 fi
 
 # The module's numpy work is many small matrix ops on the SLAM / nav threads.

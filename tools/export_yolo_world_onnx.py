@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Export YOLO-Worldv2 ONNX with indoor landmark class prompts baked in.
 
+Robots normally get this file via ``setup.sh`` / ``tools/fetch_yolo_world_onnx.py``
+(GitHub release asset). Use this script only to rebuild the asset.
+
 Ultralytics YOLO-World lets you set open-vocab classes before export; the
 resulting ONNX has one score channel per prompt (class id = list index).
-Point nav-stack ``vision_yolo_onnx`` at the file and set
-``vision_detector_classes`` to the same list (order matters).
+Class prompts come from ``src/semantic/models/yolov8s-worldv2-indoor.classes.json``.
 
 Examples:
 
@@ -22,34 +24,18 @@ import json
 import sys
 from pathlib import Path
 
-# Keep in sync with SlamConfig.vision_landmark_labels defaults / README.
-DEFAULT_CLASSES = [
-    "painting",
-    "poster",
-    "picture frame",
-    "artwork",
-    "tv",
-    "monitor",
-    "door",
-    "fire extinguisher",
-    "clock",
-    "whiteboard",
-    "sign",
-    "exit sign",
-    "potted plant",
-    "bookshelf",
-    "cabinet",
-    "laptop",
-    "book",
-    "chair",
-    "couch",
-    "bed",
-    "dining table",
-    "refrigerator",
-    "sink",
-    "bottle",
-    "vase",
-]
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CLASSES_PATH = (
+    ROOT / "src" / "semantic" / "models" / "yolov8s-worldv2-indoor.classes.json"
+)
+
+
+def _default_classes() -> list[str]:
+    if DEFAULT_CLASSES_PATH.is_file():
+        raw = json.loads(DEFAULT_CLASSES_PATH.read_text())
+        if isinstance(raw, list) and all(isinstance(c, str) for c in raw):
+            return list(raw)
+    raise SystemExit(f"missing default class list: {DEFAULT_CLASSES_PATH}")
 
 
 def main() -> int:
@@ -96,13 +82,12 @@ def main() -> int:
             print("--classes must be a JSON list of strings", file=sys.stderr)
             return 2
     else:
-        classes = list(DEFAULT_CLASSES)
+        classes = _default_classes()
 
-    root = Path(__file__).resolve().parents[1]
     out = args.out
     if out is None:
         out = (
-            root
+            ROOT
             / "src"
             / "semantic"
             / "models"

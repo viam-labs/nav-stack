@@ -35,6 +35,19 @@ fetch_dinov2_if_needed() {
     python tools/fetch_dinov2_onnx.py || log "DINOv2 fetch failed (vision will stay synthetic until weights are present)"
 }
 
+fetch_yolo_world_if_needed() {
+    local out="src/semantic/models/yolov8s-worldv2-indoor.onnx"
+    if [ -f "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -gt 5000000 ]; then
+        log "YOLO-World ONNX already present ($(du -h "$out" | awk '{print $1}'))"
+        return 0
+    fi
+    if [ ! -f tools/fetch_yolo_world_onnx.py ]; then
+        return 0
+    fi
+    log "fetching YOLO-World indoor ONNX weights…"
+    python tools/fetch_yolo_world_onnx.py || log "YOLO-World fetch failed (detector landmarks disabled until weights are present)"
+}
+
 ensure_python_venv() {
     if ! "$PYTHON" --version >/dev/null 2>&1; then
         die "python3 not found on PATH"
@@ -52,6 +65,7 @@ ensure_python_venv() {
     install_vision_deps
     log "Python dependencies installed"
     fetch_dinov2_if_needed
+    fetch_yolo_world_if_needed
 }
 
 ensure_python_venv

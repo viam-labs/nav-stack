@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from pathlib import Path
@@ -32,6 +33,9 @@ PoseAtProvider = Callable[[float], Optional[conv.Pose2D]]
 AnchorProvider = Callable[[], Tuple[int, conv.Pose2D, Dict[int, conv.Pose2D]]]
 # Same signature as BuiltinSlamHost.apply_map_pose_correction (force always False).
 PoseCorrection = Callable[..., Dict[str, Any]]
+
+# Fetched by setup.sh / run.sh next to this package (same pattern as DINOv2).
+_DEFAULT_YOLO_WORLD_ONNX = "yolov8s-worldv2-indoor.onnx"
 
 
 class VisionSupervisor:
@@ -99,17 +103,25 @@ class VisionSupervisor:
         input_size = int(cfg.vision_input_size) if not want_synthetic else 224
         if input_size < 14:
             input_size = 224
+        yolo_path = _resolve_model_path(str(cfg.vision_yolo_onnx or ""))
+        if not str(cfg.vision_yolo_onnx or "").strip() and not want_synthetic:
+            candidate = _resolve_model_path(_DEFAULT_YOLO_WORLD_ONNX)
+            if candidate and Path(candidate).is_file():
+                yolo_path = candidate
+        self._yolo_path = yolo_path or ""
+        detector_classes = _resolve_detector_classes(
+            yolo_path,
+            configured=list(cfg.vision_detector_classes or []),
+        )
         worker_cfg = WorkerConfig(
             dinov2_onnx=dinov2_path,
-            yolo_onnx=_resolve_model_path(str(cfg.vision_yolo_onnx or "")),
+            yolo_onnx=yolo_path,
             synthetic=want_synthetic,
             # One thread — leave cores for SLAM/nav; dual-cam was hesitant.
             cpu_threads=1,
             input_short_side=input_size,
             yolo_conf=float(cfg.vision_yolo_conf),
-            detector_classes=tuple(
-                str(x).strip() for x in (cfg.vision_detector_classes or []) if str(x).strip()
-            ),
+            detector_classes=detector_classes,
             landmark_labels=tuple(
                 str(x).strip() for x in (cfg.vision_landmark_labels or []) if str(x).strip()
             ),
@@ -248,7 +260,8 @@ class VisionSupervisor:
                 "round_robin": bool(self._cfg.vision_round_robin),
                 "associate_radius_m": float(self._landmarks.associate_radius_m),
                 "dinov2_onnx": self._dinov2_path or None,
-                "yolo_onnx": self._worker.cfg.yolo_onnx or None,
+                "yolo_onnx": self._yolo_path or None,
+                "detector_classes": list(self._worker.cfg.detector_classes),
                 "prefer_detections": bool(self._cfg.vision_prefer_detections),
                 "dense_fallback_patches": int(self._cfg.vision_dense_fallback_patches),
                 "last_detections": 0 if last is None else len(last.detections),
@@ -636,6 +649,44 @@ class VisionSupervisor:
             f"jump={fix.jump_m:.2f}m/{fix.jump_deg:.1f}deg "
             f"score={fix.score:.2f} inliers={int(fix.fit.inliers.sum())}"
         )
+
+
+def _resolve_detector_classes(
+    yolo_path: str,
+    *,
+    configured: Sequence[str],
+) -> Tuple[str, ...]:
+    """Config list wins; else sibling ``.classes.json`` (YOLO-World indoor default)."""
+    configured_clean = tuple(
+        str(x).strip() for x in configured if str(x).strip()
+    )
+    if configured_clean:
+        return configured_clean
+    if not yolo_path:
+        return ()
+    sidecar = Path(yolo_path).with_suffix(".classes.json")
+    # Also accept the committed name next to a renamed onnx copy.
+    if not sidecar.is_file():
+        pkg = Path(__file__).resolve().parent / "models" / (
+            Path(yolo_path).stem + ".classes.json"
+        )
+        if pkg.is_file():
+            sidecar = pkg
+    if not sidecar.is_file() and Path(yolo_path).name == _DEFAULT_YOLO_WORLD_ONNX:
+        sidecar = (
+            Path(__file__).resolve().parent
+            / "models"
+            / "yolov8s-worldv2-indoor.classes.json"
+        )
+    if not sidecar.is_file():
+        return ()
+    try:
+        raw = json.loads(sidecar.read_text())
+    except Exception:  # noqa: BLE001
+        return ()
+    if not isinstance(raw, list):
+        return ()
+    return tuple(str(x).strip() for x in raw if str(x).strip())
 
 
 def _tokens_outside_detections(

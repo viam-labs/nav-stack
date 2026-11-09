@@ -22,29 +22,34 @@ To re-fetch / export by hand:
 
 ```bash
 python tools/fetch_dinov2_onnx.py
-python tools/export_dinov2_onnx.py --size 448   # needs torch + network
-python tools/export_yolo_world_onnx.py          # needs ultralytics; writes indoor ONNX
+python tools/fetch_yolo_world_onnx.py
+# Optional local rebuilds (torch / ultralytics):
+python tools/export_dinov2_onnx.py --size 448
+python tools/export_yolo_world_onnx.py
 ```
 
-Point config at the file (relative name resolves under `src/semantic/models/`):
+`setup.sh` / `run.sh` fetch both ONNX files automatically when missing.
+You do **not** need to set `vision_dinov2_onnx` / `vision_yolo_onnx` for the
+defaults — empty config resolves to:
+
+- `dinov2_vits14_patches_448.onnx`
+- `yolov8s-worldv2-indoor.onnx` (+ class list from
+  `yolov8s-worldv2-indoor.classes.json`)
 
 ```json
 "vision_enabled": true,
 "vision_survey_only": true,
 "vision_cameras": ["camera-top"],
-"vision_dinov2_onnx": "dinov2_vits14_patches_448.onnx",
 "vision_input_size": 448,
-"vision_yolo_onnx": "yolov8s-worldv2-indoor.onnx",
-"vision_detector_classes": ["painting", "poster", "picture frame", "artwork", "tv", "monitor", "door", "fire extinguisher", "clock", "whiteboard", "sign", "exit sign", "potted plant", "bookshelf", "cabinet", "laptop", "book", "chair", "couch", "bed", "dining table", "refrigerator", "sink", "bottle", "vase"],
 "vision_prefer_detections": true
 ```
 
-Survey prefers detector boxes: each allowed YOLO box pools DINOv2 patch
+Survey prefers detector boxes: each allowed YOLO-World box pools DINOv2 patch
 tokens into one landmark (much stabler re-ID than dense 14×14 tokens). Dense
 texture patches remain as a small fallback (`vision_dense_fallback_patches`,
-default 16). Omit `vision_detector_classes` when using a standard COCO YOLOv8
-ONNX — class names come from COCO-80. `vision_landmark_labels` filters which
-detections become landmarks (defaults cover indoor artwork + furniture).
+default 16). Override `vision_yolo_onnx` / `vision_detector_classes` only for
+a custom detector (e.g. COCO YOLOv8 — leave classes empty to use COCO-80).
+`vision_landmark_labels` filters which detections become landmarks.
 
 Omit `vision_synthetic` (or set `false`). `vision_status.provider` should show
 `OpenVINOExecutionProvider` (or `CPUExecutionProvider`), **not** `synthetic`.

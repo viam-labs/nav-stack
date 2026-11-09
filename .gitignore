@@ -220,8 +220,10 @@ __marimo__/
 .streamlit/secrets.toml
 
 module.tar.gz
-# DINOv2 / YOLO weights (fetch via tools/fetch_dinov2_onnx.py; attach to releases)
+# DINOv2 / YOLO-World weights (setup.sh / tools/fetch_*.py; attach to releases)
 src/semantic/models/*.onnx
+yolov8*-worldv2*.pt
+yolov8*-worldv2*.onnx
 scripts/watch_describe_motion.py
 # Local sim bring-up artifacts
 sample_configs/.local_sim.generated.json

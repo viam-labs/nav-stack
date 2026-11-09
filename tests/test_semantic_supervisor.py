@@ -160,6 +160,24 @@ def test_save_load_roundtrip(tmp_path: Path):
     assert len(loaded.confirmed()) >= 1
 
 
+def test_resolve_detector_classes_from_sidecar():
+    from src.semantic.supervisor import _resolve_detector_classes
+
+    models = Path(__file__).resolve().parents[1] / "src" / "semantic" / "models"
+    classes_path = models / "yolov8s-worldv2-indoor.classes.json"
+    assert classes_path.is_file()
+    # Fake onnx path next to the committed classes.json.
+    fake_onnx = str(models / "yolov8s-worldv2-indoor.onnx")
+    got = _resolve_detector_classes(fake_onnx, configured=[])
+    assert "painting" in got
+    assert "door" in got
+    # Config wins.
+    assert _resolve_detector_classes(fake_onnx, configured=["tv", "clock"]) == (
+        "tv",
+        "clock",
+    )
+
+
 def test_survey_prefers_detector_boxes():
     """Injected YOLO boxes should yield fewer, box-pooled observations."""
     from src.semantic.types import Detection, VisionResult
