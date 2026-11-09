@@ -1125,7 +1125,7 @@ class SlamConfig:
             "bookshelf",
             "cabinet",
             "poster board",
-            "book",
+            # Omit "book" — books move; keep fixtures / furniture.
             "laptop",
             "vase",
             "bottle",
