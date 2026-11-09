@@ -37,6 +37,28 @@ Point config at the file (relative name resolves under `src/semantic/models/`):
 Omit `vision_synthetic` (or set `false`). `vision_status.provider` should show
 `OpenVINOExecutionProvider` (or `CPUExecutionProvider`), **not** `synthetic`.
 
+## Landmark overlay camera
+
+Add a ``viam-labs:nav-stack:vision-camera`` component to stream RGB with
+boxes (green=confirmed, yellow=candidate):
+
+```json
+{
+  "name": "vision-landmarks",
+  "model": "viam-labs:nav-stack:vision-camera",
+  "attributes": {
+    "slam": "slam",
+    "source": "camera-top",
+    "show_candidates": true,
+    "show_confirmed": true
+  },
+  "depends_on": ["slam", "camera-top"]
+}
+```
+
+``source`` should be the same RealSense as ``vision_cameras``. Open it in the
+Viam camera stream view.
+
 ## Pose writeback (opt-in)
 
 After a successful density survey, enable soft landmark corrections:

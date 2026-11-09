@@ -19,6 +19,7 @@ from .models.rplidar_shm import RPLidarShm
 from .models.shm_pointcloud import ShmPointCloud
 from .models.sim_base import SimBase
 from .models.slam import SlamService
+from .models.vision_camera import VisionCamera
 from .models.wit_imu import WitImu
 
 # SLAM ticks, nav, the lidar/IMU readers and the module event loop share one
@@ -41,6 +42,7 @@ async def main() -> None:
         ExternalNavigationService.API, ExternalNavigationService.MODEL
     )
     module.add_model_from_registry(NavCamera.API, NavCamera.MODEL)
+    module.add_model_from_registry(VisionCamera.API, VisionCamera.MODEL)
     module.add_model_from_registry(SimBase.API, SimBase.MODEL)
     module.add_model_from_registry(ShmPointCloud.API, ShmPointCloud.MODEL)
     module.add_model_from_registry(RPLidarShm.API, RPLidarShm.MODEL)

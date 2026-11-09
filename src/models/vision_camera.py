@@ -1,0 +1,246 @@
+"""Landmark overlay camera: ``viam-labs:nav-stack:vision-camera``.
+
+Pulls a live RGB frame from a source camera and draws embedding-landmark
+boxes from the in-process SLAM vision supervisor (confirmed / candidates).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import ClassVar, Mapping, Optional, Sequence
+
+import numpy as np
+from typing_extensions import Self
+from viam.components.camera import Camera
+from viam.logging import getLogger
+from viam.media.video import CameraMimeType, NamedImage, ViamImage
+from viam.proto.app.robot import ComponentConfig
+from viam.proto.common import ResourceName, ResponseMetadata
+from viam.resource.base import ResourceBase
+from viam.resource.registry import Registry, ResourceCreatorRegistration
+from viam.resource.types import Model, ModelFamily
+from viam.utils import struct_to_dict
+
+from ..config import VisionCameraConfig
+from ..runtime import get_slam, get_slam_service
+from ..semantic.decode import decode_color_image, pick_named_images
+from ..semantic.frames import intrinsics_from_size
+from ..viz.landmarks_view import (
+    LandmarkOverlayOptions,
+    collect_landmark_map_points,
+    placeholder_landmarks_png,
+    render_landmarks_overlay,
+)
+
+LOGGER = getLogger(__name__)
+
+
+class VisionCamera(Camera):
+    MODEL: ClassVar[Model] = Model(
+        ModelFamily("viam-labs", "nav-stack"), "vision-camera"
+    )
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self._cfg: Optional[VisionCameraConfig] = None
+        self._source: Optional[Camera] = None
+        self._opts = LandmarkOverlayOptions()
+        self._last_error: Optional[str] = None
+        self._last_drawn = 0
+
+    @classmethod
+    def new(
+        cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
+    ) -> Self:
+        cam = cls(config.name)
+        cam.reconfigure(config, dependencies)
+        return cam
+
+    @classmethod
+    def validate_config(
+        cls, config: ComponentConfig
+    ) -> tuple[Sequence[str], Sequence[str]]:
+        cfg = VisionCameraConfig.from_dict(struct_to_dict(config.attributes))
+        return cfg.required_dependencies(), []
+
+    def reconfigure(
+        self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
+    ) -> None:
+        cfg = VisionCameraConfig.from_dict(struct_to_dict(config.attributes))
+        self._cfg = cfg
+        self._opts = LandmarkOverlayOptions(
+            show_confirmed=cfg.show_confirmed,
+            show_candidates=cfg.show_candidates,
+            show_moved=cfg.show_moved,
+            show_labels=cfg.show_labels,
+            max_landmarks=cfg.max_landmarks,
+            box_m=cfg.box_m,
+        )
+        source = dependencies.get(Camera.get_resource_name(cfg.source))
+        if source is None:
+            raise RuntimeError(f"vision-camera source {cfg.source!r} missing")
+        self._source = source  # type: ignore[assignment]
+        LOGGER.info(
+            f"nav-stack vision-camera '{self.name}' overlaying landmarks from "
+            f"slam={cfg.slam!r} on source={cfg.source!r}"
+        )
+
+    async def _grab_rgb(self) -> np.ndarray:
+        """Pull a color frame from the source camera as HxWx3 uint8."""
+        cam = self._source
+        if cam is None:
+            raise RuntimeError("vision-camera: source not configured")
+        # Prefer get_images (RealSense color+depth); fall back to get_image.
+        if hasattr(cam, "get_images"):
+            try:
+                images, _meta = await cam.get_images(timeout=2.0)
+                if images:
+                    color_blob, _depth = pick_named_images(images)
+                    if color_blob is not None:
+                        return decode_color_image(
+                            color_blob["data"], color_blob["mime"]
+                        )
+            except Exception as exc:  # noqa: BLE001
+                self._last_error = f"get_images: {exc}"
+        img = await cam.get_image(mime_type="", timeout=2.0)
+        data = getattr(img, "data", None) or bytes(img)
+        mime = str(
+            getattr(img, "mime_type", None)
+            or getattr(img, "mimeType", None)
+            or "image/jpeg"
+        )
+        return decode_color_image(data, mime)
+
+    def _mount_and_fov(self, source_name: str):
+        """LidarConfig mount/FOV for the source, if SLAM knows it."""
+        runtime = get_slam(self._cfg.slam) if self._cfg else None
+        slam_cfg = getattr(runtime, "slam_cfg", None) if runtime else None
+        if slam_cfg is None:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 87.0
+        by_name = {lidar.name: lidar for lidar in getattr(slam_cfg, "lidars", [])}
+        lidar = by_name.get(source_name)
+        if lidar is None:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 87.0
+        return (
+            float(lidar.x),
+            float(lidar.y),
+            float(lidar.z),
+            float(lidar.theta),
+            float(lidar.pitch),
+            float(lidar.roll),
+            float(lidar.fov_deg),
+        )
+
+    async def _render(self) -> bytes:
+        cfg = self._cfg
+        if cfg is None or self._source is None:
+            return placeholder_landmarks_png("vision-camera: not configured")
+
+        svc = get_slam_service(cfg.slam)
+        if svc is None:
+            return placeholder_landmarks_png(
+                f"vision-camera: slam {cfg.slam!r} not running"
+            )
+        vision = getattr(svc, "_vision", None)
+        engine = getattr(svc, "_engine", None)
+        if vision is None:
+            return placeholder_landmarks_png(
+                "vision-camera: vision not enabled on slam "
+                "(set vision_enabled / vision_cameras)"
+            )
+        if engine is None:
+            return placeholder_landmarks_png("vision-camera: slam engine missing")
+
+        try:
+            color = await self._grab_rgb()
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = repr(exc)
+            return placeholder_landmarks_png(f"vision-camera: RGB grab failed: {exc}")
+
+        h, w = color.shape[:2]
+        mx, my, mz, mth, mpitch, mroll, fov = self._mount_and_fov(cfg.source)
+        K = intrinsics_from_size(w, h, fov_deg=fov)
+        try:
+            pose = engine.get_pose()
+            _idx, _ap, pose_of_node = engine.vision_anchor()
+            if not pose_of_node:
+                pose_of_node = {0: pose}
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"pose: {exc}"
+            return placeholder_landmarks_png(f"vision-camera: pose failed: {exc}")
+
+        landmarks = collect_landmark_map_points(
+            vision.landmarks,
+            pose_of_node,
+            include_candidates=bool(self._opts.show_candidates),
+            include_moved=bool(self._opts.show_moved),
+        )
+        png = await asyncio.to_thread(
+            render_landmarks_overlay,
+            color,
+            landmarks,
+            robot_pose=pose,
+            intrinsics=K,
+            mount_x=mx,
+            mount_y=my,
+            mount_z=mz,
+            mount_theta=mth,
+            mount_pitch=mpitch,
+            mount_roll=mroll,
+            options=self._opts,
+        )
+        self._last_error = None
+        self._last_drawn = min(len(landmarks), int(self._opts.max_landmarks))
+        return png
+
+    async def get_image(
+        self,
+        mime_type: str = "",
+        *,
+        extra=None,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> ViamImage:
+        png = await self._render()
+        return ViamImage(png, CameraMimeType.PNG)
+
+    async def get_images(
+        self, *, extra=None, timeout: Optional[float] = None, **kwargs
+    ) -> tuple[list[NamedImage], ResponseMetadata]:
+        png = await self._render()
+        return [NamedImage(self.name, png, CameraMimeType.PNG)], ResponseMetadata()
+
+    async def get_point_cloud(
+        self, *, extra=None, timeout: Optional[float] = None, **kwargs
+    ) -> tuple[bytes, str]:
+        raise NotImplementedError("vision-camera renders images only, not point clouds")
+
+    async def get_properties(
+        self, *, timeout: Optional[float] = None, **kwargs
+    ) -> Camera.Properties:
+        return Camera.Properties(supports_pcd=False, mime_types=[CameraMimeType.PNG])
+
+    async def do_command(
+        self,
+        command: Mapping[str, object],
+        *,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> Mapping[str, object]:
+        cfg = self._cfg
+        return {
+            "configured": cfg is not None,
+            "slam": None if cfg is None else cfg.slam,
+            "source": None if cfg is None else cfg.source,
+            "last_error": self._last_error,
+            "last_drawn": self._last_drawn,
+            "show_candidates": self._opts.show_candidates,
+            "show_confirmed": self._opts.show_confirmed,
+        }
+
+
+Registry.register_resource_creator(
+    Camera.API,
+    VisionCamera.MODEL,
+    ResourceCreatorRegistration(VisionCamera.new, VisionCamera.validate_config),
+)

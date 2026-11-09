@@ -1771,3 +1771,44 @@ class NavCameraConfig:
         # Depend on the navigation service so Viam constructs it (and registers
         # its viz store) before this camera.
         return [self.navigation]
+
+
+@dataclass
+class VisionCameraConfig:
+    """Config for ``viam-labs:nav-stack:vision-camera``.
+
+    Overlays embedding landmarks from the named SLAM service onto a live RGB
+    frame from ``source`` (typically the same RealSense used in
+    ``vision_cameras``).
+    """
+
+    slam: str
+    source: str
+    show_confirmed: bool = True
+    show_candidates: bool = True
+    show_moved: bool = False
+    show_labels: bool = True
+    max_landmarks: int = 80
+    box_m: float = 0.12
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "VisionCameraConfig":
+        slam = str(d.get("slam") or d.get("slam_service") or "").strip()
+        source = str(d.get("source") or d.get("camera") or "").strip()
+        if not slam:
+            raise ValueError("vision-camera requires attributes.slam")
+        if not source:
+            raise ValueError("vision-camera requires attributes.source")
+        return cls(
+            slam=slam,
+            source=source,
+            show_confirmed=bool(d.get("show_confirmed", True)),
+            show_candidates=bool(d.get("show_candidates", True)),
+            show_moved=bool(d.get("show_moved", False)),
+            show_labels=bool(d.get("show_labels", True)),
+            max_landmarks=max(1, int(d.get("max_landmarks", 80))),
+            box_m=float(d.get("box_m", 0.12)),
+        )
+
+    def required_dependencies(self) -> List[str]:
+        return [self.slam, self.source]
