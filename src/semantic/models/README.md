@@ -34,16 +34,10 @@ Point config at the file (relative name resolves under `src/semantic/models/`):
 "vision_input_size": 448
 ```
 
-On the matching `lidars[]` entry for that camera, set color FOV (example D435):
-
-```json
-"fov_deg": 69,
-"vfov_deg": 42
-```
-
-
 Omit `vision_synthetic` (or set `false`). `vision_status.provider` should show
 `OpenVINOExecutionProvider` (or `CPUExecutionProvider`), **not** `synthetic`.
+Intrinsics are auto-read from `Camera.get_properties()` when the camera
+publishes them; see `vision_status.intrinsics_source`.
 
 ## Landmark overlay camera
 
@@ -105,10 +99,10 @@ mixed/holey neighborhoods, and ``vision-camera`` hides unstable single-view
 candidates by default (`stable_candidates_only: true`). Prefer indoor opaque
 surfaces (paintings, posters, furniture) for survey.
 
-**FOV matters for spin stickiness:** set the vision camera's lidar entry
-`fov_deg` / `vfov_deg` to the *color* stream FOV (RealSense D435 color is
-often ~69°×42° or ~84°×58°, not the default 87°). Wrong FOV places the 3D
-point off the true ray, so overlays slide on opaque walls when you rotate.
+**Intrinsics / FOV:** prefer live `Camera.get_properties().intrinsic_parameters`
+(auto-scaled to the frame size). `vision_status.intrinsics_source` is
+`camera_properties` when that works, else `fov_config` (lidar `fov_deg` /
+`vfov_deg` fallback — set those only if properties are empty).
 
 Wipe `embedding_landmarks.npz` (or `clear_map`) before re-surveying after
 switching synthetic → DINOv2. Prefer a single camera in `vision_cameras`.

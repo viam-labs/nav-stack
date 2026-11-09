@@ -3,15 +3,56 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from src.geom.conversions import Pose2D
-from src.semantic.frames import intrinsics_from_size
+from src.semantic.frames import (
+    intrinsics_from_camera_properties,
+    intrinsics_from_size,
+)
 from src.semantic.patches import backproject_patches
 from src.semantic.types import CameraIntrinsics, PatchToken, VisionFrame
 from src.viz.landmarks_view import project_map_point_to_pixel
+
+
+def test_intrinsics_from_camera_properties_scales_resolution():
+    props = SimpleNamespace(
+        intrinsic_parameters=SimpleNamespace(
+            width_px=1280,
+            height_px=720,
+            focal_x_px=920.0,
+            focal_y_px=918.0,
+            center_x_px=640.0,
+            center_y_px=360.0,
+        )
+    )
+    K = intrinsics_from_camera_properties(props, image_width=640, image_height=360)
+    assert K is not None
+    assert K.width == 640 and K.height == 360
+    assert K.fx == pytest.approx(460.0)
+    assert K.fy == pytest.approx(459.0)
+    assert K.cx == pytest.approx(320.0)
+    assert K.cy == pytest.approx(180.0)
+
+
+def test_intrinsics_from_camera_properties_rejects_empty():
+    props = SimpleNamespace(
+        intrinsic_parameters=SimpleNamespace(
+            width_px=0,
+            height_px=0,
+            focal_x_px=0.0,
+            focal_y_px=0.0,
+            center_x_px=0.0,
+            center_y_px=0.0,
+        )
+    )
+    assert (
+        intrinsics_from_camera_properties(props, image_width=640, image_height=480)
+        is None
+    )
 
 
 def test_intrinsics_use_separate_vfov():

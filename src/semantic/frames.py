@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 
@@ -35,6 +35,50 @@ def intrinsics_from_size(
         fy=float(fy),
         cx=0.5 * w,
         cy=0.5 * h,
+        width=w,
+        height=h,
+    )
+
+
+def intrinsics_from_camera_properties(
+    props: Any,
+    *,
+    image_width: int,
+    image_height: int,
+) -> Optional[CameraIntrinsics]:
+    """Build K from Viam ``Camera.get_properties().intrinsic_parameters``.
+
+    Scales fx/fy/cx/cy when the live frame size differs from the calibration
+    resolution. Returns ``None`` when properties are missing or empty so
+    callers can fall back to FOV config.
+    """
+    ip = getattr(props, "intrinsic_parameters", None)
+    if ip is None:
+        return None
+    fx = float(getattr(ip, "focal_x_px", 0.0) or 0.0)
+    fy = float(getattr(ip, "focal_y_px", 0.0) or 0.0)
+    cx = float(getattr(ip, "center_x_px", 0.0) or 0.0)
+    cy = float(getattr(ip, "center_y_px", 0.0) or 0.0)
+    pw = int(getattr(ip, "width_px", 0) or 0)
+    ph = int(getattr(ip, "height_px", 0) or 0)
+    if fx < 1.0 or fy < 1.0:
+        return None
+    w = max(1, int(image_width))
+    h = max(1, int(image_height))
+    if pw > 1 and ph > 1 and (pw != w or ph != h):
+        sx = w / float(pw)
+        sy = h / float(ph)
+        fx *= sx
+        fy *= sy
+        cx *= sx
+        cy *= sy
+    elif cx <= 0.0 and cy <= 0.0:
+        cx, cy = 0.5 * w, 0.5 * h
+    return CameraIntrinsics(
+        fx=float(fx),
+        fy=float(fy),
+        cx=float(cx),
+        cy=float(cy),
         width=w,
         height=h,
     )

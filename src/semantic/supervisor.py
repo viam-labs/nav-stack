@@ -13,12 +13,16 @@ import numpy as np
 from ..config import LidarConfig, MODE_MAPPING, SlamConfig
 from ..geom import conversions as conv
 from .decode import decode_color_image, decode_depth_image, pick_named_images
-from .frames import intrinsics_from_size, vision_frame_from_arrays
+from .frames import (
+    intrinsics_from_camera_properties,
+    intrinsics_from_size,
+    vision_frame_from_arrays,
+)
 from .landmarks import EmbeddingLandmarkMap
 from .localize import estimate_landmark_fix
 from .patches import PatchObservation, backproject_patches, subsample_observations
 from .persist import load_landmarks, save_landmarks
-from .types import VisionFrame, VisionResult
+from .types import CameraIntrinsics, VisionFrame, VisionResult
 from .worker import VisionWorker, WorkerConfig
 
 
@@ -79,6 +83,9 @@ class VisionSupervisor:
         # Last survey camera geometry — vision-camera overlay must use the same
         # mount/FOV or boxes slide vs the RGB while spinning.
         self._last_camera_geom: Optional[dict] = None
+        # Per-camera K from Camera.get_properties (None = not tried / failed).
+        self._intrinsics_by_cam: Dict[str, Optional[CameraIntrinsics]] = {}
+        self._intrinsics_source_by_cam: Dict[str, str] = {}
         self._frames = 0
         self._observations = 0
         self._inflight: set = set()
@@ -237,6 +244,7 @@ class VisionSupervisor:
                 "require_descriptor_match": bool(
                     self._landmarks.require_descriptor_match
                 ),
+                "intrinsics_source": dict(self._intrinsics_source_by_cam),
                 "writeback": {
                     "attempts": self._writeback_attempts,
                     "applied": self._writeback_applied,
@@ -319,6 +327,47 @@ class VisionSupervisor:
             finally:
                 self._inflight.discard(name)
 
+    async def _resolve_intrinsics(
+        self, cam, lidar: LidarConfig, *, width: int, height: int
+    ) -> CameraIntrinsics:
+        """Prefer live Camera.get_properties(); fall back to lidar FOV config."""
+        name = lidar.name
+        cached = self._intrinsics_by_cam.get(name)
+        if cached is not None and cached.width == width and cached.height == height:
+            return cached
+        # Try (or retry on resolution change). A failed probe stores None.
+        need_probe = name not in self._intrinsics_by_cam or (
+            cached is not None
+            and (cached.width != width or cached.height != height)
+        )
+        if need_probe:
+            getter = getattr(cam, "get_properties", None)
+            if callable(getter):
+                try:
+                    props = await getter(timeout=2.0)
+                    K = intrinsics_from_camera_properties(
+                        props, image_width=width, image_height=height
+                    )
+                    if K is not None:
+                        self._intrinsics_by_cam[name] = K
+                        self._intrinsics_source_by_cam[name] = "camera_properties"
+                        self._log(
+                            f"vision: {name} intrinsics from camera properties "
+                            f"fx={K.fx:.1f} fy={K.fy:.1f} {K.width}x{K.height}"
+                        )
+                        return K
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"vision: {name} get_properties failed: {exc}")
+            self._intrinsics_by_cam[name] = None
+        K = intrinsics_from_size(
+            width,
+            height,
+            fov_deg=float(lidar.fov_deg),
+            vfov_deg=float(lidar.vfov_deg),
+        )
+        self._intrinsics_source_by_cam[name] = "fov_config"
+        return K
+
     async def _grab_frame(self, cam, lidar: LidarConfig) -> Optional[VisionFrame]:
         """Pull color+depth via get_images; return None if unavailable."""
         # Stamp pose to mid-grab. Using the *start* time while spinning places
@@ -364,11 +413,8 @@ class VisionSupervisor:
         if color.shape[:2] != depth.shape[:2]:
             # Resize depth with nearest neighbor to color size.
             depth = _resize_nearest(depth, color.shape[0], color.shape[1])
-        K = intrinsics_from_size(
-            color.shape[1],
-            color.shape[0],
-            fov_deg=float(lidar.fov_deg),
-            vfov_deg=float(lidar.vfov_deg),
+        K = await self._resolve_intrinsics(
+            cam, lidar, width=color.shape[1], height=color.shape[0]
         )
         self._last_camera_geom = {
             "camera_name": lidar.name,
@@ -380,6 +426,9 @@ class VisionSupervisor:
             "mount_roll": float(lidar.roll),
             "fov_deg": float(lidar.fov_deg),
             "vfov_deg": float(lidar.vfov_deg),
+            "intrinsics_source": self._intrinsics_source_by_cam.get(
+                lidar.name, "unknown"
+            ),
             "fx": float(K.fx),
             "fy": float(K.fy),
             "cx": float(K.cx),
