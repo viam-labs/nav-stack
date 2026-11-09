@@ -63,6 +63,10 @@ class EmbeddingLandmarkMap:
     # Within this fraction of associate_radius, confirmed landmarks may re-match
     # at the candidate cosine (bank a new view instead of minting a duplicate).
     confirmed_soft_match_frac: float = 0.7
+    # Never mint a parallel candidate this close to a confirmed landmark —
+    # absorb into it instead (YOLO box jitter / weak cosine often re-IDs and
+    # still tries to spawn a yellow neighbor).
+    confirmed_overlap_m: float = 0.40
     # When False (synthetic RGB stats), associate by distance only so nearby
     # patches collapse instead of spawning one landmark per grid cell.
     require_descriptor_match: bool = True
@@ -78,6 +82,7 @@ class EmbeddingLandmarkMap:
         self._assoc_hits = 0
         self._assoc_misses = 0
         self._assoc_soft_hits = 0
+        self._assoc_overlap_absorbs = 0
 
     def rebuild_cell_index(self) -> None:
         """Re-hash landmarks after ``cell_m`` changes (load / config apply)."""
@@ -331,6 +336,39 @@ class EmbeddingLandmarkMap:
         ):
             self._assoc_soft_hits += 1
 
+    def _overlap_radius(self, *, from_detector: bool) -> float:
+        r = float(self.confirmed_overlap_m)
+        if from_detector:
+            # Match the widened detector association gate.
+            r = max(r, 0.55)
+        return r
+
+    def _nearest_confirmed(
+        self,
+        map_xyz: np.ndarray,
+        *,
+        radius_m: float,
+        pose_of: Dict[int, conv.Pose2D],
+        fallback_pose: Optional[conv.Pose2D],
+    ) -> Optional[EmbeddingLandmark]:
+        """Closest confirmed landmark within ``radius_m`` (geometry only)."""
+        best: Optional[EmbeddingLandmark] = None
+        best_dist = float("inf")
+        for lm in self._neighbors(map_xyz, radius_m=radius_m, include_moved=False):
+            if lm.status != LandmarkStatus.CONFIRMED:
+                continue
+            lm_map = self.association_map_xyz(lm)
+            if lm_map is None:
+                ap = pose_of.get(lm.anchor_node, fallback_pose)
+                if ap is None:
+                    continue
+                lm_map = self.map_point_from_rel(ap, lm.rel_xyz)
+            dist = float(np.linalg.norm(lm_map - map_xyz))
+            if dist <= float(radius_m) and dist < best_dist:
+                best_dist = dist
+                best = lm
+        return best
+
     def observe(
         self,
         *,
@@ -368,6 +406,29 @@ class EmbeddingLandmarkMap:
         self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
 
         if best is None:
+            # Descriptor gates missed, but a confirmed landmark already owns
+            # this spot — absorb rather than paint a parallel yellow candidate.
+            overlap = self._nearest_confirmed(
+                map_xyz,
+                radius_m=self._overlap_radius(from_detector=from_detector),
+                pose_of={int(anchor_node): anchor_pose},
+                fallback_pose=anchor_pose,
+            )
+            if overlap is not None:
+                self._assoc_misses = max(0, self._assoc_misses - 1)
+                self._assoc_hits += 1
+                self._assoc_overlap_absorbs += 1
+                cos = self._best_desc_cosine(overlap, descriptor)
+                return self._update_existing(
+                    overlap,
+                    map_xyz,
+                    descriptor,
+                    view,
+                    anchor_pose,
+                    from_detector=from_detector,
+                    # Don't poison the confirmed bank with an unrelated crop.
+                    bank_descriptor=cos >= 0.20,
+                )
             lid = self._next_id
             self._next_id += 1
             rel = self.rel_from_map_point(anchor_pose, map_xyz)
@@ -473,6 +534,7 @@ class EmbeddingLandmarkMap:
         anchor_pose: conv.Pose2D,
         *,
         from_detector: bool = False,
+        bank_descriptor: bool = True,
     ) -> EmbeddingLandmark:
         lm.observations += 1
         if from_detector:
@@ -501,7 +563,8 @@ class EmbeddingLandmarkMap:
             )
             lm.rel_xyz = self.rel_from_map_point(anchor_pose, locked)
 
-        self._bank_descriptor(lm, descriptor)
+        if bank_descriptor:
+            self._bank_descriptor(lm, descriptor)
 
         self._maybe_record_view(lm, view_xy)
 
@@ -681,6 +744,7 @@ class EmbeddingLandmarkMap:
             "assoc_hits": hits,
             "assoc_misses": misses,
             "assoc_soft_hits": int(self._assoc_soft_hits),
+            "assoc_overlap_absorbs": int(self._assoc_overlap_absorbs),
             "assoc_hit_rate": (hits / attempts) if attempts else None,
             "mean_descriptors": (n_desc / max(1, len(self._landmarks))),
         }
