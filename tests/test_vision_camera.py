@@ -49,6 +49,53 @@ def test_render_overlay_draws_yolo_detections():
     assert arr[..., 2].max() > 40
 
 
+def test_match_detection_box_contains_center():
+    from src.semantic.types import Detection
+    from src.viz.landmarks_view import _match_detection_box
+
+    det = Detection(label="painting", conf=0.4, x0=40, y0=30, x1=200, y1=180)
+    boxes = [(40.0, 30.0, 200.0, 180.0, det)]
+    matched = _match_detection_box(120.0, 100.0, boxes, used=set())
+    assert matched is not None
+    assert matched[4].label == "painting"
+
+
+def test_render_nests_detector_landmark_inside_yolo():
+    """Dc fill should sit in the YOLO rectangle, not a separate offset square."""
+    from src.semantic.types import Detection
+
+    color = np.zeros((240, 320, 3), dtype=np.uint8)
+    color[:] = (20, 20, 28)
+    K = CameraIntrinsics(fx=160, fy=160, cx=160, cy=120, width=320, height=240)
+    # Landmark at map (2,0,0.5) with mount_z=0.5 projects near image center.
+    lm = EmbeddingLandmark(
+        landmark_id=3,
+        anchor_node=0,
+        rel_xyz=np.array([2.0, 0.0, 0.5]),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array([2.0, 0.0, 0.5]),
+        descriptors=[],
+        observations=2,
+        status=LandmarkStatus.CANDIDATE,
+        from_detector=True,
+    )
+    det = Detection(label="painting", conf=0.5, x0=100, y0=60, x1=220, y1=180)
+    png = render_landmarks_overlay(
+        color,
+        [(lm, np.array([2.0, 0.0, 0.5]))],
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        intrinsics=K,
+        mount_z=0.5,
+        detections=[det],
+        detection_frame_size=(320, 240),
+        yolo_loaded=True,
+    )
+    arr = np.asarray(Image.open(io.BytesIO(png)))
+    # Nested yellow fill inside the box should raise green+red in that region.
+    roi = arr[70:170, 110:210]
+    assert roi[..., 0].max() > 40 and roi[..., 1].max() > 40
+
+
 def test_sensor_optical_roundtrip():
     optical = np.array([[0.1, -0.2, 2.0]])
     sensor = conv.camera_optical_to_sensor_frame(optical)
