@@ -241,23 +241,61 @@ def annotate_patch_texture(
     color_rgb: np.ndarray,
     tokens: Sequence[PatchToken],
     *,
-    half: int = 7,
+    half: int = 14,
 ) -> None:
     """Fill ``token.texture`` from local luminance contrast."""
     for tok in tokens:
         tok.texture = local_luminance_std(color_rgb, tok.u, tok.v, half=half)
 
 
+def select_survey_tokens(
+    color_rgb: np.ndarray,
+    tokens: Sequence[PatchToken],
+    *,
+    min_texture: float = 8.0,
+    max_keep: int = 64,
+    distinctiveness_bonus: float = 10.0,
+    max_ratio: float = 0.92,
+) -> List[PatchToken]:
+    """Rank patches for survey: paintings/edges first, flat walls last.
+
+    Hard distinctiveness filtering alone drops painting *interiors* (adjacent
+    patches on the same artwork look alike). Texture is the primary signal;
+    distinctiveness is only a soft bonus for isolated features.
+    """
+    toks = list(tokens)
+    if not toks:
+        return []
+    annotate_patch_texture(color_rgb, toks)
+    desc = np.stack([t.descriptor for t in toks], axis=0)
+    distinctive = distinctiveness_mask(desc, max_ratio=float(max_ratio))
+    bonus = float(distinctiveness_bonus)
+
+    def _score(i: int) -> float:
+        return float(toks[i].texture) + (bonus if bool(distinctive[i]) else 0.0)
+
+    order = sorted(range(len(toks)), key=_score, reverse=True)
+    floor = float(min_texture)
+    # Prefer everything above the texture floor; if the scene is bland, still
+    # keep the top-scoring patches so survey is not empty.
+    above = [toks[i] for i in order if float(toks[i].texture) >= floor]
+    ranked = above if above else [toks[i] for i in order]
+    limit = int(max_keep)
+    if limit <= 0 or len(ranked) <= limit:
+        return ranked
+    return ranked[:limit]
+
+
 def filter_textured_tokens(
     tokens: Sequence[PatchToken],
     *,
-    min_texture: float = 12.0,
+    min_texture: float = 8.0,
     max_keep: int = 64,
 ) -> List[PatchToken]:
     """Drop flat wall patches; keep the most textured first.
 
-    ``min_texture`` is luminance std on a 0–255 scale. Plain white/painted
-    walls are typically well below 12; framed art / posters sit much higher.
+    ``min_texture`` is luminance std on a 0–255 scale. Plain white walls are
+    typically well below 8; framed art / posters sit much higher.
     """
     scored = [t for t in tokens if float(t.texture) >= float(min_texture)]
     if not scored:
@@ -300,7 +338,7 @@ def subsample_observations(
 def distinctiveness_mask(
     descriptors: np.ndarray,
     *,
-    max_ratio: float = 0.85,
+    max_ratio: float = 0.92,
 ) -> np.ndarray:
     """Keep patches whose best/second-best in-frame cosine ratio is below max.
 

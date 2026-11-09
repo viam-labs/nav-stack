@@ -16,6 +16,7 @@ from src.semantic.patches import (
     filter_textured_tokens,
     lateral_sigma_m,
     local_luminance_std,
+    select_survey_tokens,
 )
 from src.semantic.types import CameraIntrinsics, PatchToken, VisionFrame
 from src.semantic.worker import VisionWorker, WorkerConfig
@@ -90,7 +91,7 @@ def test_distinctiveness_keeps_unique_descriptors():
     a = np.array([1.0, 0.0, 0.0], dtype=float)
     b = np.array([0.0, 1.0, 0.0], dtype=float)
     desc = np.stack([a, a, a, b], axis=0)
-    keep = distinctiveness_mask(desc, max_ratio=0.85)
+    keep = distinctiveness_mask(desc, max_ratio=0.92)
     assert bool(keep[3])
     assert not all(keep[:3])
 
@@ -109,9 +110,31 @@ def test_texture_filter_prefers_painting_over_white_wall():
     assert local_luminance_std(color, art.u, art.v) > local_luminance_std(
         color, wall.u, wall.v
     )
-    kept = filter_textured_tokens([wall, art], min_texture=12.0)
+    kept = filter_textured_tokens([wall, art], min_texture=8.0)
     assert art in kept
     assert wall not in kept
+
+
+def test_select_survey_keeps_painting_interior_despite_similar_neighbors():
+    """Hard distinctiveness drops art interiors; texture-first must keep them."""
+    h, w = 120, 160
+    color = np.full((h, w, 3), 240, dtype=np.uint8)
+    yy, xx = np.mgrid[20:100, 90:150]
+    color[20:100, 90:150, 0] = (xx * 3) % 255
+    color[20:100, 90:150, 1] = (yy * 5) % 255
+    color[20:100, 90:150, 2] = ((xx + yy) * 7) % 255
+    # Three near-duplicate descriptors on the painting (as DINOv2 neighbors).
+    art_desc = np.array([0.9, 0.1, 0.0, 0.0], dtype=np.float32)
+    art_desc = art_desc / np.linalg.norm(art_desc)
+    wall_desc = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    arts = [
+        PatchToken(row=0, col=i, u=100.0 + 5 * i, v=60.0, descriptor=art_desc.copy())
+        for i in range(3)
+    ]
+    wall = PatchToken(row=1, col=0, u=40.0, v=60.0, descriptor=wall_desc)
+    kept = select_survey_tokens(color, arts + [wall], min_texture=8.0, max_keep=4)
+    assert wall not in kept
+    assert sum(1 for t in kept if t in arts) >= 2
 
 
 def test_subsample_prefers_higher_texture():

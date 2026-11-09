@@ -8,12 +8,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .patches import (
-    annotate_patch_texture,
-    distinctiveness_mask,
-    filter_textured_tokens,
-    patch_grid,
-)
+from .patches import patch_grid, select_survey_tokens
 from .place import l2_normalize
 from .types import Detection, PatchToken, VisionFrame, VisionResult
 
@@ -114,27 +109,10 @@ class VisionWorker:
         if self._yolo is not None:
             detections = self._run_yolo(color)
 
-        # Prefer paintings / edges over flat walls: distinctive DINOv2 tokens
-        # plus local RGB contrast. Skip texture gate in synthetic mode.
+        # Texture-first survey select (paintings/edges over flat walls).
+        # Skip in synthetic mode — RGB-stat tokens need the full grid.
         if tokens and not self.cfg.synthetic:
-            desc = np.stack([t.descriptor for t in tokens], axis=0)
-            keep = distinctiveness_mask(desc)
-            filtered = [t for t, k in zip(tokens, keep) if k]
-            annotate_patch_texture(color, filtered if filtered else tokens)
-            textured = filter_textured_tokens(
-                filtered if filtered else tokens, min_texture=12.0, max_keep=64
-            )
-            if textured:
-                tokens = textured
-            elif filtered:
-                # Distinctive but low RGB contrast — keep a sparse few so empty
-                # rooms still survey something, ranked by whatever texture exists.
-                filtered.sort(key=lambda t: float(t.texture), reverse=True)
-                step = max(1, len(filtered) // 16)
-                tokens = filtered[::step][:16]
-            else:
-                # Nothing distinctive — do not flood candidates with white wall.
-                tokens = []
+            tokens = select_survey_tokens(color, tokens, min_texture=8.0, max_keep=64)
 
         infer_ms = (time.perf_counter() - t0) * 1000.0
         self.stats["frames"] += 1
