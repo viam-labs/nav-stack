@@ -35,6 +35,7 @@ def save_landmarks(map_dir: Path, store: EmbeddingLandmarkMap) -> Optional[Path]
     ids = np.zeros(n, dtype=np.int32)
     anchors = np.zeros(n, dtype=np.int32)
     rel = np.zeros((n, 3), dtype=np.float32)
+    map_xyz = np.zeros((n, 3), dtype=np.float32)
     normals = np.zeros((n, 3), dtype=np.float32)
     obs = np.zeros(n, dtype=np.int32)
     stds = np.zeros(n, dtype=np.float32)
@@ -51,6 +52,10 @@ def save_landmarks(map_dir: Path, store: EmbeddingLandmarkMap) -> Optional[Path]
         ids[i] = lm.landmark_id
         anchors[i] = lm.anchor_node
         rel[i] = lm.rel_xyz.astype(np.float32)
+        if lm.map_xyz is not None:
+            map_xyz[i] = np.asarray(lm.map_xyz, dtype=np.float32).reshape(3)
+        else:
+            map_xyz[i] = lm.rel_xyz.astype(np.float32)
         normals[i] = lm.normal_rel.astype(np.float32)
         obs[i] = lm.observations
         stds[i] = float(lm.position_std_m) if np.isfinite(lm.position_std_m) else -1.0
@@ -66,6 +71,7 @@ def save_landmarks(map_dir: Path, store: EmbeddingLandmarkMap) -> Optional[Path]
         ids=ids,
         anchors=anchors,
         rel=rel,
+        map_xyz=map_xyz,
         normals=normals,
         observations=obs,
         stds=stds,
@@ -112,19 +118,23 @@ def load_landmarks(map_dir: Path) -> Optional[EmbeddingLandmarkMap]:
             descs[i, j].astype(np.float32) for j in range(nd) if descs.shape[1] > j
         ]
         std = float(stds[i])
+        if "map_xyz" in data:
+            mxyz = data["map_xyz"][i].astype(float)
+        else:
+            mxyz = rel[i].astype(float)
         lm = EmbeddingLandmark(
             landmark_id=int(ids[i]),
             anchor_node=int(anchors[i]),
             rel_xyz=rel[i].astype(float),
             normal_rel=normals[i].astype(float),
+            map_xyz=mxyz,
             descriptors=descriptors,
             observations=int(obs[i]),
             position_std_m=std if std >= 0.0 else float("inf"),
             status=code_status.get(int(status[i]), LandmarkStatus.CANDIDATE),
         )
         store._landmarks[lm.landmark_id] = lm  # noqa: SLF001
-        # Index at rel as if anchor were identity; rebuilt on observe_with_poses.
-        store._index_add(lm, lm.rel_xyz)  # noqa: SLF001
+        store._index_add(lm, lm.map_xyz)  # noqa: SLF001
     if "next_id" in data:
         store._next_id = max(int(data["next_id"]), max(ids) + 1 if len(ids) else 1)  # noqa: SLF001
     else:

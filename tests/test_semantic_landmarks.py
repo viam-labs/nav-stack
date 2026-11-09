@@ -119,6 +119,43 @@ def test_promote_tolerates_depth_noise_above_5cm():
     assert lm.status == LandmarkStatus.CONFIRMED
 
 
+def test_map_xyz_stable_when_virtual_anchor_pose_spins():
+    """Overlay/association must not reinterpret rel under a new live yaw."""
+    import math
+
+    store = EmbeddingLandmarkMap(require_descriptor_match=True, promote_min_obs=99)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    pose0 = Pose2D(0.0, 0.0, 0.0)
+    # Feature 2 m ahead of pose0 → map (2, 0, 1).
+    lm = store.observe(
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptor=desc,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=pose0,
+        view_xy=(0.0, 0.0, 0.0),
+    )
+    assert lm.map_xyz is not None
+    np.testing.assert_allclose(lm.map_xyz, [2.0, 0.0, 1.0], atol=1e-6)
+    # Live/virtual anchor table now claims node 0 is a spun pose — old bug
+    # would rotate the landmark with it.
+    spun = Pose2D(0.0, 0.0, math.radians(40.0))
+    resolved = EmbeddingLandmarkMap.resolved_map_xyz(lm, {0: spun})
+    np.testing.assert_allclose(resolved, [2.0, 0.0, 1.0], atol=1e-6)
+    # Re-observe the same map point after the spin; must associate, not mint.
+    lm2 = store.observe(
+        map_xyz=np.array([2.02, 0.0, 1.0]),
+        descriptor=desc,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=spun,
+        view_xy=(0.0, 0.0, math.radians(40.0)),
+    )
+    assert lm2.landmark_id == lm.landmark_id
+    assert len(store) == 1
+
+
 def test_promote_on_spin_in_place_yaw_gap():
     """Pure rotation used to never promote (view gap was XY-only)."""
     import math

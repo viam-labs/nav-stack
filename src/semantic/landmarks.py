@@ -19,6 +19,10 @@ class EmbeddingLandmark:
     # Position relative to the anchor keyframe pose (base_link of that node).
     rel_xyz: np.ndarray  # (3,)
     normal_rel: np.ndarray  # (3,) facing outward-ish in anchor frame
+    # Absolute map-frame position — authoritative for overlay / association.
+    # rel_xyz alone is unsafe when anchor 0 is a live pose or later remapped
+    # to keyframe 0 (spinning made boxes slide on landmark-camera).
+    map_xyz: Optional[np.ndarray] = None
     descriptors: List[np.ndarray] = field(default_factory=list)  # up to 3 (D,)
     observations: int = 0
     # Robot poses that saw this landmark: (x, y, yaw). Yaw matters so a
@@ -69,8 +73,21 @@ class EmbeddingLandmarkMap:
         """Re-hash landmarks after ``cell_m`` changes (load / config apply)."""
         self._cell_index = {}
         for lm in self._landmarks.values():
-            # Persist load indexes by rel_xyz (anchor-identity); keep that contract.
-            self._index_add(lm, np.asarray(lm.rel_xyz, dtype=float))
+            xyz = self.resolved_map_xyz(lm)
+            self._index_add(lm, xyz)
+
+    @staticmethod
+    def resolved_map_xyz(
+        lm: EmbeddingLandmark, pose_of_node: Optional[Dict[int, conv.Pose2D]] = None
+    ) -> np.ndarray:
+        """Absolute map position; prefer stored ``map_xyz`` over rel⊕anchor."""
+        if lm.map_xyz is not None:
+            return np.asarray(lm.map_xyz, dtype=float).reshape(3)
+        if pose_of_node is not None:
+            ap = pose_of_node.get(lm.anchor_node)
+            if ap is not None:
+                return EmbeddingLandmarkMap.map_point_from_rel(ap, lm.rel_xyz)
+        return np.asarray(lm.rel_xyz, dtype=float).reshape(3)
 
     def __len__(self) -> int:
         return len(self._landmarks)
@@ -196,10 +213,15 @@ class EmbeddingLandmarkMap:
         for lm in neighbors:
             if same_anchor is not None and lm.anchor_node != same_anchor:
                 continue
-            ap = pose_of.get(lm.anchor_node, fallback_pose)
-            if ap is None:
-                continue
-            lm_map = self.map_point_from_rel(ap, lm.rel_xyz)
+            # Prefer absolute map_xyz so a spinning live/virtual anchor cannot
+            # reinterpret rel_xyz under a new yaw.
+            if lm.map_xyz is not None:
+                lm_map = np.asarray(lm.map_xyz, dtype=float).reshape(3)
+            else:
+                ap = pose_of.get(lm.anchor_node, fallback_pose)
+                if ap is None:
+                    continue
+                lm_map = self.map_point_from_rel(ap, lm.rel_xyz)
             dist = float(np.linalg.norm(lm_map - map_xyz))
             radius = float(self.associate_radius_m)
             if lm.status == LandmarkStatus.CONFIRMED:
@@ -265,6 +287,7 @@ class EmbeddingLandmarkMap:
                 anchor_node=int(anchor_node),
                 rel_xyz=rel,
                 normal_rel=n_rel,
+                map_xyz=map_xyz.copy(),
                 descriptors=[descriptor.copy()],
                 observations=1,
                 view_poses_xy=[view],
@@ -332,8 +355,9 @@ class EmbeddingLandmarkMap:
         samples = np.stack(lm._map_samples, axis=0)
         mean = samples.mean(axis=0)
         lm.position_std_m = float(samples.std(axis=0).mean())
-        # Refresh rel from mean while still a candidate on this anchor.
+        # Candidates track the running map-frame mean; confirmed stay frozen.
         if lm.status == LandmarkStatus.CANDIDATE and lm.anchor_node >= 0:
+            lm.map_xyz = mean.copy()
             lm.rel_xyz = self.rel_from_map_point(anchor_pose, mean)
 
         if len(lm.descriptors) < int(self.max_descriptors):
@@ -387,12 +411,17 @@ class EmbeddingLandmarkMap:
         if lm.position_std_m > float(self.promote_max_std_m):
             return
         lm.status = LandmarkStatus.CONFIRMED
+        if lm._map_samples:
+            lm.map_xyz = np.stack(lm._map_samples, axis=0).mean(axis=0).copy()
         lm._map_samples.clear()
 
     def _check_moved(
         self, lm: EmbeddingLandmark, map_xyz: np.ndarray, *, pose_hint: conv.Pose2D
     ) -> None:
-        expected = self.map_point_from_rel(pose_hint, lm.rel_xyz)
+        if lm.map_xyz is not None:
+            expected = np.asarray(lm.map_xyz, dtype=float).reshape(3)
+        else:
+            expected = self.map_point_from_rel(pose_hint, lm.rel_xyz)
         # Only meaningful when pose_hint is the landmark's anchor.
         if lm.anchor_node < 0:
             return
@@ -431,10 +460,8 @@ class EmbeddingLandmarkMap:
         cyaw = conv.normalize_angle(robot_pose.theta + float(camera_yaw))
         out: List[Tuple[EmbeddingLandmark, np.ndarray]] = []
         for lm in self.confirmed():
+            mxyz = self.resolved_map_xyz(lm, pose_of_node)
             ap = pose_of_node.get(lm.anchor_node)
-            if ap is None:
-                continue
-            mxyz = self.map_point_from_rel(ap, lm.rel_xyz)
             dx = float(mxyz[0]) - cx
             dy = float(mxyz[1]) - cy
             dist = math.hypot(dx, dy)
@@ -443,7 +470,9 @@ class EmbeddingLandmarkMap:
             bearing = math.atan2(dy, dx)
             if abs(conv.normalize_angle(bearing - cyaw)) > half:
                 continue
-            # Normal in map frame.
+            # Normal in map frame (needs anchor yaw when available).
+            if ap is None:
+                continue
             c, s = math.cos(ap.theta), math.sin(ap.theta)
             nx = c * float(lm.normal_rel[0]) - s * float(lm.normal_rel[1])
             ny = s * float(lm.normal_rel[0]) + c * float(lm.normal_rel[1])

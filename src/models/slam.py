@@ -2625,6 +2625,9 @@ class SlamService(SLAM):
                     "id": int(lm.landmark_id),
                     "anchor_node": int(lm.anchor_node),
                     "rel_xyz": [float(x) for x in lm.rel_xyz],
+                    "map_xyz": (
+                        [float(x) for x in lm.map_xyz] if lm.map_xyz is not None else None
+                    ),
                     "observations": int(lm.observations),
                     "status": lm.status.value,
                     "std_m": float(lm.position_std_m)

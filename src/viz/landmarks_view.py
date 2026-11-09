@@ -205,10 +205,9 @@ def collect_landmark_map_points(
         if lm.status == LandmarkStatus.CONFIRMED or (
             lm.status == LandmarkStatus.CANDIDATE and include_candidates
         ) or (lm.status == LandmarkStatus.MOVED and include_moved):
-            ap = pose_of_node.get(lm.anchor_node)
-            if ap is None:
+            if lm.map_xyz is None and lm.anchor_node not in pose_of_node:
                 continue
-            mxyz = EmbeddingLandmarkMap.map_point_from_rel(ap, lm.rel_xyz)
+            mxyz = EmbeddingLandmarkMap.resolved_map_xyz(lm, pose_of_node)
             out.append((lm, mxyz))
     # Prefer confirmed first so max_landmarks budget keeps the useful ones.
     order = {
