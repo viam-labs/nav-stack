@@ -74,6 +74,22 @@ def test_backproject_rejects_holes():
     assert obs == []
 
 
+def test_backproject_rejects_window_edge_depth():
+    """Mixed near-frame + far/hole depth must not become a landmark."""
+    frame = _wall_frame(depth_m=1.5)
+    h, w = frame.depth_m.shape
+    # Left: room glass/wall at 1.5 m; right: invalid (outdoor through glass).
+    frame.depth_m[:, w // 2 :] = 0.0
+    tok = PatchToken(
+        row=0,
+        col=0,
+        u=float(w // 2),
+        v=float(h // 2),
+        descriptor=np.ones(4, dtype=np.float32),
+    )
+    assert backproject_patches(frame, [tok], window_half=2, support_half=6) == []
+
+
 def test_sigma_grows_with_range():
     assert depth_sigma_m(4.0) > depth_sigma_m(1.0)
     assert lateral_sigma_m(4.0, fx=300.0) > lateral_sigma_m(1.0, fx=300.0)

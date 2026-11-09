@@ -90,6 +90,13 @@ Promotion defaults (code, not config): ≥3 obs, ≥2 views with ≥0.5 m **or**
 (local RGB contrast) so painting interiors survive; distinctiveness is only a
 soft bonus (hard distinctiveness alone dropped coherent artwork).
 
+**Windows / outdoor through glass:** RGB may latch onto a far building while
+depth returns the glass plane — the box looks right from the first viewpoint
+then slides onto the window frame when you turn. Depth support checks reject
+mixed/holey neighborhoods, and ``vision-camera`` hides unstable single-view
+candidates by default (`stable_candidates_only: true`). Prefer indoor opaque
+surfaces (paintings, posters, furniture) for survey.
+
 Wipe `embedding_landmarks.npz` (or `clear_map`) before re-surveying after
 switching synthetic → DINOv2. Prefer a single camera in `vision_cameras`.
 

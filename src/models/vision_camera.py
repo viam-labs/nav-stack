@@ -47,6 +47,7 @@ class VisionCamera(Camera):
         self._cfg: Optional[VisionCameraConfig] = None
         self._source: Optional[Camera] = None
         self._opts = LandmarkOverlayOptions()
+        self._stable_candidates_only = True
         self._last_error: Optional[str] = None
         self._last_drawn = 0
 
@@ -78,6 +79,7 @@ class VisionCamera(Camera):
             max_landmarks=cfg.max_landmarks,
             box_m=cfg.box_m,
         )
+        self._stable_candidates_only = bool(cfg.stable_candidates_only)
         source = dependencies.get(Camera.get_resource_name(cfg.source))
         if source is None:
             raise RuntimeError(f"vision-camera source {cfg.source!r} missing")
@@ -224,6 +226,7 @@ class VisionCamera(Camera):
             pose_of_node,
             include_candidates=bool(self._opts.show_candidates),
             include_moved=bool(self._opts.show_moved),
+            stable_candidates_only=bool(self._stable_candidates_only),
         )
         png = await asyncio.to_thread(
             render_landmarks_overlay,

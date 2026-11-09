@@ -1786,6 +1786,8 @@ class VisionCameraConfig:
     source: str
     show_confirmed: bool = True
     show_candidates: bool = True
+    # Hide single-view candidates (often glass/through-window wrong depth).
+    stable_candidates_only: bool = True
     show_moved: bool = False
     show_labels: bool = True
     max_landmarks: int = 80
@@ -1804,6 +1806,7 @@ class VisionCameraConfig:
             source=source,
             show_confirmed=bool(d.get("show_confirmed", True)),
             show_candidates=bool(d.get("show_candidates", True)),
+            stable_candidates_only=bool(d.get("stable_candidates_only", True)),
             show_moved=bool(d.get("show_moved", False)),
             show_labels=bool(d.get("show_labels", True)),
             max_landmarks=max(1, int(d.get("max_landmarks", 80))),

@@ -82,6 +82,51 @@ def _median_depth_window(
     return float(np.median(vals)), float(np.std(vals)), n_valid, total
 
 
+def _depth_support_ok(
+    depth_m: np.ndarray,
+    u: float,
+    v: float,
+    *,
+    median_m: float,
+    support_half: int = 6,
+    min_valid_frac: float = 0.75,
+    max_span_frac: float = 0.12,
+    max_span_m: float = 0.35,
+) -> bool:
+    """Reject glass / window-edge / through-window depth.
+
+    RealSense often returns the *glass* range while RGB texture is a far
+    building. That looks correct from the first viewpoint (same ray) and then
+    slides onto the window frame under parallax. Require a solid neighborhood
+    of similar depths so outdoor-through-glass and frame edges drop out.
+    """
+    h, w = depth_m.shape[:2]
+    ui = int(round(u))
+    vi = int(round(v))
+    half = int(support_half)
+    x0 = max(0, ui - half)
+    x1 = min(w, ui + half + 1)
+    y0 = max(0, vi - half)
+    y1 = min(h, vi + half + 1)
+    win = depth_m[y0:y1, x0:x1]
+    total = int(win.size)
+    if total <= 0:
+        return False
+    valid = np.isfinite(win) & (win > 0.0)
+    n_valid = int(valid.sum())
+    if n_valid / float(total) < float(min_valid_frac):
+        return False
+    vals = win[valid].astype(float)
+    span = float(np.percentile(vals, 90) - np.percentile(vals, 10))
+    med = max(1e-3, float(median_m))
+    if span > float(max_span_m) or span > float(max_span_frac) * med:
+        return False
+    # Neighborhood median should agree with the patch median (no mixed planes).
+    if abs(float(np.median(vals)) - med) > max(0.12, 0.05 * med):
+        return False
+    return True
+
+
 def _plane_normal_optical(
     depth_m: np.ndarray,
     intrinsics: CameraIntrinsics,
@@ -128,9 +173,10 @@ def backproject_patches(
     *,
     min_range_m: float = 0.4,
     max_range_m: float = 4.0,
-    min_valid_frac: float = 0.5,
-    max_spread_frac: float = 0.1,
+    min_valid_frac: float = 0.75,
+    max_spread_frac: float = 0.06,
     window_half: int = 2,
+    support_half: int = 6,
     z_min_m: Optional[float] = None,
     z_max_m: Optional[float] = None,
 ) -> List[PatchObservation]:
@@ -156,6 +202,15 @@ def backproject_patches(
         if not math.isfinite(med) or med < float(min_range_m) or med > float(max_range_m):
             continue
         if math.isfinite(spread) and spread > float(max_spread_frac) * med:
+            continue
+        if not _depth_support_ok(
+            depth,
+            tok.u,
+            tok.v,
+            median_m=float(med),
+            support_half=int(support_half),
+            min_valid_frac=float(min_valid_frac),
+        ):
             continue
 
         ox, oy, oz = K.pixel_to_ray(tok.u, tok.v)

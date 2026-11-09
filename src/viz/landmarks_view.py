@@ -188,12 +188,25 @@ def render_landmarks_overlay(
     return _encode_png(out)
 
 
+def _candidate_geometry_trusted(lm: EmbeddingLandmark) -> bool:
+    """Skip single-view / high-std candidates — their depth is often glass."""
+    if lm.observations < 3:
+        return False
+    if len(lm.view_poses_xy) < 2:
+        return False
+    std = float(lm.position_std_m)
+    if not math.isfinite(std) or std > 0.12:
+        return False
+    return True
+
+
 def collect_landmark_map_points(
     store: EmbeddingLandmarkMap,
     pose_of_node: dict,
     *,
     include_candidates: bool = True,
     include_moved: bool = False,
+    stable_candidates_only: bool = True,
 ) -> List[Tuple[EmbeddingLandmark, np.ndarray]]:
     """Resolve landmark map-frame XYZ for overlay (not frustum-culled)."""
     out: List[Tuple[EmbeddingLandmark, np.ndarray]] = []
@@ -202,12 +215,21 @@ def collect_landmark_map_points(
             continue
         if lm.status == LandmarkStatus.MOVED and not include_moved:
             continue
+        if lm.status == LandmarkStatus.CANDIDATE and stable_candidates_only:
+            if not _candidate_geometry_trusted(lm):
+                continue
         if lm.status == LandmarkStatus.CONFIRMED or (
             lm.status == LandmarkStatus.CANDIDATE and include_candidates
         ) or (lm.status == LandmarkStatus.MOVED and include_moved):
             if lm.map_xyz is None and lm.anchor_node not in pose_of_node:
                 continue
-            mxyz = EmbeddingLandmarkMap.resolved_map_xyz(lm, pose_of_node)
+            # Prefer running mean for stable candidates (better than first hit).
+            assoc = EmbeddingLandmarkMap.association_map_xyz(lm)
+            mxyz = (
+                assoc
+                if assoc is not None
+                else EmbeddingLandmarkMap.resolved_map_xyz(lm, pose_of_node)
+            )
             out.append((lm, mxyz))
     # Prefer confirmed first so max_landmarks budget keeps the useful ones.
     order = {

@@ -163,6 +163,8 @@ def test_collect_prefers_confirmed():
             map_xyz=np.array([float(i), 0.0, 1.0]),
             descriptors=[],
             observations=3,
+            view_poses_xy=[(0.0, 0.0, 0.0), (0.6, 0.0, 0.0)],
+            position_std_m=0.04,
             status=status,
         )
         store._landmarks[lm.landmark_id] = lm  # noqa: SLF001
@@ -170,3 +172,25 @@ def test_collect_prefers_confirmed():
         store, {0: pose}, include_candidates=True, include_moved=True
     )
     assert pts[0][0].status == LandmarkStatus.CONFIRMED
+
+
+def test_collect_hides_single_view_candidates():
+    store = EmbeddingLandmarkMap()
+    pose = Pose2D(0.0, 0.0, 0.0)
+    unstable = EmbeddingLandmark(
+        landmark_id=1,
+        anchor_node=0,
+        rel_xyz=np.array([2.0, 0.0, 1.0]),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptors=[],
+        observations=1,
+        view_poses_xy=[(0.0, 0.0, 0.0)],
+        position_std_m=float("inf"),
+        status=LandmarkStatus.CANDIDATE,
+    )
+    store._landmarks[1] = unstable  # noqa: SLF001
+    pts = collect_landmark_map_points(
+        store, {0: pose}, include_candidates=True, stable_candidates_only=True
+    )
+    assert pts == []
