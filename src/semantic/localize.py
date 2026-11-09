@@ -66,15 +66,21 @@ def match_live_to_landmarks(
             dtype=float,
         )
         best_i = -1
-        best_cos = float(cosine_threshold)
+        best_cos = -1.0
         best_map: Optional[np.ndarray] = None
+        hard = float(cosine_threshold)
+        soft = min(hard, 0.35)
+        soft_dist = 0.7 * float(max_reproj_m)
         for i, (lm, mxyz) in enumerate(visible):
             if lm.landmark_id in used_lm:
                 continue
             dist = math.hypot(float(mxyz[0]) - pred_map[0], float(mxyz[1]) - pred_map[1])
             if dist > float(max_reproj_m):
                 continue
+            need = soft if dist <= soft_dist else hard
             cos = _best_desc_cosine(lm, desc)
+            if cos < need:
+                continue
             if cos > best_cos:
                 best_cos = cos
                 best_i = i

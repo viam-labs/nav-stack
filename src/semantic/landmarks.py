@@ -49,13 +49,17 @@ class EmbeddingLandmarkMap:
     promote_max_std_m: float = 0.12
     demote_offset_m: float = 0.15
     demote_passes: int = 3
-    max_descriptors: int = 3
+    # Bank several viewpoint descriptors so drive-by re-ID can match a new angle.
+    max_descriptors: int = 6
     cell_m: float = 0.30
     cosine_threshold: float = 0.55
     # Softer gate for candidates: DINOv2 patch tokens drift under approach/zoom,
     # but orthogonal / wrong-surface patches must not steal the same ID
     # (landmark-camera would then jump between objects).
     candidate_cosine_threshold: float = 0.35
+    # Within this fraction of associate_radius, confirmed landmarks may re-match
+    # at the candidate cosine (bank a new view instead of minting a duplicate).
+    confirmed_soft_match_frac: float = 0.7
     # When False (synthetic RGB stats), associate by distance only so nearby
     # patches collapse instead of spawning one landmark per grid cell.
     require_descriptor_match: bool = True
@@ -68,6 +72,9 @@ class EmbeddingLandmarkMap:
         self._landmarks: Dict[int, EmbeddingLandmark] = {}
         self._cell_index: Dict[Tuple[int, int, int], List[int]] = {}
         self._demote_strikes: Dict[int, int] = {}
+        self._assoc_hits = 0
+        self._assoc_misses = 0
+        self._assoc_soft_hits = 0
 
     def rebuild_cell_index(self) -> None:
         """Re-hash landmarks after ``cell_m`` changes (load / config apply)."""
@@ -189,10 +196,15 @@ class EmbeddingLandmarkMap:
             return float(view_xy[0]), float(view_xy[1]), float(view_xy[2])
         return float(view_xy[0]), float(view_xy[1]), 0.0
 
-    def _desc_threshold(self, lm: EmbeddingLandmark) -> float:
-        if lm.status == LandmarkStatus.CONFIRMED:
-            return float(self.cosine_threshold)
-        return float(self.candidate_cosine_threshold)
+    def _desc_threshold(self, lm: EmbeddingLandmark, dist: float) -> float:
+        if lm.status != LandmarkStatus.CONFIRMED:
+            return float(self.candidate_cosine_threshold)
+        soft_r = float(self.confirmed_soft_match_frac) * float(self.associate_radius_m)
+        if dist <= soft_r:
+            # Geometrically the same spot — allow viewpoint drift so we bank
+            # another descriptor instead of creating a parallel candidate.
+            return float(self.candidate_cosine_threshold)
+        return float(self.cosine_threshold)
 
     def _match_ok(
         self,
@@ -205,7 +217,9 @@ class EmbeddingLandmarkMap:
             return False
         if not self.require_descriptor_match:
             return True
-        return self._best_desc_cosine(lm, descriptor) >= self._desc_threshold(lm)
+        return self._best_desc_cosine(lm, descriptor) >= self._desc_threshold(
+            lm, dist
+        )
 
     def _pick_best_neighbor(
         self,
@@ -244,6 +258,29 @@ class EmbeddingLandmarkMap:
                 best = lm
         return best
 
+    def _note_association(
+        self,
+        lm: Optional[EmbeddingLandmark],
+        *,
+        map_xyz: np.ndarray,
+        descriptor: np.ndarray,
+    ) -> None:
+        if lm is None:
+            self._assoc_misses += 1
+            return
+        self._assoc_hits += 1
+        if lm.status != LandmarkStatus.CONFIRMED:
+            return
+        soft_r = float(self.confirmed_soft_match_frac) * float(self.associate_radius_m)
+        lm_map = self.association_map_xyz(lm)
+        if lm_map is None:
+            return
+        dist = float(np.linalg.norm(lm_map - map_xyz))
+        if dist <= soft_r and self._best_desc_cosine(lm, descriptor) < float(
+            self.cosine_threshold
+        ):
+            self._assoc_soft_hits += 1
+
     def observe(
         self,
         *,
@@ -271,6 +308,7 @@ class EmbeddingLandmarkMap:
             same_anchor=int(anchor_node),
             fallback_pose=anchor_pose,
         )
+        self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
 
         if best is None:
             lid = self._next_id
@@ -332,8 +370,8 @@ class EmbeddingLandmarkMap:
             pose_of=pose_of_node,
             fallback_pose=anchor_pose,
         )
-
         if best is None:
+            # Fall through to observe() which notes its own association attempt.
             return self.observe(
                 map_xyz=map_xyz,
                 descriptor=descriptor,
@@ -342,6 +380,7 @@ class EmbeddingLandmarkMap:
                 anchor_pose=anchor_pose,
                 view_xy=view,
             )
+        self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
         # Demotion needs the landmark's own anchor pose when available.
         update_pose = pose_of_node.get(best.anchor_node, anchor_pose)
         return self._update_existing(best, map_xyz, descriptor, view, update_pose)
@@ -373,12 +412,7 @@ class EmbeddingLandmarkMap:
             )
             lm.rel_xyz = self.rel_from_map_point(anchor_pose, locked)
 
-        if len(lm.descriptors) < int(self.max_descriptors):
-            if all(self._cosine(d, descriptor) < 0.95 for d in lm.descriptors):
-                lm.descriptors.append(descriptor.copy())
-        elif self._best_desc_cosine(lm, descriptor) < float(self.cosine_threshold) + 0.1:
-            # Replace weakest (lowest mean self-sim) — keep simple: replace last.
-            lm.descriptors[-1] = descriptor.copy()
+        self._bank_descriptor(lm, descriptor)
 
         self._maybe_record_view(lm, view_xy)
 
@@ -387,6 +421,24 @@ class EmbeddingLandmarkMap:
         elif lm.status == LandmarkStatus.CONFIRMED:
             self._check_moved(lm, map_xyz, pose_hint=anchor_pose)
         return lm
+
+    def _bank_descriptor(self, lm: EmbeddingLandmark, descriptor: np.ndarray) -> None:
+        """Keep a diverse multi-view descriptor set for drive-by re-ID."""
+        if not lm.descriptors:
+            lm.descriptors.append(descriptor.copy())
+            return
+        # Near-duplicate of an existing view — nothing to learn.
+        if self._best_desc_cosine(lm, descriptor) >= 0.95:
+            return
+        if len(lm.descriptors) < int(self.max_descriptors):
+            lm.descriptors.append(descriptor.copy())
+            return
+        # Full: replace the stored view least similar to the new one.
+        worst_i = min(
+            range(len(lm.descriptors)),
+            key=lambda i: self._cosine(lm.descriptors[i], descriptor),
+        )
+        lm.descriptors[worst_i] = descriptor.copy()
 
     def _maybe_record_view(
         self, lm: EmbeddingLandmark, view: Tuple[float, float, float]
@@ -509,6 +561,19 @@ class EmbeddingLandmarkMap:
 
     def status_dict(self) -> dict:
         counts = {s.value: 0 for s in LandmarkStatus}
+        n_desc = 0
         for lm in self._landmarks.values():
             counts[lm.status.value] += 1
-        return {"total": len(self._landmarks), **counts}
+            n_desc += len(lm.descriptors)
+        hits = int(self._assoc_hits)
+        misses = int(self._assoc_misses)
+        attempts = hits + misses
+        return {
+            "total": len(self._landmarks),
+            **counts,
+            "assoc_hits": hits,
+            "assoc_misses": misses,
+            "assoc_soft_hits": int(self._assoc_soft_hits),
+            "assoc_hit_rate": (hits / attempts) if attempts else None,
+            "mean_descriptors": (n_desc / max(1, len(self._landmarks))),
+        }

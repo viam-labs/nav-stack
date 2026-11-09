@@ -187,6 +187,47 @@ def test_promote_on_spin_in_place_yaw_gap():
     assert lm.status == LandmarkStatus.CONFIRMED
 
 
+def test_confirmed_soft_match_banks_new_viewpoint_descriptor():
+    """Drive-by: confirmed should re-associate under angle change when close."""
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        require_descriptor_match=True,
+        cosine_threshold=0.55,
+        candidate_cosine_threshold=0.35,
+        confirmed_soft_match_frac=0.7,
+        max_descriptors=6,
+        promote_min_obs=99,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    d0 = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    # Cosine ≈ 0.45 — below confirmed gate, above soft gate.
+    d1 = l2_normalize(np.array([0.45, 0.893, 0.0, 0.0], dtype=np.float32))
+    assert 0.35 <= float(np.dot(d0, d1)) < 0.55
+    lm = store.observe(
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptor=d0,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+    )
+    lm.status = LandmarkStatus.CONFIRMED
+    lm.map_xyz = np.array([2.0, 0.0, 1.0])
+    lm2 = store.observe(
+        map_xyz=np.array([2.05, 0.02, 1.0]),
+        descriptor=d1,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.4, 0.0, 0.3),
+    )
+    assert lm2.landmark_id == lm.landmark_id
+    assert len(store) == 1
+    assert len(lm.descriptors) == 2
+    assert store.status_dict()["assoc_soft_hits"] >= 1
+
+
 def test_candidate_rejects_orthogonal_nearby_descriptor():
     """Wrong surface nearby must not steal the same candidate ID (overlay jump)."""
     store = EmbeddingLandmarkMap(
