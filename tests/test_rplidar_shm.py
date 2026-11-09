@@ -142,7 +142,24 @@ def test_serial_handshake_resyncs_after_junk_prefix():
     assert len(meas) == 36
 
 
-def test_open_first_working_tries_ports():
+def test_open_first_working_tries_ports(monkeypatch):
+    import src.lidar.rplidar_serial as rs
+
+    # Production read deadlines floor at 1s; advance a fake clock on empty
+    # reads so the silent port fails immediately instead of burning ~20s.
+    clock = {"t": 1000.0}
+
+    class _FakeTime:
+        @staticmethod
+        def monotonic() -> float:
+            return clock["t"]
+
+        @staticmethod
+        def sleep(dt: float) -> None:
+            clock["t"] += max(0.0, float(dt))
+
+    monkeypatch.setattr(rs, "time", _FakeTime)
+
     class SilentSerial:
         dtr = True
 
@@ -150,6 +167,7 @@ def test_open_first_working_tries_ports():
             return len(data)
 
         def read(self, n: int) -> bytes:
+            clock["t"] += 0.2
             return b""
 
         def close(self) -> None:
@@ -163,28 +181,28 @@ def test_open_first_working_tries_ports():
     def factory(port, **kwargs):
         return mocks[port]
 
-    import src.lidar.rplidar_serial as rs
-
-    old = rs._pyserial
-    rs._pyserial = type(
-        "M",
-        (),
-        {
-            "Serial": staticmethod(factory),
-            "PARITY_NONE": 0,
-            "STOPBITS_ONE": 1,
-        },
+    monkeypatch.setattr(
+        rs,
+        "_pyserial",
+        type(
+            "M",
+            (),
+            {
+                "Serial": staticmethod(factory),
+                "PARITY_NONE": 0,
+                "STOPBITS_ONE": 1,
+            },
+        ),
     )
-    try:
-        lidar = RPLidarSerial.open_first_working(
-            ["/dev/ttyUSB0", "/dev/ttyUSB1"],
-            motor_warmup_s=0.0,
-            reset_settle_s=0.0,
-        )
-        assert lidar.port == "/dev/ttyUSB1"
-        lidar.close()
-    finally:
-        rs._pyserial = old
+    lidar = RPLidarSerial.open_first_working(
+        ["/dev/ttyUSB0", "/dev/ttyUSB1"],
+        timeout_s=0.05,
+        motor_warmup_s=0.0,
+        reset_settle_s=0.0,
+        rounds=1,
+    )
+    assert lidar.port == "/dev/ttyUSB1"
+    lidar.close()
 
 
 def test_scan_loop_reconnects_after_uart_exit():
