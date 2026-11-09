@@ -64,6 +64,10 @@ def test_vision_density_defaults():
     assert cfg.vision_detector_classes == []
     assert "painting" in cfg.vision_landmark_labels
     assert "tv" in cfg.vision_landmark_labels
+    assert "desk" in cfg.vision_landmark_labels
+    assert "printer" in cfg.vision_landmark_labels
+    for movable in ("book", "chair", "laptop", "bottle", "backpack"):
+        assert movable not in cfg.vision_landmark_labels
 
 
 def test_vision_detector_classes_from_config():

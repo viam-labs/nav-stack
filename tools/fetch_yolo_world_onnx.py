@@ -24,7 +24,7 @@ DEFAULT_NAME = "yolov8s-worldv2-indoor.onnx"
 # Attached to the GitHub prerelease that first shipped this asset.
 DEFAULT_URL = os.environ.get(
     "NAV_STACK_YOLO_WORLD_URL",
-    "https://github.com/viam-labs/nav-stack/releases/download/v1.2.0-rc19/"
+    "https://github.com/viam-labs/nav-stack/releases/download/v1.2.0-rc29/"
     + DEFAULT_NAME,
 )
 
