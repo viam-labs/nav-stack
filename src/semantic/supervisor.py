@@ -612,6 +612,9 @@ class VisionSupervisor:
                     extent_m=getattr(o, "extent_m", None),
                 )
                 n_new += 1
+            # Collapse detector twins that both made it to confirmed/candidate
+            # on the same object (e.g. DC1 + DC12 stacked on one painting).
+            self._landmarks.merge_overlapping_detector_landmarks()
             self._observations += n_new
 
         if self._writeback_enabled():

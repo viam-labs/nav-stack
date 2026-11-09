@@ -7,7 +7,7 @@ import pytest
 
 from src.geom.conversions import Pose2D
 from src.semantic.fit import fit_rigid_2d
-from src.semantic.landmarks import EmbeddingLandmarkMap
+from src.semantic.landmarks import EmbeddingLandmark, EmbeddingLandmarkMap
 from src.semantic.place import PlaceIndex, fit_pca, fit_vocabulary, l2_normalize
 from src.semantic.types import LandmarkStatus
 
@@ -345,6 +345,57 @@ def test_near_but_non_overlapping_footprints_still_mint():
     )
     assert lm2.landmark_id != lm.landmark_id
     assert len(store) == 2
+
+
+def test_merge_overlapping_confirmed_detector_twins():
+    """DC1 + DC12 stacked on one object should collapse to a single ID."""
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        require_descriptor_match=True,
+        promote_min_obs=99,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    d0 = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    d1 = l2_normalize(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32))
+    a = store.observe(
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptor=d0,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+        from_detector=True,
+        extent_m=0.30,
+    )
+    # Force a parallel twin (bypass observe absorb) to simulate two promotions.
+    b = EmbeddingLandmark(
+        landmark_id=store._next_id,  # noqa: SLF001
+        anchor_node=0,
+        rel_xyz=np.array([2.05, 0.02, 1.0]),
+        normal_rel=normal.copy(),
+        map_xyz=np.array([2.05, 0.02, 1.0]),
+        descriptors=[d1.copy()],
+        observations=5,
+        view_poses_xy=[(0.0, 0.0, 0.0), (0.4, 0.0, 0.3)],
+        status=LandmarkStatus.CONFIRMED,
+        from_detector=True,
+        extent_m=0.28,
+    )
+    store._next_id += 1  # noqa: SLF001
+    store._landmarks[b.landmark_id] = b  # noqa: SLF001
+    store._index_add(b, b.map_xyz)  # noqa: SLF001
+    a.status = LandmarkStatus.CONFIRMED
+    a.map_xyz = np.array([2.0, 0.0, 1.0])
+    a.observations = 8
+    assert len(store) == 2
+    n = store.merge_overlapping_detector_landmarks()
+    assert n >= 1
+    assert len(store) == 1
+    kept = next(iter(store.all_landmarks()))
+    assert kept.landmark_id == a.landmark_id  # more obs wins
+    assert len(kept.descriptors) >= 2
+    assert store.status_dict()["overlap_merges"] >= 1
 
 
 def test_detector_revive_moved_instead_of_minting():

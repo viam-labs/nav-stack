@@ -83,6 +83,7 @@ class EmbeddingLandmarkMap:
         self._assoc_misses = 0
         self._assoc_soft_hits = 0
         self._assoc_overlap_absorbs = 0
+        self._overlap_merges = 0
 
     def rebuild_cell_index(self) -> None:
         """Re-hash landmarks after ``cell_m`` changes (load / config apply)."""
@@ -336,38 +337,101 @@ class EmbeddingLandmarkMap:
         ):
             self._assoc_soft_hits += 1
 
-    @staticmethod
+    def _extent_or_fallback(self, extent_m: Optional[float]) -> float:
+        if extent_m is not None and float(extent_m) >= 0.05:
+            return float(extent_m)
+        return float(self.confirmed_overlap_m)
+
     def _footprints_overlap(
+        self,
         dist_xy: float,
         extent_a: Optional[float],
         extent_b: Optional[float],
     ) -> bool:
         """True when each center lies inside the other's footprint (strong overlap)."""
-        if extent_a is None or extent_b is None:
-            return False
-        ra = float(extent_a)
-        rb = float(extent_b)
-        if ra < 0.05 or rb < 0.05:
-            return False
+        ra = self._extent_or_fallback(extent_a)
+        rb = self._extent_or_fallback(extent_b)
         d = float(dist_xy)
         return d <= ra and d <= rb
 
-    def _nearest_overlapping_confirmed(
+    def _map_xy(self, lm: EmbeddingLandmark) -> Optional[np.ndarray]:
+        m = self.association_map_xyz(lm)
+        if m is None:
+            return None
+        return np.asarray(m, dtype=float).reshape(3)
+
+    def _xy_dist(self, a: np.ndarray, b: np.ndarray) -> float:
+        return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+    def _prefer_keeper(
+        self, a: EmbeddingLandmark, b: EmbeddingLandmark
+    ) -> Tuple[EmbeddingLandmark, EmbeddingLandmark]:
+        """Return (keeper, donor). Prefer confirmed, then more obs, then lower id."""
+        def key(lm: EmbeddingLandmark) -> Tuple[int, int, int]:
+            conf = 1 if lm.status == LandmarkStatus.CONFIRMED else 0
+            return (conf, int(lm.observations), -int(lm.landmark_id))
+
+        if key(a) >= key(b):
+            return a, b
+        return b, a
+
+    def _remove_landmark(self, lid: int) -> None:
+        lm = self._landmarks.pop(int(lid), None)
+        if lm is None:
+            return
+        for cell, ids in list(self._cell_index.items()):
+            if int(lid) in ids:
+                ids[:] = [i for i in ids if i != int(lid)]
+                if not ids:
+                    del self._cell_index[cell]
+        self._demote_strikes.pop(int(lid), None)
+
+    def _merge_donor_into_keeper(
+        self, keeper: EmbeddingLandmark, donor: EmbeddingLandmark
+    ) -> EmbeddingLandmark:
+        """Fold ``donor`` into ``keeper`` and drop ``donor`` from the map."""
+        if keeper.landmark_id == donor.landmark_id:
+            return keeper
+        for d in list(donor.descriptors):
+            self._bank_descriptor(keeper, d)
+        for view in list(donor.view_poses_xy):
+            self._maybe_record_view(keeper, self._normalize_view(view))
+        keeper.observations += max(0, int(donor.observations))
+        if donor.extent_m is not None and float(donor.extent_m) > 0:
+            prev = float(keeper.extent_m) if keeper.extent_m is not None else 0.0
+            keeper.extent_m = max(prev, float(donor.extent_m))
+        if donor.from_detector:
+            keeper.from_detector = True
+        if keeper.status == LandmarkStatus.CANDIDATE and donor.status == LandmarkStatus.CONFIRMED:
+            keeper.status = LandmarkStatus.CONFIRMED
+            if keeper.map_xyz is not None:
+                self._reindex(keeper, np.asarray(keeper.map_xyz, dtype=float).reshape(3))
+        self._remove_landmark(int(donor.landmark_id))
+        self._overlap_merges += 1
+        self._assoc_overlap_absorbs += 1
+        return keeper
+
+    def _nearest_overlapping_landmark(
         self,
         map_xyz: np.ndarray,
         *,
         new_extent_m: Optional[float],
         pose_of: Dict[int, conv.Pose2D],
         fallback_pose: Optional[conv.Pose2D],
+        exclude_id: Optional[int] = None,
+        detector_only: bool = True,
     ) -> Optional[EmbeddingLandmark]:
-        """Confirmed landmark whose footprint substantially overlaps this observation."""
-        search_r = float(self.confirmed_overlap_m)
-        if new_extent_m is not None:
-            search_r = max(search_r, float(new_extent_m) * 2.0)
+        """Existing landmark whose footprint substantially overlaps this observation."""
+        search_r = self._extent_or_fallback(new_extent_m) * 2.0
+        search_r = max(search_r, float(self.confirmed_overlap_m) * 2.0)
         best: Optional[EmbeddingLandmark] = None
-        best_dist = float("inf")
+        best_key: Tuple[int, int, int, float] = (-1, -1, 0, float("inf"))
         for lm in self._neighbors(map_xyz, radius_m=search_r, include_moved=False):
-            if lm.status != LandmarkStatus.CONFIRMED:
+            if exclude_id is not None and int(lm.landmark_id) == int(exclude_id):
+                continue
+            if lm.status == LandmarkStatus.MOVED:
+                continue
+            if detector_only and not bool(lm.from_detector):
                 continue
             lm_map = self.association_map_xyz(lm)
             if lm_map is None:
@@ -375,22 +439,57 @@ class EmbeddingLandmarkMap:
                 if ap is None:
                     continue
                 lm_map = self.map_point_from_rel(ap, lm.rel_xyz)
-            # XY footprint only — height mismatches shouldn't block absorb.
-            dist = math.hypot(
-                float(lm_map[0]) - float(map_xyz[0]),
-                float(lm_map[1]) - float(map_xyz[1]),
-            )
-            if not self._footprints_overlap(dist, lm.extent_m, new_extent_m):
-                # Legacy: no measured size yet — allow a tight nearness fallback.
-                if lm.extent_m is None and new_extent_m is None:
-                    if dist > float(self.confirmed_overlap_m):
-                        continue
-                else:
-                    continue
-            if dist < best_dist:
-                best_dist = dist
+            dist = self._xy_dist(lm_map, map_xyz)
+            # Near-identical centers always count as overlap for detector twins.
+            near_same = dist <= 0.12
+            if not near_same and not self._footprints_overlap(
+                dist, lm.extent_m, new_extent_m
+            ):
+                continue
+            conf = 1 if lm.status == LandmarkStatus.CONFIRMED else 0
+            key = (conf, int(lm.observations), -int(lm.landmark_id), -dist)
+            if best is None or key > best_key:
                 best = lm
+                best_key = key
         return best
+
+    def merge_overlapping_detector_landmarks(self) -> int:
+        """Collapse detector landmarks whose footprints heavily overlap.
+
+        Fixes twins that both promoted (e.g. DC1 + DC12 on one painting) —
+        absorb-at-mint only prevents new mints against an already-confirmed ID.
+        """
+        merged = 0
+        # Repeat until stable — a merge can expose a new pair.
+        for _ in range(8):
+            lms = [
+                lm
+                for lm in self._landmarks.values()
+                if lm.status != LandmarkStatus.MOVED and bool(lm.from_detector)
+            ]
+            pair: Optional[Tuple[EmbeddingLandmark, EmbeddingLandmark]] = None
+            for i, a in enumerate(lms):
+                a_map = self._map_xy(a)
+                if a_map is None:
+                    continue
+                for b in lms[i + 1 :]:
+                    b_map = self._map_xy(b)
+                    if b_map is None:
+                        continue
+                    dist = self._xy_dist(a_map, b_map)
+                    if dist <= 0.12 or self._footprints_overlap(
+                        dist, a.extent_m, b.extent_m
+                    ):
+                        pair = (a, b)
+                        break
+                if pair is not None:
+                    break
+            if pair is None:
+                break
+            keeper, donor = self._prefer_keeper(pair[0], pair[1])
+            self._merge_donor_into_keeper(keeper, donor)
+            merged += 1
+        return merged
 
     def observe(
         self,
@@ -431,15 +530,18 @@ class EmbeddingLandmarkMap:
         self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
 
         if best is None:
-            # Descriptor gates missed, but a confirmed landmark's footprint
-            # overlaps this observation — absorb rather than mint a yellow twin.
-            overlap = self._nearest_overlapping_confirmed(
+            # Descriptor gates missed, but another detector landmark's footprint
+            # overlaps this observation — absorb rather than mint a twin ID.
+            overlap = self._nearest_overlapping_landmark(
                 map_xyz,
                 new_extent_m=extent,
                 pose_of={int(anchor_node): anchor_pose},
                 fallback_pose=anchor_pose,
+                detector_only=bool(from_detector),
             )
-            if overlap is not None:
+            if overlap is not None and (
+                from_detector or overlap.status == LandmarkStatus.CONFIRMED
+            ):
                 self._assoc_misses = max(0, self._assoc_misses - 1)
                 self._assoc_hits += 1
                 self._assoc_overlap_absorbs += 1
@@ -670,6 +772,20 @@ class EmbeddingLandmarkMap:
             return
         if lm.position_std_m > max_std:
             return
+        # About to confirm — if we already have a confirmed twin on this object,
+        # fold into it instead of creating DC1+DC12 on the same painting.
+        if bool(lm.from_detector) and lm.map_xyz is not None:
+            twin = self._nearest_overlapping_landmark(
+                np.asarray(lm.map_xyz, dtype=float).reshape(3),
+                new_extent_m=lm.extent_m,
+                pose_of={},
+                fallback_pose=None,
+                exclude_id=int(lm.landmark_id),
+                detector_only=True,
+            )
+            if twin is not None and twin.status == LandmarkStatus.CONFIRMED:
+                self._merge_donor_into_keeper(twin, lm)
+                return
         lm.status = LandmarkStatus.CONFIRMED
         if lm._map_samples:
             new_xyz = np.stack(lm._map_samples, axis=0).mean(axis=0).copy()
@@ -782,6 +898,7 @@ class EmbeddingLandmarkMap:
             "assoc_misses": misses,
             "assoc_soft_hits": int(self._assoc_soft_hits),
             "assoc_overlap_absorbs": int(self._assoc_overlap_absorbs),
+            "overlap_merges": int(self._overlap_merges),
             "assoc_hit_rate": (hits / attempts) if attempts else None,
             "mean_descriptors": (n_desc / max(1, len(self._landmarks))),
         }
