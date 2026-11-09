@@ -609,6 +609,7 @@ class VisionSupervisor:
                     pose_of_node=pose_of_node,
                     view_xy=view_xy,
                     from_detector=i < n_det,
+                    extent_m=getattr(o, "extent_m", None),
                 )
                 n_new += 1
             self._observations += n_new

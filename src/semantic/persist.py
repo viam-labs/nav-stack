@@ -42,6 +42,7 @@ def save_landmarks(map_dir: Path, store: EmbeddingLandmarkMap) -> Optional[Path]
     status = np.zeros(n, dtype=np.int8)
     n_desc = np.zeros(n, dtype=np.int8)
     from_detector = np.zeros(n, dtype=np.int8)
+    extent_m = np.full(n, -1.0, dtype=np.float32)
     descs = np.zeros((n, max_desc, dim), dtype=np.float16) if dim else np.zeros((n, 0, 0))
 
     status_code = {
@@ -63,6 +64,8 @@ def save_landmarks(map_dir: Path, store: EmbeddingLandmarkMap) -> Optional[Path]
         status[i] = status_code.get(lm.status, 0)
         n_desc[i] = len(lm.descriptors)
         from_detector[i] = 1 if bool(lm.from_detector) else 0
+        if lm.extent_m is not None and float(lm.extent_m) > 0:
+            extent_m[i] = float(lm.extent_m)
         for j, d in enumerate(lm.descriptors[:max_desc]):
             descs[i, j] = d.astype(np.float16)
 
@@ -80,6 +83,7 @@ def save_landmarks(map_dir: Path, store: EmbeddingLandmarkMap) -> Optional[Path]
         status=status,
         n_desc=n_desc,
         from_detector=from_detector,
+        extent_m=extent_m,
         descriptors=descs,
         next_id=np.int32(store._next_id),  # noqa: SLF001
         cosine_threshold=np.float32(store.cosine_threshold),
@@ -128,6 +132,11 @@ def load_landmarks(map_dir: Path) -> Optional[EmbeddingLandmarkMap]:
         fd = False
         if "from_detector" in data:
             fd = bool(int(data["from_detector"][i]))
+        ext = None
+        if "extent_m" in data:
+            ev = float(data["extent_m"][i])
+            if ev > 0:
+                ext = ev
         lm = EmbeddingLandmark(
             landmark_id=int(ids[i]),
             anchor_node=int(anchors[i]),
@@ -139,6 +148,7 @@ def load_landmarks(map_dir: Path) -> Optional[EmbeddingLandmarkMap]:
             position_std_m=std if std >= 0.0 else float("inf"),
             status=code_status.get(int(status[i]), LandmarkStatus.CANDIDATE),
             from_detector=fd,
+            extent_m=ext,
         )
         store._landmarks[lm.landmark_id] = lm  # noqa: SLF001
         store._index_add(lm, lm.map_xyz)  # noqa: SLF001

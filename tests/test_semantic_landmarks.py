@@ -265,20 +265,19 @@ def test_detector_reassociates_across_angle_and_depth_jitter():
     assert lm.from_detector is True
 
 
-def test_confirmed_overlap_absorbs_instead_of_parallel_candidate():
-    """Re-ID + weak second box must not mint a yellow neighbor on the same spot."""
+def test_confirmed_footprint_overlap_absorbs_instead_of_parallel_candidate():
+    """Weak second box whose footprint overlaps confirmed must not mint a twin."""
     store = EmbeddingLandmarkMap(
         associate_radius_m=0.25,
         require_descriptor_match=True,
         candidate_cosine_threshold=0.35,
         cosine_threshold=0.55,
-        confirmed_overlap_m=0.40,
         promote_min_obs=99,
     )
     anchor = Pose2D(0.0, 0.0, 0.0)
     normal = np.array([-1.0, 0.0, 0.0], dtype=float)
     d0 = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
-    # Nearly orthogonal — fails every cosine gate, but spatially on top of confirmed.
+    # Nearly orthogonal — fails every cosine gate.
     d1 = l2_normalize(np.array([0.05, 0.9987, 0.0, 0.0], dtype=np.float32))
     assert float(np.dot(d0, d1)) < 0.20
     lm = store.observe(
@@ -289,10 +288,12 @@ def test_confirmed_overlap_absorbs_instead_of_parallel_candidate():
         anchor_pose=anchor,
         view_xy=(0.0, 0.0, 0.0),
         from_detector=True,
+        extent_m=0.30,
     )
     lm.status = LandmarkStatus.CONFIRMED
     lm.map_xyz = np.array([2.0, 0.0, 1.0])
     before_desc = len(lm.descriptors)
+    # 18 cm offset: each center lies inside the other's 30 cm footprint.
     lm2 = store.observe(
         map_xyz=np.array([2.18, 0.05, 1.02]),
         descriptor=d1,
@@ -301,6 +302,7 @@ def test_confirmed_overlap_absorbs_instead_of_parallel_candidate():
         anchor_pose=anchor,
         view_xy=(0.3, 0.0, 0.2),
         from_detector=True,
+        extent_m=0.28,
     )
     assert lm2.landmark_id == lm.landmark_id
     assert len(store) == 1
@@ -308,11 +310,11 @@ def test_confirmed_overlap_absorbs_instead_of_parallel_candidate():
     assert store.status_dict()["assoc_overlap_absorbs"] >= 1
 
 
-def test_confirmed_overlap_still_mints_when_far():
+def test_near_but_non_overlapping_footprints_still_mint():
+    """Centers 35 cm apart with 15 cm footprints: near, but not overlapping."""
     store = EmbeddingLandmarkMap(
         associate_radius_m=0.25,
         require_descriptor_match=True,
-        confirmed_overlap_m=0.40,
         promote_min_obs=99,
     )
     anchor = Pose2D(0.0, 0.0, 0.0)
@@ -327,17 +329,19 @@ def test_confirmed_overlap_still_mints_when_far():
         anchor_pose=anchor,
         view_xy=(0.0, 0.0, 0.0),
         from_detector=True,
+        extent_m=0.15,
     )
     lm.status = LandmarkStatus.CONFIRMED
     lm.map_xyz = np.array([2.0, 0.0, 1.0])
     lm2 = store.observe(
-        map_xyz=np.array([3.2, 0.0, 1.0]),  # well outside overlap
+        map_xyz=np.array([2.35, 0.0, 1.0]),
         descriptor=d1,
         normal_map=normal,
         anchor_node=0,
         anchor_pose=anchor,
         view_xy=(0.0, 0.0, 0.0),
         from_detector=True,
+        extent_m=0.15,
     )
     assert lm2.landmark_id != lm.landmark_id
     assert len(store) == 2

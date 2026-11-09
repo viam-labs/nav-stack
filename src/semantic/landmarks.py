@@ -33,6 +33,8 @@ class EmbeddingLandmark:
     # True once any observation came from a YOLO-box pooled DINO (not dense).
     # Overlay shows these even before multi-view "stable" geometry trust.
     from_detector: bool = False
+    # Approx half-size (m) of the object footprint in XY (from YOLO box + depth).
+    extent_m: Optional[float] = None
     # Running mean in map frame while candidate (for std); cleared on confirm.
     _map_samples: List[np.ndarray] = field(default_factory=list, repr=False)
 
@@ -63,10 +65,8 @@ class EmbeddingLandmarkMap:
     # Within this fraction of associate_radius, confirmed landmarks may re-match
     # at the candidate cosine (bank a new view instead of minting a duplicate).
     confirmed_soft_match_frac: float = 0.7
-    # Never mint a parallel candidate this close to a confirmed landmark —
-    # absorb into it instead (YOLO box jitter / weak cosine often re-IDs and
-    # still tries to spawn a yellow neighbor).
-    confirmed_overlap_m: float = 0.40
+    # Fallback search radius when a landmark has no measured footprint yet.
+    confirmed_overlap_m: float = 0.25
     # When False (synthetic RGB stats), associate by distance only so nearby
     # patches collapse instead of spawning one landmark per grid cell.
     require_descriptor_match: bool = True
@@ -336,25 +336,37 @@ class EmbeddingLandmarkMap:
         ):
             self._assoc_soft_hits += 1
 
-    def _overlap_radius(self, *, from_detector: bool) -> float:
-        r = float(self.confirmed_overlap_m)
-        if from_detector:
-            # Match the widened detector association gate.
-            r = max(r, 0.55)
-        return r
+    @staticmethod
+    def _footprints_overlap(
+        dist_xy: float,
+        extent_a: Optional[float],
+        extent_b: Optional[float],
+    ) -> bool:
+        """True when each center lies inside the other's footprint (strong overlap)."""
+        if extent_a is None or extent_b is None:
+            return False
+        ra = float(extent_a)
+        rb = float(extent_b)
+        if ra < 0.05 or rb < 0.05:
+            return False
+        d = float(dist_xy)
+        return d <= ra and d <= rb
 
-    def _nearest_confirmed(
+    def _nearest_overlapping_confirmed(
         self,
         map_xyz: np.ndarray,
         *,
-        radius_m: float,
+        new_extent_m: Optional[float],
         pose_of: Dict[int, conv.Pose2D],
         fallback_pose: Optional[conv.Pose2D],
     ) -> Optional[EmbeddingLandmark]:
-        """Closest confirmed landmark within ``radius_m`` (geometry only)."""
+        """Confirmed landmark whose footprint substantially overlaps this observation."""
+        search_r = float(self.confirmed_overlap_m)
+        if new_extent_m is not None:
+            search_r = max(search_r, float(new_extent_m) * 2.0)
         best: Optional[EmbeddingLandmark] = None
         best_dist = float("inf")
-        for lm in self._neighbors(map_xyz, radius_m=radius_m, include_moved=False):
+        for lm in self._neighbors(map_xyz, radius_m=search_r, include_moved=False):
             if lm.status != LandmarkStatus.CONFIRMED:
                 continue
             lm_map = self.association_map_xyz(lm)
@@ -363,8 +375,19 @@ class EmbeddingLandmarkMap:
                 if ap is None:
                     continue
                 lm_map = self.map_point_from_rel(ap, lm.rel_xyz)
-            dist = float(np.linalg.norm(lm_map - map_xyz))
-            if dist <= float(radius_m) and dist < best_dist:
+            # XY footprint only — height mismatches shouldn't block absorb.
+            dist = math.hypot(
+                float(lm_map[0]) - float(map_xyz[0]),
+                float(lm_map[1]) - float(map_xyz[1]),
+            )
+            if not self._footprints_overlap(dist, lm.extent_m, new_extent_m):
+                # Legacy: no measured size yet — allow a tight nearness fallback.
+                if lm.extent_m is None and new_extent_m is None:
+                    if dist > float(self.confirmed_overlap_m):
+                        continue
+                else:
+                    continue
+            if dist < best_dist:
                 best_dist = dist
                 best = lm
         return best
@@ -379,12 +402,14 @@ class EmbeddingLandmarkMap:
         anchor_pose: conv.Pose2D,
         view_xy: Tuple[float, ...],
         from_detector: bool = False,
+        extent_m: Optional[float] = None,
     ) -> EmbeddingLandmark:
         """Associate or create a landmark from one measured map-frame point."""
         map_xyz = np.asarray(map_xyz, dtype=float).reshape(3)
         descriptor = np.asarray(descriptor, dtype=np.float32).reshape(-1)
         normal_map = np.asarray(normal_map, dtype=float).reshape(3)
         view = self._normalize_view(view_xy)
+        extent = float(extent_m) if extent_m is not None and float(extent_m) > 0 else None
 
         search_r = max(
             float(self.associate_radius_m), 3.0 * float(self.demote_offset_m)
@@ -406,11 +431,11 @@ class EmbeddingLandmarkMap:
         self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
 
         if best is None:
-            # Descriptor gates missed, but a confirmed landmark already owns
-            # this spot — absorb rather than paint a parallel yellow candidate.
-            overlap = self._nearest_confirmed(
+            # Descriptor gates missed, but a confirmed landmark's footprint
+            # overlaps this observation — absorb rather than mint a yellow twin.
+            overlap = self._nearest_overlapping_confirmed(
                 map_xyz,
-                radius_m=self._overlap_radius(from_detector=from_detector),
+                new_extent_m=extent,
                 pose_of={int(anchor_node): anchor_pose},
                 fallback_pose=anchor_pose,
             )
@@ -426,6 +451,7 @@ class EmbeddingLandmarkMap:
                     view,
                     anchor_pose,
                     from_detector=from_detector,
+                    extent_m=extent,
                     # Don't poison the confirmed bank with an unrelated crop.
                     bank_descriptor=cos >= 0.20,
                 )
@@ -455,6 +481,7 @@ class EmbeddingLandmarkMap:
                 observations=1,
                 view_poses_xy=[view],
                 from_detector=bool(from_detector),
+                extent_m=extent,
                 _map_samples=[map_xyz.copy()],
             )
             self._landmarks[lid] = lm
@@ -468,6 +495,7 @@ class EmbeddingLandmarkMap:
             view,
             anchor_pose,
             from_detector=from_detector,
+            extent_m=extent,
         )
 
     def observe_with_poses(
@@ -481,11 +509,13 @@ class EmbeddingLandmarkMap:
         pose_of_node: Dict[int, conv.Pose2D],
         view_xy: Tuple[float, ...],
         from_detector: bool = False,
+        extent_m: Optional[float] = None,
     ) -> EmbeddingLandmark:
         """Like ``observe`` but resolves map positions via ``pose_of_node``."""
         map_xyz = np.asarray(map_xyz, dtype=float).reshape(3)
         descriptor = np.asarray(descriptor, dtype=np.float32).reshape(-1)
         view = self._normalize_view(view_xy)
+        extent = float(extent_m) if extent_m is not None and float(extent_m) > 0 else None
 
         search_r = max(
             float(self.associate_radius_m), 3.0 * float(self.demote_offset_m)
@@ -512,6 +542,7 @@ class EmbeddingLandmarkMap:
                 anchor_pose=anchor_pose,
                 view_xy=view,
                 from_detector=from_detector,
+                extent_m=extent,
             )
         self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
         # Demotion needs the landmark's own anchor pose when available.
@@ -523,6 +554,7 @@ class EmbeddingLandmarkMap:
             view,
             update_pose,
             from_detector=from_detector,
+            extent_m=extent,
         )
 
     def _update_existing(
@@ -534,11 +566,16 @@ class EmbeddingLandmarkMap:
         anchor_pose: conv.Pose2D,
         *,
         from_detector: bool = False,
+        extent_m: Optional[float] = None,
         bank_descriptor: bool = True,
     ) -> EmbeddingLandmark:
         lm.observations += 1
         if from_detector:
             lm.from_detector = True
+        if extent_m is not None and float(extent_m) > 0:
+            # Keep the larger footprint so later smaller crops still overlap.
+            prev = float(lm.extent_m) if lm.extent_m is not None else 0.0
+            lm.extent_m = max(prev, float(extent_m))
         # Revisit of a demoted landmark: revive instead of minting a parallel ID.
         if lm.status == LandmarkStatus.MOVED:
             lm.status = LandmarkStatus.CANDIDATE

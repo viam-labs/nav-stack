@@ -25,6 +25,8 @@ class PatchObservation:
     point_base: np.ndarray  # (3,)
     normal_base: np.ndarray  # (3,)
     sigma_m: float
+    # Approx half-size (m) of the source YOLO box in the map plane; None for dense.
+    extent_m: Optional[float] = None
 
 
 def depth_sigma_m(range_m: float) -> float:

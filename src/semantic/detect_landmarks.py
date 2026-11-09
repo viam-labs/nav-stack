@@ -194,12 +194,18 @@ def observations_from_detections(
             sigma_m=sigma,
             valid=True,
         )
+        # Map-plane half-size of the YOLO box (meters) for footprint overlap.
+        range_m = max(0.2, abs(float(point[0])))
+        fx = max(1.0, float(frame.intrinsics.fx))
+        fy = max(1.0, float(frame.intrinsics.fy))
+        extent_m = max(0.5 * bw * range_m / fx, 0.5 * bh * range_m / fy)
         out.append(
             PatchObservation(
                 token=tok,
                 point_base=point.astype(float),
                 normal_base=np.asarray(normal, dtype=float),
                 sigma_m=sigma,
+                extent_m=float(extent_m),
             )
         )
     return out
