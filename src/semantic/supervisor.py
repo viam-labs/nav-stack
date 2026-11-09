@@ -128,6 +128,10 @@ class VisionSupervisor:
             loaded.associate_radius_m = self._landmarks.associate_radius_m
             loaded.cell_m = self._landmarks.cell_m
             loaded.require_descriptor_match = self._landmarks.require_descriptor_match
+            loaded.candidate_cosine_threshold = (
+                self._landmarks.candidate_cosine_threshold
+            )
+            loaded.cosine_threshold = self._landmarks.cosine_threshold
             loaded.demote_passes = self._landmarks.demote_passes
             loaded.rebuild_cell_index()
             self._landmarks = loaded

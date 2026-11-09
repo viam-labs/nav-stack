@@ -46,10 +46,12 @@ class EmbeddingLandmarkMap:
     max_descriptors: int = 3
     cell_m: float = 0.30
     cosine_threshold: float = 0.55
+    # Softer gate for candidates: DINOv2 patch tokens drift under approach/zoom,
+    # but orthogonal / wrong-surface patches must not steal the same ID
+    # (landmark-camera would then jump between objects).
+    candidate_cosine_threshold: float = 0.35
     # When False (synthetic RGB stats), associate by distance only so nearby
     # patches collapse instead of spawning one landmark per grid cell.
-    # When True, *confirmed* still need cosine; *candidates* may merge by
-    # distance alone so approach/zoom does not mint a new ID every metre.
     require_descriptor_match: bool = True
     # Min XY (m) / yaw (deg) change before recording another view pose.
     view_record_xy_m: float = 0.15
@@ -159,6 +161,11 @@ class EmbeddingLandmarkMap:
             return float(view_xy[0]), float(view_xy[1]), float(view_xy[2])
         return float(view_xy[0]), float(view_xy[1]), 0.0
 
+    def _desc_threshold(self, lm: EmbeddingLandmark) -> float:
+        if lm.status == LandmarkStatus.CONFIRMED:
+            return float(self.cosine_threshold)
+        return float(self.candidate_cosine_threshold)
+
     def _match_ok(
         self,
         lm: EmbeddingLandmark,
@@ -170,14 +177,7 @@ class EmbeddingLandmarkMap:
             return False
         if not self.require_descriptor_match:
             return True
-        # Confirmed: keep descriptor gate (writeback / demotion need identity).
-        if lm.status == LandmarkStatus.CONFIRMED:
-            return self._best_desc_cosine(lm, descriptor) >= float(
-                self.cosine_threshold
-            )
-        # Candidates: spatial merge only — DINOv2 patch tokens change a lot
-        # under approach/zoom, so requiring cosine prevented almost all promotions.
-        return True
+        return self._best_desc_cosine(lm, descriptor) >= self._desc_threshold(lm)
 
     def _pick_best_neighbor(
         self,
@@ -205,8 +205,9 @@ class EmbeddingLandmarkMap:
             if not self._match_ok(lm, descriptor, dist, radius):
                 continue
             cos = self._best_desc_cosine(lm, descriptor)
-            # Closer wins; among equals prefer stronger descriptor agreement.
-            score = dist - 0.02 * max(0.0, cos)
+            # Descriptor agreement dominates so nearby wrong patches do not
+            # steal an ID; distance is a secondary tie-break.
+            score = -cos + 0.15 * dist
             if score < best_score:
                 best_score = score
                 best = lm

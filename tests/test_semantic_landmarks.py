@@ -114,17 +114,53 @@ def test_promote_on_spin_in_place_yaw_gap():
     assert lm.status == LandmarkStatus.CONFIRMED
 
 
-def test_candidate_spatial_merge_despite_descriptor_change():
-    """Approach/zoom: new descriptor near the same 3D point should reinforce."""
+def test_candidate_rejects_orthogonal_nearby_descriptor():
+    """Wrong surface nearby must not steal the same candidate ID (overlay jump)."""
     store = EmbeddingLandmarkMap(
         associate_radius_m=0.25,
         require_descriptor_match=True,
+        candidate_cosine_threshold=0.35,
         promote_min_obs=99,
     )
     anchor = Pose2D(0.0, 0.0, 0.0)
     normal = np.array([-1.0, 0.0, 0.0], dtype=float)
     d0 = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
     d1 = l2_normalize(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32))  # orthogonal
+    store.observe(
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptor=d0,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+    )
+    store.observe(
+        map_xyz=np.array([2.05, 0.0, 1.0]),
+        descriptor=d1,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.3, 0.0, 0.0),
+    )
+    assert len(store) == 2
+    assert all(lm.observations == 1 for lm in store.all_landmarks())
+
+
+def test_candidate_soft_cosine_allows_mild_descriptor_drift():
+    """Same feature under approach: cosine can drop below confirmed gate."""
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        require_descriptor_match=True,
+        cosine_threshold=0.55,
+        candidate_cosine_threshold=0.35,
+        promote_min_obs=99,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    # Cosine ≈ 0.45 — fails confirmed gate, passes candidate gate.
+    d0 = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    d1 = l2_normalize(np.array([0.45, 0.893, 0.0, 0.0], dtype=np.float32))
+    assert 0.35 <= float(np.dot(d0, d1)) < 0.55
     store.observe(
         map_xyz=np.array([2.0, 0.0, 1.0]),
         descriptor=d0,
