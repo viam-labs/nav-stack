@@ -212,22 +212,81 @@ def backproject_patches(
     return out
 
 
+def local_luminance_std(
+    color_rgb: np.ndarray,
+    u: float,
+    v: float,
+    *,
+    half: int = 7,
+) -> float:
+    """Local grayscale std around ``(u, v)`` — high on paintings, low on walls."""
+    img = np.asarray(color_rgb)
+    if img.ndim != 3 or img.size == 0:
+        return 0.0
+    h, w = img.shape[:2]
+    ui = int(round(float(u)))
+    vi = int(round(float(v)))
+    x0 = max(0, ui - int(half))
+    x1 = min(w, ui + int(half) + 1)
+    y0 = max(0, vi - int(half))
+    y1 = min(h, vi + int(half) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    win = img[y0:y1, x0:x1].astype(np.float32)
+    gray = win.mean(axis=2)
+    return float(gray.std())
+
+
+def annotate_patch_texture(
+    color_rgb: np.ndarray,
+    tokens: Sequence[PatchToken],
+    *,
+    half: int = 7,
+) -> None:
+    """Fill ``token.texture`` from local luminance contrast."""
+    for tok in tokens:
+        tok.texture = local_luminance_std(color_rgb, tok.u, tok.v, half=half)
+
+
+def filter_textured_tokens(
+    tokens: Sequence[PatchToken],
+    *,
+    min_texture: float = 12.0,
+    max_keep: int = 64,
+) -> List[PatchToken]:
+    """Drop flat wall patches; keep the most textured first.
+
+    ``min_texture`` is luminance std on a 0–255 scale. Plain white/painted
+    walls are typically well below 12; framed art / posters sit much higher.
+    """
+    scored = [t for t in tokens if float(t.texture) >= float(min_texture)]
+    if not scored:
+        return []
+    scored.sort(key=lambda t: float(t.texture), reverse=True)
+    limit = int(max_keep)
+    if limit <= 0 or len(scored) <= limit:
+        return scored
+    return scored[:limit]
+
+
 def subsample_observations(
     observations: Sequence[PatchObservation],
     max_count: int,
 ) -> List[PatchObservation]:
-    """Uniform stride subsample so a frame cannot flood the landmark map."""
+    """Cap associations per frame, preferring textured + low-uncertainty patches."""
     obs = list(observations)
     limit = int(max_count)
     if limit <= 0 or len(obs) <= limit:
         return obs
-    # Prefer lower range uncertainty, then stride through the ranked list so
-    # we keep spatial coverage instead of only the closest patches.
-    ranked = sorted(obs, key=lambda o: float(o.sigma_m))
+    # Texture first (paintings over walls), then tighter depth as a tie-break.
+    # Stride through the ranked list for spatial coverage.
+    ranked = sorted(
+        obs,
+        key=lambda o: (-float(getattr(o.token, "texture", 0.0)), float(o.sigma_m)),
+    )
     step = max(1, int(math.ceil(len(ranked) / float(limit))))
     picked = ranked[::step][:limit]
     if len(picked) < limit:
-        # Fill remaining from the unpicked front of the ranked list.
         seen = {id(p) for p in picked}
         for o in ranked:
             if id(o) in seen:
@@ -241,7 +300,7 @@ def subsample_observations(
 def distinctiveness_mask(
     descriptors: np.ndarray,
     *,
-    max_ratio: float = 0.9,
+    max_ratio: float = 0.85,
 ) -> np.ndarray:
     """Keep patches whose best/second-best in-frame cosine ratio is below max.
 

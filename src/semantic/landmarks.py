@@ -40,7 +40,9 @@ class EmbeddingLandmarkMap:
     promote_min_view_gap_m: float = 0.5
     # Spin-in-place: promote when yaw span across views reaches this (deg).
     promote_min_view_gap_deg: float = 25.0
-    promote_max_std_m: float = 0.05
+    # Depth + association noise routinely exceeds 5 cm on RealSense; 12 cm
+    # still rejects wild jumps while letting stable features confirm.
+    promote_max_std_m: float = 0.12
     demote_offset_m: float = 0.15
     demote_passes: int = 3
     max_descriptors: int = 3

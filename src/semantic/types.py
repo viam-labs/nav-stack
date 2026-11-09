@@ -77,6 +77,8 @@ class PatchToken:
     u: float
     v: float
     descriptor: np.ndarray  # (D,) float32
+    # Local luminance std (0–255) used to prefer paintings/edges over flat walls.
+    texture: float = 0.0
     # Filled by backproject_patches when depth is valid.
     point_base: Optional[np.ndarray] = None  # (3,)
     normal_base: Optional[np.ndarray] = None  # (3,)

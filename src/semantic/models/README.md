@@ -85,6 +85,10 @@ Defaults assume a density pilot, not pose writeback:
 | `vision_associate_radius_m` / `vision_cell_m` | `0.25` / `0.30` | Merge nearby patches |
 | `vision_input_size` | `448` | Must match the ONNX export |
 
+Promotion defaults (code, not config): ≥3 obs, ≥2 views with ≥0.5 m **or**
+≥25° yaw, position std ≤ **0.12 m**. Patch selection keeps distinctive +
+high local RGB contrast tokens so flat white walls lose to paintings/edges.
+
 Wipe `embedding_landmarks.npz` (or `clear_map`) before re-surveying after
 switching synthetic → DINOv2. Prefer a single camera in `vision_cameras`.
 

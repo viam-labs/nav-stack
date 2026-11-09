@@ -9,10 +9,13 @@ import pytest
 
 from src.semantic.paint_mask import Disc, filter_scan_endpoints
 from src.semantic.patches import (
+    annotate_patch_texture,
     backproject_patches,
     depth_sigma_m,
     distinctiveness_mask,
+    filter_textured_tokens,
     lateral_sigma_m,
+    local_luminance_std,
 )
 from src.semantic.types import CameraIntrinsics, PatchToken, VisionFrame
 from src.semantic.worker import VisionWorker, WorkerConfig
@@ -87,9 +90,52 @@ def test_distinctiveness_keeps_unique_descriptors():
     a = np.array([1.0, 0.0, 0.0], dtype=float)
     b = np.array([0.0, 1.0, 0.0], dtype=float)
     desc = np.stack([a, a, a, b], axis=0)
-    keep = distinctiveness_mask(desc, max_ratio=0.9)
+    keep = distinctiveness_mask(desc, max_ratio=0.85)
     assert bool(keep[3])
     assert not all(keep[:3])
+
+
+def test_texture_filter_prefers_painting_over_white_wall():
+    h, w = 120, 160
+    color = np.full((h, w, 3), 240, dtype=np.uint8)  # flat white wall
+    # High-contrast "painting" region on the right.
+    yy, xx = np.mgrid[20:100, 90:150]
+    color[20:100, 90:150, 0] = (xx * 3) % 255
+    color[20:100, 90:150, 1] = (yy * 5) % 255
+    color[20:100, 90:150, 2] = ((xx + yy) * 7) % 255
+    wall = PatchToken(row=0, col=0, u=40.0, v=60.0, descriptor=np.ones(4))
+    art = PatchToken(row=0, col=1, u=120.0, v=60.0, descriptor=np.ones(4))
+    annotate_patch_texture(color, [wall, art])
+    assert local_luminance_std(color, art.u, art.v) > local_luminance_std(
+        color, wall.u, wall.v
+    )
+    kept = filter_textured_tokens([wall, art], min_texture=12.0)
+    assert art in kept
+    assert wall not in kept
+
+
+def test_subsample_prefers_higher_texture():
+    from src.semantic.patches import PatchObservation, subsample_observations
+
+    wall = PatchObservation(
+        token=PatchToken(
+            row=0, col=0, u=0.0, v=0.0, descriptor=np.ones(2), texture=3.0
+        ),
+        point_base=np.array([1.0, 0.0, 1.0]),
+        normal_base=np.array([-1.0, 0.0, 0.0]),
+        sigma_m=0.01,  # closer / lower uncertainty than the painting
+    )
+    art = PatchObservation(
+        token=PatchToken(
+            row=0, col=1, u=1.0, v=0.0, descriptor=np.ones(2), texture=40.0
+        ),
+        point_base=np.array([1.5, 0.0, 1.0]),
+        normal_base=np.array([-1.0, 0.0, 0.0]),
+        sigma_m=0.05,
+    )
+    out = subsample_observations([wall, art], 1)
+    assert len(out) == 1
+    assert out[0] is art
 
 
 def test_synthetic_worker_runs():

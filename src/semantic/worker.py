@@ -8,7 +8,12 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .patches import distinctiveness_mask, patch_grid
+from .patches import (
+    annotate_patch_texture,
+    distinctiveness_mask,
+    filter_textured_tokens,
+    patch_grid,
+)
 from .place import l2_normalize
 from .types import Detection, PatchToken, VisionFrame, VisionResult
 
@@ -109,19 +114,27 @@ class VisionWorker:
         if self._yolo is not None:
             detections = self._run_yolo(color)
 
-        # Drop non-distinctive patches (textureless walls). Skip in synthetic
-        # mode — local RGB stats are too correlated for the ratio test.
+        # Prefer paintings / edges over flat walls: distinctive DINOv2 tokens
+        # plus local RGB contrast. Skip texture gate in synthetic mode.
         if tokens and not self.cfg.synthetic:
             desc = np.stack([t.descriptor for t in tokens], axis=0)
             keep = distinctiveness_mask(desc)
             filtered = [t for t, k in zip(tokens, keep) if k]
-            if filtered:
-                tokens = filtered
+            annotate_patch_texture(color, filtered if filtered else tokens)
+            textured = filter_textured_tokens(
+                filtered if filtered else tokens, min_texture=12.0, max_keep=64
+            )
+            if textured:
+                tokens = textured
+            elif filtered:
+                # Distinctive but low RGB contrast — keep a sparse few so empty
+                # rooms still survey something, ranked by whatever texture exists.
+                filtered.sort(key=lambda t: float(t.texture), reverse=True)
+                step = max(1, len(filtered) // 16)
+                tokens = filtered[::step][:16]
             else:
-                # Uniform / repeating texture: keep a sparse spatial subsample
-                # so survey still gets geometry instead of an empty frame.
-                step = max(1, len(tokens) // 64)
-                tokens = tokens[::step][:64]
+                # Nothing distinctive — do not flood candidates with white wall.
+                tokens = []
 
         infer_ms = (time.perf_counter() - t0) * 1000.0
         self.stats["frames"] += 1

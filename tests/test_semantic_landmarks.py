@@ -46,7 +46,7 @@ def test_landmark_promotion_and_demotion():
         promote_min_obs=3,
         promote_min_views=2,
         promote_min_view_gap_m=0.5,
-        promote_max_std_m=0.05,
+        promote_max_std_m=0.12,
         demote_offset_m=0.15,
         demote_passes=3,
     )
@@ -85,6 +85,40 @@ def test_landmark_promotion_and_demotion():
     assert lm.status == LandmarkStatus.MOVED
 
 
+def test_promote_tolerates_depth_noise_above_5cm():
+    """RealSense multi-view std often sits ~6–10 cm; 5 cm was too strict."""
+    store = EmbeddingLandmarkMap(
+        promote_min_obs=3,
+        promote_min_views=2,
+        promote_min_view_gap_m=0.5,
+        promote_max_std_m=0.12,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    # Multi-axis noise → mean axis-std ~7 cm (above old 5 cm gate, under 12 cm).
+    noises = (
+        np.array([-0.10, 0.10, 0.05]),
+        np.array([0.0, 0.0, 0.0]),
+        np.array([0.10, -0.10, -0.05]),
+    )
+    views = ((0.0, 0.0, 0.0), (0.6, 0.0, 0.0), (1.2, 0.0, 0.0))
+    lm = None
+    for noise, view in zip(noises, views):
+        lm = store.observe(
+            map_xyz=np.array([2.0, 0.0, 1.0], dtype=float) + noise,
+            descriptor=desc,
+            normal_map=normal,
+            anchor_node=0,
+            anchor_pose=anchor,
+            view_xy=view,
+        )
+    assert lm is not None
+    assert lm.position_std_m > 0.05
+    assert lm.position_std_m <= 0.12
+    assert lm.status == LandmarkStatus.CONFIRMED
+
+
 def test_promote_on_spin_in_place_yaw_gap():
     """Pure rotation used to never promote (view gap was XY-only)."""
     import math
@@ -94,7 +128,7 @@ def test_promote_on_spin_in_place_yaw_gap():
         promote_min_views=2,
         promote_min_view_gap_m=0.5,  # XY alone would fail
         promote_min_view_gap_deg=25.0,
-        promote_max_std_m=0.05,
+        promote_max_std_m=0.12,
         require_descriptor_match=True,
     )
     anchor = Pose2D(0.0, 0.0, 0.0)
