@@ -138,7 +138,11 @@ class EmbeddingLandmarkMap:
         self._cell_index.setdefault(cell, []).append(lm.landmark_id)
 
     def _neighbors(
-        self, map_xyz: np.ndarray, *, radius_m: Optional[float] = None
+        self,
+        map_xyz: np.ndarray,
+        *,
+        radius_m: Optional[float] = None,
+        include_moved: bool = False,
     ) -> List[EmbeddingLandmark]:
         base = self._cell(map_xyz, self.cell_m)
         reach = 1
@@ -154,10 +158,23 @@ class EmbeddingLandmarkMap:
                         if lid in seen:
                             continue
                         lm = self._landmarks.get(lid)
-                        if lm is not None and lm.status != LandmarkStatus.MOVED:
-                            seen.add(lid)
-                            out.append(lm)
+                        if lm is None:
+                            continue
+                        if lm.status == LandmarkStatus.MOVED and not include_moved:
+                            continue
+                        seen.add(lid)
+                        out.append(lm)
         return out
+
+    def _reindex(self, lm: EmbeddingLandmark, map_xyz: np.ndarray) -> None:
+        """Move a landmark to the cell of ``map_xyz`` (after promote / revive)."""
+        lid = int(lm.landmark_id)
+        for cell, ids in list(self._cell_index.items()):
+            if lid in ids:
+                ids[:] = [i for i in ids if i != lid]
+                if not ids:
+                    del self._cell_index[cell]
+        self._index_add(lm, map_xyz)
 
     @staticmethod
     def map_point_from_rel(anchor_pose: conv.Pose2D, rel_xyz: np.ndarray) -> np.ndarray:
@@ -199,10 +216,25 @@ class EmbeddingLandmarkMap:
             return float(view_xy[0]), float(view_xy[1]), float(view_xy[2])
         return float(view_xy[0]), float(view_xy[1]), 0.0
 
-    def _desc_threshold(self, lm: EmbeddingLandmark, dist: float) -> float:
+    def _desc_threshold(
+        self,
+        lm: EmbeddingLandmark,
+        dist: float,
+        *,
+        from_detector: bool = False,
+    ) -> float:
+        # Detector↔detector: object-level pooled DINO still drifts with angle;
+        # keep the soft candidate gate out to a wider radius.
+        if from_detector and bool(lm.from_detector):
+            return min(
+                float(self.candidate_cosine_threshold),
+                0.30,
+            )
         if lm.status != LandmarkStatus.CONFIRMED:
             return float(self.candidate_cosine_threshold)
         soft_r = float(self.confirmed_soft_match_frac) * float(self.associate_radius_m)
+        if from_detector and bool(lm.from_detector):
+            soft_r = max(soft_r, 0.45)
         if dist <= soft_r:
             # Geometrically the same spot — allow viewpoint drift so we bank
             # another descriptor instead of creating a parallel candidate.
@@ -215,13 +247,15 @@ class EmbeddingLandmarkMap:
         descriptor: np.ndarray,
         dist: float,
         radius: float,
+        *,
+        from_detector: bool = False,
     ) -> bool:
         if dist > radius:
             return False
         if not self.require_descriptor_match:
             return True
         return self._best_desc_cosine(lm, descriptor) >= self._desc_threshold(
-            lm, dist
+            lm, dist, from_detector=from_detector
         )
 
     def _pick_best_neighbor(
@@ -233,6 +267,7 @@ class EmbeddingLandmarkMap:
         pose_of: Dict[int, conv.Pose2D],
         same_anchor: Optional[int] = None,
         fallback_pose: Optional[conv.Pose2D] = None,
+        from_detector: bool = False,
     ) -> Optional[EmbeddingLandmark]:
         best: Optional[EmbeddingLandmark] = None
         best_score = float("inf")
@@ -250,12 +285,24 @@ class EmbeddingLandmarkMap:
             radius = float(self.associate_radius_m)
             if lm.status == LandmarkStatus.CONFIRMED:
                 radius = max(radius, 3.0 * float(self.demote_offset_m))
-            if not self._match_ok(lm, descriptor, dist, radius):
+            # YOLO-pooled centers jitter more than patch tokens; widen the gate.
+            if from_detector and bool(lm.from_detector):
+                radius = max(radius, 0.55)
+            if lm.status == LandmarkStatus.MOVED and from_detector and bool(
+                lm.from_detector
+            ):
+                radius = max(radius, 0.55)
+            if not self._match_ok(
+                lm, descriptor, dist, radius, from_detector=from_detector
+            ):
                 continue
             cos = self._best_desc_cosine(lm, descriptor)
             # Descriptor agreement dominates so nearby wrong patches do not
-            # steal an ID; distance is a secondary tie-break.
+            # steal an ID; distance is a secondary tie-break. Prefer detector
+            # landmarks when the observation is detector-anchored.
             score = -cos + 0.15 * dist
+            if from_detector and bool(lm.from_detector):
+                score -= 0.05
             if score < best_score:
                 best_score = score
                 best = lm
@@ -304,13 +351,19 @@ class EmbeddingLandmarkMap:
         search_r = max(
             float(self.associate_radius_m), 3.0 * float(self.demote_offset_m)
         )
+        if from_detector:
+            search_r = max(search_r, 0.55)
         best = self._pick_best_neighbor(
-            self._neighbors(map_xyz, radius_m=search_r),
+            self._neighbors(
+                map_xyz, radius_m=search_r, include_moved=bool(from_detector)
+            ),
             map_xyz=map_xyz,
             descriptor=descriptor,
             pose_of={int(anchor_node): anchor_pose},
-            same_anchor=int(anchor_node),
+            # Do NOT filter by same_anchor — keyframes change while driving;
+            # map_xyz association must work across anchor ids.
             fallback_pose=anchor_pose,
+            from_detector=from_detector,
         )
         self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
 
@@ -376,12 +429,17 @@ class EmbeddingLandmarkMap:
         search_r = max(
             float(self.associate_radius_m), 3.0 * float(self.demote_offset_m)
         )
+        if from_detector:
+            search_r = max(search_r, 0.55)
         best = self._pick_best_neighbor(
-            self._neighbors(map_xyz, radius_m=search_r),
+            self._neighbors(
+                map_xyz, radius_m=search_r, include_moved=bool(from_detector)
+            ),
             map_xyz=map_xyz,
             descriptor=descriptor,
             pose_of=pose_of_node,
             fallback_pose=anchor_pose,
+            from_detector=from_detector,
         )
         if best is None:
             # Fall through to observe() which notes its own association attempt.
@@ -419,6 +477,12 @@ class EmbeddingLandmarkMap:
         lm.observations += 1
         if from_detector:
             lm.from_detector = True
+        # Revisit of a demoted landmark: revive instead of minting a parallel ID.
+        if lm.status == LandmarkStatus.MOVED:
+            lm.status = LandmarkStatus.CANDIDATE
+            self._demote_strikes[lm.landmark_id] = 0
+            if lm.map_xyz is not None:
+                self._reindex(lm, np.asarray(lm.map_xyz, dtype=float).reshape(3))
         lm._map_samples.append(map_xyz.copy())
         # Keep at most 32 samples for std.
         if len(lm._map_samples) > 32:
@@ -494,15 +558,23 @@ class EmbeddingLandmarkMap:
                 gap_m = max(gap_m, math.hypot(x0 - x1, y0 - y1))
                 gap_yaw = max(gap_yaw, abs(conv.normalize_angle(yaw0 - yaw1)))
         gap_deg = math.degrees(gap_yaw)
-        if gap_m < float(self.promote_min_view_gap_m) and gap_deg < float(
-            self.promote_min_view_gap_deg
-        ):
+        min_gap_m = float(self.promote_min_view_gap_m)
+        min_gap_deg = float(self.promote_min_view_gap_deg)
+        max_std = float(self.promote_max_std_m)
+        if bool(lm.from_detector):
+            # Object-level landmarks: tolerate depth jitter; accept shorter baselines.
+            min_gap_m = min(min_gap_m, 0.25)
+            min_gap_deg = min(min_gap_deg, 18.0)
+            max_std = max(max_std, 0.22)
+        if gap_m < min_gap_m and gap_deg < min_gap_deg:
             return
-        if lm.position_std_m > float(self.promote_max_std_m):
+        if lm.position_std_m > max_std:
             return
         lm.status = LandmarkStatus.CONFIRMED
         if lm._map_samples:
-            lm.map_xyz = np.stack(lm._map_samples, axis=0).mean(axis=0).copy()
+            new_xyz = np.stack(lm._map_samples, axis=0).mean(axis=0).copy()
+            lm.map_xyz = new_xyz
+            self._reindex(lm, new_xyz)
         lm._map_samples.clear()
 
     def _check_moved(
@@ -516,10 +588,16 @@ class EmbeddingLandmarkMap:
         if lm.anchor_node < 0:
             return
         offset = float(np.linalg.norm(expected - map_xyz))
-        if offset > float(self.demote_offset_m):
+        demote_m = float(self.demote_offset_m)
+        demote_n = int(self.demote_passes)
+        if bool(lm.from_detector):
+            # Depth-center of a painting wobbles more than a single patch.
+            demote_m = max(demote_m, 0.35)
+            demote_n = max(demote_n, 5)
+        if offset > demote_m:
             strikes = self._demote_strikes.get(lm.landmark_id, 0) + 1
             self._demote_strikes[lm.landmark_id] = strikes
-            if strikes >= int(self.demote_passes):
+            if strikes >= demote_n:
                 lm.status = LandmarkStatus.MOVED
         else:
             self._demote_strikes[lm.landmark_id] = 0

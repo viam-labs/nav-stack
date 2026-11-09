@@ -540,21 +540,26 @@ class VisionSupervisor:
         self._last_detection_obs = len(det_obs)
         self._last_detection_boxes = len(result.detections or [])
 
+        # Dense patches beside live YOLO boxes are the main source of ID
+        # inflation (parallel candidates for the same painting). When detector
+        # observations exist, skip dense entirely unless explicitly configured.
         dense_cap = int(self._cfg.vision_max_patches_per_frame)
-        if det_obs and prefer:
+        if prefer and (det_obs or result.detections):
             dense_cap = int(self._cfg.vision_dense_fallback_patches)
-        dense_tokens = _tokens_outside_detections(
-            result.patches,
-            result.detections if prefer else (),
-            landmark_labels=self._cfg.vision_landmark_labels if prefer else (),
-        )
-        dense_obs = backproject_patches(
-            frame,
-            dense_tokens,
-            z_min_m=z_min,
-            z_max_m=z_max,
-        )
-        dense_obs = subsample_observations(dense_obs, dense_cap)
+        dense_obs: List[PatchObservation] = []
+        if dense_cap > 0:
+            dense_tokens = _tokens_outside_detections(
+                result.patches,
+                result.detections if prefer else (),
+                landmark_labels=self._cfg.vision_landmark_labels if prefer else (),
+            )
+            dense_obs = backproject_patches(
+                frame,
+                dense_tokens,
+                z_min_m=z_min,
+                z_max_m=z_max,
+            )
+            dense_obs = subsample_observations(dense_obs, dense_cap)
         obs = list(det_obs) + list(dense_obs)
         if not obs:
             return

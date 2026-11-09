@@ -108,7 +108,7 @@ Defaults assume a density pilot, not pose writeback:
 | `vision_z_min_m` / `vision_z_max_m` | `0.25` / `2.0` | Drop floor/ceiling |
 | `vision_max_patches_per_frame` | `64` | Cap dense associations per frame |
 | `vision_prefer_detections` | `true` | Pool DINO inside YOLO boxes first |
-| `vision_dense_fallback_patches` | `16` | Dense tokens when boxes fire |
+| `vision_dense_fallback_patches` | `0` | Dense only when YOLO is quiet (avoids duplicate IDs) |
 | `vision_associate_radius_m` / `vision_cell_m` | `0.25` / `0.30` | Merge nearby patches |
 | `vision_input_size` | `448` | Must match the ONNX export |
 

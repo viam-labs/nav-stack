@@ -1097,7 +1097,9 @@ class SlamConfig:
     # Empty detector_classes → COCO-80 names (standard YOLOv8). For YOLO-World
     # ONNX, set detector_classes to the same prompt list used at export.
     vision_prefer_detections: bool = True
-    vision_dense_fallback_patches: int = 16
+    # When YOLO boxes fire, do not also mint dense patch landmarks (they
+    # duplicate detector IDs and dominate map growth). Dense only when quiet.
+    vision_dense_fallback_patches: int = 0
     # YOLO-World open-vocab scores run lower than COCO YOLOv8; keep soft.
     vision_yolo_conf: float = 0.10
     vision_detector_classes: List[str] = field(default_factory=list)

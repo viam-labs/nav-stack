@@ -228,6 +228,76 @@ def test_confirmed_soft_match_banks_new_viewpoint_descriptor():
     assert store.status_dict()["assoc_soft_hits"] >= 1
 
 
+def test_detector_reassociates_across_angle_and_depth_jitter():
+    """YOLO-pooled centers wobble; must not mint a parallel ID each pass."""
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        require_descriptor_match=True,
+        candidate_cosine_threshold=0.35,
+        cosine_threshold=0.55,
+        promote_min_obs=99,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    d0 = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    d1 = l2_normalize(np.array([0.40, 0.9165, 0.0, 0.0], dtype=np.float32))
+    assert 0.30 <= float(np.dot(d0, d1)) < 0.55
+    lm = store.observe(
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptor=d0,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+        from_detector=True,
+    )
+    lm2 = store.observe(
+        map_xyz=np.array([2.35, 0.08, 1.05]),  # outside old 0.25 m gate
+        descriptor=d1,
+        normal_map=normal,
+        anchor_node=1,
+        anchor_pose=Pose2D(0.4, 0.0, 0.2),
+        view_xy=(0.4, 0.0, 0.2),
+        from_detector=True,
+    )
+    assert lm2.landmark_id == lm.landmark_id
+    assert len(store) == 1
+    assert lm.from_detector is True
+
+
+def test_detector_revive_moved_instead_of_minting():
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        require_descriptor_match=True,
+        promote_min_obs=99,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    lm = store.observe(
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptor=desc,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+        from_detector=True,
+    )
+    lm.status = LandmarkStatus.MOVED
+    lm2 = store.observe(
+        map_xyz=np.array([2.05, 0.02, 1.0]),
+        descriptor=desc,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.2, 0.0, 0.0),
+        from_detector=True,
+    )
+    assert lm2.landmark_id == lm.landmark_id
+    assert lm.status == LandmarkStatus.CANDIDATE
+    assert len(store) == 1
+
+
 def test_candidate_rejects_orthogonal_nearby_descriptor():
     """Wrong surface nearby must not steal the same candidate ID (overlay jump)."""
     store = EmbeddingLandmarkMap(

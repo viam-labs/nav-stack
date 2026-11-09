@@ -59,7 +59,7 @@ def test_vision_density_defaults():
     assert cfg.vision_survey_only is True
     assert cfg.vision_pose_writeback is False
     assert cfg.vision_prefer_detections is True
-    assert cfg.vision_dense_fallback_patches == 16
+    assert cfg.vision_dense_fallback_patches == 0
     assert cfg.vision_yolo_conf == 0.10
     assert cfg.vision_detector_classes == []
     assert "painting" in cfg.vision_landmark_labels
