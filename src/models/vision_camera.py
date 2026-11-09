@@ -50,6 +50,7 @@ class VisionCamera(Camera):
         self._stable_candidates_only = True
         self._last_error: Optional[str] = None
         self._last_drawn = 0
+        self._last_detections_drawn = 0
 
     @classmethod
     def new(
@@ -75,6 +76,7 @@ class VisionCamera(Camera):
             show_confirmed=cfg.show_confirmed,
             show_candidates=cfg.show_candidates,
             show_moved=cfg.show_moved,
+            show_detections=cfg.show_detections,
             show_labels=cfg.show_labels,
             max_landmarks=cfg.max_landmarks,
             box_m=cfg.box_m,
@@ -230,6 +232,14 @@ class VisionCamera(Camera):
             include_moved=bool(self._opts.show_moved),
             stable_candidates_only=bool(self._stable_candidates_only),
         )
+        detections = []
+        det_size = None
+        if self._opts.show_detections and hasattr(vision, "last_detections"):
+            try:
+                detections, det_size = vision.last_detections(camera_name=cfg.source)
+            except Exception as exc:  # noqa: BLE001
+                self._last_error = f"detections: {exc}"
+                detections, det_size = [], None
         png = await asyncio.to_thread(
             render_landmarks_overlay,
             color,
@@ -243,9 +253,12 @@ class VisionCamera(Camera):
             mount_pitch=mpitch,
             mount_roll=mroll,
             options=self._opts,
+            detections=detections,
+            detection_frame_size=det_size,
         )
         self._last_error = None
         self._last_drawn = min(len(landmarks), int(self._opts.max_landmarks))
+        self._last_detections_drawn = len(detections)
         return png
 
     async def get_image(
@@ -289,8 +302,10 @@ class VisionCamera(Camera):
             "source": None if cfg is None else cfg.source,
             "last_error": self._last_error,
             "last_drawn": self._last_drawn,
+            "last_detections_drawn": self._last_detections_drawn,
             "show_candidates": self._opts.show_candidates,
             "show_confirmed": self._opts.show_confirmed,
+            "show_detections": self._opts.show_detections,
         }
 
 

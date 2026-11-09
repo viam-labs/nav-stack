@@ -69,14 +69,17 @@ boxes (green=confirmed, yellow=candidate):
     "slam": "slam",
     "source": "camera-top",
     "show_candidates": true,
-    "show_confirmed": true
+    "show_confirmed": true,
+    "show_detections": true
   },
   "depends_on": ["slam", "camera-top"]
 }
 ```
 
 ``source`` should be the same RealSense as ``vision_cameras``. Open it in the
-Viam camera stream view.
+Viam camera stream view. Overlay colors: **green** confirmed, **yellow**
+candidate, **cyan** latest YOLO-World boxes (label + confidence). Set
+``show_detections: false`` to hide the detector layer.
 
 ## Pose writeback (opt-in)
 

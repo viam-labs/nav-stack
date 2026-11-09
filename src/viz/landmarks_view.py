@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw
 
 from ..geom import conversions as conv
 from ..semantic.landmarks import EmbeddingLandmark, EmbeddingLandmarkMap
-from ..semantic.types import CameraIntrinsics, LandmarkStatus
+from ..semantic.types import CameraIntrinsics, Detection, LandmarkStatus
 
 
 # Status → (outline RGBA, fill RGBA, label)
@@ -21,6 +21,9 @@ _COLORS = {
     LandmarkStatus.CANDIDATE: ((240, 200, 40, 255), (240, 200, 40, 40), "c"),
     LandmarkStatus.MOVED: ((240, 60, 60, 255), (240, 60, 60, 40), "M"),
 }
+# YOLO / open-vocab detector boxes (distinct from landmark green/yellow).
+_DET_OUTLINE = (80, 180, 255, 255)
+_DET_FILL = (80, 180, 255, 36)
 
 
 @dataclass
@@ -28,8 +31,10 @@ class LandmarkOverlayOptions:
     show_confirmed: bool = True
     show_candidates: bool = True
     show_moved: bool = False
+    show_detections: bool = True
     show_labels: bool = True
     max_landmarks: int = 80
+    max_detections: int = 40
     box_m: float = 0.12  # approximate landmark size in meters for box scale
 
 
@@ -118,8 +123,10 @@ def render_landmarks_overlay(
     mount_pitch: float = 0.0,
     mount_roll: float = 0.0,
     options: Optional[LandmarkOverlayOptions] = None,
+    detections: Optional[Sequence[Detection]] = None,
+    detection_frame_size: Optional[Tuple[int, int]] = None,
 ) -> bytes:
-    """Draw landmark boxes on ``color_rgb`` (HxWx3 uint8) and return PNG bytes."""
+    """Draw landmark + optional YOLO boxes on ``color_rgb``; return PNG bytes."""
     opts = options or LandmarkOverlayOptions()
     arr = np.asarray(color_rgb)
     if arr.ndim != 3 or arr.shape[2] != 3:
@@ -173,12 +180,44 @@ def render_landmarks_overlay(
         counts[status] = counts.get(status, 0) + 1
         drawn += 1
 
+    det_drawn = 0
+    if opts.show_detections and detections:
+        sx = sy = 1.0
+        if detection_frame_size is not None:
+            src_w, src_h = int(detection_frame_size[0]), int(detection_frame_size[1])
+            if src_w > 0 and src_h > 0:
+                sx = float(w) / float(src_w)
+                sy = float(h) / float(src_h)
+        for det in detections:
+            if det_drawn >= int(opts.max_detections):
+                break
+            x0 = float(det.x0) * sx
+            y0 = float(det.y0) * sy
+            x1 = float(det.x1) * sx
+            y1 = float(det.y1) * sy
+            if max(x0, x1) < -5 or max(y0, y1) < -5:
+                continue
+            if min(x0, x1) > w + 5 or min(y0, y1) > h + 5:
+                continue
+            draw.rectangle(
+                [x0, y0, x1, y1], outline=_DET_OUTLINE, width=2, fill=_DET_FILL
+            )
+            if opts.show_labels:
+                label = f"{det.label} {float(det.conf):.2f}"
+                draw.text(
+                    (min(x0, x1) + 2, max(0.0, min(y0, y1) - 12)),
+                    label,
+                    fill=_DET_OUTLINE,
+                )
+            det_drawn += 1
+
     # HUD strip.
     hud = (
         f"landmarks drawn={drawn}  "
         f"C={counts.get(LandmarkStatus.CONFIRMED, 0)} "
         f"c={counts.get(LandmarkStatus.CANDIDATE, 0)} "
         f"M={counts.get(LandmarkStatus.MOVED, 0)}  "
+        f"yolo={det_drawn}  "
         f"pose=({robot_pose.x:.2f},{robot_pose.y:.2f},{math.degrees(robot_pose.theta):.0f}°)"
     )
     draw.rectangle([0, 0, w, 18], fill=(0, 0, 0, 140))

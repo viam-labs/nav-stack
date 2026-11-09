@@ -1841,6 +1841,8 @@ class VisionCameraConfig:
     # Hide single-view candidates (often glass/through-window wrong depth).
     stable_candidates_only: bool = True
     show_moved: bool = False
+    # Latest YOLO / YOLO-World boxes from the vision supervisor (cyan).
+    show_detections: bool = True
     show_labels: bool = True
     max_landmarks: int = 80
     box_m: float = 0.12
@@ -1860,6 +1862,7 @@ class VisionCameraConfig:
             show_candidates=bool(d.get("show_candidates", True)),
             stable_candidates_only=bool(d.get("stable_candidates_only", True)),
             show_moved=bool(d.get("show_moved", False)),
+            show_detections=bool(d.get("show_detections", True)),
             show_labels=bool(d.get("show_labels", True)),
             max_landmarks=max(1, int(d.get("max_landmarks", 80))),
             box_m=float(d.get("box_m", 0.12)),

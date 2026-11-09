@@ -149,6 +149,30 @@ class VisionSupervisor:
     def landmarks(self) -> EmbeddingLandmarkMap:
         return self._landmarks
 
+    def last_detections(
+        self, *, camera_name: Optional[str] = None
+    ) -> Tuple[List[Detection], Optional[Tuple[int, int]]]:
+        """Latest YOLO boxes for overlay, plus ``(width, height)`` of that frame.
+
+        Boxes are in the survey camera's pixel space. Callers should scale when
+        the live overlay RGB differs in size. Returns ``([], None)`` when the
+        last result is missing or from a different camera.
+        """
+        with self._lock:
+            last = self._last_result
+            geom = self._last_camera_geom
+        if last is None or not last.detections:
+            return [], None
+        if camera_name and str(last.camera_name) not in ("", str(camera_name)):
+            return [], None
+        size = None
+        if isinstance(geom, dict):
+            gw = int(geom.get("width") or 0)
+            gh = int(geom.get("height") or 0)
+            if gw > 0 and gh > 0:
+                size = (gw, gh)
+        return list(last.detections), size
+
     def load_from_map_dir(self, map_dir) -> bool:
         loaded = load_landmarks(map_dir)
         if loaded is None:

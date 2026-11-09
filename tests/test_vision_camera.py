@@ -25,6 +25,28 @@ def test_vision_camera_config_deps():
     cfg = VisionCameraConfig.from_dict({"slam": "slam", "source": "camera-top"})
     assert cfg.required_dependencies() == ["slam", "camera-top"]
     assert cfg.show_candidates is True
+    assert cfg.show_detections is True
+
+
+def test_render_overlay_draws_yolo_detections():
+    from src.semantic.types import Detection
+
+    color = np.zeros((240, 320, 3), dtype=np.uint8)
+    color[:] = (20, 20, 28)
+    K = CameraIntrinsics(fx=160, fy=160, cx=160, cy=120, width=320, height=240)
+    det = Detection(label="painting", conf=0.91, x0=40, y0=30, x1=200, y1=180)
+    png = render_landmarks_overlay(
+        color,
+        [],
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        intrinsics=K,
+        detections=[det],
+        detection_frame_size=(320, 240),
+    )
+    img = Image.open(io.BytesIO(png))
+    arr = np.asarray(img)
+    # Cyan detector outline bumps the blue channel.
+    assert arr[..., 2].max() > 40
 
 
 def test_sensor_optical_roundtrip():
