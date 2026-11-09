@@ -80,7 +80,7 @@ class EmbeddingLandmarkMap:
     def resolved_map_xyz(
         lm: EmbeddingLandmark, pose_of_node: Optional[Dict[int, conv.Pose2D]] = None
     ) -> np.ndarray:
-        """Absolute map position; prefer stored ``map_xyz`` over rel⊕anchor."""
+        """Absolute map position for overlay; prefer locked ``map_xyz``."""
         if lm.map_xyz is not None:
             return np.asarray(lm.map_xyz, dtype=float).reshape(3)
         if pose_of_node is not None:
@@ -88,6 +88,15 @@ class EmbeddingLandmarkMap:
             if ap is not None:
                 return EmbeddingLandmarkMap.map_point_from_rel(ap, lm.rel_xyz)
         return np.asarray(lm.rel_xyz, dtype=float).reshape(3)
+
+    @staticmethod
+    def association_map_xyz(lm: EmbeddingLandmark) -> Optional[np.ndarray]:
+        """Map position used for re-association (running mean while candidate)."""
+        if lm.status == LandmarkStatus.CANDIDATE and lm._map_samples:
+            return np.stack(lm._map_samples, axis=0).mean(axis=0)
+        if lm.map_xyz is not None:
+            return np.asarray(lm.map_xyz, dtype=float).reshape(3)
+        return None
 
     def __len__(self) -> int:
         return len(self._landmarks)
@@ -213,11 +222,9 @@ class EmbeddingLandmarkMap:
         for lm in neighbors:
             if same_anchor is not None and lm.anchor_node != same_anchor:
                 continue
-            # Prefer absolute map_xyz so a spinning live/virtual anchor cannot
-            # reinterpret rel_xyz under a new yaw.
-            if lm.map_xyz is not None:
-                lm_map = np.asarray(lm.map_xyz, dtype=float).reshape(3)
-            else:
+            # Absolute map frame (not rel⊕live-anchor) so spin cannot reinterpret.
+            lm_map = self.association_map_xyz(lm)
+            if lm_map is None:
                 ap = pose_of.get(lm.anchor_node, fallback_pose)
                 if ap is None:
                     continue
@@ -355,10 +362,16 @@ class EmbeddingLandmarkMap:
         samples = np.stack(lm._map_samples, axis=0)
         mean = samples.mean(axis=0)
         lm.position_std_m = float(samples.std(axis=0).mean())
-        # Candidates track the running map-frame mean; confirmed stay frozen.
+        # Lock map_xyz after the first observation. Updating it to the running
+        # mean made landmark-camera boxes crawl during spins (depth/pose noise).
+        # Samples still drive std / promote; confirm refines map_xyz once.
         if lm.status == LandmarkStatus.CANDIDATE and lm.anchor_node >= 0:
-            lm.map_xyz = mean.copy()
-            lm.rel_xyz = self.rel_from_map_point(anchor_pose, mean)
+            locked = (
+                np.asarray(lm.map_xyz, dtype=float).reshape(3)
+                if lm.map_xyz is not None
+                else mean
+            )
+            lm.rel_xyz = self.rel_from_map_point(anchor_pose, locked)
 
         if len(lm.descriptors) < int(self.max_descriptors):
             if all(self._cosine(d, descriptor) < 0.95 for d in lm.descriptors):

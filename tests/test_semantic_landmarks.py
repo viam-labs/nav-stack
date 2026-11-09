@@ -154,6 +154,8 @@ def test_map_xyz_stable_when_virtual_anchor_pose_spins():
     )
     assert lm2.landmark_id == lm.landmark_id
     assert len(store) == 1
+    # Second observe must not crawl the locked map_xyz toward the new sample.
+    np.testing.assert_allclose(lm.map_xyz, [2.0, 0.0, 1.0], atol=1e-6)
 
 
 def test_promote_on_spin_in_place_yaw_gap():

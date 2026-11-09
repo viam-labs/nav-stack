@@ -7,6 +7,7 @@ boxes from the in-process SLAM vision supervisor (confirmed / candidates).
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import ClassVar, Mapping, Optional, Sequence
 
 import numpy as np
@@ -25,6 +26,7 @@ from ..config import VisionCameraConfig
 from ..runtime import get_slam, get_slam_service
 from ..semantic.decode import decode_color_image, pick_named_images
 from ..semantic.frames import intrinsics_from_size
+from ..semantic.types import CameraIntrinsics
 from ..viz.landmarks_view import (
     LandmarkOverlayOptions,
     collect_landmark_map_points,
@@ -111,16 +113,36 @@ class VisionCamera(Camera):
         )
         return decode_color_image(data, mime)
 
-    def _mount_and_fov(self, source_name: str):
-        """LidarConfig mount/FOV for the source, if SLAM knows it."""
+    def _mount_and_fov(self, source_name: str, vision=None):
+        """Mount/FOV for overlay — prefer last survey geometry when available."""
+        geom = getattr(vision, "_last_camera_geom", None) if vision is not None else None
+        if isinstance(geom, dict) and (
+            not source_name
+            or str(geom.get("camera_name") or "") in ("", source_name)
+        ):
+            return (
+                float(geom.get("mount_x", 0.0)),
+                float(geom.get("mount_y", 0.0)),
+                float(geom.get("mount_z", 0.0)),
+                float(geom.get("mount_theta", 0.0)),
+                float(geom.get("mount_pitch", 0.0)),
+                float(geom.get("mount_roll", 0.0)),
+                float(geom.get("fov_deg", 87.0)),
+                geom,
+            )
         runtime = get_slam(self._cfg.slam) if self._cfg else None
         slam_cfg = getattr(runtime, "slam_cfg", None) if runtime else None
         if slam_cfg is None:
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 87.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 87.0, None
         by_name = {lidar.name: lidar for lidar in getattr(slam_cfg, "lidars", [])}
         lidar = by_name.get(source_name)
         if lidar is None:
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 87.0
+            for name in getattr(slam_cfg, "vision_cameras", None) or []:
+                lidar = by_name.get(name)
+                if lidar is not None:
+                    break
+        if lidar is None:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 87.0, None
         return (
             float(lidar.x),
             float(lidar.y),
@@ -129,6 +151,7 @@ class VisionCamera(Camera):
             float(lidar.pitch),
             float(lidar.roll),
             float(lidar.fov_deg),
+            None,
         )
 
     async def _render(self) -> bytes:
@@ -151,17 +174,44 @@ class VisionCamera(Camera):
         if engine is None:
             return placeholder_landmarks_png("vision-camera: slam engine missing")
 
+        # Stamp pose to the RGB grab time. Reading pose *after* a slow
+        # get_images during a spin projects landmarks with a newer yaw than
+        # the image — boxes slide on the painting even when map_xyz is fixed.
         try:
+            t0 = time.monotonic()
             color = await self._grab_rgb()
+            t1 = time.monotonic()
         except Exception as exc:  # noqa: BLE001
             self._last_error = repr(exc)
             return placeholder_landmarks_png(f"vision-camera: RGB grab failed: {exc}")
 
         h, w = color.shape[:2]
-        mx, my, mz, mth, mpitch, mroll, fov = self._mount_and_fov(cfg.source)
-        K = intrinsics_from_size(w, h, fov_deg=fov)
+        mx, my, mz, mth, mpitch, mroll, fov, geom = self._mount_and_fov(
+            cfg.source, vision=vision
+        )
+        if (
+            isinstance(geom, dict)
+            and int(geom.get("width") or 0) == w
+            and int(geom.get("height") or 0) == h
+        ):
+            K = CameraIntrinsics(
+                fx=float(geom["fx"]),
+                fy=float(geom["fy"]),
+                cx=float(geom["cx"]),
+                cy=float(geom["cy"]),
+                width=w,
+                height=h,
+            )
+        else:
+            K = intrinsics_from_size(w, h, fov_deg=fov)
         try:
-            pose = engine.get_pose()
+            t_img = 0.5 * (t0 + t1)
+            pose = None
+            get_at = getattr(engine, "get_pose_at", None)
+            if callable(get_at):
+                pose = get_at(t_img)
+            if pose is None:
+                pose = engine.get_pose()
             _idx, _ap, pose_of_node = engine.vision_anchor()
             if not pose_of_node:
                 pose_of_node = {0: pose}

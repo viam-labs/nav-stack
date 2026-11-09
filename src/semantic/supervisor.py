@@ -76,6 +76,9 @@ class VisionSupervisor:
         self._last_result: Optional[VisionResult] = None
         self._last_frame_age_s: Optional[float] = None
         self._last_error: Optional[str] = None
+        # Last survey camera geometry — vision-camera overlay must use the same
+        # mount/FOV or boxes slide vs the RGB while spinning.
+        self._last_camera_geom: Optional[dict] = None
         self._frames = 0
         self._observations = 0
         self._inflight: set = set()
@@ -359,6 +362,22 @@ class VisionSupervisor:
         K = intrinsics_from_size(
             color.shape[1], color.shape[0], fov_deg=float(lidar.fov_deg)
         )
+        self._last_camera_geom = {
+            "camera_name": lidar.name,
+            "mount_x": float(lidar.x),
+            "mount_y": float(lidar.y),
+            "mount_z": float(lidar.z),
+            "mount_theta": float(lidar.theta),
+            "mount_pitch": float(lidar.pitch),
+            "mount_roll": float(lidar.roll),
+            "fov_deg": float(lidar.fov_deg),
+            "fx": float(K.fx),
+            "fy": float(K.fy),
+            "cx": float(K.cx),
+            "cy": float(K.cy),
+            "width": int(K.width),
+            "height": int(K.height),
+        }
         return vision_frame_from_arrays(
             camera_name=lidar.name,
             color_rgb=color,

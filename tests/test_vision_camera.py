@@ -56,6 +56,72 @@ def test_project_forward_point_to_centerish():
     assert abs(v - K.cy) < 5.0
 
 
+def test_project_roundtrip_stable_across_yaw():
+    """Fixed map_xyz must reproject to the geometrically correct pixel after a spin."""
+    import math
+
+    from src.semantic.patches import backproject_patches
+    from src.semantic.types import PatchToken, VisionFrame
+
+    K = CameraIntrinsics(fx=320, fy=320, cx=320, cy=240, width=640, height=480)
+    depth = np.full((480, 640), 2.0, dtype=np.float32)
+    color = np.zeros((480, 640, 3), dtype=np.uint8)
+    # Pixel slightly off-center so yaw motion moves it.
+    u0, v0 = 400.0, 240.0
+    frame = VisionFrame(
+        camera_name="cam",
+        stamp=0.0,
+        captured_at=0.0,
+        color_rgb=color,
+        depth_m=depth,
+        intrinsics=K,
+        mount_x=0.0,
+        mount_y=0.0,
+        mount_z=0.5,
+        mount_theta=0.0,
+    )
+    tok = PatchToken(row=0, col=0, u=u0, v=v0, descriptor=np.ones(4, dtype=np.float32))
+    obs = backproject_patches(frame, [tok])
+    assert len(obs) == 1
+    pb = obs[0].point_base
+    pose0 = Pose2D(0.0, 0.0, 0.0)
+    c0, s0 = math.cos(pose0.theta), math.sin(pose0.theta)
+    map_xyz = np.array(
+        [
+            pose0.x + c0 * pb[0] - s0 * pb[1],
+            pose0.y + s0 * pb[0] + c0 * pb[1],
+            pb[2],
+        ]
+    )
+    # Spin in place; same map point must project back near the ray from pose1.
+    pose1 = Pose2D(0.0, 0.0, math.radians(25.0))
+    proj = project_map_point_to_pixel(
+        map_xyz,
+        robot_pose=pose1,
+        intrinsics=K,
+        mount_x=0.0,
+        mount_y=0.0,
+        mount_z=0.5,
+        mount_theta=0.0,
+    )
+    assert proj is not None
+    u1, v1, _d = proj
+    # Expected pixel: transform map → base at pose1 → optical → K.
+    c1, s1 = math.cos(pose1.theta), math.sin(pose1.theta)
+    dx, dy = map_xyz[0] - pose1.x, map_xyz[1] - pose1.y
+    base = np.array([c1 * dx + s1 * dy, -s1 * dx + c1 * dy, map_xyz[2]])
+    sensor = conv.transform_base_link_to_lidar_mount(
+        base.reshape(1, 3), x=0.0, y=0.0, z=0.5, theta=0.0
+    )[0]
+    optical = sensor_to_camera_optical(sensor.reshape(1, 3))[0]
+    u_exp = K.fx * optical[0] / optical[2] + K.cx
+    v_exp = K.fy * optical[1] / optical[2] + K.cy
+    assert u1 == pytest.approx(u_exp, abs=0.5)
+    assert v1 == pytest.approx(v_exp, abs=0.5)
+    # And the spun projection must differ from the original pixel (not stuck).
+    assert abs(u1 - u0) > 5.0
+
+
 def test_render_overlay_draws_box():
     color = np.zeros((240, 320, 3), dtype=np.uint8)
     color[:] = (30, 30, 40)
