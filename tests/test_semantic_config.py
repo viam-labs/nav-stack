@@ -56,6 +56,8 @@ def test_vision_density_defaults():
     assert cfg.vision_max_patches_per_frame == 64
     assert cfg.vision_round_robin is True
     assert cfg.vision_input_size == 448
+    assert cfg.vision_survey_only is True
+    assert cfg.vision_pose_writeback is False
 
 
 def test_vision_requires_obstacles_only_optical():

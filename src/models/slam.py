@@ -2659,12 +2659,21 @@ class SlamService(SLAM):
         def _anchor():
             return engine.vision_anchor()
 
+        mgr = self._manager
+
+        def _apply_pose_correction(pose, *, score=None, force=False):
+            # Prefer host wrapper (same path as lidar revisit); fall back to engine.
+            if mgr is not None and hasattr(mgr, "apply_map_pose_correction"):
+                return mgr.apply_map_pose_correction(pose, score=score, force=force)
+            return engine.apply_map_pose_correction(pose, score=score, force=force)
+
         vision = VisionSupervisor(
             cfg=cfg,
             cameras=self._cameras,
             get_pose=engine.get_pose,
             get_pose_at=engine.get_pose_at,
             get_anchor=_anchor,
+            apply_pose_correction=_apply_pose_correction,
             logger=LOGGER.info,
         )
         store = self._map_store

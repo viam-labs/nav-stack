@@ -129,6 +129,10 @@ def test_start_does_not_drop_dinov2_session():
         assert vision._worker._dino is sentinel  # noqa: SLF001
         assert vision._worker.stats["provider"] == "CPUExecutionProvider"
         vision.stop()
+        # Drain the cancelled vision task so pytest doesn't warn.
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
     finally:
         loop.close()
 

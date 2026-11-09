@@ -25,7 +25,7 @@ DEFAULT_NAME = "dinov2_vits14_patches_448.onnx"
 # Filled in when we attach the asset to the GitHub release; override with --url.
 DEFAULT_URL = os.environ.get(
     "NAV_STACK_DINOV2_URL",
-    "https://github.com/viam-labs/nav-stack/releases/download/v1.2.0-rc3/"
+    "https://github.com/viam-labs/nav-stack/releases/download/v1.2.0-rc6/"
     + DEFAULT_NAME,
 )
 

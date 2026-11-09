@@ -1,4 +1,4 @@
-"""Background vision loop: grab RGB-D, infer, survey landmarks (no pose writeback)."""
+"""Background vision loop: grab RGB-D, survey landmarks, optional pose writeback."""
 
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ from ..geom import conversions as conv
 from .decode import decode_color_image, decode_depth_image, pick_named_images
 from .frames import intrinsics_from_size, vision_frame_from_arrays
 from .landmarks import EmbeddingLandmarkMap
-from .patches import backproject_patches, subsample_observations
+from .localize import estimate_landmark_fix
+from .patches import PatchObservation, backproject_patches, subsample_observations
 from .persist import load_landmarks, save_landmarks
 from .types import VisionFrame, VisionResult
 from .worker import VisionWorker, WorkerConfig
@@ -24,6 +25,8 @@ from .worker import VisionWorker, WorkerConfig
 PoseProvider = Callable[[], conv.Pose2D]
 PoseAtProvider = Callable[[float], Optional[conv.Pose2D]]
 AnchorProvider = Callable[[], Tuple[int, conv.Pose2D, Dict[int, conv.Pose2D]]]
+# Same signature as BuiltinSlamHost.apply_map_pose_correction (force always False).
+PoseCorrection = Callable[..., Dict[str, Any]]
 
 
 class VisionSupervisor:
@@ -37,6 +40,7 @@ class VisionSupervisor:
         get_pose: PoseProvider,
         get_pose_at: PoseAtProvider,
         get_anchor: AnchorProvider,
+        apply_pose_correction: Optional[PoseCorrection] = None,
         logger=None,
     ):
         self._cfg = cfg
@@ -44,6 +48,7 @@ class VisionSupervisor:
         self._get_pose = get_pose
         self._get_pose_at = get_pose_at
         self._get_anchor = get_anchor
+        self._apply_pose_correction = apply_pose_correction
         self._logger = logger
         self._lock = threading.Lock()
         self._task: Optional[asyncio.Task] = None
@@ -75,6 +80,10 @@ class VisionSupervisor:
         self._observations = 0
         self._inflight: set = set()
         self._rr_index = 0
+        self._last_writeback_mono = 0.0
+        self._writeback_attempts = 0
+        self._writeback_applied = 0
+        self._last_writeback: Optional[dict] = None
 
         input_size = int(cfg.vision_input_size) if not want_synthetic else 224
         if input_size < 14:
@@ -159,6 +168,7 @@ class VisionSupervisor:
             f"vision: started cameras={list(self._cfg.vision_cameras)} "
             f"rate={self._cfg.vision_rate_hz}Hz "
             f"survey_only={self._cfg.vision_survey_only} "
+            f"pose_writeback={self._writeback_enabled()} "
             f"round_robin={self._cfg.vision_round_robin} "
             f"z=[{self._cfg.vision_z_min_m},{self._cfg.vision_z_max_m}] "
             f"max_patches={self._cfg.vision_max_patches_per_frame} "
@@ -200,6 +210,7 @@ class VisionSupervisor:
             return {
                 "enabled": bool(self._cfg.vision_enabled),
                 "survey_only": bool(self._cfg.vision_survey_only),
+                "pose_writeback": self._writeback_enabled(),
                 "cameras": list(self._cfg.vision_cameras),
                 "provider": self._worker.stats.get("provider"),
                 "frames": self._frames,
@@ -219,7 +230,20 @@ class VisionSupervisor:
                 "require_descriptor_match": bool(
                     self._landmarks.require_descriptor_match
                 ),
+                "writeback": {
+                    "attempts": self._writeback_attempts,
+                    "applied": self._writeback_applied,
+                    "last": self._last_writeback,
+                },
             }
+
+    def _writeback_enabled(self) -> bool:
+        return (
+            bool(self._cfg.vision_pose_writeback)
+            and not bool(self._cfg.vision_survey_only)
+            and self._apply_pose_correction is not None
+            and not bool(self._worker.cfg.synthetic)
+        )
 
     def ingest_frame(self, frame: VisionFrame, *, mapping: bool = True) -> VisionResult:
         """Synchronous path for tests / sim: process one frame and maybe survey."""
@@ -276,7 +300,14 @@ class VisionSupervisor:
                         0.0, time.monotonic() - float(frame.captured_at)
                     )
                     self._last_error = None
-                if self._cfg.mode == MODE_MAPPING or self._cfg.vision_survey_only:
+                # Always survey while mapping, or whenever survey_only / writeback
+                # needs a live landmark map (localizing with writeback on).
+                do_survey = (
+                    self._cfg.mode == MODE_MAPPING
+                    or self._cfg.vision_survey_only
+                    or self._writeback_enabled()
+                )
+                if do_survey:
                     await asyncio.to_thread(self._survey, frame, result)
             finally:
                 self._inflight.discard(name)
@@ -335,7 +366,7 @@ class VisionSupervisor:
         )
 
     def _survey(self, frame: VisionFrame, result: VisionResult) -> None:
-        """Associate patches into the landmark map (no pose writeback)."""
+        """Associate patches into the landmark map; optionally soft-correct pose."""
         obs = backproject_patches(
             frame,
             result.patches,
@@ -392,6 +423,98 @@ class VisionSupervisor:
                 )
                 n_new += 1
             self._observations += n_new
+
+        if self._writeback_enabled():
+            self._try_pose_writeback(frame, obs, pose, pose_of_node)
+
+    def _try_pose_writeback(
+        self,
+        frame: VisionFrame,
+        obs: List[PatchObservation],
+        pose: conv.Pose2D,
+        pose_of_node: Dict[int, conv.Pose2D],
+    ) -> None:
+        """Soft landmark fix → apply_map_pose_correction (never force)."""
+        apply = self._apply_pose_correction
+        if apply is None:
+            return
+        now = time.monotonic()
+        cooldown = float(self._cfg.vision_pose_writeback_cooldown_s)
+        if now - self._last_writeback_mono < cooldown:
+            return
+        self._last_writeback_mono = now
+        self._writeback_attempts += 1
+
+        with self._lock:
+            confirmed = len(self._landmarks.confirmed())
+            if confirmed < int(self._cfg.vision_pose_writeback_min_inliers):
+                self._last_writeback = {
+                    "status": "skipped_few_confirmed",
+                    "confirmed": confirmed,
+                }
+                return
+            visible = self._landmarks.visible_set(
+                pose,
+                pose_of_node,
+                camera_xy=(float(frame.mount_x), float(frame.mount_y)),
+                camera_yaw=float(frame.mount_theta),
+                fov_deg=87.0,
+                max_range_m=float(self._cfg.landmark_fix_max_range_m),
+            )
+            cosine_thr = float(self._landmarks.cosine_threshold)
+
+        fix = estimate_landmark_fix(
+            obs,
+            visible,
+            robot_pose=pose,
+            cosine_threshold=cosine_thr,
+            min_inliers=int(self._cfg.vision_pose_writeback_min_inliers),
+            max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
+        )
+        if fix is None:
+            self._last_writeback = {
+                "status": "rejected_fit",
+                "visible": len(visible),
+                "confirmed": confirmed,
+            }
+            return
+        # Ignore tiny corrections (noise).
+        if fix.jump_m < 0.04 and fix.jump_deg < 1.0:
+            self._last_writeback = {
+                "status": "skipped_small",
+                "jump_m": round(fix.jump_m, 3),
+                "jump_deg": round(fix.jump_deg, 2),
+                "score": round(fix.score, 3),
+                "inliers": int(fix.fit.inliers.sum()),
+                "pairs": fix.n_pairs,
+            }
+            return
+        try:
+            result = apply(fix.fit.pose, score=fix.score, force=False)
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"writeback: {exc}"
+            self._last_writeback = {"status": "error", "error": repr(exc)}
+            return
+        applied = bool(result.get("applied"))
+        if applied:
+            self._writeback_applied += 1
+        self._last_writeback = {
+            "status": "applied" if applied else str(result.get("status", "not_applied")),
+            "jump_m": round(fix.jump_m, 3),
+            "jump_deg": round(fix.jump_deg, 2),
+            "score": round(fix.score, 3),
+            "residual_m": round(float(fix.fit.residual_rmse_m), 4),
+            "inliers": int(fix.fit.inliers.sum()),
+            "pairs": fix.n_pairs,
+            "shift_m": result.get("shift_m"),
+            "shift_deg": result.get("shift_deg"),
+            "slam_status": result.get("status"),
+        }
+        self._log(
+            f"vision writeback: {self._last_writeback['status']} "
+            f"jump={fix.jump_m:.2f}m/{fix.jump_deg:.1f}deg "
+            f"score={fix.score:.2f} inliers={int(fix.fit.inliers.sum())}"
+        )
 
 
 def _resize_nearest(img: np.ndarray, new_h: int, new_w: int) -> np.ndarray:

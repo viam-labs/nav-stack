@@ -37,6 +37,19 @@ Point config at the file (relative name resolves under `src/semantic/models/`):
 Omit `vision_synthetic` (or set `false`). `vision_status.provider` should show
 `OpenVINOExecutionProvider` (or `CPUExecutionProvider`), **not** `synthetic`.
 
+## Pose writeback (opt-in)
+
+After a successful density survey, enable soft landmark corrections:
+
+```json
+"vision_survey_only": false,
+"vision_pose_writeback": true
+```
+
+Uses confirmed landmarks → RANSAC rigid fit → `apply_map_pose_correction`
+(`force=False`, lidar revisit path). Synthetic / survey-only never write pose.
+Watch `vision_status.writeback` (`attempts` / `applied` / `last`).
+
 ## Survey density / nav load (rc2+)
 
 Defaults assume a density pilot, not pose writeback:

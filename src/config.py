@@ -1073,8 +1073,14 @@ class SlamConfig:
     vision_input_size: int = 448
     landmark_fix_max_range_m: float = 4.0
     landmark_fix_max_jump_m: float = 1.5
-    # Survey-only: build landmarks but do not write pose corrections / loops.
-    vision_survey_only: bool = False
+    # Survey builds landmarks without writing pose. Default on so enabling
+    # vision cannot accidentally correct SLAM until writeback is opted in.
+    vision_survey_only: bool = True
+    # Soft landmark pose writeback via apply_map_pose_correction (force=False).
+    # Requires vision_survey_only=false and a real (non-synthetic) DINOv2 provider.
+    vision_pose_writeback: bool = False
+    vision_pose_writeback_min_inliers: int = 8
+    vision_pose_writeback_cooldown_s: float = 2.0
     # Height band in base_link (reject floor/ceiling spam). Floor hits from a
     # chest-height RealSense sit near z≈0; keep wall/artwork band only.
     vision_z_min_m: float = 0.25
