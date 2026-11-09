@@ -572,9 +572,10 @@ class VisionSupervisor:
             anchor_pose = pose
             pose_of_node = {0: pose}
 
+        n_det = len(det_obs)
         n_new = 0
         with self._lock:
-            for o in obs:
+            for i, o in enumerate(obs):
                 # Map-frame point from capture pose.
                 c, s = float(np.cos(pose.theta)), float(np.sin(pose.theta))
                 pb = o.point_base
@@ -602,6 +603,7 @@ class VisionSupervisor:
                     anchor_pose=anchor_pose,
                     pose_of_node=pose_of_node,
                     view_xy=view_xy,
+                    from_detector=i < n_det,
                 )
                 n_new += 1
             self._observations += n_new

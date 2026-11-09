@@ -30,6 +30,9 @@ class EmbeddingLandmark:
     view_poses_xy: List[Tuple[float, float, float]] = field(default_factory=list)
     position_std_m: float = float("inf")
     status: LandmarkStatus = LandmarkStatus.CANDIDATE
+    # True once any observation came from a YOLO-box pooled DINO (not dense).
+    # Overlay shows these even before multi-view "stable" geometry trust.
+    from_detector: bool = False
     # Running mean in map frame while candidate (for std); cleared on confirm.
     _map_samples: List[np.ndarray] = field(default_factory=list, repr=False)
 
@@ -290,6 +293,7 @@ class EmbeddingLandmarkMap:
         anchor_node: int,
         anchor_pose: conv.Pose2D,
         view_xy: Tuple[float, ...],
+        from_detector: bool = False,
     ) -> EmbeddingLandmark:
         """Associate or create a landmark from one measured map-frame point."""
         map_xyz = np.asarray(map_xyz, dtype=float).reshape(3)
@@ -336,13 +340,21 @@ class EmbeddingLandmarkMap:
                 descriptors=[descriptor.copy()],
                 observations=1,
                 view_poses_xy=[view],
+                from_detector=bool(from_detector),
                 _map_samples=[map_xyz.copy()],
             )
             self._landmarks[lid] = lm
             self._index_add(lm, map_xyz)
             return lm
 
-        return self._update_existing(best, map_xyz, descriptor, view, anchor_pose)
+        return self._update_existing(
+            best,
+            map_xyz,
+            descriptor,
+            view,
+            anchor_pose,
+            from_detector=from_detector,
+        )
 
     def observe_with_poses(
         self,
@@ -354,6 +366,7 @@ class EmbeddingLandmarkMap:
         anchor_pose: conv.Pose2D,
         pose_of_node: Dict[int, conv.Pose2D],
         view_xy: Tuple[float, ...],
+        from_detector: bool = False,
     ) -> EmbeddingLandmark:
         """Like ``observe`` but resolves map positions via ``pose_of_node``."""
         map_xyz = np.asarray(map_xyz, dtype=float).reshape(3)
@@ -379,11 +392,19 @@ class EmbeddingLandmarkMap:
                 anchor_node=anchor_node,
                 anchor_pose=anchor_pose,
                 view_xy=view,
+                from_detector=from_detector,
             )
         self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
         # Demotion needs the landmark's own anchor pose when available.
         update_pose = pose_of_node.get(best.anchor_node, anchor_pose)
-        return self._update_existing(best, map_xyz, descriptor, view, update_pose)
+        return self._update_existing(
+            best,
+            map_xyz,
+            descriptor,
+            view,
+            update_pose,
+            from_detector=from_detector,
+        )
 
     def _update_existing(
         self,
@@ -392,8 +413,12 @@ class EmbeddingLandmarkMap:
         descriptor: np.ndarray,
         view_xy: Tuple[float, float, float],
         anchor_pose: conv.Pose2D,
+        *,
+        from_detector: bool = False,
     ) -> EmbeddingLandmark:
         lm.observations += 1
+        if from_detector:
+            lm.from_detector = True
         lm._map_samples.append(map_xyz.copy())
         # Keep at most 32 samples for std.
         if len(lm._map_samples) > 32:
@@ -568,9 +593,13 @@ class EmbeddingLandmarkMap:
         hits = int(self._assoc_hits)
         misses = int(self._assoc_misses)
         attempts = hits + misses
+        from_det = sum(
+            1 for lm in self._landmarks.values() if bool(lm.from_detector)
+        )
         return {
             "total": len(self._landmarks),
             **counts,
+            "from_detector": int(from_det),
             "assoc_hits": hits,
             "assoc_misses": misses,
             "assoc_soft_hits": int(self._assoc_soft_hits),

@@ -216,3 +216,27 @@ def test_collect_hides_single_view_candidates():
         store, {0: pose}, include_candidates=True, stable_candidates_only=True
     )
     assert pts == []
+
+
+def test_collect_shows_single_view_detector_candidates():
+    store = EmbeddingLandmarkMap()
+    pose = Pose2D(0.0, 0.0, 0.0)
+    det_lm = EmbeddingLandmark(
+        landmark_id=2,
+        anchor_node=0,
+        rel_xyz=np.array([2.0, 0.0, 1.0]),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptors=[],
+        observations=1,
+        view_poses_xy=[(0.0, 0.0, 0.0)],
+        position_std_m=float("inf"),
+        status=LandmarkStatus.CANDIDATE,
+        from_detector=True,
+    )
+    store._landmarks[2] = det_lm  # noqa: SLF001
+    pts = collect_landmark_map_points(
+        store, {0: pose}, include_candidates=True, stable_candidates_only=True
+    )
+    assert len(pts) == 1
+    assert pts[0][0].from_detector is True

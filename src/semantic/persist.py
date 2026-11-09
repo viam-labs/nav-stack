@@ -41,6 +41,7 @@ def save_landmarks(map_dir: Path, store: EmbeddingLandmarkMap) -> Optional[Path]
     stds = np.zeros(n, dtype=np.float32)
     status = np.zeros(n, dtype=np.int8)
     n_desc = np.zeros(n, dtype=np.int8)
+    from_detector = np.zeros(n, dtype=np.int8)
     descs = np.zeros((n, max_desc, dim), dtype=np.float16) if dim else np.zeros((n, 0, 0))
 
     status_code = {
@@ -61,6 +62,7 @@ def save_landmarks(map_dir: Path, store: EmbeddingLandmarkMap) -> Optional[Path]
         stds[i] = float(lm.position_std_m) if np.isfinite(lm.position_std_m) else -1.0
         status[i] = status_code.get(lm.status, 0)
         n_desc[i] = len(lm.descriptors)
+        from_detector[i] = 1 if bool(lm.from_detector) else 0
         for j, d in enumerate(lm.descriptors[:max_desc]):
             descs[i, j] = d.astype(np.float16)
 
@@ -77,6 +79,7 @@ def save_landmarks(map_dir: Path, store: EmbeddingLandmarkMap) -> Optional[Path]
         stds=stds,
         status=status,
         n_desc=n_desc,
+        from_detector=from_detector,
         descriptors=descs,
         next_id=np.int32(store._next_id),  # noqa: SLF001
         cosine_threshold=np.float32(store.cosine_threshold),
@@ -122,6 +125,9 @@ def load_landmarks(map_dir: Path) -> Optional[EmbeddingLandmarkMap]:
             mxyz = data["map_xyz"][i].astype(float)
         else:
             mxyz = rel[i].astype(float)
+        fd = False
+        if "from_detector" in data:
+            fd = bool(int(data["from_detector"][i]))
         lm = EmbeddingLandmark(
             landmark_id=int(ids[i]),
             anchor_node=int(anchors[i]),
@@ -132,6 +138,7 @@ def load_landmarks(map_dir: Path) -> Optional[EmbeddingLandmarkMap]:
             observations=int(obs[i]),
             position_std_m=std if std >= 0.0 else float("inf"),
             status=code_status.get(int(status[i]), LandmarkStatus.CANDIDATE),
+            from_detector=fd,
         )
         store._landmarks[lm.landmark_id] = lm  # noqa: SLF001
         store._index_add(lm, lm.map_xyz)  # noqa: SLF001

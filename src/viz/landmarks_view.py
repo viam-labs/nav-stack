@@ -166,17 +166,24 @@ def render_landmarks_overlay(
         if u < -20 or v < -20 or u > w + 20 or v > h + 20:
             continue
         # Box half-size from approximate physical size at this depth.
-        half = max(6.0, float(intrinsics.fx) * float(opts.box_m) / max(0.2, depth))
-        half = min(half, 48.0)
+        # Detector-anchored landmarks are object-sized — draw them larger so
+        # they read as sitting inside the cyan YOLO box, not a tiny pin.
+        box_m = float(opts.box_m)
+        if bool(getattr(lm, "from_detector", False)):
+            box_m = max(box_m, 0.28)
+        half = max(6.0, float(intrinsics.fx) * box_m / max(0.2, depth))
+        half = min(half, 90.0 if bool(getattr(lm, "from_detector", False)) else 48.0)
         x0, y0 = u - half, v - half
         x1, y1 = u + half, v + half
         outline, fill, tag = _COLORS.get(
             status, ((200, 200, 200, 255), (200, 200, 200, 40), "?")
         )
-        draw.rectangle([x0, y0, x1, y1], outline=outline, width=2, fill=fill)
+        width = 3 if bool(getattr(lm, "from_detector", False)) else 2
+        draw.rectangle([x0, y0, x1, y1], outline=outline, width=width, fill=fill)
         draw.ellipse([u - 2, v - 2, u + 2, v + 2], fill=outline)
         if opts.show_labels:
-            label = f"{tag}{lm.landmark_id}"
+            prefix = f"D{tag}" if bool(getattr(lm, "from_detector", False)) else tag
+            label = f"{prefix}{lm.landmark_id}"
             draw.text((x0 + 2, max(0.0, y0 - 12)), label, fill=outline)
         counts[status] = counts.get(status, 0) + 1
         drawn += 1
@@ -263,8 +270,11 @@ def collect_landmark_map_points(
         if lm.status == LandmarkStatus.MOVED and not include_moved:
             continue
         if lm.status == LandmarkStatus.CANDIDATE and stable_candidates_only:
-            if not _candidate_geometry_trusted(lm):
-                continue
+            # Detector-anchored landmarks are already object-level; show them
+            # immediately so cyan YOLO boxes have matching yellow/green marks.
+            if not bool(getattr(lm, "from_detector", False)):
+                if not _candidate_geometry_trusted(lm):
+                    continue
         if lm.status == LandmarkStatus.CONFIRMED or (
             lm.status == LandmarkStatus.CANDIDATE and include_candidates
         ) or (lm.status == LandmarkStatus.MOVED and include_moved):
@@ -278,11 +288,17 @@ def collect_landmark_map_points(
                 else EmbeddingLandmarkMap.resolved_map_xyz(lm, pose_of_node)
             )
             out.append((lm, mxyz))
-    # Prefer confirmed first so max_landmarks budget keeps the useful ones.
+    # Prefer confirmed, then detector-anchored, so the budget keeps useful ones.
     order = {
         LandmarkStatus.CONFIRMED: 0,
         LandmarkStatus.CANDIDATE: 1,
         LandmarkStatus.MOVED: 2,
     }
-    out.sort(key=lambda pair: (order.get(pair[0].status, 9), -pair[0].observations))
+    out.sort(
+        key=lambda pair: (
+            order.get(pair[0].status, 9),
+            0 if bool(getattr(pair[0], "from_detector", False)) else 1,
+            -pair[0].observations,
+        )
+    )
     return out
