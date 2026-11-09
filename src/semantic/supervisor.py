@@ -381,9 +381,9 @@ class VisionSupervisor:
         except Exception as exc:  # noqa: BLE001
             self._last_error = f"anchor: {exc}"
             return
-        # Pose at capture for view_xy; fall back to current.
+        # Pose at capture for multi-view promotion (XY + yaw); fall back to current.
         pose = self._get_pose_at(float(frame.captured_at)) or self._get_pose()
-        view_xy = (float(pose.x), float(pose.y))
+        view_xy = (float(pose.x), float(pose.y), float(pose.theta))
         if anchor_node < 0:
             # No keyframe yet — park candidates on a virtual node 0 at current pose.
             anchor_node = 0

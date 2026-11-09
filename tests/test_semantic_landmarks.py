@@ -54,7 +54,7 @@ def test_landmark_promotion_and_demotion():
     desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
     normal = np.array([-1.0, 0.0, 0.0], dtype=float)
     # Three views of the same wall point.
-    views = [(0.0, 0.0), (0.6, 0.0), (1.2, 0.0)]
+    views = [(0.0, 0.0, 0.0), (0.6, 0.0, 0.0), (1.2, 0.0, 0.0)]
     lm = None
     for i, view in enumerate(views):
         # Small noise within promote std.
@@ -80,9 +80,70 @@ def test_landmark_promotion_and_demotion():
             normal_map=normal,
             anchor_node=0,
             anchor_pose=anchor,
-            view_xy=(0.0, 0.0),
+            view_xy=(0.0, 0.0, 0.0),
         )
     assert lm.status == LandmarkStatus.MOVED
+
+
+def test_promote_on_spin_in_place_yaw_gap():
+    """Pure rotation used to never promote (view gap was XY-only)."""
+    import math
+
+    store = EmbeddingLandmarkMap(
+        promote_min_obs=3,
+        promote_min_views=2,
+        promote_min_view_gap_m=0.5,  # XY alone would fail
+        promote_min_view_gap_deg=25.0,
+        promote_max_std_m=0.05,
+        require_descriptor_match=True,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    lm = None
+    for i, yaw_deg in enumerate((0.0, 15.0, 35.0)):
+        lm = store.observe(
+            map_xyz=np.array([2.0, 0.01 * (i - 1), 1.0], dtype=float),
+            descriptor=desc,
+            normal_map=normal,
+            anchor_node=0,
+            anchor_pose=anchor,
+            view_xy=(0.0, 0.0, math.radians(yaw_deg)),
+        )
+    assert lm is not None
+    assert lm.status == LandmarkStatus.CONFIRMED
+
+
+def test_candidate_spatial_merge_despite_descriptor_change():
+    """Approach/zoom: new descriptor near the same 3D point should reinforce."""
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        require_descriptor_match=True,
+        promote_min_obs=99,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    d0 = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    d1 = l2_normalize(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32))  # orthogonal
+    store.observe(
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptor=d0,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+    )
+    lm = store.observe(
+        map_xyz=np.array([2.05, 0.0, 1.0]),
+        descriptor=d1,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.3, 0.0, 0.0),
+    )
+    assert len(store) == 1
+    assert lm.observations == 2
+    assert lm.status == LandmarkStatus.CANDIDATE
 
 
 def test_fit_rigid_recovers_pose_with_outliers():
