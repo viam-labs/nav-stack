@@ -321,12 +321,17 @@ class VisionSupervisor:
 
     async def _grab_frame(self, cam, lidar: LidarConfig) -> Optional[VisionFrame]:
         """Pull color+depth via get_images; return None if unavailable."""
-        received = time.monotonic()
+        # Stamp pose to mid-grab. Using the *start* time while spinning places
+        # map_xyz with a stale yaw vs the RGB/depth content, so overlays slide
+        # even on opaque walls (not only glass).
+        t0 = time.monotonic()
         try:
             images, _meta = await cam.get_images(timeout=2.0)
         except Exception as exc:  # noqa: BLE001
             self._last_error = f"get_images({lidar.name}): {exc}"
             return None
+        t1 = time.monotonic()
+        captured_at = 0.5 * (t0 + t1)
         if not images:
             return None
         color_blob, depth_blob = pick_named_images(images)
@@ -360,7 +365,10 @@ class VisionSupervisor:
             # Resize depth with nearest neighbor to color size.
             depth = _resize_nearest(depth, color.shape[0], color.shape[1])
         K = intrinsics_from_size(
-            color.shape[1], color.shape[0], fov_deg=float(lidar.fov_deg)
+            color.shape[1],
+            color.shape[0],
+            fov_deg=float(lidar.fov_deg),
+            vfov_deg=float(lidar.vfov_deg),
         )
         self._last_camera_geom = {
             "camera_name": lidar.name,
@@ -371,6 +379,7 @@ class VisionSupervisor:
             "mount_pitch": float(lidar.pitch),
             "mount_roll": float(lidar.roll),
             "fov_deg": float(lidar.fov_deg),
+            "vfov_deg": float(lidar.vfov_deg),
             "fx": float(K.fx),
             "fy": float(K.fy),
             "cx": float(K.cx),
@@ -383,7 +392,7 @@ class VisionSupervisor:
             color_rgb=color,
             depth_m=depth,
             stamp=time.time(),
-            captured_at=received,
+            captured_at=captured_at,
             lidar=lidar,
             intrinsics=K,
         )

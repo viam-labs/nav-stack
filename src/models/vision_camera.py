@@ -130,12 +130,13 @@ class VisionCamera(Camera):
                 float(geom.get("mount_pitch", 0.0)),
                 float(geom.get("mount_roll", 0.0)),
                 float(geom.get("fov_deg", 87.0)),
+                float(geom.get("vfov_deg", geom.get("fov_deg", 58.0))),
                 geom,
             )
         runtime = get_slam(self._cfg.slam) if self._cfg else None
         slam_cfg = getattr(runtime, "slam_cfg", None) if runtime else None
         if slam_cfg is None:
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 87.0, None
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 87.0, 58.0, None
         by_name = {lidar.name: lidar for lidar in getattr(slam_cfg, "lidars", [])}
         lidar = by_name.get(source_name)
         if lidar is None:
@@ -144,7 +145,7 @@ class VisionCamera(Camera):
                 if lidar is not None:
                     break
         if lidar is None:
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 87.0, None
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 87.0, 58.0, None
         return (
             float(lidar.x),
             float(lidar.y),
@@ -153,6 +154,7 @@ class VisionCamera(Camera):
             float(lidar.pitch),
             float(lidar.roll),
             float(lidar.fov_deg),
+            float(lidar.vfov_deg),
             None,
         )
 
@@ -188,7 +190,7 @@ class VisionCamera(Camera):
             return placeholder_landmarks_png(f"vision-camera: RGB grab failed: {exc}")
 
         h, w = color.shape[:2]
-        mx, my, mz, mth, mpitch, mroll, fov, geom = self._mount_and_fov(
+        mx, my, mz, mth, mpitch, mroll, fov, vfov, geom = self._mount_and_fov(
             cfg.source, vision=vision
         )
         if (
@@ -205,7 +207,7 @@ class VisionCamera(Camera):
                 height=h,
             )
         else:
-            K = intrinsics_from_size(w, h, fov_deg=fov)
+            K = intrinsics_from_size(w, h, fov_deg=fov, vfov_deg=vfov)
         try:
             t_img = 0.5 * (t0 + t1)
             pose = None

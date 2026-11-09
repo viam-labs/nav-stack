@@ -17,12 +17,19 @@ def intrinsics_from_size(
     height: int,
     *,
     fov_deg: float = 87.0,
+    vfov_deg: float | None = None,
 ) -> CameraIntrinsics:
-    """Approximate pinhole K from image size + horizontal FOV."""
+    """Approximate pinhole K from image size + FOV.
+
+    ``fov_deg`` is horizontal; ``vfov_deg`` is vertical (defaults to the same
+    angular value only when omitted — prefer passing the camera's real vfov,
+    otherwise painted landmarks drift vertically).
+    """
     w = max(1, int(width))
     h = max(1, int(height))
     fx = (0.5 * w) / max(1e-6, np.tan(np.deg2rad(float(fov_deg) * 0.5)))
-    fy = fx
+    v = float(fov_deg if vfov_deg is None else vfov_deg)
+    fy = (0.5 * h) / max(1e-6, np.tan(np.deg2rad(v * 0.5)))
     return CameraIntrinsics(
         fx=float(fx),
         fy=float(fy),
@@ -45,7 +52,9 @@ def vision_frame_from_arrays(
 ) -> VisionFrame:
     """Stamp a decoded RGB-D pair with the obstacles_only lidar mount."""
     h, w = color_rgb.shape[:2]
-    K = intrinsics or intrinsics_from_size(w, h, fov_deg=lidar.fov_deg)
+    K = intrinsics or intrinsics_from_size(
+        w, h, fov_deg=lidar.fov_deg, vfov_deg=lidar.vfov_deg
+    )
     return VisionFrame(
         camera_name=camera_name,
         stamp=float(stamp),
