@@ -1130,7 +1130,7 @@ class SlamConfig:
             "vase",
             "bottle",
             "cup",
-            "chair",
+            # Omit "chair" — chairs get rearranged constantly.
             "couch",
             "bed",
             "dining table",
