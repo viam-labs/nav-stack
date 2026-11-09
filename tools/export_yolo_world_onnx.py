@@ -101,6 +101,14 @@ def main() -> int:
     model = YOLO(weights)
     print(f"set_classes ({len(classes)}): {classes}")
     model.set_classes(classes)
+    # Warmup forward pass so text embeddings are fused before ONNX export.
+    try:
+        import numpy as np
+
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        model.predict(dummy, conf=0.01, verbose=False)
+    except Exception as exc:  # noqa: BLE001
+        print(f"warmup predict skipped ({exc})")
 
     print(f"exporting onnx imgsz={args.imgsz} → {out}")
     exported = model.export(format="onnx", imgsz=int(args.imgsz), simplify=True)

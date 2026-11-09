@@ -1098,7 +1098,8 @@ class SlamConfig:
     # ONNX, set detector_classes to the same prompt list used at export.
     vision_prefer_detections: bool = True
     vision_dense_fallback_patches: int = 16
-    vision_yolo_conf: float = 0.35
+    # YOLO-World open-vocab scores run lower than COCO YOLOv8; 0.35 hid most boxes.
+    vision_yolo_conf: float = 0.15
     vision_detector_classes: List[str] = field(default_factory=list)
     vision_landmark_labels: List[str] = field(
         default_factory=lambda: [

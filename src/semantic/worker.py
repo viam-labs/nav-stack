@@ -107,7 +107,8 @@ class WorkerConfig:
     # When True (or no dinov2 path), emit synthetic descriptors for benches/tests.
     synthetic: bool = False
     yolo_input: int = 640
-    yolo_conf: float = 0.35
+    yolo_conf: float = 0.15
+    yolo_nms_iou: float = 0.5
     # Class-id → name for the loaded ONNX. Empty → COCO-80 (standard YOLOv8).
     # YOLO-World exports must pass the same prompt list used at export time.
     detector_classes: Tuple[str, ...] = ()
@@ -132,6 +133,10 @@ class VisionWorker:
             "infer_ms_ema": None,
             "provider": self._provider,
             "last_error": None,
+            "yolo_loaded": False,
+            "last_yolo_raw": 0,
+            "last_yolo_kept": 0,
+            "last_yolo_max_conf": None,
         }
         if not self.cfg.synthetic and self.cfg.dinov2_onnx:
             self._load_models()
@@ -156,13 +161,18 @@ class VisionWorker:
                 self._yolo, self._yolo_info = make_session(
                     self.cfg.yolo_onnx, cpu_threads=self.cfg.cpu_threads
                 )
+                self.stats["yolo_loaded"] = True
             except Exception as exc:  # noqa: BLE001
                 self.stats["last_error"] = f"yolo: {exc}"
                 self._yolo = None
+                self.stats["yolo_loaded"] = False
+        else:
+            self.stats["yolo_loaded"] = False
 
     def close(self) -> None:
         self._dino = None
         self._yolo = None
+        self.stats["yolo_loaded"] = False
 
     def process(self, frame: VisionFrame) -> VisionResult:
         t0 = time.perf_counter()
@@ -423,9 +433,14 @@ class VisionWorker:
         keep = confs >= float(self.cfg.yolo_conf)
         detections: List[Detection] = []
         names = self._class_names()
+        raw_kept = 0
+        max_conf = 0.0
         for i in np.where(keep)[0]:
             cid = int(cls_ids[i])
             label = names[cid] if 0 <= cid < len(names) else str(cid)
+            conf_i = float(confs[i])
+            max_conf = max(max_conf, conf_i)
+            raw_kept += 1
             if not self._keep_detection_label(label):
                 continue
             cx, cy, bw, bh = boxes[i]
@@ -437,13 +452,17 @@ class VisionWorker:
             detections.append(
                 Detection(
                     label=label,
-                    conf=float(confs[i]),
+                    conf=conf_i,
                     x0=float(x0),
                     y0=float(y0),
                     x1=float(x1),
                     y1=float(y1),
                 )
             )
+        detections = _nms_xyxy(detections, iou_thr=float(self.cfg.yolo_nms_iou))
+        self.stats["last_yolo_raw"] = int(raw_kept)
+        self.stats["last_yolo_kept"] = len(detections)
+        self.stats["last_yolo_max_conf"] = max_conf if raw_kept else None
         return detections
 
 
@@ -469,3 +488,42 @@ def _letterbox(
     pad_x = (size - nw) // 2
     canvas[pad_y : pad_y + nh, pad_x : pad_x + nw] = resized
     return canvas, scale, float(pad_x), float(pad_y)
+
+
+def _nms_xyxy(dets: List[Detection], *, iou_thr: float = 0.5) -> List[Detection]:
+    """Greedy per-class NMS on axis-aligned boxes."""
+    if len(dets) <= 1 or iou_thr <= 0.0:
+        return dets
+    by_label: dict = {}
+    for d in dets:
+        by_label.setdefault(d.label, []).append(d)
+    out: List[Detection] = []
+    for group in by_label.values():
+        group = sorted(group, key=lambda d: float(d.conf), reverse=True)
+        while group:
+            best = group.pop(0)
+            out.append(best)
+            kept = []
+            for d in group:
+                if _iou_xyxy(best, d) < iou_thr:
+                    kept.append(d)
+            group = kept
+    out.sort(key=lambda d: float(d.conf), reverse=True)
+    return out
+
+
+def _iou_xyxy(a: Detection, b: Detection) -> float:
+    ax0, ax1 = sorted((float(a.x0), float(a.x1)))
+    ay0, ay1 = sorted((float(a.y0), float(a.y1)))
+    bx0, bx1 = sorted((float(b.x0), float(b.x1)))
+    by0, by1 = sorted((float(b.y0), float(b.y1)))
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    union = area_a + area_b - inter
+    return float(inter / union) if union > 0.0 else 0.0

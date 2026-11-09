@@ -155,15 +155,16 @@ class VisionSupervisor:
         """Latest YOLO boxes for overlay, plus ``(width, height)`` of that frame.
 
         Boxes are in the survey camera's pixel space. Callers should scale when
-        the live overlay RGB differs in size. Returns ``([], None)`` when the
-        last result is missing or from a different camera.
+        the live overlay RGB differs in size. ``camera_name`` is accepted for
+        API compatibility but does not drop boxes — dense-fallback candidates
+        can appear without YOLO, so the overlay must still surface whatever the
+        detector last produced (or nothing) regardless of source aliasing.
         """
+        del camera_name  # overlay always wants the latest survey detections
         with self._lock:
             last = self._last_result
             geom = self._last_camera_geom
         if last is None or not last.detections:
-            return [], None
-        if camera_name and str(last.camera_name) not in ("", str(camera_name)):
             return [], None
         size = None
         if isinstance(geom, dict):
@@ -222,6 +223,7 @@ class VisionSupervisor:
         self._stop = asyncio.Event()
         self._ensure_worker_loaded()
         self._task = loop.create_task(self._run(), name="vision-supervisor")
+        yolo_loaded = bool(self._worker.stats.get("yolo_loaded"))
         self._log(
             f"vision: started cameras={list(self._cfg.vision_cameras)} "
             f"rate={self._cfg.vision_rate_hz}Hz "
@@ -231,8 +233,18 @@ class VisionSupervisor:
             f"z=[{self._cfg.vision_z_min_m},{self._cfg.vision_z_max_m}] "
             f"max_patches={self._cfg.vision_max_patches_per_frame} "
             f"provider={self._worker.stats.get('provider')} "
-            f"dinov2={self._dinov2_path or 'none'}"
+            f"dinov2={self._dinov2_path or 'none'} "
+            f"yolo={self._yolo_path or 'none'} "
+            f"yolo_loaded={yolo_loaded} "
+            f"yolo_conf={self._cfg.vision_yolo_conf}"
         )
+        if self._cfg.vision_prefer_detections and not yolo_loaded:
+            self._log(
+                "vision: YOLO detector not loaded — landmarks will use dense "
+                "DINO fallback only. Ensure setup/run fetched "
+                f"{_DEFAULT_YOLO_WORLD_ONNX} (vision_status.yolo_onnx / "
+                "worker.yolo_loaded)."
+            )
 
     def _stop_loop(self) -> None:
         task = self._task
@@ -285,10 +297,13 @@ class VisionSupervisor:
                 "associate_radius_m": float(self._landmarks.associate_radius_m),
                 "dinov2_onnx": self._dinov2_path or None,
                 "yolo_onnx": self._yolo_path or None,
+                "yolo_loaded": bool(self._worker.stats.get("yolo_loaded")),
+                "yolo_conf": float(self._cfg.vision_yolo_conf),
                 "detector_classes": list(self._worker.cfg.detector_classes),
                 "prefer_detections": bool(self._cfg.vision_prefer_detections),
                 "dense_fallback_patches": int(self._cfg.vision_dense_fallback_patches),
                 "last_detections": 0 if last is None else len(last.detections),
+                "last_yolo_max_conf": self._worker.stats.get("last_yolo_max_conf"),
                 "input_size": int(self._worker.cfg.input_short_side),
                 "require_descriptor_match": bool(
                     self._landmarks.require_descriptor_match

@@ -222,6 +222,21 @@ def test_subsample_observations_caps_count():
     assert len(out) == 5
 
 
+def test_yolo_nms_keeps_highest_conf():
+    from src.semantic.types import Detection
+    from src.semantic.worker import _nms_xyxy
+
+    dets = [
+        Detection("painting", 0.4, 10, 10, 100, 100),
+        Detection("painting", 0.9, 12, 12, 98, 98),
+        Detection("door", 0.8, 200, 10, 300, 100),
+    ]
+    kept = _nms_xyxy(dets, iou_thr=0.5)
+    assert len(kept) == 2
+    assert kept[0].label == "painting" and kept[0].conf == 0.9
+    assert kept[1].label == "door"
+
+
 def test_dinov2_onnx_letterbox_smoke():
     """If the exported ViT-S ONNX is present, run one real inference frame."""
     from pathlib import Path

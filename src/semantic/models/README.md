@@ -78,8 +78,11 @@ boxes (green=confirmed, yellow=candidate):
 
 ``source`` should be the same RealSense as ``vision_cameras``. Open it in the
 Viam camera stream view. Overlay colors: **green** confirmed, **yellow**
-candidate, **cyan** latest YOLO-World boxes (label + confidence). Set
-``show_detections: false`` to hide the detector layer.
+candidate, **cyan** latest YOLO-World boxes (label + confidence). HUD
+``yolo=OFF`` means the detector ONNX is not loaded (candidates can still
+appear from dense DINO fallback); ``yolo=N`` is the latest box count. Set
+``show_detections: false`` to hide the detector layer. Check
+``vision_status.yolo_loaded`` / ``yolo_onnx`` if cyan boxes never appear.
 
 ## Pose writeback (opt-in)
 

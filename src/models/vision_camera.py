@@ -234,6 +234,10 @@ class VisionCamera(Camera):
         )
         detections = []
         det_size = None
+        yolo_loaded = None
+        worker_stats = getattr(getattr(vision, "_worker", None), "stats", None)
+        if isinstance(worker_stats, dict):
+            yolo_loaded = bool(worker_stats.get("yolo_loaded"))
         if self._opts.show_detections and hasattr(vision, "last_detections"):
             try:
                 detections, det_size = vision.last_detections(camera_name=cfg.source)
@@ -255,6 +259,7 @@ class VisionCamera(Camera):
             options=self._opts,
             detections=detections,
             detection_frame_size=det_size,
+            yolo_loaded=yolo_loaded,
         )
         self._last_error = None
         self._last_drawn = min(len(landmarks), int(self._opts.max_landmarks))

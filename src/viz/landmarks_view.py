@@ -125,6 +125,7 @@ def render_landmarks_overlay(
     options: Optional[LandmarkOverlayOptions] = None,
     detections: Optional[Sequence[Detection]] = None,
     detection_frame_size: Optional[Tuple[int, int]] = None,
+    yolo_loaded: Optional[bool] = None,
 ) -> bytes:
     """Draw landmark + optional YOLO boxes on ``color_rgb``; return PNG bytes."""
     opts = options or LandmarkOverlayOptions()
@@ -211,13 +212,20 @@ def render_landmarks_overlay(
                 )
             det_drawn += 1
 
-    # HUD strip.
+    # HUD strip. Distinguish detector-off from detector-quiet (dense fallback
+    # can still mint candidates when YOLO is missing).
+    if yolo_loaded is False:
+        yolo_hud = "yolo=OFF"
+    elif yolo_loaded is True:
+        yolo_hud = f"yolo={det_drawn}"
+    else:
+        yolo_hud = f"yolo={det_drawn}"
     hud = (
         f"landmarks drawn={drawn}  "
         f"C={counts.get(LandmarkStatus.CONFIRMED, 0)} "
         f"c={counts.get(LandmarkStatus.CANDIDATE, 0)} "
         f"M={counts.get(LandmarkStatus.MOVED, 0)}  "
-        f"yolo={det_drawn}  "
+        f"{yolo_hud}  "
         f"pose=({robot_pose.x:.2f},{robot_pose.y:.2f},{math.degrees(robot_pose.theta):.0f}°)"
     )
     draw.rectangle([0, 0, w, 18], fill=(0, 0, 0, 140))
