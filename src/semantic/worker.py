@@ -8,6 +8,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .detect_landmarks import tokens_inside_detections
 from .patches import patch_grid, select_survey_tokens
 from .place import l2_normalize
 from .types import Detection, PatchToken, VisionFrame, VisionResult
@@ -221,9 +222,25 @@ class VisionWorker:
             detections = self._run_yolo(color)
 
         # Texture-first survey select (paintings/edges over flat walls).
+        # Always keep tokens that fall inside YOLO boxes so detector pooling
+        # is not starved by the max_keep=64 cull.
         # Skip in synthetic mode — RGB-stat tokens need the full grid.
         if tokens and not self.cfg.synthetic:
-            tokens = select_survey_tokens(color, tokens, min_texture=8.0, max_keep=64)
+            selected = select_survey_tokens(
+                color, tokens, min_texture=8.0, max_keep=64
+            )
+            if detections:
+                in_box = tokens_inside_detections(tokens, detections)
+                seen = {(t.row, t.col, round(float(t.u), 1), round(float(t.v), 1)) for t in selected}
+                merged = list(selected)
+                for t in in_box:
+                    key = (t.row, t.col, round(float(t.u), 1), round(float(t.v), 1))
+                    if key not in seen:
+                        seen.add(key)
+                        merged.append(t)
+                tokens = merged
+            else:
+                tokens = selected
 
         infer_ms = (time.perf_counter() - t0) * 1000.0
         self.stats["frames"] += 1

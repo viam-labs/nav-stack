@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Sequence, Set
+from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -58,6 +58,39 @@ def pool_descriptor(descriptors: Sequence[np.ndarray]) -> np.ndarray:
     return l2_normalize(stacked.mean(axis=0).astype(np.float32))
 
 
+def tokens_inside_detections(
+    patches: Sequence[PatchToken],
+    detections: Sequence[Detection],
+    *,
+    shrink: float = 0.0,
+) -> List[PatchToken]:
+    """Return patch tokens whose centers fall inside any detection box."""
+    if not patches or not detections:
+        return []
+    boxes: List[Tuple[float, float, float, float]] = []
+    for det in detections:
+        x0, x1 = sorted((float(det.x0), float(det.x1)))
+        y0, y1 = sorted((float(det.y0), float(det.y1)))
+        if shrink > 0.0:
+            bw, bh = max(1.0, x1 - x0), max(1.0, y1 - y0)
+            x0 += shrink * bw
+            x1 -= shrink * bw
+            y0 += shrink * bh
+            y1 -= shrink * bh
+        boxes.append((x0, y0, x1, y1))
+    out: List[PatchToken] = []
+    seen = set()
+    for tok in patches:
+        u, v = float(tok.u), float(tok.v)
+        key = (tok.row, tok.col, round(u, 1), round(v, 1))
+        if key in seen:
+            continue
+        if any(x0 <= u <= x1 and y0 <= v <= y1 for x0, y0, x1, y1 in boxes):
+            seen.add(key)
+            out.append(tok)
+    return out
+
+
 def observations_from_detections(
     frame: VisionFrame,
     patches: Sequence[PatchToken],
@@ -66,21 +99,28 @@ def observations_from_detections(
     landmark_labels: Iterable[str],
     z_min_m: Optional[float] = None,
     z_max_m: Optional[float] = None,
-    min_patches: int = 2,
+    min_patches: int = 1,
+    shrink: float = 0.05,
 ) -> List[PatchObservation]:
-    """One observation per allowed detection: mean DINO + median depth in-box."""
+    """One observation per allowed detection: mean DINO + median depth in-box.
+
+    Descriptor pooling uses every DINO token whose center lies in the box
+    (depth-invalid tokens still contribute appearance). Geometry prefers
+    depth-valid in-box patches; if none survive the depth gate, falls back to
+    back-projecting the box center alone.
+    """
     allowed = {str(x).strip().lower() for x in landmark_labels if str(x).strip()}
     if not allowed or not detections or not patches:
         return []
 
+    # Depth-valid observations for geometry (may be a subset of in-box tokens).
     patch_obs = backproject_patches(
         frame,
         patches,
         z_min_m=z_min_m,
         z_max_m=z_max_m,
     )
-    if not patch_obs:
-        return []
+    obs_by_uv = {(round(float(o.token.u), 1), round(float(o.token.v), 1)): o for o in patch_obs}
 
     out: List[PatchObservation] = []
     for det in detections:
@@ -88,38 +128,69 @@ def observations_from_detections(
             continue
         x0, x1 = sorted((float(det.x0), float(det.x1)))
         y0, y1 = sorted((float(det.y0), float(det.y1)))
-        # Slightly shrink box to avoid frame/edge depth contamination.
         bw, bh = max(1.0, x1 - x0), max(1.0, y1 - y0)
-        x0i, x1i = x0 + 0.08 * bw, x1 - 0.08 * bw
-        y0i, y1i = y0 + 0.08 * bh, y1 - 0.08 * bh
-        inside = [
-            o
-            for o in patch_obs
-            if x0i <= float(o.token.u) <= x1i and y0i <= float(o.token.v) <= y1i
+        s = max(0.0, float(shrink))
+        x0i, x1i = x0 + s * bw, x1 - s * bw
+        y0i, y1i = y0 + s * bh, y1 - s * bh
+        # Appearance: all tokens in box (even if depth failed).
+        in_tokens = [
+            t
+            for t in patches
+            if x0i <= float(t.u) <= x1i and y0i <= float(t.v) <= y1i
         ]
-        if len(inside) < int(min_patches):
+        if len(in_tokens) < int(min_patches):
+            # Retry without shrink — small YOLO boxes otherwise starve.
+            in_tokens = [
+                t
+                for t in patches
+                if x0 <= float(t.u) <= x1 and y0 <= float(t.v) <= y1
+            ]
+        if len(in_tokens) < int(min_patches):
             continue
-        desc = pool_descriptor([o.token.descriptor for o in inside])
-        pts = np.stack([o.point_base for o in inside], axis=0)
-        point = np.median(pts, axis=0)
-        normals = np.stack([o.normal_base for o in inside], axis=0)
-        normal = normals.mean(axis=0)
-        nn = float(np.linalg.norm(normal))
-        if nn > 1e-9:
-            normal = normal / nn
+        desc = pool_descriptor([t.descriptor for t in in_tokens])
+        inside_obs = [
+            obs_by_uv[(round(float(t.u), 1), round(float(t.v), 1))]
+            for t in in_tokens
+            if (round(float(t.u), 1), round(float(t.v), 1)) in obs_by_uv
+        ]
+        if inside_obs:
+            pts = np.stack([o.point_base for o in inside_obs], axis=0)
+            point = np.median(pts, axis=0)
+            normals = np.stack([o.normal_base for o in inside_obs], axis=0)
+            normal = normals.mean(axis=0)
+            nn = float(np.linalg.norm(normal))
+            normal = normal / nn if nn > 1e-9 else inside_obs[0].normal_base
+            sigma = float(np.median([o.sigma_m for o in inside_obs]))
         else:
-            normal = inside[0].normal_base
-        sigma = float(np.median([o.sigma_m for o in inside]))
-        # Synthetic token at box center carrying the pooled descriptor.
+            # Depth gate wiped the box — still landmark from center depth + pooled DINO.
+            center = PatchToken(
+                row=-1,
+                col=-1,
+                u=0.5 * (x0 + x1),
+                v=0.5 * (y0 + y1),
+                descriptor=desc,
+            )
+            center_obs = backproject_patches(
+                frame,
+                [center],
+                z_min_m=z_min_m,
+                z_max_m=z_max_m,
+                window_half=2,
+            )
+            if not center_obs:
+                continue
+            point = center_obs[0].point_base
+            normal = center_obs[0].normal_base
+            sigma = float(center_obs[0].sigma_m)
         tok = PatchToken(
             row=-1,
             col=-1,
             u=0.5 * (x0 + x1),
             v=0.5 * (y0 + y1),
             descriptor=desc,
-            texture=float(max(o.token.texture for o in inside)),
+            texture=float(max((float(t.texture) for t in in_tokens), default=0.0)),
             point_base=point.astype(float),
-            normal_base=normal.astype(float),
+            normal_base=np.asarray(normal, dtype=float),
             sigma_m=sigma,
             valid=True,
         )
@@ -127,7 +198,7 @@ def observations_from_detections(
             PatchObservation(
                 token=tok,
                 point_base=point.astype(float),
-                normal_base=normal.astype(float),
+                normal_base=np.asarray(normal, dtype=float),
                 sigma_m=sigma,
             )
         )

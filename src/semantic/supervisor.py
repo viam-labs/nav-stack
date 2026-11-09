@@ -99,6 +99,8 @@ class VisionSupervisor:
         self._writeback_attempts = 0
         self._writeback_applied = 0
         self._last_writeback: Optional[dict] = None
+        self._last_detection_obs = 0
+        self._last_detection_boxes = 0
 
         input_size = int(cfg.vision_input_size) if not want_synthetic else 224
         if input_size < 14:
@@ -305,6 +307,8 @@ class VisionSupervisor:
                 "prefer_detections": bool(self._cfg.vision_prefer_detections),
                 "dense_fallback_patches": int(self._cfg.vision_dense_fallback_patches),
                 "last_detections": 0 if last is None else len(last.detections),
+                "last_detection_obs": int(self._last_detection_obs),
+                "last_detection_boxes": int(self._last_detection_boxes),
                 "last_yolo_max_conf": self._worker.stats.get("last_yolo_max_conf"),
                 "input_size": int(self._worker.cfg.input_short_side),
                 "require_descriptor_match": bool(
@@ -531,7 +535,10 @@ class VisionSupervisor:
                 landmark_labels=self._cfg.vision_landmark_labels,
                 z_min_m=z_min,
                 z_max_m=z_max,
+                min_patches=1,
             )
+        self._last_detection_obs = len(det_obs)
+        self._last_detection_boxes = len(result.detections or [])
 
         dense_cap = int(self._cfg.vision_max_patches_per_frame)
         if det_obs and prefer:

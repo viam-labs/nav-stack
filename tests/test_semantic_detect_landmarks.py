@@ -129,3 +129,37 @@ def test_soft_label_match_picture_frame():
         min_patches=2,
     )
     assert len(obs) == 1
+
+
+def test_tokens_inside_detections_keeps_box_centers():
+    from src.semantic.detect_landmarks import tokens_inside_detections
+
+    frame = _frame_with_wall()
+    tokens = _grid_tokens(frame)
+    det = Detection(label="painting", conf=0.4, x0=100, y0=60, x1=220, y1=180)
+    inside = tokens_inside_detections(tokens, [det])
+    assert len(inside) >= 2
+    assert all(100 <= t.u <= 220 and 60 <= t.v <= 180 for t in inside)
+
+
+def test_detection_obs_with_single_token():
+    """Small YOLO boxes must still form a landmark from one in-box patch."""
+    frame = _frame_with_wall()
+    tok = PatchToken(
+        row=0,
+        col=0,
+        u=160.0,
+        v=120.0,
+        descriptor=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+    )
+    det = Detection(label="painting", conf=0.3, x0=140, y0=100, x1=180, y1=140)
+    obs = observations_from_detections(
+        frame,
+        [tok],
+        [det],
+        landmark_labels=["painting"],
+        z_min_m=0.25,
+        z_max_m=2.0,
+        min_patches=1,
+    )
+    assert len(obs) == 1
