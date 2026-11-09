@@ -134,9 +134,11 @@ class VisionWorker:
             "provider": self._provider,
             "last_error": None,
             "yolo_loaded": False,
+            "yolo_provider": None,
             "last_yolo_raw": 0,
             "last_yolo_kept": 0,
             "last_yolo_max_conf": None,
+            "last_yolo_out_shape": None,
         }
         if not self.cfg.synthetic and self.cfg.dinov2_onnx:
             self._load_models()
@@ -158,16 +160,24 @@ class VisionWorker:
             return
         if self.cfg.yolo_onnx:
             try:
+                # Keep YOLO-World on CPU FP32. OpenVINO GPU FP16 (used for
+                # DINOv2) collapses open-vocab class scores to ~0 on Meerkat.
                 self._yolo, self._yolo_info = make_session(
-                    self.cfg.yolo_onnx, cpu_threads=self.cfg.cpu_threads
+                    self.cfg.yolo_onnx,
+                    cpu_threads=self.cfg.cpu_threads,
+                    prefer_openvino=False,
+                    prefer_cuda=False,
                 )
                 self.stats["yolo_loaded"] = True
+                self.stats["yolo_provider"] = self._yolo_info.provider
             except Exception as exc:  # noqa: BLE001
                 self.stats["last_error"] = f"yolo: {exc}"
                 self._yolo = None
                 self.stats["yolo_loaded"] = False
+                self.stats["yolo_provider"] = None
         else:
             self.stats["yolo_loaded"] = False
+            self.stats["yolo_provider"] = None
 
     def close(self) -> None:
         self._dino = None
@@ -416,30 +426,29 @@ class VisionWorker:
         blob = np.transpose(blob, (2, 0, 1))[None, ...]
         name = self._yolo.get_inputs()[0].name
         out = np.asarray(self._yolo.run(None, {name: blob})[0])
-        # YOLOv8: (1, 4+nc, N) or (1, N, 4+nc)
-        if out.ndim != 3:
+        self.stats["last_yolo_out_shape"] = list(out.shape)
+        pred = _yolo_predictions(out)
+        if pred is None or pred.shape[1] < 5:
+            self.stats["last_yolo_raw"] = 0
+            self.stats["last_yolo_kept"] = 0
+            self.stats["last_yolo_max_conf"] = None
             return []
-        if out.shape[1] < out.shape[2]:
-            pred = out[0].T
-        else:
-            pred = out[0]
         # pred: (N, 4+nc) = cx,cy,w,h, scores...
-        if pred.shape[1] < 5:
-            return []
         boxes = pred[:, :4]
         scores = pred[:, 4:]
         cls_ids = np.argmax(scores, axis=1)
         confs = scores[np.arange(len(scores)), cls_ids]
+        # Always record peak score (even when nothing clears the gate).
+        peak = float(confs.max()) if len(confs) else 0.0
+        self.stats["last_yolo_max_conf"] = peak
         keep = confs >= float(self.cfg.yolo_conf)
         detections: List[Detection] = []
         names = self._class_names()
         raw_kept = 0
-        max_conf = 0.0
         for i in np.where(keep)[0]:
             cid = int(cls_ids[i])
             label = names[cid] if 0 <= cid < len(names) else str(cid)
             conf_i = float(confs[i])
-            max_conf = max(max_conf, conf_i)
             raw_kept += 1
             if not self._keep_detection_label(label):
                 continue
@@ -462,7 +471,6 @@ class VisionWorker:
         detections = _nms_xyxy(detections, iou_thr=float(self.cfg.yolo_nms_iou))
         self.stats["last_yolo_raw"] = int(raw_kept)
         self.stats["last_yolo_kept"] = len(detections)
-        self.stats["last_yolo_max_conf"] = max_conf if raw_kept else None
         return detections
 
 
@@ -474,6 +482,22 @@ def _resize_rgb(img: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
     ys = (np.linspace(0, h - 1, new_h)).astype(np.int32)
     xs = (np.linspace(0, w - 1, new_w)).astype(np.int32)
     return img[ys][:, xs]
+
+
+def _yolo_predictions(out: np.ndarray) -> Optional[np.ndarray]:
+    """Normalize YOLO ONNX output to ``(N, 4+nc)`` rows."""
+    out = np.asarray(out)
+    if out.ndim == 3:
+        # (1, 4+nc, N) or (1, N, 4+nc)
+        if out.shape[1] < out.shape[2]:
+            return out[0].T
+        return out[0]
+    if out.ndim == 2:
+        # Some EPs drop the batch dim: (4+nc, N) or (N, 4+nc)
+        if out.shape[0] < out.shape[1]:
+            return out.T
+        return out
+    return None
 
 
 def _letterbox(

@@ -237,6 +237,20 @@ def test_yolo_nms_keeps_highest_conf():
     assert kept[1].label == "door"
 
 
+def test_yolo_predictions_layout_variants():
+    from src.semantic.worker import _yolo_predictions
+
+    # (1, 4+nc, N)
+    a = np.zeros((1, 6, 10), dtype=np.float32)
+    assert _yolo_predictions(a).shape == (10, 6)
+    # (1, N, 4+nc)
+    b = np.zeros((1, 10, 6), dtype=np.float32)
+    assert _yolo_predictions(b).shape == (10, 6)
+    # batch-squeezed (4+nc, N)
+    c = np.zeros((6, 10), dtype=np.float32)
+    assert _yolo_predictions(c).shape == (10, 6)
+
+
 def test_dinov2_onnx_letterbox_smoke():
     """If the exported ViT-S ONNX is present, run one real inference frame."""
     from pathlib import Path
