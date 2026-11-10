@@ -44,7 +44,8 @@ PoseAtProvider = Callable[[float], Optional[conv.Pose2D]]
 AnchorProvider = Callable[[], Tuple[int, conv.Pose2D, Dict[int, conv.Pose2D]]]
 # Same signature as BuiltinSlamHost.apply_map_pose_correction (force always False).
 PoseCorrection = Callable[..., Dict[str, Any]]
-NavActiveProvider = Callable[[], bool]
+# True when SLAM localization_state is lost/unknown (place apply only then).
+LocLostProvider = Callable[[], bool]
 
 # Fetched by setup.sh / run.sh next to this package (same pattern as DINOv2).
 _DEFAULT_YOLO_WORLD_ONNX = "yolov8s-worldv2-indoor.onnx"
@@ -62,7 +63,7 @@ class VisionSupervisor:
         get_pose_at: PoseAtProvider,
         get_anchor: AnchorProvider,
         apply_pose_correction: Optional[PoseCorrection] = None,
-        is_navigation_active: Optional[NavActiveProvider] = None,
+        is_localization_lost: Optional[LocLostProvider] = None,
         logger=None,
     ):
         self._cfg = cfg
@@ -71,7 +72,7 @@ class VisionSupervisor:
         self._get_pose_at = get_pose_at
         self._get_anchor = get_anchor
         self._apply_pose_correction = apply_pose_correction
-        self._is_navigation_active = is_navigation_active
+        self._is_localization_lost = is_localization_lost
         self._logger = logger
         self._lock = threading.Lock()
         self._task: Optional[asyncio.Task] = None
@@ -668,7 +669,7 @@ class VisionSupervisor:
                     "keyframes": len(self._place.keyframe_ids),
                 }
 
-        # Attempt path handles nav skip so status shows skipped_navigating.
+        # Attempt path handles tracking skip so status shows skipped_tracking.
         if (
             bool(self._cfg.vision_place_enabled)
             and bool(self._cfg.vision_place_retrieval)
@@ -688,8 +689,9 @@ class VisionSupervisor:
             self._cfg.vision_place_keyframe_min_gap_deg
         )
 
-    def _navigation_active(self) -> bool:
-        fn = self._is_navigation_active
+    def _localization_lost(self) -> bool:
+        """True when SLAM says lost/unknown — the only time place may apply."""
+        fn = self._is_localization_lost
         if fn is None:
             return False
         try:
@@ -702,7 +704,7 @@ class VisionSupervisor:
             bool(self._cfg.vision_place_enabled)
             and bool(self._cfg.vision_place_retrieval)
             and self._vision_apply_allowed()
-            and not self._navigation_active()
+            and self._localization_lost()
             and self._place.keyframe_vlad is not None
             and len(self._place.keyframe_ids) > 0
         )
@@ -710,13 +712,16 @@ class VisionSupervisor:
     def _try_place_retrieval(
         self, descs: np.ndarray, pose: conv.Pose2D
     ) -> None:
-        """Soft coarse pose from top VLAD hit (force=False)."""
+        """Soft coarse relocalization from top VLAD hit (force=False).
+
+        Place is meter-scale and ambiguous — apply only when lost/unknown, never
+        as continuous drift correction while tracking.
+        """
         apply = self._apply_pose_correction
         if apply is None:
             return
-        # Never teleport mid-nav — a wrong place hit yanks the path into walls.
-        if self._navigation_active():
-            self._last_place_retrieval = {"status": "skipped_navigating"}
+        if not self._localization_lost():
+            self._last_place_retrieval = {"status": "skipped_tracking"}
             return
         now = time.monotonic()
         if now - self._last_place_retrieval_mono < float(
@@ -759,18 +764,8 @@ class VisionSupervisor:
                 "jump_deg": round(float(jump_deg), 1),
             }
             return
-        if jump_m > float(self._cfg.vision_place_max_jump_m) or jump_deg > float(
-            self._cfg.vision_place_max_jump_deg
-        ):
-            self._last_place_retrieval = {
-                "status": "rejected_jump",
-                "keyframe_id": int(kid),
-                "score": round(float(score), 3),
-                "jump_m": round(float(jump_m), 3),
-                "jump_deg": round(float(jump_deg), 1),
-            }
-            return
-        # Large teleports need a stronger match than the floor score.
+        # Lost: current pose is untrusted — no relative jump cap. Large
+        # teleports still need a stronger match than the floor score.
         if jump_m >= float(self._cfg.vision_place_large_jump_m) and float(
             score
         ) < float(self._cfg.vision_place_large_jump_min_score):

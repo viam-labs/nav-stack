@@ -1090,12 +1090,14 @@ class SlamConfig:
     vision_place_vocab_size: int = 32
     vision_place_pca_dim: int = 128
     vision_place_min_keyframes_to_fit: int = 8
-    # Coarse pose from top VLAD hit (force=False). Localizing only; mapping
-    # builds the index but does not apply (avoids whole-map shifts).
+    # Coarse relocalization from top VLAD hit (force=False). Applies only when
+    # localization_state is lost/unknown — never as continuous drift correction.
+    # Mapping builds the index but does not apply (avoids whole-map shifts).
     vision_place_retrieval: bool = True
-    # Weak scores (~0.45–0.50) with multi-meter jumps teleport the robot;
-    # keep the floor high and the max jump modest.
+    # Weak scores (~0.45–0.50) are ambiguous corridor twins; keep the floor high.
     vision_place_min_score: float = 0.55
+    # Retained for config compat; lost-only apply drops relative jump caps
+    # (current pose is untrusted). Large jumps still need a stronger score.
     vision_place_max_jump_m: float = 0.75
     vision_place_max_jump_deg: float = 25.0
     # Top hit must beat 2nd by this much or the place is ambiguous (corridor twin).
@@ -1104,7 +1106,6 @@ class SlamConfig:
     vision_place_large_jump_m: float = 0.40
     vision_place_large_jump_min_score: float = 0.75
     vision_place_cooldown_s: float = 3.0
-    # Place apply is always suppressed while a nav goal is active (see supervisor).
     # Height band in base_link (reject floor/ceiling spam). Floor hits from a
     # chest-height RealSense sit near z≈0; keep wall/artwork band only.
     vision_z_min_m: float = 0.25

@@ -2670,6 +2670,11 @@ class SlamService(SLAM):
                 return mgr.apply_map_pose_correction(pose, score=score, force=force)
             return engine.apply_map_pose_correction(pose, score=score, force=force)
 
+        def _is_localization_lost() -> bool:
+            # Place apply only when pose is untrusted (lost) or not yet seeded.
+            state = str(getattr(self._loc_state, "state", "") or "")
+            return state in ("lost", "unknown")
+
         vision = VisionSupervisor(
             cfg=cfg,
             cameras=self._cameras,
@@ -2677,7 +2682,7 @@ class SlamService(SLAM):
             get_pose_at=engine.get_pose_at,
             get_anchor=_anchor,
             apply_pose_correction=_apply_pose_correction,
-            is_navigation_active=self._is_navigation_active,
+            is_localization_lost=_is_localization_lost,
             logger=LOGGER.info,
         )
         store = self._map_store

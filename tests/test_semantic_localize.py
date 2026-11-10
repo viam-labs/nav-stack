@@ -122,7 +122,7 @@ def test_writeback_inactive_while_mapping():
     assert vision._writeback_enabled() is False  # noqa: SLF001
 
 
-def test_place_retrieval_skipped_while_navigating():
+def test_place_retrieval_skipped_while_tracking():
     cfg = _cfg(
         mode="localizing",
         vision_survey_only=False,
@@ -143,19 +143,64 @@ def test_place_retrieval_skipped_while_navigating():
         get_pose_at=lambda _t: pose,
         get_anchor=lambda: (0, pose, {0: pose}),
         apply_pose_correction=apply,
-        is_navigation_active=lambda: True,
+        is_localization_lost=lambda: False,
     )
-    # Seed a fake place hit bank so retrieval would otherwise be enabled.
-    from src.semantic.place import l2_normalize
-    import numpy as np
-
     descs = l2_normalize(np.eye(8, dtype=np.float32))
     vision._place.add_keyframe(1, pose, descs)  # noqa: SLF001
     vision._place.add_keyframe(2, Pose2D(1.0, 0.0, 0.0), descs)  # noqa: SLF001
     assert vision._place_retrieval_enabled() is False  # noqa: SLF001
     vision._try_place_retrieval(descs, pose)  # noqa: SLF001
-    assert vision.status()["place"]["last_retrieval"]["status"] == "skipped_navigating"
+    assert vision.status()["place"]["last_retrieval"]["status"] == "skipped_tracking"
     assert called == []
+
+
+def test_place_retrieval_applies_when_lost_large_jump():
+    """Lost: relative jump cap dropped; strong score may teleport."""
+    cfg = _cfg(
+        mode="localizing",
+        vision_survey_only=False,
+        vision_place_retrieval=True,
+        vision_pose_writeback=True,
+        vision_place_cooldown_s=0.0,
+        vision_place_min_score=0.55,
+        vision_place_large_jump_m=0.40,
+        vision_place_large_jump_min_score=0.75,
+        vision_place_min_score_margin=0.08,
+    )
+    pose = Pose2D(0.0, 0.0, 0.0)
+    target = Pose2D(2.5, 0.0, 0.0)
+    called = []
+
+    def apply(p, *, score=None, force=False):
+        called.append({"pose": p, "score": score, "force": force})
+        return {"applied": True, "status": "pose_only", "shift_m": 2.5, "shift_deg": 0.0}
+
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: pose,
+        get_pose_at=lambda _t: pose,
+        get_anchor=lambda: (0, pose, {0: pose}),
+        apply_pose_correction=apply,
+        is_localization_lost=lambda: True,
+    )
+    # Synthetic blocks apply-allowed even if flags are on.
+    vision._worker.cfg.synthetic = False  # noqa: SLF001
+
+    # Distinct means so unfitted mean-pool VLAD ranks the far keyframe first.
+    rng = np.random.default_rng(7)
+    near = l2_normalize(rng.standard_normal((16, 8)).astype(np.float32))
+    far = l2_normalize(rng.standard_normal((16, 8)).astype(np.float32) + 3.0)
+    vision._place.add_keyframe(1, pose, near)  # noqa: SLF001
+    vision._place.add_keyframe(2, target, far)  # noqa: SLF001
+    assert vision._place_retrieval_enabled() is True  # noqa: SLF001
+    vision._try_place_retrieval(far, pose)  # noqa: SLF001
+    last = vision.status()["place"]["last_retrieval"]
+    assert last["status"] == "applied", last
+    assert last["jump_m"] == pytest.approx(2.5, abs=0.01)
+    assert len(called) == 1
+    assert called[0]["force"] is False
+    assert called[0]["pose"].x == pytest.approx(2.5)
 
 
 def test_writeback_applies_when_enabled(tmp_path):

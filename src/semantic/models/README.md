@@ -90,17 +90,16 @@ With `vision_enabled: true` the defaults are:
 
 - **mapping**: build landmarks + VLAD place index only (never apply pose —
   applying during mapping can shift the whole occupancy map)
-- **localizing**: soft-apply place retrieval (coarse) then landmark writeback
-  (fine), both via `apply_map_pose_correction(force=False)`
+- **localizing + tracking/degraded**: landmark writeback only (fine)
+- **localizing + lost/unknown**: place retrieval (coarse relocalization), then
+  landmark writeback — both via `apply_map_pose_correction(force=False)`
 
 You should not need to flip `vision_pose_writeback` / `vision_place_retrieval`
 when switching modes. Check `vision_status.pose_writeback_active` and
-`place.retrieval_active` (false while mapping or mid-nav; true while
-localizing and idle).
+`place.retrieval_active` (true only while localizing **and** lost/unknown).
 
-Place retrieval is **suppressed during active navigation** so a wrong
-scene match cannot yank the path into walls. Landmark writeback may still
-run for small corrections.
+Place is meter-scale and ambiguous — it recovers when SLAM reports lost, it
+does not nudge pose while tracking. Landmark writeback handles fine drift.
 
 Kill switch if needed: `"vision_survey_only": true` (build only, never apply).
 
