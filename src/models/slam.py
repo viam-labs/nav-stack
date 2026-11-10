@@ -2677,6 +2677,7 @@ class SlamService(SLAM):
             get_pose_at=engine.get_pose_at,
             get_anchor=_anchor,
             apply_pose_correction=_apply_pose_correction,
+            is_navigation_active=self._is_navigation_active,
             logger=LOGGER.info,
         )
         store = self._map_store

@@ -95,7 +95,12 @@ With `vision_enabled: true` the defaults are:
 
 You should not need to flip `vision_pose_writeback` / `vision_place_retrieval`
 when switching modes. Check `vision_status.pose_writeback_active` and
-`place.retrieval_active` (false while mapping, true while localizing).
+`place.retrieval_active` (false while mapping or mid-nav; true while
+localizing and idle).
+
+Place retrieval is **suppressed during active navigation** so a wrong
+scene match cannot yank the path into walls. Landmark writeback may still
+run for small corrections.
 
 Kill switch if needed: `"vision_survey_only": true` (build only, never apply).
 

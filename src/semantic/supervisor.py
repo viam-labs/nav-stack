@@ -44,6 +44,7 @@ PoseAtProvider = Callable[[float], Optional[conv.Pose2D]]
 AnchorProvider = Callable[[], Tuple[int, conv.Pose2D, Dict[int, conv.Pose2D]]]
 # Same signature as BuiltinSlamHost.apply_map_pose_correction (force always False).
 PoseCorrection = Callable[..., Dict[str, Any]]
+NavActiveProvider = Callable[[], bool]
 
 # Fetched by setup.sh / run.sh next to this package (same pattern as DINOv2).
 _DEFAULT_YOLO_WORLD_ONNX = "yolov8s-worldv2-indoor.onnx"
@@ -61,6 +62,7 @@ class VisionSupervisor:
         get_pose_at: PoseAtProvider,
         get_anchor: AnchorProvider,
         apply_pose_correction: Optional[PoseCorrection] = None,
+        is_navigation_active: Optional[NavActiveProvider] = None,
         logger=None,
     ):
         self._cfg = cfg
@@ -69,6 +71,7 @@ class VisionSupervisor:
         self._get_pose_at = get_pose_at
         self._get_anchor = get_anchor
         self._apply_pose_correction = apply_pose_correction
+        self._is_navigation_active = is_navigation_active
         self._logger = logger
         self._lock = threading.Lock()
         self._task: Optional[asyncio.Task] = None
@@ -665,7 +668,14 @@ class VisionSupervisor:
                     "keyframes": len(self._place.keyframe_ids),
                 }
 
-        if self._place_retrieval_enabled():
+        # Attempt path handles nav skip so status shows skipped_navigating.
+        if (
+            bool(self._cfg.vision_place_enabled)
+            and bool(self._cfg.vision_place_retrieval)
+            and self._vision_apply_allowed()
+            and self._place.keyframe_vlad is not None
+            and len(self._place.keyframe_ids) > 0
+        ):
             self._try_place_retrieval(descs, pose)
 
     def _should_add_place_keyframe(self, pose: conv.Pose2D) -> bool:
@@ -678,11 +688,21 @@ class VisionSupervisor:
             self._cfg.vision_place_keyframe_min_gap_deg
         )
 
+    def _navigation_active(self) -> bool:
+        fn = self._is_navigation_active
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _place_retrieval_enabled(self) -> bool:
         return (
             bool(self._cfg.vision_place_enabled)
             and bool(self._cfg.vision_place_retrieval)
             and self._vision_apply_allowed()
+            and not self._navigation_active()
             and self._place.keyframe_vlad is not None
             and len(self._place.keyframe_ids) > 0
         )
@@ -693,6 +713,10 @@ class VisionSupervisor:
         """Soft coarse pose from top VLAD hit (force=False)."""
         apply = self._apply_pose_correction
         if apply is None:
+            return
+        # Never teleport mid-nav — a wrong place hit yanks the path into walls.
+        if self._navigation_active():
+            self._last_place_retrieval = {"status": "skipped_navigating"}
             return
         now = time.monotonic()
         if now - self._last_place_retrieval_mono < float(

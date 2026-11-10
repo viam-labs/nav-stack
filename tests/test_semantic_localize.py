@@ -122,6 +122,42 @@ def test_writeback_inactive_while_mapping():
     assert vision._writeback_enabled() is False  # noqa: SLF001
 
 
+def test_place_retrieval_skipped_while_navigating():
+    cfg = _cfg(
+        mode="localizing",
+        vision_survey_only=False,
+        vision_place_retrieval=True,
+        vision_pose_writeback=True,
+    )
+    pose = Pose2D(0.0, 0.0, 0.0)
+    called = []
+
+    def apply(p, *, score=None, force=False):
+        called.append(p)
+        return {"applied": True, "status": "pose_only"}
+
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: pose,
+        get_pose_at=lambda _t: pose,
+        get_anchor=lambda: (0, pose, {0: pose}),
+        apply_pose_correction=apply,
+        is_navigation_active=lambda: True,
+    )
+    # Seed a fake place hit bank so retrieval would otherwise be enabled.
+    from src.semantic.place import l2_normalize
+    import numpy as np
+
+    descs = l2_normalize(np.eye(8, dtype=np.float32))
+    vision._place.add_keyframe(1, pose, descs)  # noqa: SLF001
+    vision._place.add_keyframe(2, Pose2D(1.0, 0.0, 0.0), descs)  # noqa: SLF001
+    assert vision._place_retrieval_enabled() is False  # noqa: SLF001
+    vision._try_place_retrieval(descs, pose)  # noqa: SLF001
+    assert vision.status()["place"]["last_retrieval"]["status"] == "skipped_navigating"
+    assert called == []
+
+
 def test_writeback_applies_when_enabled(tmp_path):
     cfg = _cfg(
         mode="localizing",
