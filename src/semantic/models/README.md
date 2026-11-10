@@ -97,6 +97,25 @@ Uses confirmed landmarks → RANSAC rigid fit → `apply_map_pose_correction`
 (`force=False`, lidar revisit path). Synthetic / survey-only never write pose.
 Watch `vision_status.writeback` (`attempts` / `applied` / `last`).
 
+## VLAD place retrieval (opt-in apply)
+
+During mapping/survey, vision builds a **place index** (`place_index.npz`):
+keyframes every ~0.75 m / 25° with a VLAD over DINOv2 patches. After enough
+keyframes it fits PCA + a small vocabulary. `vision_status.place` shows
+`keyframes`, `fitted`, and `last_query` (top hit + score) automatically when
+`vision_place_enabled` is true (default).
+
+To let a strong place hit softly correct pose (coarse; landmark writeback
+still does fine alignment):
+
+```json
+"vision_survey_only": false,
+"vision_place_retrieval": true,
+"vision_pose_writeback": true
+```
+
+Watch `vision_status.place.retrieval_applied` / `last_retrieval`.
+
 ## Survey density / nav load (rc2+)
 
 Defaults assume a density pilot, not pose writeback:

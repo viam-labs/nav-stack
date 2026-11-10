@@ -117,6 +117,7 @@ class MapHandle:
             self.root / "map.pgm",
             self.root / "keyframes.npz",
             self.root / "embedding_landmarks.npz",
+            self.root / "place_index.npz",
             self.last_pose_path,
         ):
             if path.exists():

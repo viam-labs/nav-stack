@@ -1082,6 +1082,20 @@ class SlamConfig:
     # Indoor FOV rarely sees ≥8 landmarks at once; 3 is enough for a 2D rigid fit.
     vision_pose_writeback_min_inliers: int = 3
     vision_pose_writeback_cooldown_s: float = 2.0
+    # VLAD place index: build keyframes during survey/mapping (no pose writes).
+    vision_place_enabled: bool = True
+    vision_place_keyframe_min_gap_m: float = 0.75
+    vision_place_keyframe_min_gap_deg: float = 25.0
+    vision_place_vocab_size: int = 32
+    vision_place_pca_dim: int = 128
+    vision_place_min_keyframes_to_fit: int = 8
+    # Opt-in coarse pose from top VLAD hit (force=False). Landmark writeback
+    # still does the fine correction afterward when both are on.
+    vision_place_retrieval: bool = False
+    vision_place_min_score: float = 0.45
+    vision_place_max_jump_m: float = 8.0
+    vision_place_max_jump_deg: float = 90.0
+    vision_place_cooldown_s: float = 3.0
     # Height band in base_link (reject floor/ceiling spam). Floor hits from a
     # chest-height RealSense sit near z≈0; keep wall/artwork band only.
     vision_z_min_m: float = 0.25

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -23,7 +24,13 @@ from .detect_landmarks import observations_from_detections
 from .landmarks import EmbeddingLandmarkMap
 from .localize import estimate_landmark_fix, match_live_to_landmarks
 from .patches import PatchObservation, backproject_patches, subsample_observations
-from .persist import load_landmarks, save_landmarks
+from .persist import (
+    load_landmarks,
+    load_place_index,
+    save_landmarks,
+    save_place_index,
+)
+from .place import PlaceIndex, descriptors_from_patches
 from .types import CameraIntrinsics, Detection, PatchToken, VisionFrame, VisionResult
 from .worker import VisionWorker, WorkerConfig
 
@@ -101,6 +108,17 @@ class VisionSupervisor:
         self._last_writeback: Optional[dict] = None
         self._last_detection_obs = 0
         self._last_detection_boxes = 0
+        self._place = PlaceIndex(
+            cosine_threshold=float(cfg.vision_place_min_score)
+        )
+        self._place_next_id = 1
+        self._place_last_pose: Optional[conv.Pose2D] = None
+        self._place_fit_attempted = False
+        self._last_place_query: Optional[dict] = None
+        self._place_retrieval_attempts = 0
+        self._place_retrieval_applied = 0
+        self._last_place_retrieval: Optional[dict] = None
+        self._last_place_retrieval_mono = 0.0
 
         input_size = int(cfg.vision_input_size) if not want_synthetic else 224
         if input_size < 14:
@@ -178,26 +196,47 @@ class VisionSupervisor:
 
     def load_from_map_dir(self, map_dir) -> bool:
         loaded = load_landmarks(map_dir)
-        if loaded is None:
-            return False
+        place = load_place_index(map_dir)
+        ok = False
         with self._lock:
-            # Keep live merge / height settings; only restore landmark rows.
-            loaded.associate_radius_m = self._landmarks.associate_radius_m
-            loaded.cell_m = self._landmarks.cell_m
-            loaded.require_descriptor_match = self._landmarks.require_descriptor_match
-            loaded.candidate_cosine_threshold = (
-                self._landmarks.candidate_cosine_threshold
+            if loaded is not None:
+                # Keep live merge / height settings; only restore landmark rows.
+                loaded.associate_radius_m = self._landmarks.associate_radius_m
+                loaded.cell_m = self._landmarks.cell_m
+                loaded.require_descriptor_match = self._landmarks.require_descriptor_match
+                loaded.candidate_cosine_threshold = (
+                    self._landmarks.candidate_cosine_threshold
+                )
+                loaded.cosine_threshold = self._landmarks.cosine_threshold
+                loaded.demote_passes = self._landmarks.demote_passes
+                loaded.rebuild_cell_index()
+                self._landmarks = loaded
+                ok = True
+            if place is not None:
+                place.cosine_threshold = float(self._cfg.vision_place_min_score)
+                self._place = place
+                self._place_next_id = (
+                    max(self._place.keyframe_ids) + 1
+                    if self._place.keyframe_ids
+                    else 1
+                )
+                self._place_fit_attempted = bool(place.fitted)
+                ok = True
+        if loaded is not None:
+            self._log(f"vision: loaded {len(loaded)} landmarks from {map_dir}")
+        if place is not None:
+            self._log(
+                f"vision: loaded place index keyframes={len(place.keyframe_ids)} "
+                f"fitted={place.fitted} from {map_dir}"
             )
-            loaded.cosine_threshold = self._landmarks.cosine_threshold
-            loaded.demote_passes = self._landmarks.demote_passes
-            loaded.rebuild_cell_index()
-            self._landmarks = loaded
-        self._log(f"vision: loaded {len(loaded)} landmarks from {map_dir}")
-        return True
+        return ok
 
     def save_to_map_dir(self, map_dir) -> Optional[str]:
         with self._lock:
             path = save_landmarks(map_dir, self._landmarks)
+            place_path = save_place_index(map_dir, self._place)
+        if place_path is not None:
+            self._log(f"vision: saved place index → {place_path}")
         return str(path) if path is not None else None
 
     def reset_landmarks(self) -> None:
@@ -210,6 +249,16 @@ class VisionSupervisor:
                 require_descriptor_match=not synthetic,
                 demote_passes=5 if synthetic else 3,
             )
+            self._place = PlaceIndex(
+                cosine_threshold=float(self._cfg.vision_place_min_score)
+            )
+            self._place_next_id = 1
+            self._place_last_pose = None
+            self._place_fit_attempted = False
+            self._last_place_query = None
+            self._place_retrieval_attempts = 0
+            self._place_retrieval_applied = 0
+            self._last_place_retrieval = None
             self._observations = 0
             self._frames = 0
             self._last_result = None
@@ -320,6 +369,15 @@ class VisionSupervisor:
                     "applied": self._writeback_applied,
                     "last": self._last_writeback,
                 },
+                "place": {
+                    "enabled": bool(self._cfg.vision_place_enabled),
+                    "retrieval": bool(self._cfg.vision_place_retrieval),
+                    **self._place.status_dict(),
+                    "last_query": self._last_place_query,
+                    "retrieval_attempts": self._place_retrieval_attempts,
+                    "retrieval_applied": self._place_retrieval_applied,
+                    "last_retrieval": self._last_place_retrieval,
+                },
             }
 
     def _writeback_enabled(self) -> bool:
@@ -336,6 +394,8 @@ class VisionSupervisor:
         with self._lock:
             self._last_result = result
             self._frames += 1
+        if self._cfg.vision_place_enabled:
+            self._place_tick(frame, result, allow_keyframe=bool(mapping))
         if mapping:
             self._survey(frame, result)
         return result
@@ -392,6 +452,17 @@ class VisionSupervisor:
                     or self._cfg.vision_survey_only
                     or self._writeback_enabled()
                 )
+                # Place VLAD: keyframe while mapping/surveying; query always when on.
+                allow_place_kf = (
+                    self._cfg.mode == MODE_MAPPING or self._cfg.vision_survey_only
+                )
+                if self._cfg.vision_place_enabled:
+                    await asyncio.to_thread(
+                        self._place_tick,
+                        frame,
+                        result,
+                        allow_keyframe=allow_place_kf,
+                    )
                 if do_survey:
                     await asyncio.to_thread(self._survey, frame, result)
             finally:
@@ -514,6 +585,166 @@ class VisionSupervisor:
             captured_at=captured_at,
             lidar=lidar,
             intrinsics=K,
+        )
+
+    def _place_tick(
+        self,
+        frame: VisionFrame,
+        result: VisionResult,
+        *,
+        allow_keyframe: bool,
+    ) -> None:
+        """Build / query the VLAD place index from live patch tokens."""
+        descs = descriptors_from_patches(result.patches, max_patches=64)
+        if descs is None:
+            return
+        pose = self._get_pose_at(float(frame.captured_at)) or self._get_pose()
+
+        with self._lock:
+            if allow_keyframe and self._should_add_place_keyframe(pose):
+                kid = int(self._place_next_id)
+                self._place_next_id += 1
+                self._place.add_keyframe(kid, pose, descs)
+                self._place_last_pose = pose
+                # Fit once we have enough travel keyframes.
+                if (
+                    not self._place.fitted
+                    and len(self._place.keyframe_ids)
+                    >= int(self._cfg.vision_place_min_keyframes_to_fit)
+                ):
+                    ok = self._place.fit(
+                        n_clusters=int(self._cfg.vision_place_vocab_size),
+                        pca_dim=int(self._cfg.vision_place_pca_dim),
+                    )
+                    self._place_fit_attempted = True
+                    if ok:
+                        self._log(
+                            f"vision place: fitted vocab "
+                            f"k={self._cfg.vision_place_vocab_size} "
+                            f"pca={self._cfg.vision_place_pca_dim} "
+                            f"keyframes={len(self._place.keyframe_ids)}"
+                        )
+
+            hits = self._place.query(descs, top_k=3)
+            if hits:
+                kid, hit_pose, score = hits[0]
+                jump_m = math.hypot(hit_pose.x - pose.x, hit_pose.y - pose.y)
+                jump_deg = abs(
+                    math.degrees(conv.normalize_angle(hit_pose.theta - pose.theta))
+                )
+                self._last_place_query = {
+                    "keyframe_id": int(kid),
+                    "score": round(float(score), 3),
+                    "pose": {
+                        "x": round(float(hit_pose.x), 3),
+                        "y": round(float(hit_pose.y), 3),
+                        "theta_deg": round(math.degrees(float(hit_pose.theta)), 1),
+                    },
+                    "jump_m": round(float(jump_m), 3),
+                    "jump_deg": round(float(jump_deg), 1),
+                    "hits": len(hits),
+                    "fitted": bool(self._place.fitted),
+                    "keyframes": len(self._place.keyframe_ids),
+                }
+            else:
+                self._last_place_query = {
+                    "status": "no_hit",
+                    "fitted": bool(self._place.fitted),
+                    "keyframes": len(self._place.keyframe_ids),
+                }
+
+        if self._place_retrieval_enabled():
+            self._try_place_retrieval(descs, pose)
+
+    def _should_add_place_keyframe(self, pose: conv.Pose2D) -> bool:
+        last = self._place_last_pose
+        if last is None:
+            return True
+        gap_m = math.hypot(pose.x - last.x, pose.y - last.y)
+        gap_deg = abs(math.degrees(conv.normalize_angle(pose.theta - last.theta)))
+        return gap_m >= float(self._cfg.vision_place_keyframe_min_gap_m) or gap_deg >= float(
+            self._cfg.vision_place_keyframe_min_gap_deg
+        )
+
+    def _place_retrieval_enabled(self) -> bool:
+        return (
+            bool(self._cfg.vision_place_enabled)
+            and bool(self._cfg.vision_place_retrieval)
+            and not bool(self._cfg.vision_survey_only)
+            and self._apply_pose_correction is not None
+            and not bool(self._worker.cfg.synthetic)
+            and self._place.keyframe_vlad is not None
+            and len(self._place.keyframe_ids) > 0
+        )
+
+    def _try_place_retrieval(
+        self, descs: np.ndarray, pose: conv.Pose2D
+    ) -> None:
+        """Soft coarse pose from top VLAD hit (force=False)."""
+        apply = self._apply_pose_correction
+        if apply is None:
+            return
+        now = time.monotonic()
+        if now - self._last_place_retrieval_mono < float(
+            self._cfg.vision_place_cooldown_s
+        ):
+            return
+        self._last_place_retrieval_mono = now
+        self._place_retrieval_attempts += 1
+
+        with self._lock:
+            hits = self._place.query(descs, top_k=1)
+        if not hits:
+            self._last_place_retrieval = {"status": "no_hit"}
+            return
+        kid, hit_pose, score = hits[0]
+        jump_m = math.hypot(hit_pose.x - pose.x, hit_pose.y - pose.y)
+        jump_deg = abs(
+            math.degrees(conv.normalize_angle(hit_pose.theta - pose.theta))
+        )
+        # Ignore tiny / no-op corrections (already near the place).
+        if jump_m < 0.25 and jump_deg < 5.0:
+            self._last_place_retrieval = {
+                "status": "skipped_small",
+                "keyframe_id": int(kid),
+                "score": round(float(score), 3),
+                "jump_m": round(float(jump_m), 3),
+                "jump_deg": round(float(jump_deg), 1),
+            }
+            return
+        if jump_m > float(self._cfg.vision_place_max_jump_m) or jump_deg > float(
+            self._cfg.vision_place_max_jump_deg
+        ):
+            self._last_place_retrieval = {
+                "status": "rejected_jump",
+                "keyframe_id": int(kid),
+                "score": round(float(score), 3),
+                "jump_m": round(float(jump_m), 3),
+                "jump_deg": round(float(jump_deg), 1),
+            }
+            return
+        try:
+            result = apply(hit_pose, score=float(score), force=False)
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"place_retrieval: {exc}"
+            self._last_place_retrieval = {"status": "error", "error": repr(exc)}
+            return
+        applied = bool(result.get("applied"))
+        if applied:
+            self._place_retrieval_applied += 1
+        self._last_place_retrieval = {
+            "status": "applied" if applied else str(result.get("status", "not_applied")),
+            "keyframe_id": int(kid),
+            "score": round(float(score), 3),
+            "jump_m": round(float(jump_m), 3),
+            "jump_deg": round(float(jump_deg), 1),
+            "shift_m": result.get("shift_m"),
+            "shift_deg": result.get("shift_deg"),
+            "slam_status": result.get("status"),
+        }
+        self._log(
+            f"vision place retrieval: {self._last_place_retrieval['status']} "
+            f"kf={kid} score={score:.2f} jump={jump_m:.2f}m/{jump_deg:.1f}deg"
         )
 
     def _survey(self, frame: VisionFrame, result: VisionResult) -> None:
