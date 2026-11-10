@@ -703,7 +703,7 @@ class VisionSupervisor:
         self._place_retrieval_attempts += 1
 
         with self._lock:
-            hits = self._place.query(descs, top_k=1)
+            hits = self._place.query(descs, top_k=3)
         if not hits:
             self._last_place_retrieval = {"status": "no_hit"}
             return
@@ -712,12 +712,25 @@ class VisionSupervisor:
         jump_deg = abs(
             math.degrees(conv.normalize_angle(hit_pose.theta - pose.theta))
         )
+        margin = float(self._cfg.vision_place_min_score_margin)
+        second = float(hits[1][2]) if len(hits) > 1 else None
         # Ignore tiny / no-op corrections (already near the place).
         if jump_m < 0.25 and jump_deg < 5.0:
             self._last_place_retrieval = {
                 "status": "skipped_small",
                 "keyframe_id": int(kid),
                 "score": round(float(score), 3),
+                "jump_m": round(float(jump_m), 3),
+                "jump_deg": round(float(jump_deg), 1),
+            }
+            return
+        if second is not None and (float(score) - second) < margin:
+            self._last_place_retrieval = {
+                "status": "rejected_ambiguous",
+                "keyframe_id": int(kid),
+                "score": round(float(score), 3),
+                "second_score": round(second, 3),
+                "margin": round(margin, 3),
                 "jump_m": round(float(jump_m), 3),
                 "jump_deg": round(float(jump_deg), 1),
             }
@@ -729,6 +742,19 @@ class VisionSupervisor:
                 "status": "rejected_jump",
                 "keyframe_id": int(kid),
                 "score": round(float(score), 3),
+                "jump_m": round(float(jump_m), 3),
+                "jump_deg": round(float(jump_deg), 1),
+            }
+            return
+        # Large teleports need a stronger match than the floor score.
+        if jump_m >= float(self._cfg.vision_place_large_jump_m) and float(
+            score
+        ) < float(self._cfg.vision_place_large_jump_min_score):
+            self._last_place_retrieval = {
+                "status": "rejected_weak_for_jump",
+                "keyframe_id": int(kid),
+                "score": round(float(score), 3),
+                "need_score": float(self._cfg.vision_place_large_jump_min_score),
                 "jump_m": round(float(jump_m), 3),
                 "jump_deg": round(float(jump_deg), 1),
             }

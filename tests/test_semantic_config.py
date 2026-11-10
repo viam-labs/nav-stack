@@ -61,6 +61,8 @@ def test_vision_density_defaults():
     assert cfg.vision_pose_writeback_min_inliers == 2
     assert cfg.vision_place_enabled is True
     assert cfg.vision_place_retrieval is True
+    assert cfg.vision_place_min_score == 0.55
+    assert cfg.vision_place_max_jump_m == 1.5
     assert cfg.vision_prefer_detections is True
     assert cfg.vision_dense_fallback_patches == 0
     assert cfg.vision_yolo_conf == 0.10

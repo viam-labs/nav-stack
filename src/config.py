@@ -1093,9 +1093,16 @@ class SlamConfig:
     # Coarse pose from top VLAD hit (force=False). Localizing only; mapping
     # builds the index but does not apply (avoids whole-map shifts).
     vision_place_retrieval: bool = True
-    vision_place_min_score: float = 0.45
-    vision_place_max_jump_m: float = 8.0
-    vision_place_max_jump_deg: float = 90.0
+    # Weak scores (~0.45–0.50) with multi-meter jumps teleport the robot;
+    # keep the floor high and the max jump modest.
+    vision_place_min_score: float = 0.55
+    vision_place_max_jump_m: float = 1.5
+    vision_place_max_jump_deg: float = 35.0
+    # Top hit must beat 2nd by this much or the place is ambiguous (corridor twin).
+    vision_place_min_score_margin: float = 0.08
+    # Jumps above this require an even stronger score (see supervisor).
+    vision_place_large_jump_m: float = 0.75
+    vision_place_large_jump_min_score: float = 0.70
     vision_place_cooldown_s: float = 3.0
     # Height band in base_link (reject floor/ceiling spam). Floor hits from a
     # chest-height RealSense sit near z≈0; keep wall/artwork band only.
