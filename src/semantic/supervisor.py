@@ -951,12 +951,26 @@ class VisionSupervisor:
                     "confirmed": confirmed,
                 }
                 return
-            visible = self._landmarks.visible_set(
+            # Match pool = image-projected confirmed (same cull as landmark-camera).
+            # Keep frustum count as a diagnostic for the old facing filter.
+            visible_frustum = self._landmarks.visible_set(
                 pose,
                 pose_of_node,
                 camera_xy=(float(frame.mount_x), float(frame.mount_y)),
                 camera_yaw=float(frame.mount_theta),
                 fov_deg=87.0,
+                max_range_m=float(self._cfg.landmark_fix_max_range_m),
+            )
+            visible = self._landmarks.image_visible_set(
+                pose,
+                pose_of_node,
+                intrinsics=frame.intrinsics,
+                mount_x=float(frame.mount_x),
+                mount_y=float(frame.mount_y),
+                mount_z=float(frame.mount_z),
+                mount_theta=float(frame.mount_theta),
+                mount_pitch=float(frame.mount_pitch),
+                mount_roll=float(frame.mount_roll),
                 max_range_m=float(self._cfg.landmark_fix_max_range_m),
             )
             cosine_thr = float(self._landmarks.cosine_threshold)
@@ -995,6 +1009,8 @@ class VisionSupervisor:
                 "pairs": pairs,
                 "min_inliers": min_inliers,
                 "visible": len(visible),
+                "visible_image": len(visible),
+                "visible_frustum": len(visible_frustum),
                 "confirmed": confirmed,
                 "match": diag,
             }
@@ -1031,6 +1047,9 @@ class VisionSupervisor:
             "residual_m": round(float(fix.fit.residual_rmse_m), 4),
             "inliers": int(fix.fit.inliers.sum()),
             "pairs": fix.n_pairs,
+            "visible": len(visible),
+            "visible_image": len(visible),
+            "visible_frustum": len(visible_frustum),
             "shift_m": result.get("shift_m"),
             "shift_deg": result.get("shift_deg"),
             "slam_status": result.get("status"),

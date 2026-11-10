@@ -107,6 +107,8 @@ Kill switch if needed: `"vision_survey_only": true` (build only, never apply).
 
 Watch `vision_status.writeback` and `vision_status.place`.
 
+Writeback `visible` / `visible_image` counts confirmed landmarks that project into the camera image (same cull as landmark-camera greens). `visible_frustum` is the older facing-filtered count for comparison.
+
 ## Survey density / nav load (rc2+)
 
 Defaults assume a density pilot, not pose writeback:

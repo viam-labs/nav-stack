@@ -260,13 +260,17 @@ def test_writeback_applies_when_enabled(tmp_path):
     obs = [
         _obs(1.0 + 0.1 * i, 0.05 * (i % 3 - 1), 1.0, descs[i]) for i in range(10)
     ]
+    # Realistic image size so landmarks at z≈1 m project into-frame for
+    # image_visible_set (tiny 8x8 FOV puts them above the image).
     frame = VisionFrame(
         camera_name="depth-cam",
         stamp=0.0,
         captured_at=0.0,
-        color_rgb=np.zeros((8, 8, 3), dtype=np.uint8),
-        depth_m=np.ones((8, 8), dtype=np.float32),
-        intrinsics=CameraIntrinsics(fx=100, fy=100, cx=4, cy=4, width=8, height=8),
+        color_rgb=np.zeros((240, 320, 3), dtype=np.uint8),
+        depth_m=np.ones((240, 320), dtype=np.float32),
+        intrinsics=CameraIntrinsics(
+            fx=300, fy=300, cx=160, cy=120, width=320, height=240
+        ),
         mount_x=0.1,
         mount_z=0.4,
     )

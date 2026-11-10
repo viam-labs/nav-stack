@@ -9,7 +9,7 @@ from src.geom.conversions import Pose2D
 from src.semantic.fit import fit_rigid_2d
 from src.semantic.landmarks import EmbeddingLandmark, EmbeddingLandmarkMap
 from src.semantic.place import PlaceIndex, fit_pca, fit_vocabulary, l2_normalize
-from src.semantic.types import LandmarkStatus
+from src.semantic.types import CameraIntrinsics, LandmarkStatus
 
 
 def test_spatial_merge_without_descriptor_match():
@@ -540,3 +540,67 @@ def test_place_index_query_top_k():
     hits = index.query(a[:20], top_k=2)
     assert hits
     assert hits[0][0] == 0
+
+
+def test_image_visible_includes_facing_away():
+    """Overlay-style projection keeps landmarks that facing-cull drops."""
+    store = EmbeddingLandmarkMap()
+    lm = EmbeddingLandmark(
+        landmark_id=1,
+        anchor_node=0,
+        rel_xyz=np.array([2.0, 0.0, 1.0]),
+        # Faces +x (away from robot at origin looking +x) → fails facing gate.
+        normal_rel=np.array([1.0, 0.0, 0.0]),
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptors=[l2_normalize(np.ones(8, dtype=np.float32))],
+        observations=5,
+        status=LandmarkStatus.CONFIRMED,
+    )
+    store._landmarks[1] = lm  # noqa: SLF001
+    store._index_add(lm, lm.map_xyz)  # noqa: SLF001
+    pose = Pose2D(0.0, 0.0, 0.0)
+    nodes = {0: Pose2D(0.0, 0.0, 0.0)}
+    K = CameraIntrinsics(fx=200, fy=200, cx=160, cy=120, width=320, height=240)
+    frustum = store.visible_set(
+        pose, nodes, camera_xy=(0.1, 0.0), camera_yaw=0.0, max_range_m=4.0
+    )
+    image = store.image_visible_set(
+        pose,
+        nodes,
+        intrinsics=K,
+        mount_x=0.1,
+        mount_z=0.4,
+        max_range_m=4.0,
+    )
+    assert frustum == []
+    assert len(image) == 1
+    assert image[0][0].landmark_id == 1
+
+
+def test_image_visible_excludes_behind_camera():
+    store = EmbeddingLandmarkMap()
+    lm = EmbeddingLandmark(
+        landmark_id=2,
+        anchor_node=0,
+        rel_xyz=np.array([-2.0, 0.0, 1.0]),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array([-2.0, 0.0, 1.0]),
+        descriptors=[l2_normalize(np.ones(8, dtype=np.float32))],
+        observations=5,
+        status=LandmarkStatus.CONFIRMED,
+    )
+    store._landmarks[2] = lm  # noqa: SLF001
+    store._index_add(lm, lm.map_xyz)  # noqa: SLF001
+    pose = Pose2D(0.0, 0.0, 0.0)
+    nodes = {0: Pose2D(0.0, 0.0, 0.0)}
+    K = CameraIntrinsics(fx=200, fy=200, cx=160, cy=120, width=320, height=240)
+    image = store.image_visible_set(
+        pose,
+        nodes,
+        intrinsics=K,
+        mount_x=0.1,
+        mount_z=0.4,
+        max_range_m=4.0,
+    )
+    assert image == []
+

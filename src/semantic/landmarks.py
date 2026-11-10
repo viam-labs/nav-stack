@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..geom import conversions as conv
-from .types import LandmarkStatus
+from .types import CameraIntrinsics, LandmarkStatus
 
 
 @dataclass
@@ -874,6 +874,68 @@ class EmbeddingLandmarkMap:
             nx /= nn
             ny /= nn
             if nx * toward_x + ny * toward_y < math.cos(max_facing):
+                continue
+            out.append((lm, mxyz))
+        return out
+
+    def image_visible_set(
+        self,
+        robot_pose: conv.Pose2D,
+        pose_of_node: Dict[int, conv.Pose2D],
+        *,
+        intrinsics: CameraIntrinsics,
+        mount_x: float = 0.0,
+        mount_y: float = 0.0,
+        mount_z: float = 0.0,
+        mount_theta: float = 0.0,
+        mount_pitch: float = 0.0,
+        mount_roll: float = 0.0,
+        max_range_m: float = 4.0,
+        margin_px: float = 20.0,
+    ) -> List[Tuple[EmbeddingLandmark, np.ndarray]]:
+        """Confirmed landmarks that project into the camera image.
+
+        Matches landmark-camera overlay culling (image projection), not the
+        stricter frustum+facing filter in ``visible_set``. Used for writeback
+        pairing so greens on the overlay can form inliers.
+        """
+        # Lazy import: viz already depends on landmarks.
+        from ..viz.landmarks_view import project_map_point_to_pixel
+
+        w = int(intrinsics.width)
+        h = int(intrinsics.height)
+        margin = float(margin_px)
+        cx = robot_pose.x + math.cos(robot_pose.theta) * float(mount_x) - math.sin(
+            robot_pose.theta
+        ) * float(mount_y)
+        cy = robot_pose.y + math.sin(robot_pose.theta) * float(mount_x) + math.cos(
+            robot_pose.theta
+        ) * float(mount_y)
+        out: List[Tuple[EmbeddingLandmark, np.ndarray]] = []
+        for lm in self.confirmed():
+            assoc = self.association_map_xyz(lm)
+            if assoc is not None:
+                mxyz = assoc
+            else:
+                mxyz = self.resolved_map_xyz(lm, pose_of_node)
+            dist = math.hypot(float(mxyz[0]) - cx, float(mxyz[1]) - cy)
+            if dist < 0.2 or dist > float(max_range_m):
+                continue
+            proj = project_map_point_to_pixel(
+                mxyz,
+                robot_pose=robot_pose,
+                intrinsics=intrinsics,
+                mount_x=float(mount_x),
+                mount_y=float(mount_y),
+                mount_z=float(mount_z),
+                mount_theta=float(mount_theta),
+                mount_pitch=float(mount_pitch),
+                mount_roll=float(mount_roll),
+            )
+            if proj is None:
+                continue
+            u, v, _depth = proj
+            if u < -margin or v < -margin or u > w + margin or v > h + margin:
                 continue
             out.append((lm, mxyz))
         return out
