@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from src.semantic.detect_landmarks import (
+    SKIP_MIXED_DEPTH,
+    SKIP_RANGE,
+    SKIP_SPARSE_DEPTH,
+    box_surface_point,
     observations_from_detections,
     pool_descriptor,
 )
@@ -163,3 +169,115 @@ def test_detection_obs_with_single_token():
         min_patches=1,
     )
     assert len(obs) == 1
+
+
+def _box(frame: VisionFrame, x0, y0, x1, y1):
+    return box_surface_point(frame, x0, y0, x1, y1, z_min_m=0.25, z_max_m=2.0)
+
+
+def test_box_surface_takes_the_majority_surface():
+    """A painting with a strip of nearer clutter still lands on the painting."""
+    frame = _frame_with_wall(depth_m=3.0)
+    # A chair back pokes into the bottom fifth of the box core.
+    frame.depth_m[150:180, 100:220] = 1.2
+    surface, why = _box(frame, 100, 60, 220, 180)
+    assert why is None and surface is not None
+    assert surface.depth_m == pytest.approx(3.0, abs=0.02)
+    assert surface.point_base[0] == pytest.approx(3.2, abs=0.05)
+    assert 0.6 <= surface.support < 1.0
+    # Wall faces the camera: normal points back along -x in base_link.
+    assert surface.normal_base[0] < -0.9
+
+
+def test_box_surface_skips_two_surfaces_without_majority():
+    """Half object, half background: a median would be a point on neither."""
+    frame = _frame_with_wall(depth_m=3.0)
+    frame.depth_m[60:180, 100:160] = 1.6
+    surface, why = _box(frame, 100, 60, 220, 180)
+    assert surface is None
+    assert why == SKIP_MIXED_DEPTH
+
+
+def test_box_surface_skips_sparse_depth():
+    """Object pixels with no depth must not hand the box to what little is left."""
+    frame = _frame_with_wall(depth_m=3.0)
+    frame.depth_m[60:180, 100:220] = 0.0
+    # A sliver of background wall is all the depth the box has.
+    frame.depth_m[60:180, 190:200] = 3.9
+    surface, why = _box(frame, 100, 60, 220, 180)
+    assert surface is None
+    assert why == SKIP_SPARSE_DEPTH
+
+
+def test_box_surface_rejects_out_of_range():
+    frame = _frame_with_wall(depth_m=5.5)
+    surface, why = _box(frame, 100, 60, 220, 180)
+    assert surface is None
+    assert why == SKIP_RANGE
+
+
+def test_box_surface_keeps_an_oblique_plane_together():
+    """Depth ramps across a painting seen at an angle; still one surface."""
+    frame = _frame_with_wall(depth_m=3.0)
+    ramp = np.linspace(2.85, 3.15, 120, dtype=np.float32)
+    frame.depth_m[60:180, 100:220] = ramp[None, :]
+    surface, why = _box(frame, 100, 60, 220, 180)
+    assert why is None and surface is not None
+    assert surface.depth_m == pytest.approx(3.0, abs=0.03)
+    assert surface.support == pytest.approx(1.0)
+
+
+def test_mixed_box_makes_no_observation_and_is_counted():
+    frame = _frame_with_wall(depth_m=3.0)
+    frame.depth_m[60:180, 100:160] = 1.6
+    det = Detection(label="painting", conf=0.9, x0=100.0, y0=60.0, x1=220.0, y1=180.0)
+    stats: dict = {}
+    obs = observations_from_detections(
+        frame,
+        _grid_tokens(frame),
+        [det],
+        landmark_labels=["painting"],
+        stats=stats,
+    )
+    assert obs == []
+    assert stats == {SKIP_MIXED_DEPTH: 1}
+
+
+# One real camera-top frame (424x240, depth in mm) from the office: a painting
+# on a wall 3.67 m away, a table with trays at 2.4-3.0 m in front of a wall at
+# 3.9 m, and an armchair at 1.2 m in the foreground.
+_REAL_DEPTH = Path(__file__).parent / "data" / "camera_top_depth_424x240.npz"
+
+
+def real_camera_top_frame() -> VisionFrame:
+    depth = np.load(_REAL_DEPTH)["depth_mm"].astype(np.float32) / 1000.0
+    h, w = depth.shape
+    return VisionFrame(
+        camera_name="camera-top",
+        stamp=0.0,
+        captured_at=0.0,
+        color_rgb=np.zeros((h, w, 3), dtype=np.uint8),
+        depth_m=depth,
+        intrinsics=CameraIntrinsics(
+            fx=303.845, fy=303.684, cx=219.518, cy=126.626, width=w, height=h
+        ),
+        mount_x=0.276,
+        mount_y=0.015,
+        mount_z=0.745,
+    )
+
+
+def test_real_frame_painting_box_lands_on_the_painting():
+    frame = real_camera_top_frame()
+    for box in ((85, 38, 145, 98), (75, 28, 155, 108)):
+        surface, why = _box(frame, *box)
+        assert why is None and surface is not None
+        assert surface.depth_m == pytest.approx(3.67, abs=0.08)
+
+
+def test_real_frame_table_box_is_skipped_not_put_on_the_wall_behind():
+    """Trays + table: the per-patch median used to return the wall at 3.9 m."""
+    frame = real_camera_top_frame()
+    surface, why = _box(frame, 150, 60, 280, 200)
+    assert surface is None
+    assert why == SKIP_MIXED_DEPTH

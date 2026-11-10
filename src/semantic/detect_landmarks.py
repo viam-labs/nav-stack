@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Sequence, Set, Tuple
+import math
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
-from .patches import PatchObservation, backproject_patches
+from .patches import (
+    PatchObservation,
+    backproject_pixels,
+    depth_sigma_m,
+    lateral_sigma_m,
+    optical_normal_to_base,
+)
 from .place import l2_normalize
 from .types import Detection, PatchToken, VisionFrame
 
@@ -91,6 +99,160 @@ def tokens_inside_detections(
     return out
 
 
+@dataclass(frozen=True)
+class BoxSurface:
+    """The one surface a detector box sits on, measured from raw depth."""
+
+    point_base: np.ndarray  # (3,)
+    normal_base: np.ndarray  # (3,)
+    depth_m: float
+    sigma_m: float
+    # Share of the box core's valid depth pixels that lie on this surface.
+    support: float
+
+
+# Why a box produced no surface (keys of the ``stats`` dict).
+SKIP_SPARSE_DEPTH = "skipped_sparse_depth"
+SKIP_MIXED_DEPTH = "skipped_mixed_depth"
+SKIP_RANGE = "skipped_range"
+SKIP_HEIGHT = "skipped_height"
+
+
+def _cluster_width_m(depth_m: np.ndarray) -> np.ndarray:
+    """Depth span still counted as one surface, per starting depth.
+
+    Wide enough for a painting seen at about 45 degrees, narrow enough to keep
+    a table apart from the wall a metre behind it.
+    """
+    return 2.0 * np.maximum(0.12, 0.06 * np.asarray(depth_m, dtype=float))
+
+
+def box_surface_point(
+    frame: VisionFrame,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    *,
+    core_frac: float = 0.6,
+    min_valid_frac: float = 0.30,
+    min_valid_px: int = 12,
+    min_support: float = 0.60,
+    min_range_m: float = 0.4,
+    max_range_m: float = 4.0,
+    z_min_m: Optional[float] = None,
+    z_max_m: Optional[float] = None,
+) -> Tuple[Optional[BoxSurface], Optional[str]]:
+    """Locate the object in a detector box, or say why it cannot be located.
+
+    Reads raw depth in the central ``core_frac`` of the box and keeps the
+    dominant depth cluster. A box that spans two surfaces with no clear
+    majority (object plus background, or an occluder in front) returns
+    ``None``: a median across them is a point on neither.
+
+    Returns ``(surface, None)`` or ``(None, skip_reason)``.
+    """
+    depth = np.asarray(frame.depth_m, dtype=float)
+    h, w = depth.shape[:2]
+    xa, xb = sorted((float(x0), float(x1)))
+    ya, yb = sorted((float(y0), float(y1)))
+    inset = 0.5 * (1.0 - float(core_frac))
+    u0 = int(math.floor(xa + inset * (xb - xa)))
+    u1 = int(math.ceil(xb - inset * (xb - xa)))
+    v0 = int(math.floor(ya + inset * (yb - ya)))
+    v1 = int(math.ceil(yb - inset * (yb - ya)))
+    u0, u1 = max(0, u0), min(w, max(u1, u0 + 1))
+    v0, v1 = max(0, v0), min(h, max(v1, v0 + 1))
+    core = depth[v0:v1, u0:u1]
+    if core.size == 0:
+        return None, SKIP_SPARSE_DEPTH
+    valid = np.isfinite(core) & (core > 0.0)
+    n_valid = int(valid.sum())
+    if n_valid < int(min_valid_px) or n_valid / float(core.size) < float(min_valid_frac):
+        return None, SKIP_SPARSE_DEPTH
+
+    vs_idx, us_idx = np.nonzero(valid)
+    vals = core[valid]
+    order = np.argsort(vals)
+    sorted_vals = vals[order]
+    # Densest depth window: start at each sample, count those within one
+    # cluster width behind it.
+    ends = np.searchsorted(
+        sorted_vals, sorted_vals + _cluster_width_m(sorted_vals), side="right"
+    )
+    counts = ends - np.arange(n_valid)
+    start = int(np.argmax(counts))
+    end = int(ends[start])
+    support = float(end - start) / float(n_valid)
+    if support < float(min_support):
+        return None, SKIP_MIXED_DEPTH
+
+    members = order[start:end]
+    cluster_depths = vals[members]
+    depth_med = float(np.median(cluster_depths))
+    if depth_med < float(min_range_m) or depth_med > float(max_range_m):
+        return None, SKIP_RANGE
+    us = us_idx[members].astype(float) + float(u0)
+    vs = vs_idx[members].astype(float) + float(v0)
+    points = backproject_pixels(frame, us, vs, cluster_depths)
+    point = np.median(points, axis=0)
+    z = float(point[2])
+    if z_min_m is not None and z < float(z_min_m):
+        return None, SKIP_HEIGHT
+    if z_max_m is not None and z > float(z_max_m):
+        return None, SKIP_HEIGHT
+
+    normal_optical = _surface_normal_optical(frame, us, vs, cluster_depths)
+    sigma = float(
+        math.hypot(
+            depth_sigma_m(depth_med),
+            lateral_sigma_m(depth_med, frame.intrinsics.fx),
+        )
+    )
+    return (
+        BoxSurface(
+            point_base=point.astype(float),
+            normal_base=optical_normal_to_base(frame, normal_optical),
+            depth_m=depth_med,
+            sigma_m=sigma,
+            support=support,
+        ),
+        None,
+    )
+
+
+def _surface_normal_optical(
+    frame: VisionFrame,
+    us: np.ndarray,
+    vs: np.ndarray,
+    depths_m: np.ndarray,
+    *,
+    max_points: int = 400,
+) -> np.ndarray:
+    """Plane-fit normal of the cluster in the optical frame, facing the camera."""
+    toward_camera = np.array([0.0, 0.0, -1.0], dtype=float)
+    n = len(depths_m)
+    if n < 3:
+        return toward_camera
+    step = max(1, n // int(max_points))
+    K = frame.intrinsics
+    d = np.asarray(depths_m, dtype=float)[::step]
+    cloud = np.column_stack(
+        [
+            (us[::step] - float(K.cx)) / float(K.fx) * d,
+            (vs[::step] - float(K.cy)) / float(K.fy) * d,
+            d,
+        ]
+    )
+    centered = cloud - cloud.mean(axis=0)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    normal = vh[-1]
+    if normal[2] > 0.0:
+        normal = -normal
+    nn = float(np.linalg.norm(normal))
+    return normal / nn if nn > 1e-9 else toward_camera
+
+
 def observations_from_detections(
     frame: VisionFrame,
     patches: Sequence[PatchToken],
@@ -101,26 +263,18 @@ def observations_from_detections(
     z_max_m: Optional[float] = None,
     min_patches: int = 1,
     shrink: float = 0.05,
+    stats: Optional[Dict[str, int]] = None,
 ) -> List[PatchObservation]:
-    """One observation per allowed detection: mean DINO + median depth in-box.
+    """One observation per allowed detection: mean DINO + the box's surface.
 
     Descriptor pooling uses every DINO token whose center lies in the box
-    (depth-invalid tokens still contribute appearance). Geometry prefers
-    depth-valid in-box patches; if none survive the depth gate, falls back to
-    back-projecting the box center alone.
+    (depth-invalid tokens still contribute appearance). Geometry comes from
+    :func:`box_surface_point`; a box with no single clear surface yields no
+    observation. ``stats`` (optional) is filled with per-reason skip counts.
     """
     allowed = {str(x).strip().lower() for x in landmark_labels if str(x).strip()}
     if not allowed or not detections or not patches:
         return []
-
-    # Depth-valid observations for geometry (may be a subset of in-box tokens).
-    patch_obs = backproject_patches(
-        frame,
-        patches,
-        z_min_m=z_min_m,
-        z_max_m=z_max_m,
-    )
-    obs_by_uv = {(round(float(o.token.u), 1), round(float(o.token.v), 1)): o for o in patch_obs}
 
     out: List[PatchObservation] = []
     for det in detections:
@@ -148,40 +302,16 @@ def observations_from_detections(
         if len(in_tokens) < int(min_patches):
             continue
         desc = pool_descriptor([t.descriptor for t in in_tokens])
-        inside_obs = [
-            obs_by_uv[(round(float(t.u), 1), round(float(t.v), 1))]
-            for t in in_tokens
-            if (round(float(t.u), 1), round(float(t.v), 1)) in obs_by_uv
-        ]
-        if inside_obs:
-            pts = np.stack([o.point_base for o in inside_obs], axis=0)
-            point = np.median(pts, axis=0)
-            normals = np.stack([o.normal_base for o in inside_obs], axis=0)
-            normal = normals.mean(axis=0)
-            nn = float(np.linalg.norm(normal))
-            normal = normal / nn if nn > 1e-9 else inside_obs[0].normal_base
-            sigma = float(np.median([o.sigma_m for o in inside_obs]))
-        else:
-            # Depth gate wiped the box — still landmark from center depth + pooled DINO.
-            center = PatchToken(
-                row=-1,
-                col=-1,
-                u=0.5 * (x0 + x1),
-                v=0.5 * (y0 + y1),
-                descriptor=desc,
-            )
-            center_obs = backproject_patches(
-                frame,
-                [center],
-                z_min_m=z_min_m,
-                z_max_m=z_max_m,
-                window_half=2,
-            )
-            if not center_obs:
-                continue
-            point = center_obs[0].point_base
-            normal = center_obs[0].normal_base
-            sigma = float(center_obs[0].sigma_m)
+        surface, skip_reason = box_surface_point(
+            frame, x0, y0, x1, y1, z_min_m=z_min_m, z_max_m=z_max_m
+        )
+        if surface is None:
+            if stats is not None and skip_reason:
+                stats[skip_reason] = int(stats.get(skip_reason, 0)) + 1
+            continue
+        point = surface.point_base
+        normal = surface.normal_base
+        sigma = float(surface.sigma_m)
         tok = PatchToken(
             row=-1,
             col=-1,
@@ -195,7 +325,7 @@ def observations_from_detections(
             valid=True,
         )
         # Map-plane half-size of the YOLO box (meters) for footprint overlap.
-        range_m = max(0.2, abs(float(point[0])))
+        range_m = max(0.2, float(surface.depth_m))
         fx = max(1.0, float(frame.intrinsics.fx))
         fy = max(1.0, float(frame.intrinsics.fy))
         extent_m = max(0.5 * bw * range_m / fx, 0.5 * bh * range_m / fy)

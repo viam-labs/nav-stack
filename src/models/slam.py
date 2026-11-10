@@ -91,6 +91,8 @@ _SLAM_DO_ALIASES = build_alias_map(
         "repair_map": ("repair",),
         "vision_status": ("get_vision_status",),
         "list_landmarks": ("get_landmarks",),
+        "landmark_audit": ("audit_landmarks",),
+        "clear_landmarks": ("reset_landmarks",),
     }
 )
 
@@ -1637,6 +1639,8 @@ class SlamService(SLAM):
             "delete_map": self._cmd_delete_map,
             "vision_status": self._cmd_vision_status,
             "list_landmarks": self._cmd_list_landmarks,
+            "landmark_audit": self._cmd_landmark_audit,
+            "clear_landmarks": self._cmd_clear_landmarks,
         }
 
     async def do_command(
@@ -2641,6 +2645,29 @@ class SlamService(SLAM):
             "landmarks": rows,
             **vision.landmarks.status_dict(),
         }
+
+    def _cmd_landmark_audit(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        """Stored vs measured depth for each landmark in the last survey frame."""
+        del command
+        vision = self._vision
+        if vision is None:
+            return {"enabled": False, "reason": "vision not running", "rows": []}
+        return vision.landmark_audit()
+
+    def _cmd_clear_landmarks(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        """Drop all embedding landmarks (memory and saved file); keep the map."""
+        del command
+        vision = self._vision
+        if vision is None:
+            return {"enabled": False, "reason": "vision not running"}
+        store = self._map_store
+        handle = store.active_handle() if store is not None else None
+        out = vision.clear_landmarks(handle.root if handle is not None else None)
+        return {"enabled": True, "status": "cleared", **out}
 
     def _stop_vision(self) -> None:
         vision = self._vision

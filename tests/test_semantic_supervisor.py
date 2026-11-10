@@ -221,3 +221,231 @@ def test_survey_prefers_detector_boxes():
     assert vision.status()["observations"] <= 12
     assert vision.status()["landmarks"]["total"] >= 1
     assert vision.status()["prefer_detections"] is True
+
+
+# --- Depth audit, capture pose, clear_landmarks ---
+
+
+def _vision(cfg: SlamConfig, pose: Pose2D, **kwargs) -> VisionSupervisor:
+    from src.semantic.worker import VisionWorker
+
+    args = {
+        "get_pose": lambda: pose,
+        "get_pose_at": lambda _t: pose,
+        "get_anchor": lambda: (0, pose, {0: pose}),
+    }
+    args.update(kwargs)
+    vision = VisionSupervisor(cfg=cfg, cameras={}, **args)
+    vision._worker = VisionWorker(WorkerConfig(synthetic=True, input_short_side=112))  # noqa: SLF001
+    return vision
+
+
+def _air_landmark(vision: VisionSupervisor, lid: int = 500):
+    """Confirmed landmark 0.8 m ahead of the lens; ``_frame()`` wall is at 1.5 m."""
+    from src.semantic.landmarks import EmbeddingLandmark
+
+    xyz = np.array([0.9, 0.0, 0.4])
+    lm = EmbeddingLandmark(
+        landmark_id=lid,
+        anchor_node=0,
+        rel_xyz=xyz.copy(),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=xyz.copy(),
+        descriptors=[np.array([0.0, 0.0, 1.0], dtype=np.float32)],
+        observations=5,
+        status=LandmarkStatus.CONFIRMED,
+        from_detector=True,
+    )
+    store = vision.landmarks
+    store._landmarks[lid] = lm  # noqa: SLF001
+    store._index_add(lm, xyz)  # noqa: SLF001
+    store._next_id = max(store._next_id, lid + 1)  # noqa: SLF001
+    return lm
+
+
+def test_survey_drops_landmark_the_camera_sees_through():
+    vision = _vision(_cfg(), Pose2D(0.0, 0.0, 0.0))
+    _air_landmark(vision)
+    frame = _frame()
+    for _ in range(2):
+        vision.ingest_frame(frame, mapping=True)
+    assert vision.landmarks.get(500) is not None
+    assert vision.seen_through_ids() == [500]
+    report = vision.landmark_audit()
+    row = report["rows"][0]  # worst first
+    assert (row["id"], row["verdict"], row["strikes"]) == (500, "seen_through", 2)
+    assert row["stored_depth_m"] < 1.0 < row["measured_depth_m"]
+    assert report["removes"] is True
+
+    vision.ingest_frame(frame, mapping=True)
+    assert vision.landmarks.get(500) is None
+    status = vision.status()
+    assert status["depth_audit"]["removed_total"] == 1
+    assert status["depth_audit"]["last"]["removed_ids"] == [500]
+    assert status["landmarks"]["seen_through_removed"] == 1
+    report = vision.landmark_audit()
+    assert [r["id"] for r in report["recent_removed"]] == [500]
+    # Landmarks the same frames built on the wall are untouched.
+    assert status["landmarks"]["total"] >= 1
+    others = [r for r in report["rows"] if r["id"] != 500]
+    assert others and all(r["verdict"] == "agrees" for r in others)
+
+
+def test_audit_runs_on_a_frame_with_nothing_to_add():
+    """An air landmark has no box to match, so the audit cannot wait for one."""
+    from src.semantic.types import VisionResult
+
+    vision = _vision(_cfg(), Pose2D(0.0, 0.0, 0.0))
+    _air_landmark(vision)
+    frame = _frame()
+    empty = VisionResult(
+        camera_name=frame.camera_name,
+        stamp=0.0,
+        captured_at=0.0,
+        patches=[],
+        detections=[],
+        place_descriptor=None,
+        infer_ms=0.0,
+        provider="test",
+    )
+    for _ in range(3):
+        vision._survey(frame, empty)  # noqa: SLF001
+    assert vision.landmarks.get(500) is None
+
+
+def test_audit_only_reports_while_localizing():
+    vision = _vision(
+        _cfg(mode="localizing", vision_survey_only=False), Pose2D(0.0, 0.0, 0.0)
+    )
+    _air_landmark(vision)
+    frame = _frame()
+    for _ in range(6):
+        vision.ingest_frame(frame, mapping=True)
+    assert vision.landmarks.get(500) is not None
+    status = vision.status()["depth_audit"]
+    assert status["removes"] is False
+    assert status["flagged_ids"] == [500]
+    assert status["removed_total"] == 0
+
+
+def test_clear_landmarks_drops_store_and_saved_file(tmp_path: Path):
+    from src.semantic.persist import landmarks_path
+
+    vision = _vision(_cfg(), Pose2D(0.0, 0.0, 0.0))
+    frame = _frame()
+    vision.ingest_frame(frame, mapping=True)
+    assert vision.status()["landmarks"]["total"] >= 1
+    assert vision.save_to_map_dir(tmp_path) is not None
+    assert landmarks_path(tmp_path).is_file()
+
+    out = vision.clear_landmarks(tmp_path)
+    assert out["cleared"] >= 1 and out["saved_file_removed"] is True
+    assert vision.status()["landmarks"]["total"] == 0
+    assert not landmarks_path(tmp_path).is_file()
+    assert vision.landmark_audit()["rows"] == []
+    # Surveying starts again from an empty store.
+    vision.ingest_frame(frame, mapping=True)
+    assert vision.status()["landmarks"]["total"] >= 1
+
+
+def _aged_frame(age_s: float) -> VisionFrame:
+    import dataclasses
+    import time
+
+    return dataclasses.replace(_frame(), captured_at=time.monotonic() - age_s)
+
+
+def test_capture_pose_prefers_lookup_then_grab_stamp():
+    """A frame that aged out of odometry history keeps its grab-time pose."""
+    now = Pose2D(5.0, 0.0, 0.0)
+    at_grab = Pose2D(4.0, 0.0, 0.0)
+    looked_up = Pose2D(4.2, 0.0, 0.0)
+    answers = [looked_up, None]
+    vision = _vision(_cfg(), now, get_pose_at=lambda _t: answers.pop(0))
+    frame = _aged_frame(0.4)
+    assert vision._capture_pose(frame, at_grab) is looked_up  # noqa: SLF001
+    assert vision._capture_pose(frame, at_grab) is at_grab  # noqa: SLF001
+    assert vision.status()["capture_pose"]["grab_time_fallbacks"] == 1
+
+
+def test_stale_frame_without_capture_pose_is_dropped():
+    now = Pose2D(5.0, 0.0, 0.0)
+    vision = _vision(_cfg(), now, get_pose_at=lambda _t: None)
+    # Fresh frame, no odometry history yet: the current pose stands in.
+    assert vision._pose_at_grab(_aged_frame(0.1)) is now  # noqa: SLF001
+    # Old frame: the robot may have moved since; do not place it at ``now``.
+    assert vision._pose_at_grab(_aged_frame(1.5)) is None  # noqa: SLF001
+    assert vision.status()["capture_pose"]["stale_frames_dropped"] == 1
+
+
+def test_tick_skips_survey_for_a_stale_frame():
+    import asyncio
+
+    vision = _vision(_cfg(), Pose2D(0.0, 0.0, 0.0), get_pose_at=lambda _t: None)
+    vision._cameras = {"depth-cam": object()}  # noqa: SLF001
+    frames = [_aged_frame(1.5), _aged_frame(0.05)]
+
+    async def grab(_cam, _lidar):
+        return frames.pop(0)
+
+    vision._grab_frame = grab  # noqa: SLF001
+    asyncio.run(vision._tick_once())  # noqa: SLF001
+    assert vision.status()["frames"] == 0
+    assert vision.status()["capture_pose"]["stale_frames_dropped"] == 1
+    asyncio.run(vision._tick_once())  # noqa: SLF001
+    assert vision.status()["frames"] == 1
+    assert vision.status()["observations"] > 0
+
+
+def test_slam_do_commands_audit_and_clear_landmarks(tmp_path: Path):
+    """``landmark_audit`` / ``clear_landmarks`` through the SLAM DoCommand."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from viam.utils import dict_to_struct
+
+    from src.models.slam import SlamService
+    from src.nav.stores.maps import MapStore
+    from src.semantic.persist import landmarks_path
+
+    slam = SlamService("slam")
+    store = MapStore(str(tmp_path))
+    store.create_map("floor1")
+    store.set_active_map("floor1")
+    slam._map_store = store  # noqa: SLF001
+    slam._manager = MagicMock()  # noqa: SLF001
+    slam._reset_live_slam = MagicMock()  # noqa: SLF001
+
+    def do(name: str) -> dict:
+        return asyncio.run(slam.do_command({"command": name}))
+
+    assert do("landmark_audit") == {
+        "enabled": False,
+        "reason": "vision not running",
+        "rows": [],
+    }
+
+    vision = _vision(_cfg(), Pose2D(0.0, 0.0, 0.0))
+    slam._vision = vision  # noqa: SLF001
+    frame = _frame()
+    vision.ingest_frame(frame, mapping=True)
+    root = store.active_handle().root
+    assert vision.save_to_map_dir(root) is not None
+    _air_landmark(vision)
+    vision.ingest_frame(frame, mapping=True)
+
+    report = do("audit_landmarks")  # alias
+    assert report["summary"]["seen_through"] == 1
+    assert report["rows"][0]["label"] == "DC500"
+    # The reply must survive the trip through a protobuf Struct.
+    dict_to_struct(report)
+    dict_to_struct(do("vision_status"))
+
+    out = do("clear_landmarks")
+    assert out["status"] == "cleared" and out["cleared"] >= 2
+    assert out["saved_file_removed"] is True
+    assert not landmarks_path(root).is_file()
+    assert len(vision.landmarks) == 0
+    # The occupancy map is not touched.
+    slam._reset_live_slam.assert_not_called()  # noqa: SLF001
+    assert store.get_active_map_name() == "floor1"

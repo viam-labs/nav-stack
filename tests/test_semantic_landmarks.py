@@ -604,3 +604,191 @@ def test_image_visible_excludes_behind_camera():
     )
     assert image == []
 
+
+
+# --- Depth audit: does a surface exist where each landmark is stored? ---
+
+_AUDIT_K = CameraIntrinsics(fx=300.0, fy=300.0, cx=160.0, cy=120.0, width=320, height=240)
+_AUDIT_MOUNT = {"mount_x": 0.1, "mount_z": 0.4}
+
+
+def _stored(store: EmbeddingLandmarkMap, lid: int, map_xyz, *, status=LandmarkStatus.CONFIRMED):
+    lm = EmbeddingLandmark(
+        landmark_id=lid,
+        anchor_node=0,
+        rel_xyz=np.array(map_xyz, dtype=float),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array(map_xyz, dtype=float),
+        descriptors=[],
+        observations=5,
+        status=status,
+        from_detector=True,
+    )
+    store._landmarks[lid] = lm  # noqa: SLF001
+    store._index_add(lm, lm.map_xyz)  # noqa: SLF001
+    return lm
+
+
+def _audit(store, depth, *, remove, pose=Pose2D(0.0, 0.0, 0.0)):
+    return store.audit_against_depth(
+        depth,
+        robot_pose=pose,
+        pose_of_node={},
+        intrinsics=_AUDIT_K,
+        remove=remove,
+        **_AUDIT_MOUNT,
+    )
+
+
+def _row(audit: dict, lid: int) -> dict:
+    return next(r for r in audit["rows"] if r["id"] == lid)
+
+
+def test_audit_verdicts_on_a_wall_at_three_metres():
+    """Camera at base x=0.1 looking along +x at a wall 3 m from the lens."""
+    store = EmbeddingLandmarkMap()
+    _stored(store, 1, [3.1, 0.0, 0.4])  # on the wall
+    _stored(store, 2, [1.6, 0.0, 0.4])  # in the air, 1.5 m in front of it
+    _stored(store, 3, [4.1, 0.0, 0.4])  # behind the wall
+    depth = np.full((240, 320), 3.0, dtype=np.float32)
+    audit = _audit(store, depth, remove=False)
+    assert audit["pose_suspect"] is False
+    on_wall, in_air, behind = (_row(audit, i) for i in (1, 2, 3))
+    assert on_wall["verdict"] == "agrees"
+    assert in_air["verdict"] == "seen_through"
+    assert in_air["label"] == "DC2"
+    assert in_air["stored_depth_m"] == pytest.approx(1.5, abs=0.01)
+    assert in_air["measured_depth_m"] == pytest.approx(3.0, abs=0.01)
+    assert in_air["strikes"] == 1
+    assert behind["verdict"] == "occluded"
+
+
+def test_audit_removes_after_consecutive_seen_through_frames():
+    store = EmbeddingLandmarkMap()
+    _stored(store, 1, [3.1, 0.0, 0.4])
+    _stored(store, 2, [1.6, 0.0, 0.4])
+    _stored(store, 5, [1.6, 0.3, 0.4], status=LandmarkStatus.CANDIDATE)
+    depth = np.full((240, 320), 3.0, dtype=np.float32)
+    for _ in range(2):
+        audit = _audit(store, depth, remove=True)
+        assert not any(r["removed"] for r in audit["rows"])
+    assert store.seen_through_ids() == []
+    assert store.seen_through_ids(min_strikes=1) == [2, 5]
+    audit = _audit(store, depth, remove=True)
+    assert _row(audit, 2)["removed"] and _row(audit, 5)["removed"]
+    assert store.get(2) is None and store.get(5) is None
+    assert store.get(1) is not None
+    assert store.status_dict()["seen_through_removed"] == 2
+    # Gone from the spatial index too: nothing left to associate with.
+    assert all(1 in ids or not ids for ids in store._cell_index.values())  # noqa: SLF001
+
+
+def test_audit_agreeing_frame_clears_strikes():
+    store = EmbeddingLandmarkMap()
+    _stored(store, 2, [1.6, 0.0, 0.4])
+    far = np.full((240, 320), 3.0, dtype=np.float32)
+    here = np.full((240, 320), 1.5, dtype=np.float32)
+    _audit(store, far, remove=True)
+    _audit(store, far, remove=True)
+    assert _row(_audit(store, here, remove=True), 2)["strikes"] == 0
+    _audit(store, far, remove=True)
+    _audit(store, far, remove=True)
+    assert store.get(2) is not None
+
+
+def test_audit_report_only_flags_but_keeps_the_landmark():
+    store = EmbeddingLandmarkMap()
+    _stored(store, 2, [1.6, 0.0, 0.4])
+    depth = np.full((240, 320), 3.0, dtype=np.float32)
+    for _ in range(5):
+        audit = _audit(store, depth, remove=False)
+    assert _row(audit, 2)["strikes"] == store.see_through_strikes
+    assert _row(audit, 2)["removed"] is False
+    assert store.get(2) is not None
+    assert store.seen_through_ids() == [2]
+    assert store.status_dict()["seen_through_flagged"] == 1
+
+
+def test_audit_missing_depth_and_occluders_never_strike():
+    store = EmbeddingLandmarkMap()
+    _stored(store, 2, [1.6, 0.0, 0.4])
+    no_depth = np.zeros((240, 320), dtype=np.float32)
+    blocked = np.full((240, 320), 0.6, dtype=np.float32)
+    for depth, verdict in ((no_depth, "no_depth"), (blocked, "occluded")):
+        for _ in range(4):
+            row = _row(_audit(store, depth, remove=True), 2)
+            assert row["verdict"] == verdict
+            assert row["strikes"] == 0
+    assert store.get(2) is not None
+
+
+def test_audit_thin_object_in_front_of_far_background_agrees():
+    """A pole fills a fraction of the window; it is still there."""
+    store = EmbeddingLandmarkMap()
+    _stored(store, 2, [1.6, 0.0, 0.4])
+    depth = np.full((240, 320), 3.5, dtype=np.float32)
+    depth[:, 156:164] = 1.5  # 8 px wide at the image center
+    assert _row(_audit(store, depth, remove=True), 2)["verdict"] == "agrees"
+
+
+def test_audit_blames_the_pose_when_most_landmarks_are_seen_through():
+    """Robot is really 0.8 m further from the wall than its pose says."""
+    store = EmbeddingLandmarkMap()
+    for i, y in enumerate((-0.6, -0.3, 0.0, 0.3, 0.6)):
+        _stored(store, i + 1, [3.1, y, 0.4])
+    depth = np.full((240, 320), 3.8, dtype=np.float32)
+    for _ in range(5):
+        audit = _audit(store, depth, remove=True)
+        assert audit["pose_suspect"] is True
+        assert all(r["verdict"] == "seen_through" for r in audit["rows"])
+        assert not any(r["removed"] or r["strikes"] for r in audit["rows"])
+    assert len(store) == 5
+
+
+def test_confirm_keeps_rel_xyz_with_the_refined_map_xyz():
+    """Confirming moves map_xyz to the sample mean; rel_xyz must follow."""
+    store = EmbeddingLandmarkMap()
+    anchor = Pose2D(1.0, 2.0, 0.5)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    lm = None
+    for i, view in enumerate([(0.0, 0.0, 0.0), (0.6, 0.0, 0.0), (1.2, 0.0, 0.0)]):
+        lm = store.observe(
+            map_xyz=np.array([3.0 + 0.06 * i, 2.0, 1.0]),
+            descriptor=desc,
+            normal_map=np.array([-1.0, 0.0, 0.0]),
+            anchor_node=0,
+            anchor_pose=anchor,
+            view_xy=view,
+        )
+    assert lm is not None and lm.status == LandmarkStatus.CONFIRMED
+    assert lm.map_xyz[0] == pytest.approx(3.06)
+    np.testing.assert_allclose(
+        EmbeddingLandmarkMap.map_point_from_rel(anchor, lm.rel_xyz), lm.map_xyz, atol=1e-9
+    )
+
+
+def test_update_from_another_anchor_does_not_rewrite_rel_xyz():
+    """rel_xyz is relative to the landmark's own anchor, not the current one."""
+    store = EmbeddingLandmarkMap(promote_min_obs=99)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    first_anchor = Pose2D(1.0, 0.0, 0.0)
+    common = {
+        "map_xyz": np.array([3.0, 0.0, 1.0]),
+        "descriptor": desc,
+        "normal_map": np.array([-1.0, 0.0, 0.0]),
+    }
+    lm = store.observe(anchor_node=0, anchor_pose=first_anchor, view_xy=(0.0, 0.0), **common)
+    rel_before = lm.rel_xyz.copy()
+    # Robot has driven on: the current keyframe is node 7, and the pose table
+    # no longer holds node 0.
+    later_anchor = Pose2D(2.5, 0.4, 1.0)
+    again = store.observe_with_poses(
+        anchor_node=7,
+        anchor_pose=later_anchor,
+        pose_of_node={7: later_anchor},
+        view_xy=(1.0, 0.0),
+        **common,
+    )
+    assert again.landmark_id == lm.landmark_id
+    assert lm.anchor_node == 0
+    np.testing.assert_allclose(lm.rel_xyz, rel_before)

@@ -169,6 +169,47 @@ def _plane_normal_optical(
     return (normal / n).astype(float)
 
 
+def backproject_pixels(
+    frame: VisionFrame,
+    us: np.ndarray,
+    vs: np.ndarray,
+    depths_m: np.ndarray,
+) -> np.ndarray:
+    """Pixels with a depth each → ``(N, 3)`` points in base_link."""
+    K = frame.intrinsics
+    d = np.asarray(depths_m, dtype=float).reshape(-1)
+    x = (np.asarray(us, dtype=float).reshape(-1) - float(K.cx)) / float(K.fx) * d
+    y = (np.asarray(vs, dtype=float).reshape(-1) - float(K.cy)) / float(K.fy) * d
+    sensor = camera_optical_to_sensor_frame(np.column_stack([x, y, d]))
+    return transform_lidar_mount_to_base_link(
+        sensor,
+        x=frame.mount_x,
+        y=frame.mount_y,
+        z=frame.mount_z,
+        theta=frame.mount_theta,
+        pitch=frame.mount_pitch,
+        roll=frame.mount_roll,
+    )
+
+
+def optical_normal_to_base(frame: VisionFrame, normal_optical: np.ndarray) -> np.ndarray:
+    """Rotate an optical-frame unit normal into base_link (no translation)."""
+    n_sensor = camera_optical_to_sensor_frame(
+        np.asarray(normal_optical, dtype=float).reshape(1, 3)
+    )
+    n_base = transform_lidar_mount_to_base_link(
+        n_sensor,
+        x=0.0,
+        y=0.0,
+        z=0.0,
+        theta=frame.mount_theta,
+        pitch=frame.mount_pitch,
+        roll=frame.mount_roll,
+    )[0]
+    nn = float(np.linalg.norm(n_base))
+    return n_base / nn if nn > 1e-9 else n_base
+
+
 def backproject_patches(
     frame: VisionFrame,
     tokens: Sequence[PatchToken],

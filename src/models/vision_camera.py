@@ -253,6 +253,12 @@ class VisionCamera(Camera):
                 wb_pair = list(wb.get("paired_ids") or [])
             except Exception:  # noqa: BLE001
                 wb_vis, wb_pair = [], []
+        seen_through: list = []
+        if hasattr(vision, "seen_through_ids"):
+            try:
+                seen_through = list(vision.seen_through_ids())
+            except Exception:  # noqa: BLE001
+                seen_through = []
         png = await asyncio.to_thread(
             render_landmarks_overlay,
             color,
@@ -271,6 +277,7 @@ class VisionCamera(Camera):
             yolo_loaded=yolo_loaded,
             writeback_visible_ids=wb_vis,
             writeback_paired_ids=wb_pair,
+            seen_through_ids=seen_through,
         )
         self._last_error = None
         self._last_drawn = min(len(landmarks), int(self._opts.max_landmarks))

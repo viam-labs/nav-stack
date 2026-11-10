@@ -49,40 +49,37 @@ def test_render_overlay_draws_yolo_detections():
     assert arr[..., 2].max() > 40
 
 
-def test_match_detection_box_contains_center():
-    from src.semantic.types import Detection
-    from src.viz.landmarks_view import _match_detection_box
+def _detector_landmark(landmark_id: int, map_xyz) -> EmbeddingLandmark:
+    return EmbeddingLandmark(
+        landmark_id=landmark_id,
+        anchor_node=0,
+        rel_xyz=np.array(map_xyz, dtype=float),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array(map_xyz, dtype=float),
+        descriptors=[],
+        observations=5,
+        status=LandmarkStatus.CONFIRMED,
+        from_detector=True,
+    )
 
-    det = Detection(label="painting", conf=0.4, x0=40, y0=30, x1=200, y1=180)
-    boxes = [(40.0, 30.0, 200.0, 180.0, det)]
-    matched = _match_detection_box(120.0, 100.0, boxes, used=set())
-    assert matched is not None
-    assert matched[4].label == "painting"
 
+def test_render_draws_detector_landmark_at_its_own_point_not_the_yolo_box():
+    """A landmark inside a YOLO box must not paint that box with its ID.
 
-def test_render_nests_detector_landmark_inside_yolo():
-    """Dc fill should sit in the YOLO rectangle, not a separate offset square."""
+    Filling the rectangle made a landmark stored metres in front of a painting
+    look as if it sat on the painting.
+    """
     from src.semantic.types import Detection
 
     color = np.zeros((240, 320, 3), dtype=np.uint8)
     color[:] = (20, 20, 28)
     K = CameraIntrinsics(fx=160, fy=160, cx=160, cy=120, width=320, height=240)
-    # Landmark at map (2,0,0.5) with mount_z=0.5 projects near image center.
-    lm = EmbeddingLandmark(
-        landmark_id=3,
-        anchor_node=0,
-        rel_xyz=np.array([2.0, 0.0, 0.5]),
-        normal_rel=np.array([-1.0, 0.0, 0.0]),
-        map_xyz=np.array([2.0, 0.0, 0.5]),
-        descriptors=[],
-        observations=2,
-        status=LandmarkStatus.CANDIDATE,
-        from_detector=True,
-    )
-    det = Detection(label="painting", conf=0.5, x0=100, y0=60, x1=220, y1=180)
+    # Projects to the image center (160, 120); half-size ~10 px at 2 m.
+    lm = _detector_landmark(3, [2.0, 0.0, 0.5])
+    det = Detection(label="painting", conf=0.5, x0=60, y0=40, x1=260, y1=200)
     png = render_landmarks_overlay(
         color,
-        [(lm, np.array([2.0, 0.0, 0.5]))],
+        [(lm, lm.map_xyz)],
         robot_pose=Pose2D(0.0, 0.0, 0.0),
         intrinsics=K,
         mount_z=0.5,
@@ -90,10 +87,39 @@ def test_render_nests_detector_landmark_inside_yolo():
         detection_frame_size=(320, 240),
         yolo_loaded=True,
     )
-    arr = np.asarray(Image.open(io.BytesIO(png)))
-    # Nested yellow fill inside the box should raise green+red in that region.
-    roi = arr[70:170, 110:210]
-    assert roi[..., 0].max() > 40 and roi[..., 1].max() > 40
+    arr = np.asarray(Image.open(io.BytesIO(png))).astype(int)
+    green = (arr[..., 1] > 150) & (arr[..., 0] < 120) & (arr[..., 2] < 150)
+    # Green landmark square around its own projection...
+    assert green[105:135, 145:175].any()
+    # ...and none along the YOLO rectangle or elsewhere inside it (the label
+    # sits just above the square).
+    green[94:136, 144:230] = False
+    assert not green[36:204, 56:264].any()
+
+
+def test_render_marks_seen_through_landmark_red():
+    color = np.zeros((240, 320, 3), dtype=np.uint8)
+    color[:] = (20, 20, 28)
+    K = CameraIntrinsics(fx=160, fy=160, cx=160, cy=120, width=320, height=240)
+    lm = _detector_landmark(9, [2.0, 0.0, 0.5])
+
+    def render(seen_through):
+        png = render_landmarks_overlay(
+            color,
+            [(lm, lm.map_xyz)],
+            robot_pose=Pose2D(0.0, 0.0, 0.0),
+            intrinsics=K,
+            mount_z=0.5,
+            seen_through_ids=seen_through,
+        )
+        arr = np.asarray(Image.open(io.BytesIO(png))).astype(int)
+        return (arr[..., 0] > 200) & (arr[..., 1] < 90) & (arr[..., 2] < 90)
+
+    assert not render([])[100:140, 140:180].any()
+    red = render([9])
+    # Outline plus a cross through the center of the square.
+    assert red[100:140, 140:180].sum() > 40
+    assert red[118:123, 158:163].any()
 
 
 def test_sensor_optical_roundtrip():

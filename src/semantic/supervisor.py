@@ -21,13 +21,14 @@ from .frames import (
     vision_frame_from_arrays,
 )
 from .detect_landmarks import observations_from_detections
-from .landmarks import EmbeddingLandmarkMap
+from .landmarks import AUDIT_SEEN_THROUGH, EmbeddingLandmarkMap
 from .localize import (
     diagnose_landmark_match,
     estimate_landmark_fix,
 )
 from .patches import PatchObservation, backproject_patches, subsample_observations
 from .persist import (
+    landmarks_path,
     load_landmarks,
     load_place_index,
     save_landmarks,
@@ -49,6 +50,13 @@ LocLostProvider = Callable[[], bool]
 # Dense patches used only for writeback pairing (never surveyed) so detector-only
 # survey does not starve the rigid fit of inliers.
 _WRITEBACK_DENSE_MATCH_CAP = 24
+
+# A frame whose capture-time pose cannot be looked up is still usable while it
+# is this fresh (no odometry history yet); older than this it is dropped.
+_MAX_UNSTAMPED_FRAME_AGE_S = 1.0
+# Rows kept from the latest depth audit / recent removals (DoCommand payload).
+_AUDIT_MAX_ROWS = 200
+_AUDIT_RECENT_REMOVED = 20
 
 # Fetched by setup.sh / run.sh next to this package (same pattern as DINOv2).
 _DEFAULT_YOLO_WORLD_ONNX = "yolov8s-worldv2-indoor.onnx"
@@ -124,6 +132,17 @@ class VisionSupervisor:
         }
         self._last_detection_obs = 0
         self._last_detection_boxes = 0
+        # Detector boxes turned into observations vs skipped, by reason.
+        self._box_depth_counts: Dict[str, int] = {}
+        self._last_box_depth: Dict[str, int] = {}
+        # Depth audit of stored landmarks against each survey frame.
+        self._audit_frames = 0
+        self._audit_pose_suspect_frames = 0
+        self._last_audit: Optional[dict] = None
+        self._audit_recent_removed: List[dict] = []
+        # Frames dropped / stamped at grab time for lack of a capture pose.
+        self._stale_frames_dropped = 0
+        self._grab_pose_fallbacks = 0
         self._place = PlaceIndex(
             cosine_threshold=float(cfg.vision_place_min_score)
         )
@@ -192,6 +211,43 @@ class VisionSupervisor:
                 "visible_ids": list(self._last_writeback_match.get("visible_ids") or []),
                 "paired_ids": list(self._last_writeback_match.get("paired_ids") or []),
             }
+
+    def seen_through_ids(self) -> List[int]:
+        """Landmarks the camera currently sees past (for landmark-camera)."""
+        with self._lock:
+            return self._landmarks.seen_through_ids(min_strikes=1)
+
+    def landmark_audit(self) -> dict:
+        """Latest depth audit: stored vs measured depth per in-view landmark."""
+        with self._lock:
+            last = self._last_audit
+            out: Dict[str, Any] = {
+                "enabled": True,
+                "mode": str(self._cfg.mode),
+                "removes": self._audit_removes(),
+                "frames": int(self._audit_frames),
+                "pose_suspect_frames": int(self._audit_pose_suspect_frames),
+                "strike_limit": int(self._landmarks.see_through_strikes),
+                "flagged_ids": self._landmarks.seen_through_ids(),
+                "removed_total": int(
+                    self._landmarks.status_dict()["seen_through_removed"]
+                ),
+                "recent_removed": list(self._audit_recent_removed),
+            }
+            if last is None:
+                out.update({"age_s": None, "summary": {}, "rows": []})
+                return out
+            out.update(
+                {
+                    "age_s": round(max(0.0, time.monotonic() - last["mono"]), 2),
+                    "camera": last["camera"],
+                    "pose": last["pose"],
+                    "summary": dict(last["summary"]),
+                    "rows": list(last["rows"]),
+                    "rows_truncated": bool(last["truncated"]),
+                }
+            )
+            return out
 
     def last_detections(
         self, *, camera_name: Optional[str] = None
@@ -263,16 +319,47 @@ class VisionSupervisor:
             self._log(f"vision: saved place index → {place_path}")
         return str(path) if path is not None else None
 
+    def _new_landmark_map(self) -> EmbeddingLandmarkMap:
+        synthetic = bool(self._worker.cfg.synthetic)
+        return EmbeddingLandmarkMap(
+            associate_radius_m=float(self._cfg.vision_associate_radius_m),
+            cell_m=float(self._cfg.vision_cell_m),
+            require_descriptor_match=not synthetic,
+            demote_passes=5 if synthetic else 3,
+        )
+
+    def clear_landmarks(self, map_dir=None) -> dict:
+        """Drop every landmark and its saved file; the place index is kept.
+
+        The saved file goes too, otherwise the next restart loads the old
+        landmarks back.
+        """
+        with self._lock:
+            cleared = len(self._landmarks)
+            self._landmarks = self._new_landmark_map()
+            self._observations = 0
+            self._box_depth_counts = {}
+            self._last_box_depth = {}
+            self._audit_frames = 0
+            self._audit_pose_suspect_frames = 0
+            self._last_audit = None
+            self._audit_recent_removed = []
+            self._last_writeback_match = {"visible_ids": [], "paired_ids": []}
+            removed_file = False
+            if map_dir is not None:
+                path = landmarks_path(map_dir)
+                if path.is_file():
+                    path.unlink()
+                    removed_file = True
+        self._log(
+            f"vision: cleared {cleared} landmarks (saved file removed={removed_file})"
+        )
+        return {"cleared": int(cleared), "saved_file_removed": removed_file}
+
     def reset_landmarks(self) -> None:
         """Drop the in-memory landmark map (e.g. after ``clear_map``)."""
-        synthetic = bool(self._worker.cfg.synthetic)
         with self._lock:
-            self._landmarks = EmbeddingLandmarkMap(
-                associate_radius_m=float(self._cfg.vision_associate_radius_m),
-                cell_m=float(self._cfg.vision_cell_m),
-                require_descriptor_match=not synthetic,
-                demote_passes=5 if synthetic else 3,
-            )
+            self._landmarks = self._new_landmark_map()
             self._place = PlaceIndex(
                 cosine_threshold=float(self._cfg.vision_place_min_score)
             )
@@ -287,6 +374,12 @@ class VisionSupervisor:
             self._frames = 0
             self._last_result = None
             self._last_error = None
+            self._box_depth_counts = {}
+            self._last_box_depth = {}
+            self._audit_frames = 0
+            self._audit_pose_suspect_frames = 0
+            self._last_audit = None
+            self._audit_recent_removed = []
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         if not self._cfg.vision_enabled:
@@ -385,6 +478,27 @@ class VisionSupervisor:
                 "last_detections": 0 if last is None else len(last.detections),
                 "last_detection_obs": int(self._last_detection_obs),
                 "last_detection_boxes": int(self._last_detection_boxes),
+                # Boxes located on one surface vs skipped (no observation).
+                "box_depth": {
+                    **{k: int(v) for k, v in self._box_depth_counts.items()},
+                    "last": dict(self._last_box_depth),
+                },
+                "depth_audit": {
+                    "removes": self._audit_removes(),
+                    "frames": int(self._audit_frames),
+                    "pose_suspect_frames": int(self._audit_pose_suspect_frames),
+                    "flagged_ids": self._landmarks.seen_through_ids(),
+                    "removed_total": int(lm["seen_through_removed"]),
+                    "last": (
+                        None
+                        if self._last_audit is None
+                        else dict(self._last_audit["summary"])
+                    ),
+                },
+                "capture_pose": {
+                    "stale_frames_dropped": int(self._stale_frames_dropped),
+                    "grab_time_fallbacks": int(self._grab_pose_fallbacks),
+                },
                 "last_yolo_max_conf": self._worker.stats.get("last_yolo_max_conf"),
                 "input_size": int(self._worker.cfg.input_short_side),
                 "require_descriptor_match": bool(
@@ -419,6 +533,49 @@ class VisionSupervisor:
 
     def _writeback_enabled(self) -> bool:
         return bool(self._cfg.vision_pose_writeback) and self._vision_apply_allowed()
+
+    def _audit_removes(self) -> bool:
+        """The depth audit may delete landmarks only while the map is being built.
+
+        While localizing the pose is the thing in doubt: a wrong pose makes
+        every landmark look seen through, so the audit only reports.
+        """
+        return str(self._cfg.mode) == MODE_MAPPING or bool(
+            self._cfg.vision_survey_only
+        )
+
+    def _pose_at_grab(self, frame: VisionFrame) -> Optional[conv.Pose2D]:
+        """Pose stamp taken right after the grab, before inference.
+
+        ``None`` drops the frame: its capture pose is unknown and it is too old
+        for the current pose to stand in.
+        """
+        t = float(frame.captured_at)
+        pose = self._get_pose_at(t)
+        if pose is not None:
+            return pose
+        if time.monotonic() - t > _MAX_UNSTAMPED_FRAME_AGE_S:
+            self._stale_frames_dropped += 1
+            return None
+        return self._get_pose()
+
+    def _capture_pose(
+        self, frame: VisionFrame, grab_pose: Optional[conv.Pose2D] = None
+    ) -> conv.Pose2D:
+        """Robot pose when ``frame`` was captured.
+
+        The lookup after inference interpolates inside the odometry history,
+        so it is preferred. If the frame has aged out of that history, use the
+        pose stamped at grab time rather than the current pose.
+        """
+        pose = self._get_pose_at(float(frame.captured_at))
+        if pose is not None:
+            return pose
+        if grab_pose is not None:
+            self._grab_pose_fallbacks += 1
+            return grab_pose
+        # Synchronous path (tests / sim): no inference latency to undo.
+        return self._get_pose()
 
     def ingest_frame(self, frame: VisionFrame, *, mapping: bool = True) -> VisionResult:
         """Synchronous path for tests / sim: process one frame and maybe survey."""
@@ -469,6 +626,9 @@ class VisionSupervisor:
                 frame = await self._grab_frame(cam, lidar)
                 if frame is None:
                     continue
+                grab_pose = self._pose_at_grab(frame)
+                if grab_pose is None:
+                    continue
                 result = await asyncio.to_thread(self._worker.process, frame)
                 with self._lock:
                     self._last_result = result
@@ -488,15 +648,17 @@ class VisionSupervisor:
                 allow_place_kf = (
                     self._cfg.mode == MODE_MAPPING or self._cfg.vision_survey_only
                 )
+                pose = self._capture_pose(frame, grab_pose)
                 if self._cfg.vision_place_enabled:
                     await asyncio.to_thread(
                         self._place_tick,
                         frame,
                         result,
                         allow_keyframe=allow_place_kf,
+                        pose=pose,
                     )
                 if do_survey:
-                    await asyncio.to_thread(self._survey, frame, result)
+                    await asyncio.to_thread(self._survey, frame, result, pose=pose)
             finally:
                 self._inflight.discard(name)
 
@@ -625,12 +787,14 @@ class VisionSupervisor:
         result: VisionResult,
         *,
         allow_keyframe: bool,
+        pose: Optional[conv.Pose2D] = None,
     ) -> None:
         """Build / query the VLAD place index from live patch tokens."""
         descs = descriptors_from_patches(result.patches, max_patches=64)
         if descs is None:
             return
-        pose = self._get_pose_at(float(frame.captured_at)) or self._get_pose()
+        if pose is None:
+            pose = self._capture_pose(frame)
 
         with self._lock:
             if allow_keyframe and self._should_add_place_keyframe(pose):
@@ -818,17 +982,44 @@ class VisionSupervisor:
             f"kf={kid} score={score:.2f} jump={jump_m:.2f}m/{jump_deg:.1f}deg"
         )
 
-    def _survey(self, frame: VisionFrame, result: VisionResult) -> None:
+    def _survey(
+        self,
+        frame: VisionFrame,
+        result: VisionResult,
+        *,
+        pose: Optional[conv.Pose2D] = None,
+    ) -> None:
         """Associate patches into the landmark map; optionally soft-correct pose.
 
         Prefer detector boxes (YOLO-World / COCO): pool DINOv2 tokens inside each
         allowed box into one landmark observation. Dense texture patches remain as
         a capped fallback when the detector is quiet or missing.
+
+        ``pose`` is the robot pose at capture (looked up when omitted).
         """
+        if pose is None:
+            pose = self._capture_pose(frame)
+        try:
+            anchor_node, anchor_pose, pose_of_node = self._get_anchor()
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"anchor: {exc}"
+            return
+        view_xy = (float(pose.x), float(pose.y), float(pose.theta))
+        if anchor_node < 0:
+            # No keyframe yet — park candidates on a virtual node 0 at current pose.
+            anchor_node = 0
+            anchor_pose = pose
+            pose_of_node = {0: pose}
+
+        # Check what is already stored before adding to it, even on a frame
+        # with nothing to add: a landmark in empty air has no box to match.
+        self._audit_landmarks(frame, pose, pose_of_node)
+
         z_min = float(self._cfg.vision_z_min_m)
         z_max = float(self._cfg.vision_z_max_m)
         prefer = bool(self._cfg.vision_prefer_detections)
         det_obs: List[PatchObservation] = []
+        box_stats: Dict[str, int] = {}
         if prefer and result.detections and result.patches:
             det_obs = observations_from_detections(
                 frame,
@@ -838,7 +1029,15 @@ class VisionSupervisor:
                 z_min_m=z_min,
                 z_max_m=z_max,
                 min_patches=1,
+                stats=box_stats,
             )
+        box_stats["used"] = len(det_obs)
+        with self._lock:
+            self._last_box_depth = dict(box_stats)
+            for key, n in box_stats.items():
+                self._box_depth_counts[key] = (
+                    int(self._box_depth_counts.get(key, 0)) + int(n)
+                )
         self._last_detection_obs = len(det_obs)
         self._last_detection_boxes = len(result.detections or [])
 
@@ -881,19 +1080,6 @@ class VisionSupervisor:
         writeback_obs = list(det_obs) + list(wb_dense)
         if not obs and not writeback_obs:
             return
-        try:
-            anchor_node, anchor_pose, pose_of_node = self._get_anchor()
-        except Exception as exc:  # noqa: BLE001
-            self._last_error = f"anchor: {exc}"
-            return
-        # Pose at capture for multi-view promotion (XY + yaw); fall back to current.
-        pose = self._get_pose_at(float(frame.captured_at)) or self._get_pose()
-        view_xy = (float(pose.x), float(pose.y), float(pose.theta))
-        if anchor_node < 0:
-            # No keyframe yet — park candidates on a virtual node 0 at current pose.
-            anchor_node = 0
-            anchor_pose = pose
-            pose_of_node = {0: pose}
 
         n_det = len(det_obs)
         n_new = 0
@@ -937,6 +1123,73 @@ class VisionSupervisor:
 
         if self._writeback_enabled() and writeback_obs:
             self._try_pose_writeback(frame, writeback_obs, pose, pose_of_node)
+
+    def _audit_landmarks(
+        self,
+        frame: VisionFrame,
+        pose: conv.Pose2D,
+        pose_of_node: Dict[int, conv.Pose2D],
+    ) -> None:
+        """Compare stored landmarks with this frame's depth; drop air landmarks."""
+        removes = self._audit_removes()
+        with self._lock:
+            audit = self._landmarks.audit_against_depth(
+                frame.depth_m,
+                robot_pose=pose,
+                pose_of_node=pose_of_node,
+                intrinsics=frame.intrinsics,
+                mount_x=float(frame.mount_x),
+                mount_y=float(frame.mount_y),
+                mount_z=float(frame.mount_z),
+                mount_theta=float(frame.mount_theta),
+                mount_pitch=float(frame.mount_pitch),
+                mount_roll=float(frame.mount_roll),
+                remove=removes,
+            )
+            rows = audit["rows"]
+            summary: Dict[str, Any] = {
+                "in_view": len(rows),
+                # Most landmarks seen through at once: blamed on the pose, so
+                # this frame counted no strikes and removed nothing.
+                "pose_suspect": bool(audit["pose_suspect"]),
+            }
+            for row in rows:
+                verdict = str(row["verdict"])
+                summary[verdict] = int(summary.get(verdict, 0)) + 1
+            removed = [row for row in rows if row["removed"]]
+            summary["removed_ids"] = [int(row["id"]) for row in removed]
+            self._audit_frames += 1
+            if audit["pose_suspect"]:
+                self._audit_pose_suspect_frames += 1
+            self._audit_recent_removed = (
+                self._audit_recent_removed + removed
+            )[-_AUDIT_RECENT_REMOVED:]
+            # Worst first, so a truncated list keeps what matters.
+            rows.sort(
+                key=lambda row: (
+                    0 if row["verdict"] == AUDIT_SEEN_THROUGH else 1,
+                    -int(row["strikes"]),
+                    int(row["id"]),
+                )
+            )
+            self._last_audit = {
+                "mono": time.monotonic(),
+                "camera": str(frame.camera_name),
+                "pose": {
+                    "x": round(float(pose.x), 3),
+                    "y": round(float(pose.y), 3),
+                    "theta_deg": round(math.degrees(float(pose.theta)), 1),
+                },
+                "summary": summary,
+                "rows": rows[:_AUDIT_MAX_ROWS],
+                "truncated": len(rows) > _AUDIT_MAX_ROWS,
+            }
+        for row in removed:
+            self._log(
+                f"vision: dropped landmark {row['label']} — camera sees "
+                f"{row['measured_depth_m']} m where it was stored at "
+                f"{row['stored_depth_m']} m"
+            )
 
     def _try_pose_writeback(
         self,

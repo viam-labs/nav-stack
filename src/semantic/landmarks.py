@@ -11,6 +11,63 @@ import numpy as np
 from ..geom import conversions as conv
 from .types import CameraIntrinsics, LandmarkStatus
 
+# Depth-audit verdicts: what the depth image shows where a landmark is stored.
+AUDIT_AGREES = "agrees"  # a surface sits at the stored depth
+AUDIT_SEEN_THROUGH = "seen_through"  # the camera sees well past the stored point
+AUDIT_OCCLUDED = "occluded"  # something nearer is in the way
+AUDIT_NO_DEPTH = "no_depth"  # too few valid depth pixels to judge
+AUDIT_UNCLEAR = "unclear"  # mixed readings, no verdict
+
+
+def display_label(lm: "EmbeddingLandmark") -> str:
+    """Name shown on landmark-camera: ``DC12`` / ``Dc12`` / ``C12`` / ``c12``."""
+    tag = {
+        LandmarkStatus.CONFIRMED: "C",
+        LandmarkStatus.CANDIDATE: "c",
+        LandmarkStatus.MOVED: "M",
+    }.get(lm.status, "?")
+    prefix = "D" if bool(lm.from_detector) else ""
+    return f"{prefix}{tag}{int(lm.landmark_id)}"
+
+
+def _depth_verdict(
+    depth_m: np.ndarray,
+    u: float,
+    v: float,
+    stored_m: float,
+    *,
+    half_px: float,
+) -> Tuple[str, Optional[float]]:
+    """Judge one stored depth against the image; returns (verdict, median depth)."""
+    h, w = depth_m.shape
+    half = int(round(min(12.0, max(4.0, float(half_px)))))
+    ui, vi = int(round(u)), int(round(v))
+    win = depth_m[
+        max(0, vi - half) : min(h, vi + half + 1),
+        max(0, ui - half) : min(w, ui + half + 1),
+    ]
+    vals = win[np.isfinite(win) & (win > 0.0)]
+    # Measured against the full window, so one clipped by the image edge or
+    # mostly invalid gives no verdict.
+    if vals.size < max(8.0, 0.25 * float((2 * half + 1) ** 2)):
+        return AUDIT_NO_DEPTH, None
+    measured = float(np.median(vals))
+    near_tol = max(0.20, 0.08 * float(stored_m))
+    far_tol = max(0.40, 0.15 * float(stored_m))
+    n = float(vals.size)
+    at = float(np.count_nonzero(np.abs(vals - stored_m) <= near_tol)) / n
+    beyond = float(np.count_nonzero(vals > stored_m + far_tol)) / n
+    front = float(np.count_nonzero(vals < stored_m - near_tol)) / n
+    # A thin object (pole, plant) fills little of the window: any real share
+    # at the stored depth counts as present.
+    if at >= 0.15:
+        return AUDIT_AGREES, measured
+    if beyond >= 0.80:
+        return AUDIT_SEEN_THROUGH, measured
+    if front >= 0.50:
+        return AUDIT_OCCLUDED, measured
+    return AUDIT_UNCLEAR, measured
+
 
 @dataclass
 class EmbeddingLandmark:
@@ -73,12 +130,17 @@ class EmbeddingLandmarkMap:
     # Min XY (m) / yaw (deg) change before recording another view pose.
     view_record_xy_m: float = 0.15
     view_record_yaw_deg: float = 12.0
+    # Depth audit: frames in a row the camera must see past a landmark's
+    # stored point before the landmark is dropped.
+    see_through_strikes: int = 3
 
     def __post_init__(self) -> None:
         self._next_id = 1
         self._landmarks: Dict[int, EmbeddingLandmark] = {}
         self._cell_index: Dict[Tuple[int, int, int], List[int]] = {}
         self._demote_strikes: Dict[int, int] = {}
+        self._see_through_strikes: Dict[int, int] = {}
+        self._seen_through_removed = 0
         self._assoc_hits = 0
         self._assoc_misses = 0
         self._assoc_soft_hits = 0
@@ -385,6 +447,130 @@ class EmbeddingLandmarkMap:
                 if not ids:
                     del self._cell_index[cell]
         self._demote_strikes.pop(int(lid), None)
+        self._see_through_strikes.pop(int(lid), None)
+
+    def seen_through_ids(self, *, min_strikes: Optional[int] = None) -> List[int]:
+        """Landmarks the depth audit caught in empty air.
+
+        Default: those at the strike limit (flagged). ``min_strikes=1`` adds
+        the ones seen through on their latest audited frame.
+        """
+        limit = max(1, int(self.see_through_strikes))
+        need = limit if min_strikes is None else max(1, int(min_strikes))
+        return sorted(
+            int(lid)
+            for lid, strikes in self._see_through_strikes.items()
+            if strikes >= need and lid in self._landmarks
+        )
+
+    def audit_against_depth(
+        self,
+        depth_m: np.ndarray,
+        *,
+        robot_pose: conv.Pose2D,
+        pose_of_node: Dict[int, conv.Pose2D],
+        intrinsics: CameraIntrinsics,
+        mount_x: float = 0.0,
+        mount_y: float = 0.0,
+        mount_z: float = 0.0,
+        mount_theta: float = 0.0,
+        mount_pitch: float = 0.0,
+        mount_roll: float = 0.0,
+        remove: bool = False,
+        max_range_m: float = 4.5,
+        window_m: float = 0.10,
+    ) -> dict:
+        """Compare each in-view landmark's stored depth with the depth image.
+
+        A landmark is a claim that a surface exists at ``map_xyz``. When the
+        camera reads depth well beyond that point, nothing is there. After
+        ``see_through_strikes`` such frames in a row the landmark is flagged,
+        and removed when ``remove`` is set. A frame that agrees clears the
+        count; occluded / no-depth / unclear frames leave it unchanged.
+
+        Only pass ``remove=True`` when ``robot_pose`` is trusted (mapping): a
+        wrong pose makes every landmark look seen through. As a second guard,
+        a frame where most judged landmarks are seen through at once is
+        treated as a pose problem (``pose_suspect``) and changes nothing.
+
+        Returns ``{"rows": [...], "pose_suspect": bool}`` with one row per
+        landmark that projects into the image.
+        """
+        # Lazy import: viz already depends on landmarks.
+        from ..viz.landmarks_view import project_map_point_to_pixel
+
+        depth = np.asarray(depth_m, dtype=float)
+        if depth.ndim != 2 or depth.size == 0:
+            return {"rows": [], "pose_suspect": False}
+        h, w = depth.shape
+        rows: List[dict] = []
+        for lm in self._landmarks.values():
+            if lm.status == LandmarkStatus.MOVED:
+                continue
+            mxyz = self.association_map_xyz(lm)
+            if mxyz is None:
+                mxyz = self.resolved_map_xyz(lm, pose_of_node)
+            proj = project_map_point_to_pixel(
+                mxyz,
+                robot_pose=robot_pose,
+                intrinsics=intrinsics,
+                mount_x=float(mount_x),
+                mount_y=float(mount_y),
+                mount_z=float(mount_z),
+                mount_theta=float(mount_theta),
+                mount_pitch=float(mount_pitch),
+                mount_roll=float(mount_roll),
+            )
+            if proj is None:
+                continue
+            u, v, stored = proj
+            if stored > float(max_range_m) or not (0.0 <= u < w and 0.0 <= v < h):
+                continue
+            verdict, measured = _depth_verdict(
+                depth,
+                u,
+                v,
+                stored,
+                half_px=float(window_m) * float(intrinsics.fx) / max(0.2, stored),
+            )
+            rows.append(
+                {
+                    "id": int(lm.landmark_id),
+                    "label": display_label(lm),
+                    "status": lm.status.value,
+                    "from_detector": bool(lm.from_detector),
+                    "observations": int(lm.observations),
+                    "u": round(float(u), 1),
+                    "v": round(float(v), 1),
+                    "stored_depth_m": round(float(stored), 3),
+                    "measured_depth_m": (
+                        None if measured is None else round(float(measured), 3)
+                    ),
+                    "verdict": verdict,
+                }
+            )
+
+        n_seen = sum(1 for row in rows if row["verdict"] == AUDIT_SEEN_THROUGH)
+        n_agree = sum(1 for row in rows if row["verdict"] == AUDIT_AGREES)
+        pose_suspect = n_seen >= 4 and n_seen > n_agree
+        limit = max(1, int(self.see_through_strikes))
+        for row in rows:
+            lid = int(row["id"])
+            strikes = int(self._see_through_strikes.get(lid, 0))
+            if not pose_suspect:
+                if row["verdict"] == AUDIT_SEEN_THROUGH:
+                    strikes = min(strikes + 1, limit)
+                    self._see_through_strikes[lid] = strikes
+                elif row["verdict"] == AUDIT_AGREES and strikes:
+                    strikes = 0
+                    self._see_through_strikes.pop(lid, None)
+            removed = bool(remove) and not pose_suspect and strikes >= limit
+            row["strikes"] = strikes
+            row["removed"] = removed
+            if removed:
+                self._remove_landmark(lid)
+                self._seen_through_removed += 1
+        return {"rows": rows, "pose_suspect": pose_suspect}
 
     def _merge_donor_into_keeper(
         self, keeper: EmbeddingLandmark, donor: EmbeddingLandmark
@@ -502,8 +688,18 @@ class EmbeddingLandmarkMap:
         view_xy: Tuple[float, ...],
         from_detector: bool = False,
         extent_m: Optional[float] = None,
+        pose_of_node: Optional[Dict[int, conv.Pose2D]] = None,
     ) -> EmbeddingLandmark:
-        """Associate or create a landmark from one measured map-frame point."""
+        """Associate or create a landmark from one measured map-frame point.
+
+        ``pose_of_node`` lets an update find the matched landmark's own anchor
+        pose; without it only landmarks on ``anchor_node`` refresh ``rel_xyz``.
+        """
+        poses = (
+            pose_of_node
+            if pose_of_node is not None
+            else {int(anchor_node): anchor_pose}
+        )
         map_xyz = np.asarray(map_xyz, dtype=float).reshape(3)
         descriptor = np.asarray(descriptor, dtype=np.float32).reshape(-1)
         normal_map = np.asarray(normal_map, dtype=float).reshape(3)
@@ -551,7 +747,7 @@ class EmbeddingLandmarkMap:
                     map_xyz,
                     descriptor,
                     view,
-                    anchor_pose,
+                    poses.get(overlap.anchor_node),
                     from_detector=from_detector,
                     extent_m=extent,
                     # Don't poison the confirmed bank with an unrelated crop.
@@ -595,7 +791,7 @@ class EmbeddingLandmarkMap:
             map_xyz,
             descriptor,
             view,
-            anchor_pose,
+            poses.get(best.anchor_node),
             from_detector=from_detector,
             extent_m=extent,
         )
@@ -645,10 +841,11 @@ class EmbeddingLandmarkMap:
                 view_xy=view,
                 from_detector=from_detector,
                 extent_m=extent,
+                pose_of_node=pose_of_node,
             )
         self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
-        # Demotion needs the landmark's own anchor pose when available.
-        update_pose = pose_of_node.get(best.anchor_node, anchor_pose)
+        # rel_xyz is only meaningful against the landmark's own anchor.
+        update_pose = pose_of_node.get(best.anchor_node)
         return self._update_existing(
             best,
             map_xyz,
@@ -665,12 +862,17 @@ class EmbeddingLandmarkMap:
         map_xyz: np.ndarray,
         descriptor: np.ndarray,
         view_xy: Tuple[float, float, float],
-        anchor_pose: conv.Pose2D,
+        anchor_pose: Optional[conv.Pose2D],
         *,
         from_detector: bool = False,
         extent_m: Optional[float] = None,
         bank_descriptor: bool = True,
     ) -> EmbeddingLandmark:
+        """Fold one observation into ``lm``.
+
+        ``anchor_pose`` is the pose of ``lm.anchor_node`` (``None`` when
+        unknown, which leaves ``rel_xyz`` untouched).
+        """
         lm.observations += 1
         if from_detector:
             lm.from_detector = True
@@ -694,7 +896,11 @@ class EmbeddingLandmarkMap:
         # Lock map_xyz after the first observation. Updating it to the running
         # mean made landmark-camera boxes crawl during spins (depth/pose noise).
         # Samples still drive std / promote; confirm refines map_xyz once.
-        if lm.status == LandmarkStatus.CANDIDATE and lm.anchor_node >= 0:
+        if (
+            lm.status == LandmarkStatus.CANDIDATE
+            and lm.anchor_node >= 0
+            and anchor_pose is not None
+        ):
             locked = (
                 np.asarray(lm.map_xyz, dtype=float).reshape(3)
                 if lm.map_xyz is not None
@@ -708,7 +914,7 @@ class EmbeddingLandmarkMap:
         self._maybe_record_view(lm, view_xy)
 
         if lm.status == LandmarkStatus.CANDIDATE:
-            self._try_promote(lm)
+            self._try_promote(lm, anchor_pose=anchor_pose)
         elif lm.status == LandmarkStatus.CONFIRMED:
             self._check_moved(lm, map_xyz, pose_hint=anchor_pose)
         return lm
@@ -745,7 +951,9 @@ class EmbeddingLandmarkMap:
                 return
         lm.view_poses_xy.append((vx, vy, vyaw))
 
-    def _try_promote(self, lm: EmbeddingLandmark) -> None:
+    def _try_promote(
+        self, lm: EmbeddingLandmark, *, anchor_pose: Optional[conv.Pose2D] = None
+    ) -> None:
         if lm.observations < int(self.promote_min_obs):
             return
         if len(lm.view_poses_xy) < int(self.promote_min_views):
@@ -791,15 +999,24 @@ class EmbeddingLandmarkMap:
             new_xyz = np.stack(lm._map_samples, axis=0).mean(axis=0).copy()
             lm.map_xyz = new_xyz
             self._reindex(lm, new_xyz)
+            # Confirming moves map_xyz to the sample mean; keep rel_xyz with it.
+            if anchor_pose is not None and lm.anchor_node >= 0:
+                lm.rel_xyz = self.rel_from_map_point(anchor_pose, new_xyz)
         lm._map_samples.clear()
 
     def _check_moved(
-        self, lm: EmbeddingLandmark, map_xyz: np.ndarray, *, pose_hint: conv.Pose2D
+        self,
+        lm: EmbeddingLandmark,
+        map_xyz: np.ndarray,
+        *,
+        pose_hint: Optional[conv.Pose2D],
     ) -> None:
         if lm.map_xyz is not None:
             expected = np.asarray(lm.map_xyz, dtype=float).reshape(3)
-        else:
+        elif pose_hint is not None:
             expected = self.map_point_from_rel(pose_hint, lm.rel_xyz)
+        else:
+            return
         # Only meaningful when pose_hint is the landmark's anchor.
         if lm.anchor_node < 0:
             return
@@ -961,6 +1178,8 @@ class EmbeddingLandmarkMap:
             "assoc_soft_hits": int(self._assoc_soft_hits),
             "assoc_overlap_absorbs": int(self._assoc_overlap_absorbs),
             "overlap_merges": int(self._overlap_merges),
+            "seen_through_flagged": len(self.seen_through_ids()),
+            "seen_through_removed": int(self._seen_through_removed),
             "assoc_hit_rate": (hits / attempts) if attempts else None,
             "mean_descriptors": (n_desc / max(1, len(self._landmarks))),
         }

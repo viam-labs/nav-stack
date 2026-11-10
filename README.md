@@ -689,7 +689,11 @@ is inside them.
 ### Map management (SLAM service)
 
 `list_maps`, `get_active_map`, `set_active_map`, `rename_map`, `delete_map`,
-`clear_map`, `clear_obstacles` (alias `erase_obstacles`; paint free space in a
+`clear_map`, `clear_landmarks` (alias `reset_landmarks`; drop every vision
+landmark and the saved `embedding_landmarks.npz`, keeping the occupancy map
+and place index), `landmark_audit` (alias `audit_landmarks`; stored vs
+measured depth for each landmark in the last vision frame — see
+`src/semantic/models/README.md`), `clear_obstacles` (alias `erase_obstacles`; paint free space in a
 disk — builtin SLAM; args `x`/`y` or `pose`, `radius_m`, optional `save`),
 `clear_region` (alias `erase_region`; blank an axis-aligned box and drop
 keyframes whose poses fall inside it — builtin SLAM; args `x_min`/`y_min`/

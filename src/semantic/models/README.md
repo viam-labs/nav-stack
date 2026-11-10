@@ -88,6 +88,73 @@ is not loaded; ``yolo=N`` is the latest box count. Set
 ``show_detections: false`` to hide the detector layer. Check
 ``vision_status.yolo_loaded`` / ``yolo_onnx`` if cyan boxes never appear.
 
+Every landmark is drawn as a small square at the projection of its own
+stored point, labelled with its ID and stored depth (``DC124 3.7m``). It is
+never drawn as the YOLO rectangle: a landmark stored in front of or behind
+an object still projects inside that object's box, so a filled box made a
+wrong position look right. The square scales with stored depth, so a
+landmark stored too near draws larger than the object behind it. A **red
+square with a cross** is a landmark the camera currently sees past (see the
+depth audit below); HUD ``air=N`` counts them.
+
+## Depth audit (`landmark_audit`)
+
+A landmark is a claim that a surface exists at its stored point. Each survey
+frame, every landmark that projects into the image has its stored depth
+compared with the depth image in a ~10 cm window:
+
+| Verdict | Meaning |
+| --- | --- |
+| `agrees` | ≥15% of the window reads the stored depth (±max(0.20 m, 8%)) |
+| `seen_through` | ≥80% of the window reads beyond stored + max(0.40 m, 15%) |
+| `occluded` | most of the window is nearer than the stored point |
+| `no_depth` | under 25% of the window has valid depth |
+| `unclear` | none of the above |
+
+Three `seen_through` frames in a row flag the landmark; an `agrees` frame
+clears the count; the other verdicts leave it unchanged. While **mapping**
+(or `vision_survey_only`) a flagged landmark, candidate or confirmed, is
+deleted and logged (`vision: dropped landmark DC125 …`), so the real object
+can be re-minted cleanly. While **localizing** the audit only reports: the
+pose is what is in doubt there, and a wrong pose makes every landmark look
+seen through. For the same reason a frame where at least 4 landmarks are
+seen through and they outnumber the agreeing ones is marked `pose_suspect`
+and changes nothing.
+
+`{"command": "landmark_audit"}` on the SLAM service returns the latest frame's
+rows (`id`, `label`, `status`, `u`, `v`, `stored_depth_m`, `measured_depth_m`,
+`verdict`, `strikes`, `removed`; worst first, at most 200), a `summary` of
+verdict counts, `flagged_ids`, `removed_total` and `recent_removed`.
+`vision_status.depth_audit` carries the counts.
+
+`{"command": "clear_landmarks"}` drops every landmark and deletes the active
+map's `embedding_landmarks.npz`; the occupancy map and the place index are
+kept. Use it before re-surveying.
+
+## Where a detector box's point comes from
+
+The point is read from raw depth in the central 60% of the box. The pixels
+are grouped by depth and the largest group within one surface width
+(2 × max(0.12 m, 6% of depth)) is the object. The box becomes an observation
+only when that group is unambiguous; otherwise it is skipped and counted in
+`vision_status.box_depth`:
+
+| Count | Why the box made no observation |
+| --- | --- |
+| `skipped_sparse_depth` | under 30% of the box core has valid depth |
+| `skipped_mixed_depth` | no surface holds 60% of the valid pixels (object + background, or an occluder) |
+| `skipped_range` | the surface is nearer than 0.4 m or beyond 4.0 m |
+| `skipped_height` | the point is outside `vision_z_min_m` / `vision_z_max_m` |
+
+`used` counts boxes that did. A box mostly filled by something standing in
+front of the object still lands on that nearer thing: it is a real surface,
+so the audit will not flag it.
+
+`vision_status.capture_pose` counts frames whose capture-time pose had to
+come from the grab-time stamp (`grab_time_fallbacks`) or that were dropped
+because no capture pose was available and they were over 1 s old
+(`stale_frames_dropped`).
+
 ## Pose corrections (defaults — no mode knobs)
 
 With `vision_enabled: true` the defaults are:
@@ -145,8 +212,8 @@ surfaces (paintings, posters, furniture) for survey.
 `camera_properties` when that works, else `fov_config` (lidar `fov_deg` /
 `vfov_deg` fallback — set those only if properties are empty).
 
-Wipe `embedding_landmarks.npz` (or `clear_map`) before re-surveying after
-switching synthetic → DINOv2. Prefer a single camera in `vision_cameras`.
+Run `clear_landmarks` (or `clear_map`, which also wipes the occupancy map)
+before re-surveying after switching synthetic → DINOv2. Prefer a single camera in `vision_cameras`.
 
 ## Meerkat GPU runtime
 
