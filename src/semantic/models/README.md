@@ -38,11 +38,11 @@ defaults — empty config resolves to:
 
 ```json
 "vision_enabled": true,
-"vision_survey_only": true,
 "vision_cameras": ["camera-top"],
 "vision_input_size": 448,
 "vision_prefer_detections": true
 ```
+
 
 Survey prefers detector boxes: each allowed YOLO-World box pools DINOv2 patch
 tokens into one landmark (much stabler re-ID than dense 14×14 tokens). Dense
