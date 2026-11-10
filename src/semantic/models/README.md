@@ -84,37 +84,22 @@ appear from dense DINO fallback); ``yolo=N`` is the latest box count. Set
 ``show_detections: false`` to hide the detector layer. Check
 ``vision_status.yolo_loaded`` / ``yolo_onnx`` if cyan boxes never appear.
 
-## Pose writeback (opt-in)
+## Pose corrections (defaults — no mode knobs)
 
-After a successful density survey, enable soft landmark corrections:
+With `vision_enabled: true` the defaults are:
 
-```json
-"vision_survey_only": false,
-"vision_pose_writeback": true
-```
+- **mapping**: build landmarks + VLAD place index only (never apply pose —
+  applying during mapping can shift the whole occupancy map)
+- **localizing**: soft-apply place retrieval (coarse) then landmark writeback
+  (fine), both via `apply_map_pose_correction(force=False)`
 
-Uses confirmed landmarks → RANSAC rigid fit → `apply_map_pose_correction`
-(`force=False`, lidar revisit path). Synthetic / survey-only never write pose.
-Watch `vision_status.writeback` (`attempts` / `applied` / `last`).
+You should not need to flip `vision_pose_writeback` / `vision_place_retrieval`
+when switching modes. Check `vision_status.pose_writeback_active` and
+`place.retrieval_active` (false while mapping, true while localizing).
 
-## VLAD place retrieval (opt-in apply)
+Kill switch if needed: `"vision_survey_only": true` (build only, never apply).
 
-During mapping/survey, vision builds a **place index** (`place_index.npz`):
-keyframes every ~0.75 m / 25° with a VLAD over DINOv2 patches. After enough
-keyframes it fits PCA + a small vocabulary. `vision_status.place` shows
-`keyframes`, `fitted`, and `last_query` (top hit + score) automatically when
-`vision_place_enabled` is true (default).
-
-To let a strong place hit softly correct pose (coarse; landmark writeback
-still does fine alignment):
-
-```json
-"vision_survey_only": false,
-"vision_place_retrieval": true,
-"vision_pose_writeback": true
-```
-
-Watch `vision_status.place.retrieval_applied` / `last_retrieval`.
+Watch `vision_status.writeback` and `vision_status.place`.
 
 ## Survey density / nav load (rc2+)
 

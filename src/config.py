@@ -1073,25 +1073,26 @@ class SlamConfig:
     vision_input_size: int = 448
     landmark_fix_max_range_m: float = 4.0
     landmark_fix_max_jump_m: float = 1.5
-    # Survey builds landmarks without writing pose. Default on so enabling
-    # vision cannot accidentally correct SLAM until writeback is opted in.
-    vision_survey_only: bool = True
+    # Kill switch: never apply vision pose corrections (still builds landmarks /
+    # place index). Prefer leaving this false — mapping vs localizing is gated
+    # in code so you do not need to retune when switching modes.
+    vision_survey_only: bool = False
     # Soft landmark pose writeback via apply_map_pose_correction (force=False).
-    # Requires vision_survey_only=false and a real (non-synthetic) DINOv2 provider.
-    vision_pose_writeback: bool = False
+    # Applies only while localizing (never during mapping — that rebuilds the map).
+    vision_pose_writeback: bool = True
     # 2D rigid fit needs 2 points; indoor FOV often only sees 2 fixtures at once.
     vision_pose_writeback_min_inliers: int = 2
     vision_pose_writeback_cooldown_s: float = 2.0
-    # VLAD place index: build keyframes during survey/mapping (no pose writes).
+    # VLAD place index: always build keyframes while mapping when vision is on.
     vision_place_enabled: bool = True
     vision_place_keyframe_min_gap_m: float = 0.75
     vision_place_keyframe_min_gap_deg: float = 25.0
     vision_place_vocab_size: int = 32
     vision_place_pca_dim: int = 128
     vision_place_min_keyframes_to_fit: int = 8
-    # Opt-in coarse pose from top VLAD hit (force=False). Landmark writeback
-    # still does the fine correction afterward when both are on.
-    vision_place_retrieval: bool = False
+    # Coarse pose from top VLAD hit (force=False). Localizing only; mapping
+    # builds the index but does not apply (avoids whole-map shifts).
+    vision_place_retrieval: bool = True
     vision_place_min_score: float = 0.45
     vision_place_max_jump_m: float = 8.0
     vision_place_max_jump_deg: float = 90.0

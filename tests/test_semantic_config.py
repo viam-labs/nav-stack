@@ -56,11 +56,11 @@ def test_vision_density_defaults():
     assert cfg.vision_max_patches_per_frame == 64
     assert cfg.vision_round_robin is True
     assert cfg.vision_input_size == 448
-    assert cfg.vision_survey_only is True
-    assert cfg.vision_pose_writeback is False
+    assert cfg.vision_survey_only is False
+    assert cfg.vision_pose_writeback is True
     assert cfg.vision_pose_writeback_min_inliers == 2
     assert cfg.vision_place_enabled is True
-    assert cfg.vision_place_retrieval is False
+    assert cfg.vision_place_retrieval is True
     assert cfg.vision_prefer_detections is True
     assert cfg.vision_dense_fallback_patches == 0
     assert cfg.vision_yolo_conf == 0.10

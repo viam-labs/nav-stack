@@ -101,13 +101,12 @@ def _cfg(**extra) -> SlamConfig:
     return SlamConfig.from_dict(d)
 
 
-def test_writeback_gated_off_by_default():
-    cfg = _cfg()
+def test_writeback_inactive_while_mapping():
+    """Defaults enable writeback, but mapping mode must not apply corrections."""
+    cfg = _cfg(mode="mapping", vision_survey_only=False, vision_pose_writeback=True)
     pose = Pose2D(0.0, 0.0, 0.0)
-    called = []
 
     def apply(p, *, score=None, force=False):
-        called.append((p, score, force))
         return {"applied": True, "status": "pose_only"}
 
     vision = VisionSupervisor(
@@ -118,12 +117,14 @@ def test_writeback_gated_off_by_default():
         get_anchor=lambda: (0, pose, {0: pose}),
         apply_pose_correction=apply,
     )
+    assert vision.status()["pose_writeback"] is True
+    assert vision.status()["pose_writeback_active"] is False
     assert vision._writeback_enabled() is False  # noqa: SLF001
-    assert vision.status()["pose_writeback"] is False
 
 
 def test_writeback_applies_when_enabled(tmp_path):
     cfg = _cfg(
+        mode="localizing",
         vision_survey_only=False,
         vision_pose_writeback=True,
         vision_pose_writeback_min_inliers=3,

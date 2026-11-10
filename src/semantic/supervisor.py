@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..config import LidarConfig, MODE_MAPPING, SlamConfig
+from ..config import LidarConfig, MODE_LOCALIZING, MODE_MAPPING, SlamConfig
 from ..geom import conversions as conv
 from .decode import decode_color_image, decode_depth_image, pick_named_images
 from .frames import (
@@ -334,8 +334,11 @@ class VisionSupervisor:
             last = self._last_result
             return {
                 "enabled": bool(self._cfg.vision_enabled),
+                "mode": str(self._cfg.mode),
                 "survey_only": bool(self._cfg.vision_survey_only),
-                "pose_writeback": self._writeback_enabled(),
+                # Config intent vs actually applying (mapping never applies).
+                "pose_writeback": bool(self._cfg.vision_pose_writeback),
+                "pose_writeback_active": self._writeback_enabled(),
                 "cameras": list(self._cfg.vision_cameras),
                 "provider": self._worker.stats.get("provider"),
                 "frames": self._frames,
@@ -376,6 +379,7 @@ class VisionSupervisor:
                 "place": {
                     "enabled": bool(self._cfg.vision_place_enabled),
                     "retrieval": bool(self._cfg.vision_place_retrieval),
+                    "retrieval_active": self._place_retrieval_enabled(),
                     **self._place.status_dict(),
                     "last_query": self._last_place_query,
                     "retrieval_attempts": self._place_retrieval_attempts,
@@ -384,13 +388,17 @@ class VisionSupervisor:
                 },
             }
 
-    def _writeback_enabled(self) -> bool:
+    def _vision_apply_allowed(self) -> bool:
+        """Pose corrections only while localizing — mapping only builds maps."""
         return (
-            bool(self._cfg.vision_pose_writeback)
+            str(self._cfg.mode) == MODE_LOCALIZING
             and not bool(self._cfg.vision_survey_only)
             and self._apply_pose_correction is not None
             and not bool(self._worker.cfg.synthetic)
         )
+
+    def _writeback_enabled(self) -> bool:
+        return bool(self._cfg.vision_pose_writeback) and self._vision_apply_allowed()
 
     def ingest_frame(self, frame: VisionFrame, *, mapping: bool = True) -> VisionResult:
         """Synchronous path for tests / sim: process one frame and maybe survey."""
@@ -674,9 +682,7 @@ class VisionSupervisor:
         return (
             bool(self._cfg.vision_place_enabled)
             and bool(self._cfg.vision_place_retrieval)
-            and not bool(self._cfg.vision_survey_only)
-            and self._apply_pose_correction is not None
-            and not bool(self._worker.cfg.synthetic)
+            and self._vision_apply_allowed()
             and self._place.keyframe_vlad is not None
             and len(self._place.keyframe_ids) > 0
         )
