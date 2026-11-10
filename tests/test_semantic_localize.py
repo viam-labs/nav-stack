@@ -60,7 +60,7 @@ def test_match_and_fit_recovers_pose():
 
     # Wrong seed pose (drifted).
     seed = Pose2D(1.0, -0.2, math.radians(5.0))
-    live_xy, map_out, w = match_live_to_landmarks(
+    live_xy, map_out, w, _ids = match_live_to_landmarks(
         obs, visible, robot_pose=seed, cosine_threshold=0.5, max_reproj_m=1.0
     )
     assert live_xy.shape[0] >= 8
@@ -329,7 +329,7 @@ def test_detector_writeback_match_uses_soft_cosine():
         status=LandmarkStatus.CONFIRMED,
         from_detector=True,
     )
-    live, _, _ = match_live_to_landmarks(
+    live, _, _, _ids = match_live_to_landmarks(
         [_obs(2.0, 0.0, 1.0, d1)],
         [(lm, lm.map_xyz)],
         robot_pose=Pose2D(0.0, 0.0, 0.0),

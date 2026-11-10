@@ -117,6 +117,11 @@ class VisionSupervisor:
         self._writeback_attempts = 0
         self._writeback_applied = 0
         self._last_writeback: Optional[dict] = None
+        # Overlay: last writeback visible / paired landmark ids.
+        self._last_writeback_match: dict = {
+            "visible_ids": [],
+            "paired_ids": [],
+        }
         self._last_detection_obs = 0
         self._last_detection_boxes = 0
         self._place = PlaceIndex(
@@ -179,6 +184,14 @@ class VisionSupervisor:
     @property
     def landmarks(self) -> EmbeddingLandmarkMap:
         return self._landmarks
+
+    def writeback_match_overlay(self) -> dict:
+        """Landmark ids from the latest writeback attempt (for landmark-camera)."""
+        with self._lock:
+            return {
+                "visible_ids": list(self._last_writeback_match.get("visible_ids") or []),
+                "paired_ids": list(self._last_writeback_match.get("paired_ids") or []),
+            }
 
     def last_detections(
         self, *, camera_name: Optional[str] = None
@@ -976,6 +989,7 @@ class VisionSupervisor:
             cosine_thr = float(self._landmarks.cosine_threshold)
 
         min_inliers = int(self._cfg.vision_pose_writeback_min_inliers)
+        visible_ids = [int(lm.landmark_id) for lm, _ in visible]
         attempt = estimate_landmark_fix(
             obs,
             visible,
@@ -1003,6 +1017,11 @@ class VisionSupervisor:
                     reason = "weak_cosine"  # nearby but descriptors disagree
                 else:
                     reason = "few_pairs"
+            paired_ids = [int(x) for x in (attempt.paired_ids or [])]
+            self._last_writeback_match = {
+                "visible_ids": list(visible_ids),
+                "paired_ids": paired_ids,
+            }
             self._last_writeback = {
                 "status": "rejected_fit",
                 "reason": reason,
@@ -1012,6 +1031,8 @@ class VisionSupervisor:
                 "visible_image": len(visible),
                 "visible_frustum": len(visible_frustum),
                 "confirmed": confirmed,
+                "visible_ids": list(visible_ids),
+                "paired_ids": paired_ids,
                 "match": diag,
             }
             if attempt.jump_m is not None:
@@ -1021,6 +1042,11 @@ class VisionSupervisor:
             return
         # Ignore tiny corrections (noise).
         if fix.jump_m < 0.04 and fix.jump_deg < 1.0:
+            paired_ids = [int(x) for x in (attempt.paired_ids or [])]
+            self._last_writeback_match = {
+                "visible_ids": list(visible_ids),
+                "paired_ids": paired_ids,
+            }
             self._last_writeback = {
                 "status": "skipped_small",
                 "jump_m": round(fix.jump_m, 3),
@@ -1028,6 +1054,8 @@ class VisionSupervisor:
                 "score": round(fix.score, 3),
                 "inliers": int(fix.fit.inliers.sum()),
                 "pairs": fix.n_pairs,
+                "visible_ids": list(visible_ids),
+                "paired_ids": paired_ids,
             }
             return
         try:
@@ -1039,6 +1067,11 @@ class VisionSupervisor:
         applied = bool(result.get("applied"))
         if applied:
             self._writeback_applied += 1
+        paired_ids = [int(x) for x in (attempt.paired_ids or [])]
+        self._last_writeback_match = {
+            "visible_ids": list(visible_ids),
+            "paired_ids": paired_ids,
+        }
         self._last_writeback = {
             "status": "applied" if applied else str(result.get("status", "not_applied")),
             "jump_m": round(fix.jump_m, 3),
@@ -1050,6 +1083,8 @@ class VisionSupervisor:
             "visible": len(visible),
             "visible_image": len(visible),
             "visible_frustum": len(visible_frustum),
+            "visible_ids": list(visible_ids),
+            "paired_ids": paired_ids,
             "shift_m": result.get("shift_m"),
             "shift_deg": result.get("shift_deg"),
             "slam_status": result.get("status"),

@@ -244,6 +244,15 @@ class VisionCamera(Camera):
             except Exception as exc:  # noqa: BLE001
                 self._last_error = f"detections: {exc}"
                 detections, det_size = [], None
+        wb_vis: list = []
+        wb_pair: list = []
+        if hasattr(vision, "writeback_match_overlay"):
+            try:
+                wb = vision.writeback_match_overlay()
+                wb_vis = list(wb.get("visible_ids") or [])
+                wb_pair = list(wb.get("paired_ids") or [])
+            except Exception:  # noqa: BLE001
+                wb_vis, wb_pair = [], []
         png = await asyncio.to_thread(
             render_landmarks_overlay,
             color,
@@ -260,6 +269,8 @@ class VisionCamera(Camera):
             detections=detections,
             detection_frame_size=det_size,
             yolo_loaded=yolo_loaded,
+            writeback_visible_ids=wb_vis,
+            writeback_paired_ids=wb_pair,
         )
         self._last_error = None
         self._last_drawn = min(len(landmarks), int(self._opts.max_landmarks))

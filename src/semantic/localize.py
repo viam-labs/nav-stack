@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -38,6 +38,7 @@ class LandmarkPoseAttempt:
     pairs: int = 0
     jump_m: Optional[float] = None
     jump_deg: Optional[float] = None
+    paired_ids: List[int] = field(default_factory=list)
 
 
 def match_live_to_landmarks(
@@ -48,24 +49,25 @@ def match_live_to_landmarks(
     cosine_threshold: float,
     max_reproj_m: float = 0.45,
     detector_cosine_threshold: float = 0.30,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
     """Greedy 1:1 match of live base_link patches to visible map landmarks.
 
-    Returns ``(live_xy, map_xy, weights)`` with shape ``(N, 2)`` / ``(N,)``.
-    Empty arrays when nothing matched.
+    Returns ``(live_xy, map_xy, weights, paired_ids)``.
+    Empty arrays / empty ids when nothing matched.
 
     Detector-anchored landmarks use ``detector_cosine_threshold`` (aligned with
     survey association) so writeback is not harsher than re-ID.
     """
     if not observations or not visible:
         empty = np.zeros((0, 2), dtype=float)
-        return empty, empty, np.zeros((0,), dtype=float)
+        return empty, empty, np.zeros((0,), dtype=float), []
 
     c, s = math.cos(robot_pose.theta), math.sin(robot_pose.theta)
     used_lm: set = set()
     live_rows: List[np.ndarray] = []
     map_rows: List[np.ndarray] = []
     weights: List[float] = []
+    paired_ids: List[int] = []
 
     # Prefer distinctive (higher best-vs-threshold margin) by sorting on
     # range uncertainty ascending — closer/cleaner patches first.
@@ -109,16 +111,18 @@ def match_live_to_landmarks(
         used_lm.add(lm.landmark_id)
         live_rows.append(np.asarray(pb[:2], dtype=float))
         map_rows.append(best_map)
+        paired_ids.append(int(lm.landmark_id))
         # Weight by cosine margin and inverse depth sigma.
         weights.append(max(0.05, best_cos) / max(0.01, float(o.sigma_m)))
 
     if not live_rows:
         empty = np.zeros((0, 2), dtype=float)
-        return empty, empty, np.zeros((0,), dtype=float)
+        return empty, empty, np.zeros((0,), dtype=float), []
     return (
         np.stack(live_rows, axis=0),
         np.stack(map_rows, axis=0),
         np.asarray(weights, dtype=float),
+        paired_ids,
     )
 
 
@@ -206,7 +210,7 @@ def estimate_landmark_fix(
     rng: Optional[np.random.Generator] = None,
 ) -> LandmarkPoseAttempt:
     """Pair -> rigid fit -> jump gate. ``fix`` is set only when trusted."""
-    live_xy, map_xy, weights = match_live_to_landmarks(
+    live_xy, map_xy, weights, paired_ids = match_live_to_landmarks(
         observations,
         visible,
         robot_pose=robot_pose,
@@ -216,7 +220,9 @@ def estimate_landmark_fix(
     )
     pairs = int(live_xy.shape[0])
     if pairs < int(min_inliers):
-        return LandmarkPoseAttempt(reason="few_pairs", pairs=pairs)
+        return LandmarkPoseAttempt(
+            reason="few_pairs", pairs=pairs, paired_ids=list(paired_ids)
+        )
     fit = fit_rigid_2d(
         live_xy,
         map_xy,
@@ -226,7 +232,9 @@ def estimate_landmark_fix(
         rng=rng,
     )
     if fit is None:
-        return LandmarkPoseAttempt(reason="rejected_residual", pairs=pairs)
+        return LandmarkPoseAttempt(
+            reason="rejected_residual", pairs=pairs, paired_ids=list(paired_ids)
+        )
     jump_m = math.hypot(fit.pose.x - robot_pose.x, fit.pose.y - robot_pose.y)
     jump_deg = abs(
         math.degrees(conv.normalize_angle(fit.pose.theta - robot_pose.theta))
@@ -237,6 +245,7 @@ def estimate_landmark_fix(
             pairs=pairs,
             jump_m=float(jump_m),
             jump_deg=float(jump_deg),
+            paired_ids=list(paired_ids),
         )
     # Score: inlier fraction x residual quality (soft for apply_map_pose_correction).
     inlier_frac = float(fit.inliers.mean()) if fit.inliers.size else 0.0
@@ -254,4 +263,5 @@ def estimate_landmark_fix(
         pairs=pairs,
         jump_m=float(jump_m),
         jump_deg=float(jump_deg),
+        paired_ids=list(paired_ids),
     )

@@ -31,6 +31,9 @@ _NESTED_FILL = {
 # YOLO / open-vocab detector boxes (distinct from landmark green/yellow).
 _DET_OUTLINE = (80, 180, 255, 255)
 _DET_FILL = (80, 180, 255, 28)
+# Writeback match rings (navigation pose correction).
+_WB_PAIRED = (255, 80, 220, 255)  # magenta = unique pair used in fit
+_WB_VISIBLE = (255, 160, 40, 255)  # orange = in writeback pool, not paired
 
 
 @dataclass
@@ -133,6 +136,8 @@ def render_landmarks_overlay(
     detections: Optional[Sequence[Detection]] = None,
     detection_frame_size: Optional[Tuple[int, int]] = None,
     yolo_loaded: Optional[bool] = None,
+    writeback_visible_ids: Optional[Sequence[int]] = None,
+    writeback_paired_ids: Optional[Sequence[int]] = None,
 ) -> bytes:
     """Draw landmark + optional YOLO boxes on ``color_rgb``; return PNG bytes.
 
@@ -144,6 +149,8 @@ def render_landmarks_overlay(
     3D center, not the detection rectangle, and YOLO lags the live RGB.
     """
     opts = options or LandmarkOverlayOptions()
+    wb_visible = {int(x) for x in (writeback_visible_ids or ())}
+    wb_paired = {int(x) for x in (writeback_paired_ids or ())}
     arr = np.asarray(color_rgb)
     if arr.ndim != 3 or arr.shape[2] != 3:
         return placeholder_landmarks_png("vision-camera: bad RGB shape")
@@ -258,6 +265,22 @@ def render_landmarks_overlay(
                     f"{prefix}{lm.landmark_id}",
                     fill=outline,
                 )
+        # Navigation writeback: orange = in match pool, magenta = unique pair.
+        lid = int(lm.landmark_id)
+        if lid in wb_paired:
+            r = 14.0
+            draw.ellipse(
+                [u - r, v - r, u + r, v + r], outline=_WB_PAIRED, width=3
+            )
+            if opts.show_labels:
+                draw.text((u + r + 2, v - 6), "P", fill=_WB_PAIRED)
+        elif lid in wb_visible:
+            r = 12.0
+            draw.ellipse(
+                [u - r, v - r, u + r, v + r], outline=_WB_VISIBLE, width=2
+            )
+            if opts.show_labels:
+                draw.text((u + r + 2, v - 6), "V", fill=_WB_VISIBLE)
         counts[status] = counts.get(status, 0) + 1
         drawn += 1
 
@@ -271,6 +294,7 @@ def render_landmarks_overlay(
         f"C={counts.get(LandmarkStatus.CONFIRMED, 0)} "
         f"c={counts.get(LandmarkStatus.CANDIDATE, 0)} "
         f"M={counts.get(LandmarkStatus.MOVED, 0)}  "
+        f"wbV={len(wb_visible)} wbP={len(wb_paired)}  "
         f"{yolo_hud}  "
         f"pose=({robot_pose.x:.2f},{robot_pose.y:.2f},{math.degrees(robot_pose.theta):.0f}°)"
     )
@@ -279,7 +303,7 @@ def render_landmarks_overlay(
     draw.text((4, 2), hud, fill=(230, 230, 230, 255))
     draw.text(
         (4, 16),
-        "cyan=YOLO  Dc=detector-landmark (fill inside box)  c/C=dense",
+        "cyan=YOLO  orange-V=wb pool  magenta-P=wb pair  c/C=map",
         fill=(180, 200, 220, 255),
     )
 

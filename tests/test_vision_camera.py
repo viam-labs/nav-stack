@@ -287,3 +287,45 @@ def test_collect_shows_single_view_detector_candidates():
     )
     assert len(pts) == 1
     assert pts[0][0].from_detector is True
+
+
+def test_render_overlay_writeback_rings():
+    """Paired landmarks get a magenta accent; pool-only get orange."""
+    color = np.zeros((240, 320, 3), dtype=np.uint8)
+    color[:] = (20, 20, 28)
+    K = CameraIntrinsics(fx=160, fy=160, cx=160, cy=120, width=320, height=240)
+    lm_pair = EmbeddingLandmark(
+        landmark_id=7,
+        anchor_node=0,
+        rel_xyz=np.array([1.5, 0.0, 0.9]),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array([1.5, 0.0, 0.9]),
+        descriptors=[],
+        observations=5,
+        status=LandmarkStatus.CONFIRMED,
+    )
+    lm_vis = EmbeddingLandmark(
+        landmark_id=8,
+        anchor_node=0,
+        rel_xyz=np.array([1.5, 0.3, 0.9]),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array([1.5, 0.3, 0.9]),
+        descriptors=[],
+        observations=5,
+        status=LandmarkStatus.CONFIRMED,
+    )
+    png = render_landmarks_overlay(
+        color,
+        [(lm_pair, lm_pair.map_xyz), (lm_vis, lm_vis.map_xyz)],
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        intrinsics=K,
+        mount_x=0.1,
+        mount_z=0.4,
+        writeback_visible_ids=[7, 8],
+        writeback_paired_ids=[7],
+    )
+    arr = np.asarray(Image.open(io.BytesIO(png)))
+    # Magenta ring bumps red+blue; orange bumps red+green.
+    assert arr[..., 0].max() > 40
+    assert arr[..., 2].max() > 40
+

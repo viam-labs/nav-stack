@@ -78,9 +78,13 @@ boxes (green=confirmed, yellow=candidate):
 
 ``source`` should be the same RealSense as ``vision_cameras``. Open it in the
 Viam camera stream view. Overlay colors: **green** confirmed, **yellow**
-candidate, **cyan** latest YOLO-World boxes (label + confidence). HUD
-``yolo=OFF`` means the detector ONNX is not loaded (candidates can still
-appear from dense DINO fallback); ``yolo=N`` is the latest box count. Set
+candidate, **cyan** latest YOLO-World boxes (label + confidence).
+**Orange ring + V** = in the latest writeback match pool (image-visible
+confirmed); **magenta ring + P** = unique pair used for the pose fit.
+HUD ``wbV`` / ``wbP`` are those counts. Plain greens without a ring are
+on the map overlay but not in the last navigation match (e.g. candidate,
+out of range, or not paired). HUD ``yolo=OFF`` means the detector ONNX
+is not loaded; ``yolo=N`` is the latest box count. Set
 ``show_detections: false`` to hide the detector layer. Check
 ``vision_status.yolo_loaded`` / ``yolo_onnx`` if cyan boxes never appear.
 
