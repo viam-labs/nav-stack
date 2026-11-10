@@ -101,6 +101,8 @@ when switching modes. Check `vision_status.pose_writeback_active` and
 Place is meter-scale and ambiguous — it recovers when SLAM reports lost, it
 does not nudge pose while tracking. Landmark writeback handles fine drift.
 
+Writeback needs ≥3 landmark pairs (2-point SE(2) fits are unstable). Matching may use a small dense patch set that is **not** surveyed, so detector-only mapping still gets enough inliers. Rejections report `few_pairs` / `rejected_residual` / `rejected_jump` (no catch-all).
+
 Kill switch if needed: `"vision_survey_only": true` (build only, never apply).
 
 Watch `vision_status.writeback` and `vision_status.place`.

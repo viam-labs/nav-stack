@@ -64,7 +64,7 @@ def test_match_and_fit_recovers_pose():
         obs, visible, robot_pose=seed, cosine_threshold=0.5, max_reproj_m=1.0
     )
     assert live_xy.shape[0] >= 8
-    fix = estimate_landmark_fix(
+    attempt = estimate_landmark_fix(
         obs,
         visible,
         robot_pose=seed,
@@ -74,7 +74,8 @@ def test_match_and_fit_recovers_pose():
         max_reproj_m=1.0,
         rng=rng,
     )
-    assert fix is not None
+    assert attempt.fix is not None, attempt
+    fix = attempt.fix
     assert fix.fit.pose.x == pytest.approx(true.x, abs=0.08)
     assert fix.fit.pose.y == pytest.approx(true.y, abs=0.08)
     assert fix.fit.pose.theta == pytest.approx(true.theta, abs=0.08)
@@ -331,3 +332,159 @@ def test_detector_writeback_match_uses_soft_cosine():
         cosine_threshold=0.55,
     )
     assert live.shape[0] == 1
+
+
+def _confirmed_lm(lid: int, xyz, desc: np.ndarray) -> EmbeddingLandmark:
+    xyz = np.asarray(xyz, dtype=float)
+    return EmbeddingLandmark(
+        landmark_id=lid,
+        anchor_node=0,
+        rel_xyz=xyz.copy(),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=xyz.copy(),
+        descriptors=[desc],
+        observations=5,
+        status=LandmarkStatus.CONFIRMED,
+        from_detector=True,
+    )
+
+
+def test_estimate_two_pairs_is_few_pairs_with_min_inliers_3():
+    """SE(2) writeback requires ≥3 pairs; 2-point fits must not apply."""
+    rng = np.random.default_rng(3)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(2)]
+    visible = [
+        (_confirmed_lm(1, [1.0, 0.0, 1.0], descs[0]), np.array([1.0, 0.0, 1.0])),
+        (_confirmed_lm(2, [1.0, 0.4, 1.0], descs[1]), np.array([1.0, 0.4, 1.0])),
+    ]
+    obs = [_obs(1.0, 0.0, 1.0, descs[0]), _obs(1.0, 0.4, 1.0, descs[1])]
+    attempt = estimate_landmark_fix(
+        obs,
+        visible,
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        cosine_threshold=0.55,
+        min_inliers=3,
+    )
+    assert attempt.fix is None
+    assert attempt.reason == "few_pairs"
+    assert attempt.pairs == 2
+
+
+def test_estimate_landmark_fix_rejected_jump():
+    rng = np.random.default_rng(4)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(3)]
+    # Map landmarks imply robot at ~(+2, 0); seed pose at origin → large jump.
+    true = Pose2D(2.0, 0.0, 0.0)
+    visible = []
+    obs = []
+    for i, d in enumerate(descs):
+        live = np.array([1.0 + 0.15 * i, 0.1 * (i - 1), 1.0])
+        map_xy = np.array([true.x + live[0], true.y + live[1], 1.0])
+        visible.append((_confirmed_lm(i + 1, map_xy, d), map_xy))
+        obs.append(_obs(float(live[0]), float(live[1]), 1.0, d))
+    attempt = estimate_landmark_fix(
+        obs,
+        visible,
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        cosine_threshold=0.55,
+        min_inliers=3,
+        max_jump_m=0.5,
+        max_jump_deg=10.0,
+        max_reproj_m=2.5,
+    )
+    assert attempt.fix is None, attempt
+    assert attempt.reason == "rejected_jump", attempt
+    assert attempt.jump_m is not None and attempt.jump_m > 0.5
+
+
+def test_estimate_landmark_fix_applies_with_three_pairs():
+    rng = np.random.default_rng(5)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(3)]
+    true = Pose2D(0.25, 0.0, 0.0)
+    visible = []
+    obs = []
+    for i, d in enumerate(descs):
+        live = np.array([1.0 + 0.2 * i, 0.15 * (i - 1), 1.0])
+        map_xy = np.array([true.x + live[0], true.y + live[1], 1.0])
+        visible.append((_confirmed_lm(i + 1, map_xy, d), map_xy))
+        obs.append(_obs(float(live[0]), float(live[1]), 1.0, d))
+    attempt = estimate_landmark_fix(
+        obs,
+        visible,
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        cosine_threshold=0.55,
+        min_inliers=3,
+        max_jump_m=1.5,
+    )
+    assert attempt.fix is not None, attempt
+    assert attempt.fix.n_pairs >= 3
+    assert abs(attempt.fix.fit.pose.x - 0.25) < 0.08
+
+
+def test_writeback_dense_match_not_surveyed():
+    """Writeback may use dense patches; survey with dense_fallback=0 must not grow map from them."""
+    cfg = _cfg(
+        mode="mapping",
+        vision_survey_only=False,
+        vision_prefer_detections=True,
+        vision_dense_fallback_patches=0,
+        vision_pose_writeback=False,
+        vision_max_patches_per_frame=64,
+    )
+    pose = Pose2D(0.0, 0.0, 0.0)
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: pose,
+        get_pose_at=lambda _t: pose,
+        get_anchor=lambda: (0, pose, {0: pose}),
+    )
+    # Synthetic frame with patches + one painting detection.
+    from src.semantic.types import Detection, VisionResult
+
+    h = w = 64
+    rng = np.random.default_rng(9)
+    patches = []
+    for r in range(4):
+        for c in range(4):
+            patches.append(
+                PatchToken(
+                    row=r,
+                    col=c,
+                    u=8.0 + 12.0 * c,
+                    v=8.0 + 12.0 * r,
+                    descriptor=l2_normalize(rng.standard_normal(8).astype(np.float32)),
+                )
+            )
+    # Depth so backproject keeps tokens in the wall band.
+    depth = np.full((h, w), 1.2, dtype=np.float32)
+    frame = VisionFrame(
+        camera_name="depth-cam",
+        stamp=0.0,
+        captured_at=0.0,
+        color_rgb=np.zeros((h, w, 3), dtype=np.uint8),
+        depth_m=depth,
+        intrinsics=CameraIntrinsics(fx=100, fy=100, cx=32, cy=32, width=w, height=h),
+        mount_x=0.1,
+        mount_z=0.4,
+    )
+    det = Detection(label="painting", conf=0.9, x0=5, y0=5, x1=20, y1=20)
+    result = VisionResult(
+        camera_name="depth-cam",
+        stamp=0.0,
+        captured_at=0.0,
+        patches=patches,
+        detections=[det],
+        provider="test",
+        infer_ms=1.0,
+    )
+    before = len(vision.landmarks)
+    vision._survey(frame, result)  # noqa: SLF001
+    # Detector-only survey: at most one new landmark from the painting box.
+    after = len(vision.landmarks)
+    assert after - before <= 1
+    # Cap constant is wired for writeback pairing.
+    from src.semantic import supervisor as sup
+
+    assert int(sup._WRITEBACK_DENSE_MATCH_CAP) == 24
+

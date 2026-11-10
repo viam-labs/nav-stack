@@ -25,7 +25,6 @@ from .landmarks import EmbeddingLandmarkMap
 from .localize import (
     diagnose_landmark_match,
     estimate_landmark_fix,
-    match_live_to_landmarks,
 )
 from .patches import PatchObservation, backproject_patches, subsample_observations
 from .persist import (
@@ -46,6 +45,10 @@ AnchorProvider = Callable[[], Tuple[int, conv.Pose2D, Dict[int, conv.Pose2D]]]
 PoseCorrection = Callable[..., Dict[str, Any]]
 # True when SLAM localization_state is lost/unknown (place apply only then).
 LocLostProvider = Callable[[], bool]
+
+# Dense patches used only for writeback pairing (never surveyed) so detector-only
+# survey does not starve the rigid fit of inliers.
+_WRITEBACK_DENSE_MATCH_CAP = 24
 
 # Fetched by setup.sh / run.sh next to this package (same pattern as DINOv2).
 _DEFAULT_YOLO_WORLD_ONNX = "yolov8s-worldv2-indoor.onnx"
@@ -847,7 +850,23 @@ class VisionSupervisor:
             )
             dense_obs = subsample_observations(dense_obs, dense_cap)
         obs = list(det_obs) + list(dense_obs)
-        if not obs:
+        # Extra dense patches for writeback pairing only (not surveyed).
+        wb_dense: List[PatchObservation] = []
+        if prefer and result.patches and _WRITEBACK_DENSE_MATCH_CAP > 0:
+            wb_tokens = _tokens_outside_detections(
+                result.patches,
+                result.detections or (),
+                landmark_labels=self._cfg.vision_landmark_labels,
+            )
+            wb_dense = backproject_patches(
+                frame,
+                wb_tokens,
+                z_min_m=z_min,
+                z_max_m=z_max,
+            )
+            wb_dense = subsample_observations(wb_dense, _WRITEBACK_DENSE_MATCH_CAP)
+        writeback_obs = list(det_obs) + list(wb_dense)
+        if not obs and not writeback_obs:
             return
         try:
             anchor_node, anchor_pose, pose_of_node = self._get_anchor()
@@ -903,8 +922,8 @@ class VisionSupervisor:
             self._landmarks.merge_overlapping_detector_landmarks()
             self._observations += n_new
 
-        if self._writeback_enabled():
-            self._try_pose_writeback(frame, obs, pose, pose_of_node)
+        if self._writeback_enabled() and writeback_obs:
+            self._try_pose_writeback(frame, writeback_obs, pose, pose_of_node)
 
     def _try_pose_writeback(
         self,
@@ -943,7 +962,7 @@ class VisionSupervisor:
             cosine_thr = float(self._landmarks.cosine_threshold)
 
         min_inliers = int(self._cfg.vision_pose_writeback_min_inliers)
-        fix = estimate_landmark_fix(
+        attempt = estimate_landmark_fix(
             obs,
             visible,
             robot_pose=pose,
@@ -951,21 +970,17 @@ class VisionSupervisor:
             min_inliers=min_inliers,
             max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
         )
+        fix = attempt.fix
         if fix is None:
-            live_xy, _, _ = match_live_to_landmarks(
-                obs,
-                visible,
-                robot_pose=pose,
-                cosine_threshold=cosine_thr,
-            )
-            pairs = int(live_xy.shape[0])
+            pairs = int(attempt.pairs)
             diag = diagnose_landmark_match(
                 obs,
                 visible,
                 robot_pose=pose,
                 cosine_threshold=cosine_thr,
             )
-            if pairs < min_inliers:
+            reason = attempt.reason or "rejected_fit"
+            if reason == "few_pairs":
                 if int(diag.get("n_obs") or 0) == 0:
                     reason = "no_live_obs"
                 elif int(diag.get("n_geom_ok") or 0) == 0:
@@ -974,8 +989,6 @@ class VisionSupervisor:
                     reason = "weak_cosine"  # nearby but descriptors disagree
                 else:
                     reason = "few_pairs"
-            else:
-                reason = "fit_or_jump_gate"
             self._last_writeback = {
                 "status": "rejected_fit",
                 "reason": reason,
@@ -985,6 +998,10 @@ class VisionSupervisor:
                 "confirmed": confirmed,
                 "match": diag,
             }
+            if attempt.jump_m is not None:
+                self._last_writeback["jump_m"] = round(float(attempt.jump_m), 3)
+            if attempt.jump_deg is not None:
+                self._last_writeback["jump_deg"] = round(float(attempt.jump_deg), 2)
             return
         # Ignore tiny corrections (noise).
         if fix.jump_m < 0.04 and fix.jump_deg < 1.0:

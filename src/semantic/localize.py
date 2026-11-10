@@ -29,6 +29,17 @@ class LandmarkFix:
     jump_deg: float
 
 
+@dataclass
+class LandmarkPoseAttempt:
+    """Result of pair → fit → jump; ``fix`` set only when all gates pass."""
+
+    fix: Optional[LandmarkFix] = None
+    reason: Optional[str] = None  # few_pairs | rejected_residual | rejected_jump
+    pairs: int = 0
+    jump_m: Optional[float] = None
+    jump_deg: Optional[float] = None
+
+
 def match_live_to_landmarks(
     observations: Sequence[PatchObservation],
     visible: Sequence[Tuple[EmbeddingLandmark, np.ndarray]],
@@ -193,8 +204,8 @@ def estimate_landmark_fix(
     max_jump_deg: float = 25.0,
     max_reproj_m: float = 0.45,
     rng: Optional[np.random.Generator] = None,
-) -> Optional[LandmarkFix]:
-    """Pair → rigid fit → jump gate. Returns None when the fix is untrusted."""
+) -> LandmarkPoseAttempt:
+    """Pair -> rigid fit -> jump gate. ``fix`` is set only when trusted."""
     live_xy, map_xy, weights = match_live_to_landmarks(
         observations,
         visible,
@@ -203,8 +214,9 @@ def estimate_landmark_fix(
         max_reproj_m=max_reproj_m,
         detector_cosine_threshold=0.30,
     )
-    if live_xy.shape[0] < int(min_inliers):
-        return None
+    pairs = int(live_xy.shape[0])
+    if pairs < int(min_inliers):
+        return LandmarkPoseAttempt(reason="few_pairs", pairs=pairs)
     fit = fit_rigid_2d(
         live_xy,
         map_xy,
@@ -214,21 +226,32 @@ def estimate_landmark_fix(
         rng=rng,
     )
     if fit is None:
-        return None
+        return LandmarkPoseAttempt(reason="rejected_residual", pairs=pairs)
     jump_m = math.hypot(fit.pose.x - robot_pose.x, fit.pose.y - robot_pose.y)
     jump_deg = abs(
         math.degrees(conv.normalize_angle(fit.pose.theta - robot_pose.theta))
     )
     if jump_m > float(max_jump_m) or jump_deg > float(max_jump_deg):
-        return None
-    # Score: inlier fraction × residual quality (soft for apply_map_pose_correction).
+        return LandmarkPoseAttempt(
+            reason="rejected_jump",
+            pairs=pairs,
+            jump_m=float(jump_m),
+            jump_deg=float(jump_deg),
+        )
+    # Score: inlier fraction x residual quality (soft for apply_map_pose_correction).
     inlier_frac = float(fit.inliers.mean()) if fit.inliers.size else 0.0
     resid_q = max(0.0, 1.0 - float(fit.residual_rmse_m) / max(1e-6, float(residual_m)))
     score = max(0.05, min(0.95, 0.5 * inlier_frac + 0.5 * resid_q))
-    return LandmarkFix(
+    fix = LandmarkFix(
         fit=fit,
-        n_pairs=int(live_xy.shape[0]),
+        n_pairs=pairs,
         score=score,
         jump_m=jump_m,
         jump_deg=jump_deg,
+    )
+    return LandmarkPoseAttempt(
+        fix=fix,
+        pairs=pairs,
+        jump_m=float(jump_m),
+        jump_deg=float(jump_deg),
     )

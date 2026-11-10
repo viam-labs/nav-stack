@@ -58,7 +58,7 @@ def test_vision_density_defaults():
     assert cfg.vision_input_size == 448
     assert cfg.vision_survey_only is False
     assert cfg.vision_pose_writeback is True
-    assert cfg.vision_pose_writeback_min_inliers == 2
+    assert cfg.vision_pose_writeback_min_inliers == 3
     assert cfg.vision_place_enabled is True
     assert cfg.vision_place_retrieval is True
     assert cfg.vision_place_min_score == 0.55

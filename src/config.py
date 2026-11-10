@@ -1081,7 +1081,8 @@ class SlamConfig:
     # Applies only while localizing (never during mapping — that rebuilds the map).
     vision_pose_writeback: bool = True
     # 2D rigid fit needs 2 points; indoor FOV often only sees 2 fixtures at once.
-    vision_pose_writeback_min_inliers: int = 2
+    # SE(2) needs ≥3 pairs; 2-point fits invent large yaw from noise.
+    vision_pose_writeback_min_inliers: int = 3
     vision_pose_writeback_cooldown_s: float = 2.0
     # VLAD place index: always build keyframes while mapping when vision is on.
     vision_place_enabled: bool = True
