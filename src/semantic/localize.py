@@ -36,11 +36,15 @@ def match_live_to_landmarks(
     robot_pose: conv.Pose2D,
     cosine_threshold: float,
     max_reproj_m: float = 0.45,
+    detector_cosine_threshold: float = 0.30,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Greedy 1:1 match of live base_link patches to visible map landmarks.
 
     Returns ``(live_xy, map_xy, weights)`` with shape ``(N, 2)`` / ``(N,)``.
     Empty arrays when nothing matched.
+
+    Detector-anchored landmarks use ``detector_cosine_threshold`` (aligned with
+    survey association) so writeback is not harsher than re-ID.
     """
     if not observations or not visible:
         empty = np.zeros((0, 2), dtype=float)
@@ -71,6 +75,7 @@ def match_live_to_landmarks(
         hard = float(cosine_threshold)
         soft = min(hard, 0.35)
         soft_dist = 0.7 * float(max_reproj_m)
+        det_thr = float(detector_cosine_threshold)
         for i, (lm, mxyz) in enumerate(visible):
             if lm.landmark_id in used_lm:
                 continue
@@ -78,6 +83,8 @@ def match_live_to_landmarks(
             if dist > float(max_reproj_m):
                 continue
             need = soft if dist <= soft_dist else hard
+            if bool(lm.from_detector):
+                need = min(need, det_thr)
             cos = _best_desc_cosine(lm, desc)
             if cos < need:
                 continue
@@ -104,6 +111,76 @@ def match_live_to_landmarks(
     )
 
 
+def diagnose_landmark_match(
+    observations: Sequence[PatchObservation],
+    visible: Sequence[Tuple[EmbeddingLandmark, np.ndarray]],
+    *,
+    robot_pose: conv.Pose2D,
+    cosine_threshold: float,
+    max_reproj_m: float = 0.45,
+    detector_cosine_threshold: float = 0.30,
+) -> dict:
+    """Explain why writeback pairing failed (geometry vs descriptor)."""
+    n_obs = len(observations)
+    n_vis = len(visible)
+    if n_obs == 0 or n_vis == 0:
+        return {
+            "n_obs": n_obs,
+            "n_visible": n_vis,
+            "n_geom_ok": 0,
+            "n_cos_ok": 0,
+            "best_cos": None,
+            "best_dist_m": None,
+            "cosine_thr": float(cosine_threshold),
+            "detector_cosine_thr": float(detector_cosine_threshold),
+            "max_reproj_m": float(max_reproj_m),
+        }
+
+    c, s = math.cos(robot_pose.theta), math.sin(robot_pose.theta)
+    hard = float(cosine_threshold)
+    soft = min(hard, 0.35)
+    soft_dist = 0.7 * float(max_reproj_m)
+    det_thr = float(detector_cosine_threshold)
+    n_geom_ok = 0
+    n_cos_ok = 0
+    best_cos = -1.0
+    best_dist = None
+    for o in observations:
+        pb = o.point_base
+        pred_map = np.array(
+            [
+                robot_pose.x + c * float(pb[0]) - s * float(pb[1]),
+                robot_pose.y + s * float(pb[0]) + c * float(pb[1]),
+            ],
+            dtype=float,
+        )
+        for lm, mxyz in visible:
+            dist = math.hypot(float(mxyz[0]) - pred_map[0], float(mxyz[1]) - pred_map[1])
+            if dist > float(max_reproj_m):
+                continue
+            n_geom_ok += 1
+            need = soft if dist <= soft_dist else hard
+            if bool(lm.from_detector):
+                need = min(need, det_thr)
+            cos = _best_desc_cosine(lm, o.token.descriptor)
+            if cos > best_cos:
+                best_cos = cos
+                best_dist = dist
+            if cos >= need:
+                n_cos_ok += 1
+    return {
+        "n_obs": n_obs,
+        "n_visible": n_vis,
+        "n_geom_ok": int(n_geom_ok),
+        "n_cos_ok": int(n_cos_ok),
+        "best_cos": None if best_cos < 0 else round(float(best_cos), 3),
+        "best_dist_m": None if best_dist is None else round(float(best_dist), 3),
+        "cosine_thr": round(float(cosine_threshold), 3),
+        "detector_cosine_thr": round(float(det_thr), 3),
+        "max_reproj_m": float(max_reproj_m),
+    }
+
+
 def estimate_landmark_fix(
     observations: Sequence[PatchObservation],
     visible: Sequence[Tuple[EmbeddingLandmark, np.ndarray]],
@@ -124,6 +201,7 @@ def estimate_landmark_fix(
         robot_pose=robot_pose,
         cosine_threshold=cosine_threshold,
         max_reproj_m=max_reproj_m,
+        detector_cosine_threshold=0.30,
     )
     if live_xy.shape[0] < int(min_inliers):
         return None

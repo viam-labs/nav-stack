@@ -10,7 +10,11 @@ import pytest
 from src.config import SlamConfig
 from src.geom.conversions import Pose2D
 from src.semantic.landmarks import EmbeddingLandmark
-from src.semantic.localize import estimate_landmark_fix, match_live_to_landmarks
+from src.semantic.localize import (
+    diagnose_landmark_match,
+    estimate_landmark_fix,
+    match_live_to_landmarks,
+)
 from src.semantic.patches import PatchObservation
 from src.semantic.place import l2_normalize
 from src.semantic.supervisor import VisionSupervisor
@@ -190,3 +194,58 @@ def test_writeback_applies_when_enabled(tmp_path):
     assert called[0]["score"] is not None
     assert abs(called[0]["pose"].x - 0.3) < 0.08
     assert vision.status()["writeback"]["applied"] >= 1
+
+
+def test_diagnose_match_reports_weak_cosine_vs_geom():
+    d0 = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    d1 = l2_normalize(np.array([0.2, 0.98, 0.0, 0.0], dtype=np.float32))
+    assert float(np.dot(d0, d1)) < 0.30
+    lm = EmbeddingLandmark(
+        landmark_id=1,
+        anchor_node=0,
+        rel_xyz=np.array([2.0, 0.0, 1.0]),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptors=[d0],
+        observations=5,
+        status=LandmarkStatus.CONFIRMED,
+        from_detector=True,
+    )
+    pose = Pose2D(0.0, 0.0, 0.0)
+    obs = [_obs(2.05, 0.02, 1.0, d1)]
+    diag = diagnose_landmark_match(
+        obs,
+        [(lm, lm.map_xyz)],
+        robot_pose=pose,
+        cosine_threshold=0.55,
+    )
+    assert diag["n_geom_ok"] >= 1
+    assert diag["n_cos_ok"] == 0
+    assert diag["best_cos"] is not None
+    assert diag["best_cos"] < 0.30
+
+
+def test_detector_writeback_match_uses_soft_cosine():
+    """Survey associates at ~0.30; writeback must not demand 0.55."""
+    d0 = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    d1 = l2_normalize(np.array([0.32, 0.947, 0.0, 0.0], dtype=np.float32))
+    cos = float(np.dot(d0, d1))
+    assert 0.30 <= cos < 0.55
+    lm = EmbeddingLandmark(
+        landmark_id=1,
+        anchor_node=0,
+        rel_xyz=np.array([2.0, 0.0, 1.0]),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptors=[d0],
+        observations=5,
+        status=LandmarkStatus.CONFIRMED,
+        from_detector=True,
+    )
+    live, _, _ = match_live_to_landmarks(
+        [_obs(2.0, 0.0, 1.0, d1)],
+        [(lm, lm.map_xyz)],
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        cosine_threshold=0.55,
+    )
+    assert live.shape[0] == 1

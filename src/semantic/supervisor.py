@@ -22,7 +22,11 @@ from .frames import (
 )
 from .detect_landmarks import observations_from_detections
 from .landmarks import EmbeddingLandmarkMap
-from .localize import estimate_landmark_fix, match_live_to_landmarks
+from .localize import (
+    diagnose_landmark_match,
+    estimate_landmark_fix,
+    match_live_to_landmarks,
+)
 from .patches import PatchObservation, backproject_patches, subsample_observations
 from .persist import (
     load_landmarks,
@@ -904,11 +908,23 @@ class VisionSupervisor:
                 cosine_threshold=cosine_thr,
             )
             pairs = int(live_xy.shape[0])
-            reason = (
-                "few_pairs"
-                if pairs < min_inliers
-                else "fit_or_jump_gate"
+            diag = diagnose_landmark_match(
+                obs,
+                visible,
+                robot_pose=pose,
+                cosine_threshold=cosine_thr,
             )
+            if pairs < min_inliers:
+                if int(diag.get("n_obs") or 0) == 0:
+                    reason = "no_live_obs"
+                elif int(diag.get("n_geom_ok") or 0) == 0:
+                    reason = "geom_far"  # live pts not near any visible landmark
+                elif int(diag.get("n_cos_ok") or 0) == 0:
+                    reason = "weak_cosine"  # nearby but descriptors disagree
+                else:
+                    reason = "few_pairs"
+            else:
+                reason = "fit_or_jump_gate"
             self._last_writeback = {
                 "status": "rejected_fit",
                 "reason": reason,
@@ -916,6 +932,7 @@ class VisionSupervisor:
                 "min_inliers": min_inliers,
                 "visible": len(visible),
                 "confirmed": confirmed,
+                "match": diag,
             }
             return
         # Ignore tiny corrections (noise).
