@@ -792,3 +792,61 @@ def test_update_from_another_anchor_does_not_rewrite_rel_xyz():
     assert again.landmark_id == lm.landmark_id
     assert lm.anchor_node == 0
     np.testing.assert_allclose(lm.rel_xyz, rel_before)
+
+
+def test_audit_ignores_incoherent_far_depth_on_a_real_frame():
+    """Real camera-top frame: part of a painting 3.7 m away reads 4-10 m.
+
+    The stereo matcher returns a steep ramp of far depths on the painting's
+    left side. That is a sensor artefact, not a view past the painting, and
+    it once deleted a correctly placed landmark (DC101).
+    """
+    from pathlib import Path
+
+    from src.semantic.landmarks import _depth_verdict
+
+    path = Path(__file__).parent / "data" / "camera_top_depth_424x240.npz"
+    depth = np.load(path)["depth_mm"].astype(float) / 1000.0
+    fx = 303.845
+
+    def verdict(u, v, stored):
+        return _depth_verdict(
+            depth, u, v, stored, half_px=0.10 * fx / stored, focal_px=fx
+        )
+
+    # Landmark on the painting's left side, where the depth is garbage.
+    kind, measured = verdict(94.1, 65.9, 3.617)
+    assert measured > 6.0
+    assert kind == "unclear"
+    # Landmark on the painting's well-measured centre.
+    assert verdict(122.1, 67.0, 3.684)[0] == "agrees"
+    # Landmark in the air 1.8 m in front of the painting: the wall behind.
+    kind, measured = verdict(138.1, 55.3, 1.797)
+    assert kind == "seen_through"
+    assert measured == pytest.approx(3.65, abs=0.1)
+    # Landmark in the air with a chair and a wall behind it: two real
+    # surfaces, still seen through.
+    assert verdict(322.6, 148.4, 1.589)[0] == "seen_through"
+
+
+def test_audit_sees_through_to_a_floor_or_side_wall():
+    """Backgrounds steep in one image direction are real surfaces."""
+    from src.semantic.landmarks import _depth_verdict
+
+    rows = np.arange(240, dtype=float)[:, None] * np.ones((1, 320))
+    cols = np.ones((240, 1)) * np.arange(320, dtype=float)[None, :]
+    # 0.06 m per pixel at 3 m with f=300 px is a slope of 6 (about 80 degrees).
+    up = 0.06 * (120.0 - rows)
+    across = 0.06 * (cols - 160.0)
+    floor = 3.0 + up
+    side_wall = 3.0 + across
+    garbage = 3.0 + up + across
+    for depth, expected in (
+        (floor, "seen_through"),
+        (side_wall, "seen_through"),
+        (garbage, "unclear"),
+    ):
+        kind, _ = _depth_verdict(
+            depth, 160.0, 120.0, 1.0, half_px=12.0, focal_px=300.0
+        )
+        assert kind == expected

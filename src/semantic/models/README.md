@@ -106,10 +106,10 @@ compared with the depth image in a ~10 cm window:
 | Verdict | Meaning |
 | --- | --- |
 | `agrees` | ≥15% of the window reads the stored depth (±max(0.20 m, 8%)) |
-| `seen_through` | ≥80% of the window reads beyond stored + max(0.40 m, 15%) |
+| `seen_through` | ≥80% of the window reads beyond stored + max(0.40 m, 15%), and those readings look like a surface |
 | `occluded` | most of the window is nearer than the stored point |
 | `no_depth` | under 25% of the window has valid depth |
-| `unclear` | none of the above |
+| `unclear` | none of the above, including far readings that are steep both across and down the image — stereo mismatches on patterned or glossy objects, not a surface |
 
 Three `seen_through` frames in a row flag the landmark; an `agrees` frame
 clears the count; the other verdicts leave it unchanged. While **mapping**

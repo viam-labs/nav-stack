@@ -30,6 +30,32 @@ def display_label(lm: "EmbeddingLandmark") -> str:
     return f"{prefix}{tag}{int(lm.landmark_id)}"
 
 
+# Surface slope (depth change per metre across the image) past which a
+# reading is not a surface. Real indoor backgrounds are steep in at most one
+# image direction: a side wall across, a floor down. 4 is about 76 degrees.
+_GARBAGE_SLOPE = 4.0
+
+
+def _depth_is_garbage(win: np.ndarray, depth_m: float, focal_px: float) -> bool:
+    """True when a depth window is steep both across and down the image.
+
+    Stereo mismatches on a patterned or glossy object read as a ramp of far
+    depths (4 m to 10 m across a painting really at 3.7 m). That is no
+    evidence the object is absent. Medians, so a step between two real
+    surfaces does not count.
+    """
+    ok = np.isfinite(win) & (win > 0.0)
+    metres_per_px = max(1e-6, float(depth_m)) / max(1.0, float(focal_px))
+    slopes = []
+    for axis in (0, 1):
+        both = (ok[1:, :] & ok[:-1, :]) if axis == 0 else (ok[:, 1:] & ok[:, :-1])
+        steps = np.abs(np.diff(win, axis=axis))[both]
+        if steps.size < 8:
+            return False
+        slopes.append(float(np.median(steps)) / metres_per_px)
+    return min(slopes) > _GARBAGE_SLOPE
+
+
 def _depth_verdict(
     depth_m: np.ndarray,
     u: float,
@@ -37,6 +63,7 @@ def _depth_verdict(
     stored_m: float,
     *,
     half_px: float,
+    focal_px: float,
 ) -> Tuple[str, Optional[float]]:
     """Judge one stored depth against the image; returns (verdict, median depth)."""
     h, w = depth_m.shape
@@ -63,6 +90,8 @@ def _depth_verdict(
     if at >= 0.15:
         return AUDIT_AGREES, measured
     if beyond >= 0.80:
+        if _depth_is_garbage(win, measured, float(focal_px)):
+            return AUDIT_UNCLEAR, measured
         return AUDIT_SEEN_THROUGH, measured
     if front >= 0.50:
         return AUDIT_OCCLUDED, measured
@@ -532,6 +561,7 @@ class EmbeddingLandmarkMap:
                 v,
                 stored,
                 half_px=float(window_m) * float(intrinsics.fx) / max(0.2, stored),
+                focal_px=float(intrinsics.fx),
             )
             rows.append(
                 {
