@@ -47,13 +47,19 @@ def match_live_to_landmarks(
     *,
     robot_pose: conv.Pose2D,
     cosine_threshold: float,
-    max_reproj_m: float = 0.45,
+    max_reproj_m: Optional[float] = 0.45,
     detector_cosine_threshold: float = 0.30,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
     """Greedy 1:1 match of live base_link patches to visible map landmarks.
 
     Returns ``(live_xy, map_xy, weights, paired_ids)``.
     Empty arrays / empty ids when nothing matched.
+
+    ``max_reproj_m`` drops a landmark whose stored point is farther than that
+    from the live point placed at ``robot_pose``. ``None`` skips that check
+    and pairs by descriptor among ``visible``; the caller has already limited
+    ``visible`` (image projection from a place guess) and the rigid fit is
+    the geometry check.
 
     Detector-anchored landmarks use ``detector_cosine_threshold`` (aligned with
     survey association) so writeback is not harsher than re-ID.
@@ -87,15 +93,21 @@ def match_live_to_landmarks(
         best_map: Optional[np.ndarray] = None
         hard = float(cosine_threshold)
         soft = min(hard, 0.35)
-        soft_dist = 0.7 * float(max_reproj_m)
+        gate = None if max_reproj_m is None else float(max_reproj_m)
+        soft_dist = 0.0 if gate is None else 0.7 * gate
         det_thr = float(detector_cosine_threshold)
         for i, (lm, mxyz) in enumerate(visible):
             if lm.landmark_id in used_lm:
                 continue
-            dist = math.hypot(float(mxyz[0]) - pred_map[0], float(mxyz[1]) - pred_map[1])
-            if dist > float(max_reproj_m):
-                continue
-            need = soft if dist <= soft_dist else hard
+            if gate is None:
+                need = hard
+            else:
+                dist = math.hypot(
+                    float(mxyz[0]) - pred_map[0], float(mxyz[1]) - pred_map[1]
+                )
+                if dist > gate:
+                    continue
+                need = soft if dist <= soft_dist else hard
             if bool(lm.from_detector):
                 need = min(need, det_thr)
             cos = _best_desc_cosine(lm, desc)
@@ -132,7 +144,7 @@ def diagnose_landmark_match(
     *,
     robot_pose: conv.Pose2D,
     cosine_threshold: float,
-    max_reproj_m: float = 0.45,
+    max_reproj_m: Optional[float] = 0.45,
     detector_cosine_threshold: float = 0.30,
 ) -> dict:
     """Explain why writeback pairing failed (geometry vs descriptor)."""
@@ -148,13 +160,14 @@ def diagnose_landmark_match(
             "best_dist_m": None,
             "cosine_thr": float(cosine_threshold),
             "detector_cosine_thr": float(detector_cosine_threshold),
-            "max_reproj_m": float(max_reproj_m),
+            "max_reproj_m": None if max_reproj_m is None else float(max_reproj_m),
         }
 
     c, s = math.cos(robot_pose.theta), math.sin(robot_pose.theta)
     hard = float(cosine_threshold)
     soft = min(hard, 0.35)
-    soft_dist = 0.7 * float(max_reproj_m)
+    gate = None if max_reproj_m is None else float(max_reproj_m)
+    soft_dist = 0.0 if gate is None else 0.7 * gate
     det_thr = float(detector_cosine_threshold)
     n_geom_ok = 0
     n_cos_ok = 0
@@ -171,10 +184,13 @@ def diagnose_landmark_match(
         )
         for lm, mxyz in visible:
             dist = math.hypot(float(mxyz[0]) - pred_map[0], float(mxyz[1]) - pred_map[1])
-            if dist > float(max_reproj_m):
+            if gate is not None and dist > gate:
                 continue
             n_geom_ok += 1
-            need = soft if dist <= soft_dist else hard
+            if gate is None:
+                need = hard
+            else:
+                need = soft if dist <= soft_dist else hard
             if bool(lm.from_detector):
                 need = min(need, det_thr)
             cos = _best_desc_cosine(lm, o.token.descriptor)
@@ -192,7 +208,7 @@ def diagnose_landmark_match(
         "best_dist_m": None if best_dist is None else round(float(best_dist), 3),
         "cosine_thr": round(float(cosine_threshold), 3),
         "detector_cosine_thr": round(float(det_thr), 3),
-        "max_reproj_m": float(max_reproj_m),
+        "max_reproj_m": None if max_reproj_m is None else float(max_reproj_m),
     }
 
 
@@ -206,7 +222,7 @@ def estimate_landmark_fix(
     residual_m: float = 0.08,
     max_jump_m: float = 1.5,
     max_jump_deg: float = 25.0,
-    max_reproj_m: float = 0.45,
+    max_reproj_m: Optional[float] = 0.45,
     rng: Optional[np.random.Generator] = None,
 ) -> LandmarkPoseAttempt:
     """Pair -> rigid fit -> jump gate. ``fix`` is set only when trusted."""

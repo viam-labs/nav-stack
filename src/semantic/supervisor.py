@@ -21,6 +21,7 @@ from .frames import (
     vision_frame_from_arrays,
 )
 from .detect_landmarks import (
+    BOX_MAX_RANGE_M,
     describe_box_outcome,
     observations_from_detections,
 )
@@ -62,10 +63,10 @@ PaintDiscNote = Callable[..., None]
 _WRITEBACK_DENSE_MATCH_CAP = 24
 # Graph optimize + re-render is the expensive part; don't repeat it every frame.
 _LANDMARK_LOOP_COOLDOWN_S = 8.0
-# Place keyframes are a coarse guess (0.75 m apart). Pair landmarks this far
-# from that guess; the fit still has to land within the writeback jump cap.
+# Place keyframes are a coarse guess (0.75 m apart, heading often off).
+# Pair the landmarks that project into the image by appearance; the fit is
+# the geometry check and still has to land within the writeback jump cap.
 _PLACE_SEED_TOP_K = 5
-_PLACE_SEED_REPROJ_M = 1.25
 # Two fits closer than this are the same place (nearby keyframes). Farther
 # apart, both explaining the picture, and neither guess is applied.
 _PLACE_SEED_AGREE_M = 0.75
@@ -1112,10 +1113,11 @@ class VisionSupervisor:
     ) -> bool:
         """While lost, fit landmarks from each tied place guess.
 
-        The guess is not applied. A fit has to pass the same 3-inlier,
-        residual, and jump gates as writeback, measured from the guess. Two
-        guesses that fit different poses are refused. Returns True only when
-        a correction was applied, so writeback does not run from the old pose
+        The guess is not applied. Landmarks that project into the image from
+        the guess are paired by appearance; the fit is the geometry check
+        (3 inliers, lost residual, jump measured from the guess). Two guesses
+        that fit different poses are refused. Returns True only when a
+        correction was applied, so writeback does not run from the old pose
         on this frame.
         """
         apply = self._apply_pose_correction
@@ -1183,7 +1185,7 @@ class VisionSupervisor:
                 residual_m=max(
                     float(self._cfg.landmark_fix_residual_m), _LOST_FIT_RESIDUAL_M
                 ),
-                max_reproj_m=_PLACE_SEED_REPROJ_M,
+                max_reproj_m=None,
             )
             fix = attempt.fix
             if fix is None:
@@ -1389,6 +1391,26 @@ class VisionSupervisor:
             )
             dense_obs = subsample_observations(dense_obs, dense_cap)
         obs = list(det_obs) + list(dense_obs)
+        # A box past the create range can still recognize a landmark that
+        # already exists. It is not added to ``obs``, so it is not stored.
+        match_det = det_obs
+        fix_range = float(self._cfg.landmark_fix_max_range_m)
+        if (
+            prefer
+            and result.detections
+            and result.patches
+            and fix_range > float(BOX_MAX_RANGE_M)
+        ):
+            match_det = observations_from_detections(
+                frame,
+                result.patches,
+                result.detections,
+                landmark_labels=self._cfg.vision_landmark_labels,
+                z_min_m=z_min,
+                z_max_m=z_max,
+                min_patches=1,
+                max_range_m=fix_range,
+            )
         # Extra dense patches for writeback pairing only (not surveyed).
         wb_dense: List[PatchObservation] = []
         if prefer and result.patches and _WRITEBACK_DENSE_MATCH_CAP > 0:
@@ -1404,7 +1426,7 @@ class VisionSupervisor:
                 z_max_m=z_max,
             )
             wb_dense = subsample_observations(wb_dense, _WRITEBACK_DENSE_MATCH_CAP)
-        writeback_obs = list(det_obs) + list(wb_dense)
+        writeback_obs = list(match_det) + list(wb_dense)
         if not obs and not writeback_obs:
             return
 

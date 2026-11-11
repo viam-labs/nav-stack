@@ -1072,8 +1072,8 @@ class SlamConfig:
     # Square letterbox side for DINOv2 ONNX (must match the exported model).
     vision_input_size: int = 448
     # Pose correction may use a confirmed landmark this far away. Creating a
-    # landmark still stops at 4.5 m (box range); this only widens the match
-    # pool so a look across the office can pair the ones already stored.
+    # landmark still stops at 4.5 m. A live box out to this range can match
+    # one that already exists, and is not stored.
     landmark_fix_max_range_m: float = 6.0
     landmark_fix_max_jump_m: float = 1.5
     # Pairs must agree within this of one pose. 8 cm rejected office fits

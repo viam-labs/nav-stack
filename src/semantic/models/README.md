@@ -174,14 +174,17 @@ only when that group is unambiguous; otherwise it is skipped and counted in
 per YOLO label (plus `not_landmark_label`), which shows which classes rarely
 produce a usable surface.
 
-The box range is 0.4–4.5 m. It was tried out to 6 m, and a poster at 5.5 m
-repeated within one depth step from one pose, but landmarks stored at
-5.5–6.0 m were deleted on the next viewpoint, where the camera read 9–12 m.
-A box past 4.5 m is labelled `far …m`. A detector landmark confirms after 8
-observations from more than one view, and only when its position has
+The box range for storing a landmark is 0.4–4.5 m. It was tried out to 6 m,
+and a poster at 5.5 m repeated within one depth step from one pose, but
+landmarks stored at 5.5–6.0 m were deleted on the next viewpoint, where the
+camera read 9–12 m. A box past 4.5 m is labelled `far …m` and is not stored.
+While localizing, that same box out to `landmark_fix_max_range_m` (6 m) can
+still match a landmark that already exists. A detector landmark confirms
+after 8 observations from more than one view, and only when its position has
 scattered by 12 cm or less. Pose writeback pairs confirmed landmarks out to
-`landmark_fix_max_range_m` (6 m) and accepts a fit that agrees within
-`landmark_fix_residual_m` (15 cm). It still needs 3 pairs.
+6 m and accepts a fit that agrees within `landmark_fix_residual_m` (15 cm).
+It still needs 3 pairs. The live point has to land within 0.45 m of the
+stored one, because the pose is already close.
 
 A box mostly filled by something standing in
 front of the object still lands on that nearer thing: it is a real surface,
@@ -210,15 +213,16 @@ With `vision_enabled: true` the defaults are:
 - **localizing + tracking/degraded**: landmark writeback only (fine)
 - **localizing + lost/unknown**: place retrieval, then a landmark check of the
   places it cannot separate. The top keyframes are pose guesses. Landmarks
-  are projected from each guess, and the pose moves only when one guess has
-  at least 3 agreeing landmarks and no other guess fits a different pose.
+  that project into the image from a guess are paired by appearance. The
+  pose moves only when one guess has at least 3 of those pairs on one pose
+  within 30 cm, and no other guess fits a different pose. The points do not
+  have to already lie within 1.25 m: that check was dropping the matches
+  the fit exists to judge, because a keyframe heading is coarser than that.
   A raw place teleport still happens when the top hit beats the second by
   `vision_place_min_score_margin` and is strong enough for the jump, and only
   when fewer than 3 confirmed landmarks exist. Otherwise the landmark fit
-  decides. While lost that fit keeps three matches but allows 30 cm of
-  scatter, because a two-point sample was rejecting sets that agree more
-  loosely than the 15 cm tracking nudge. Then landmark writeback. All of
-  these go through `apply_map_pose_correction(force=False)`.
+  decides. Then landmark writeback, which keeps the 0.45 m pairing gate.
+  All of these go through `apply_map_pose_correction(force=False)`.
 
 You should not need to flip `vision_pose_writeback` / `vision_place_retrieval`
 when switching modes. Check `vision_status.pose_writeback_active` and

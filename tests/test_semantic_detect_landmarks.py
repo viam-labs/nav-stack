@@ -230,6 +230,27 @@ def test_box_surface_accepts_a_clean_surface_out_to_four_and_a_half_metres():
     assert BOX_MAX_RANGE_M == pytest.approx(4.5)
 
 
+def test_match_range_keeps_a_box_the_create_range_drops():
+    """5.5 m is not stored, but it can still identify a landmark out to 6 m."""
+    frame = _frame_with_wall(depth_m=5.5)
+    tokens = _grid_tokens(frame)
+    det = Detection(label="painting", conf=0.9, x0=100.0, y0=60.0, x1=220.0, y1=180.0)
+    created = observations_from_detections(
+        frame, tokens, [det], landmark_labels=["painting"]
+    )
+    matched = observations_from_detections(
+        frame, tokens, [det], landmark_labels=["painting"], max_range_m=6.0
+    )
+    assert created == []
+    assert len(matched) == 1
+    assert float(np.linalg.norm(matched[0].point_base[:2])) == pytest.approx(5.5, abs=0.3)
+    farther = _frame_with_wall(depth_m=6.5)
+    dropped = observations_from_detections(
+        farther, _grid_tokens(farther), [det], landmark_labels=["painting"], max_range_m=6.0
+    )
+    assert dropped == []
+
+
 def test_box_surface_rejects_a_clean_surface_past_four_and_a_half_metres():
     """5.5 m repeated from one pose, then failed the next viewpoint."""
     frame = _frame_with_wall(depth_m=5.5)

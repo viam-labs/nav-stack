@@ -336,6 +336,7 @@ def observations_from_detections(
     z_max_m: Optional[float] = None,
     min_patches: int = 1,
     shrink: float = 0.05,
+    max_range_m: float = BOX_MAX_RANGE_M,
     stats: Optional[Dict[str, int]] = None,
     outcomes: Optional[List[dict]] = None,
 ) -> List[PatchObservation]:
@@ -344,7 +345,10 @@ def observations_from_detections(
     Descriptor pooling uses every DINO token whose center lies in the box
     (depth-invalid tokens still contribute appearance). Geometry comes from
     :func:`box_surface_point`; a box with no single clear surface yields no
-    observation. ``stats`` (optional) is filled with per-reason skip counts.
+    observation. ``max_range_m`` defaults to the range a new landmark may be
+    stored at. A caller matching landmarks that already exist may pass the
+    wider fix range; those farther points must not be surveyed. ``stats``
+    (optional) is filled with per-reason skip counts.
 
     ``outcomes`` (optional) receives one dict per detection, in order:
     ``label``, ``outcome`` (``used`` or why not), ``depth_m`` when a surface
@@ -394,7 +398,14 @@ def observations_from_detections(
             continue
         desc = pool_descriptor([t.descriptor for t in in_tokens])
         surface, skip_reason, depth_m = _locate_box(
-            frame, x0, y0, x1, y1, z_min_m=z_min_m, z_max_m=z_max_m
+            frame,
+            x0,
+            y0,
+            x1,
+            y1,
+            z_min_m=z_min_m,
+            z_max_m=z_max_m,
+            max_range_m=float(max_range_m),
         )
         if surface is None:
             if stats is not None and skip_reason:

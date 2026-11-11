@@ -20,6 +20,7 @@ from src.semantic.place import l2_normalize
 from src.semantic.supervisor import VisionSupervisor
 from src.semantic.types import (
     CameraIntrinsics,
+    Detection,
     LandmarkStatus,
     PatchToken,
     VisionFrame,
@@ -492,6 +493,54 @@ def test_estimate_accepts_a_12cm_fit_and_rejects_it_at_8cm():
     assert loose.fix.n_pairs == 4
 
 
+def test_appearance_pairing_keeps_matches_the_reproj_gate_drops():
+    """A guess 1.4 m off still pairs by appearance. The 1.25 m ball does not."""
+    rng = np.random.default_rng(11)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(3)]
+    lives = ((4.0, -0.4, 1.0), (3.6, 0.15, 1.0), (4.3, 0.55, 1.0))
+    guess = Pose2D(1.4, 0.0, 0.0)
+    visible = []
+    obs = []
+    for i, live in enumerate(lives):
+        stored = np.array(live, dtype=float)
+        visible.append((_confirmed_lm(i + 1, stored, descs[i]), stored))
+        obs.append(_obs(live[0], live[1], live[2], descs[i]))
+    gated = estimate_landmark_fix(
+        obs,
+        visible,
+        robot_pose=guess,
+        cosine_threshold=0.55,
+        min_inliers=3,
+        residual_m=0.15,
+        max_reproj_m=1.25,
+    )
+    assert gated.fix is None
+    assert gated.pairs < 3
+    tracking = estimate_landmark_fix(
+        obs,
+        visible,
+        robot_pose=guess,
+        cosine_threshold=0.55,
+        min_inliers=3,
+        max_reproj_m=0.45,
+    )
+    assert tracking.pairs == 0
+    free = estimate_landmark_fix(
+        obs,
+        visible,
+        robot_pose=guess,
+        cosine_threshold=0.55,
+        min_inliers=3,
+        residual_m=0.30,
+        max_jump_m=1.5,
+        max_reproj_m=None,
+    )
+    assert free.fix is not None, free
+    assert free.fix.n_pairs == 3
+    assert free.fix.fit.pose.x == pytest.approx(0.0, abs=0.08)
+    assert free.fix.fit.pose.y == pytest.approx(0.0, abs=0.08)
+
+
 def test_lost_residual_keeps_a_22cm_scatter_that_15cm_drops():
     """Three real matches scattered past 15 cm still vote while lost."""
     rng = np.random.default_rng(8)
@@ -747,6 +796,73 @@ def test_place_seed_applies_landmark_fit_when_vlads_tie():
     assert last["status"] == "applied"
     assert last["inliers"] >= 3
     assert vision.status()["place"]["seed_applied"] == 1
+
+
+def test_place_seed_pairs_when_the_guess_is_past_1_25m():
+    """A keyframe 1.4 m from the landmarks still yields a fit."""
+    vision, called, lost = _lost_supervisor()
+    true = Pose2D(4.0, 0.0, 0.0)
+    rng = np.random.default_rng(12)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(3)]
+    for i, live in enumerate(_SEED_LIVES):
+        _confirm_at(vision.landmarks, i + 1, true, live, descs[i])
+    place = l2_normalize(np.array([1.0, 0.0, 0.2, 0, 0, 0, 0, 0], dtype=np.float32))
+    bank = np.stack([place] * 12, axis=0)
+    vision._place.add_keyframe(1, Pose2D(2.6, 0.0, 0.0), bank)  # noqa: SLF001
+    obs = [_obs(*live, descs[i]) for i, live in enumerate(_SEED_LIVES)]
+    applied = vision._try_place_seeded_fix(  # noqa: SLF001
+        _seed_frame(), _place_result(place), obs, lost, {0: lost}
+    )
+    assert applied, vision.status()["place"]["last_seed"]
+    assert called[0]["pose"].x == pytest.approx(true.x, abs=0.08)
+    assert called[0]["pose"].y == pytest.approx(true.y, abs=0.08)
+
+
+def test_far_box_matches_without_being_stored():
+    """A 5.5 m box is not a new landmark, and writeback still sees the point."""
+    vision, _called, _lost = _lost_supervisor()
+    true = Pose2D(0.0, 0.0, 0.0)
+    rng = np.random.default_rng(13)
+    lives = ((1.2, -1.2, 1.0), (2.4, 0.1, 1.0), (1.6, 1.3, 1.0))
+    for i, live in enumerate(lives):
+        desc = l2_normalize(rng.standard_normal(8).astype(np.float32))
+        _confirm_at(vision.landmarks, i + 1, true, live, desc)
+    h, w = 240, 320
+    frame = VisionFrame(
+        camera_name="depth-cam",
+        stamp=0.0,
+        captured_at=0.0,
+        color_rgb=np.zeros((h, w, 3), dtype=np.uint8),
+        depth_m=np.full((h, w), 5.5, dtype=np.float32),
+        intrinsics=CameraIntrinsics(fx=300, fy=300, cx=160, cy=120, width=w, height=h),
+        mount_x=0.1,
+        mount_z=0.4,
+    )
+    patches = []
+    for r, v in enumerate(range(40, 200, 40)):
+        for c, u in enumerate(range(80, 240, 40)):
+            desc = np.zeros(8, dtype=np.float32)
+            desc[0] = 1.0
+            patches.append(
+                PatchToken(row=r, col=c, u=float(u), v=float(v), descriptor=desc)
+            )
+    det = Detection(label="painting", conf=0.9, x0=60, y0=20, x1=260, y1=220)
+    result = VisionResult(
+        camera_name="depth-cam",
+        stamp=0.0,
+        captured_at=0.0,
+        patches=patches,
+        detections=[det],
+        provider="test",
+        infer_ms=1.0,
+    )
+    before = len(vision.landmarks)
+    vision._survey(frame, result)  # noqa: SLF001
+    assert len(vision.landmarks) == before
+    boxes = vision._last_boxes["boxes"]  # noqa: SLF001
+    assert boxes[0]["outcome"] == "skipped_range"
+    wb = vision.status()["writeback"]["last"]
+    assert wb["match"]["n_obs"] == 1
 
 
 def test_place_seed_refuses_two_landmarks():
