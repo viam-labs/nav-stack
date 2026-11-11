@@ -1107,7 +1107,9 @@ class SlamConfig:
     # (current pose is untrusted). Large jumps still need a stronger score.
     vision_place_max_jump_m: float = 0.75
     vision_place_max_jump_deg: float = 25.0
-    # Top hit must beat 2nd by this much or the place is ambiguous (corridor twin).
+    # Top hit must beat 2nd by this much or the raw place teleport is refused
+    # (corridor twin). A tied place can still move the pose when one of those
+    # keyframes is confirmed by a 3-landmark fit and the others are not.
     vision_place_min_score_margin: float = 0.08
     # Jumps above this require an even stronger score (see supervisor).
     vision_place_large_jump_m: float = 0.40

@@ -18,7 +18,13 @@ from src.semantic.localize import (
 from src.semantic.patches import PatchObservation
 from src.semantic.place import l2_normalize
 from src.semantic.supervisor import VisionSupervisor
-from src.semantic.types import CameraIntrinsics, LandmarkStatus, PatchToken, VisionFrame
+from src.semantic.types import (
+    CameraIntrinsics,
+    LandmarkStatus,
+    PatchToken,
+    VisionFrame,
+    VisionResult,
+)
 
 
 def _obs(x: float, y: float, z: float, desc: np.ndarray, sigma: float = 0.02):
@@ -528,4 +534,190 @@ def test_writeback_dense_match_not_surveyed():
     from src.semantic import supervisor as sup
 
     assert int(sup._WRITEBACK_DENSE_MATCH_CAP) == 24
+
+
+def _seed_frame() -> VisionFrame:
+    return VisionFrame(
+        camera_name="depth-cam",
+        stamp=0.0,
+        captured_at=0.0,
+        color_rgb=np.zeros((240, 320, 3), dtype=np.uint8),
+        depth_m=np.ones((240, 320), dtype=np.float32),
+        intrinsics=CameraIntrinsics(
+            fx=300, fy=300, cx=160, cy=120, width=320, height=240
+        ),
+        mount_x=0.1,
+        mount_z=0.4,
+    )
+
+
+def _lost_supervisor():
+    cfg = _cfg(
+        mode="localizing",
+        vision_survey_only=False,
+        vision_place_retrieval=True,
+        vision_pose_writeback=True,
+        vision_pose_writeback_min_inliers=3,
+        vision_pose_writeback_cooldown_s=0.0,
+        vision_place_cooldown_s=0.0,
+        landmark_fix_max_jump_m=1.5,
+        landmark_fix_residual_m=0.15,
+        vision_place_min_score=0.55,
+        vision_place_min_score_margin=0.08,
+    )
+    lost = Pose2D(0.0, 0.0, 0.0)
+    called = []
+
+    def apply(p, *, score=None, force=False):
+        called.append({"pose": p, "score": score, "force": force})
+        return {
+            "applied": True,
+            "status": "pose_only",
+            "shift_m": 1.0,
+            "shift_deg": 0.0,
+        }
+
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: lost,
+        get_pose_at=lambda _t: lost,
+        get_anchor=lambda: (0, lost, {0: lost}),
+        apply_pose_correction=apply,
+        is_localization_lost=lambda: True,
+    )
+    vision._worker.cfg.synthetic = False  # noqa: SLF001
+    return vision, called, lost
+
+
+def _confirm_at(store, landmark_id, true, live, desc):
+    c, s = math.cos(true.theta), math.sin(true.theta)
+    mxyz = np.array(
+        [
+            true.x + c * live[0] - s * live[1],
+            true.y + s * live[0] + c * live[1],
+            live[2],
+        ]
+    )
+    lm = EmbeddingLandmark(
+        landmark_id=landmark_id,
+        anchor_node=0,
+        rel_xyz=mxyz.copy(),
+        map_xyz=mxyz.copy(),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        descriptors=[desc],
+        observations=8,
+        status=LandmarkStatus.CONFIRMED,
+        from_detector=True,
+    )
+    store._landmarks[lm.landmark_id] = lm  # noqa: SLF001
+
+
+def _place_result(desc: np.ndarray) -> VisionResult:
+    patches = [
+        PatchToken(row=0, col=i, u=0.0, v=0.0, descriptor=desc) for i in range(12)
+    ]
+    return VisionResult(
+        camera_name="depth-cam", stamp=0.0, captured_at=0.0, patches=patches
+    )
+
+
+_SEED_LIVES = (
+    (2.0, -0.30, 1.0),
+    (2.4, 0.35, 1.0),
+    (2.9, 0.05, 1.0),
+)
+
+
+def test_place_seed_applies_landmark_fit_when_vlads_tie():
+    """A tied place does not teleport. Three landmarks from one guess do."""
+    vision, called, lost = _lost_supervisor()
+    true = Pose2D(4.0, 0.0, 0.0)
+    rng = np.random.default_rng(3)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(3)]
+    for i, live in enumerate(_SEED_LIVES):
+        _confirm_at(vision.landmarks, i + 1, true, live, descs[i])
+    place = l2_normalize(np.array([1.0, 0.2, 0.0, 0.0, 0, 0, 0, 0], dtype=np.float32))
+    bank = np.stack([place] * 12, axis=0)
+    # Two guesses of the real place, both offset past the 0.45 m writeback gate,
+    # plus a far twin with the same picture and no landmarks.
+    vision._place.add_keyframe(1, Pose2D(4.7, 0.0, 0.0), bank)  # noqa: SLF001
+    vision._place.add_keyframe(2, Pose2D(3.6, 0.0, 0.0), bank)  # noqa: SLF001
+    vision._place.add_keyframe(3, Pose2D(4.0, 7.0, 0.0), bank)  # noqa: SLF001
+    obs = [_obs(*live, descs[i]) for i, live in enumerate(_SEED_LIVES)]
+    result = _place_result(place)
+    vision._try_place_retrieval(  # noqa: SLF001
+        np.stack([place] * 12, axis=0), lost
+    )
+    assert vision.status()["place"]["last_retrieval"]["status"] == "rejected_ambiguous"
+    assert called == []
+    applied = vision._try_place_seeded_fix(  # noqa: SLF001
+        _seed_frame(), result, obs, lost, {0: lost}
+    )
+    assert applied, vision.status()["place"]["last_seed"]
+    assert len(called) == 1
+    assert called[0]["force"] is False
+    assert called[0]["pose"].x == pytest.approx(true.x, abs=0.08)
+    assert called[0]["pose"].y == pytest.approx(true.y, abs=0.08)
+    assert abs(called[0]["pose"].x - 4.7) > 0.3
+    last = vision.status()["place"]["last_seed"]
+    assert last["status"] == "applied"
+    assert last["inliers"] >= 3
+    assert vision.status()["place"]["seed_applied"] == 1
+
+
+def test_place_seed_refuses_two_landmarks():
+    vision, called, lost = _lost_supervisor()
+    true = Pose2D(4.0, 0.0, 0.0)
+    rng = np.random.default_rng(4)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(2)]
+    for i, live in enumerate(_SEED_LIVES[:2]):
+        _confirm_at(vision.landmarks, i + 1, true, live, descs[i])
+    place = l2_normalize(np.ones(8, dtype=np.float32))
+    bank = np.stack([place] * 12, axis=0)
+    vision._place.add_keyframe(1, Pose2D(4.5, 0.0, 0.0), bank)  # noqa: SLF001
+    obs = [_obs(*live, descs[i]) for i, live in enumerate(_SEED_LIVES[:2])]
+    applied = vision._try_place_seeded_fix(  # noqa: SLF001
+        _seed_frame(), _place_result(place), obs, lost, {0: lost}
+    )
+    assert applied is False
+    assert called == []
+    assert vision.status()["place"]["last_seed"]["status"] == "no_fit"
+
+
+def test_place_seed_refuses_two_poses_that_both_fit():
+    vision, called, lost = _lost_supervisor()
+    pose_a = Pose2D(4.0, 0.0, 0.0)
+    pose_b = Pose2D(4.0, 7.0, 0.0)
+    rng = np.random.default_rng(5)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(3)]
+    for i, live in enumerate(_SEED_LIVES):
+        _confirm_at(vision.landmarks, i + 1, pose_a, live, descs[i])
+        _confirm_at(vision.landmarks, i + 4, pose_b, live, descs[i])
+    place = l2_normalize(np.array([0.0, 1.0, 0.3, 0, 0, 0, 0, 0], dtype=np.float32))
+    bank = np.stack([place] * 12, axis=0)
+    vision._place.add_keyframe(1, pose_a, bank)  # noqa: SLF001
+    vision._place.add_keyframe(2, pose_b, bank)  # noqa: SLF001
+    obs = [_obs(*live, descs[i]) for i, live in enumerate(_SEED_LIVES)]
+    applied = vision._try_place_seeded_fix(  # noqa: SLF001
+        _seed_frame(), _place_result(place), obs, lost, {0: lost}
+    )
+    assert applied is False
+    assert called == []
+    last = vision.status()["place"]["last_seed"]
+    assert last["status"] == "rejected_ambiguous_fits"
+    assert len(last["fits"]) == 2
+
+
+def test_place_seed_skipped_while_tracking():
+    vision, called, lost = _lost_supervisor()
+    vision._is_localization_lost = lambda: False  # noqa: SLF001
+    place = l2_normalize(np.ones(8, dtype=np.float32))
+    vision._place.add_keyframe(1, Pose2D(4.0, 0.0, 0.0), np.stack([place] * 8))  # noqa: SLF001
+    applied = vision._try_place_seeded_fix(  # noqa: SLF001
+        _seed_frame(), _place_result(place), [], lost, {0: lost}
+    )
+    assert applied is False
+    assert called == []
+    assert vision.status()["place"]["last_seed"]["status"] == "skipped_tracking"
 

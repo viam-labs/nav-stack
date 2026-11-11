@@ -208,22 +208,31 @@ With `vision_enabled: true` the defaults are:
   ONNX from v1.2.0-rc49 includes `person` (appended, so older class ids stay
   put). Startup replaces an onnx that was fetched for an older class list.
 - **localizing + tracking/degraded**: landmark writeback only (fine)
-- **localizing + lost/unknown**: place retrieval (coarse relocalization), then
-  landmark writeback — both via `apply_map_pose_correction(force=False)`
+- **localizing + lost/unknown**: place retrieval, then a landmark check of the
+  places it cannot separate. The top keyframes are pose guesses. Landmarks
+  are projected from each guess, and the pose moves only when one guess has
+  at least 3 agreeing landmarks and no other guess fits a different pose.
+  A raw place teleport still happens when the top hit beats the second by
+  `vision_place_min_score_margin` and is strong enough for the jump. Then
+  landmark writeback. All of these go through
+  `apply_map_pose_correction(force=False)`.
 
 You should not need to flip `vision_pose_writeback` / `vision_place_retrieval`
 when switching modes. Check `vision_status.pose_writeback_active` and
 `place.retrieval_active` (true only while localizing **and** lost/unknown).
 
 Place is meter-scale and ambiguous — it recovers when SLAM reports lost, it
-does not nudge pose while tracking. Landmark writeback handles fine drift.
+does not nudge pose while tracking. A tie (two keyframes within the score
+margin) does not teleport on its own. Landmark writeback handles fine drift
+and, while lost, confirms one place guess.
 
 Writeback needs ≥3 landmark pairs (2-point SE(2) fits are unstable). Matching may use a small dense patch set that is **not** surveyed, so detector-only mapping still gets enough inliers. Rejections report `few_pairs` / `rejected_residual` / `rejected_jump` (no catch-all).
 
 Kill switch if needed: `"vision_survey_only": true` (build only, never apply).
 
 Watch `vision_status.writeback`, `vision_status.landmark_loop`,
-`vision_status.paint_gate`, and `vision_status.place`.
+`vision_status.paint_gate`, and `vision_status.place` (`last_seed` is the
+lost-pose landmark check).
 
 Writeback `visible` / `visible_image` counts confirmed landmarks that project into the camera image (same cull as landmark-camera greens). `visible_frustum` is the older facing-filtered count for comparison.
 

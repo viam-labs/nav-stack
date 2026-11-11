@@ -62,6 +62,14 @@ PaintDiscNote = Callable[..., None]
 _WRITEBACK_DENSE_MATCH_CAP = 24
 # Graph optimize + re-render is the expensive part; don't repeat it every frame.
 _LANDMARK_LOOP_COOLDOWN_S = 8.0
+# Place keyframes are a coarse guess (0.75 m apart). Pair landmarks this far
+# from that guess; the fit still has to land within the writeback jump cap.
+_PLACE_SEED_TOP_K = 5
+_PLACE_SEED_REPROJ_M = 1.25
+# Two fits closer than this are the same place (nearby keyframes). Farther
+# apart, both explaining the picture, and neither guess is applied.
+_PLACE_SEED_AGREE_M = 0.75
+_PLACE_SEED_AGREE_DEG = 15.0
 
 # A frame whose capture-time pose cannot be looked up is still usable while it
 # is this fresh (no odometry history yet); older than this it is dropped.
@@ -181,6 +189,10 @@ class VisionSupervisor:
         self._place_retrieval_applied = 0
         self._last_place_retrieval: Optional[dict] = None
         self._last_place_retrieval_mono = 0.0
+        self._place_seed_attempts = 0
+        self._place_seed_applied = 0
+        self._last_place_seed: Optional[dict] = None
+        self._last_place_seed_mono = 0.0
 
         input_size = int(cfg.vision_input_size) if not want_synthetic else 224
         if input_size < 14:
@@ -424,6 +436,10 @@ class VisionSupervisor:
             self._place_retrieval_attempts = 0
             self._place_retrieval_applied = 0
             self._last_place_retrieval = None
+            self._place_seed_attempts = 0
+            self._place_seed_applied = 0
+            self._last_place_seed = None
+            self._last_place_seed_mono = 0.0
             self._observations = 0
             self._frames = 0
             self._last_result = None
@@ -589,6 +605,9 @@ class VisionSupervisor:
                     "retrieval_attempts": self._place_retrieval_attempts,
                     "retrieval_applied": self._place_retrieval_applied,
                     "last_retrieval": self._last_place_retrieval,
+                    "seed_attempts": self._place_seed_attempts,
+                    "seed_applied": self._place_seed_applied,
+                    "last_seed": self._last_place_seed,
                 },
             }
 
@@ -968,6 +987,10 @@ class VisionSupervisor:
             and len(self._place.keyframe_ids) > 0
         )
 
+    def _place_seed_enabled(self) -> bool:
+        """Lost pose may move when one place guess has 3 agreeing landmarks."""
+        return self._place_retrieval_enabled() and bool(self._cfg.vision_pose_writeback)
+
     def _try_place_retrieval(
         self, descs: np.ndarray, pose: conv.Pose2D
     ) -> None:
@@ -1060,6 +1083,183 @@ class VisionSupervisor:
             f"vision place retrieval: {self._last_place_retrieval['status']} "
             f"kf={kid} score={score:.2f} jump={jump_m:.2f}m/{jump_deg:.1f}deg"
         )
+
+    def _try_place_seeded_fix(
+        self,
+        frame: VisionFrame,
+        result: VisionResult,
+        obs: List[PatchObservation],
+        pose: conv.Pose2D,
+        pose_of_node: Dict[int, conv.Pose2D],
+    ) -> bool:
+        """While lost, fit landmarks from each tied place guess.
+
+        The guess is not applied. A fit has to pass the same 3-inlier,
+        residual, and jump gates as writeback, measured from the guess. Two
+        guesses that fit different poses are refused. Returns True only when
+        a correction was applied, so writeback does not run from the old pose
+        on this frame.
+        """
+        apply = self._apply_pose_correction
+        if apply is None or not self._localization_lost():
+            self._last_place_seed = {"status": "skipped_tracking"}
+            return False
+        now = time.monotonic()
+        if now - self._last_place_seed_mono < float(self._cfg.vision_place_cooldown_s):
+            return False
+        descs = descriptors_from_patches(result.patches, max_patches=64)
+        if descs is None:
+            self._last_place_seed = {"status": "no_hit"}
+            return False
+        min_inliers = int(self._cfg.vision_pose_writeback_min_inliers)
+        margin = float(self._cfg.vision_place_min_score_margin)
+        prepared: List[Tuple[int, conv.Pose2D, float, list]] = []
+        with self._lock:
+            hits = self._place.query(descs, top_k=_PLACE_SEED_TOP_K)
+            cosine_thr = float(self._landmarks.cosine_threshold)
+            if hits:
+                top = float(hits[0][2])
+                chosen = [hits[0]]
+                for hit in hits[1:]:
+                    if top - float(hit[2]) < margin:
+                        chosen.append(hit)
+                for kid, hit_pose, score in chosen:
+                    visible = self._landmarks.image_visible_set(
+                        hit_pose,
+                        pose_of_node,
+                        intrinsics=frame.intrinsics,
+                        mount_x=float(frame.mount_x),
+                        mount_y=float(frame.mount_y),
+                        mount_z=float(frame.mount_z),
+                        mount_theta=float(frame.mount_theta),
+                        mount_pitch=float(frame.mount_pitch),
+                        mount_roll=float(frame.mount_roll),
+                        max_range_m=float(self._cfg.landmark_fix_max_range_m),
+                    )
+                    prepared.append((int(kid), hit_pose, float(score), visible))
+        self._place_seed_attempts += 1
+        if not prepared:
+            self._last_place_seed = {"status": "no_hit"}
+            return False
+
+        accepted = []
+        tried = []
+        for kid, hit_pose, score, visible in prepared:
+            if len(visible) < min_inliers:
+                tried.append(
+                    {
+                        "keyframe_id": kid,
+                        "score": round(score, 3),
+                        "reason": "few_visible",
+                        "visible": len(visible),
+                    }
+                )
+                continue
+            attempt = estimate_landmark_fix(
+                obs,
+                visible,
+                robot_pose=hit_pose,
+                cosine_threshold=cosine_thr,
+                min_inliers=min_inliers,
+                max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
+                residual_m=float(self._cfg.landmark_fix_residual_m),
+                max_reproj_m=_PLACE_SEED_REPROJ_M,
+            )
+            fix = attempt.fix
+            if fix is None:
+                tried.append(
+                    {
+                        "keyframe_id": kid,
+                        "score": round(score, 3),
+                        "reason": attempt.reason or "rejected_fit",
+                        "visible": len(visible),
+                        "pairs": int(attempt.pairs),
+                    }
+                )
+                continue
+            accepted.append(
+                {
+                    "keyframe_id": kid,
+                    "place_score": score,
+                    "hit_pose": hit_pose,
+                    "fix": fix,
+                    "paired_ids": [int(x) for x in attempt.paired_ids],
+                }
+            )
+        if not accepted:
+            self._last_place_seed = {"status": "no_fit", "tried": tried}
+            return False
+        poses = [item["fix"].fit.pose for item in accepted]
+        if seeded_poses_conflict(
+            poses, sep_m=_PLACE_SEED_AGREE_M, sep_deg=_PLACE_SEED_AGREE_DEG
+        ):
+            self._last_place_seed = {
+                "status": "rejected_ambiguous_fits",
+                "fits": [
+                    {
+                        "keyframe_id": int(item["keyframe_id"]),
+                        "inliers": int(item["fix"].fit.inliers.sum()),
+                        "x": round(float(item["fix"].fit.pose.x), 3),
+                        "y": round(float(item["fix"].fit.pose.y), 3),
+                    }
+                    for item in accepted
+                ],
+            }
+            self._log(
+                "vision place seed: rejected_ambiguous_fits "
+                + " ".join(f"kf={item['keyframe_id']}" for item in accepted)
+            )
+            return False
+        best = max(
+            accepted,
+            key=lambda item: (
+                int(item["fix"].fit.inliers.sum()),
+                float(item["place_score"]),
+            ),
+        )
+        fix = best["fix"]
+        fitted = fix.fit.pose
+        jump_m = math.hypot(fitted.x - pose.x, fitted.y - pose.y)
+        jump_deg = abs(math.degrees(conv.normalize_angle(fitted.theta - pose.theta)))
+        # A few centimetres around the lost pose is writeback's job.
+        if jump_m < 0.25 and jump_deg < 5.0:
+            self._last_place_seed = {
+                "status": "skipped_small",
+                "keyframe_id": int(best["keyframe_id"]),
+                "inliers": int(fix.fit.inliers.sum()),
+                "jump_m": round(jump_m, 3),
+                "jump_deg": round(jump_deg, 1),
+            }
+            return False
+        try:
+            applied_result = apply(fitted, score=float(fix.score), force=False)
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"place_seed: {exc}"
+            self._last_place_seed = {"status": "error", "error": repr(exc)}
+            return False
+        applied = bool(applied_result.get("applied"))
+        self._last_place_seed = {
+            "status": "applied" if applied else str(applied_result.get("status", "not_applied")),
+            "keyframe_id": int(best["keyframe_id"]),
+            "place_score": round(float(best["place_score"]), 3),
+            "inliers": int(fix.fit.inliers.sum()),
+            "pairs": int(fix.n_pairs),
+            "paired_ids": list(best["paired_ids"]),
+            "jump_m": round(jump_m, 3),
+            "jump_deg": round(jump_deg, 1),
+            "shift_m": applied_result.get("shift_m"),
+            "shift_deg": applied_result.get("shift_deg"),
+            "slam_status": applied_result.get("status"),
+        }
+        if applied:
+            self._place_seed_applied += 1
+            self._last_place_seed_mono = now
+        self._log(
+            f"vision place seed: {self._last_place_seed['status']} "
+            f"kf={best['keyframe_id']} inliers={int(fix.fit.inliers.sum())} "
+            f"jump={jump_m:.2f}m/{jump_deg:.1f}deg"
+        )
+        return applied
 
     def _survey(
         self,
@@ -1247,7 +1447,12 @@ class VisionSupervisor:
 
         if self._landmark_loop_enabled() and writeback_obs:
             self._try_landmark_loop(frame, writeback_obs, pose, pose_of_node)
-        if self._writeback_enabled() and writeback_obs:
+        seeded = False
+        if self._place_seed_enabled() and writeback_obs:
+            seeded = self._try_place_seeded_fix(
+                frame, result, writeback_obs, pose, pose_of_node
+            )
+        if self._writeback_enabled() and writeback_obs and not seeded:
             self._try_pose_writeback(frame, writeback_obs, pose, pose_of_node)
 
     def _publish_paint_discs(self, frame: VisionFrame, result: VisionResult) -> None:
@@ -1643,6 +1848,21 @@ class VisionSupervisor:
             f"jump={fix.jump_m:.2f}m/{fix.jump_deg:.1f}deg "
             f"score={fix.score:.2f} inliers={int(fix.fit.inliers.sum())}"
         )
+
+
+def seeded_poses_conflict(
+    poses: Sequence[conv.Pose2D], *, sep_m: float, sep_deg: float
+) -> bool:
+    """True when two fitted poses are different places."""
+    for i in range(len(poses)):
+        for j in range(i + 1, len(poses)):
+            a, b = poses[i], poses[j]
+            if math.hypot(a.x - b.x, a.y - b.y) > float(sep_m):
+                return True
+            turn = abs(math.degrees(conv.normalize_angle(a.theta - b.theta)))
+            if turn > float(sep_deg):
+                return True
+    return False
 
 
 def dominant_loop_anchor(
