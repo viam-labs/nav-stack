@@ -179,8 +179,9 @@ repeated within one depth step from one pose, but landmarks stored at
 5.5–6.0 m were deleted on the next viewpoint, where the camera read 9–12 m.
 A box past 4.5 m is labelled `far …m`. A detector landmark confirms after 8
 observations from more than one view, and only when its position has
-scattered by 12 cm or less. Pose writeback is unchanged: it only pairs
-landmarks within `landmark_fix_max_range_m` (4 m) of the robot.
+scattered by 12 cm or less. Pose writeback pairs confirmed landmarks out to
+`landmark_fix_max_range_m` (6 m) and accepts a fit that agrees within
+`landmark_fix_residual_m` (15 cm). It still needs 3 pairs.
 
 A box mostly filled by something standing in
 front of the object still lands on that nearer thing: it is a real surface,

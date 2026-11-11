@@ -1071,8 +1071,14 @@ class SlamConfig:
     vision_synthetic: bool = False  # bench/tests without ONNX weights
     # Square letterbox side for DINOv2 ONNX (must match the exported model).
     vision_input_size: int = 448
-    landmark_fix_max_range_m: float = 4.0
+    # Pose correction may use a confirmed landmark this far away. Creating a
+    # landmark still stops at 4.5 m (box range); this only widens the match
+    # pool so a look across the office can pair the ones already stored.
+    landmark_fix_max_range_m: float = 6.0
     landmark_fix_max_jump_m: float = 1.5
+    # Pairs must agree within this of one pose. 8 cm rejected office fits
+    # whose landmarks had confirmed with up to 12 cm of scatter.
+    landmark_fix_residual_m: float = 0.15
     # Kill switch: never apply vision pose corrections (still builds landmarks /
     # place index). Prefer leaving this false — mapping vs localizing is gated
     # in code so you do not need to retune when switching modes.

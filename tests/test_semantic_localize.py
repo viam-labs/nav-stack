@@ -401,6 +401,43 @@ def test_estimate_landmark_fix_rejected_jump():
     assert attempt.jump_m is not None and attempt.jump_m > 0.5
 
 
+def test_estimate_accepts_a_12cm_fit_and_rejects_it_at_8cm():
+    """Office landmarks confirm with ~12 cm of scatter; 8 cm never agreed."""
+    rng = np.random.default_rng(6)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(4)]
+    # Each stored point is 12 cm off the live one, alternating sign, so no
+    # pose puts three of them inside 8 cm and the 15 cm gate still fits.
+    visible = []
+    obs = []
+    for i, d in enumerate(descs):
+        live = np.array([1.2 + 0.5 * i, 0.4 * (i - 1.5), 1.0])
+        sign = 1.0 if i % 2 == 0 else -1.0
+        stored = live + np.array([sign * 0.12, 0.0, 0.0])
+        visible.append((_confirmed_lm(i + 1, stored, d), stored))
+        obs.append(_obs(float(live[0]), float(live[1]), 1.0, d))
+    tight = estimate_landmark_fix(
+        obs,
+        visible,
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        cosine_threshold=0.55,
+        min_inliers=3,
+        residual_m=0.08,
+        max_reproj_m=0.45,
+    )
+    loose = estimate_landmark_fix(
+        obs,
+        visible,
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        cosine_threshold=0.55,
+        min_inliers=3,
+        residual_m=0.15,
+        max_reproj_m=0.45,
+    )
+    assert tight.fix is None and tight.reason == "rejected_residual"
+    assert loose.fix is not None
+    assert loose.fix.n_pairs == 4
+
+
 def test_estimate_landmark_fix_applies_with_three_pairs():
     rng = np.random.default_rng(5)
     descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(3)]

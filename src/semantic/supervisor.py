@@ -1334,6 +1334,7 @@ class VisionSupervisor:
             cosine_threshold=cosine_thr,
             min_inliers=min_inliers,
             max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
+            residual_m=float(self._cfg.landmark_fix_residual_m),
         )
         fix = attempt.fix
         if fix is None:
