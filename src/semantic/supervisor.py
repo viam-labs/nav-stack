@@ -29,6 +29,7 @@ from .localize import (
     diagnose_landmark_match,
     estimate_landmark_fix,
 )
+from .paint_mask import discs_from_detections
 from .patches import PatchObservation, backproject_patches, subsample_observations
 from .persist import (
     landmarks_path,
@@ -49,10 +50,18 @@ AnchorProvider = Callable[[], Tuple[int, conv.Pose2D, Dict[int, conv.Pose2D]]]
 PoseCorrection = Callable[..., Dict[str, Any]]
 # True when SLAM localization_state is lost/unknown (place apply only then).
 LocLostProvider = Callable[[], bool]
+# Path length of each pose-graph node, for landmark loop travel gaps.
+NodeTravelProvider = Callable[[], Dict[int, float]]
+# ``(matched_pose, anchor, *, score=)`` → engine.add_landmark_loop.
+LandmarkLoop = Callable[..., Dict[str, Any]]
+# ``(discs, captured_at)`` → engine.note_paint_discs.
+PaintDiscNote = Callable[..., None]
 
 # Dense patches used only for writeback pairing (never surveyed) so detector-only
 # survey does not starve the rigid fit of inliers.
 _WRITEBACK_DENSE_MATCH_CAP = 24
+# Graph optimize + re-render is the expensive part; don't repeat it every frame.
+_LANDMARK_LOOP_COOLDOWN_S = 8.0
 
 # A frame whose capture-time pose cannot be looked up is still usable while it
 # is this fresh (no odometry history yet); older than this it is dropped.
@@ -78,6 +87,9 @@ class VisionSupervisor:
         get_anchor: AnchorProvider,
         apply_pose_correction: Optional[PoseCorrection] = None,
         is_localization_lost: Optional[LocLostProvider] = None,
+        get_node_travel: Optional[NodeTravelProvider] = None,
+        add_landmark_loop: Optional[LandmarkLoop] = None,
+        note_paint_discs: Optional[PaintDiscNote] = None,
         logger=None,
     ):
         self._cfg = cfg
@@ -87,6 +99,9 @@ class VisionSupervisor:
         self._get_anchor = get_anchor
         self._apply_pose_correction = apply_pose_correction
         self._is_localization_lost = is_localization_lost
+        self._get_node_travel = get_node_travel
+        self._add_landmark_loop = add_landmark_loop
+        self._note_paint_discs = note_paint_discs
         self._logger = logger
         self._lock = threading.Lock()
         self._task: Optional[asyncio.Task] = None
@@ -128,6 +143,11 @@ class VisionSupervisor:
         self._writeback_attempts = 0
         self._writeback_applied = 0
         self._last_writeback: Optional[dict] = None
+        self._last_loop_mono = 0.0
+        self._loop_attempts = 0
+        self._loop_applied = 0
+        self._last_landmark_loop: Optional[dict] = None
+        self._last_paint_discs = 0
         # Overlay: last writeback visible / paired landmark ids.
         self._last_writeback_match: dict = {
             "visible_ids": [],
@@ -550,6 +570,16 @@ class VisionSupervisor:
                     "applied": self._writeback_applied,
                     "last": self._last_writeback,
                 },
+                "landmark_loop": {
+                    "active": self._landmark_loop_enabled(),
+                    "attempts": self._loop_attempts,
+                    "applied": self._loop_applied,
+                    "last": self._last_landmark_loop,
+                },
+                "paint_gate": {
+                    "last_discs": int(self._last_paint_discs),
+                    "labels": list(self._worker.cfg.dynamic_labels),
+                },
                 "place": {
                     "enabled": bool(self._cfg.vision_place_enabled),
                     "retrieval": bool(self._cfg.vision_place_retrieval),
@@ -573,6 +603,15 @@ class VisionSupervisor:
 
     def _writeback_enabled(self) -> bool:
         return bool(self._cfg.vision_pose_writeback) and self._vision_apply_allowed()
+
+    def _landmark_loop_enabled(self) -> bool:
+        """Re-observed landmarks may add a pose-graph edge while mapping."""
+        return (
+            str(self._cfg.mode) == MODE_MAPPING
+            and not bool(self._cfg.vision_survey_only)
+            and self._add_landmark_loop is not None
+            and not bool(self._worker.cfg.synthetic)
+        )
 
     def _audit_removes(self) -> bool:
         """The depth audit may delete landmarks only while the map is being built.
@@ -1037,6 +1076,7 @@ class VisionSupervisor:
 
         ``pose`` is the robot pose at capture (looked up when omitted).
         """
+        self._publish_paint_discs(frame, result)
         if pose is None:
             pose = self._capture_pose(frame)
         try:
@@ -1205,8 +1245,179 @@ class VisionSupervisor:
                 box["landmark"] = display_label(lm)
                 box["text"] = f"={box['landmark']}"
 
+        if self._landmark_loop_enabled() and writeback_obs:
+            self._try_landmark_loop(frame, writeback_obs, pose, pose_of_node)
         if self._writeback_enabled() and writeback_obs:
             self._try_pose_writeback(frame, writeback_obs, pose, pose_of_node)
+
+    def _publish_paint_discs(self, frame: VisionFrame, result: VisionResult) -> None:
+        """Hand person (and other mover) discs to SLAM so the scan skips them."""
+        note = self._note_paint_discs
+        if note is None:
+            return
+        labels = self._worker.cfg.dynamic_labels
+        discs = discs_from_detections(frame, result.detections or [], labels)
+        with self._lock:
+            self._last_paint_discs = len(discs)
+        try:
+            note(discs, float(frame.captured_at))
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"paint_gate: {exc}"
+
+    def _try_landmark_loop(
+        self,
+        frame: VisionFrame,
+        obs: List[PatchObservation],
+        pose: conv.Pose2D,
+        pose_of_node: Dict[int, conv.Pose2D],
+    ) -> None:
+        """While mapping, a fit to one old keyframe's landmarks becomes a loop edge."""
+        add = self._add_landmark_loop
+        travel_of = self._get_node_travel
+        if add is None or travel_of is None:
+            return
+        now = time.monotonic()
+        if now - self._last_loop_mono < _LANDMARK_LOOP_COOLDOWN_S:
+            return
+        min_inliers = int(self._cfg.vision_pose_writeback_min_inliers)
+        with self._lock:
+            confirmed = len(self._landmarks.confirmed())
+            if confirmed < min_inliers:
+                self._last_landmark_loop = {
+                    "status": "skipped_few_confirmed",
+                    "confirmed": confirmed,
+                }
+                return
+            visible = self._landmarks.image_visible_set(
+                pose,
+                pose_of_node,
+                intrinsics=frame.intrinsics,
+                mount_x=float(frame.mount_x),
+                mount_y=float(frame.mount_y),
+                mount_z=float(frame.mount_z),
+                mount_theta=float(frame.mount_theta),
+                mount_pitch=float(frame.mount_pitch),
+                mount_roll=float(frame.mount_roll),
+                max_range_m=float(self._cfg.landmark_fix_max_range_m),
+            )
+            cosine_thr = float(self._landmarks.cosine_threshold)
+            anchor_of = {
+                int(lm.landmark_id): int(lm.anchor_node) for lm, _xyz in visible
+            }
+        if len(visible) < min_inliers:
+            self._last_landmark_loop = {
+                "status": "few_pairs",
+                "visible": len(visible),
+            }
+            return
+        attempt = estimate_landmark_fix(
+            obs,
+            visible,
+            robot_pose=pose,
+            cosine_threshold=cosine_thr,
+            min_inliers=min_inliers,
+            max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
+            residual_m=float(self._cfg.landmark_fix_residual_m),
+        )
+        fix = attempt.fix
+        if fix is None:
+            self._last_landmark_loop = {
+                "status": "rejected_fit",
+                "reason": attempt.reason or "rejected_fit",
+                "pairs": int(attempt.pairs),
+                "visible": len(visible),
+            }
+            return
+        anchor = dominant_loop_anchor(
+            attempt.paired_ids,
+            fix.fit.inliers,
+            anchor_of,
+            min_inliers=min_inliers,
+        )
+        if anchor is None:
+            self._last_landmark_loop = {
+                "status": "split_anchors",
+                "pairs": int(fix.n_pairs),
+                "paired_ids": [int(x) for x in attempt.paired_ids],
+            }
+            return
+        group = [
+            (lm, xyz)
+            for lm, xyz in visible
+            if int(lm.anchor_node) == int(anchor)
+        ]
+        if len(group) < min_inliers:
+            self._last_landmark_loop = {
+                "status": "split_anchors",
+                "anchor": int(anchor),
+            }
+            return
+        if len(group) != len(visible):
+            attempt = estimate_landmark_fix(
+                obs,
+                group,
+                robot_pose=pose,
+                cosine_threshold=cosine_thr,
+                min_inliers=min_inliers,
+                max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
+                residual_m=float(self._cfg.landmark_fix_residual_m),
+            )
+            fix = attempt.fix
+            if fix is None:
+                self._last_landmark_loop = {
+                    "status": "rejected_fit",
+                    "reason": attempt.reason or "rejected_fit",
+                    "anchor": int(anchor),
+                    "pairs": int(attempt.pairs),
+                }
+                return
+        try:
+            travel = travel_of() or {}
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"landmark_loop: {exc}"
+            self._last_landmark_loop = {"status": "error", "error": repr(exc)}
+            return
+        if int(anchor) not in travel or not travel:
+            self._last_landmark_loop = {
+                "status": "skipped_anchor",
+                "anchor": int(anchor),
+            }
+            return
+        cur = max(int(k) for k in travel)
+        gap = float(travel[cur]) - float(travel[int(anchor)])
+        min_gap = float(self._cfg.builtin_loop_min_travel_m)
+        if gap < min_gap or int(anchor) >= cur:
+            self._last_landmark_loop = {
+                "status": "skipped_near",
+                "anchor": int(anchor),
+                "gap_m": round(gap, 2),
+            }
+            return
+        self._loop_attempts += 1
+        self._last_loop_mono = now
+        try:
+            result = add(fix.fit.pose, int(anchor), score=fix.score)
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"landmark_loop: {exc}"
+            self._last_landmark_loop = {"status": "error", "error": repr(exc)}
+            return
+        applied = bool(result.get("applied"))
+        if applied:
+            self._loop_applied += 1
+        self._last_landmark_loop = {
+            "status": str(result.get("status", "applied" if applied else "not_applied")),
+            "anchor": int(anchor),
+            "inliers": int(fix.fit.inliers.sum()),
+            "jump_m": round(fix.jump_m, 3),
+            "jump_deg": round(fix.jump_deg, 2),
+            "gap_m": round(gap, 2),
+            "applied": applied,
+        }
+        self._log(
+            f"vision landmark loop: {self._last_landmark_loop['status']} "
+            f"anchor={int(anchor)} jump={fix.jump_m:.2f}m/{fix.jump_deg:.1f}deg "
+            f"inliers={int(fix.fit.inliers.sum())}"
+        )
 
     def _audit_landmarks(
         self,
@@ -1432,6 +1643,35 @@ class VisionSupervisor:
             f"jump={fix.jump_m:.2f}m/{fix.jump_deg:.1f}deg "
             f"score={fix.score:.2f} inliers={int(fix.fit.inliers.sum())}"
         )
+
+
+def dominant_loop_anchor(
+    paired_ids: Sequence[int],
+    inliers,
+    anchor_of: Dict[int, int],
+    *,
+    min_inliers: int,
+) -> Optional[int]:
+    """Keyframe that owns at least ``min_inliers`` of the fit, or None.
+
+    A loop edge has to come from landmarks stored on one older node. Pairs
+    split across several keyframes do not vote together.
+    """
+    mask = np.asarray(inliers, dtype=bool).reshape(-1)
+    counts: Dict[int, int] = {}
+    for i, lid in enumerate(paired_ids):
+        if i >= int(mask.size) or not bool(mask[i]):
+            continue
+        anchor = anchor_of.get(int(lid))
+        if anchor is None or int(anchor) < 0:
+            continue
+        counts[int(anchor)] = counts.get(int(anchor), 0) + 1
+    if not counts:
+        return None
+    anchor, n = max(counts.items(), key=lambda kv: (kv[1], -kv[0]))
+    if n < int(min_inliers):
+        return None
+    return int(anchor)
 
 
 def _resolve_detector_classes(

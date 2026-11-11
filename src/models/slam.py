@@ -2702,6 +2702,9 @@ class SlamService(SLAM):
             state = str(getattr(self._loc_state, "state", "") or "")
             return state in ("lost", "unknown")
 
+        def _add_landmark_loop(pose, anchor, *, score=None):
+            return engine.add_landmark_loop(pose, anchor, score=score)
+
         vision = VisionSupervisor(
             cfg=cfg,
             cameras=self._cameras,
@@ -2710,6 +2713,9 @@ class SlamService(SLAM):
             get_anchor=_anchor,
             apply_pose_correction=_apply_pose_correction,
             is_localization_lost=_is_localization_lost,
+            get_node_travel=engine.vision_node_travel,
+            add_landmark_loop=_add_landmark_loop,
+            note_paint_discs=engine.note_paint_discs,
             logger=LOGGER.info,
         )
         store = self._map_store

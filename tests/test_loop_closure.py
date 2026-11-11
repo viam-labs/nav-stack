@@ -561,6 +561,83 @@ def test_large_shift_loop_needs_three_agreeing_detections(monkeypatch):
     assert engine.diagnostics()["loop_closure"]["closures"] == 1
 
 
+def _mapping_engine():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "maps_dir": "/tmp",
+            "mode": "mapping",
+            "builtin_loop_closure": False,
+        }
+    )
+    return BuiltinSlamEngine(cfg, _Sensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+
+
+def _straight_graph(engine, steps: int) -> conv.Pose2D:
+    scan = conv.LaserScan2D(np.array([2.0]), 0.0, 0.0, 0.1, 10.0)
+    last = conv.Pose2D(0.0, 0.0, 0.0)
+    for i in range(steps):
+        last = conv.Pose2D(0.5 * i, 0.0, 0.0)
+        engine._graph.add_scan(last, scan)  # noqa: SLF001
+    return last
+
+
+def test_landmark_loop_pulls_a_drifted_pose_back():
+    engine = _mapping_engine()
+    last = _straight_graph(engine, 17)
+    engine._pose = conv.Pose2D(last.x, 0.30, 0.0)  # noqa: SLF001
+    out = engine.add_landmark_loop(conv.Pose2D(last.x, 0.0, 0.0), 0, score=0.7)
+    assert out["status"] == "rebuilt", out
+    assert out["applied"] is True
+    assert any(e.loop and e.i == 0 for e in engine._graph.edges)  # noqa: SLF001
+    assert abs(engine.get_pose().y) < 0.15
+
+
+def test_landmark_loop_refuses_a_short_gap_and_a_wild_jump():
+    engine = _mapping_engine()
+    last = _straight_graph(engine, 3)
+    engine._pose = conv.Pose2D(last.x, 0.40, 0.0)  # noqa: SLF001
+    near = engine.add_landmark_loop(conv.Pose2D(last.x, 0.0, 0.0), 0, score=0.8)
+    assert near["status"] == "skipped_near"
+    assert near["applied"] is False
+
+    engine = _mapping_engine()
+    last = _straight_graph(engine, 17)
+    engine._pose = conv.Pose2D(last.x, 3.0, 0.0)  # noqa: SLF001
+    wild = engine.add_landmark_loop(conv.Pose2D(last.x, 0.0, 0.0), 0, score=0.8)
+    assert wild["status"] == "rejected_implausible"
+    assert wild["applied"] is False
+    assert not any(e.loop for e in engine._graph.edges)  # noqa: SLF001
+
+
+def test_paint_gate_does_not_store_a_return_on_a_person():
+    engine = _mapping_engine()
+    scan = conv.LaserScan2D(
+        np.array([2.0, 4.0]), 0.0, 0.5, 0.1, 10.0
+    )
+    now = 10.0
+    engine.note_paint_discs([(2.0, 0.0, 0.4)], now)
+    engine._paint_mapping_scan(scan, conv.Pose2D(0.0, 0.0, 0.0), now)  # noqa: SLF001
+    grid = engine._grid  # noqa: SLF001
+    int16 = occ.to_occupancy_int16(grid)
+    near_r, near_c = grid.world_to_cell(2.0, 0.0)
+    far_x = 4.0 * math.cos(0.5)
+    far_y = 4.0 * math.sin(0.5)
+    far_r, far_c = grid.world_to_cell(far_x, far_y)
+    assert int(int16[near_r, near_c]) != 100
+    assert int(int16[far_r, far_c]) == 100
+
+    # A disc from a second ago no longer blanks the beam.
+    engine = _mapping_engine()
+    engine.note_paint_discs([(2.0, 0.0, 0.4)], now - 1.0)
+    engine._paint_mapping_scan(scan, conv.Pose2D(0.0, 0.0, 0.0), now)  # noqa: SLF001
+    grid = engine._grid  # noqa: SLF001
+    int16 = occ.to_occupancy_int16(grid)
+    near_r, near_c = grid.world_to_cell(2.0, 0.0)
+    assert int(int16[near_r, near_c]) == 100
+
+
 def test_set_pose_jump_does_not_become_odometry():
     graph = pg.PoseGraph(node_spacing_m=0.5)
     scan = conv.LaserScan2D(np.array([2.0]), 0.0, 0.0, 0.1, 10.0)

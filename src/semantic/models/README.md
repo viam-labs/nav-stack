@@ -196,8 +196,17 @@ because no capture pose was available and they were over 1 s old
 
 With `vision_enabled: true` the defaults are:
 
-- **mapping**: build landmarks + VLAD place index only (never apply pose —
-  applying during mapping can shift the whole occupancy map)
+- **mapping**: build landmarks + VLAD place index. Re-seeing at least 3
+  confirmed landmarks that all belong to one keyframe at least
+  `builtin_loop_min_travel_m` (6 m of path) behind the robot adds a pose-graph
+  loop edge. The edge is dropped if it disagrees with the rest of the graph.
+  Small agreements (under 8 cm and 2°) add nothing. This is separate from
+  localizing writeback, which still does not run while mapping.
+- **mapping paint**: a detection labelled person, bicycle, car, or motorcycle
+  blanks the lidar returns inside that box for 0.2 s, so a passer-by is not
+  stored as a wall. Furniture and this robot are not blanked. The indoor
+  ONNX from v1.2.0-rc49 includes `person` (appended, so older class ids stay
+  put). Startup replaces an onnx that was fetched for an older class list.
 - **localizing + tracking/degraded**: landmark writeback only (fine)
 - **localizing + lost/unknown**: place retrieval (coarse relocalization), then
   landmark writeback — both via `apply_map_pose_correction(force=False)`
@@ -213,7 +222,8 @@ Writeback needs ≥3 landmark pairs (2-point SE(2) fits are unstable). Matching 
 
 Kill switch if needed: `"vision_survey_only": true` (build only, never apply).
 
-Watch `vision_status.writeback` and `vision_status.place`.
+Watch `vision_status.writeback`, `vision_status.landmark_loop`,
+`vision_status.paint_gate`, and `vision_status.place`.
 
 Writeback `visible` / `visible_image` counts confirmed landmarks that project into the camera image (same cull as landmark-camera greens). `visible_frustum` is the older facing-filtered count for comparison.
 

@@ -21,9 +21,8 @@ if [ ! -f "$DINOV2_ONNX" ] && [ -f tools/fetch_dinov2_onnx.py ]; then
     echo "[nav-stack] fetching DINOv2 ONNX…"
     python tools/fetch_dinov2_onnx.py || true
 fi
-YOLO_WORLD_ONNX="src/semantic/models/yolov8s-worldv2-indoor.onnx"
-if [ ! -f "$YOLO_WORLD_ONNX" ] && [ -f tools/fetch_yolo_world_onnx.py ]; then
-    echo "[nav-stack] fetching YOLO-World ONNX…"
+if [ -f tools/fetch_yolo_world_onnx.py ]; then
+    echo "[nav-stack] checking YOLO-World ONNX…"
     python tools/fetch_yolo_world_onnx.py || true
 fi
 

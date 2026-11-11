@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pytest
 
-from src.semantic.paint_mask import Disc, filter_scan_endpoints
+from src.semantic.paint_mask import Disc, filter_scan_endpoints, mask_scan_ranges
 from src.semantic.patches import (
     annotate_patch_texture,
     backproject_patches,
@@ -101,6 +101,15 @@ def test_filter_scan_endpoints_drops_disc():
     assert len(out) == 2
     assert out[0, 0] == pytest.approx(1.0)
     assert out[1, 0] == pytest.approx(3.0)
+
+
+def test_mask_scan_ranges_blanks_a_beam_inside_the_disc():
+    ranges = np.array([2.0, 4.0], dtype=float)
+    out = mask_scan_ranges(ranges, 0.0, 0.5, [Disc(x=2.0, y=0.0, radius_m=0.4)])
+    assert math.isnan(out[0])
+    assert out[1] == pytest.approx(4.0)
+    # The source array stays so a later matcher still sees the raw scan.
+    assert ranges[0] == pytest.approx(2.0)
 
 
 def test_distinctiveness_keeps_unique_descriptors():

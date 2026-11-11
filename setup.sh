@@ -36,15 +36,12 @@ fetch_dinov2_if_needed() {
 }
 
 fetch_yolo_world_if_needed() {
-    local out="src/semantic/models/yolov8s-worldv2-indoor.onnx"
-    if [ -f "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -gt 5000000 ]; then
-        log "YOLO-World ONNX already present ($(du -h "$out" | awk '{print $1}'))"
-        return 0
-    fi
     if [ ! -f tools/fetch_yolo_world_onnx.py ]; then
         return 0
     fi
-    log "fetching YOLO-World indoor ONNX weights…"
+    # The fetcher keeps a file only when it matches the shipped class list,
+    # so an older copy without the person prompt is replaced.
+    log "checking YOLO-World indoor ONNX…"
     python tools/fetch_yolo_world_onnx.py || log "YOLO-World fetch failed (detector landmarks disabled until weights are present)"
 }
 

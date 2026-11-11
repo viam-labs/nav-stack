@@ -171,10 +171,75 @@ def test_resolve_detector_classes_from_sidecar():
     got = _resolve_detector_classes(fake_onnx, configured=[])
     assert "painting" in got
     assert "door" in got
+    # Appended so a rebuilt ONNX learns people without shifting older class ids.
+    assert got[-1] == "person"
     # Config wins.
     assert _resolve_detector_classes(fake_onnx, configured=["tv", "clock"]) == (
         "tv",
         "clock",
+    )
+
+
+def test_person_box_is_handed_to_the_paint_gate():
+    """A person blanks lidar returns. A painting does not."""
+    from src.semantic.types import Detection, VisionResult
+
+    cfg = _cfg(mode="mapping", vision_survey_only=False)
+    pose = Pose2D(0.0, 0.0, 0.0)
+    seen = {}
+
+    def note(discs, captured_at):
+        seen["n"] = len(discs)
+        seen["t"] = captured_at
+        seen["labels_x"] = [round(d.x, 2) for d in discs]
+
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: pose,
+        get_pose_at=lambda _t: pose,
+        get_anchor=lambda: (0, pose, {0: pose}),
+        note_paint_discs=note,
+    )
+    frame = _frame()
+    frame.captured_at = 1.5
+    person = Detection(label="person", conf=0.9, x0=40, y0=20, x1=120, y1=100)
+    painting = Detection(label="painting", conf=0.9, x0=10, y0=10, x1=30, y1=30)
+    result = VisionResult(
+        camera_name=frame.camera_name,
+        stamp=frame.stamp,
+        captured_at=1.5,
+        patches=[],
+        detections=[person, painting],
+        provider="test",
+    )
+    vision._survey(frame, result)  # noqa: SLF001
+    assert seen["n"] == 1
+    assert seen["t"] == 1.5
+    assert seen["labels_x"][0] > 0.5
+    assert vision.status()["paint_gate"]["last_discs"] == 1
+
+
+def test_loop_anchor_needs_three_inliers_on_one_keyframe():
+    from src.semantic.supervisor import dominant_loop_anchor
+
+    # Three inliers on node 2, one on node 9.
+    anchor = dominant_loop_anchor(
+        [1, 2, 3, 4],
+        [True, True, True, True],
+        {1: 2, 2: 2, 3: 2, 4: 9},
+        min_inliers=3,
+    )
+    assert anchor == 2
+    # Split 2 and 2 does not close a loop.
+    assert (
+        dominant_loop_anchor(
+            [1, 2, 3, 4],
+            [True, True, True, True],
+            {1: 2, 2: 2, 3: 9, 4: 9},
+            min_inliers=3,
+        )
+        is None
     )
 
 

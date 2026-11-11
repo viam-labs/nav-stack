@@ -222,6 +222,7 @@ __marimo__/
 module.tar.gz
 # DINOv2 / YOLO-World weights (setup.sh / tools/fetch_*.py; attach to releases)
 src/semantic/models/*.onnx
+src/semantic/models/*.stamp
 yolov8*-worldv2*.pt
 yolov8*-worldv2*.onnx
 scripts/watch_describe_motion.py

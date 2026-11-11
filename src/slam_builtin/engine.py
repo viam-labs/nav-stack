@@ -203,6 +203,10 @@ class BuiltinSlamEngine:
         # Bumped whenever the pose jumps frame (correction / set_pose) so an
         # in-flight match computed in the old frame is not applied.
         self._pose_epoch = 0
+        # Person discs from the vision paint gate. Endpoints inside them are
+        # dropped only while the camera frame is this fresh.
+        self._paint_discs: list = []
+        self._paint_discs_at = 0.0
         self._loop_params = loop_closure.LoopClosureParams(
             min_travel_gap_m=float(cfg.builtin_loop_min_travel_m),
             search_radius_m=float(cfg.builtin_loop_search_radius_m),
@@ -823,6 +827,12 @@ class BuiltinSlamEngine:
     # A new loop edge still this far off after optimizing disagrees with the
     # rest of the graph (likely a false match) and is dropped.
     _LOOP_MAX_CHI2 = 25.0
+    # A landmark agreement smaller than this is already what the odometry
+    # edge says. Larger disagreements become a loop edge.
+    _LANDMARK_LOOP_MIN_SHIFT_M = 0.08
+    _LANDMARK_LOOP_MIN_SHIFT_DEG = 2.0
+    # Camera frame older than this no longer punches holes in the lidar scan.
+    _PAINT_DISC_MAX_AGE_S = 0.2
     _LOOP_REBUILD_MIN_M = 0.08
     _LOOP_REBUILD_MIN_DEG = 1.0
     # Small snaps close after two agreeing detections; multi-meter corridor
@@ -1023,6 +1033,174 @@ class BuiltinSlamEngine:
             f"chi2={result.get('loop_chi2', 'n/a')}"
         )
         return out
+
+    def add_landmark_loop(
+        self,
+        matched_pose: conv.Pose2D,
+        anchor: int,
+        *,
+        score: Optional[float] = None,
+    ) -> dict:
+        """Add a loop edge from a landmark fit while mapping.
+
+        ``matched_pose`` is where the robot must stand for the live landmark
+        points to sit on their stored map points. ``anchor`` is the keyframe
+        those landmarks belong to. The edge is dropped when it disagrees with
+        the rest of the graph (``_LOOP_MAX_CHI2``).
+        """
+        anchor = int(anchor)
+        with self._lock:
+            if self._mode != MODE_MAPPING:
+                return {"applied": False, "status": "skipped_not_mapping"}
+            n = len(self._graph)
+            if n < 2 or anchor < 0 or anchor >= n - 1:
+                return {"applied": False, "status": "skipped_anchor", "anchor": anchor}
+            cur = n - 1
+            gap = float(self._graph.nodes[cur].travel_m) - float(
+                self._graph.nodes[anchor].travel_m
+            )
+            min_gap = float(self._loop_params.min_travel_gap_m)
+            if gap < min_gap:
+                return {
+                    "applied": False,
+                    "status": "skipped_near",
+                    "anchor": anchor,
+                    "gap_m": round(gap, 2),
+                }
+            if any(
+                e.loop and e.i == anchor and e.j == cur for e in self._graph.edges
+            ):
+                return {
+                    "applied": False,
+                    "status": "skipped_duplicate",
+                    "anchor": anchor,
+                }
+            current = self._pose
+            shift_m = math.hypot(
+                matched_pose.x - current.x, matched_pose.y - current.y
+            )
+            shift_deg = abs(
+                math.degrees(
+                    conv.normalize_angle(matched_pose.theta - current.theta)
+                )
+            )
+            if (
+                shift_m < self._LANDMARK_LOOP_MIN_SHIFT_M
+                and shift_deg < self._LANDMARK_LOOP_MIN_SHIFT_DEG
+            ):
+                return {
+                    "applied": False,
+                    "status": "skipped_agrees",
+                    "anchor": anchor,
+                    "shift_m": round(shift_m, 3),
+                    "shift_deg": round(shift_deg, 2),
+                }
+            allowed_m = max(0.3, self._loop_params.drift_fraction * gap)
+            if (
+                shift_m > allowed_m
+                or shift_deg > self._GRAPH_CORRECTION_MAX_DEG
+            ):
+                return {
+                    "applied": False,
+                    "status": "rejected_implausible",
+                    "anchor": anchor,
+                    "gap_m": round(gap, 2),
+                    "shift_m": round(shift_m, 3),
+                    "shift_deg": round(shift_deg, 2),
+                    "allowed_m": round(allowed_m, 2),
+                }
+        with self._graph_job:
+            with self._lock:
+                if self._mode != MODE_MAPPING or len(self._graph) < 2:
+                    return {"applied": False, "status": "skipped_not_mapping"}
+                cur = len(self._graph) - 1
+                if anchor >= cur:
+                    return {
+                        "applied": False,
+                        "status": "skipped_anchor",
+                        "anchor": anchor,
+                    }
+                if any(
+                    e.loop and e.i == anchor and e.j == cur
+                    for e in self._graph.edges
+                ):
+                    return {
+                        "applied": False,
+                        "status": "skipped_duplicate",
+                        "anchor": anchor,
+                    }
+                corr = pg.world_correction(self._pose, matched_pose)
+                target = conv.compose_poses(corr, self._graph.nodes[cur].pose)
+                rel = conv.compose_poses(
+                    conv.invert_pose(self._graph.nodes[anchor].pose), target
+                )
+                sigma_m, sigma_rad = self._revisit_edge_sigmas(score)
+                edge = pg.GraphEdge(
+                    anchor,
+                    cur,
+                    rel,
+                    pg.info_from_sigmas(sigma_m, sigma_rad),
+                    loop=True,
+                )
+                self._graph.add_edge(edge)
+                new_edges = [edge]
+                first_free = self._live_first_free(anchor + 1)
+            result = self._optimize_and_render(first_free, new_edges=new_edges)
+        status = str(result.get("status", ""))
+        out = {
+            "applied": status == "rebuilt",
+            "status": status,
+            "anchor": anchor,
+            "shift_m": round(shift_m, 3),
+            "shift_deg": round(shift_deg, 2),
+            "gap_m": round(gap, 2),
+        }
+        if "loop_chi2" in result:
+            out["loop_chi2"] = result["loop_chi2"]
+        self._log(
+            f"builtin SLAM landmark loop (anchor={anchor}): {status} "
+            f"shift={shift_m:.2f} m {shift_deg:.1f} deg gap={gap:.1f} m"
+        )
+        return out
+
+    def note_paint_discs(self, discs, captured_at: float) -> None:
+        """Remember dynamic-object discs until the next scan paint."""
+        packed = []
+        for disc in discs or []:
+            if isinstance(disc, tuple):
+                x, y, r = disc
+            else:
+                x, y, r = disc.x, disc.y, disc.radius_m
+            if float(r) > 0.0:
+                packed.append((float(x), float(y), float(r)))
+        with self._lock:
+            self._paint_discs = packed
+            self._paint_discs_at = float(captured_at)
+
+    def _fresh_paint_discs(self, now: float) -> list:
+        with self._lock:
+            if not self._paint_discs:
+                return []
+            if float(now) - float(self._paint_discs_at) > self._PAINT_DISC_MAX_AGE_S:
+                return []
+            return list(self._paint_discs)
+
+    def _mask_dynamic_scan(self, scan, now: float):
+        """Blank lidar returns that land on a fresh person (or other mover)."""
+        discs = self._fresh_paint_discs(now)
+        if not discs or scan is None:
+            return scan
+        from dataclasses import replace
+
+        from ..semantic.paint_mask import mask_scan_ranges
+
+        ranges = mask_scan_ranges(
+            np.asarray(scan.ranges, dtype=float),
+            float(scan.angle_min),
+            float(scan.angle_increment),
+            discs,
+        )
+        return replace(scan, ranges=ranges)
 
     def optimize_pose_graph(self) -> dict:
         """Optimize the whole mapping pose graph and re-render the grid."""
@@ -2273,6 +2451,11 @@ class BuiltinSlamEngine:
             idx = len(self._graph.nodes) - 1
             return idx, poses[idx], poses
 
+    def vision_node_travel(self) -> dict:
+        """Path length (m) of each pose-graph node, for landmark loop gaps."""
+        with self._lock:
+            return {i: float(n.travel_m) for i, n in enumerate(self._graph.nodes)}
+
     def get_pose_at(self, t: float) -> Optional[conv.Pose2D]:
         """Map pose at monotonic time ``t``, in the current map frame.
 
@@ -3126,6 +3309,7 @@ class BuiltinSlamEngine:
         frames: Optional[list] = None,
     ) -> None:
         """Draw one mapping scan at ``pose_snap``. Caller already decided it fits."""
+        scan = self._mask_dynamic_scan(scan, now)
         if frames is None:
             frames = self._mapping_frames()
         with self._lock:
@@ -3133,6 +3317,11 @@ class BuiltinSlamEngine:
             extend_only = not self._baseline_trusted_locked()
             protect = self._session_baseline if extend_only else None
         band_scans = self._band_scans(frames)
+        if band_scans:
+            band_scans = {
+                band: self._mask_dynamic_scan(band_scan, now)
+                for band, band_scan in band_scans.items()
+            }
         primary_band = 0
         if band_scans:
             painted, bands, primary, extras, primary_band = self._paint_height_bands(
