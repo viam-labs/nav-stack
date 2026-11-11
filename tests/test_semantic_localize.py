@@ -210,6 +210,54 @@ def test_place_retrieval_applies_when_lost_large_jump():
     assert called[0]["pose"].x == pytest.approx(2.5)
 
 
+def test_place_retrieval_defers_when_landmarks_can_vote():
+    """A confident place hit does not teleport once three landmarks exist."""
+    cfg = _cfg(
+        mode="localizing",
+        vision_survey_only=False,
+        vision_place_retrieval=True,
+        vision_pose_writeback=True,
+        vision_pose_writeback_min_inliers=3,
+        vision_place_cooldown_s=0.0,
+        vision_place_min_score=0.55,
+        vision_place_large_jump_m=0.40,
+        vision_place_large_jump_min_score=0.75,
+        vision_place_min_score_margin=0.08,
+    )
+    pose = Pose2D(0.0, 0.0, 0.0)
+    target = Pose2D(2.5, 0.0, 0.0)
+    called = []
+
+    def apply(p, *, score=None, force=False):
+        called.append(p)
+        return {"applied": True, "status": "pose_only"}
+
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: pose,
+        get_pose_at=lambda _t: pose,
+        get_anchor=lambda: (0, pose, {0: pose}),
+        apply_pose_correction=apply,
+        is_localization_lost=lambda: True,
+    )
+    vision._worker.cfg.synthetic = False  # noqa: SLF001
+    rng = np.random.default_rng(9)
+    desc = l2_normalize(rng.standard_normal(8).astype(np.float32))
+    for i in range(3):
+        xyz = np.array([1.0 + 0.4 * i, 0.2 * i, 1.0])
+        lm = _confirmed_lm(i + 1, xyz, desc)
+        vision.landmarks._landmarks[lm.landmark_id] = lm  # noqa: SLF001
+    near = l2_normalize(rng.standard_normal((16, 8)).astype(np.float32))
+    far = l2_normalize(rng.standard_normal((16, 8)).astype(np.float32) + 3.0)
+    vision._place.add_keyframe(1, pose, near)  # noqa: SLF001
+    vision._place.add_keyframe(2, target, far)  # noqa: SLF001
+    vision._try_place_retrieval(far, pose)  # noqa: SLF001
+    last = vision.status()["place"]["last_retrieval"]
+    assert last["status"] == "deferred_to_landmarks", last
+    assert called == []
+
+
 def test_writeback_applies_when_enabled(tmp_path):
     cfg = _cfg(
         mode="localizing",
@@ -442,6 +490,41 @@ def test_estimate_accepts_a_12cm_fit_and_rejects_it_at_8cm():
     assert tight.fix is None and tight.reason == "rejected_residual"
     assert loose.fix is not None
     assert loose.fix.n_pairs == 4
+
+
+def test_lost_residual_keeps_a_22cm_scatter_that_15cm_drops():
+    """Three real matches scattered past 15 cm still vote while lost."""
+    rng = np.random.default_rng(8)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(4)]
+    visible = []
+    obs = []
+    for i, d in enumerate(descs):
+        live = np.array([1.2 + 0.5 * i, 0.4 * (i - 1.5), 1.0])
+        sign = 1.0 if i % 2 == 0 else -1.0
+        stored = live + np.array([sign * 0.22, 0.0, 0.0])
+        visible.append((_confirmed_lm(i + 1, stored, d), stored))
+        obs.append(_obs(float(live[0]), float(live[1]), 1.0, d))
+    tight = estimate_landmark_fix(
+        obs,
+        visible,
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        cosine_threshold=0.55,
+        min_inliers=3,
+        residual_m=0.15,
+        max_reproj_m=0.45,
+    )
+    lost = estimate_landmark_fix(
+        obs,
+        visible,
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        cosine_threshold=0.55,
+        min_inliers=3,
+        residual_m=0.30,
+        max_reproj_m=0.45,
+    )
+    assert tight.fix is None and tight.reason == "rejected_residual"
+    assert lost.fix is not None
+    assert int(lost.fix.fit.inliers.sum()) >= 3
 
 
 def test_estimate_landmark_fix_applies_with_three_pairs():

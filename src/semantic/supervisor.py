@@ -70,6 +70,9 @@ _PLACE_SEED_REPROJ_M = 1.25
 # apart, both explaining the picture, and neither guess is applied.
 _PLACE_SEED_AGREE_M = 0.75
 _PLACE_SEED_AGREE_DEG = 15.0
+# While lost, landmark positions from a tracked survey still scatter more
+# than the 15 cm nudge gate. Three matches inside this may move the pose.
+_LOST_FIT_RESIDUAL_M = 0.30
 
 # A frame whose capture-time pose cannot be looked up is still usable while it
 # is this fresh (no odometry history yet); older than this it is dropped.
@@ -1060,6 +1063,21 @@ class VisionSupervisor:
                 "jump_deg": round(float(jump_deg), 1),
             }
             return
+        # Landmarks get the vote when there are enough of them. A place hit
+        # alone is what walked the pose down a corridor the scan would not lock.
+        with self._lock:
+            confirmed = len(self._landmarks.confirmed())
+        if self._place_seed_enabled() and confirmed >= int(
+            self._cfg.vision_pose_writeback_min_inliers
+        ):
+            self._last_place_retrieval = {
+                "status": "deferred_to_landmarks",
+                "keyframe_id": int(kid),
+                "score": round(float(score), 3),
+                "jump_m": round(float(jump_m), 3),
+                "jump_deg": round(float(jump_deg), 1),
+            }
+            return
         try:
             result = apply(hit_pose, score=float(score), force=False)
         except Exception as exc:  # noqa: BLE001
@@ -1162,7 +1180,9 @@ class VisionSupervisor:
                 cosine_threshold=cosine_thr,
                 min_inliers=min_inliers,
                 max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
-                residual_m=float(self._cfg.landmark_fix_residual_m),
+                residual_m=max(
+                    float(self._cfg.landmark_fix_residual_m), _LOST_FIT_RESIDUAL_M
+                ),
                 max_reproj_m=_PLACE_SEED_REPROJ_M,
             )
             fix = attempt.fix
@@ -1743,6 +1763,9 @@ class VisionSupervisor:
 
         min_inliers = int(self._cfg.vision_pose_writeback_min_inliers)
         visible_ids = [int(lm.landmark_id) for lm, _ in visible]
+        residual_m = float(self._cfg.landmark_fix_residual_m)
+        if self._localization_lost():
+            residual_m = max(residual_m, _LOST_FIT_RESIDUAL_M)
         attempt = estimate_landmark_fix(
             obs,
             visible,
@@ -1750,7 +1773,7 @@ class VisionSupervisor:
             cosine_threshold=cosine_thr,
             min_inliers=min_inliers,
             max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
-            residual_m=float(self._cfg.landmark_fix_residual_m),
+            residual_m=residual_m,
         )
         fix = attempt.fix
         if fix is None:

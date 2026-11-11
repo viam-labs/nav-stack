@@ -213,9 +213,12 @@ With `vision_enabled: true` the defaults are:
   are projected from each guess, and the pose moves only when one guess has
   at least 3 agreeing landmarks and no other guess fits a different pose.
   A raw place teleport still happens when the top hit beats the second by
-  `vision_place_min_score_margin` and is strong enough for the jump. Then
-  landmark writeback. All of these go through
-  `apply_map_pose_correction(force=False)`.
+  `vision_place_min_score_margin` and is strong enough for the jump, and only
+  when fewer than 3 confirmed landmarks exist. Otherwise the landmark fit
+  decides. While lost that fit keeps three matches but allows 30 cm of
+  scatter, because a two-point sample was rejecting sets that agree more
+  loosely than the 15 cm tracking nudge. Then landmark writeback. All of
+  these go through `apply_map_pose_correction(force=False)`.
 
 You should not need to flip `vision_pose_writeback` / `vision_place_retrieval`
 when switching modes. Check `vision_status.pose_writeback_active` and

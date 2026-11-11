@@ -91,6 +91,10 @@ def fit_rigid_2d(
     best_inliers: Optional[np.ndarray] = None
     best_count = 0
     best_pose: Optional[Tuple[float, float, float]] = None
+    # A pose from two noisy points tilts, so the other true matches miss a
+    # tight gate. Collect the cluster more loosely, then judge it on residual_m.
+    accept_m = float(residual_m)
+    search_m = max(accept_m * 2.0, accept_m)
 
     for _ in range(max(1, int(ransac_iters))):
         if n == 2:
@@ -109,7 +113,7 @@ def fit_rigid_2d(
             ]
         )
         err = np.hypot(pred[:, 0] - maps[:, 0], pred[:, 1] - maps[:, 1])
-        inliers = err <= float(residual_m)
+        inliers = err <= search_m
         count = int(inliers.sum())
         if count > best_count:
             best_count = count
@@ -134,7 +138,7 @@ def fit_rigid_2d(
         ]
     )
     err = np.hypot(pred[:, 0] - maps[:, 0], pred[:, 1] - maps[:, 1])
-    inliers = err <= float(residual_m)
+    inliers = err <= accept_m
     if int(inliers.sum()) < int(min_inliers):
         return None
     rmse = float(np.sqrt(np.mean(err[inliers] ** 2))) if inliers.any() else float("inf")
