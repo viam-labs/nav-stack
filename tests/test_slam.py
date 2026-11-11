@@ -1731,6 +1731,67 @@ def test_periodic_relocalize_does_not_fast_confirm_an_along_hall_slide():
     slam.do_command.assert_not_awaited()
 
 
+def test_lost_and_still_runs_the_auto_refine_button():
+    """A lost, stationary cart gets the button's full-turn search and apply."""
+    slam = _relocalize_slam()
+    slam._loc_state.state = "lost"
+    slam._base_is_stopped = MagicMock(return_value=True)
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": -0.1}
+
+    async def _localize(command):
+        assert command.get("apply") is True
+        assert command.get("full_map") is False
+        assert command.get("search_radius_m") == 1.0
+        assert command.get("local_yaw_window_deg") == 360.0
+        assert command.get("min_apply_score") == 0.22
+        assert command.get("max_apply_ray_mae_m") == 1.5
+        assert command.get("refuse_ambiguous") is False
+        return {
+            "status": "localized",
+            "applied": True,
+            "score": 0.31,
+            "ray_mae_m": 1.2,
+            "ambiguous": True,
+            "second_best_score": 0.24,
+            "pose": {"x": -0.6, "y": -1.1, "theta": -2.3},
+        }
+
+    slam._global_localize = AsyncMock(side_effect=_localize)
+
+    result = asyncio.run(slam._periodic_relocalize_cycle())
+
+    assert result["status"] == "corrected"
+    assert result["match_mode"] == "lost_still_refine"
+    assert result["corrected"] is True
+    assert slam._global_localize.await_count == 1
+    assert slam._loc_state.state == "tracking"
+
+
+def test_lost_while_moving_does_not_run_the_full_turn_refine():
+    slam = _relocalize_slam()
+    slam._loc_state.state = "lost"
+    slam._base_is_stopped = MagicMock(return_value=False)
+    slam._engine = MagicMock()
+    slam._engine.diagnostics.return_value = {"last_match_score": -0.1}
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.2,
+            "ray_mae_m": 1.4,
+            "prior_score": -0.4,
+            "pose": {"x": 0.4, "y": 0.0, "theta": 0.2},
+            "ambiguous": True,
+        }
+    )
+
+    asyncio.run(slam._periodic_relocalize_cycle())
+
+    sent = slam._global_localize.await_args.args[0]
+    assert sent.get("local_yaw_window_deg") != 360.0
+    assert sent.get("apply") is False
+
+
 def test_periodic_relocalize_parked_applies_button_style_local_match():
     """A parked hallway slip the button would take is applied without a full-map search."""
     slam = _relocalize_slam(periodic_relocalize_min_shift_m=0.2)

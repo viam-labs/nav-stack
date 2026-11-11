@@ -789,6 +789,57 @@ class LocalizeSupervisor:
         # Full-map only with no published pose. A weak score around a known
         # pose stays local.
         have_pose = current is not None
+        # Lost and sitting still: run the UI auto-refine (1 m, full turn,
+        # weak or ambiguous peak allowed) and apply it. The parked window
+        # stays at ±45° so a tracking pose cannot flip heading on its own.
+        if (
+            have_pose
+            and not driving
+            and apply_override is not True
+            and not stopped_recovery
+            and str(getattr(self.host._loc_state, "state", "") or "") == "lost"
+            and self.host._base_is_stopped()
+        ):
+            button = {
+                "command": "global_localize",
+                "full_map": False,
+                "auto_full_map_fallback": False,
+                "apply": True,
+                "map_source": "live",
+                "search_radius_m": 1.0,
+                "local_yaw_window_deg": 360.0,
+                "min_apply_score": 0.22,
+                "max_apply_ray_mae_m": 1.5,
+                "refuse_ambiguous": False,
+            }
+            match = await self.host._global_localize(button)
+            LOGGER.info(
+                "lost and still: auto-refine %s score=%s ray_mae=%s",
+                "applied"
+                if match.get("applied")
+                else match.get("apply_blocked_reason") or match.get("status"),
+                match.get("score"),
+                match.get("ray_mae_m"),
+            )
+            if match.get("applied"):
+                pose = match.get("pose")
+                shift_m, shift_deg = self.host._pose_shift_from_current(current, pose)
+                return self.host._publish_relocalize_check(
+                    {
+                        "status": "corrected",
+                        "match_mode": "lost_still_refine",
+                        "score": match.get("score"),
+                        "ray_mae_m": match.get("ray_mae_m"),
+                        "shift_m": None if math.isinf(shift_m) else round(shift_m, 3),
+                        "shift_deg": None
+                        if math.isinf(shift_deg)
+                        else round(shift_deg, 2),
+                        "good_match": True,
+                        "corrected": True,
+                        "ambiguous": bool(match.get("ambiguous")),
+                        "second_best_score": match.get("second_best_score"),
+                    }
+                )
         force_full_map = not have_pose
         # Tick scores just above zero (the paused hallway was 0.12) are not
         # "still bad", but they are also not a pose the button would leave

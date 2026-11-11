@@ -1026,7 +1026,8 @@ class SlamConfig:
     # While parked and the published pose does not explain the scan, try the
     # UI auto-refine window. Same 1 m radius and
     # apply floors as ``set_initial_pose`` refine. Yaw stays inside ±45° so
-    # an unattended cycle cannot lock the opposite heading.
+    # a tracking pose cannot lock the opposite heading. Lost and still runs
+    # the button itself: 1 m and a full turn, ambiguous peak allowed.
     periodic_relocalize_parked_radius_m: float = 1.0
     periodic_relocalize_parked_yaw_window_deg: float = 90.0
     periodic_relocalize_parked_min_score: float = 0.22
