@@ -27,6 +27,10 @@ _SEEN_THROUGH = (255, 40, 40, 255)
 # YOLO / open-vocab detector boxes (distinct from landmark green/yellow).
 _DET_OUTLINE = (80, 180, 255, 255)
 _DET_FILL = (80, 180, 255, 28)
+# A box that made no landmark observation this frame (too far, mixed depth…).
+_DET_SKIPPED = (170, 170, 170, 255)
+# Two text lines at the top of the frame.
+_HUD_HEIGHT = 32
 # Writeback match rings (navigation pose correction).
 _WB_PAIRED = (255, 80, 220, 255)  # magenta = unique pair used in fit
 _WB_VISIBLE = (255, 160, 40, 255)  # orange = in writeback pool, not paired
@@ -135,6 +139,7 @@ def render_landmarks_overlay(
     writeback_visible_ids: Optional[Sequence[int]] = None,
     writeback_paired_ids: Optional[Sequence[int]] = None,
     seen_through_ids: Optional[Sequence[int]] = None,
+    detection_notes: Optional[Sequence[Optional[dict]]] = None,
 ) -> bytes:
     """Draw landmark + optional YOLO boxes on ``color_rgb``; return PNG bytes.
 
@@ -145,6 +150,12 @@ def render_landmarks_overlay(
     behind an object still projects inside that object's box, and painting the
     box with its ID made a wrong position look right. A red cross marks a
     landmark the depth audit sees past (``seen_through_ids``).
+
+    ``detection_notes`` (one per detection, from the survey) says what each
+    box became this frame. A box that fed a landmark stays cyan, is labelled
+    ``=DC17`` and gets a line to that landmark's square; a box that fed
+    nothing is grey and labelled with the reason (``far 9.6m``,
+    ``mixed depth``, ``no depth``).
     """
     opts = options or LandmarkOverlayOptions()
     seen_through = {int(x) for x in (seen_through_ids or ())}
@@ -160,6 +171,13 @@ def render_landmarks_overlay(
 
     # Scale YOLO boxes into this frame; drawn first so landmarks sit on top.
     det_boxes: List[Tuple[float, float, float, float, Detection]] = []
+    notes: Sequence[Optional[dict]] = ()
+    if detections and detection_notes is not None:
+        if len(detection_notes) == len(detections):
+            notes = detection_notes
+    # Landmark id → centre of the box that fed it this frame.
+    fed_from: dict = {}
+    boxes_used = 0
     if opts.show_detections and detections:
         sx = sy = 1.0
         if detection_frame_size is not None:
@@ -167,9 +185,10 @@ def render_landmarks_overlay(
             if src_w > 0 and src_h > 0:
                 sx = float(w) / float(src_w)
                 sy = float(h) / float(src_h)
-        for det in detections:
+        for i, det in enumerate(detections):
             if len(det_boxes) >= int(opts.max_detections):
                 break
+            note = notes[i] if notes else None
             x0 = float(det.x0) * sx
             y0 = float(det.y0) * sy
             x1 = float(det.x1) * sx
@@ -181,15 +200,30 @@ def render_landmarks_overlay(
             xa, xb = sorted((x0, x1))
             ya, yb = sorted((y0, y1))
             det_boxes.append((xa, ya, xb, yb, det))
+            used = note is None or note.get("outcome") == "used"
+            box_color = _DET_OUTLINE if used else _DET_SKIPPED
             draw.rectangle(
-                [xa, ya, xb, yb], outline=_DET_OUTLINE, width=2, fill=_DET_FILL
+                [xa, ya, xb, yb],
+                outline=box_color,
+                width=2 if used else 1,
+                fill=_DET_FILL if used else None,
             )
+            label = f"{det.label} {float(det.conf):.2f}"
+            if note is not None:
+                label = f"{det.label} {note.get('text') or ''}".rstrip()
+                if used:
+                    boxes_used += 1
+                    if note.get("landmark_id") is not None:
+                        fed_from[int(note["landmark_id"])] = (
+                            0.5 * (xa + xb),
+                            0.5 * (ya + yb),
+                        )
             if opts.show_labels:
-                draw.text(
-                    (xa + 2, max(0.0, ya - 12)),
-                    f"{det.label} {float(det.conf):.2f}",
-                    fill=_DET_OUTLINE,
-                )
+                # Keep the label on screen: clear of the right edge and, for a
+                # box under the HUD, just inside its top edge instead.
+                lx = max(0.0, min(xa + 2, float(w) - draw.textlength(label) - 2))
+                ly = ya - 12 if ya - 12 >= _HUD_HEIGHT else max(ya, _HUD_HEIGHT) + 2
+                draw.text((lx, ly), label, fill=box_color)
 
     drawn = 0
     flagged = 0
@@ -238,6 +272,9 @@ def render_landmarks_overlay(
         x1, y1 = u + half, v + half
         draw.rectangle([x0, y0, x1, y1], outline=outline, width=2, fill=fill)
         draw.ellipse([u - 2, v - 2, u + 2, v + 2], fill=outline)
+        if lid in fed_from:
+            # Tie the square to the box that was matched to it this frame.
+            draw.line([fed_from[lid], (u, v)], fill=outline, width=1)
         if is_air:
             draw.line([x0, y0, x1, y1], fill=outline, width=2)
             draw.line([x0, y1, x1, y0], fill=outline, width=2)
@@ -270,23 +307,24 @@ def render_landmarks_overlay(
     if yolo_loaded is False:
         yolo_hud = "yolo=OFF"
     else:
-        yolo_hud = f"yolo={det_drawn}"
+        # Boxes that fed a landmark / boxes drawn, once the frame is surveyed.
+        yolo_hud = f"yolo={boxes_used}/{det_drawn}" if notes else f"yolo={det_drawn}"
     hud = (
-        f"lm={drawn}  "
+        f"lm={drawn} "
         f"C={counts.get(LandmarkStatus.CONFIRMED, 0)} "
         f"c={counts.get(LandmarkStatus.CANDIDATE, 0)} "
         f"M={counts.get(LandmarkStatus.MOVED, 0)} "
-        f"air={flagged}  "
-        f"wbV={len(wb_visible)} wbP={len(wb_paired)}  "
-        f"{yolo_hud}  "
+        f"air={flagged} "
+        f"wb={len(wb_visible)}/{len(wb_paired)} "
+        f"{yolo_hud} "
         f"pose=({robot_pose.x:.2f},{robot_pose.y:.2f},{math.degrees(robot_pose.theta):.0f}°)"
     )
     # Two-line HUD: counts + legend (kept short enough for a 424 px frame).
-    draw.rectangle([0, 0, w, 32], fill=(0, 0, 0, 150))
+    draw.rectangle([0, 0, w, _HUD_HEIGHT], fill=(0, 0, 0, 150))
     draw.text((4, 2), hud, fill=(230, 230, 230, 255))
     draw.text(
         (4, 16),
-        "cyan=YOLO  red X=camera sees past it  V/P=writeback",
+        "cyan=used box  grey=skipped  red X=seen past  wb=V/P  yolo=used/all",
         fill=(180, 200, 220, 255),
     )
 

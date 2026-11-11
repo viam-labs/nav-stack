@@ -506,7 +506,7 @@ class EmbeddingLandmarkMap:
         mount_pitch: float = 0.0,
         mount_roll: float = 0.0,
         remove: bool = False,
-        max_range_m: float = 4.5,
+        max_range_m: float = 6.5,
         window_m: float = 0.10,
     ) -> dict:
         """Compare each in-view landmark's stored depth with the depth image.

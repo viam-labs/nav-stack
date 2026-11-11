@@ -238,12 +238,20 @@ class VisionCamera(Camera):
         worker_stats = getattr(getattr(vision, "_worker", None), "stats", None)
         if isinstance(worker_stats, dict):
             yolo_loaded = bool(worker_stats.get("yolo_loaded"))
+        det_notes = None
         if self._opts.show_detections and hasattr(vision, "last_detections"):
             try:
-                detections, det_size = vision.last_detections(camera_name=cfg.source)
+                if hasattr(vision, "last_detections_with_outcomes"):
+                    detections, det_size, det_notes = (
+                        vision.last_detections_with_outcomes()
+                    )
+                else:
+                    detections, det_size = vision.last_detections(
+                        camera_name=cfg.source
+                    )
             except Exception as exc:  # noqa: BLE001
                 self._last_error = f"detections: {exc}"
-                detections, det_size = [], None
+                detections, det_size, det_notes = [], None, None
         wb_vis: list = []
         wb_pair: list = []
         if hasattr(vision, "writeback_match_overlay"):
@@ -278,6 +286,7 @@ class VisionCamera(Camera):
             writeback_visible_ids=wb_vis,
             writeback_paired_ids=wb_pair,
             seen_through_ids=seen_through,
+            detection_notes=det_notes,
         )
         self._last_error = None
         self._last_drawn = min(len(landmarks), int(self._opts.max_landmarks))

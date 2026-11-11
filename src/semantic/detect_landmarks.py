@@ -116,6 +116,33 @@ SKIP_SPARSE_DEPTH = "skipped_sparse_depth"
 SKIP_MIXED_DEPTH = "skipped_mixed_depth"
 SKIP_RANGE = "skipped_range"
 SKIP_HEIGHT = "skipped_height"
+# Other per-box outcomes (``outcomes`` list of observations_from_detections).
+BOX_USED = "used"
+BOX_NOT_LANDMARK_LABEL = "not_landmark_label"
+BOX_NO_PATCHES = "no_patches"
+
+# A box is located from hundreds of depth pixels, so it stays usable further
+# out than a single patch (4 m): on camera-top a poster 5.6 m away repeated
+# within one depth step (9 cm) over six frames. Past 6 m a step is 10 cm or
+# more and far walls start to read as noise.
+BOX_MIN_RANGE_M = 0.4
+BOX_MAX_RANGE_M = 6.0
+
+
+def describe_box_outcome(outcome: str, depth_m: Optional[float] = None) -> str:
+    """Short text for landmark-camera: why a box did or did not count."""
+    if outcome == SKIP_RANGE and depth_m is not None:
+        side = "far" if float(depth_m) > BOX_MAX_RANGE_M else "near"
+        return f"{side} {float(depth_m):.1f}m"
+    return {
+        BOX_USED: "used",
+        SKIP_RANGE: "out of range",
+        SKIP_MIXED_DEPTH: "mixed depth",
+        SKIP_SPARSE_DEPTH: "no depth",
+        SKIP_HEIGHT: "height",
+        BOX_NOT_LANDMARK_LABEL: "not a landmark class",
+        BOX_NO_PATCHES: "too small",
+    }.get(str(outcome), str(outcome))
 
 
 def _cluster_width_m(depth_m: np.ndarray) -> np.ndarray:
@@ -138,8 +165,8 @@ def box_surface_point(
     min_valid_frac: float = 0.30,
     min_valid_px: int = 12,
     min_support: float = 0.60,
-    min_range_m: float = 0.4,
-    max_range_m: float = 4.0,
+    min_range_m: float = BOX_MIN_RANGE_M,
+    max_range_m: float = BOX_MAX_RANGE_M,
     z_min_m: Optional[float] = None,
     z_max_m: Optional[float] = None,
 ) -> Tuple[Optional[BoxSurface], Optional[str]]:
@@ -151,6 +178,45 @@ def box_surface_point(
     ``None``: a median across them is a point on neither.
 
     Returns ``(surface, None)`` or ``(None, skip_reason)``.
+    """
+    surface, why, _depth = _locate_box(
+        frame,
+        x0,
+        y0,
+        x1,
+        y1,
+        core_frac=core_frac,
+        min_valid_frac=min_valid_frac,
+        min_valid_px=min_valid_px,
+        min_support=min_support,
+        min_range_m=min_range_m,
+        max_range_m=max_range_m,
+        z_min_m=z_min_m,
+        z_max_m=z_max_m,
+    )
+    return surface, why
+
+
+def _locate_box(
+    frame: VisionFrame,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    *,
+    core_frac: float = 0.6,
+    min_valid_frac: float = 0.30,
+    min_valid_px: int = 12,
+    min_support: float = 0.60,
+    min_range_m: float = BOX_MIN_RANGE_M,
+    max_range_m: float = BOX_MAX_RANGE_M,
+    z_min_m: Optional[float] = None,
+    z_max_m: Optional[float] = None,
+) -> Tuple[Optional[BoxSurface], Optional[str], Optional[float]]:
+    """:func:`box_surface_point` plus the surface depth when one was found.
+
+    The depth is reported even for a surface rejected for range or height,
+    so the caller can say how far away the skipped object is.
     """
     depth = np.asarray(frame.depth_m, dtype=float)
     h, w = depth.shape[:2]
@@ -165,11 +231,11 @@ def box_surface_point(
     v0, v1 = max(0, v0), min(h, max(v1, v0 + 1))
     core = depth[v0:v1, u0:u1]
     if core.size == 0:
-        return None, SKIP_SPARSE_DEPTH
+        return None, SKIP_SPARSE_DEPTH, None
     valid = np.isfinite(core) & (core > 0.0)
     n_valid = int(valid.sum())
     if n_valid < int(min_valid_px) or n_valid / float(core.size) < float(min_valid_frac):
-        return None, SKIP_SPARSE_DEPTH
+        return None, SKIP_SPARSE_DEPTH, None
 
     vs_idx, us_idx = np.nonzero(valid)
     vals = core[valid]
@@ -185,22 +251,27 @@ def box_surface_point(
     end = int(ends[start])
     support = float(end - start) / float(n_valid)
     if support < float(min_support):
-        return None, SKIP_MIXED_DEPTH
+        # Far walls read as noise with no dominant depth; call that range,
+        # not a mix of surfaces.
+        overall = float(np.median(vals))
+        if overall > float(max_range_m):
+            return None, SKIP_RANGE, overall
+        return None, SKIP_MIXED_DEPTH, None
 
     members = order[start:end]
     cluster_depths = vals[members]
     depth_med = float(np.median(cluster_depths))
     if depth_med < float(min_range_m) or depth_med > float(max_range_m):
-        return None, SKIP_RANGE
+        return None, SKIP_RANGE, depth_med
     us = us_idx[members].astype(float) + float(u0)
     vs = vs_idx[members].astype(float) + float(v0)
     points = backproject_pixels(frame, us, vs, cluster_depths)
     point = np.median(points, axis=0)
     z = float(point[2])
     if z_min_m is not None and z < float(z_min_m):
-        return None, SKIP_HEIGHT
+        return None, SKIP_HEIGHT, depth_med
     if z_max_m is not None and z > float(z_max_m):
-        return None, SKIP_HEIGHT
+        return None, SKIP_HEIGHT, depth_med
 
     normal_optical = _surface_normal_optical(frame, us, vs, cluster_depths)
     sigma = float(
@@ -218,6 +289,7 @@ def box_surface_point(
             support=support,
         ),
         None,
+        depth_med,
     )
 
 
@@ -264,6 +336,7 @@ def observations_from_detections(
     min_patches: int = 1,
     shrink: float = 0.05,
     stats: Optional[Dict[str, int]] = None,
+    outcomes: Optional[List[dict]] = None,
 ) -> List[PatchObservation]:
     """One observation per allowed detection: mean DINO + the box's surface.
 
@@ -271,14 +344,30 @@ def observations_from_detections(
     (depth-invalid tokens still contribute appearance). Geometry comes from
     :func:`box_surface_point`; a box with no single clear surface yields no
     observation. ``stats`` (optional) is filled with per-reason skip counts.
+
+    ``outcomes`` (optional) receives one dict per detection, in order:
+    ``label``, ``outcome`` (``used`` or why not), ``depth_m`` when a surface
+    was found, and ``obs_index`` into the returned list when used.
     """
     allowed = {str(x).strip().lower() for x in landmark_labels if str(x).strip()}
     if not allowed or not detections or not patches:
         return []
 
+    def note(det: Detection, outcome: str, depth_m=None, obs_index=None) -> None:
+        if outcomes is not None:
+            outcomes.append(
+                {
+                    "label": str(det.label),
+                    "outcome": outcome,
+                    "depth_m": None if depth_m is None else float(depth_m),
+                    "obs_index": obs_index,
+                }
+            )
+
     out: List[PatchObservation] = []
     for det in detections:
         if not label_allowed(det.label, allowed):
+            note(det, BOX_NOT_LANDMARK_LABEL)
             continue
         x0, x1 = sorted((float(det.x0), float(det.x1)))
         y0, y1 = sorted((float(det.y0), float(det.y1)))
@@ -300,15 +389,18 @@ def observations_from_detections(
                 if x0 <= float(t.u) <= x1 and y0 <= float(t.v) <= y1
             ]
         if len(in_tokens) < int(min_patches):
+            note(det, BOX_NO_PATCHES)
             continue
         desc = pool_descriptor([t.descriptor for t in in_tokens])
-        surface, skip_reason = box_surface_point(
+        surface, skip_reason, depth_m = _locate_box(
             frame, x0, y0, x1, y1, z_min_m=z_min_m, z_max_m=z_max_m
         )
         if surface is None:
             if stats is not None and skip_reason:
                 stats[skip_reason] = int(stats.get(skip_reason, 0)) + 1
+            note(det, str(skip_reason), depth_m)
             continue
+        note(det, BOX_USED, depth_m, obs_index=len(out))
         point = surface.point_base
         normal = surface.normal_base
         sigma = float(surface.sigma_m)

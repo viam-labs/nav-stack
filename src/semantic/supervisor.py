@@ -20,8 +20,11 @@ from .frames import (
     intrinsics_from_size,
     vision_frame_from_arrays,
 )
-from .detect_landmarks import observations_from_detections
-from .landmarks import AUDIT_SEEN_THROUGH, EmbeddingLandmarkMap
+from .detect_landmarks import (
+    describe_box_outcome,
+    observations_from_detections,
+)
+from .landmarks import AUDIT_SEEN_THROUGH, EmbeddingLandmarkMap, display_label
 from .localize import (
     diagnose_landmark_match,
     estimate_landmark_fix,
@@ -135,6 +138,10 @@ class VisionSupervisor:
         # Detector boxes turned into observations vs skipped, by reason.
         self._box_depth_counts: Dict[str, int] = {}
         self._last_box_depth: Dict[str, int] = {}
+        self._box_label_counts: Dict[str, Dict[str, int]] = {}
+        # What became of each box in the last surveyed frame (for the overlay
+        # and landmark_audit): ``{"result": VisionResult, "boxes": [...]}``.
+        self._last_boxes: Optional[dict] = None
         # Depth audit of stored landmarks against each survey frame.
         self._audit_frames = 0
         self._audit_pose_suspect_frames = 0
@@ -245,6 +252,11 @@ class VisionSupervisor:
                     "summary": dict(last["summary"]),
                     "rows": list(last["rows"]),
                     "rows_truncated": bool(last["truncated"]),
+                    # Every detector box in the last frame and what it became.
+                    "boxes": [
+                        {k: v for k, v in box.items() if k != "landmark_id"}
+                        for box in (self._last_boxes or {}).get("boxes", [])
+                    ],
                 }
             )
             return out
@@ -261,18 +273,38 @@ class VisionSupervisor:
         detector last produced (or nothing) regardless of source aliasing.
         """
         del camera_name  # overlay always wants the latest survey detections
+        detections, size, _boxes = self.last_detections_with_outcomes()
+        return detections, size
+
+    def last_detections_with_outcomes(
+        self,
+    ) -> Tuple[List[Detection], Optional[Tuple[int, int]], Optional[List[dict]]]:
+        """:meth:`last_detections` plus what each box became, read together.
+
+        The third value has one dict per detection (``outcome``, ``text``,
+        ``depth_m``, ``landmark_id``, ``landmark``), or ``None`` when the
+        latest detections have not been surveyed (yet).
+        """
         with self._lock:
             last = self._last_result
             geom = self._last_camera_geom
+            noted = self._last_boxes
         if last is None or not last.detections:
-            return [], None
+            return [], None, None
         size = None
         if isinstance(geom, dict):
             gw = int(geom.get("width") or 0)
             gh = int(geom.get("height") or 0)
             if gw > 0 and gh > 0:
                 size = (gw, gh)
-        return list(last.detections), size
+        boxes = None
+        if (
+            noted is not None
+            and noted["result"] is last
+            and len(noted["boxes"]) == len(last.detections)
+        ):
+            boxes = [dict(box) for box in noted["boxes"]]
+        return list(last.detections), size, boxes
 
     def load_from_map_dir(self, map_dir) -> bool:
         loaded = load_landmarks(map_dir)
@@ -340,6 +372,8 @@ class VisionSupervisor:
             self._observations = 0
             self._box_depth_counts = {}
             self._last_box_depth = {}
+            self._box_label_counts = {}
+            self._last_boxes = None
             self._audit_frames = 0
             self._audit_pose_suspect_frames = 0
             self._last_audit = None
@@ -376,6 +410,8 @@ class VisionSupervisor:
             self._last_error = None
             self._box_depth_counts = {}
             self._last_box_depth = {}
+            self._box_label_counts = {}
+            self._last_boxes = None
             self._audit_frames = 0
             self._audit_pose_suspect_frames = 0
             self._last_audit = None
@@ -482,6 +518,10 @@ class VisionSupervisor:
                 "box_depth": {
                     **{k: int(v) for k, v in self._box_depth_counts.items()},
                     "last": dict(self._last_box_depth),
+                    "by_label": {
+                        label: dict(counts)
+                        for label, counts in sorted(self._box_label_counts.items())
+                    },
                 },
                 "depth_audit": {
                     "removes": self._audit_removes(),
@@ -1020,6 +1060,7 @@ class VisionSupervisor:
         prefer = bool(self._cfg.vision_prefer_detections)
         det_obs: List[PatchObservation] = []
         box_stats: Dict[str, int] = {}
+        outcomes: List[dict] = []
         if prefer and result.detections and result.patches:
             det_obs = observations_from_detections(
                 frame,
@@ -1030,14 +1071,40 @@ class VisionSupervisor:
                 z_max_m=z_max,
                 min_patches=1,
                 stats=box_stats,
+                outcomes=outcomes,
             )
         box_stats["used"] = len(det_obs)
+        # One note per detection, in order (empty when boxes were not used).
+        boxes: List[dict] = []
+        if len(outcomes) == len(result.detections or []):
+            for det, note in zip(result.detections, outcomes):
+                boxes.append(
+                    {
+                        "label": str(det.label),
+                        "conf": round(float(det.conf), 2),
+                        "outcome": str(note["outcome"]),
+                        "text": describe_box_outcome(
+                            note["outcome"], note["depth_m"]
+                        ),
+                        "depth_m": (
+                            None
+                            if note["depth_m"] is None
+                            else round(float(note["depth_m"]), 2)
+                        ),
+                        "landmark_id": None,
+                        "landmark": None,
+                    }
+                )
         with self._lock:
             self._last_box_depth = dict(box_stats)
             for key, n in box_stats.items():
                 self._box_depth_counts[key] = (
                     int(self._box_depth_counts.get(key, 0)) + int(n)
                 )
+            for box in boxes:
+                per_label = self._box_label_counts.setdefault(box["label"], {})
+                per_label[box["outcome"]] = int(per_label.get(box["outcome"], 0)) + 1
+            self._last_boxes = {"result": result, "boxes": boxes}
         self._last_detection_obs = len(det_obs)
         self._last_detection_boxes = len(result.detections or [])
 
@@ -1083,6 +1150,12 @@ class VisionSupervisor:
 
         n_det = len(det_obs)
         n_new = 0
+        # Detector observation index → the box it came from.
+        box_of_obs = {
+            int(note["obs_index"]): box
+            for box, note in zip(boxes, outcomes)
+            if note.get("obs_index") is not None
+        }
         with self._lock:
             for i, o in enumerate(obs):
                 # Map-frame point from capture pose.
@@ -1104,7 +1177,7 @@ class VisionSupervisor:
                     ],
                     dtype=float,
                 )
-                self._landmarks.observe_with_poses(
+                lm = self._landmarks.observe_with_poses(
                     map_xyz=map_xyz,
                     descriptor=o.token.descriptor,
                     normal_map=n_map,
@@ -1115,11 +1188,22 @@ class VisionSupervisor:
                     from_detector=i < n_det,
                     extent_m=getattr(o, "extent_m", None),
                 )
+                if i < n_det and i in box_of_obs:
+                    box_of_obs[i]["landmark_id"] = int(lm.landmark_id)
                 n_new += 1
             # Collapse detector twins that both made it to confirmed/candidate
             # on the same object (e.g. DC1 + DC12 stacked on one painting).
             self._landmarks.merge_overlapping_detector_landmarks()
             self._observations += n_new
+            # Name each used box after the landmark it fed. One folded into a
+            # twin just now no longer exists; the box then stays unnamed.
+            for box in box_of_obs.values():
+                lm = self._landmarks.get(box["landmark_id"])
+                if lm is None:
+                    box["landmark_id"] = None
+                    continue
+                box["landmark"] = display_label(lm)
+                box["text"] = f"={box['landmark']}"
 
         if self._writeback_enabled() and writeback_obs:
             self._try_pose_writeback(frame, writeback_obs, pose, pose_of_node)

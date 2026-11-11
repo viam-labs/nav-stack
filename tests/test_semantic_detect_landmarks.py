@@ -8,10 +8,15 @@ import numpy as np
 import pytest
 
 from src.semantic.detect_landmarks import (
+    BOX_MAX_RANGE_M,
+    BOX_NOT_LANDMARK_LABEL,
+    BOX_USED,
+    SKIP_HEIGHT,
     SKIP_MIXED_DEPTH,
     SKIP_RANGE,
     SKIP_SPARSE_DEPTH,
     box_surface_point,
+    describe_box_outcome,
     observations_from_detections,
     pool_descriptor,
 )
@@ -210,10 +215,82 @@ def test_box_surface_skips_sparse_depth():
 
 
 def test_box_surface_rejects_out_of_range():
-    frame = _frame_with_wall(depth_m=5.5)
+    frame = _frame_with_wall(depth_m=7.0)
     surface, why = _box(frame, 100, 60, 220, 180)
     assert surface is None
     assert why == SKIP_RANGE
+
+
+def test_box_surface_accepts_a_clean_surface_out_to_six_metres():
+    """A box averages hundreds of pixels, so it reaches past the 4 m patch limit."""
+    frame = _frame_with_wall(depth_m=5.5)
+    surface, why = _box(frame, 100, 60, 220, 180)
+    assert why is None and surface is not None
+    assert surface.depth_m == pytest.approx(5.5, abs=0.02)
+    assert BOX_MAX_RANGE_M == pytest.approx(6.0)
+
+
+def test_far_noisy_box_is_called_range_not_mixed_depth():
+    """Beyond range the depth scatters; say "too far", not "two surfaces"."""
+    frame = _frame_with_wall(depth_m=3.0)
+    rng = np.random.default_rng(3)
+    frame.depth_m[60:180, 100:220] = rng.uniform(7.0, 14.0, size=(120, 120))
+    det = Detection(label="painting", conf=0.9, x0=100.0, y0=60.0, x1=220.0, y1=180.0)
+    stats: dict = {}
+    outcomes: list = []
+    obs = observations_from_detections(
+        frame,
+        _grid_tokens(frame),
+        [det],
+        landmark_labels=["painting"],
+        stats=stats,
+        outcomes=outcomes,
+    )
+    assert obs == []
+    assert stats == {SKIP_RANGE: 1}
+    assert outcomes[0]["outcome"] == SKIP_RANGE
+    assert 7.0 < outcomes[0]["depth_m"] < 14.0
+    assert describe_box_outcome(SKIP_RANGE, outcomes[0]["depth_m"]).startswith("far ")
+
+
+def test_describe_box_outcome_texts():
+    assert describe_box_outcome(SKIP_RANGE, 9.62) == "far 9.6m"
+    assert describe_box_outcome(SKIP_RANGE, 0.31) == "near 0.3m"
+    assert describe_box_outcome(SKIP_RANGE) == "out of range"
+    assert describe_box_outcome(SKIP_MIXED_DEPTH) == "mixed depth"
+    assert describe_box_outcome(SKIP_SPARSE_DEPTH) == "no depth"
+    assert describe_box_outcome(SKIP_HEIGHT, 2.0) == "height"
+    assert describe_box_outcome(BOX_NOT_LANDMARK_LABEL) == "not a landmark class"
+    assert describe_box_outcome(BOX_USED, 2.0) == "used"
+
+
+def test_outcomes_has_one_entry_per_detection_in_order():
+    frame = _frame_with_wall(depth_m=3.0)
+    # Left box: half near, half far. Right box: clean wall.
+    frame.depth_m[40:120, 20:50] = 1.6
+    dets = [
+        Detection(label="person", conf=0.9, x0=100.0, y0=60.0, x1=220.0, y1=180.0),
+        Detection(label="painting", conf=0.9, x0=20.0, y0=40.0, x1=80.0, y1=120.0),
+        Detection(label="painting", conf=0.9, x0=230.0, y0=60.0, x1=310.0, y1=180.0),
+    ]
+    outcomes: list = []
+    obs = observations_from_detections(
+        frame,
+        _grid_tokens(frame),
+        dets,
+        landmark_labels=["painting"],
+        outcomes=outcomes,
+    )
+    assert [o["outcome"] for o in outcomes] == [
+        BOX_NOT_LANDMARK_LABEL,
+        SKIP_MIXED_DEPTH,
+        BOX_USED,
+    ]
+    assert [o["label"] for o in outcomes] == ["person", "painting", "painting"]
+    assert len(obs) == 1
+    assert outcomes[2]["obs_index"] == 0
+    assert outcomes[2]["depth_m"] == pytest.approx(3.0, abs=0.02)
+    assert outcomes[0]["obs_index"] is None and outcomes[1]["obs_index"] is None
 
 
 def test_box_surface_keeps_an_oblique_plane_together():
@@ -249,8 +326,14 @@ def test_mixed_box_makes_no_observation_and_is_counted():
 _REAL_DEPTH = Path(__file__).parent / "data" / "camera_top_depth_424x240.npz"
 
 
-def real_camera_top_frame() -> VisionFrame:
-    depth = np.load(_REAL_DEPTH)["depth_mm"].astype(np.float32) / 1000.0
+# A second frame looking down the long side of the office: a poster on a
+# pillar 5.5 m away, a framed picture on the far wall ~9.5 m away, and an
+# armchair under a desk in the foreground.
+_REAL_DEPTH_FAR = Path(__file__).parent / "data" / "camera_top_depth_far_wall_424x240.npz"
+
+
+def real_camera_top_frame(path: Path = _REAL_DEPTH) -> VisionFrame:
+    depth = np.load(path)["depth_mm"].astype(np.float32) / 1000.0
     h, w = depth.shape
     return VisionFrame(
         camera_name="camera-top",
@@ -281,3 +364,35 @@ def test_real_frame_table_box_is_skipped_not_put_on_the_wall_behind():
     surface, why = _box(frame, 150, 60, 280, 200)
     assert surface is None
     assert why == SKIP_MIXED_DEPTH
+
+
+def test_real_frame_poster_at_five_and_a_half_metres_is_used():
+    """This poster was detected every frame but skipped by the old 4 m limit."""
+    frame = real_camera_top_frame(_REAL_DEPTH_FAR)
+    for box in ((236, 66, 277, 108), (230, 60, 283, 114)):
+        surface, why = _box(frame, *box)
+        assert why is None and surface is not None
+        assert surface.depth_m == pytest.approx(5.5, abs=0.1)
+        assert surface.support > 0.9
+        assert 1.3 < surface.point_base[2] < 1.6
+
+
+def test_real_frame_picture_on_the_far_wall_is_out_of_range():
+    frame = real_camera_top_frame(_REAL_DEPTH_FAR)
+    det = Detection(label="picture frame", conf=0.3, x0=97, y0=82, x1=121, y1=112)
+    tok = PatchToken(
+        row=0, col=0, u=109.0, v=97.0, descriptor=np.array([1.0, 0.0], dtype=np.float32)
+    )
+    outcomes: list = []
+    obs = observations_from_detections(
+        frame,
+        [tok],
+        [det],
+        landmark_labels=["picture"],
+        z_min_m=0.25,
+        z_max_m=2.0,
+        outcomes=outcomes,
+    )
+    assert obs == []
+    assert outcomes[0]["outcome"] == SKIP_RANGE
+    assert outcomes[0]["depth_m"] > 8.0

@@ -97,6 +97,76 @@ def test_render_draws_detector_landmark_at_its_own_point_not_the_yolo_box():
     assert not green[36:204, 56:264].any()
 
 
+def test_render_shows_which_boxes_were_used_and_which_were_skipped():
+    """Used box: cyan, tied to its landmark. Skipped box: grey, no fill."""
+    from src.semantic.types import Detection
+
+    color = np.zeros((240, 320, 3), dtype=np.uint8)
+    color[:] = (20, 20, 28)
+    K = CameraIntrinsics(fx=160, fy=160, cx=160, cy=120, width=320, height=240)
+    # Projects to the image center (160, 120); half-size ~10 px at 2 m.
+    lm = _detector_landmark(3, [2.0, 0.0, 0.5])
+    used = Detection(label="painting", conf=0.5, x0=20, y0=60, x1=100, y1=180)
+    skipped = Detection(label="poster", conf=0.3, x0=220, y0=60, x1=300, y1=180)
+    notes = [
+        {"outcome": "used", "text": "=DC3", "landmark_id": 3, "landmark": "DC3"},
+        {"outcome": "skipped_range", "text": "far 9.6m", "landmark_id": None},
+    ]
+
+    def render(detection_notes):
+        png = render_landmarks_overlay(
+            color,
+            [(lm, lm.map_xyz)],
+            robot_pose=Pose2D(0.0, 0.0, 0.0),
+            intrinsics=K,
+            mount_z=0.5,
+            detections=[used, skipped],
+            detection_frame_size=(320, 240),
+            yolo_loaded=True,
+            detection_notes=detection_notes,
+        )
+        arr = np.asarray(Image.open(io.BytesIO(png))).astype(int)
+        r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+        cyan = (b > 220) & (g > 150) & (r < 120)
+        grey = (abs(r - 170) < 12) & (abs(g - 170) < 12) & (abs(b - 170) < 12)
+        green = (g > 150) & (r < 120) & (b < 150)
+        return cyan, grey, green
+
+    cyan, grey, green = render(notes)
+    # Left edges of the two rectangles.
+    assert cyan[60:181, 19:23].any() and not grey[60:181, 19:23].any()
+    assert grey[60:181, 219:223].any() and not cyan[60:181, 219:223].any()
+    # The skipped box is not filled.
+    assert tuple(
+        np.asarray(
+            Image.open(
+                io.BytesIO(
+                    render_landmarks_overlay(
+                        color,
+                        [],
+                        robot_pose=Pose2D(0.0, 0.0, 0.0),
+                        intrinsics=K,
+                        detections=[used, skipped],
+                        detection_frame_size=(320, 240),
+                        detection_notes=notes,
+                    )
+                )
+            )
+        )[120, 260, :3]
+    ) == (20, 20, 28)
+    # A line runs from the used box's centre (60, 120) to the landmark square.
+    assert green[119:122, 105:145].sum() >= 40
+
+    # Without notes (detections not surveyed yet) every box is plain cyan and
+    # nothing is tied to a landmark.
+    cyan, grey, green = render(None)
+    assert cyan[60:181, 219:223].any() and not grey[60:181, 219:223].any()
+    assert not green[119:122, 105:145].any()
+    # Notes that do not line up with the detections are ignored, not misapplied.
+    cyan, grey, _green = render(notes[:1])
+    assert cyan[60:181, 219:223].any() and not grey.any()
+
+
 def test_render_marks_seen_through_landmark_red():
     color = np.zeros((240, 320, 3), dtype=np.uint8)
     color[:] = (20, 20, 28)

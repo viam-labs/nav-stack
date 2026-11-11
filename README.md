@@ -692,7 +692,8 @@ is inside them.
 `clear_map`, `clear_landmarks` (alias `reset_landmarks`; drop every vision
 landmark and the saved `embedding_landmarks.npz`, keeping the occupancy map
 and place index), `landmark_audit` (alias `audit_landmarks`; stored vs
-measured depth for each landmark in the last vision frame — see
+measured depth for each landmark in the last vision frame, and what each
+detector box in that frame became — see
 `src/semantic/models/README.md`), `clear_obstacles` (alias `erase_obstacles`; paint free space in a
 disk — builtin SLAM; args `x`/`y` or `pose`, `radius_m`, optional `save`),
 `clear_region` (alias `erase_region`; blank an axis-aligned box and drop

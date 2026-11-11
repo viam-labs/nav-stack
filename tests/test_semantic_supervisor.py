@@ -223,6 +223,104 @@ def test_survey_prefers_detector_boxes():
     assert vision.status()["prefer_detections"] is True
 
 
+def _surveyed_boxes(vision: VisionSupervisor):
+    """Survey one frame with a usable box, a far box and a non-landmark box."""
+    from src.semantic.types import Detection, VisionResult
+
+    frame = _frame()
+    # Right third of the wall is far beyond box range and noisy.
+    rng = np.random.default_rng(5)
+    frame.depth_m[:, 85:] = rng.uniform(7.5, 12.0, size=(120, 75))
+    base = vision._worker.process(frame)  # noqa: SLF001
+    dets = [
+        Detection(label="person", conf=0.9, x0=40.0, y0=10.0, x1=120.0, y1=110.0),
+        Detection(label="painting", conf=0.8, x0=10.0, y0=20.0, x1=70.0, y1=100.0),
+        Detection(label="painting", conf=0.4, x0=95.0, y0=20.0, x1=155.0, y1=100.0),
+    ]
+    result = VisionResult(
+        camera_name=base.camera_name,
+        stamp=base.stamp,
+        captured_at=base.captured_at,
+        patches=base.patches,
+        detections=dets,
+        place_descriptor=base.place_descriptor,
+        infer_ms=base.infer_ms,
+        provider=base.provider,
+    )
+    with vision._lock:  # noqa: SLF001
+        vision._last_result = result  # noqa: SLF001
+        vision._last_camera_geom = {"width": 160, "height": 120}  # noqa: SLF001
+    vision._survey(frame, result)  # noqa: SLF001
+    return result
+
+
+def test_survey_records_what_each_box_became():
+    """The overlay and ``landmark_audit`` must be able to explain every box."""
+    from viam.utils import dict_to_struct
+
+    cfg = _cfg(
+        vision_prefer_detections=True,
+        vision_dense_fallback_patches=0,
+        vision_landmark_labels=["painting"],
+    )
+    vision = _vision(cfg, Pose2D(0.0, 0.0, 0.0))
+    result = _surveyed_boxes(vision)
+
+    detections, size, boxes = vision.last_detections_with_outcomes()
+    assert detections == result.detections and size == (160, 120)
+    assert [b["outcome"] for b in boxes] == [
+        "not_landmark_label",
+        "used",
+        "skipped_range",
+    ]
+    person, used, far = boxes
+    assert person["text"] == "not a landmark class" and person["landmark"] is None
+    lm = vision.landmarks.get(used["landmark_id"])
+    assert lm is not None and lm.from_detector is True
+    assert used["landmark"] == f"Dc{lm.landmark_id}"
+    assert used["text"] == f"=Dc{lm.landmark_id}"
+    assert abs(used["depth_m"] - 1.5) < 0.05
+    assert far["text"].startswith("far ") and far["depth_m"] > 7.0
+    assert far["landmark_id"] is None
+    # The old two-value call still works for callers that only want boxes.
+    assert vision.last_detections() == (detections, size)
+
+    report = vision.landmark_audit()
+    assert [b["label"] for b in report["boxes"]] == ["person", "painting", "painting"]
+    assert [b["text"] for b in report["boxes"]] == [b["text"] for b in boxes]
+    assert all("landmark_id" not in b for b in report["boxes"])
+    dict_to_struct(report)
+
+    box_depth = vision.status()["box_depth"]
+    assert box_depth["by_label"] == {
+        "painting": {"used": 1, "skipped_range": 1},
+        "person": {"not_landmark_label": 1},
+    }
+    assert box_depth["used"] == 1 and box_depth["skipped_range"] == 1
+    dict_to_struct(vision.status())
+
+
+def test_box_outcomes_are_not_reported_for_unsurveyed_detections():
+    """Newer detections than the last survey must not borrow its notes."""
+    import dataclasses
+
+    cfg = _cfg(
+        vision_prefer_detections=True,
+        vision_dense_fallback_patches=0,
+        vision_landmark_labels=["painting"],
+    )
+    vision = _vision(cfg, Pose2D(0.0, 0.0, 0.0))
+    result = _surveyed_boxes(vision)
+    newer = dataclasses.replace(result, detections=list(result.detections))
+    with vision._lock:  # noqa: SLF001
+        vision._last_result = newer  # noqa: SLF001
+    detections, _size, boxes = vision.last_detections_with_outcomes()
+    assert len(detections) == 3 and boxes is None
+
+    vision.clear_landmarks()
+    assert vision.status()["box_depth"]["by_label"] == {}
+
+
 # --- Depth audit, capture pose, clear_landmarks ---
 
 

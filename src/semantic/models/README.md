@@ -78,15 +78,30 @@ boxes (green=confirmed, yellow=candidate):
 
 ``source`` should be the same RealSense as ``vision_cameras``. Open it in the
 Viam camera stream view. Overlay colors: **green** confirmed, **yellow**
-candidate, **cyan** latest YOLO-World boxes (label + confidence).
+candidate, **cyan** / **grey** latest YOLO-World boxes (see below).
 **Orange ring + V** = in the latest writeback match pool (image-visible
 confirmed); **magenta ring + P** = unique pair used for the pose fit.
-HUD ``wbV`` / ``wbP`` are those counts. Plain greens without a ring are
+HUD ``wb=V/P`` are those counts. Plain greens without a ring are
 on the map overlay but not in the last navigation match (e.g. candidate,
 out of range, or not paired). HUD ``yolo=OFF`` means the detector ONNX
-is not loaded; ``yolo=N`` is the latest box count. Set
-``show_detections: false`` to hide the detector layer. Check
-``vision_status.yolo_loaded`` / ``yolo_onnx`` if cyan boxes never appear.
+is not loaded; ``yolo=3/10`` means 3 of the 10 latest boxes fed a landmark.
+Set ``show_detections: false`` to hide the detector layer. Check
+``vision_status.yolo_loaded`` / ``yolo_onnx`` if boxes never appear.
+
+Each YOLO box says what became of it in the last surveyed frame:
+
+- **cyan**, labelled with a landmark (``poster =DC23``): the box was located
+  and matched to (or created) that landmark. A thin line joins the box centre
+  to the landmark's square, so a box that fed a landmark stored somewhere
+  else is visible as a long line.
+- **grey**, thin, labelled with a reason: the box made no observation.
+  ``far 9.6m`` / ``near 0.3m`` = outside the 0.4–6.0 m box range,
+  ``mixed depth`` = no single surface, ``no depth`` = too little valid depth,
+  ``height`` = outside the z gate, ``not a landmark class`` = label not in
+  ``vision_landmark_labels``.
+
+A plain cyan box with a confidence (``poster 0.27``) has not been surveyed
+yet.
 
 Every landmark is drawn as a small square at the projection of its own
 stored point, labelled with its ID and stored depth (``DC124 3.7m``). It is
@@ -125,7 +140,13 @@ and changes nothing.
 rows (`id`, `label`, `status`, `u`, `v`, `stored_depth_m`, `measured_depth_m`,
 `verdict`, `strikes`, `removed`; worst first, at most 200), a `summary` of
 verdict counts, `flagged_ids`, `removed_total` and `recent_removed`.
-`vision_status.depth_audit` carries the counts.
+`vision_status.depth_audit` carries the counts. Landmarks stored up to 6.5 m
+from the camera are audited.
+
+The reply also lists every detector box of that frame under `boxes`
+(`label`, `conf`, `outcome`, `text`, `depth_m`, `landmark`): the same
+information the overlay draws, so "YOLO sees it but there is no landmark"
+can be answered without the image.
 
 `{"command": "clear_landmarks"}` drops every landmark and deletes the active
 map's `embedding_landmarks.npz`; the occupancy map and the place index are
@@ -143,10 +164,20 @@ only when that group is unambiguous; otherwise it is skipped and counted in
 | --- | --- |
 | `skipped_sparse_depth` | under 30% of the box core has valid depth |
 | `skipped_mixed_depth` | no surface holds 60% of the valid pixels (object + background, or an occluder) |
-| `skipped_range` | the surface is nearer than 0.4 m or beyond 4.0 m |
+| `skipped_range` | the surface is nearer than 0.4 m or beyond 6.0 m, or the box holds only scattered depth beyond 6.0 m |
 | `skipped_height` | the point is outside `vision_z_min_m` / `vision_z_max_m` |
 
-`used` counts boxes that did. A box mostly filled by something standing in
+`used` counts boxes that did. `box_depth.by_label` splits the same counts
+per YOLO label (plus `not_landmark_label`), which shows which classes rarely
+produce a usable surface.
+
+The box range (6.0 m) is longer than the per-patch range (4 m) because a box
+is located from hundreds of depth pixels. On camera-top a poster 5.6 m away
+repeated within one depth step (9 cm) over six frames; the absolute error at
+that range has not been measured. Pose writeback is unchanged: it only pairs
+landmarks within `landmark_fix_max_range_m` (4 m) of the robot.
+
+A box mostly filled by something standing in
 front of the object still lands on that nearer thing: it is a real surface,
 so the audit will not flag it.
 
