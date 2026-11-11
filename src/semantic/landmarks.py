@@ -138,6 +138,10 @@ class EmbeddingLandmarkMap:
     # Depth + association noise routinely exceeds 5 cm on RealSense; 12 cm
     # still rejects wild jumps while letting stable features confirm.
     promote_max_std_m: float = 0.12
+    # A detector box used to confirm on 3 observations with up to 22 cm of
+    # scatter, which confirmed landmarks on one short pass. It now needs this
+    # many observations and the same 12 cm cap as a patch.
+    detector_promote_min_obs: int = 8
     demote_offset_m: float = 0.15
     demote_passes: int = 3
     # Bank several viewpoint descriptors so drive-by re-ID can match a new angle.
@@ -162,6 +166,12 @@ class EmbeddingLandmarkMap:
     # Depth audit: frames in a row the camera must see past a landmark's
     # stored point before the landmark is dropped.
     see_through_strikes: int = 3
+    # A landmark seen this often is only deleted when the camera reads at
+    # least see_through_keep_gap_m past the stored depth. A smaller gap still
+    # flags it (red X); throwing away hundreds of observations for a 1 m
+    # disagreement was dropping real objects.
+    see_through_keep_min_obs: int = 30
+    see_through_keep_gap_m: float = 1.2
 
     def __post_init__(self) -> None:
         self._next_id = 1
@@ -514,8 +524,11 @@ class EmbeddingLandmarkMap:
         A landmark is a claim that a surface exists at ``map_xyz``. When the
         camera reads depth well beyond that point, nothing is there. After
         ``see_through_strikes`` such frames in a row the landmark is flagged,
-        and removed when ``remove`` is set. A frame that agrees clears the
-        count; occluded / no-depth / unclear frames leave it unchanged.
+        and removed when ``remove`` is set. One with at least
+        ``see_through_keep_min_obs`` observations is removed only when the
+        camera reads ``see_through_keep_gap_m`` or more past the stored depth;
+        a smaller gap stays flagged. A frame that agrees clears the count;
+        occluded / no-depth / unclear frames leave it unchanged.
 
         Only pass ``remove=True`` when ``robot_pose`` is trusted (mapping): a
         wrong pose makes every landmark look seen through. As a second guard,
@@ -594,7 +607,19 @@ class EmbeddingLandmarkMap:
                 elif row["verdict"] == AUDIT_AGREES and strikes:
                     strikes = 0
                     self._see_through_strikes.pop(lid, None)
-            removed = bool(remove) and not pose_suspect and strikes >= limit
+            # Young landmarks drop on the ordinary seen-through test. A
+            # well-observed one stays unless the depth gap is large; the red
+            # mark still shows the disagreement.
+            drops = True
+            if int(row["observations"]) >= int(self.see_through_keep_min_obs):
+                measured = row["measured_depth_m"]
+                gap = (
+                    None
+                    if measured is None
+                    else float(measured) - float(row["stored_depth_m"])
+                )
+                drops = gap is not None and gap >= float(self.see_through_keep_gap_m)
+            removed = bool(remove) and not pose_suspect and strikes >= limit and drops
             row["strikes"] = strikes
             row["removed"] = removed
             if removed:
@@ -984,7 +1009,10 @@ class EmbeddingLandmarkMap:
     def _try_promote(
         self, lm: EmbeddingLandmark, *, anchor_pose: Optional[conv.Pose2D] = None
     ) -> None:
-        if lm.observations < int(self.promote_min_obs):
+        min_obs = int(self.promote_min_obs)
+        if bool(lm.from_detector):
+            min_obs = max(min_obs, int(self.detector_promote_min_obs))
+        if lm.observations < min_obs:
             return
         if len(lm.view_poses_xy) < int(self.promote_min_views):
             return
@@ -1002,10 +1030,11 @@ class EmbeddingLandmarkMap:
         min_gap_deg = float(self.promote_min_view_gap_deg)
         max_std = float(self.promote_max_std_m)
         if bool(lm.from_detector):
-            # Object-level landmarks: tolerate depth jitter; accept shorter baselines.
+            # A box is one object, so a short drive past it is enough baseline.
+            # Scatter stays at promote_max_std_m: a 22 cm allowance confirmed
+            # landmarks whose position wandered 14–16 cm.
             min_gap_m = min(min_gap_m, 0.25)
             min_gap_deg = min(min_gap_deg, 18.0)
-            max_std = max(max_std, 0.22)
         if gap_m < min_gap_m and gap_deg < min_gap_deg:
             return
         if lm.position_std_m > max_std:

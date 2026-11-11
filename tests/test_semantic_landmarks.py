@@ -187,6 +187,71 @@ def test_promote_on_spin_in_place_yaw_gap():
     assert lm.status == LandmarkStatus.CONFIRMED
 
 
+def _observe_detector(store, *, n, views, offsets):
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    lm = None
+    for i in range(n):
+        lm = store.observe(
+            map_xyz=np.array([2.0, 0.0, 1.0], dtype=float) + offsets[i % len(offsets)],
+            descriptor=desc,
+            normal_map=normal,
+            anchor_node=0,
+            anchor_pose=anchor,
+            view_xy=views[i % len(views)],
+            from_detector=True,
+        )
+    return lm
+
+
+def test_detector_landmark_confirms_on_the_eighth_observation():
+    """Three observations used to confirm a box landmark on one short pass."""
+    store = EmbeddingLandmarkMap(
+        promote_min_obs=3,
+        promote_min_views=2,
+        promote_min_view_gap_m=0.5,
+        promote_max_std_m=0.12,
+    )
+    views = ((0.0, 0.0, 0.0), (0.6, 0.0, 0.0))
+    offsets = (np.zeros(3), np.array([0.01, 0.0, 0.0]))
+    lm = _observe_detector(store, n=7, views=views, offsets=offsets)
+    assert lm is not None
+    assert lm.status == LandmarkStatus.CANDIDATE
+    assert lm.observations == 7
+    lm = _observe_detector(store, n=1, views=views[1:], offsets=offsets)
+    assert lm.observations == 8
+    assert lm.status == LandmarkStatus.CONFIRMED
+
+
+def test_detector_landmark_stays_candidate_above_12cm_scatter():
+    """The old 22 cm allowance confirmed landmarks that wandered 14–16 cm."""
+    store = EmbeddingLandmarkMap(
+        promote_min_obs=3,
+        promote_min_views=2,
+        promote_min_view_gap_m=0.5,
+        promote_max_std_m=0.12,
+        associate_radius_m=0.35,
+    )
+    # Around the first point, inside the association radius, noisy on every axis.
+    offsets = (
+        np.zeros(3),
+        np.array([0.20, 0.10, 0.08]),
+        np.array([-0.20, -0.10, -0.08]),
+        np.array([0.10, 0.20, -0.08]),
+        np.array([-0.10, -0.20, 0.08]),
+        np.array([0.08, -0.08, 0.20]),
+        np.array([-0.08, 0.08, -0.20]),
+        np.array([0.15, -0.15, 0.10]),
+    )
+    views = ((0.0, 0.0, 0.0), (0.6, 0.0, 0.0))
+    lm = _observe_detector(store, n=8, views=views, offsets=offsets)
+    assert lm is not None
+    assert len(store) == 1
+    assert 0.12 < lm.position_std_m < 0.22
+    assert lm.status == LandmarkStatus.CANDIDATE
+
+
 def test_confirmed_soft_match_banks_new_viewpoint_descriptor():
     """Drive-by: confirmed should re-associate under angle change when close."""
     store = EmbeddingLandmarkMap(
@@ -681,6 +746,35 @@ def test_audit_removes_after_consecutive_seen_through_frames():
     assert store.status_dict()["seen_through_removed"] == 2
     # Gone from the spatial index too: nothing left to associate with.
     assert all(1 in ids or not ids for ids in store._cell_index.values())  # noqa: SLF001
+
+
+def test_audit_keeps_a_well_seen_landmark_unless_the_gap_is_large():
+    """477 observations at a 1.1 m gap were being deleted; a 1.5 m gap still goes."""
+    store = EmbeddingLandmarkMap()
+    kept = _stored(store, 2, [1.6, 0.0, 0.4])
+    _stored(store, 5, [1.6, 0.4, 0.4], status=LandmarkStatus.CANDIDATE)
+    kept.observations = 40
+    # Stored depth is 1.5 m. 2.3 m is seen through (past the 0.4 m margin)
+    # but short of the 1.2 m gap a well-observed landmark needs.
+    near = np.full((240, 320), 2.3, dtype=np.float32)
+    for _ in range(3):
+        audit = _audit(store, near, remove=True)
+    row = _row(audit, 2)
+    assert row["verdict"] == "seen_through"
+    assert row["strikes"] == store.see_through_strikes
+    assert row["removed"] is False
+    assert store.get(2) is not None
+    assert store.seen_through_ids() == [2]
+    # A young landmark at the same disagreement is still deleted.
+    assert store.get(5) is None
+
+    gone = _stored(store, 7, [1.6, -0.4, 0.4])
+    gone.observations = 40
+    far = np.full((240, 320), 3.0, dtype=np.float32)
+    for _ in range(3):
+        audit = _audit(store, far, remove=True)
+    assert _row(audit, 7)["removed"] is True
+    assert store.get(7) is None
 
 
 def test_audit_agreeing_frame_clears_strikes():

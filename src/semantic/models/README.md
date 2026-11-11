@@ -95,7 +95,7 @@ Each YOLO box says what became of it in the last surveyed frame:
   to the landmark's square, so a box that fed a landmark stored somewhere
   else is visible as a long line.
 - **grey**, thin, labelled with a reason: the box made no observation.
-  ``far 9.6m`` / ``near 0.3m`` = outside the 0.4–6.0 m box range,
+  ``far 9.6m`` / ``near 0.3m`` = outside the 0.4–4.5 m box range,
   ``mixed depth`` = no single surface, ``no depth`` = too little valid depth,
   ``height`` = outside the z gate, ``not a landmark class`` = label not in
   ``vision_landmark_labels``.
@@ -130,7 +130,10 @@ Three `seen_through` frames in a row flag the landmark; an `agrees` frame
 clears the count; the other verdicts leave it unchanged. While **mapping**
 (or `vision_survey_only`) a flagged landmark, candidate or confirmed, is
 deleted and logged (`vision: dropped landmark DC125 …`), so the real object
-can be re-minted cleanly. While **localizing** the audit only reports: the
+can be re-minted cleanly. A landmark with 30 or more observations is deleted
+only when the camera reads at least 1.2 m past the stored depth; a smaller
+gap stays flagged (red X) instead of throwing away a well-seen object. While
+**localizing** the audit only reports: the
 pose is what is in doubt there, and a wrong pose makes every landmark look
 seen through. For the same reason a frame where at least 4 landmarks are
 seen through and they outnumber the agreeing ones is marked `pose_suspect`
@@ -164,17 +167,19 @@ only when that group is unambiguous; otherwise it is skipped and counted in
 | --- | --- |
 | `skipped_sparse_depth` | under 30% of the box core has valid depth |
 | `skipped_mixed_depth` | no surface holds 60% of the valid pixels (object + background, or an occluder) |
-| `skipped_range` | the surface is nearer than 0.4 m or beyond 6.0 m, or the box holds only scattered depth beyond 6.0 m |
+| `skipped_range` | the surface is nearer than 0.4 m or beyond 4.5 m, or the box holds only scattered depth beyond 4.5 m |
 | `skipped_height` | the point is outside `vision_z_min_m` / `vision_z_max_m` |
 
 `used` counts boxes that did. `box_depth.by_label` splits the same counts
 per YOLO label (plus `not_landmark_label`), which shows which classes rarely
 produce a usable surface.
 
-The box range (6.0 m) is longer than the per-patch range (4 m) because a box
-is located from hundreds of depth pixels. On camera-top a poster 5.6 m away
-repeated within one depth step (9 cm) over six frames; the absolute error at
-that range has not been measured. Pose writeback is unchanged: it only pairs
+The box range is 0.4–4.5 m. It was tried out to 6 m, and a poster at 5.5 m
+repeated within one depth step from one pose, but landmarks stored at
+5.5–6.0 m were deleted on the next viewpoint, where the camera read 9–12 m.
+A box past 4.5 m is labelled `far …m`. A detector landmark confirms after 8
+observations from more than one view, and only when its position has
+scattered by 12 cm or less. Pose writeback is unchanged: it only pairs
 landmarks within `landmark_fix_max_range_m` (4 m) of the robot.
 
 A box mostly filled by something standing in

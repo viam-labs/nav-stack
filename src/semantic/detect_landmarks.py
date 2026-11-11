@@ -121,12 +121,13 @@ BOX_USED = "used"
 BOX_NOT_LANDMARK_LABEL = "not_landmark_label"
 BOX_NO_PATCHES = "no_patches"
 
-# A box is located from hundreds of depth pixels, so it stays usable further
-# out than a single patch (4 m): on camera-top a poster 5.6 m away repeated
-# within one depth step (9 cm) over six frames. Past 6 m a step is 10 cm or
-# more and far walls start to read as noise.
+# A box averages hundreds of depth pixels, so it reaches past a single patch
+# (4 m). It stops at 4.5 m: a poster at 5.5 m repeated within one depth step
+# from one pose, but landmarks stored at 5.5–6.0 m were deleted on the next
+# viewpoint, where the camera read 9–12 m. A farther box is labelled
+# "far …m" instead of becoming a landmark.
 BOX_MIN_RANGE_M = 0.4
-BOX_MAX_RANGE_M = 6.0
+BOX_MAX_RANGE_M = 4.5
 
 
 def describe_box_outcome(outcome: str, depth_m: Optional[float] = None) -> str:

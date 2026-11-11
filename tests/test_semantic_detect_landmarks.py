@@ -221,13 +221,21 @@ def test_box_surface_rejects_out_of_range():
     assert why == SKIP_RANGE
 
 
-def test_box_surface_accepts_a_clean_surface_out_to_six_metres():
+def test_box_surface_accepts_a_clean_surface_out_to_four_and_a_half_metres():
     """A box averages hundreds of pixels, so it reaches past the 4 m patch limit."""
-    frame = _frame_with_wall(depth_m=5.5)
+    frame = _frame_with_wall(depth_m=4.4)
     surface, why = _box(frame, 100, 60, 220, 180)
     assert why is None and surface is not None
-    assert surface.depth_m == pytest.approx(5.5, abs=0.02)
-    assert BOX_MAX_RANGE_M == pytest.approx(6.0)
+    assert surface.depth_m == pytest.approx(4.4, abs=0.02)
+    assert BOX_MAX_RANGE_M == pytest.approx(4.5)
+
+
+def test_box_surface_rejects_a_clean_surface_past_four_and_a_half_metres():
+    """5.5 m repeated from one pose, then failed the next viewpoint."""
+    frame = _frame_with_wall(depth_m=5.5)
+    surface, why = _box(frame, 100, 60, 220, 180)
+    assert surface is None
+    assert why == SKIP_RANGE
 
 
 def test_far_noisy_box_is_called_range_not_mixed_depth():
@@ -366,15 +374,27 @@ def test_real_frame_table_box_is_skipped_not_put_on_the_wall_behind():
     assert why == SKIP_MIXED_DEPTH
 
 
-def test_real_frame_poster_at_five_and_a_half_metres_is_used():
-    """This poster was detected every frame but skipped by the old 4 m limit."""
+def test_real_frame_poster_at_five_and_a_half_metres_is_too_far():
+    """Repeatable from one pose; landmarks stored here died on the next look."""
     frame = real_camera_top_frame(_REAL_DEPTH_FAR)
-    for box in ((236, 66, 277, 108), (230, 60, 283, 114)):
-        surface, why = _box(frame, *box)
-        assert why is None and surface is not None
-        assert surface.depth_m == pytest.approx(5.5, abs=0.1)
-        assert surface.support > 0.9
-        assert 1.3 < surface.point_base[2] < 1.6
+    det = Detection(label="poster", conf=0.3, x0=236, y0=66, x1=277, y1=108)
+    tok = PatchToken(
+        row=0, col=0, u=256.0, v=87.0, descriptor=np.array([1.0, 0.0], dtype=np.float32)
+    )
+    outcomes: list = []
+    obs = observations_from_detections(
+        frame,
+        [tok],
+        [det],
+        landmark_labels=["poster"],
+        z_min_m=0.25,
+        z_max_m=2.0,
+        outcomes=outcomes,
+    )
+    assert obs == []
+    assert outcomes[0]["outcome"] == SKIP_RANGE
+    assert outcomes[0]["depth_m"] == pytest.approx(5.5, abs=0.15)
+    assert describe_box_outcome(SKIP_RANGE, outcomes[0]["depth_m"]).startswith("far ")
 
 
 def test_real_frame_picture_on_the_far_wall_is_out_of_range():
