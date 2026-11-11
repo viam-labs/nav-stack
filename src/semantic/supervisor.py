@@ -197,6 +197,9 @@ class VisionSupervisor:
         self._place_seed_applied = 0
         self._last_place_seed: Optional[dict] = None
         self._last_place_seed_mono = 0.0
+        # Pose last published by a seed. A later fit that lands somewhere
+        # else is the other corridor twin and is not applied.
+        self._last_seed_pose: Optional[conv.Pose2D] = None
 
         input_size = int(cfg.vision_input_size) if not want_synthetic else 224
         if input_size < 14:
@@ -1116,9 +1119,10 @@ class VisionSupervisor:
         The guess is not applied. Landmarks that project into the image from
         the guess are paired by appearance; the fit is the geometry check
         (3 inliers, lost residual, jump measured from the guess). Two guesses
-        that fit different poses are refused. Returns True only when a
-        correction was applied, so writeback does not run from the old pose
-        on this frame.
+        that fit different poses are refused, including a guess on a later
+        frame that disagrees with the pose this recovery already published.
+        Returns True only when a correction was applied, so writeback does
+        not run from the old pose on this frame.
         """
         apply = self._apply_pose_correction
         if apply is None or not self._localization_lost():
@@ -1253,6 +1257,32 @@ class VisionSupervisor:
                 "jump_deg": round(jump_deg, 1),
             }
             return False
+        # The cart has driven off the pose we published, so that memory no
+        # longer describes where we are. While we are still there, a fit
+        # that lands somewhere else is the twin we already refused to bounce to.
+        held = self._last_seed_pose
+        if held is not None and seeded_poses_conflict(
+            [held, pose], sep_m=_PLACE_SEED_AGREE_M, sep_deg=_PLACE_SEED_AGREE_DEG
+        ):
+            self._last_seed_pose = None
+            held = None
+        if held is not None and seeded_poses_conflict(
+            [held, fitted], sep_m=_PLACE_SEED_AGREE_M, sep_deg=_PLACE_SEED_AGREE_DEG
+        ):
+            self._last_place_seed = {
+                "status": "rejected_disagrees_with_last",
+                "keyframe_id": int(best["keyframe_id"]),
+                "inliers": int(fix.fit.inliers.sum()),
+                "jump_m": round(jump_m, 3),
+                "jump_deg": round(jump_deg, 1),
+                "held_x": round(float(held.x), 3),
+                "held_y": round(float(held.y), 3),
+            }
+            self._log(
+                "vision place seed: rejected_disagrees_with_last "
+                f"kf={best['keyframe_id']} jump={jump_m:.2f}m/{jump_deg:.1f}deg"
+            )
+            return False
         try:
             applied_result = apply(fitted, score=float(fix.score), force=False)
         except Exception as exc:  # noqa: BLE001
@@ -1276,6 +1306,7 @@ class VisionSupervisor:
         if applied:
             self._place_seed_applied += 1
             self._last_place_seed_mono = now
+            self._last_seed_pose = conv.Pose2D(fitted.x, fitted.y, fitted.theta)
         self._log(
             f"vision place seed: {self._last_place_seed['status']} "
             f"kf={best['keyframe_id']} inliers={int(fix.fit.inliers.sum())} "

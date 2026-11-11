@@ -884,6 +884,60 @@ def test_place_seed_refuses_two_landmarks():
     assert vision.status()["place"]["last_seed"]["status"] == "no_fit"
 
 
+def test_place_seed_refuses_a_later_fit_that_contradicts_the_last_apply():
+    """Keyframe 61 then keyframe 133 must not yank the pose back and forth."""
+    vision, called, lost = _lost_supervisor()
+    pose_a = Pose2D(4.0, 0.0, 0.0)
+    rng = np.random.default_rng(6)
+    descs_a = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(3)]
+    for i, live in enumerate(_SEED_LIVES):
+        _confirm_at(vision.landmarks, i + 1, pose_a, live, descs_a[i])
+    place_a = l2_normalize(np.array([1.0, 0.0, 0.0, 0, 0, 0, 0, 0], dtype=np.float32))
+    vision._place.add_keyframe(1, Pose2D(4.4, 0.0, 0.0), np.stack([place_a] * 12))  # noqa: SLF001
+    obs_a = [_obs(*live, descs_a[i]) for i, live in enumerate(_SEED_LIVES)]
+    applied = vision._try_place_seeded_fix(  # noqa: SLF001
+        _seed_frame(), _place_result(place_a), obs_a, lost, {0: lost}
+    )
+    assert applied, vision.status()["place"]["last_seed"]
+    held = called[0]["pose"]
+    vision._last_place_seed_mono = 0.0  # noqa: SLF001
+
+    pose_b = Pose2D(4.0, 7.0, 0.0)
+    descs_b = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(3)]
+    for i, live in enumerate(_SEED_LIVES):
+        _confirm_at(vision.landmarks, i + 4, pose_b, live, descs_b[i])
+    place_b = l2_normalize(np.array([0.0, 1.0, 0.0, 0, 0, 0, 0, 0], dtype=np.float32))
+    vision._place.add_keyframe(2, Pose2D(4.0, 6.6, 0.0), np.stack([place_b] * 12))  # noqa: SLF001
+    obs_b = [_obs(*live, descs_b[i]) for i, live in enumerate(_SEED_LIVES)]
+    applied = vision._try_place_seeded_fix(  # noqa: SLF001
+        _seed_frame(), _place_result(place_b), obs_b, held, {0: held}
+    )
+    assert applied is False
+    assert len(called) == 1
+    assert vision.status()["place"]["last_seed"]["status"] == "rejected_disagrees_with_last"
+
+
+def test_place_seed_may_move_again_after_the_cart_leaves_that_pose():
+    vision, called, lost = _lost_supervisor()
+    true = Pose2D(4.0, 0.0, 0.0)
+    rng = np.random.default_rng(7)
+    descs = [l2_normalize(rng.standard_normal(8).astype(np.float32)) for _ in range(3)]
+    for i, live in enumerate(_SEED_LIVES):
+        _confirm_at(vision.landmarks, i + 1, true, live, descs[i])
+    place = l2_normalize(np.array([1.0, 0.2, 0.0, 0, 0, 0, 0, 0], dtype=np.float32))
+    vision._place.add_keyframe(1, Pose2D(4.4, 0.0, 0.0), np.stack([place] * 12))  # noqa: SLF001
+    obs = [_obs(*live, descs[i]) for i, live in enumerate(_SEED_LIVES)]
+    assert vision._try_place_seeded_fix(  # noqa: SLF001
+        _seed_frame(), _place_result(place), obs, lost, {0: lost}
+    )
+    vision._last_place_seed_mono = 0.0  # noqa: SLF001
+    driven = Pose2D(4.0, 3.0, 0.0)
+    assert vision._try_place_seeded_fix(  # noqa: SLF001
+        _seed_frame(), _place_result(place), obs, driven, {0: driven}
+    )
+    assert len(called) == 2
+
+
 def test_place_seed_refuses_two_poses_that_both_fit():
     vision, called, lost = _lost_supervisor()
     pose_a = Pose2D(4.0, 0.0, 0.0)

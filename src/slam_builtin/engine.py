@@ -1351,9 +1351,11 @@ class BuiltinSlamEngine:
         "degrading": 6.0,
     }
 
-    # A resumed map this torn holds two copies of some walls; matching the
-    # session against it picks one at random, so loop/revisit ignore it.
-    _BASE_DISTRUST_STATUSES = ("degrading",)
+    # A resumed map with doubled walls holds two copies of some of them;
+    # matching the session against it picks one at random, so loop/revisit
+    # ignore it. Tile-angle scatter does not. A floor that is not all
+    # parallel still localizes, and freezing paint on that scatter blocked
+    # updates where the scan lined up.
 
     def refresh_map_health(self, *, force: bool = False) -> dict:
         """Update cached occupancy health; no-op when not mapping or too soon."""
@@ -1395,12 +1397,12 @@ class BuiltinSlamEngine:
                     origin_y=base_origin[1],
                 )
                 self._map_health_base_cells = base_cells
-                # Use unclamped score so a small but clearly doubled resume is
-                # still untrusted even when live status was capped at watch.
-                base_raw = str(
-                    getattr(base_health, "raw_status", None) or base_health.status
+                # Doubled walls distrust the resume even when the live status
+                # was capped at watch. Angle scatter alone does not: a floor
+                # that is not all parallel still localizes.
+                trusted = float(base_health.ghost_frac) < float(
+                    map_health._DEGRADING_GHOST
                 )
-                trusted = base_raw not in self._BASE_DISTRUST_STATUSES
                 self._map_health_base = {
                     **base_health.as_dict(),
                     "trusted": trusted,
@@ -1415,11 +1417,11 @@ class BuiltinSlamEngine:
                 )
                 if not trusted and not self._operator_trusted_paint:
                     self._log(
-                        "WARNING: mapping resumed on a damaged map (ghost walls / "
-                        "skewed tiles); loop closure and revisit will not snap "
-                        "this session onto it. Scan tracking still uses it, so "
-                        "doubled areas can keep doubling: clear_map and remap "
-                        "is recommended"
+                        "WARNING: mapping resumed on a doubled map "
+                        f"(ghost={base_health.ghost_frac:.2f}); loop closure and "
+                        "revisit will not snap this session onto it. Scan "
+                        "tracking still uses it, so doubled areas can keep "
+                        "doubling: clear the torn stretch before rewriting walls"
                     )
             baseline = None
             scope = "map"

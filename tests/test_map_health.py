@@ -232,6 +232,32 @@ def _clean_hallway():
     return grid, res
 
 
+def _skewed_single_walls():
+    """Walls at two headings, spaced far enough that they are not ghost pairs."""
+    grid, res = _blank(240, 240)
+    grid[:, :] = 0
+    for r in (20, 80, 140, 200):
+        _paint_wall(grid, r, r + 2, 10, 90)
+    for k in range(70):
+        r = 30 + k
+        c = 140 + k
+        grid[r : r + 2, c : c + 2] = 100
+    return grid, res
+
+
+def test_angle_scatter_does_not_distrust_a_resumed_map(tmp_path):
+    cells, res = _skewed_single_walls()
+    scored = map_health.assess_occupancy(
+        cells, resolution=res, origin_x=-2.0, origin_y=-3.0
+    )
+    assert scored.ghost_frac < map_health._DEGRADING_GHOST
+    assert scored.raw_status == "degrading"
+    engine = _resume_on(tmp_path, cells, res)
+    health = engine.map_health()
+    assert health["baseline"]["trusted"] is True
+    assert engine.diagnostics()["paint"]["extend_only"] is False
+
+
 def test_torn_resumed_map_is_not_used_by_loop_closure(tmp_path, monkeypatch):
     from src.slam_builtin import loop_closure
     from src.slam_builtin.engine import BuiltinSlamEngine
