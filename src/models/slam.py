@@ -1734,10 +1734,22 @@ class SlamService(SLAM):
         store = self._map_store
         mgr = self._manager
         assert store is not None and mgr is not None
-        name = command.get("map")
-        if name:
-            store.get_or_create_map(str(name))
-            store.set_active_map(str(name))
+        # Accept ``map`` or ``map_name`` (UI Create & map sends ``map``).
+        raw = command.get("map")
+        if raw is None:
+            raw = command.get("map_name")
+        if raw is not None and str(raw).strip():
+            map_name = validate_map_name(str(raw))
+            store.get_or_create_map(map_name)
+            store.set_active_map(map_name)
+            if self._cfg is not None:
+                self._cfg.active_map = map_name
+        elif store.active_handle() is None:
+            # Mapping with no map_dir only lives in memory — save cannot persist
+            # it and list_maps never shows it. Require an explicit create/select.
+            raise ValueError(
+                "no active map; pass map=<name> to create one, or select a map first"
+            )
         # Subprocess-heavy manager calls must stay off the module event
         # loop: the bridge marshals odom/lidar/cmd_vel onto it, so blocking
         # here stalls TF and scans.
@@ -2011,7 +2023,13 @@ class SlamService(SLAM):
         store = self._map_store
         mgr = self._manager
         assert store is not None and mgr is not None
-        return {"maps": store.list_maps()}
+        maps = store.list_maps()
+        # ``names`` is a flat string list so clients don't depend on Struct
+        # decoding of nested map metadata dicts (which can surface as objects).
+        return {
+            "maps": maps,
+            "names": [str(m.get("name", "")) for m in maps if m.get("name")],
+        }
 
     def _cmd_get_active_map(
         self, command: Mapping[str, ValueTypes]
