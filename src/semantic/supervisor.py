@@ -875,6 +875,7 @@ class VisionSupervisor:
             "cy": float(K.cy),
             "width": int(K.width),
             "height": int(K.height),
+            "max_range": float(lidar.max_range),
         }
         return vision_frame_from_arrays(
             camera_name=lidar.name,

@@ -160,6 +160,28 @@ class VisionCamera(Camera):
             None,
         )
 
+    def _source_max_range(self, source_name: str, geom) -> Optional[float]:
+        """Range cap for the overlay: this camera's configured max, not the map."""
+        if isinstance(geom, dict) and geom.get("max_range") is not None:
+            try:
+                return float(geom["max_range"])
+            except (TypeError, ValueError):
+                pass
+        runtime = get_slam(self._cfg.slam) if self._cfg else None
+        slam_cfg = getattr(runtime, "slam_cfg", None) if runtime else None
+        if slam_cfg is None:
+            return None
+        by_name = {lidar.name: lidar for lidar in getattr(slam_cfg, "lidars", [])}
+        lidar = by_name.get(source_name)
+        if lidar is None:
+            for name in getattr(slam_cfg, "vision_cameras", None) or []:
+                lidar = by_name.get(name)
+                if lidar is not None:
+                    break
+        if lidar is None:
+            return None
+        return float(lidar.max_range)
+
     async def _render(self) -> bytes:
         cfg = self._cfg
         if cfg is None or self._source is None:
@@ -287,6 +309,9 @@ class VisionCamera(Camera):
             writeback_paired_ids=wb_pair,
             seen_through_ids=seen_through,
             detection_notes=det_notes,
+            max_range_m=self._source_max_range(cfg.source, geom),
+            fov_deg=fov,
+            vfov_deg=vfov,
         )
         self._last_error = None
         self._last_drawn = min(len(landmarks), int(self._opts.max_landmarks))

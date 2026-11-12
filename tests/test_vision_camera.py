@@ -425,3 +425,120 @@ def test_render_overlay_writeback_rings():
     assert arr[..., 0].max() > 40
     assert arr[..., 2].max() > 40
 
+
+def _green(arr: np.ndarray) -> np.ndarray:
+    return (arr[..., 1] > 150) & (arr[..., 0] < 120) & (arr[..., 2] < 150)
+
+
+def _yellow(arr: np.ndarray) -> np.ndarray:
+    return (arr[..., 0] > 200) & (arr[..., 1] > 160) & (arr[..., 2] < 80)
+
+
+def test_render_drops_landmarks_beyond_camera_range():
+    """A point down the map still projects near the principal point."""
+    color = np.zeros((240, 320, 3), dtype=np.uint8)
+    color[:] = (20, 20, 28)
+    K = CameraIntrinsics(fx=160, fy=160, cx=160, cy=120, width=320, height=240)
+    far = _detector_landmark(4, [20.0, 0.0, 0.5])
+    near = _detector_landmark(5, [2.0, 0.4, 0.5])
+
+    def render(**kwargs):
+        png = render_landmarks_overlay(
+            color,
+            [(far, far.map_xyz), (near, near.map_xyz)],
+            robot_pose=Pose2D(0.0, 0.0, 0.0),
+            intrinsics=K,
+            mount_z=0.5,
+            fov_deg=87.0,
+            vfov_deg=58.0,
+            **kwargs,
+        )
+        return np.asarray(Image.open(io.BytesIO(png))).astype(int)
+
+    # No range cap: the 20 m point lands on the image center.
+    assert _green(render())[114:126, 154:166].any()
+    # Camera max range keeps the 2 m mark and drops the one down the map.
+    capped = render(max_range_m=4.0)
+    assert not _green(capped)[114:126, 154:166].any()
+    assert _green(capped)[110:130, 118:138].any()
+
+
+def test_render_drops_bearings_outside_fov_even_when_k_is_too_wide():
+    """A tiny focal length pulls the whole forward map into the frame."""
+    color = np.zeros((240, 320, 3), dtype=np.uint8)
+    color[:] = (20, 20, 28)
+    wide = CameraIntrinsics(fx=5.0, fy=5.0, cx=160, cy=120, width=320, height=240)
+    ang = np.deg2rad(80.0)
+    side = _detector_landmark(6, [2.0 * np.cos(ang), 2.0 * np.sin(ang), 0.5])
+    kwargs = dict(
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        intrinsics=wide,
+        mount_z=0.5,
+    )
+    bare = np.asarray(
+        Image.open(
+            io.BytesIO(
+                render_landmarks_overlay(color, [(side, side.map_xyz)], **kwargs)
+            )
+        )
+    ).astype(int)
+    # ~80° off axis, but the wide K places the square inside the image.
+    assert _green(bare)[114:126, 120:145].any()
+    gated = np.asarray(
+        Image.open(
+            io.BytesIO(
+                render_landmarks_overlay(
+                    color,
+                    [(side, side.map_xyz)],
+                    fov_deg=87.0,
+                    vfov_deg=58.0,
+                    **kwargs,
+                )
+            )
+        )
+    ).astype(int)
+    assert not _green(gated).any()
+
+
+def test_render_hides_untrusted_detector_candidates_not_seen_this_frame():
+    color = np.zeros((240, 320, 3), dtype=np.uint8)
+    color[:] = (20, 20, 28)
+    K = CameraIntrinsics(fx=160, fy=160, cx=160, cy=120, width=320, height=240)
+    stale = EmbeddingLandmark(
+        landmark_id=11,
+        anchor_node=0,
+        rel_xyz=np.array([2.0, 0.0, 0.5]),
+        normal_rel=np.array([-1.0, 0.0, 0.0]),
+        map_xyz=np.array([2.0, 0.0, 0.5]),
+        descriptors=[],
+        observations=1,
+        status=LandmarkStatus.CANDIDATE,
+        from_detector=True,
+    )
+    from src.semantic.types import Detection
+
+    det = Detection(label="poster", conf=0.4, x0=20, y0=40, x1=80, y1=100)
+
+    def render(notes):
+        png = render_landmarks_overlay(
+            color,
+            [(stale, stale.map_xyz)],
+            robot_pose=Pose2D(0.0, 0.0, 0.0),
+            intrinsics=K,
+            mount_z=0.5,
+            max_range_m=4.0,
+            fov_deg=87.0,
+            vfov_deg=58.0,
+            detections=[det],
+            detection_frame_size=(320, 240),
+            detection_notes=notes,
+        )
+        return np.asarray(Image.open(io.BytesIO(png))).astype(int)
+
+    # This frame saw a different box. The stale candidate stays off the image.
+    assert not _yellow(render([{"outcome": "skipped_range", "text": "far"}])).any()
+    # The box that fed it is drawn, at the candidate's own point.
+    assert _yellow(
+        render([{"outcome": "used", "text": "=Dc11", "landmark_id": 11}])
+    )[105:135, 145:175].any()
+

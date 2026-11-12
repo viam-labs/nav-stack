@@ -107,6 +107,44 @@ def project_map_point_to_pixel(
     return u, v, z
 
 
+def _ray_in_camera_view(
+    u: float,
+    v: float,
+    depth: float,
+    intrinsics: CameraIntrinsics,
+    *,
+    max_range_m: Optional[float],
+    fov_deg: Optional[float],
+    vfov_deg: Optional[float],
+) -> bool:
+    """True when the back-projected ray is inside the configured camera volume.
+
+    The pixel test alone keeps every map point in an infinite wedge, and a
+    too-wide K pulls bearings that are off to the side back into the frame.
+    Reconstruct the optical ray and apply the camera's own range and FOV.
+    """
+    if max_range_m is None and fov_deg is None and vfov_deg is None:
+        return True
+    z = float(depth)
+    if z <= 1e-6:
+        return False
+    fx = max(float(intrinsics.fx), 1e-6)
+    fy = max(float(intrinsics.fy), 1e-6)
+    ox = (float(u) - float(intrinsics.cx)) * z / fx
+    oy = (float(v) - float(intrinsics.cy)) * z / fy
+    if max_range_m is not None and math.hypot(ox, oy, z) > float(max_range_m):
+        return False
+    # 1° of slack so a point on the image edge is not dropped by rounding.
+    slack = math.radians(1.0)
+    if fov_deg is not None and float(fov_deg) > 1.0:
+        if abs(math.atan2(ox, z)) > math.radians(float(fov_deg)) * 0.5 + slack:
+            return False
+    if vfov_deg is not None and float(vfov_deg) > 1.0:
+        if abs(math.atan2(oy, z)) > math.radians(float(vfov_deg)) * 0.5 + slack:
+            return False
+    return True
+
+
 def _encode_png(img: Image.Image) -> bytes:
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
@@ -140,6 +178,9 @@ def render_landmarks_overlay(
     writeback_paired_ids: Optional[Sequence[int]] = None,
     seen_through_ids: Optional[Sequence[int]] = None,
     detection_notes: Optional[Sequence[Optional[dict]]] = None,
+    max_range_m: Optional[float] = None,
+    fov_deg: Optional[float] = None,
+    vfov_deg: Optional[float] = None,
 ) -> bytes:
     """Draw landmark + optional YOLO boxes on ``color_rgb``; return PNG bytes.
 
@@ -156,6 +197,13 @@ def render_landmarks_overlay(
     ``=DC17`` and gets a line to that landmark's square; a box that fed
     nothing is grey and labelled with the reason (``far 9.6m``,
     ``mixed depth``, ``no depth``).
+
+    Stored points are not drawn just because they fall in an infinite pinhole
+    wedge. ``max_range_m`` drops anything farther than the camera is configured
+    to see. ``fov_deg`` / ``vfov_deg`` drop rays outside that lens, including
+    when a too-wide K would still land the pixel inside the frame. An
+    untrusted detector candidate is drawn only when this frame's notes tie a
+    box to it — a one-shot fix elsewhere on the map is not reprojected.
     """
     opts = options or LandmarkOverlayOptions()
     seen_through = {int(x) for x in (seen_through_ids or ())}
@@ -238,6 +286,18 @@ def render_landmarks_overlay(
             continue
         if status == LandmarkStatus.MOVED and not opts.show_moved:
             continue
+        is_det = bool(getattr(lm, "from_detector", False))
+        lid = int(lm.landmark_id)
+        # A single YOLO hit is stored immediately, often metres off the object.
+        # Until geometry is trusted, only draw it when this frame's box fed it.
+        if (
+            notes
+            and status == LandmarkStatus.CANDIDATE
+            and is_det
+            and lid not in fed_from
+            and not _candidate_geometry_trusted(lm)
+        ):
+            continue
         proj = project_map_point_to_pixel(
             map_xyz,
             robot_pose=robot_pose,
@@ -252,13 +312,21 @@ def render_landmarks_overlay(
         if proj is None:
             continue
         u, v, depth = proj
+        if not _ray_in_camera_view(
+            u,
+            v,
+            depth,
+            intrinsics,
+            max_range_m=max_range_m,
+            fov_deg=fov_deg,
+            vfov_deg=vfov_deg,
+        ):
+            continue
         if u < -20 or v < -20 or u > w + 20 or v > h + 20:
             continue
         outline, fill, tag = _COLORS.get(
             status, ((200, 200, 200, 255), (200, 200, 200, 40), "?")
         )
-        is_det = bool(getattr(lm, "from_detector", False))
-        lid = int(lm.landmark_id)
         is_air = lid in seen_through
         if is_air:
             outline = _SEEN_THROUGH
@@ -360,8 +428,9 @@ def collect_landmark_map_points(
         if lm.status == LandmarkStatus.MOVED and not include_moved:
             continue
         if lm.status == LandmarkStatus.CANDIDATE and stable_candidates_only:
-            # Detector-anchored landmarks are already object-level; show them
-            # immediately so cyan YOLO boxes have matching yellow/green marks.
+            # Detector-anchored landmarks are object-level. Include them here
+            # so a box from this frame can be tied to its mark; the overlay
+            # drops an untrusted one that this frame did not detect.
             if not bool(getattr(lm, "from_detector", False)):
                 if not _candidate_geometry_trusted(lm):
                     continue

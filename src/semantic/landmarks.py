@@ -117,7 +117,8 @@ class EmbeddingLandmark:
     position_std_m: float = float("inf")
     status: LandmarkStatus = LandmarkStatus.CANDIDATE
     # True once any observation came from a YOLO-box pooled DINO (not dense).
-    # Overlay shows these even before multi-view "stable" geometry trust.
+    # The overlay may show these before geometry is trusted, but only while
+    # this frame's detector box is tied to them.
     from_detector: bool = False
     # Approx half-size (m) of the object footprint in XY (from YOLO box + depth).
     extent_m: Optional[float] = None
