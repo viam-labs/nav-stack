@@ -366,8 +366,10 @@ def test_survey_records_what_each_box_became():
 
 
 def test_box_outcomes_are_not_reported_for_unsurveyed_detections():
-    """Newer detections than the last survey must not borrow its notes."""
+    """A frame still being surveyed does not replace the last finished one."""
     import dataclasses
+
+    from src.semantic.types import Detection
 
     cfg = _cfg(
         vision_prefer_detections=True,
@@ -376,11 +378,22 @@ def test_box_outcomes_are_not_reported_for_unsurveyed_detections():
     )
     vision = _vision(cfg, Pose2D(0.0, 0.0, 0.0))
     result = _surveyed_boxes(vision)
-    newer = dataclasses.replace(result, detections=list(result.detections))
+    newer = dataclasses.replace(
+        result,
+        detections=[
+            Detection(label="clock", conf=0.2, x0=1.0, y0=1.0, x1=4.0, y1=4.0)
+        ],
+    )
     with vision._lock:  # noqa: SLF001
         vision._last_result = newer  # noqa: SLF001
     detections, _size, boxes = vision.last_detections_with_outcomes()
-    assert len(detections) == 3 and boxes is None
+    assert [d.label for d in detections] == ["person", "painting", "painting"]
+    assert [b["outcome"] for b in boxes] == [
+        "not_landmark_label",
+        "used",
+        "skipped_range",
+    ]
+    assert all(d.label != "clock" for d in detections)
 
     vision.clear_landmarks()
     assert vision.status()["box_depth"]["by_label"] == {}

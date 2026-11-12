@@ -312,14 +312,19 @@ def test_outcomes_has_one_entry_per_detection_in_order():
     )
     assert [o["outcome"] for o in outcomes] == [
         BOX_NOT_LANDMARK_LABEL,
-        SKIP_MIXED_DEPTH,
+        BOX_USED,
         BOX_USED,
     ]
     assert [o["label"] for o in outcomes] == ["person", "painting", "painting"]
-    assert len(obs) == 1
-    assert outcomes[2]["obs_index"] == 0
+    assert len(obs) == 2
+    assert outcomes[1]["obs_index"] == 0
+    assert outcomes[2]["obs_index"] == 1
+    left_depth = float(outcomes[1]["depth_m"])
+    assert left_depth == pytest.approx(1.6, abs=0.08) or left_depth == pytest.approx(
+        3.0, abs=0.08
+    )
     assert outcomes[2]["depth_m"] == pytest.approx(3.0, abs=0.02)
-    assert outcomes[0]["obs_index"] is None and outcomes[1]["obs_index"] is None
+    assert outcomes[0]["obs_index"] is None
 
 
 def test_box_surface_keeps_an_oblique_plane_together():
@@ -333,9 +338,36 @@ def test_box_surface_keeps_an_oblique_plane_together():
     assert surface.support == pytest.approx(1.0)
 
 
-def test_mixed_box_makes_no_observation_and_is_counted():
+def test_mixed_box_landmarks_the_single_depth_patch():
+    """Half object, half background: landmark one of them, not the gap."""
     frame = _frame_with_wall(depth_m=3.0)
     frame.depth_m[60:180, 100:160] = 1.6
+    det = Detection(label="painting", conf=0.9, x0=100.0, y0=60.0, x1=220.0, y1=180.0)
+    stats: dict = {}
+    outcomes: list = []
+    obs = observations_from_detections(
+        frame,
+        _grid_tokens(frame),
+        [det],
+        landmark_labels=["painting"],
+        stats=stats,
+        outcomes=outcomes,
+    )
+    assert stats == {}
+    assert outcomes[0]["outcome"] == BOX_USED
+    assert len(obs) == 1
+    depth = float(outcomes[0]["depth_m"])
+    assert depth == pytest.approx(1.6, abs=0.08) or depth == pytest.approx(3.0, abs=0.08)
+    # The point sits on that surface (mount_x is 0.2), not between them.
+    assert obs[0].point_base[0] == pytest.approx(depth + 0.2, abs=0.2)
+    assert abs(float(obs[0].point_base[0]) - 2.5) > 0.4
+
+
+def test_speckled_box_still_has_no_single_depth_patch():
+    """Pixel-scale mixing has no window that is one surface."""
+    frame = _frame_with_wall(depth_m=3.0)
+    frame.depth_m[60:180, 100:220] = 1.4
+    frame.depth_m[60:180, 100:220:2] = 3.0
     det = Detection(label="painting", conf=0.9, x0=100.0, y0=60.0, x1=220.0, y1=180.0)
     stats: dict = {}
     obs = observations_from_detections(

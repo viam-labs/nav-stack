@@ -203,7 +203,7 @@ def render_landmarks_overlay(
     to see. ``fov_deg`` / ``vfov_deg`` drop rays outside that lens, including
     when a too-wide K would still land the pixel inside the frame. An
     untrusted detector candidate is drawn only when this frame's notes tie a
-    box to it — a one-shot fix elsewhere on the map is not reprojected.
+    box to it. Missing notes are not a license to draw every candidate.
     """
     opts = options or LandmarkOverlayOptions()
     seen_through = {int(x) for x in (seen_through_ids or ())}
@@ -290,9 +290,10 @@ def render_landmarks_overlay(
         lid = int(lm.landmark_id)
         # A single YOLO hit is stored immediately, often metres off the object.
         # Until geometry is trusted, only draw it when this frame's box fed it.
+        # No notes means the survey has not named these boxes yet: hide the
+        # candidate rather than flashing every stored one.
         if (
-            notes
-            and status == LandmarkStatus.CANDIDATE
+            status == LandmarkStatus.CANDIDATE
             and is_det
             and lid not in fed_from
             and not _candidate_geometry_trusted(lm)

@@ -326,6 +326,130 @@ def _surface_normal_optical(
     return normal / nn if nn > 1e-9 else toward_camera
 
 
+def _tokens_on_depth(
+    frame: VisionFrame,
+    tokens: Sequence[PatchToken],
+    depth_m: float,
+) -> List[PatchToken]:
+    """Tokens whose own pixel sits on ``depth_m`` (one cluster width)."""
+    depth = np.asarray(frame.depth_m, dtype=float)
+    h, w = depth.shape[:2]
+    width = float(_cluster_width_m(np.array([depth_m]))[0])
+    kept: List[PatchToken] = []
+    for tok in tokens:
+        ui = int(round(float(tok.u)))
+        vi = int(round(float(tok.v)))
+        if ui < 0 or vi < 0 or ui >= w or vi >= h:
+            continue
+        d = float(depth[vi, ui])
+        if math.isfinite(d) and d > 0.0 and abs(d - float(depth_m)) <= width:
+            kept.append(tok)
+    return kept
+
+
+def _single_depth_patch(
+    frame: VisionFrame,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    tokens: Sequence[PatchToken],
+    *,
+    z_min_m: Optional[float],
+    z_max_m: Optional[float],
+    max_range_m: float,
+) -> Optional[Tuple[BoxSurface, List[PatchToken], float]]:
+    """A window inside a mixed box that is one surface, plus its tokens.
+
+    The whole box has no majority, so a median would sit in the gap. Windows
+    that are themselves one depth are grouped, and the group with the most
+    windows is the landmark. The third value is that group's half-size in
+    the map plane, not the full detector box.
+    """
+    xa, xb = sorted((float(x0), float(x1)))
+    ya, yb = sorted((float(y0), float(y1)))
+    span_u = xb - xa
+    span_v = yb - ya
+    if span_u < 8.0 or span_v < 8.0:
+        return None
+    half = max(4, min(12, int(span_u) // 4, int(span_v) // 4))
+    step = max(half, 8)
+    found: List[Tuple[float, BoxSurface, float, float]] = []
+    for v in range(int(math.ceil(ya)) + half, int(math.floor(yb)) - half + 1, step):
+        for u in range(int(math.ceil(xa)) + half, int(math.floor(xb)) - half + 1, step):
+            surface, _why, _depth = _locate_box(
+                frame,
+                u - half,
+                v - half,
+                u + half,
+                v + half,
+                core_frac=1.0,
+                min_valid_frac=0.50,
+                min_valid_px=12,
+                min_support=0.85,
+                max_range_m=float(max_range_m),
+                z_min_m=z_min_m,
+                z_max_m=z_max_m,
+            )
+            if surface is None:
+                continue
+            found.append((float(surface.depth_m), surface, float(u), float(v)))
+    if not found:
+        return None
+    found.sort(key=lambda item: item[0])
+    groups: List[dict] = []
+    for depth, surface, u, v in found:
+        width = float(_cluster_width_m(np.array([depth]))[0])
+        placed = False
+        for group in groups:
+            if abs(depth - float(group["depth"])) <= max(width, float(group["width"])):
+                group["items"].append((depth, surface, u, v))
+                depths = [item[0] for item in group["items"]]
+                group["depth"] = float(np.median(depths))
+                group["width"] = float(
+                    _cluster_width_m(np.array([group["depth"]]))[0]
+                )
+                placed = True
+                break
+        if not placed:
+            groups.append(
+                {"depth": depth, "width": width, "items": [(depth, surface, u, v)]}
+            )
+    # More windows wins. A tie takes the nearer surface.
+    best = max(groups, key=lambda group: (len(group["items"]), -float(group["depth"])))
+    items = best["items"]
+    points = np.stack([item[1].point_base for item in items], axis=0)
+    point = np.median(points, axis=0)
+    depth_m = float(np.median([item[0] for item in items]))
+    rep = max(items, key=lambda item: float(item[1].support))[1]
+    surface = BoxSurface(
+        point_base=point.astype(float),
+        normal_base=np.asarray(rep.normal_base, dtype=float),
+        depth_m=depth_m,
+        sigma_m=float(rep.sigma_m),
+        support=float(np.mean([item[1].support for item in items])),
+    )
+    on_surface = _tokens_on_depth(frame, tokens, depth_m)
+    if not on_surface:
+        cu = float(np.median([item[2] for item in items]))
+        cv = float(np.median([item[3] for item in items]))
+        on_surface = [
+            min(
+                tokens,
+                key=lambda tok: (float(tok.u) - cu) ** 2 + (float(tok.v) - cv) ** 2,
+            )
+        ]
+    us = [item[2] for item in items]
+    vs = [item[3] for item in items]
+    pix_u = (max(us) - min(us)) + 2.0 * half
+    pix_v = (max(vs) - min(vs)) + 2.0 * half
+    fx = max(1.0, float(frame.intrinsics.fx))
+    fy = max(1.0, float(frame.intrinsics.fy))
+    range_m = max(0.2, depth_m)
+    extent_m = max(0.5 * pix_u * range_m / fx, 0.5 * pix_v * range_m / fy)
+    return surface, on_surface, float(extent_m)
+
+
 def observations_from_detections(
     frame: VisionFrame,
     patches: Sequence[PatchToken],
@@ -344,8 +468,10 @@ def observations_from_detections(
 
     Descriptor pooling uses every DINO token whose center lies in the box
     (depth-invalid tokens still contribute appearance). Geometry comes from
-    :func:`box_surface_point`; a box with no single clear surface yields no
-    observation. ``max_range_m`` defaults to the range a new landmark may be
+    :func:`box_surface_point`. A box with no majority surface still yields an
+    observation when a window inside it is one depth; the point and the
+    descriptor are taken from that window, not from a median of the mix.
+    ``max_range_m`` defaults to the range a new landmark may be
     stored at. A caller matching landmarks that already exist may pass the
     wider fix range; those farther points must not be surveyed. ``stats``
     (optional) is filled with per-reason skip counts.
@@ -396,7 +522,6 @@ def observations_from_detections(
         if len(in_tokens) < int(min_patches):
             note(det, BOX_NO_PATCHES)
             continue
-        desc = pool_descriptor([t.descriptor for t in in_tokens])
         surface, skip_reason, depth_m = _locate_box(
             frame,
             x0,
@@ -407,11 +532,30 @@ def observations_from_detections(
             z_max_m=z_max_m,
             max_range_m=float(max_range_m),
         )
+        extent_m: Optional[float] = None
+        desc_tokens = in_tokens
+        if surface is None and skip_reason == SKIP_MIXED_DEPTH:
+            patch = _single_depth_patch(
+                frame,
+                x0,
+                y0,
+                x1,
+                y1,
+                in_tokens,
+                z_min_m=z_min_m,
+                z_max_m=z_max_m,
+                max_range_m=float(max_range_m),
+            )
+            if patch is not None:
+                surface, desc_tokens, extent_m = patch
+                depth_m = float(surface.depth_m)
+                skip_reason = None
         if surface is None:
             if stats is not None and skip_reason:
                 stats[skip_reason] = int(stats.get(skip_reason, 0)) + 1
             note(det, str(skip_reason), depth_m)
             continue
+        desc = pool_descriptor([t.descriptor for t in desc_tokens])
         note(det, BOX_USED, depth_m, obs_index=len(out))
         point = surface.point_base
         normal = surface.normal_base
@@ -428,11 +572,13 @@ def observations_from_detections(
             sigma_m=sigma,
             valid=True,
         )
-        # Map-plane half-size of the YOLO box (meters) for footprint overlap.
-        range_m = max(0.2, float(surface.depth_m))
-        fx = max(1.0, float(frame.intrinsics.fx))
-        fy = max(1.0, float(frame.intrinsics.fy))
-        extent_m = max(0.5 * bw * range_m / fx, 0.5 * bh * range_m / fy)
+        # Map-plane half-size. A mixed box uses the chosen patch, not the
+        # whole detector rectangle, so it does not swallow the other surface.
+        if extent_m is None:
+            range_m = max(0.2, float(surface.depth_m))
+            fx = max(1.0, float(frame.intrinsics.fx))
+            fy = max(1.0, float(frame.intrinsics.fy))
+            extent_m = max(0.5 * bw * range_m / fx, 0.5 * bh * range_m / fy)
         out.append(
             PatchObservation(
                 token=tok,

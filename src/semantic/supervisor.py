@@ -306,13 +306,15 @@ class VisionSupervisor:
     def last_detections(
         self, *, camera_name: Optional[str] = None
     ) -> Tuple[List[Detection], Optional[Tuple[int, int]]]:
-        """Latest YOLO boxes for overlay, plus ``(width, height)`` of that frame.
+        """Latest surveyed YOLO boxes, plus ``(width, height)`` of that frame.
 
         Boxes are in the survey camera's pixel space. Callers should scale when
         the live overlay RGB differs in size. ``camera_name`` is accepted for
         API compatibility but does not drop boxes — dense-fallback candidates
         can appear without YOLO, so the overlay must still surface whatever the
-        detector last produced (or nothing) regardless of source aliasing.
+        detector last surveyed (or nothing) regardless of source aliasing.
+        A frame whose inference finished but whose survey has not is held back;
+        the previous surveyed frame stays up so candidates do not all flash on.
         """
         del camera_name  # overlay always wants the latest survey detections
         detections, size, _boxes = self.last_detections_with_outcomes()
@@ -324,29 +326,41 @@ class VisionSupervisor:
         """:meth:`last_detections` plus what each box became, read together.
 
         The third value has one dict per detection (``outcome``, ``text``,
-        ``depth_m``, ``landmark_id``, ``landmark``), or ``None`` when the
-        latest detections have not been surveyed (yet).
+        ``depth_m``, ``landmark_id``, ``landmark``). While a newer frame has
+        been inferred but not surveyed, the previous surveyed frame is returned
+        so the overlay does not treat missing notes as "draw every candidate".
+        ``None`` notes means nothing has been surveyed yet.
         """
         with self._lock:
             last = self._last_result
             geom = self._last_camera_geom
             noted = self._last_boxes
-        if last is None or not last.detections:
-            return [], None, None
         size = None
         if isinstance(geom, dict):
             gw = int(geom.get("width") or 0)
             gh = int(geom.get("height") or 0)
             if gw > 0 and gh > 0:
                 size = (gw, gh)
-        boxes = None
-        if (
-            noted is not None
-            and noted["result"] is last
-            and len(noted["boxes"]) == len(last.detections)
-        ):
-            boxes = [dict(box) for box in noted["boxes"]]
-        return list(last.detections), size, boxes
+
+        def surveyed(result, box_rows):
+            dets = list(getattr(result, "detections", None) or [])
+            if box_rows is None or len(box_rows) != len(dets):
+                return None
+            return dets, size, [dict(box) for box in box_rows]
+
+        if noted is not None and last is not None and noted.get("result") is last:
+            hit = surveyed(last, noted.get("boxes"))
+            if hit is not None:
+                return hit
+        if noted is not None and noted.get("result") is not None:
+            prev = noted["result"]
+            if last is None or prev is not last:
+                hit = surveyed(prev, noted.get("boxes"))
+                if hit is not None:
+                    return hit
+        if last is None or not last.detections:
+            return [], None, None
+        return list(last.detections), size, None
 
     def load_from_map_dir(self, map_dir) -> bool:
         loaded = load_landmarks(map_dir)

@@ -96,7 +96,7 @@ Each YOLO box says what became of it in the last surveyed frame:
   else is visible as a long line.
 - **grey**, thin, labelled with a reason: the box made no observation.
   ``far 9.6m`` / ``near 0.3m`` = outside the 0.4–4.5 m box range,
-  ``mixed depth`` = no single surface, ``no depth`` = too little valid depth,
+  ``mixed depth`` = no patch inside the box is one surface, ``no depth`` = too little valid depth,
   ``height`` = outside the z gate, ``not a landmark class`` = label not in
   ``vision_landmark_labels``.
 

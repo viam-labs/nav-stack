@@ -537,6 +537,8 @@ def test_render_hides_untrusted_detector_candidates_not_seen_this_frame():
 
     # This frame saw a different box. The stale candidate stays off the image.
     assert not _yellow(render([{"outcome": "skipped_range", "text": "far"}])).any()
+    # Notes not ready yet: do not flash every stored candidate.
+    assert not _yellow(render(None)).any()
     # The box that fed it is drawn, at the candidate's own point.
     assert _yellow(
         render([{"outcome": "used", "text": "=Dc11", "landmark_id": 11}])
