@@ -24,7 +24,7 @@ AUDIT_UNCLEAR = "unclear"  # mixed readings, no verdict
 # unmatched instead of stealing an id.
 UNIQUE_COSINE_MARGIN = 0.08
 UNIQUE_DISTANCE_MARGIN_M = 0.15
-# Short-term identity between 1 Hz surveys: a box keeps its landmark when it
+# Short-term identity between surveys: a box keeps its landmark when it
 # still overlaps the previous box and the embedding still agrees.
 TRACK_MIN_IOU = 0.25
 TRACK_IOU_MARGIN = 0.15
@@ -261,10 +261,11 @@ class EmbeddingLandmarkMap:
     # Depth + association noise routinely exceeds 5 cm on RealSense; 12 cm
     # still rejects wild jumps while letting stable features confirm.
     promote_max_std_m: float = 0.12
-    # A detector box used to confirm on 3 observations with up to 22 cm of
-    # scatter, which confirmed landmarks on one short pass. It now needs this
-    # many observations and the same 12 cm cap as a patch.
-    detector_promote_min_obs: int = 8
+    # Three observations confirmed a box on one short pass. Eight was waiting
+    # out id swaps between similar objects. A tie is now refused and a box
+    # keeps its id between surveys, so five is enough. Scatter stays at
+    # promote_max_std_m.
+    detector_promote_min_obs: int = 5
     demote_offset_m: float = 0.15
     demote_passes: int = 3
     # Bank several viewpoint descriptors so drive-by re-ID can match a new angle.

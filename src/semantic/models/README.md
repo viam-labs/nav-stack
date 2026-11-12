@@ -180,7 +180,7 @@ landmarks stored at 5.5–6.0 m were deleted on the next viewpoint, where the
 camera read 9–12 m. A box past 4.5 m is labelled `far …m` and is not stored.
 While localizing, that same box out to `landmark_fix_max_range_m` (6 m) can
 still match a landmark that already exists. A detector landmark confirms
-after 8 observations from more than one view, and only when its position has
+after 5 observations from more than one view, and only when its position has
 scattered by 12 cm or less. Pose writeback pairs confirmed landmarks out to
 6 m and accepts a fit that agrees within `landmark_fix_residual_m` (15 cm).
 It still needs 3 pairs. The live point has to land within 0.45 m of the
@@ -249,7 +249,7 @@ Defaults assume a density pilot, not pose writeback:
 
 | Attribute | Default | Why |
 | --- | --- | --- |
-| `vision_rate_hz` | `1.0` | Leave CPU for SLAM/nav |
+| `vision_rate_hz` | `2.0` | One camera. Two RealSense cameras faster than this starved nav |
 | `vision_round_robin` | `true` | One camera per tick when multiple are listed |
 | `vision_z_min_m` / `vision_z_max_m` | `0.25` / `2.0` | Drop floor/ceiling |
 | `vision_max_patches_per_frame` | `64` | Cap dense associations per frame |

@@ -48,7 +48,7 @@ def test_vision_enabled_ok():
 
 def test_vision_density_defaults():
     cfg = SlamConfig.from_dict({"base": "b", "lidars": _base_lidars()})
-    assert cfg.vision_rate_hz == 1.0
+    assert cfg.vision_rate_hz == 2.0
     assert cfg.vision_z_min_m == 0.25
     assert cfg.vision_z_max_m == 2.0
     assert cfg.vision_associate_radius_m == 0.25

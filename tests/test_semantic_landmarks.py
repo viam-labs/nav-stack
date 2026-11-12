@@ -205,8 +205,8 @@ def _observe_detector(store, *, n, views, offsets):
     return lm
 
 
-def test_detector_landmark_confirms_on_the_eighth_observation():
-    """Three observations used to confirm a box landmark on one short pass."""
+def test_detector_landmark_confirms_on_the_fifth_observation():
+    """Three observations confirmed a box landmark on one short pass."""
     store = EmbeddingLandmarkMap(
         promote_min_obs=3,
         promote_min_views=2,
@@ -215,12 +215,12 @@ def test_detector_landmark_confirms_on_the_eighth_observation():
     )
     views = ((0.0, 0.0, 0.0), (0.6, 0.0, 0.0))
     offsets = (np.zeros(3), np.array([0.01, 0.0, 0.0]))
-    lm = _observe_detector(store, n=7, views=views, offsets=offsets)
+    lm = _observe_detector(store, n=4, views=views, offsets=offsets)
     assert lm is not None
     assert lm.status == LandmarkStatus.CANDIDATE
-    assert lm.observations == 7
+    assert lm.observations == 4
     lm = _observe_detector(store, n=1, views=views[1:], offsets=offsets)
-    assert lm.observations == 8
+    assert lm.observations == 5
     assert lm.status == LandmarkStatus.CONFIRMED
 
 
@@ -234,15 +234,16 @@ def test_detector_landmark_stays_candidate_above_12cm_scatter():
         associate_radius_m=0.35,
     )
     # Around the first point, inside the association radius, noisy on every axis.
+    # Large enough that the scatter already exceeds 12 cm by the fifth hit.
     offsets = (
         np.zeros(3),
-        np.array([0.20, 0.10, 0.08]),
-        np.array([-0.20, -0.10, -0.08]),
-        np.array([0.10, 0.20, -0.08]),
-        np.array([-0.10, -0.20, 0.08]),
-        np.array([0.08, -0.08, 0.20]),
-        np.array([-0.08, 0.08, -0.20]),
-        np.array([0.15, -0.15, 0.10]),
+        np.array([0.22, 0.11, 0.09]),
+        np.array([-0.22, -0.11, -0.09]),
+        np.array([0.11, 0.22, -0.09]),
+        np.array([-0.11, -0.22, 0.09]),
+        np.array([0.09, -0.09, 0.22]),
+        np.array([-0.09, 0.09, -0.22]),
+        np.array([0.16, -0.16, 0.11]),
     )
     views = ((0.0, 0.0, 0.0), (0.6, 0.0, 0.0))
     lm = _observe_detector(store, n=8, views=views, offsets=offsets)

@@ -1064,8 +1064,9 @@ class SlamConfig:
     # for avoidance). Mount comes from that entry.
     vision_enabled: bool = False
     vision_cameras: List[str] = field(default_factory=list)
-    # Keep ≤1 Hz while surveying — dual RealSense grab+infer was starving nav.
-    vision_rate_hz: float = 1.0
+    # One vision camera at 2 Hz. Surveying two RealSense cameras faster than
+    # this starved nav; round-robin still runs one camera per tick.
+    vision_rate_hz: float = 2.0
     vision_dinov2_onnx: str = ""
     vision_yolo_onnx: str = ""
     vision_head_onnx: str = ""  # optional site-finetuned projection head
