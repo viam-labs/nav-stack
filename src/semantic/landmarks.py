@@ -299,6 +299,9 @@ class EmbeddingLandmarkMap:
     # See ``choose_unique_match``. Same numbers gate pose-fix pairing.
     unique_cosine_margin: float = UNIQUE_COSINE_MARGIN
     unique_distance_margin_m: float = UNIQUE_DISTANCE_MARGIN_M
+    # While the scan match is tracking, blend a confirmed landmark this far
+    # toward a new sighting. One frame must not jump the square.
+    tracking_position_blend: float = 0.2
 
     def __post_init__(self) -> None:
         self._next_id = 1
@@ -372,6 +375,45 @@ class EmbeddingLandmarkMap:
     def _index_add(self, lm: EmbeddingLandmark, map_xyz: np.ndarray) -> None:
         cell = self._cell(map_xyz, self.cell_m)
         self._cell_index.setdefault(cell, []).append(lm.landmark_id)
+
+    def follow_anchors(
+        self,
+        old_poses: Dict[int, conv.Pose2D],
+        new_poses: Dict[int, conv.Pose2D],
+    ) -> int:
+        """Move landmarks with the keyframe they were recorded against.
+
+        ``map_xyz`` stays the displayed point, so a live yaw written into the
+        pose table cannot spin it. This runs only when a pose-graph update
+        reports the node's pose before and after.
+        """
+        moved = 0
+        for lm in list(self._landmarks.values()):
+            old = old_poses.get(int(lm.anchor_node))
+            new = new_poses.get(int(lm.anchor_node))
+            if old is None or new is None or lm.map_xyz is None:
+                continue
+            if (
+                abs(old.x - new.x) <= 1e-9
+                and abs(old.y - new.y) <= 1e-9
+                and abs(conv.normalize_angle(old.theta - new.theta)) <= 1e-9
+            ):
+                continue
+            old_xyz = np.asarray(lm.map_xyz, dtype=float).reshape(3)
+            rel = self.rel_from_map_point(old, old_xyz)
+            new_xyz = self.map_point_from_rel(new, rel)
+            lm._map_samples = [
+                self.map_point_from_rel(
+                    new,
+                    self.rel_from_map_point(old, np.asarray(sample, dtype=float).reshape(3)),
+                )
+                for sample in lm._map_samples
+            ]
+            lm.map_xyz = new_xyz
+            lm.rel_xyz = self.rel_from_map_point(new, new_xyz)
+            self._reindex(lm, new_xyz)
+            moved += 1
+        return moved
 
     def _neighbors(
         self,
@@ -901,6 +943,7 @@ class EmbeddingLandmarkMap:
         from_detector: bool = False,
         extent_m: Optional[float] = None,
         pose_of_node: Optional[Dict[int, conv.Pose2D]] = None,
+        commit_position: bool = True,
     ) -> Optional[EmbeddingLandmark]:
         """Associate or create a landmark from one measured map-frame point.
 
@@ -971,7 +1014,11 @@ class EmbeddingLandmarkMap:
                     extent_m=extent,
                     # Don't poison the confirmed bank with an unrelated crop.
                     bank_descriptor=cos >= 0.20,
+                    commit_position=commit_position,
                 )
+            if not commit_position:
+                # The live pose is in question. Do not store a point from it.
+                return None
             lid = self._next_id
             self._next_id += 1
             rel = self.rel_from_map_point(anchor_pose, map_xyz)
@@ -1013,6 +1060,7 @@ class EmbeddingLandmarkMap:
             poses.get(best.anchor_node),
             from_detector=from_detector,
             extent_m=extent,
+            commit_position=commit_position,
         )
 
     def observe_with_poses(
@@ -1027,6 +1075,7 @@ class EmbeddingLandmarkMap:
         view_xy: Tuple[float, ...],
         from_detector: bool = False,
         extent_m: Optional[float] = None,
+        commit_position: bool = True,
     ) -> Optional[EmbeddingLandmark]:
         """Like ``observe`` but resolves map positions via ``pose_of_node``."""
         map_xyz = np.asarray(map_xyz, dtype=float).reshape(3)
@@ -1065,6 +1114,7 @@ class EmbeddingLandmarkMap:
                 from_detector=from_detector,
                 extent_m=extent,
                 pose_of_node=pose_of_node,
+                commit_position=commit_position,
             )
         self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
         # rel_xyz is only meaningful against the landmark's own anchor.
@@ -1077,6 +1127,7 @@ class EmbeddingLandmarkMap:
             update_pose,
             from_detector=from_detector,
             extent_m=extent,
+            commit_position=commit_position,
         )
 
     def observe_known(
@@ -1089,6 +1140,7 @@ class EmbeddingLandmarkMap:
         view_xy: Tuple[float, ...],
         from_detector: bool = False,
         extent_m: Optional[float] = None,
+        commit_position: bool = True,
     ) -> Optional[EmbeddingLandmark]:
         """Fold an observation into a landmark the previous box already named.
 
@@ -1124,6 +1176,7 @@ class EmbeddingLandmarkMap:
             update_pose,
             from_detector=from_detector,
             extent_m=extent,
+            commit_position=commit_position,
         )
 
     def _update_existing(
@@ -1137,12 +1190,22 @@ class EmbeddingLandmarkMap:
         from_detector: bool = False,
         extent_m: Optional[float] = None,
         bank_descriptor: bool = True,
+        commit_position: bool = True,
     ) -> EmbeddingLandmark:
         """Fold one observation into ``lm``.
 
         ``anchor_pose`` is the pose of ``lm.anchor_node`` (``None`` when
         unknown, which leaves ``rel_xyz`` untouched).
+
+        ``commit_position`` is false while the lidar pose is in question: the
+        descriptor is still banked, and the stored point is left alone.
         """
+        if not commit_position:
+            if from_detector:
+                lm.from_detector = True
+            if bank_descriptor:
+                self._bank_descriptor(lm, descriptor)
+            return lm
         lm.observations += 1
         if from_detector:
             lm.from_detector = True
@@ -1187,7 +1250,31 @@ class EmbeddingLandmarkMap:
             self._try_promote(lm, anchor_pose=anchor_pose)
         elif lm.status == LandmarkStatus.CONFIRMED:
             self._check_moved(lm, map_xyz, pose_hint=anchor_pose)
+            self._blend_confirmed_position(lm, map_xyz, anchor_pose)
         return lm
+
+    def _blend_confirmed_position(
+        self,
+        lm: EmbeddingLandmark,
+        map_xyz: np.ndarray,
+        anchor_pose: Optional[conv.Pose2D],
+    ) -> None:
+        """Pull a confirmed point toward a sighting taken while tracking.
+
+        The sighting is in the map frame of a pose the scan match accepts, so
+        it is a better position than the one frozen at survey time. One frame
+        only moves a fraction of the gap, which keeps the overlay from crawling.
+        """
+        if lm.status != LandmarkStatus.CONFIRMED or lm.map_xyz is None:
+            return
+        old = np.asarray(lm.map_xyz, dtype=float).reshape(3)
+        obs = np.asarray(map_xyz, dtype=float).reshape(3)
+        a = min(1.0, max(0.0, float(self.tracking_position_blend)))
+        blended = (1.0 - a) * old + a * obs
+        lm.map_xyz = blended
+        self._reindex(lm, blended)
+        if anchor_pose is not None and lm.anchor_node >= 0:
+            lm.rel_xyz = self.rel_from_map_point(anchor_pose, blended)
 
     def _bank_descriptor(self, lm: EmbeddingLandmark, descriptor: np.ndarray) -> None:
         """Keep a diverse multi-view descriptor set for drive-by re-ID."""

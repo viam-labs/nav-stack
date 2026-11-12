@@ -2702,6 +2702,13 @@ class SlamService(SLAM):
             state = str(getattr(self._loc_state, "state", "") or "")
             return state in ("lost", "unknown")
 
+        def _is_pose_in_question() -> bool:
+            # Landmark writeback while the scan match is tracking fights the
+            # lidar and comes back every cooldown. Lost, degraded, unknown,
+            # and map-mismatch are the states where that pose is in question.
+            state = str(getattr(self._loc_state, "state", "") or "")
+            return state in ("lost", "unknown", "degraded", "map_mismatch")
+
         def _add_landmark_loop(pose, anchor, *, score=None):
             return engine.add_landmark_loop(pose, anchor, score=score)
 
@@ -2713,6 +2720,7 @@ class SlamService(SLAM):
             get_anchor=_anchor,
             apply_pose_correction=_apply_pose_correction,
             is_localization_lost=_is_localization_lost,
+            is_pose_in_question=_is_pose_in_question,
             get_node_travel=engine.vision_node_travel,
             add_landmark_loop=_add_landmark_loop,
             note_paint_discs=engine.note_paint_discs,
@@ -2724,6 +2732,7 @@ class SlamService(SLAM):
             vision.load_from_map_dir(handle.root)
         vision.start(loop)
         self._vision = vision
+        engine.set_anchor_motion_hook(vision.follow_anchor_motion)
 
     async def close(self) -> None:
         self._cancel_startup_global_localize_task()

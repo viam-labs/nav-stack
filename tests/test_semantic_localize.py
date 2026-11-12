@@ -204,6 +204,43 @@ def test_place_retrieval_skipped_while_tracking():
     assert called == []
 
 
+def test_writeback_skipped_while_lidar_is_tracking():
+    """A healthy scan match keeps the pose; landmarks must not nudge it."""
+    cfg = _cfg(
+        mode="localizing",
+        vision_survey_only=False,
+        vision_pose_writeback=True,
+    )
+    pose = Pose2D(0.0, 0.0, 0.0)
+    called = []
+
+    def apply(p, *, score=None, force=False):
+        called.append(p)
+        return {"applied": True, "status": "pose_only"}
+
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: pose,
+        get_pose_at=lambda _t: pose,
+        get_anchor=lambda: (0, pose, {0: pose}),
+        apply_pose_correction=apply,
+        is_pose_in_question=lambda: False,
+    )
+    vision._worker.cfg.synthetic = False  # noqa: SLF001
+    frame = VisionFrame(
+        camera_name="depth-cam",
+        stamp=0.0,
+        captured_at=0.0,
+        color_rgb=np.zeros((8, 8, 3), dtype=np.uint8),
+        depth_m=np.ones((8, 8), dtype=np.float32),
+        intrinsics=CameraIntrinsics(fx=8, fy=8, cx=4, cy=4, width=8, height=8),
+    )
+    vision._try_pose_writeback(frame, [], pose, {0: pose})  # noqa: SLF001
+    assert called == []
+    assert vision.status()["writeback"]["last"]["status"] == "skipped_tracking"
+
+
 def test_place_retrieval_applies_when_lost_large_jump():
     """Lost: relative jump cap dropped; strong score may teleport."""
     cfg = _cfg(

@@ -1130,3 +1130,103 @@ def test_box_track_follows_overlap_and_refuses_a_tie():
     )
     assert tied == {}
 
+
+def test_follow_anchors_moves_the_landmark_with_its_keyframe():
+    """A pose-graph update carries the landmark by the same motion as its node."""
+    store = EmbeddingLandmarkMap(promote_min_obs=99)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    lm = store.observe(
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptor=desc,
+        normal_map=np.array([-1.0, 0.0, 0.0]),
+        anchor_node=3,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+    )
+    moved = Pose2D(1.0, 0.5, 0.0)
+    n = store.follow_anchors({3: anchor}, {3: moved})
+    assert n == 1
+    np.testing.assert_allclose(lm.map_xyz, [3.0, 0.5, 1.0], atol=1e-6)
+    np.testing.assert_allclose(
+        EmbeddingLandmarkMap.map_point_from_rel(moved, lm.rel_xyz),
+        lm.map_xyz,
+        atol=1e-6,
+    )
+
+
+def test_untrusted_pose_does_not_store_a_landmark_position():
+    """A jumped pose may refresh the descriptor and must not move the point."""
+    store = EmbeddingLandmarkMap(promote_min_obs=99, require_descriptor_match=True)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    other = l2_normalize(np.array([0.9, 0.4359, 0.0, 0.0], dtype=np.float32))
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0])
+    lm = store.observe(
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptor=desc,
+        normal_map=normal,
+        anchor_node=1,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+        commit_position=True,
+    )
+    lm.status = LandmarkStatus.CONFIRMED
+    again = store.observe(
+        map_xyz=np.array([2.4, 0.0, 1.0]),
+        descriptor=other,
+        normal_map=normal,
+        anchor_node=1,
+        anchor_pose=anchor,
+        view_xy=(0.3, 0.0, 0.0),
+        commit_position=False,
+    )
+    assert again is not None and again.landmark_id == lm.landmark_id
+    np.testing.assert_allclose(lm.map_xyz, [2.0, 0.0, 1.0], atol=1e-6)
+    assert lm.observations == 1
+    fresh = store.observe(
+        map_xyz=np.array([4.0, 0.0, 1.0]),
+        descriptor=other,
+        normal_map=normal,
+        anchor_node=1,
+        anchor_pose=anchor,
+        view_xy=(1.0, 0.0, 0.0),
+        commit_position=False,
+    )
+    assert fresh is None
+    assert len(store) == 1
+
+
+def test_tracking_sighting_blends_a_confirmed_landmark():
+    store = EmbeddingLandmarkMap(
+        promote_min_obs=99,
+        require_descriptor_match=True,
+        tracking_position_blend=0.2,
+    )
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    lm = store.observe(
+        map_xyz=np.array([2.0, 0.0, 1.0]),
+        descriptor=desc,
+        normal_map=np.array([-1.0, 0.0, 0.0]),
+        anchor_node=1,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+    )
+    lm.status = LandmarkStatus.CONFIRMED
+    store.observe(
+        map_xyz=np.array([2.2, 0.0, 1.0]),
+        descriptor=desc,
+        normal_map=np.array([-1.0, 0.0, 0.0]),
+        anchor_node=1,
+        anchor_pose=anchor,
+        view_xy=(0.4, 0.0, 0.0),
+        commit_position=True,
+    )
+    assert lm.map_xyz[0] == pytest.approx(2.04, abs=1e-6)
+    np.testing.assert_allclose(
+        EmbeddingLandmarkMap.map_point_from_rel(anchor, lm.rel_xyz),
+        lm.map_xyz,
+        atol=1e-6,
+    )
+

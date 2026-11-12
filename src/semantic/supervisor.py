@@ -99,6 +99,7 @@ class VisionSupervisor:
         get_anchor: AnchorProvider,
         apply_pose_correction: Optional[PoseCorrection] = None,
         is_localization_lost: Optional[LocLostProvider] = None,
+        is_pose_in_question: Optional[LocLostProvider] = None,
         get_node_travel: Optional[NodeTravelProvider] = None,
         add_landmark_loop: Optional[LandmarkLoop] = None,
         note_paint_discs: Optional[PaintDiscNote] = None,
@@ -111,6 +112,7 @@ class VisionSupervisor:
         self._get_anchor = get_anchor
         self._apply_pose_correction = apply_pose_correction
         self._is_localization_lost = is_localization_lost
+        self._is_pose_in_question = is_pose_in_question
         self._get_node_travel = get_node_travel
         self._add_landmark_loop = add_landmark_loop
         self._note_paint_discs = note_paint_discs
@@ -996,6 +998,47 @@ class VisionSupervisor:
             self._cfg.vision_place_keyframe_min_gap_deg
         )
 
+    def _pose_in_question(self) -> bool:
+        """True when the lidar pose should not veto a vision correction.
+
+        Tracking means the scan match is holding the pose, so landmark
+        writeback stays quiet. Lost, unknown, degraded, and map-mismatch
+        are the states where the landmarks may move it. Callers without a
+        tracker (tests) allow writeback.
+        """
+        fn = self._is_pose_in_question
+        if fn is None:
+            return True
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _commit_landmark_position(self) -> bool:
+        """Record a landmark position only from a pose the map accepts.
+
+        Mapping is that pose. While localizing, a tracking scan match is too,
+        and a lost or degraded pose is not.
+        """
+        if str(self._cfg.mode) == MODE_MAPPING or bool(self._cfg.vision_survey_only):
+            return True
+        fn = self._is_pose_in_question
+        if fn is None:
+            return True
+        try:
+            return not bool(fn())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def follow_anchor_motion(
+        self,
+        old_poses: Dict[int, conv.Pose2D],
+        new_poses: Dict[int, conv.Pose2D],
+    ) -> None:
+        """Pose-graph update: landmarks move with their anchor keyframe."""
+        with self._lock:
+            self._landmarks.follow_anchors(old_poses, new_poses)
+
     def _localization_lost(self) -> bool:
         """True when SLAM says lost/unknown — the only time place may apply."""
         fn = self._is_localization_lost
@@ -1526,6 +1569,7 @@ class VisionSupervisor:
                         min_cosine=float(self._landmarks.candidate_cosine_threshold),
                     )
             new_tracks: List[dict] = []
+            commit_position = self._commit_landmark_position()
             for i, o in enumerate(obs):
                 # Map-frame point from capture pose.
                 c, s = float(np.cos(pose.theta)), float(np.sin(pose.theta))
@@ -1557,6 +1601,7 @@ class VisionSupervisor:
                         view_xy=view_xy,
                         from_detector=True,
                         extent_m=getattr(o, "extent_m", None),
+                        commit_position=commit_position,
                     )
                 if lm is None:
                     lm = self._landmarks.observe_with_poses(
@@ -1569,10 +1614,13 @@ class VisionSupervisor:
                         view_xy=view_xy,
                         from_detector=i < n_det,
                         extent_m=getattr(o, "extent_m", None),
+                        commit_position=commit_position,
                     )
                 if lm is None:
                     if i < n_det and i in box_of_obs:
-                        box_of_obs[i]["text"] = "ambiguous"
+                        box_of_obs[i]["text"] = (
+                            "ambiguous" if commit_position else "pose"
+                        )
                     continue
                 if i < n_det and i in box_of_obs:
                     box = box_of_obs[i]
@@ -1868,9 +1916,17 @@ class VisionSupervisor:
         pose: conv.Pose2D,
         pose_of_node: Dict[int, conv.Pose2D],
     ) -> None:
-        """Soft landmark fix → apply_map_pose_correction (never force)."""
+        """Soft landmark fix → apply_map_pose_correction (never force).
+
+        Only while the lidar pose is in question. A tracking scan match is
+        pulled back to the occupancy map within a tick, so applying the same
+        landmark offset on every cooldown just oscillates the pose.
+        """
         apply = self._apply_pose_correction
         if apply is None:
+            return
+        if not self._pose_in_question():
+            self._last_writeback = {"status": "skipped_tracking"}
             return
         now = time.monotonic()
         cooldown = float(self._cfg.vision_pose_writeback_cooldown_s)
