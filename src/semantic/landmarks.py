@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -17,6 +17,128 @@ AUDIT_SEEN_THROUGH = "seen_through"  # the camera sees well past the stored poin
 AUDIT_OCCLUDED = "occluded"  # something nearer is in the way
 AUDIT_NO_DEPTH = "no_depth"  # too few valid depth pixels to judge
 AUDIT_UNCLEAR = "unclear"  # mixed readings, no verdict
+
+
+# A match is refused when another landmark's embedding is this close and the
+# two are not clearly separated in distance. Similar nearby objects then stay
+# unmatched instead of stealing an id.
+UNIQUE_COSINE_MARGIN = 0.08
+UNIQUE_DISTANCE_MARGIN_M = 0.15
+# Short-term identity between 1 Hz surveys: a box keeps its landmark when it
+# still overlaps the previous box and the embedding still agrees.
+TRACK_MIN_IOU = 0.25
+TRACK_IOU_MARGIN = 0.15
+
+
+def choose_unique_match(
+    scored: Sequence[Tuple[Any, float, float]],
+    *,
+    cosine_margin: float,
+    distance_margin_m: float,
+):
+    """Pick one ``(item, cosine, distance)`` row, or refuse a tie.
+
+    The higher cosine wins when it leads by ``cosine_margin``. Among rows
+    that close, the nearer one wins when it is closer by ``distance_margin_m``.
+    A tie on both returns ``None``.
+    """
+    if not scored:
+        return None
+    best_cos = max(float(row[1]) for row in scored)
+    margin = float(cosine_margin)
+    tied = [
+        row
+        for row in scored
+        if float(row[1]) == best_cos or best_cos - float(row[1]) < margin
+    ]
+    tied.sort(key=lambda row: float(row[2]))
+    if len(tied) == 1:
+        return tied[0][0]
+    if float(tied[1][2]) - float(tied[0][2]) >= float(distance_margin_m):
+        return tied[0][0]
+    return None
+
+
+def box_iou(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> float:
+    """Intersection-over-union of two ``(x0, y0, x1, y1)`` boxes."""
+    ax0, ay0, ax1, ay1 = (float(v) for v in a)
+    bx0, by0, bx1, by1 = (float(v) for v in b)
+    if ax1 < ax0:
+        ax0, ax1 = ax1, ax0
+    if ay1 < ay0:
+        ay0, ay1 = ay1, ay0
+    if bx1 < bx0:
+        bx0, bx1 = bx1, bx0
+    if by1 < by0:
+        by0, by1 = by1, by0
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return float(inter / union)
+
+
+def assign_box_tracks(
+    boxes: Sequence[Tuple[int, Tuple[float, float, float, float], np.ndarray]],
+    tracks: Sequence[dict],
+    *,
+    cosine_of: Callable[[int, np.ndarray], float],
+    min_iou: float = TRACK_MIN_IOU,
+    iou_margin: float = TRACK_IOU_MARGIN,
+    min_cosine: float = 0.35,
+) -> Dict[int, int]:
+    """Bind this frame's boxes to the previous frame's boxes.
+
+    ``boxes`` is ``(index, xyxy, descriptor)``. Each track has ``xyxy`` and
+    ``landmark_id``. A box keeps a landmark only when its overlap leads every
+    other landmark by ``iou_margin`` and ``cosine_of`` still clears
+    ``min_cosine``. Two boxes cannot take the same landmark.
+    """
+    by_index: Dict[int, List[Tuple[float, int]]] = {}
+    for index, xyxy, desc in boxes:
+        desc_arr = np.asarray(desc, dtype=float).reshape(-1)
+        for tr in tracks:
+            iou = box_iou(xyxy, tuple(tr["xyxy"]))  # type: ignore[arg-type]
+            if iou < float(min_iou):
+                continue
+            lid = int(tr["landmark_id"])
+            if float(cosine_of(lid, desc_arr)) < float(min_cosine):
+                continue
+            by_index.setdefault(int(index), []).append((iou, lid))
+    proposals: List[Tuple[float, int, int]] = []
+    for index, hits in by_index.items():
+        hits.sort(key=lambda row: row[0], reverse=True)
+        best_iou, best_lid = hits[0]
+        refused = False
+        for other_iou, other_lid in hits[1:]:
+            if other_lid == best_lid:
+                continue
+            if best_iou - other_iou < float(iou_margin):
+                refused = True
+            break
+        if refused:
+            continue
+        proposals.append((best_iou, int(index), int(best_lid)))
+    proposals.sort(key=lambda row: row[0], reverse=True)
+    used_index: set = set()
+    used_lid: set = set()
+    assigned: Dict[int, int] = {}
+    for _iou, index, lid in proposals:
+        if index in used_index or lid in used_lid:
+            continue
+        assigned[index] = lid
+        used_index.add(index)
+        used_lid.add(lid)
+    return assigned
 
 
 def display_label(lm: "EmbeddingLandmark") -> str:
@@ -173,6 +295,9 @@ class EmbeddingLandmarkMap:
     # disagreement was dropping real objects.
     see_through_keep_min_obs: int = 30
     see_through_keep_gap_m: float = 1.2
+    # See ``choose_unique_match``. Same numbers gate pose-fix pairing.
+    unique_cosine_margin: float = UNIQUE_COSINE_MARGIN
+    unique_distance_margin_m: float = UNIQUE_DISTANCE_MARGIN_M
 
     def __post_init__(self) -> None:
         self._next_id = 1
@@ -185,6 +310,8 @@ class EmbeddingLandmarkMap:
         self._assoc_misses = 0
         self._assoc_soft_hits = 0
         self._assoc_overlap_absorbs = 0
+        self._assoc_ambiguous = 0
+        self._assoc_tracks = 0
         self._overlap_merges = 0
 
     def rebuild_cell_index(self) -> None:
@@ -376,9 +503,14 @@ class EmbeddingLandmarkMap:
         same_anchor: Optional[int] = None,
         fallback_pose: Optional[conv.Pose2D] = None,
         from_detector: bool = False,
-    ) -> Optional[EmbeddingLandmark]:
-        best: Optional[EmbeddingLandmark] = None
-        best_score = float("inf")
+    ) -> Tuple[Optional[EmbeddingLandmark], bool]:
+        """Return ``(match, ambiguous)``.
+
+        ``ambiguous`` means more than one landmark cleared the gate and neither
+        the embedding nor the distance separated them. The caller must not
+        mint a new id in that case.
+        """
+        scored: List[Tuple[EmbeddingLandmark, float, float]] = []
         for lm in neighbors:
             if same_anchor is not None and lm.anchor_node != same_anchor:
                 continue
@@ -405,16 +537,39 @@ class EmbeddingLandmarkMap:
             ):
                 continue
             cos = self._best_desc_cosine(lm, descriptor)
-            # Descriptor agreement dominates so nearby wrong patches do not
-            # steal an ID; distance is a secondary tie-break. Prefer detector
-            # landmarks when the observation is detector-anchored.
-            score = -cos + 0.15 * dist
-            if from_detector and bool(lm.from_detector):
-                score -= 0.05
-            if score < best_score:
-                best_score = score
-                best = lm
-        return best
+            scored.append((lm, cos, dist))
+        if not scored:
+            return None, False
+        # Synthetic RGB has no real descriptor. Keep the old nearest-wins score.
+        if not self.require_descriptor_match:
+            best: Optional[EmbeddingLandmark] = None
+            best_score = float("inf")
+            for lm, cos, dist in scored:
+                score = -cos + 0.15 * dist
+                if from_detector and bool(lm.from_detector):
+                    score -= 0.05
+                if score < best_score:
+                    best_score = score
+                    best = lm
+            return best, False
+        margin = float(self.unique_cosine_margin)
+        dist_margin = float(self.unique_distance_margin_m)
+        picked = choose_unique_match(
+            scored, cosine_margin=margin, distance_margin_m=dist_margin
+        )
+        if picked is not None:
+            return picked, False
+        # A detector box prefers another detector landmark when a dense patch
+        # is the thing making the embedding look tied.
+        if from_detector:
+            det_scored = [row for row in scored if bool(row[0].from_detector)]
+            if 0 < len(det_scored) < len(scored):
+                picked = choose_unique_match(
+                    det_scored, cosine_margin=margin, distance_margin_m=dist_margin
+                )
+                if picked is not None:
+                    return picked, False
+        return None, True
 
     def _note_association(
         self,
@@ -745,8 +900,11 @@ class EmbeddingLandmarkMap:
         from_detector: bool = False,
         extent_m: Optional[float] = None,
         pose_of_node: Optional[Dict[int, conv.Pose2D]] = None,
-    ) -> EmbeddingLandmark:
+    ) -> Optional[EmbeddingLandmark]:
         """Associate or create a landmark from one measured map-frame point.
+
+        Returns ``None`` when two landmarks match and neither the embedding
+        nor the distance separates them. Nothing is minted in that case.
 
         ``pose_of_node`` lets an update find the matched landmark's own anchor
         pose; without it only landmarks on ``anchor_node`` refresh ``rel_xyz``.
@@ -767,7 +925,7 @@ class EmbeddingLandmarkMap:
         )
         if from_detector:
             search_r = max(search_r, 0.55)
-        best = self._pick_best_neighbor(
+        best, ambiguous = self._pick_best_neighbor(
             self._neighbors(
                 map_xyz, radius_m=search_r, include_moved=bool(from_detector)
             ),
@@ -779,6 +937,10 @@ class EmbeddingLandmarkMap:
             fallback_pose=anchor_pose,
             from_detector=from_detector,
         )
+        if ambiguous:
+            self._assoc_ambiguous += 1
+            self._note_association(None, map_xyz=map_xyz, descriptor=descriptor)
+            return None
         self._note_association(best, map_xyz=map_xyz, descriptor=descriptor)
 
         if best is None:
@@ -864,7 +1026,7 @@ class EmbeddingLandmarkMap:
         view_xy: Tuple[float, ...],
         from_detector: bool = False,
         extent_m: Optional[float] = None,
-    ) -> EmbeddingLandmark:
+    ) -> Optional[EmbeddingLandmark]:
         """Like ``observe`` but resolves map positions via ``pose_of_node``."""
         map_xyz = np.asarray(map_xyz, dtype=float).reshape(3)
         descriptor = np.asarray(descriptor, dtype=np.float32).reshape(-1)
@@ -876,7 +1038,7 @@ class EmbeddingLandmarkMap:
         )
         if from_detector:
             search_r = max(search_r, 0.55)
-        best = self._pick_best_neighbor(
+        best, ambiguous = self._pick_best_neighbor(
             self._neighbors(
                 map_xyz, radius_m=search_r, include_moved=bool(from_detector)
             ),
@@ -886,6 +1048,10 @@ class EmbeddingLandmarkMap:
             fallback_pose=anchor_pose,
             from_detector=from_detector,
         )
+        if ambiguous:
+            self._assoc_ambiguous += 1
+            self._note_association(None, map_xyz=map_xyz, descriptor=descriptor)
+            return None
         if best is None:
             # Fall through to observe() which notes its own association attempt.
             return self.observe(
@@ -904,6 +1070,53 @@ class EmbeddingLandmarkMap:
         update_pose = pose_of_node.get(best.anchor_node)
         return self._update_existing(
             best,
+            map_xyz,
+            descriptor,
+            view,
+            update_pose,
+            from_detector=from_detector,
+            extent_m=extent,
+        )
+
+    def observe_known(
+        self,
+        landmark_id: int,
+        *,
+        map_xyz: np.ndarray,
+        descriptor: np.ndarray,
+        pose_of_node: Optional[Dict[int, conv.Pose2D]],
+        view_xy: Tuple[float, ...],
+        from_detector: bool = False,
+        extent_m: Optional[float] = None,
+    ) -> Optional[EmbeddingLandmark]:
+        """Fold an observation into a landmark the previous box already named.
+
+        The short-term track is what separates two similar objects. This skips
+        the geometric search. The embedding still has to clear the candidate
+        cosine, so a different object that slid into the box does not inherit
+        the id. Returns ``None`` when the landmark is gone or the embedding
+        disagrees.
+        """
+        lm = self.get(int(landmark_id))
+        if lm is None:
+            return None
+        map_xyz = np.asarray(map_xyz, dtype=float).reshape(3)
+        descriptor = np.asarray(descriptor, dtype=np.float32).reshape(-1)
+        if self.require_descriptor_match:
+            need = float(self.candidate_cosine_threshold)
+            if from_detector and bool(lm.from_detector):
+                need = min(need, 0.30)
+            if self._best_desc_cosine(lm, descriptor) < need:
+                return None
+        view = self._normalize_view(view_xy)
+        extent = float(extent_m) if extent_m is not None and float(extent_m) > 0 else None
+        self._note_association(lm, map_xyz=map_xyz, descriptor=descriptor)
+        self._assoc_tracks += 1
+        update_pose = None
+        if pose_of_node is not None:
+            update_pose = pose_of_node.get(lm.anchor_node)
+        return self._update_existing(
+            lm,
             map_xyz,
             descriptor,
             view,
@@ -1237,6 +1450,8 @@ class EmbeddingLandmarkMap:
             "assoc_misses": misses,
             "assoc_soft_hits": int(self._assoc_soft_hits),
             "assoc_overlap_absorbs": int(self._assoc_overlap_absorbs),
+            "assoc_ambiguous": int(self._assoc_ambiguous),
+            "assoc_tracks": int(self._assoc_tracks),
             "overlap_merges": int(self._overlap_merges),
             "seen_through_flagged": len(self.seen_through_ids()),
             "seen_through_removed": int(self._seen_through_removed),

@@ -88,6 +88,48 @@ def test_match_and_fit_recovers_pose():
     assert fix.fit.pose.theta == pytest.approx(true.theta, abs=0.08)
 
 
+def test_match_skips_tied_embeddings():
+    """Two landmarks with the same embedding and similar range stay unpaired."""
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+
+    def visible_at(*xs):
+        rows = []
+        for i, x in enumerate(xs):
+            lm = EmbeddingLandmark(
+                landmark_id=i + 1,
+                anchor_node=0,
+                rel_xyz=np.array([x, 0.0, 1.0]),
+                normal_rel=np.array([-1.0, 0.0, 0.0]),
+                descriptors=[desc],
+                observations=5,
+                status=LandmarkStatus.CONFIRMED,
+                from_detector=True,
+            )
+            rows.append((lm, np.array([x, 0.0, 1.0])))
+        return rows
+
+    live, _map, _w, ids = match_live_to_landmarks(
+        [_obs(2.05, 0.0, 1.0, desc)],
+        visible_at(2.00, 2.10),
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        cosine_threshold=0.55,
+        max_reproj_m=0.45,
+    )
+    assert live.shape[0] == 0
+    assert ids == []
+
+    separated, _map, _w, ids = match_live_to_landmarks(
+        [_obs(2.00, 0.0, 1.0, desc)],
+        visible_at(2.00, 2.30),
+        robot_pose=Pose2D(0.0, 0.0, 0.0),
+        cosine_threshold=0.55,
+        max_reproj_m=0.45,
+    )
+    assert separated.shape[0] == 1
+    assert ids == [1]
+
+
+
 def _cfg(**extra) -> SlamConfig:
     d = {
         "base": "b",

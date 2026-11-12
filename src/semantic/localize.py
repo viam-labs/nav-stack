@@ -10,7 +10,13 @@ import numpy as np
 
 from ..geom import conversions as conv
 from .fit import RigidFitResult, fit_rigid_2d
-from .landmarks import EmbeddingLandmark, EmbeddingLandmarkMap
+from .landmarks import (
+    UNIQUE_COSINE_MARGIN,
+    UNIQUE_DISTANCE_MARGIN_M,
+    EmbeddingLandmark,
+    EmbeddingLandmarkMap,
+    choose_unique_match,
+)
 from .patches import PatchObservation
 
 
@@ -49,10 +55,15 @@ def match_live_to_landmarks(
     cosine_threshold: float,
     max_reproj_m: Optional[float] = 0.45,
     detector_cosine_threshold: float = 0.30,
+    unique_cosine_margin: float = UNIQUE_COSINE_MARGIN,
+    unique_distance_margin_m: float = UNIQUE_DISTANCE_MARGIN_M,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int]]:
-    """Greedy 1:1 match of live base_link patches to visible map landmarks.
+    """1:1 match of live base_link patches to visible map landmarks.
 
-    Returns ``(live_xy, map_xy, weights, paired_ids)``.
+    A pair is kept only when its embedding leads the next landmark by
+    ``unique_cosine_margin``, or the nearer landmark is clearly nearer.
+    A tie is left unpaired so two similar objects cannot both explain one
+    patch. Returns ``(live_xy, map_xy, weights, paired_ids)``.
     Empty arrays / empty ids when nothing matched.
 
     ``max_reproj_m`` drops a landmark whose stored point is farther than that
@@ -88,23 +99,21 @@ def match_live_to_landmarks(
             ],
             dtype=float,
         )
-        best_i = -1
-        best_cos = -1.0
-        best_map: Optional[np.ndarray] = None
         hard = float(cosine_threshold)
         soft = min(hard, 0.35)
         gate = None if max_reproj_m is None else float(max_reproj_m)
         soft_dist = 0.0 if gate is None else 0.7 * gate
         det_thr = float(detector_cosine_threshold)
+        scored: List[Tuple[int, float, float]] = []
         for i, (lm, mxyz) in enumerate(visible):
             if lm.landmark_id in used_lm:
                 continue
+            dist = math.hypot(
+                float(mxyz[0]) - pred_map[0], float(mxyz[1]) - pred_map[1]
+            )
             if gate is None:
                 need = hard
             else:
-                dist = math.hypot(
-                    float(mxyz[0]) - pred_map[0], float(mxyz[1]) - pred_map[1]
-                )
                 if dist > gate:
                     continue
                 need = soft if dist <= soft_dist else hard
@@ -113,12 +122,17 @@ def match_live_to_landmarks(
             cos = _best_desc_cosine(lm, desc)
             if cos < need:
                 continue
-            if cos > best_cos:
-                best_cos = cos
-                best_i = i
-                best_map = np.asarray(mxyz[:2], dtype=float)
-        if best_i < 0 or best_map is None:
+            scored.append((i, cos, dist))
+        chosen = choose_unique_match(
+            scored,
+            cosine_margin=float(unique_cosine_margin),
+            distance_margin_m=float(unique_distance_margin_m),
+        )
+        if chosen is None:
             continue
+        best_i = int(chosen)
+        best_cos = next(cos for i, cos, _dist in scored if i == best_i)
+        best_map = np.asarray(visible[best_i][1][:2], dtype=float)
         lm = visible[best_i][0]
         used_lm.add(lm.landmark_id)
         live_rows.append(np.asarray(pb[:2], dtype=float))
@@ -223,6 +237,8 @@ def estimate_landmark_fix(
     max_jump_m: float = 1.5,
     max_jump_deg: float = 25.0,
     max_reproj_m: Optional[float] = 0.45,
+    unique_cosine_margin: float = UNIQUE_COSINE_MARGIN,
+    unique_distance_margin_m: float = UNIQUE_DISTANCE_MARGIN_M,
     rng: Optional[np.random.Generator] = None,
 ) -> LandmarkPoseAttempt:
     """Pair -> rigid fit -> jump gate. ``fix`` is set only when trusted."""
@@ -233,6 +249,8 @@ def estimate_landmark_fix(
         cosine_threshold=cosine_threshold,
         max_reproj_m=max_reproj_m,
         detector_cosine_threshold=0.30,
+        unique_cosine_margin=unique_cosine_margin,
+        unique_distance_margin_m=unique_distance_margin_m,
     )
     pairs = int(live_xy.shape[0])
     if pairs < int(min_inliers):

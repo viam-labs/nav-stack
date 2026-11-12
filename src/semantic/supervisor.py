@@ -25,7 +25,7 @@ from .detect_landmarks import (
     describe_box_outcome,
     observations_from_detections,
 )
-from .landmarks import AUDIT_SEEN_THROUGH, EmbeddingLandmarkMap, display_label
+from .landmarks import AUDIT_SEEN_THROUGH, EmbeddingLandmarkMap, assign_box_tracks, display_label
 from .localize import (
     diagnose_landmark_match,
     estimate_landmark_fix,
@@ -174,6 +174,9 @@ class VisionSupervisor:
         # What became of each box in the last surveyed frame (for the overlay
         # and landmark_audit): ``{"result": VisionResult, "boxes": [...]}``.
         self._last_boxes: Optional[dict] = None
+        # Previous survey's detector boxes that received a landmark, so the
+        # next frame can keep that identity when the box still overlaps.
+        self._prev_box_tracks: List[dict] = []
         # Depth audit of stored landmarks against each survey frame.
         self._audit_frames = 0
         self._audit_pose_suspect_frames = 0
@@ -359,6 +362,8 @@ class VisionSupervisor:
                     self._landmarks.candidate_cosine_threshold
                 )
                 loaded.cosine_threshold = self._landmarks.cosine_threshold
+                loaded.unique_cosine_margin = self._landmarks.unique_cosine_margin
+                loaded.unique_distance_margin_m = self._landmarks.unique_distance_margin_m
                 loaded.demote_passes = self._landmarks.demote_passes
                 loaded.rebuild_cell_index()
                 self._landmarks = loaded
@@ -413,6 +418,7 @@ class VisionSupervisor:
             self._last_box_depth = {}
             self._box_label_counts = {}
             self._last_boxes = None
+            self._prev_box_tracks = []
             self._audit_frames = 0
             self._audit_pose_suspect_frames = 0
             self._last_audit = None
@@ -455,6 +461,7 @@ class VisionSupervisor:
             self._last_box_depth = {}
             self._box_label_counts = {}
             self._last_boxes = None
+            self._prev_box_tracks = []
             self._audit_frames = 0
             self._audit_pose_suspect_frames = 0
             self._last_audit = None
@@ -1142,6 +1149,8 @@ class VisionSupervisor:
         with self._lock:
             hits = self._place.query(descs, top_k=_PLACE_SEED_TOP_K)
             cosine_thr = float(self._landmarks.cosine_threshold)
+            unique_cos = float(self._landmarks.unique_cosine_margin)
+            unique_dist = float(self._landmarks.unique_distance_margin_m)
             if hits:
                 top = float(hits[0][2])
                 chosen = [hits[0]]
@@ -1191,6 +1200,8 @@ class VisionSupervisor:
                     float(self._cfg.landmark_fix_residual_m), _LOST_FIT_RESIDUAL_M
                 ),
                 max_reproj_m=None,
+                unique_cosine_margin=unique_cos,
+                unique_distance_margin_m=unique_dist,
             )
             fix = attempt.fix
             if fix is None:
@@ -1387,6 +1398,12 @@ class VisionSupervisor:
                         ),
                         "landmark_id": None,
                         "landmark": None,
+                        "xyxy": (
+                            float(det.x0),
+                            float(det.y0),
+                            float(det.x1),
+                            float(det.y1),
+                        ),
                     }
                 )
         with self._lock:
@@ -1471,6 +1488,30 @@ class VisionSupervisor:
             if note.get("obs_index") is not None
         }
         with self._lock:
+            track_of: Dict[int, int] = {}
+            if n_det and self._prev_box_tracks:
+                track_items = []
+                for i in range(n_det):
+                    box = box_of_obs.get(i)
+                    if box is None or "xyxy" not in box:
+                        continue
+                    track_items.append((i, box["xyxy"], obs[i].token.descriptor))
+                if track_items:
+                    landmarks = self._landmarks
+
+                    def _track_cosine(lid: int, desc: np.ndarray) -> float:
+                        lm = landmarks.get(int(lid))
+                        if lm is None:
+                            return -1.0
+                        return landmarks._best_desc_cosine(lm, desc)  # noqa: SLF001
+
+                    track_of = assign_box_tracks(
+                        track_items,
+                        self._prev_box_tracks,
+                        cosine_of=_track_cosine,
+                        min_cosine=float(self._landmarks.candidate_cosine_threshold),
+                    )
+            new_tracks: List[dict] = []
             for i, o in enumerate(obs):
                 # Map-frame point from capture pose.
                 c, s = float(np.cos(pose.theta)), float(np.sin(pose.theta))
@@ -1491,27 +1532,62 @@ class VisionSupervisor:
                     ],
                     dtype=float,
                 )
-                lm = self._landmarks.observe_with_poses(
-                    map_xyz=map_xyz,
-                    descriptor=o.token.descriptor,
-                    normal_map=n_map,
-                    anchor_node=int(anchor_node),
-                    anchor_pose=anchor_pose,
-                    pose_of_node=pose_of_node,
-                    view_xy=view_xy,
-                    from_detector=i < n_det,
-                    extent_m=getattr(o, "extent_m", None),
-                )
+                forced = track_of.get(i)
+                lm = None
+                if forced is not None:
+                    lm = self._landmarks.observe_known(
+                        forced,
+                        map_xyz=map_xyz,
+                        descriptor=o.token.descriptor,
+                        pose_of_node=pose_of_node,
+                        view_xy=view_xy,
+                        from_detector=True,
+                        extent_m=getattr(o, "extent_m", None),
+                    )
+                if lm is None:
+                    lm = self._landmarks.observe_with_poses(
+                        map_xyz=map_xyz,
+                        descriptor=o.token.descriptor,
+                        normal_map=n_map,
+                        anchor_node=int(anchor_node),
+                        anchor_pose=anchor_pose,
+                        pose_of_node=pose_of_node,
+                        view_xy=view_xy,
+                        from_detector=i < n_det,
+                        extent_m=getattr(o, "extent_m", None),
+                    )
+                if lm is None:
+                    if i < n_det and i in box_of_obs:
+                        box_of_obs[i]["text"] = "ambiguous"
+                    continue
                 if i < n_det and i in box_of_obs:
-                    box_of_obs[i]["landmark_id"] = int(lm.landmark_id)
+                    box = box_of_obs[i]
+                    box["landmark_id"] = int(lm.landmark_id)
+                    xyxy = box.get("xyxy")
+                    if xyxy is not None:
+                        new_tracks.append(
+                            {
+                                "xyxy": xyxy,
+                                "landmark_id": int(lm.landmark_id),
+                            }
+                        )
                 n_new += 1
             # Collapse detector twins that both made it to confirmed/candidate
             # on the same object (e.g. DC1 + DC12 stacked on one painting).
             self._landmarks.merge_overlapping_detector_landmarks()
+            kept_tracks = [
+                tr
+                for tr in new_tracks
+                if self._landmarks.get(tr["landmark_id"]) is not None
+            ]
+            self._prev_box_tracks = kept_tracks if n_det else []
             self._observations += n_new
             # Name each used box after the landmark it fed. One folded into a
             # twin just now no longer exists; the box then stays unnamed.
+            # A tie that was refused keeps the "ambiguous" text set above.
             for box in box_of_obs.values():
+                if box.get("landmark_id") is None:
+                    continue
                 lm = self._landmarks.get(box["landmark_id"])
                 if lm is None:
                     box["landmark_id"] = None
@@ -1580,6 +1656,8 @@ class VisionSupervisor:
                 max_range_m=float(self._cfg.landmark_fix_max_range_m),
             )
             cosine_thr = float(self._landmarks.cosine_threshold)
+            unique_cos = float(self._landmarks.unique_cosine_margin)
+            unique_dist = float(self._landmarks.unique_distance_margin_m)
             anchor_of = {
                 int(lm.landmark_id): int(lm.anchor_node) for lm, _xyz in visible
             }
@@ -1597,6 +1675,8 @@ class VisionSupervisor:
             min_inliers=min_inliers,
             max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
             residual_m=float(self._cfg.landmark_fix_residual_m),
+            unique_cosine_margin=unique_cos,
+            unique_distance_margin_m=unique_dist,
         )
         fix = attempt.fix
         if fix is None:
@@ -1640,6 +1720,8 @@ class VisionSupervisor:
                 min_inliers=min_inliers,
                 max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
                 residual_m=float(self._cfg.landmark_fix_residual_m),
+                unique_cosine_margin=unique_cos,
+                unique_distance_margin_m=unique_dist,
             )
             fix = attempt.fix
             if fix is None:
@@ -1814,6 +1896,8 @@ class VisionSupervisor:
                 max_range_m=float(self._cfg.landmark_fix_max_range_m),
             )
             cosine_thr = float(self._landmarks.cosine_threshold)
+            unique_cos = float(self._landmarks.unique_cosine_margin)
+            unique_dist = float(self._landmarks.unique_distance_margin_m)
 
         min_inliers = int(self._cfg.vision_pose_writeback_min_inliers)
         visible_ids = [int(lm.landmark_id) for lm, _ in visible]
@@ -1828,6 +1912,8 @@ class VisionSupervisor:
             min_inliers=min_inliers,
             max_jump_m=float(self._cfg.landmark_fix_max_jump_m),
             residual_m=residual_m,
+            unique_cosine_margin=unique_cos,
+            unique_distance_margin_m=unique_dist,
         )
         fix = attempt.fix
         if fix is None:

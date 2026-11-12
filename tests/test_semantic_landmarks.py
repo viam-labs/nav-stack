@@ -944,3 +944,188 @@ def test_audit_sees_through_to_a_floor_or_side_wall():
             depth, 160.0, 120.0, 1.0, half_px=12.0, focal_px=300.0
         )
         assert kind == expected
+
+
+def _plant_detector(store, xyz, desc):
+    """Insert a detector landmark without running association."""
+    lid = store._next_id  # noqa: SLF001
+    store._next_id += 1  # noqa: SLF001
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    point = np.asarray(xyz, dtype=float).reshape(3)
+    lm = EmbeddingLandmark(
+        landmark_id=lid,
+        anchor_node=0,
+        rel_xyz=point.copy(),
+        normal_rel=normal.copy(),
+        map_xyz=point.copy(),
+        descriptors=[np.asarray(desc, dtype=np.float32).copy()],
+        observations=1,
+        view_poses_xy=[(0.0, 0.0, 0.0)],
+        from_detector=True,
+        status=LandmarkStatus.CANDIDATE,
+    )
+    store._landmarks[lid] = lm  # noqa: SLF001
+    store._index_add(lm, point)  # noqa: SLF001
+    return lm
+
+
+def test_tied_embeddings_are_refused_instead_of_stealing_an_id():
+    """Two similar objects at similar range: do not attach, do not mint."""
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        require_descriptor_match=True,
+        promote_min_obs=99,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    left = _plant_detector(store, [2.00, 0.0, 1.0], desc)
+    right = _plant_detector(store, [2.20, 0.0, 1.0], desc)
+    got = store.observe(
+        map_xyz=np.array([2.10, 0.0, 1.0]),
+        descriptor=desc,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+        from_detector=True,
+    )
+    assert got is None
+    assert len(store) == 2
+    assert left.observations == 1
+    assert right.observations == 1
+    assert store.status_dict()["assoc_ambiguous"] >= 1
+
+
+def test_tied_embeddings_keep_the_clearly_nearer_landmark():
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        require_descriptor_match=True,
+        promote_min_obs=99,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    near = _plant_detector(store, [2.00, 0.0, 1.0], desc)
+    far = _plant_detector(store, [2.40, 0.0, 1.0], desc)
+    got = store.observe(
+        map_xyz=np.array([2.02, 0.0, 1.0]),
+        descriptor=desc,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.2, 0.0, 0.0),
+        from_detector=True,
+    )
+    assert got is not None
+    assert got.landmark_id == near.landmark_id
+    assert near.observations == 2
+    assert far.observations == 1
+
+
+def test_distinct_embedding_beats_a_nearer_lookalike():
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        require_descriptor_match=True,
+        promote_min_obs=99,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    normal = np.array([-1.0, 0.0, 0.0], dtype=float)
+    query = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    lookalike = l2_normalize(np.array([0.50, 0.866025, 0.0, 0.0], dtype=np.float32))
+    assert float(np.dot(query, lookalike)) == pytest.approx(0.50, abs=0.01)
+    far = _plant_detector(store, [2.40, 0.0, 1.0], query)
+    near = _plant_detector(store, [2.05, 0.0, 1.0], lookalike)
+    got = store.observe(
+        map_xyz=np.array([2.05, 0.0, 1.0]),
+        descriptor=query,
+        normal_map=normal,
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+        from_detector=True,
+    )
+    assert got is not None
+    assert got.landmark_id == far.landmark_id
+    assert near.observations == 1
+
+
+def test_known_track_updates_that_landmark_when_embeddings_tie():
+    """The previous box names the landmark; geometry would have refused."""
+    store = EmbeddingLandmarkMap(
+        associate_radius_m=0.25,
+        require_descriptor_match=True,
+        promote_min_obs=99,
+    )
+    anchor = Pose2D(0.0, 0.0, 0.0)
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    left = _plant_detector(store, [2.00, 0.0, 1.0], desc)
+    right = _plant_detector(store, [2.20, 0.0, 1.0], desc)
+    refused = store.observe(
+        map_xyz=np.array([2.10, 0.0, 1.0]),
+        descriptor=desc,
+        normal_map=np.array([-1.0, 0.0, 0.0]),
+        anchor_node=0,
+        anchor_pose=anchor,
+        view_xy=(0.0, 0.0, 0.0),
+        from_detector=True,
+    )
+    assert refused is None
+    kept = store.observe_known(
+        right.landmark_id,
+        map_xyz=np.array([2.10, 0.0, 1.0]),
+        descriptor=desc,
+        pose_of_node={0: anchor},
+        view_xy=(0.3, 0.0, 0.1),
+        from_detector=True,
+    )
+    assert kept is not None
+    assert kept.landmark_id == right.landmark_id
+    assert right.observations == 2
+    assert left.observations == 1
+    assert store.status_dict()["assoc_tracks"] >= 1
+
+
+def test_box_track_follows_overlap_and_refuses_a_tie():
+    from src.semantic.landmarks import assign_box_tracks
+
+    desc = l2_normalize(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    tracks = [
+        {"xyxy": (0.0, 0.0, 100.0, 100.0), "landmark_id": 1},
+        {"xyxy": (200.0, 0.0, 300.0, 100.0), "landmark_id": 2},
+    ]
+
+    def cosine_of(lid, _desc):
+        return 0.9 if lid in (1, 2) else -1.0
+
+    assigned = assign_box_tracks(
+        [
+            (0, (8.0, 4.0, 108.0, 104.0), desc),
+            (1, (206.0, 4.0, 306.0, 104.0), desc),
+        ],
+        tracks,
+        cosine_of=cosine_of,
+        min_cosine=0.35,
+    )
+    assert assigned == {0: 1, 1: 2}
+    assert (
+        assign_box_tracks(
+            [(0, (400.0, 0.0, 500.0, 100.0), desc)],
+            tracks,
+            cosine_of=cosine_of,
+            min_cosine=0.35,
+        )
+        == {}
+    )
+    # One box covering both previous boxes about equally.
+    tied = assign_box_tracks(
+        [(0, (20.0, 0.0, 120.0, 100.0), desc)],
+        [
+            {"xyxy": (0.0, 0.0, 100.0, 100.0), "landmark_id": 1},
+            {"xyxy": (40.0, 0.0, 140.0, 100.0), "landmark_id": 2},
+        ],
+        cosine_of=cosine_of,
+        min_cosine=0.35,
+    )
+    assert tied == {}
+
