@@ -199,49 +199,97 @@ because no capture pose was available and they were over 1 s old
 
 With `vision_enabled: true` the defaults are:
 
-- **mapping**: build landmarks + VLAD place index. Re-seeing at least 3
-  confirmed landmarks that all belong to one keyframe at least
-  `builtin_loop_min_travel_m` (6 m of path) behind the robot adds a pose-graph
-  loop edge. The edge is dropped if it disagrees with the rest of the graph.
-  Small agreements (under 8 cm and 2°) add nothing. This is separate from
-  localizing writeback, which still does not run while mapping.
+- **mapping**: build landmarks and store a recovery keyframe every 0.75 m or
+  25° (`vision_keyframes.npz` next to the map: the frame's pose, one pooled
+  descriptor, and every patch with its descriptor and 3D point; about 0.2 MB
+  per keyframe). A keyframe hangs from its pose-graph node, so a loop closure
+  moves it with the map. Re-seeing at least 3 confirmed landmarks that all
+  belong to one keyframe at least `builtin_loop_min_travel_m` (6 m of path)
+  behind the robot adds a pose-graph loop edge. The edge is dropped if it
+  disagrees with the rest of the graph.
 - **mapping paint**: a detection labelled person, bicycle, car, or motorcycle
   blanks the lidar returns inside that box for 0.2 s, so a passer-by is not
-  stored as a wall. Furniture and this robot are not blanked. The indoor
-  ONNX from v1.2.0-rc49 includes `person` (appended, so older class ids stay
-  put). Startup replaces an onnx that was fetched for an older class list.
-- **localizing + tracking/degraded**: landmark writeback only (fine)
-- **localizing + lost/unknown**: place retrieval, then a landmark check of the
-  places it cannot separate. The top keyframes are pose guesses. Landmarks
-  that project into the image from a guess are paired by appearance. The
-  pose moves only when one guess has at least 3 of those pairs on one pose
-  within 30 cm, and no other guess fits a different pose. The points do not
-  have to already lie within 1.25 m: that check was dropping the matches
-  the fit exists to judge, because a keyframe heading is coarser than that.
-  A raw place teleport still happens when the top hit beats the second by
-  `vision_place_min_score_margin` and is strong enough for the jump, and only
-  when fewer than 3 confirmed landmarks exist. Otherwise the landmark fit
-  decides. Then landmark writeback, which keeps the 0.45 m pairing gate.
-  All of these go through `apply_map_pose_correction(force=False)`.
+  stored as a wall. Furniture and this robot are not blanked.
+- **localizing, pose tracking**: vision does nothing. No frame is grabbed and
+  no model runs.
+- **localizing, lost or unknown, base standing still**: lost-pose recovery
+  (`vision_recovery`, see below).
 
-You should not need to flip `vision_pose_writeback` / `vision_place_retrieval`
-when switching modes. Check `vision_status.pose_writeback_active` and
-`place.retrieval_active` (true only while localizing **and** lost/unknown).
+Kill switch: `"vision_survey_only": true` (build only, never move the pose).
 
-Place is meter-scale and ambiguous — it recovers when SLAM reports lost, it
-does not nudge pose while tracking. A tie (two keyframes within the score
-margin) does not teleport on its own. Landmark writeback handles fine drift
-and, while lost, confirms one place guess.
+### Lost-pose recovery (`src/semantic/relocalize.py`)
 
-Writeback needs ≥3 landmark pairs (2-point SE(2) fits are unstable). Matching may use a small dense patch set that is **not** surveyed, so detector-only mapping still gets enough inliers. Rejections report `few_pairs` / `rejected_residual` / `rejected_jump` (no catch-all).
+The camera proposes, the lidar decides:
 
-Kill switch if needed: `"vision_survey_only": true` (build only, never apply).
+1. The live frame's pooled descriptor shortlists 30 keyframes; the shortlist
+   is reordered by how many patches match one-to-one, and the top 5 are kept.
+2. For each, the matched patches that have depth on both sides are fitted to
+   one camera pose (at least 8 within 15 cm).
+3. The scan search runs around each camera pose (0.6 m, ±20°).
+4. The pose is placed only when the scan match passes the usual floors
+   (score ≥ 0.35, ray error ≤ 1.0 m), the lidar and camera poses agree within
+   0.25 m and 6°, and no other guess more than 1 m away scores within 0.10.
 
-Watch `vision_status.writeback`, `vision_status.landmark_loop`,
-`vision_status.paint_gate`, and `vision_status.place` (`last_seed` is the
-lost-pose landmark check).
+`vision_status.recovery` reports `keyframes`, `attempts`, `applied`, and
+`last` (`accepted`, `no_agreement`, `rival_place`, `skipped_moving`, with the
+score of every guess).
 
-Writeback `visible` / `visible_image` counts confirmed landmarks that project into the camera image (same cull as landmark-camera greens). `visible_frustum` is the older facing-filtered count for comparison.
+These rules were chosen on the LILocBench office dataset, treating each
+sampled frame as a kidnapped robot (right = within 0.5 m and 15°):
+
+| Method | Static run | Crowded run | Rearranged-furniture run |
+| --- | --- | --- | --- |
+| Whole-map lidar search, before its repair | not measured | 2% placed, 0% wrong | 2% placed, 0% wrong |
+| Whole-map lidar search, repaired | 99% placed, 0% wrong | 14% placed, 0% wrong | 27% placed, 1% wrong |
+| Camera recovery as shipped | 74% placed, 2% wrong | 26% placed, 0% wrong | 38% placed, 2% wrong |
+| Lidar search given a hint 1 m and 30° off | 100% placed, 0% wrong | 80% placed, 0% wrong | 79% placed, 6% wrong |
+
+Rates are per attempt; a lost robot tries again every
+`vision_recovery_cooldown_s`. One office, 187 / 50 / 137 frames: treat the
+percentages as rough.
+
+What the table says:
+
+- The lidar search had two faults, both repaired in
+  `src/nav/localize/global_localize.py`: a coarse grid wider than the match
+  tolerance dropped the true pose before the fine search, and a correct
+  answer was flagged `ambiguous` 83-93% of the time because "second best" was
+  a neighbouring sample of the same peak. Repaired, it needs no camera in a
+  scene that matches the map.
+- Where people or moved furniture change the scene, a wrong place often
+  out-scores the true one for the lidar, and the camera adds 11-12 points.
+- The last row is the ceiling for any hint-based method: a better place guess
+  could still roughly double the changed-scene numbers.
+- Most wrong placements were in the hallway, where look-alike doors and two
+  parallel walls fool both sensors.
+
+### Off by default
+
+- `vision_pose_writeback` (landmark pose fit applied to the pose). While
+  localizing, `apply_map_pose_correction` sets the pose with no scan check,
+  and a pose fitted from the camera alone was wrong about half the time on
+  LILocBench with nothing in the fit to show it.
+- `vision_place_enabled` / `vision_place_retrieval` (VLAD place index and its
+  teleport). Its top guess was the true place for 26-60% of frames, against
+  66-71% for the keyframe patch match.
+
+Setting them `true` restores the earlier behaviour, including
+`vision_status.writeback` and `vision_status.place`.
+
+## Measuring vision offline
+
+```bash
+python tools/fetch_lilocbench.py     # ~2 GB subset into ~/datasets/lilocbench
+python tools/eval_vision.py place    # is the true place among the top guesses?
+python tools/eval_vision.py reloc    # kidnapped-robot recovery, lidar vs camera+lidar
+```
+
+LILocBench (Uni Bonn) has a 2D lidar, RealSense RGB-D, odometry and
+ground-truth poses for one mapping run and later runs with people and
+rearranged furniture. It is licensed CC BY-NC-SA 4.0 and is not part of this
+repo. `reloc --place-methods runtime` runs `recover_pose` itself; other
+method names compare alternatives (see `--help`). DINOv2 tokens are cached
+under `~/datasets/lilocbench/cache`, so re-runs take seconds to minutes.
 
 ## Survey density / nav load (rc2+)
 
