@@ -3085,16 +3085,16 @@ class BuiltinSlamEngine:
         if known < 0.02:
             return False
         try:
-            result = global_localize_scan(
-                occ_map,
-                scan,
-                hint=None,
-                full_map=True,
-                coarse_position_step_m=0.6,
-                coarse_yaw_step_deg=18.0,
-            )
+            result = global_localize_scan(occ_map, scan, hint=None, full_map=True)
         except Exception as exc:  # noqa: BLE001
             self._log(f"seed global localize failed: {exc}")
+            return False
+        if result.ambiguous:
+            # A second place explains the scan nearly as well.
+            self._log(
+                f"seed global localize ambiguous (score={float(result.score):.3f} "
+                f"second={float(result.second_best_score):.3f}); retrying"
+            )
             return False
         score = float(result.score)
         if not math.isfinite(score) or score < self._seed_min_score:

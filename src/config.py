@@ -927,10 +927,10 @@ class SlamConfig:
         default_factory=lambda: {
             "full_map": True,
             "map_source": "live",
-            # Finer than the generic full-map defaults — office maps need it
-            # to keep the true pose in the coarse winner set.
-            "coarse_position_step_m": 0.35,
-            "coarse_yaw_step_deg": 10.0,
+            # No coarse grid here: the search sizes it from its hit tolerance
+            # (about 15 cm / 4° on a 5 cm map). 35 cm / 10° still dropped the
+            # true pose from the coarse winner set in about half of office
+            # searches.
             "ray_weight": 0.55,
             "ray_refine_candidates": 48,
         }

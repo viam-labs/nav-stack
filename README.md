@@ -571,6 +571,13 @@ turned (`snaps_rejected`, above 120°/s over one sample) and the net yaw the
 scan has corrected since the last seed (`bias_deg_s` once 30 s have passed),
 and `yaw_only_applies` counts the heading-only corrections made while driving.
 
+The coarse search grid is sized from the hit tolerance (`hit_radius_cells`):
+about 15 cm and 4° on a 5 cm map. Leave `coarse_position_step_m` /
+`coarse_yaw_step_deg` unset unless a search must be faster; a coarser grid can
+drop the true pose before the fine search sees it. `ambiguous` and
+`second_best_score` compare the winner with the best *different place* (over
+1 m away or facing over 45° differently), not with a neighbouring sample.
+
 Speed/robustness knobs: `local_yaw_window_deg`, `coarse_position_step_m`,
 `coarse_yaw_step_deg`, `max_scan_points`, `min_in_map_points`,
 `min_in_map_ratio`, `hit_radius_cells`, `ray_refine_candidates`,

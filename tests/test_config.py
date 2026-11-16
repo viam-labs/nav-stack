@@ -347,8 +347,7 @@ def test_slam_config_global_localize_on_start_defaults_enabled():
     assert cfg.global_localize_on_start_options == {
         "full_map": True,
         "map_source": "live",
-        "coarse_position_step_m": 0.35,
-        "coarse_yaw_step_deg": 10.0,
+        # No coarse grid: the search sizes it from its hit tolerance.
         "ray_weight": 0.55,
         "ray_refine_candidates": 48,
     }

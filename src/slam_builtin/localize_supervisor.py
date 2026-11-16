@@ -168,8 +168,6 @@ class LocalizeSupervisor:
                 full_map=full_map,
                 search_radius_m=radius_m,
                 local_yaw_window_deg=yaw_window_deg,
-                coarse_position_step_m=0.6 if full_map else 0.4,
-                coarse_yaw_step_deg=18.0 if full_map else 12.0,
             )
 
         tiers_tried = []
@@ -495,8 +493,6 @@ class LocalizeSupervisor:
                 full_map=False,
                 search_radius_m=1.0,
                 local_yaw_window_deg=30.0,
-                coarse_position_step_m=0.2,
-                coarse_yaw_step_deg=10.0,
                 fine_position_step_m=0.05,
                 fine_yaw_step_deg=2.0,
                 fine_window_m=0.35,
@@ -1435,18 +1431,23 @@ class LocalizeSupervisor:
                     float(ray_mae),
                 )
                 return False
-            # Prefer a clear margin over second-best when reported.
+            # Prefer a clear margin over the best other place when reported.
+            # Both numbers are combined (endpoint + ray) scores; comparing the
+            # endpoint score with the other place's combined score could not
+            # clear the margin even for a clean match.
             second = match.get("second_best_score")
+            combined = match.get("combined_score")
             if (
-                score is not None
+                combined is not None
                 and second is not None
                 and math.isfinite(float(second))
-                and float(score) - float(second) < 0.08
+                and math.isfinite(float(combined))
+                and float(combined) - float(second) < 0.08
             ):
                 LOGGER.info(
                     "startup global_localize: skipping apply (near-tie "
-                    "score=%.3f second_best=%.3f)",
-                    float(score),
+                    "combined=%.3f second_best=%.3f)",
+                    float(combined),
                     float(second),
                 )
                 return False

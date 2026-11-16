@@ -36,6 +36,7 @@ from ..config import (
 from ..geom import conversions as conv
 from ..nav.localize import pause_keyframes, slice_match
 from ..nav.localize.global_localize import (
+    DEFAULT_AMBIGUITY_MARGIN,
     load_occupancy_from_map_dict,
     load_occupancy_from_map_dir,
 )
@@ -2395,9 +2396,13 @@ class SlamService(SLAM):
 
         loop = asyncio.get_running_loop()
 
+        def _optional_step(key: str) -> Optional[float]:
+            # Unset: the search uses the coarsest grid its hit tolerance
+            # supports. A coarser one loses the true pose before the fine
+            # search (35 cm / 10° did in 46-88% of whole-map office searches).
+            return float(command[key]) if command.get(key) is not None else None
+
         async def _run_match(full_map_override: bool):
-            default_coarse_pos = 0.35 if full_map_override else 0.4
-            default_coarse_yaw = 10.0 if full_map_override else 12.0
             default_local_yaw_window = 360.0 if full_map_override else 180.0
             default_ray_weight = 0.55 if full_map_override else 0.35
             default_ray_candidates = 48 if full_map_override else 24
@@ -2408,12 +2413,8 @@ class SlamService(SLAM):
                 hint=hint,
                 full_map=full_map_override,
                 search_radius_m=search_radius_m,
-                coarse_position_step_m=float(
-                    command.get("coarse_position_step_m", default_coarse_pos)
-                ),
-                coarse_yaw_step_deg=float(
-                    command.get("coarse_yaw_step_deg", default_coarse_yaw)
-                ),
+                coarse_position_step_m=_optional_step("coarse_position_step_m"),
+                coarse_yaw_step_deg=_optional_step("coarse_yaw_step_deg"),
                 local_yaw_window_deg=float(
                     command.get("local_yaw_window_deg", default_local_yaw_window)
                 ),
@@ -2429,7 +2430,9 @@ class SlamService(SLAM):
                 ray_refine_beams=int(command.get("ray_refine_beams", 64)),
                 ray_step_m=float(command.get("ray_step_m", 0.08)),
                 ray_weight=float(command.get("ray_weight", default_ray_weight)),
-                ambiguity_margin=float(command.get("ambiguity_margin", 0.06)),
+                ambiguity_margin=float(
+                    command.get("ambiguity_margin", DEFAULT_AMBIGUITY_MARGIN)
+                ),
             )
 
         result = await _run_match(full_map)
@@ -2553,6 +2556,7 @@ class SlamService(SLAM):
             "ray_score": result.ray_score,
             "ray_mae_m": result.ray_mae_m,
             "second_best_score": getattr(result, "second_best_score", None),
+            "combined_score": getattr(result, "combined_score", None),
             "ambiguous": bool(getattr(result, "ambiguous", False)),
             "map_source": map_source,
             "full_map": resolved_full_map,
