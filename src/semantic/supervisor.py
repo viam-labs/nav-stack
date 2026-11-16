@@ -25,6 +25,7 @@ from .detect_landmarks import (
     describe_box_outcome,
     observations_from_detections,
 )
+from .keyframes import KeyframeIndex, keyframe_gap_reached, stack_tokens, token_points
 from .landmarks import AUDIT_SEEN_THROUGH, EmbeddingLandmarkMap, assign_box_tracks, display_label
 from .localize import (
     diagnose_landmark_match,
@@ -40,6 +41,7 @@ from .persist import (
     save_place_index,
 )
 from .place import PlaceIndex, descriptors_from_patches
+from .relocalize import LidarSearch, recover_pose
 from .types import CameraIntrinsics, Detection, PatchToken, VisionFrame, VisionResult
 from .worker import VisionWorker, WorkerConfig
 
@@ -57,6 +59,8 @@ NodeTravelProvider = Callable[[], Dict[int, float]]
 LandmarkLoop = Callable[..., Dict[str, Any]]
 # ``(discs, captured_at)`` → engine.note_paint_discs.
 PaintDiscNote = Callable[..., None]
+# ``(pose)`` → True when SLAM took the recovered pose.
+Relocalize = Callable[[conv.Pose2D], bool]
 
 # Dense patches used only for writeback pairing (never surveyed) so detector-only
 # survey does not starve the rigid fit of inliers.
@@ -103,6 +107,9 @@ class VisionSupervisor:
         get_node_travel: Optional[NodeTravelProvider] = None,
         add_landmark_loop: Optional[LandmarkLoop] = None,
         note_paint_discs: Optional[PaintDiscNote] = None,
+        lidar_search: Optional[LidarSearch] = None,
+        apply_relocalization: Optional[Relocalize] = None,
+        is_base_stopped: Optional[Callable[[], bool]] = None,
         logger=None,
     ):
         self._cfg = cfg
@@ -116,6 +123,9 @@ class VisionSupervisor:
         self._get_node_travel = get_node_travel
         self._add_landmark_loop = add_landmark_loop
         self._note_paint_discs = note_paint_discs
+        self._lidar_search = lidar_search
+        self._apply_relocalization = apply_relocalization
+        self._is_base_stopped = is_base_stopped
         self._logger = logger
         self._lock = threading.Lock()
         self._task: Optional[asyncio.Task] = None
@@ -205,6 +215,17 @@ class VisionSupervisor:
         # Pose last published by a seed. A later fit that lands somewhere
         # else is the other corridor twin and is not applied.
         self._last_seed_pose: Optional[conv.Pose2D] = None
+        # Camera keyframes for lost-pose recovery (see relocalize.py).
+        self._keyframes = KeyframeIndex()
+        self._keyframe_next_id = 1
+        self._keyframe_last_pose: Optional[conv.Pose2D] = None
+        # Keyframe id → (pose-graph node, pose relative to that node), for
+        # keyframes stored this session, so a loop closure moves them too.
+        self._keyframe_anchor: Dict[int, Tuple[int, conv.Pose2D]] = {}
+        self._recovery_attempts = 0
+        self._recovery_applied = 0
+        self._last_recovery: Optional[dict] = None
+        self._last_recovery_mono = 0.0
 
         input_size = int(cfg.vision_input_size) if not want_synthetic else 224
         if input_size < 14:
@@ -367,8 +388,14 @@ class VisionSupervisor:
     def load_from_map_dir(self, map_dir) -> bool:
         loaded = load_landmarks(map_dir)
         place = load_place_index(map_dir)
+        keyframes = KeyframeIndex.load(map_dir)
         ok = False
         with self._lock:
+            if keyframes is not None:
+                self._keyframes = keyframes
+                self._keyframe_next_id = max(keyframes.keyframe_ids, default=0) + 1
+                self._keyframe_anchor = {}
+                ok = True
             if loaded is not None:
                 # Keep live merge / height settings; only restore landmark rows.
                 loaded.associate_radius_m = self._landmarks.associate_radius_m
@@ -401,14 +428,21 @@ class VisionSupervisor:
                 f"vision: loaded place index keyframes={len(place.keyframe_ids)} "
                 f"fitted={place.fitted} from {map_dir}"
             )
+        if keyframes is not None:
+            self._log(f"vision: loaded {len(keyframes)} recovery keyframes from {map_dir}")
         return ok
 
     def save_to_map_dir(self, map_dir) -> Optional[str]:
         with self._lock:
             path = save_landmarks(map_dir, self._landmarks)
             place_path = save_place_index(map_dir, self._place)
+            keyframes_path = self._keyframes.save(map_dir)
         if place_path is not None:
             self._log(f"vision: saved place index → {place_path}")
+        if keyframes_path is not None:
+            self._log(
+                f"vision: saved {len(self._keyframes)} recovery keyframes → {keyframes_path}"
+            )
         return str(path) if path is not None else None
 
     def _new_landmark_map(self) -> EmbeddingLandmarkMap:
@@ -469,6 +503,13 @@ class VisionSupervisor:
             self._place_seed_applied = 0
             self._last_place_seed = None
             self._last_place_seed_mono = 0.0
+            self._keyframes = KeyframeIndex()
+            self._keyframe_next_id = 1
+            self._keyframe_last_pose = None
+            self._keyframe_anchor = {}
+            self._recovery_attempts = 0
+            self._recovery_applied = 0
+            self._last_recovery = None
             self._observations = 0
             self._frames = 0
             self._last_result = None
@@ -626,6 +667,14 @@ class VisionSupervisor:
                     "last_discs": int(self._last_paint_discs),
                     "labels": list(self._worker.cfg.dynamic_labels),
                 },
+                "recovery": {
+                    "enabled": self._recovery_enabled(),
+                    "active": self._recovery_active(),
+                    **self._keyframes.status_dict(),
+                    "attempts": self._recovery_attempts,
+                    "applied": self._recovery_applied,
+                    "last": self._last_recovery,
+                },
                 "place": {
                     "enabled": bool(self._cfg.vision_place_enabled),
                     "retrieval": bool(self._cfg.vision_place_retrieval),
@@ -713,6 +762,7 @@ class VisionSupervisor:
             self._frames += 1
         if self._cfg.vision_place_enabled:
             self._place_tick(frame, result, allow_keyframe=bool(mapping))
+        self._keyframe_tick(frame, result, allow_keyframe=bool(mapping))
         if mapping:
             self._survey(frame, result)
         return result
@@ -748,6 +798,8 @@ class VisionSupervisor:
                 continue
             cam = self._cameras.get(name)
             if cam is None:
+                continue
+            if not self._tick_needed():
                 continue
             self._inflight.add(name)
             try:
@@ -785,6 +837,13 @@ class VisionSupervisor:
                         allow_keyframe=allow_place_kf,
                         pose=pose,
                     )
+                await asyncio.to_thread(
+                    self._keyframe_tick,
+                    frame,
+                    result,
+                    allow_keyframe=allow_place_kf,
+                    pose=pose,
+                )
                 if do_survey:
                     await asyncio.to_thread(self._survey, frame, result, pose=pose)
             finally:
@@ -909,6 +968,127 @@ class VisionSupervisor:
             lidar=lidar,
             intrinsics=K,
         )
+
+    def _recovery_enabled(self) -> bool:
+        """Keyframes are stored and may be used (real DINOv2 tokens only)."""
+        return bool(self._cfg.vision_recovery) and not bool(self._worker.cfg.synthetic)
+
+    def _recovery_active(self) -> bool:
+        """True while a lost pose may be recovered from the camera and lidar."""
+        return (
+            self._recovery_enabled()
+            and str(self._cfg.mode) == MODE_LOCALIZING
+            and not bool(self._cfg.vision_survey_only)
+            and self._lidar_search is not None
+            and self._apply_relocalization is not None
+            and len(self._keyframes) > 0
+            and self._localization_lost()
+        )
+
+    def _tick_needed(self) -> bool:
+        """False when nothing would use a frame, so none is grabbed or inferred.
+
+        While localizing with the pose tracking, vision has no job: keyframes
+        are only stored while mapping and recovery only runs when lost.
+        """
+        if str(self._cfg.mode) == MODE_MAPPING or bool(self._cfg.vision_survey_only):
+            return True
+        if self._writeback_enabled():
+            return True
+        if bool(self._cfg.vision_place_enabled) and bool(self._cfg.vision_place_retrieval):
+            return True
+        return self._recovery_active()
+
+    def _keyframe_tick(
+        self,
+        frame: VisionFrame,
+        result: VisionResult,
+        *,
+        allow_keyframe: bool,
+        pose: Optional[conv.Pose2D] = None,
+    ) -> None:
+        """Store a recovery keyframe while mapping; try a recovery while lost."""
+        if not self._recovery_enabled() or not result.grid_patches:
+            return
+        if not allow_keyframe:
+            if self._recovery_active():
+                self._try_recover(frame, result)
+            return
+        if pose is None:
+            pose = self._capture_pose(frame)
+        if not keyframe_gap_reached(
+            pose,
+            self._keyframe_last_pose,
+            gap_m=float(self._cfg.vision_place_keyframe_min_gap_m),
+            gap_deg=float(self._cfg.vision_place_keyframe_min_gap_deg),
+        ):
+            return
+        tokens, uv = stack_tokens(result.grid_patches)
+        points = token_points(frame, uv)
+        anchor = None
+        try:
+            node, node_pose, _poses = self._get_anchor()
+            if int(node) >= 0:
+                anchor = (
+                    int(node),
+                    conv.compose_poses(conv.invert_pose(node_pose), pose),
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"keyframe anchor: {exc}"
+        with self._lock:
+            keyframe_id = int(self._keyframe_next_id)
+            self._keyframe_next_id += 1
+            self._keyframes.add(keyframe_id, pose, tokens, points)
+            self._keyframe_last_pose = pose
+            if anchor is not None:
+                self._keyframe_anchor[keyframe_id] = anchor
+
+    def _try_recover(self, frame: VisionFrame, result: VisionResult) -> None:
+        """Lost and standing still: ask the camera where, let the lidar decide."""
+        search = self._lidar_search
+        apply = self._apply_relocalization
+        if search is None or apply is None:
+            return
+        now = time.monotonic()
+        if now - self._last_recovery_mono < float(self._cfg.vision_recovery_cooldown_s):
+            return
+        # The scan is read after the camera frame. They describe one pose
+        # only while the base is still.
+        stopped = self._is_base_stopped
+        if stopped is not None:
+            try:
+                still = bool(stopped())
+            except Exception:  # noqa: BLE001
+                still = False
+            if not still:
+                self._last_recovery = {"status": "skipped_moving"}
+                return
+        self._last_recovery_mono = now
+        self._recovery_attempts += 1
+        tokens, uv = stack_tokens(result.grid_patches)
+        points = token_points(frame, uv)
+        try:
+            recovery = recover_pose(self._keyframes, tokens, points, search)
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = f"recovery: {exc}"
+            self._last_recovery = {"status": "error", "error": repr(exc)}
+            return
+        report = recovery.as_dict()
+        if recovery.accepted:
+            try:
+                applied = bool(apply(recovery.pose))
+            except Exception as exc:  # noqa: BLE001
+                self._last_error = f"recovery apply: {exc}"
+                applied = False
+            report["applied"] = applied
+            if applied:
+                self._recovery_applied += 1
+        self._last_recovery = report
+        if recovery.accepted or recovery.status == "rival_place":
+            self._log(
+                f"vision recovery: {recovery.status} "
+                f"keyframe={report.get('keyframe_id')} pose={report.get('pose')}"
+            )
 
     def _place_tick(
         self,
@@ -1035,9 +1215,13 @@ class VisionSupervisor:
         old_poses: Dict[int, conv.Pose2D],
         new_poses: Dict[int, conv.Pose2D],
     ) -> None:
-        """Pose-graph update: landmarks move with their anchor keyframe."""
+        """Pose-graph update: landmarks and keyframes move with their node."""
         with self._lock:
             self._landmarks.follow_anchors(old_poses, new_poses)
+            for keyframe_id, (node, rel) in self._keyframe_anchor.items():
+                node_pose = new_poses.get(node)
+                if node_pose is not None:
+                    self._keyframes.move(keyframe_id, conv.compose_poses(node_pose, rel))
 
     def _localization_lost(self) -> bool:
         """True when SLAM says lost/unknown — the only time place may apply."""

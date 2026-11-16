@@ -2716,6 +2716,40 @@ class SlamService(SLAM):
         def _add_landmark_loop(pose, anchor, *, score=None):
             return engine.add_landmark_loop(pose, anchor, score=score)
 
+        # Lost-pose recovery runs on a vision worker thread; the scan search
+        # and the pose apply run on the module loop.
+        def _lidar_search(hint, radius_m, yaw_window_deg):
+            from ..semantic.relocalize import LidarMatch
+
+            command = {
+                "command": "global_localize",
+                "pose": {"x": hint.x, "y": hint.y, "theta": hint.theta},
+                "full_map": False,
+                "auto_full_map_fallback": False,
+                "apply": False,
+                "map_source": "live",
+                "search_radius_m": float(radius_m),
+                "local_yaw_window_deg": float(yaw_window_deg),
+            }
+            match = asyncio.run_coroutine_threadsafe(
+                self._global_localize(command), loop
+            ).result(timeout=20.0)
+            pose = match.get("pose")
+            if not pose or match.get("score") is None:
+                return None
+            return LidarMatch(
+                conv.Pose2D(float(pose["x"]), float(pose["y"]), float(pose["theta"])),
+                float(match["score"]),
+                float(match.get("ray_mae_m", float("inf"))),
+            )
+
+        def _apply_relocalization(pose) -> bool:
+            return bool(
+                asyncio.run_coroutine_threadsafe(
+                    self._apply_vision_recovery(pose), loop
+                ).result(timeout=10.0)
+            )
+
         vision = VisionSupervisor(
             cfg=cfg,
             cameras=self._cameras,
@@ -2728,6 +2762,9 @@ class SlamService(SLAM):
             get_node_travel=engine.vision_node_travel,
             add_landmark_loop=_add_landmark_loop,
             note_paint_discs=engine.note_paint_discs,
+            lidar_search=_lidar_search,
+            apply_relocalization=_apply_relocalization,
+            is_base_stopped=self._base_is_stopped,
             logger=LOGGER.info,
         )
         store = self._map_store
@@ -2737,6 +2774,29 @@ class SlamService(SLAM):
         vision.start(loop)
         self._vision = vision
         engine.set_anchor_motion_hook(vision.follow_anchor_motion)
+
+    async def _apply_vision_recovery(self, pose: conv.Pose2D) -> bool:
+        """Place a pose the camera proposed and the scan search confirmed."""
+        mgr = self._manager
+        if mgr is None or self._cfg is None or self._cfg.mode != MODE_LOCALIZING:
+            return False
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: mgr.relocalize(
+                pose,
+                position_variance_m2=0.25,
+                yaw_variance_rad2=0.06853891945200942,
+            ),
+        )
+        self._mark_pose_seeded("vision_recovery")
+        LOGGER.info(
+            "vision recovery: pose placed at x=%.2f y=%.2f theta=%.1f deg",
+            pose.x,
+            pose.y,
+            math.degrees(pose.theta),
+        )
+        return True
 
     async def close(self) -> None:
         self._cancel_startup_global_localize_task()

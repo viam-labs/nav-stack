@@ -118,6 +118,7 @@ class MapHandle:
             self.root / "keyframes.npz",
             self.root / "embedding_landmarks.npz",
             self.root / "place_index.npz",
+            self.root / "vision_keyframes.npz",
             self.last_pose_path,
         ):
             if path.exists():

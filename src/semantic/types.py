@@ -94,6 +94,9 @@ class VisionResult:
     stamp: float
     captured_at: float
     patches: List[PatchToken] = field(default_factory=list)
+    # Every in-image patch, before the survey cull. Lost-pose recovery matches
+    # the whole picture against stored keyframes.
+    grid_patches: List[PatchToken] = field(default_factory=list)
     detections: List[Detection] = field(default_factory=list)
     # Whole-image place descriptor (VLAD / mean-pool); may be empty until fit.
     place_descriptor: Optional[np.ndarray] = None

@@ -1085,15 +1085,27 @@ class SlamConfig:
     # place index). Prefer leaving this false — mapping vs localizing is gated
     # in code so you do not need to retune when switching modes.
     vision_survey_only: bool = False
-    # Soft landmark pose writeback via apply_map_pose_correction (force=False).
-    # Applies only while localizing (never during mapping — that rebuilds the map).
-    vision_pose_writeback: bool = True
+    # Lost-pose recovery (src/semantic/relocalize.py): camera keyframes stored
+    # while mapping propose places, and the lidar scan search decides. Runs
+    # only while localizing, lost, and standing still. On the LILocBench
+    # office it placed 26-38% of kidnapped frames per attempt in changed
+    # scenes (0-2% wrong) where the whole-map lidar search placed 14-27%. In
+    # an unchanged scene the lidar alone placed 99% and this path 74%.
+    vision_recovery: bool = True
+    vision_recovery_cooldown_s: float = 2.0
+    # Landmark pose writeback via apply_map_pose_correction. Off by default:
+    # while localizing that call sets the pose with no scan check, and a pose
+    # fitted from the camera alone was wrong about half the time on LILocBench
+    # with no sign of it in the fit. ``vision_recovery`` replaces it.
+    vision_pose_writeback: bool = False
     # 2D rigid fit needs 2 points; indoor FOV often only sees 2 fixtures at once.
     # SE(2) needs ≥3 pairs; 2-point fits invent large yaw from noise.
     vision_pose_writeback_min_inliers: int = 3
     vision_pose_writeback_cooldown_s: float = 2.0
-    # VLAD place index: always build keyframes while mapping when vision is on.
-    vision_place_enabled: bool = True
+    # VLAD place index (superseded by ``vision_recovery`` keyframes; its top
+    # guess was the true place for 26-60% of LILocBench frames against 66-71%
+    # for the keyframe patch match). Off by default.
+    vision_place_enabled: bool = False
     vision_place_keyframe_min_gap_m: float = 0.75
     vision_place_keyframe_min_gap_deg: float = 25.0
     vision_place_vocab_size: int = 32
@@ -1102,7 +1114,8 @@ class SlamConfig:
     # Coarse relocalization from top VLAD hit (force=False). Applies only when
     # localization_state is lost/unknown — never as continuous drift correction.
     # Mapping builds the index but does not apply (avoids whole-map shifts).
-    vision_place_retrieval: bool = True
+    # Off by default with the index above.
+    vision_place_retrieval: bool = False
     # Weak scores (~0.45–0.50) are ambiguous corridor twins; keep the floor high.
     vision_place_min_score: float = 0.55
     # Retained for config compat; lost-only apply drops relative jump caps

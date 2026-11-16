@@ -176,6 +176,7 @@ def test_place_retrieval_skipped_while_tracking():
     cfg = _cfg(
         mode="localizing",
         vision_survey_only=False,
+        vision_place_enabled=True,
         vision_place_retrieval=True,
         vision_pose_writeback=True,
     )
@@ -246,6 +247,7 @@ def test_place_retrieval_applies_when_lost_large_jump():
     cfg = _cfg(
         mode="localizing",
         vision_survey_only=False,
+        vision_place_enabled=True,
         vision_place_retrieval=True,
         vision_pose_writeback=True,
         vision_place_cooldown_s=0.0,
@@ -295,6 +297,7 @@ def test_place_retrieval_defers_when_landmarks_can_vote():
     cfg = _cfg(
         mode="localizing",
         vision_survey_only=False,
+        vision_place_enabled=True,
         vision_place_retrieval=True,
         vision_pose_writeback=True,
         vision_pose_writeback_min_inliers=3,
@@ -766,6 +769,7 @@ def _lost_supervisor():
     cfg = _cfg(
         mode="localizing",
         vision_survey_only=False,
+        vision_place_enabled=True,
         vision_place_retrieval=True,
         vision_pose_writeback=True,
         vision_pose_writeback_min_inliers=3,

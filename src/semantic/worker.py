@@ -217,6 +217,7 @@ class VisionWorker:
             )
             provider = self._provider
 
+        grid = list(tokens)
         detections: List[Detection] = []
         if self._yolo is not None:
             detections = self._run_yolo(color)
@@ -254,6 +255,7 @@ class VisionWorker:
             stamp=frame.stamp,
             captured_at=frame.captured_at,
             patches=tokens,
+            grid_patches=grid,
             detections=detections,
             place_descriptor=place,
             infer_ms=infer_ms,

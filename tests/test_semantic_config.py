@@ -57,12 +57,14 @@ def test_vision_density_defaults():
     assert cfg.vision_round_robin is True
     assert cfg.vision_input_size == 448
     assert cfg.vision_survey_only is False
-    assert cfg.vision_pose_writeback is True
+    # Camera-only pose appliers are off; lidar-checked recovery is on.
+    assert cfg.vision_recovery is True
+    assert cfg.vision_pose_writeback is False
     assert cfg.vision_pose_writeback_min_inliers == 3
     assert cfg.landmark_fix_max_range_m == pytest.approx(6.0)
     assert cfg.landmark_fix_residual_m == pytest.approx(0.15)
-    assert cfg.vision_place_enabled is True
-    assert cfg.vision_place_retrieval is True
+    assert cfg.vision_place_enabled is False
+    assert cfg.vision_place_retrieval is False
     assert cfg.vision_place_min_score == 0.55
     assert cfg.vision_place_max_jump_m == 0.75
     assert cfg.vision_prefer_detections is True
