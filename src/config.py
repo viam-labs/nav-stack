@@ -927,10 +927,10 @@ class SlamConfig:
         default_factory=lambda: {
             "full_map": True,
             "map_source": "live",
-            # Finer than the generic full-map defaults — office maps need it
-            # to keep the true pose in the coarse winner set.
-            "coarse_position_step_m": 0.35,
-            "coarse_yaw_step_deg": 10.0,
+            # No coarse grid here: the search sizes it from its hit tolerance
+            # (about 15 cm / 4° on a 5 cm map). 35 cm / 10° still dropped the
+            # true pose from the coarse winner set in about half of office
+            # searches.
             "ray_weight": 0.55,
             "ray_refine_candidates": 48,
         }
@@ -1026,7 +1026,8 @@ class SlamConfig:
     # While parked and the published pose does not explain the scan, try the
     # UI auto-refine window. Same 1 m radius and
     # apply floors as ``set_initial_pose`` refine. Yaw stays inside ±45° so
-    # an unattended cycle cannot lock the opposite heading.
+    # a tracking pose cannot lock the opposite heading. Lost and still runs
+    # the button itself: 1 m and a full turn, ambiguous peak allowed.
     periodic_relocalize_parked_radius_m: float = 1.0
     periodic_relocalize_parked_yaw_window_deg: float = 90.0
     periodic_relocalize_parked_min_score: float = 0.22
@@ -1056,6 +1057,71 @@ class SlamConfig:
     robot_radius: Optional[float] = None
     # Builtin simulation: raycast floorplan + in-process SimSensors (see ``sim``).
     sim: SimConfig = field(default_factory=SimConfig)
+    # ---- Vision (RGB-D side-channel) --------------------------------------
+    # Camera keyframes for lost-pose recovery, and a person mask while
+    # mapping. Off by default. When enabled, each name in ``vision_cameras``
+    # must match an existing ``lidars[]`` entry with ``obstacles_only: true``
+    # and ``cloud_frame: camera_optical`` (the RealSense depth cams already
+    # used for avoidance). Mount comes from that entry.
+    vision_enabled: bool = False
+    vision_cameras: List[str] = field(default_factory=list)
+    # One vision camera at 2 Hz. Two RealSense cameras faster than this
+    # starved nav; round-robin still runs one camera per tick.
+    vision_rate_hz: float = 2.0
+    vision_dinov2_onnx: str = ""
+    vision_yolo_onnx: str = ""
+    vision_head_onnx: str = ""  # optional site-finetuned projection head
+    vision_synthetic: bool = False  # bench/tests without ONNX weights
+    # Square letterbox side for DINOv2 ONNX (must match the exported model).
+    vision_input_size: int = 448
+    # Kill switch: never move the pose from vision (keyframes are still
+    # stored). Prefer leaving this false — mapping vs localizing is gated in
+    # code so you do not need to retune when switching modes.
+    vision_survey_only: bool = False
+    # Lost-pose recovery (src/semantic/relocalize.py): camera keyframes stored
+    # while mapping propose places, and the lidar scan search decides. Runs
+    # only while localizing, lost, and standing still. On the LILocBench
+    # office it placed 26-38% of kidnapped frames per attempt in changed
+    # scenes (0-2% wrong) where the whole-map lidar search placed 14-27%. In
+    # an unchanged scene the lidar alone placed 99% and this path 74%.
+    vision_recovery: bool = True
+    vision_recovery_cooldown_s: float = 2.0
+    # VLAD place index (superseded by ``vision_recovery`` keyframes; its top
+    # guess was the true place for 26-60% of LILocBench frames against 66-71%
+    # for the keyframe patch match). Off by default.
+    vision_place_enabled: bool = False
+    # A keyframe (place index and recovery alike) every this much travel or turn.
+    vision_place_keyframe_min_gap_m: float = 0.75
+    vision_place_keyframe_min_gap_deg: float = 25.0
+    vision_place_vocab_size: int = 32
+    vision_place_pca_dim: int = 128
+    vision_place_min_keyframes_to_fit: int = 8
+    # Coarse relocalization from top VLAD hit (force=False). Applies only when
+    # localization_state is lost/unknown — never as continuous drift correction.
+    # Mapping builds the index but does not apply (avoids whole-map shifts).
+    # Off by default with the index above.
+    vision_place_retrieval: bool = False
+    # Weak scores (~0.45–0.50) are ambiguous corridor twins; keep the floor high.
+    vision_place_min_score: float = 0.55
+    # Retained for config compat; lost-only apply drops relative jump caps
+    # (current pose is untrusted). Large jumps still need a stronger score.
+    vision_place_max_jump_m: float = 0.75
+    vision_place_max_jump_deg: float = 25.0
+    # Top hit must beat 2nd by this much or the place teleport is refused
+    # (corridor twin).
+    vision_place_min_score_margin: float = 0.08
+    # Jumps above this require an even stronger score (see supervisor).
+    vision_place_large_jump_m: float = 0.40
+    vision_place_large_jump_min_score: float = 0.75
+    vision_place_cooldown_s: float = 3.0
+    # One camera per tick (round-robin) when multiple vision_cameras are set.
+    vision_round_robin: bool = True
+    # Detector for the person mask. Empty detector_classes → the class list
+    # next to the ONNX file, else COCO-80 names (standard YOLOv8). For a
+    # custom YOLO-World ONNX, set detector_classes to the prompt list used at
+    # export. Open-vocab scores run lower than COCO YOLOv8; keep the floor soft.
+    vision_yolo_conf: float = 0.10
+    vision_detector_classes: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "SlamConfig":
@@ -1074,6 +1140,38 @@ class SlamConfig:
             else:
                 raise ValueError("at least one lidar is required ('lidars' or 'lidar')")
         lidars = [LidarConfig.from_dict(x) for x in lidars_raw]
+        vision_enabled = bool(d.get("vision_enabled", False))
+        vision_cameras_raw = d.get("vision_cameras") or []
+        if isinstance(vision_cameras_raw, str):
+            vision_cameras = (
+                [vision_cameras_raw.strip()] if vision_cameras_raw.strip() else []
+            )
+        else:
+            vision_cameras = [
+                str(name).strip() for name in vision_cameras_raw if str(name).strip()
+            ]
+        if vision_enabled and vision_cameras:
+            by_name = {lidar.name: lidar for lidar in lidars}
+            for name in vision_cameras:
+                lidar = by_name.get(name)
+                if lidar is None:
+                    raise ValueError(
+                        f"vision_cameras entry {name!r} must match a lidars[] name"
+                    )
+                if not lidar.obstacles_only:
+                    raise ValueError(
+                        f"vision camera {name!r} must have obstacles_only=true "
+                        "(a depth camera, not a lidar SLAM paints from)"
+                    )
+                if lidar.cloud_frame != CLOUD_FRAME_CAMERA_OPTICAL:
+                    raise ValueError(
+                        f"vision camera {name!r} must use "
+                        f"cloud_frame={CLOUD_FRAME_CAMERA_OPTICAL!r}"
+                    )
+        elif vision_enabled and not vision_cameras:
+            raise ValueError(
+                "vision_enabled requires at least one vision_cameras entry"
+            )
         footprint = resolve_footprint(d)
         if bool(d.get("crop_inside_footprint", True)):
             stamp_lidar_footprint(lidars, footprint)
@@ -1321,7 +1419,13 @@ class SlamConfig:
                 d.get("global_localize_on_start", not sim.enabled)
             ),
             "sim": sim,
+            "vision_enabled": vision_enabled,
+            "vision_cameras": vision_cameras,
         }
+        if "vision_rate_hz" in d:
+            overrides["vision_rate_hz"] = _positive_hz(
+                d["vision_rate_hz"], "vision_rate_hz"
+            )
         if "scan_rate_hz" in d:
             overrides["scan_rate_hz"] = _positive_hz(d["scan_rate_hz"], "scan_rate_hz")
         if "odom_rate_hz" in d:
@@ -1379,6 +1483,18 @@ class SlamConfig:
     def slam_lidars(self) -> List[LidarConfig]:
         """Lidars used for SLAM matching/mapping (excludes ``obstacles_only``)."""
         return [lidar for lidar in self.lidars if not lidar.obstacles_only]
+
+    def vision_lidar_configs(self) -> List[LidarConfig]:
+        """``lidars[]`` entries selected as RGB-D vision cameras."""
+        if not self.vision_enabled or not self.vision_cameras:
+            return []
+        by_name = {lidar.name: lidar for lidar in self.lidars}
+        out: List[LidarConfig] = []
+        for name in self.vision_cameras:
+            lidar = by_name.get(name)
+            if lidar is not None:
+                out.append(lidar)
+        return out
 
     def uses_builtin_slam(self) -> bool:
         return self.slam_backend == SLAM_BACKEND_BUILTIN

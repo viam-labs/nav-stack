@@ -36,6 +36,7 @@ from ..config import (
 from ..geom import conversions as conv
 from ..nav.localize import pause_keyframes, slice_match
 from ..nav.localize.global_localize import (
+    DEFAULT_AMBIGUITY_MARGIN,
     load_occupancy_from_map_dict,
     load_occupancy_from_map_dir,
 )
@@ -89,6 +90,7 @@ _SLAM_DO_ALIASES = build_alias_map(
         "clear_region": ("erase_region",),
         "add_obstacles": ("mark_obstacles",),
         "repair_map": ("repair",),
+        "vision_status": ("get_vision_status",),
     }
 )
 
@@ -147,6 +149,13 @@ class SlamService(SLAM):
         # Scan-to-map matcher subprocess (keeps the heavy search off this GIL).
         self._localizer = LocalizeWorker(enabled=True, logger=LOGGER)
         self._localize = LocalizeSupervisor(self)
+        # RGB-D side-channel: recovery keyframes and the person mask.
+        self._vision = None
+        # Installs ONNX Runtime / downloads weights the first time vision is
+        # enabled, then starts the supervisor. ``_vision_runtime`` is its report.
+        self._vision_prepare_task: Optional[asyncio.Task] = None
+        self._vision_prepare_cancel: Optional[threading.Event] = None
+        self._vision_runtime: Optional[dict] = None
         self._framesystem_task: Optional[asyncio.Task] = None
         self._framesystem_gen = 0
         self._framesystem_raw_attrs: Optional[Mapping] = None
@@ -176,6 +185,7 @@ class SlamService(SLAM):
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
         self._cancel_framesystem_task()
+        self._stop_vision()
         self._skip_get_laser_scan = set()
         attrs = struct_to_dict(config.attributes)
         cfg = SlamConfig.from_dict(attrs)
@@ -283,6 +293,7 @@ class SlamService(SLAM):
         self._manager.start()
         self._start_mode(cfg.mode)
         self._wire_still_keyframe_hook()
+        self._start_vision(loop)
         backend = "builtin+sim" if cfg.uses_sim() else "builtin"
 
         self._schedule_startup_global_localize(loop)
@@ -1629,6 +1640,7 @@ class SlamService(SLAM):
             "clear_region": self._cmd_clear_region,
             "add_obstacles": self._cmd_add_obstacles,
             "delete_map": self._cmd_delete_map,
+            "vision_status": self._cmd_vision_status,
         }
 
     async def do_command(
@@ -1719,6 +1731,11 @@ class SlamService(SLAM):
         status["localization_check"] = dict(self._last_relocalize_check)
         status["localization_state"] = self._loc_state.snapshot()
         status["revisit_check"] = dict(self._last_revisit_check)
+        if self._vision is not None or self._cfg is not None:
+            enabled = self._cfg is not None and bool(self._cfg.vision_enabled)
+            status["vision"] = self._vision_report(
+                {"enabled": enabled, "reason": "not_running"}
+            )
         if self._pause_keyframes is not None:
             status["pause_keyframes"] = self._pause_keyframes.status()
         shm_status = self._shm_lidar.status()
@@ -1790,6 +1807,14 @@ class SlamService(SLAM):
         out = {"status": "saved", "map": handle.name}
         if isinstance(result, Mapping):
             out.update({k: v for k, v in result.items() if k not in out})
+        vision = self._vision
+        if vision is not None:
+            try:
+                path = vision.save_to_map_dir(handle.root)
+                if path:
+                    out["vision_keyframes"] = path
+            except Exception as exc:  # noqa: BLE001
+                out["vision_keyframes_error"] = repr(exc)
         return out
 
     def _builtin_map_fn(self, name: str):
@@ -2054,6 +2079,9 @@ class SlamService(SLAM):
             handle.clear_serialized_data()
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._reset_live_slam, MODE_MAPPING)
+            vision = self._vision
+            if vision is not None:
+                vision.reset()
         finally:
             self._end_map_reset()
         return {"status": "cleared", "map": handle.name, "mode": MODE_MAPPING}
@@ -2365,9 +2393,13 @@ class SlamService(SLAM):
 
         loop = asyncio.get_running_loop()
 
+        def _optional_step(key: str) -> Optional[float]:
+            # Unset: the search uses the coarsest grid its hit tolerance
+            # supports. A coarser one loses the true pose before the fine
+            # search (35 cm / 10° did in 46-88% of whole-map office searches).
+            return float(command[key]) if command.get(key) is not None else None
+
         async def _run_match(full_map_override: bool):
-            default_coarse_pos = 0.35 if full_map_override else 0.4
-            default_coarse_yaw = 10.0 if full_map_override else 12.0
             default_local_yaw_window = 360.0 if full_map_override else 180.0
             default_ray_weight = 0.55 if full_map_override else 0.35
             default_ray_candidates = 48 if full_map_override else 24
@@ -2378,12 +2410,8 @@ class SlamService(SLAM):
                 hint=hint,
                 full_map=full_map_override,
                 search_radius_m=search_radius_m,
-                coarse_position_step_m=float(
-                    command.get("coarse_position_step_m", default_coarse_pos)
-                ),
-                coarse_yaw_step_deg=float(
-                    command.get("coarse_yaw_step_deg", default_coarse_yaw)
-                ),
+                coarse_position_step_m=_optional_step("coarse_position_step_m"),
+                coarse_yaw_step_deg=_optional_step("coarse_yaw_step_deg"),
                 local_yaw_window_deg=float(
                     command.get("local_yaw_window_deg", default_local_yaw_window)
                 ),
@@ -2399,7 +2427,9 @@ class SlamService(SLAM):
                 ray_refine_beams=int(command.get("ray_refine_beams", 64)),
                 ray_step_m=float(command.get("ray_step_m", 0.08)),
                 ray_weight=float(command.get("ray_weight", default_ray_weight)),
-                ambiguity_margin=float(command.get("ambiguity_margin", 0.06)),
+                ambiguity_margin=float(
+                    command.get("ambiguity_margin", DEFAULT_AMBIGUITY_MARGIN)
+                ),
             )
 
         result = await _run_match(full_map)
@@ -2523,6 +2553,7 @@ class SlamService(SLAM):
             "ray_score": result.ray_score,
             "ray_mae_m": result.ray_mae_m,
             "second_best_score": getattr(result, "second_best_score", None),
+            "combined_score": getattr(result, "combined_score", None),
             "ambiguous": bool(getattr(result, "ambiguous", False)),
             "map_source": map_source,
             "full_map": resolved_full_map,
@@ -2575,11 +2606,246 @@ class SlamService(SLAM):
             "or call set_initial_pose with a rough estimate first"
         )
 
+    def _cmd_vision_status(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        del command
+        return self._vision_report({"enabled": False, "reason": "vision not running"})
+
+    def _vision_report(self, idle: Mapping[str, ValueTypes]) -> dict:
+        """Supervisor status, or ``idle`` when there is none, plus the runtime report."""
+        vision = self._vision
+        runtime = self._vision_runtime
+        task = self._vision_prepare_task
+        if vision is not None:
+            out = dict(vision.status())
+        elif task is not None and not task.done():
+            # Enabled in the config; still installing / downloading.
+            out = {"enabled": True, "reason": "preparing"}
+        else:
+            out = dict(idle)
+        if runtime is not None:
+            out["runtime"] = dict(runtime)
+        return out
+
+    def _stop_vision(self) -> None:
+        # Stop a download or install in flight, so nothing outlives the
+        # config that asked for it (or holds up a shutdown).
+        cancel = self._vision_prepare_cancel
+        self._vision_prepare_cancel = None
+        if cancel is not None:
+            cancel.set()
+        task = self._vision_prepare_task
+        self._vision_prepare_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        self._vision_runtime = None
+        vision = self._vision
+        self._vision = None
+        if vision is not None:
+            try:
+                vision.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _start_vision(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start vision if the config enables it; otherwise nothing is loaded.
+
+        With the real models, ONNX Runtime and the weights are put in place
+        first, on a worker thread (``src/semantic/provision.py``): nothing of
+        vision is installed until a config turns it on, and nothing has to be
+        installed by hand. A step that fails is tried again until it works.
+        """
+        self._stop_vision()
+        cfg = self._cfg
+        if cfg is None or self._engine is None or not cfg.vision_enabled:
+            return
+        from ..semantic import provision
+
+        if not provision.uses_models(cfg):
+            self._launch_vision(loop)
+            return
+        self._vision_runtime = {"state": "preparing"}
+        cancel = threading.Event()
+        self._vision_prepare_cancel = cancel
+        self._vision_prepare_task = loop.create_task(
+            self._prepare_then_launch_vision(loop, cfg, cancel), name="vision-prepare"
+        )
+
+    async def _prepare_then_launch_vision(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        cfg: SlamConfig,
+        cancel: threading.Event,
+    ) -> None:
+        """Get the runtime in place and start vision, retrying until it is all there."""
+        from ..semantic import provision
+
+        attempts = 0
+        delay = float(provision.RETRY_FIRST_S)
+        detector_ok = False
+        while True:
+            try:
+                report = await asyncio.to_thread(
+                    provision.prepare, cfg, LOGGER.info, cancel=cancel
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                report = {
+                    "state": "failed",
+                    "steps": {"onnxruntime": f"failed: {exc!r}"},
+                }
+            # A reconfigure or close while this ran has already moved on.
+            if cancel.is_set() or self._cfg is not cfg or self._engine is None:
+                return
+            attempts += 1
+            ready = report.get("state") == "ready"
+            runtime = {**report, "attempts": attempts}
+            if not ready:
+                runtime.update(state="retrying", retry_in_s=round(delay))
+            self._vision_runtime = runtime
+            if self._vision is None:
+                # Keyframes and recovery need ONNX Runtime and DINOv2. The
+                # detector only feeds the person mask and may come later.
+                if provision.essentials_ready(report):
+                    detector_ok = provision.step_ok(report, "yolo_world")
+                    try:
+                        self._launch_vision(loop)
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.exception("vision: failed to start")
+                        self._vision_runtime = {
+                            **runtime,
+                            "state": "failed",
+                            "error": repr(exc),
+                        }
+                        return
+            elif not detector_ok and provision.step_ok(report, "yolo_world"):
+                detector_ok = bool(self._vision.load_detector())
+            if ready:
+                return
+            missing = sorted(
+                name
+                for name, outcome in (report.get("steps") or {}).items()
+                if str(outcome).startswith("failed")
+            )
+            LOGGER.warning(
+                "vision: still missing %s; trying again in %.0f s",
+                ", ".join(missing) or "a step",
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2.0, float(provision.RETRY_MAX_S))
+
+    def _launch_vision(self, loop: asyncio.AbstractEventLoop) -> None:
+        cfg = self._cfg
+        engine = self._engine
+        if cfg is None or engine is None:
+            return
+        from ..semantic.supervisor import VisionSupervisor
+
+        def _anchor():
+            return engine.vision_anchor()
+
+        mgr = self._manager
+
+        def _apply_pose_correction(pose, *, score=None, force=False):
+            # Place-index teleport (off by default). Prefer host wrapper (same
+            # path as lidar revisit); fall back to engine.
+            if mgr is not None and hasattr(mgr, "apply_map_pose_correction"):
+                return mgr.apply_map_pose_correction(pose, score=score, force=force)
+            return engine.apply_map_pose_correction(pose, score=score, force=force)
+
+        def _is_localization_lost() -> bool:
+            # Vision moves the pose only when it is untrusted (lost) or not yet seeded.
+            state = str(getattr(self._loc_state, "state", "") or "")
+            return state in ("lost", "unknown")
+
+        # Lost-pose recovery runs on a vision worker thread; the scan search
+        # and the pose apply run on the module loop.
+        def _lidar_search(hint, radius_m, yaw_window_deg):
+            from ..semantic.relocalize import LidarMatch
+
+            command = {
+                "command": "global_localize",
+                "pose": {"x": hint.x, "y": hint.y, "theta": hint.theta},
+                "full_map": False,
+                "auto_full_map_fallback": False,
+                "apply": False,
+                "map_source": "live",
+                "search_radius_m": float(radius_m),
+                "local_yaw_window_deg": float(yaw_window_deg),
+            }
+            match = asyncio.run_coroutine_threadsafe(
+                self._global_localize(command), loop
+            ).result(timeout=20.0)
+            pose = match.get("pose")
+            if not pose or match.get("score") is None:
+                return None
+            return LidarMatch(
+                conv.Pose2D(float(pose["x"]), float(pose["y"]), float(pose["theta"])),
+                float(match["score"]),
+                float(match.get("ray_mae_m", float("inf"))),
+            )
+
+        def _apply_relocalization(pose) -> bool:
+            return bool(
+                asyncio.run_coroutine_threadsafe(
+                    self._apply_vision_recovery(pose), loop
+                ).result(timeout=10.0)
+            )
+
+        vision = VisionSupervisor(
+            cfg=cfg,
+            cameras=self._cameras,
+            get_pose=engine.get_pose,
+            get_pose_at=engine.get_pose_at,
+            get_anchor=_anchor,
+            apply_pose_correction=_apply_pose_correction,
+            is_localization_lost=_is_localization_lost,
+            note_paint_discs=engine.note_paint_discs,
+            lidar_search=_lidar_search,
+            apply_relocalization=_apply_relocalization,
+            is_base_stopped=self._base_is_stopped,
+            logger=LOGGER.info,
+        )
+        store = self._map_store
+        handle = store.active_handle() if store is not None else None
+        if handle is not None:
+            vision.load_from_map_dir(handle.root)
+        vision.start(loop)
+        self._vision = vision
+        engine.set_anchor_motion_hook(vision.follow_anchor_motion)
+
+    async def _apply_vision_recovery(self, pose: conv.Pose2D) -> bool:
+        """Place a pose the camera proposed and the scan search confirmed."""
+        mgr = self._manager
+        if mgr is None or self._cfg is None or self._cfg.mode != MODE_LOCALIZING:
+            return False
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: mgr.relocalize(
+                pose,
+                position_variance_m2=0.25,
+                yaw_variance_rad2=0.06853891945200942,
+            ),
+        )
+        self._mark_pose_seeded("vision_recovery")
+        LOGGER.info(
+            "vision recovery: pose placed at x=%.2f y=%.2f theta=%.1f deg",
+            pose.x,
+            pose.y,
+            math.degrees(pose.theta),
+        )
+        return True
+
     async def close(self) -> None:
         self._cancel_startup_global_localize_task()
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
         self._cancel_framesystem_task()
+        self._stop_vision()
         unregister_slam(self.name)
         unregister_slam_service(self.name)
         self._shm_lidar.close()

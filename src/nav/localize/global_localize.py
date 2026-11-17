@@ -10,7 +10,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Mapping, Optional, Tuple
+from typing import List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -53,10 +53,14 @@ class GlobalLocalizeResult:
     hit_rate: float
     ray_score: float
     ray_mae_m: float
-    # Combined (endpoint + ray) score of the runner-up after ray rerank.
-    # Used to refuse applying an ambiguous full-map peak.
+    # Combined (endpoint + ray) score of the best different place (over 1 m
+    # away or facing over 45° differently); -inf when there is none. Used to
+    # refuse applying a pose that a second place explains nearly as well.
     second_best_score: float = float("-inf")
     ambiguous: bool = False
+    # The winner's own combined (endpoint + ray) score: the number to compare
+    # with ``second_best_score``. ``score`` is the endpoint part alone.
+    combined_score: float = float("-inf")
     # Fraction of the scan the map could judge at the winning pose.
     coverage: float = 0.0
 
@@ -428,29 +432,6 @@ def score_pose_with_rays(
     return float(endpoint.score), float(ray_mae)
 
 
-def _iter_pose_grid(
-    *,
-    center_x: float,
-    center_y: float,
-    center_theta: float,
-    radius_m: float,
-    position_step_m: float,
-    yaw_step_rad: float,
-    yaw_range_rad: float,
-) -> Iterable[conv.Pose2D]:
-    pos_steps = max(1, int(math.ceil(radius_m / position_step_m)))
-    yaw_steps = max(1, int(math.ceil(yaw_range_rad / yaw_step_rad)))
-    for ix in range(-pos_steps, pos_steps + 1):
-        x = center_x + ix * position_step_m
-        for iy in range(-pos_steps, pos_steps + 1):
-            y = center_y + iy * position_step_m
-            if (x - center_x) ** 2 + (y - center_y) ** 2 > radius_m**2 + 1e-9:
-                continue
-            for it in range(-yaw_steps, yaw_steps + 1):
-                theta = conv.normalize_angle(center_theta + it * yaw_step_rad)
-                yield conv.Pose2D(x, y, theta)
-
-
 def _map_search_bounds(occ_map: OccupancyMap) -> Tuple[float, float, float, float]:
     known = occ_map.known_mask()
     if not np.any(known):
@@ -472,23 +453,224 @@ def _map_search_bounds(occ_map: OccupancyMap) -> Tuple[float, float, float, floa
     return min_x, min_y, max_x, max_y
 
 
-def _iter_full_map_poses(
+# The coarse grid may be no coarser than the match tolerance supports. A scan
+# endpoint counts as a hit within ``hit_radius_cells`` of a wall, so a sample
+# farther than that from the true pose scores like a wrong pose and is thrown
+# away before the fine search sees it. On an office map (5 cm cells, 10 cm
+# tolerance) the score kept about 70% of its peak 10 cm and 2° off and about
+# 30% at 20 cm and 5°; a 35 cm / 10° grid lost the true pose in 46-88% of
+# whole-map searches.
+_YAW_STEP_RANGE_PERCENTILE = 90.0
+_MIN_COARSE_YAW_STEP_DEG = 2.0
+_MAX_COARSE_YAW_STEP_DEG = 12.0
+# Two answers this far apart, or facing this differently, are different
+# places. ``second_best_score`` and ``ambiguous`` compare the winner with the
+# best different place, never with a neighbouring sample of the same peak.
+_RIVAL_DISTANCE_M = 1.0
+_RIVAL_YAW_DEG = 45.0
+# The winner must lead the best different place by this much on the combined
+# score. Over 90 whole-map searches per office run the lead had a median of
+# 0.26-0.54 when the answer was right and 0.05 when it was wrong; 0.06 let
+# through 1-3% wrong placements in changed scenes and 0.15 none, for 0-4
+# points fewer right ones.
+DEFAULT_AMBIGUITY_MARGIN = 0.15
+# Different places refined by the fine search before one is chosen.
+_REFINE_PLACES = 3
+# Fine candidates per place that get the ray check.
+_FINE_RAY_CANDIDATES = 12
+_COARSE_KEEP_PER_YAW = 64
+# Quarter fine steps either side of the fine winner (position and heading).
+_POLISH_STEPS = np.arange(-2, 3)
+_BATCH_POSES = 16384
+
+
+def tolerance_grid_steps(
+    scan_xy: np.ndarray, resolution: float, hit_radius_cells: int
+) -> Tuple[float, float]:
+    """Coarsest ``(position step m, heading step deg)`` the hit tolerance supports.
+
+    Neighbouring position samples are ``hit_radius_cells + 1`` cells apart, so
+    the true pose is never more than the tolerance from one of them along an
+    axis. The heading step moves the far scan points (90th percentile range)
+    by no more than the tolerance either side of a sample.
+    """
+    radius = max(0, int(hit_radius_cells))
+    position_step = (radius + 1) * float(resolution)
+    tolerance_m = (radius + 0.5) * float(resolution)
+    ranges = np.hypot(scan_xy[:, 0], scan_xy[:, 1]) if scan_xy.size else np.zeros(0)
+    far = (
+        float(np.percentile(ranges, _YAW_STEP_RANGE_PERCENTILE)) if ranges.size else 1.0
+    )
+    yaw_step = math.degrees(2.0 * tolerance_m / max(far, 1e-3))
+    return position_step, min(
+        _MAX_COARSE_YAW_STEP_DEG, max(_MIN_COARSE_YAW_STEP_DEG, yaw_step)
+    )
+
+
+class _BatchScorer:
+    """Score many candidate poses at once. Same numbers as ``_score_pose``."""
+
+    def __init__(
+        self,
+        occ_map: OccupancyMap,
+        scan_xy: np.ndarray,
+        occupied_lookup: np.ndarray,
+        *,
+        min_in_map_points: int,
+        min_in_map_ratio: float,
+    ) -> None:
+        grid = occ_map.grid
+        height, width = grid.shape
+        self._map = occ_map
+        self._xs = np.asarray(scan_xy[:, 0], dtype=float)
+        self._ys = np.asarray(scan_xy[:, 1], dtype=float)
+        self._total = int(scan_xy.shape[0])
+        self._min_points = max(
+            int(min_in_map_points), int(self._total * min_in_map_ratio)
+        )
+        # One byte per cell: bit 0 hit (near a wall), bit 1 known free,
+        # bit 2 inside the grid. The border of zeros stands for off-grid.
+        code = occupied_lookup.astype(np.uint8)
+        code |= ((grid >= 0) & (grid < 50)).astype(np.uint8) << 1
+        code |= 4
+        reach = float(np.hypot(self._xs, self._ys).max()) if self._total else 0.0
+        pad = int(
+            min(math.ceil(reach / occ_map.resolution) + 2, max(height, width) + 2)
+        )
+        padded = np.zeros((height + 2 * pad, width + 2 * pad), dtype=np.uint8)
+        padded[pad : pad + height, pad : pad + width] = code
+        self._flat = padded.ravel()
+        self._pad = pad
+        self._padded_width = width + 2 * pad
+
+    def _rotated(self, theta: float) -> Tuple[np.ndarray, np.ndarray]:
+        c, s = math.cos(theta), math.sin(theta)
+        return c * self._xs - s * self._ys, s * self._xs + c * self._ys
+
+    def _scores(self, codes: np.ndarray) -> Tuple[np.ndarray, ...]:
+        inside = np.count_nonzero(codes & 4, axis=1)
+        hits = np.count_nonzero(codes & 1, axis=1)
+        free = np.count_nonzero(codes & 2, axis=1)
+        known = np.count_nonzero(codes & 3, axis=1)
+        enough = (inside >= self._min_points) & (known >= self._min_points)
+        denom = np.maximum(known, 1).astype(float)
+        hit_rate = hits / denom
+        coverage = known / float(max(1, self._total))
+        score = hit_rate - 0.7 * (free / denom)
+        score = np.where(
+            coverage < _COVERAGE_FLOOR,
+            score - _COVERAGE_PENALTY * (_COVERAGE_FLOOR - coverage),
+            score,
+        )
+        score = np.where(enough, score, -np.inf)
+        hit_rate = np.where(enough, hit_rate, 0.0)
+        coverage = np.where(inside >= self._min_points, coverage, 0.0)
+        return score, inside, hit_rate, coverage
+
+    def score_lattice(
+        self,
+        rows: np.ndarray,
+        cols: np.ndarray,
+        frac_x: float,
+        frac_y: float,
+        theta: float,
+    ) -> Tuple[np.ndarray, ...]:
+        """Candidates at in-grid cells ``(rows, cols)`` sharing one sub-cell offset.
+
+        With a common offset each scan point shifts every candidate by the
+        same whole number of cells, so the lookup is one integer add.
+        """
+        res = self._map.resolution
+        rx, ry = self._rotated(theta)
+        dcol = np.clip(np.floor(frac_x + rx / res), -self._pad, self._pad).astype(
+            np.int64
+        )
+        drow = np.clip(np.floor(frac_y + ry / res), -self._pad, self._pad).astype(
+            np.int64
+        )
+        offsets = drow * self._padded_width + dcol
+        base = (rows.astype(np.int64) + self._pad) * self._padded_width + (
+            cols.astype(np.int64) + self._pad
+        )
+        parts = [
+            self._scores(
+                self._flat[base[i : i + _BATCH_POSES, None] + offsets[None, :]]
+            )
+            for i in range(0, len(base), _BATCH_POSES)
+        ]
+        return tuple(np.concatenate(col) for col in zip(*parts))
+
+    def score_xy(
+        self, xs: np.ndarray, ys: np.ndarray, theta: float
+    ) -> Tuple[np.ndarray, ...]:
+        """Candidates at arbitrary positions, one heading."""
+        res = self._map.resolution
+        height, width = self._map.grid.shape
+        rx, ry = self._rotated(theta)
+        cols = np.floor((xs[:, None] + rx[None, :] - self._map.origin_x) / res).astype(
+            np.int64
+        )
+        rows = np.floor((ys[:, None] + ry[None, :] - self._map.origin_y) / res).astype(
+            np.int64
+        )
+        inside = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+        # Index 0 is in the zero border: an off-grid point reads as off-grid.
+        index = np.where(
+            inside, (rows + self._pad) * self._padded_width + cols + self._pad, 0
+        )
+        return self._scores(self._flat[index])
+
+
+def _lattice_cells(
     occ_map: OccupancyMap,
+    anchor_x: float,
+    anchor_y: float,
+    stride: int,
     *,
-    position_step_m: float,
-    yaw_step_rad: float,
-) -> Iterable[conv.Pose2D]:
-    min_x, min_y, max_x, max_y = _map_search_bounds(occ_map)
-    x = min_x
-    while x <= max_x:
-        y = min_y
-        while y <= max_y:
-            theta = -math.pi
-            while theta < math.pi:
-                yield conv.Pose2D(x, y, theta)
-                theta += yaw_step_rad
-            y += position_step_m
-        x += position_step_m
+    radius_m: Optional[float],
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    """Known cells on a square lattice through the anchor.
+
+    ``radius_m`` limits the lattice to a disc around the anchor; ``None``
+    covers the known part of the map. Returns ``(rows, cols, frac_x, frac_y)``
+    where a candidate sits at ``origin + (col + frac_x) * resolution``.
+    """
+    res = occ_map.resolution
+    height, width = occ_map.grid.shape
+    ax = (anchor_x - occ_map.origin_x) / res
+    ay = (anchor_y - occ_map.origin_y) / res
+    col0, row0 = math.floor(ax), math.floor(ay)
+    frac_x, frac_y = ax - col0, ay - row0
+    if radius_m is None:
+        known = occ_map.known_mask()
+        if np.any(known):
+            known_rows, known_cols = np.where(known)
+            lo_r, hi_r = int(known_rows.min()), int(known_rows.max())
+            lo_c, hi_c = int(known_cols.min()), int(known_cols.max())
+        else:
+            lo_r, hi_r, lo_c, hi_c = 0, height - 1, 0, width - 1
+        row_steps = np.arange(-((row0 - lo_r) // stride), (hi_r - row0) // stride + 1)
+        col_steps = np.arange(-((col0 - lo_c) // stride), (hi_c - col0) // stride + 1)
+    else:
+        n = max(1, int(math.ceil(radius_m / (stride * res))))
+        row_steps = col_steps = np.arange(-n, n + 1)
+    jj, ii = np.meshgrid(row_steps, col_steps, indexing="ij")
+    if radius_m is not None:
+        keep = (ii * ii + jj * jj) * (stride * res) ** 2 <= radius_m * radius_m + 1e-9
+        ii, jj = ii[keep], jj[keep]
+    rows = (row0 + jj * stride).ravel()
+    cols = (col0 + ii * stride).ravel()
+    ok = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+    rows, cols = rows[ok], cols[ok]
+    ok = occ_map.grid[rows, cols] >= 0
+    return rows[ok], cols[ok], float(frac_x), float(frac_y)
+
+
+def _different_place(a: conv.Pose2D, b: conv.Pose2D) -> bool:
+    return (
+        math.hypot(a.x - b.x, a.y - b.y) > _RIVAL_DISTANCE_M
+        or abs(math.degrees(conv.normalize_angle(a.theta - b.theta))) > _RIVAL_YAW_DEG
+    )
 
 
 def global_localize_scan(
@@ -498,8 +680,8 @@ def global_localize_scan(
     hint: Optional[conv.Pose2D] = None,
     full_map: bool = False,
     search_radius_m: float = 8.0,
-    coarse_position_step_m: float = 0.4,
-    coarse_yaw_step_deg: float = 12.0,
+    coarse_position_step_m: Optional[float] = None,
+    coarse_yaw_step_deg: Optional[float] = None,
     local_yaw_window_deg: float = 180.0,
     fine_position_step_m: float = 0.08,
     fine_yaw_step_deg: float = 2.0,
@@ -513,14 +695,19 @@ def global_localize_scan(
     ray_refine_beams: int = 64,
     ray_step_m: float = 0.08,
     ray_weight: float = 0.35,
-    ambiguity_margin: float = 0.06,
+    ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
 ) -> GlobalLocalizeResult:
     """Find the map-frame pose that best explains ``scan`` against ``occ_map``.
 
-    For ``full_map`` searches, prefer a finer coarse grid and higher
-    ``ray_weight`` / ``ray_refine_candidates`` (callers should pass those). The
-    result's ``ambiguous`` flag is set when the best and second-best combined
-    scores are within ``ambiguity_margin`` — callers should not auto-apply.
+    The coarse grid defaults to the coarsest spacing the hit tolerance
+    supports (``tolerance_grid_steps``). A caller on a tight time budget may
+    pass a coarser one and accept that the true pose can be missed.
+
+    The strongest distinct places from the coarse grid get the ray check, the
+    best few different places are each refined, and the best refined pose
+    wins. ``second_best_score`` is the best combined (endpoint + ray) score of
+    a different place, and ``ambiguous`` is set when the winner leads it by
+    less than ``ambiguity_margin`` — callers should not auto-apply then.
     """
     scan_xy = scan_endpoints_base_link(scan)
     if scan_xy.shape[0] < 8:
@@ -531,136 +718,247 @@ def global_localize_scan(
         idx = np.linspace(0, scan_xy.shape[0] - 1, max_scan_points, dtype=np.int32)
         scan_xy = scan_xy[idx]
 
-    # Full-map defaults: denser coarse grid + stronger ray voice so repetitive
-    # corridors are less likely to win on endpoint hits alone. Only rewrite the
-    # legacy defaults so explicit coarser/faster callers (e.g. revisit) keep
-    # their steps.
-    if full_map or hint is None:
-        if abs(coarse_position_step_m - 0.4) < 1e-9:
-            coarse_position_step_m = 0.35
-        if abs(coarse_yaw_step_deg - 12.0) < 1e-9:
-            coarse_yaw_step_deg = 10.0
+    whole_map = bool(full_map) or hint is None
+    # Whole-map: a stronger ray voice so repetitive corridors are less likely
+    # to win on endpoint hits alone. Only the legacy defaults are rewritten.
+    if whole_map:
         if abs(ray_weight - 0.35) < 1e-9:
             ray_weight = 0.55
         if ray_refine_candidates == 24:
             ray_refine_candidates = 48
 
-    coarse_yaw = math.radians(coarse_yaw_step_deg)
-    fine_yaw = math.radians(fine_yaw_step_deg)
-    occupied_lookup = _inflate_occupied(
-        occ_map.grid >= 65, max(0, int(hit_radius_cells))
+    res = float(occ_map.resolution)
+    hit_radius_cells = max(0, int(hit_radius_cells))
+    default_step_m, default_yaw_deg = tolerance_grid_steps(
+        scan_xy, res, hit_radius_cells
+    )
+    coarse_step_m = (
+        default_step_m
+        if coarse_position_step_m is None
+        else float(coarse_position_step_m)
+    )
+    coarse_yaw_deg = (
+        default_yaw_deg if coarse_yaw_step_deg is None else float(coarse_yaw_step_deg)
+    )
+    stride = max(1, int(round(coarse_step_m / res)))
+    coarse_yaw = math.radians(max(1e-3, coarse_yaw_deg))
+
+    occupied_lookup = _inflate_occupied(occ_map.grid >= 65, hit_radius_cells)
+    scorer = _BatchScorer(
+        occ_map,
+        scan_xy,
+        occupied_lookup,
+        min_in_map_points=min_in_map_points,
+        min_in_map_ratio=min_in_map_ratio,
     )
     ray_angles, ray_ranges = _sample_scan_beams(scan, max(0, int(ray_refine_beams)))
     range_max = float(scan.range_max) if math.isfinite(scan.range_max) else 25.0
     evaluated = 0
 
-    def search_candidates(
-        candidates: Iterable[conv.Pose2D], keep: int
-    ) -> List[_ScoredPose]:
-        nonlocal evaluated
-        scored: List[_ScoredPose] = []
-        for pose in candidates:
-            if not _pose_in_known_map(occ_map, pose):
-                continue
-            score_eval = _score_pose(
-                occ_map,
-                scan_xy,
-                pose,
-                occupied_lookup=occupied_lookup,
-                min_in_map_points=min_in_map_points,
-                min_in_map_ratio=min_in_map_ratio,
-            )
-            evaluated += 1
-            if math.isfinite(score_eval.score):
-                scored.append(_ScoredPose(pose=pose, endpoint_eval=score_eval))
-        scored.sort(key=lambda item: item.endpoint_eval.score, reverse=True)
-        return scored[: max(1, keep)]
-
-    def rerank_with_rays(
-        scored: List[_ScoredPose],
-    ) -> Tuple[conv.Pose2D, _PoseScore, float, float, float]:
-        """Returns pose, endpoint eval, ray_score, ray_mae, second_best_combined."""
-        if not scored:
-            return (
-                conv.Pose2D(0.0, 0.0, 0.0),
-                _PoseScore(float("-inf"), 0, 0.0),
-                0.0,
-                float("inf"),
-                float("-inf"),
-            )
-        best_pose = scored[0].pose
-        best_eval = scored[0].endpoint_eval
-        best_ray_score = 0.0
-        best_ray_mae = float("inf")
-        best_combined = float("-inf")
-        second_combined = float("-inf")
-        limit = min(len(scored), max(1, int(ray_refine_candidates)))
-        for item in scored[:limit]:
-            ray_quality, ray_mae = _ray_alignment(
-                occ_map,
-                item.pose,
-                ray_angles,
-                ray_ranges,
-                range_max_m=range_max,
-                step_m=ray_step_m,
-            )
-            combined = item.endpoint_eval.score + ray_weight * (
-                (2.0 * ray_quality) - 1.0
-            )
-            if combined > best_combined:
-                second_combined = best_combined
-                best_combined = combined
-                best_pose = item.pose
-                best_eval = item.endpoint_eval
-                best_ray_score = ray_quality
-                best_ray_mae = ray_mae
-            elif combined > second_combined:
-                second_combined = combined
-        return best_pose, best_eval, best_ray_score, best_ray_mae, second_combined
-
-    if full_map or hint is None:
-        coarse_candidates = _iter_full_map_poses(
+    def with_rays(
+        pose: conv.Pose2D, endpoint: _PoseScore
+    ) -> Tuple[float, float, float]:
+        quality, mae = _ray_alignment(
             occ_map,
-            position_step_m=coarse_position_step_m,
-            yaw_step_rad=coarse_yaw,
+            pose,
+            ray_angles,
+            ray_ranges,
+            range_max_m=range_max,
+            step_m=ray_step_m,
         )
+        return endpoint.score + ray_weight * ((2.0 * quality) - 1.0), quality, mae
+
+    # --- Coarse grid -------------------------------------------------------
+    if whole_map:
+        min_x, min_y, _max_x, _max_y = _map_search_bounds(occ_map)
+        rows, cols, frac_x, frac_y = _lattice_cells(
+            occ_map, min_x + 0.5 * res, min_y + 0.5 * res, stride, radius_m=None
+        )
+        yaws = np.arange(-math.pi, math.pi - 1e-9, coarse_yaw)
     else:
-        coarse_candidates = _iter_pose_grid(
-            center_x=hint.x,
-            center_y=hint.y,
-            center_theta=hint.theta,
-            radius_m=search_radius_m,
-            position_step_m=coarse_position_step_m,
-            yaw_step_rad=coarse_yaw,
-            yaw_range_rad=math.radians(local_yaw_window_deg / 2.0),
+        rows, cols, frac_x, frac_y = _lattice_cells(
+            occ_map, hint.x, hint.y, stride, radius_m=float(search_radius_m)
         )
+        half = math.radians(local_yaw_window_deg / 2.0)
+        yaw_steps = max(1, int(math.ceil(half / coarse_yaw)))
+        yaws = hint.theta + np.arange(-yaw_steps, yaw_steps + 1) * coarse_yaw
 
-    coarse_scored = search_candidates(
-        coarse_candidates, keep=max(8, int(ray_refine_candidates))
-    )
-    best_pose, best_eval, _, _, _ = rerank_with_rays(coarse_scored)
-
-    fine_yaw_window = math.radians(fine_yaw_window_deg)
-    fine_candidates = _iter_pose_grid(
-        center_x=best_pose.x,
-        center_y=best_pose.y,
-        center_theta=best_pose.theta,
-        radius_m=fine_window_m,
-        position_step_m=fine_position_step_m,
-        yaw_step_rad=fine_yaw,
-        yaw_range_rad=fine_yaw_window,
-    )
-    fine_scored = search_candidates(
-        fine_candidates, keep=max(12, int(ray_refine_candidates))
-    )
-    best_pose, best_eval, best_ray_score, best_ray_mae, second_best = rerank_with_rays(
-        fine_scored
-    )
-
-    if not math.isfinite(best_eval.score):
+    coarse: List[Tuple[float, conv.Pose2D, _PoseScore]] = []
+    if rows.size:
+        cell_x = occ_map.origin_x + (cols + frac_x) * res
+        cell_y = occ_map.origin_y + (rows + frac_y) * res
+        for theta in yaws:
+            theta = conv.normalize_angle(float(theta))
+            score, inside, hit_rate, coverage = scorer.score_lattice(
+                rows, cols, frac_x, frac_y, theta
+            )
+            evaluated += int(rows.size)
+            take = min(_COARSE_KEEP_PER_YAW, score.size)
+            best = (
+                np.argpartition(-score, take - 1)[:take]
+                if take < score.size
+                else np.arange(score.size)
+            )
+            for i in best:
+                if math.isfinite(score[i]):
+                    coarse.append(
+                        (
+                            float(score[i]),
+                            conv.Pose2D(float(cell_x[i]), float(cell_y[i]), theta),
+                            _PoseScore(
+                                float(score[i]),
+                                int(inside[i]),
+                                float(hit_rate[i]),
+                                float(coverage[i]),
+                            ),
+                        )
+                    )
+    if not coarse:
         raise RuntimeError("global scan match failed; no valid candidate in map bounds")
+    coarse.sort(key=lambda item: item[0], reverse=True)
 
-    # Corridor 180° check on the fine winner (cheap; breaks common false peaks).
+    # Neighbouring samples of one peak would fill the shortlist; keep one each.
+    nms_m = max(2.0 * stride * res, 0.3)
+    nms_yaw = max(2.0 * coarse_yaw, math.radians(8.0))
+    peaks: List[Tuple[conv.Pose2D, _PoseScore]] = []
+    for _score, pose, endpoint in coarse:
+        if all(
+            math.hypot(pose.x - kept.x, pose.y - kept.y) > nms_m
+            or abs(conv.normalize_angle(pose.theta - kept.theta)) > nms_yaw
+            for kept, _ in peaks
+        ):
+            peaks.append((pose, endpoint))
+            if len(peaks) >= max(1, int(ray_refine_candidates)):
+                break
+
+    ranked = sorted(
+        ((with_rays(pose, endpoint)[0], pose, endpoint) for pose, endpoint in peaks),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    places: List[Tuple[float, conv.Pose2D, _PoseScore]] = []
+    for item in ranked:
+        if all(_different_place(item[1], chosen[1]) for chosen in places):
+            places.append(item)
+            if len(places) >= _REFINE_PLACES:
+                break
+
+    # --- Fine search around each place --------------------------------------
+    fine_step = max(1e-3, float(fine_position_step_m))
+    fine_yaw = math.radians(max(1e-3, float(fine_yaw_step_deg)))
+    pos_steps = max(1, int(math.ceil(fine_window_m / fine_step)))
+    offs = np.arange(-pos_steps, pos_steps + 1) * fine_step
+    gx, gy = np.meshgrid(offs, offs, indexing="ij")
+    in_disc = gx * gx + gy * gy <= fine_window_m * fine_window_m + 1e-9
+    gx, gy = gx[in_disc], gy[in_disc]
+    yaw_count = max(1, int(math.ceil(math.radians(fine_yaw_window_deg) / fine_yaw)))
+
+    def refine(
+        center: conv.Pose2D,
+    ) -> Optional[Tuple[float, conv.Pose2D, _PoseScore, float, float]]:
+        nonlocal evaluated
+        xs, ys = center.x + gx, center.y + gy
+        cell_cols = np.floor((xs - occ_map.origin_x) / res).astype(np.int64)
+        cell_rows = np.floor((ys - occ_map.origin_y) / res).astype(np.int64)
+        ok = (
+            (cell_rows >= 0)
+            & (cell_rows < occ_map.height)
+            & (cell_cols >= 0)
+            & (cell_cols < occ_map.width)
+        )
+        ok[ok] = occ_map.grid[cell_rows[ok], cell_cols[ok]] >= 0
+        xs, ys = xs[ok], ys[ok]
+        if xs.size == 0:
+            return None
+        found: List[Tuple[float, conv.Pose2D, _PoseScore]] = []
+        for k in range(-yaw_count, yaw_count + 1):
+            theta = conv.normalize_angle(center.theta + k * fine_yaw)
+            score, inside, hit_rate, coverage = scorer.score_xy(xs, ys, theta)
+            evaluated += int(xs.size)
+            take = min(_FINE_RAY_CANDIDATES, score.size)
+            best = (
+                np.argpartition(-score, take - 1)[:take]
+                if take < score.size
+                else np.arange(score.size)
+            )
+            for i in best:
+                if math.isfinite(score[i]):
+                    found.append(
+                        (
+                            float(score[i]),
+                            conv.Pose2D(float(xs[i]), float(ys[i]), theta),
+                            _PoseScore(
+                                float(score[i]),
+                                int(inside[i]),
+                                float(hit_rate[i]),
+                                float(coverage[i]),
+                            ),
+                        )
+                    )
+        if not found:
+            return None
+        found.sort(key=lambda item: item[0], reverse=True)
+        best_item = None
+        for _score, pose, endpoint in found[:_FINE_RAY_CANDIDATES]:
+            combined, quality, mae = with_rays(pose, endpoint)
+            if best_item is None or combined > best_item[0]:
+                best_item = (combined, pose, endpoint, quality, mae)
+        # Polish between the fine samples. The peak is narrower than the fine
+        # step, so without this the reported score depends on where the grid
+        # happened to fall (0.80 against 0.93 for one office pose).
+        anchor = best_item[1]
+        px, py = np.meshgrid(
+            _POLISH_STEPS * (fine_step / 4.0), _POLISH_STEPS * (fine_step / 4.0)
+        )
+        px, py = anchor.x + px.ravel(), anchor.y + py.ravel()
+        polished: List[Tuple[float, conv.Pose2D, _PoseScore]] = []
+        for k in _POLISH_STEPS:
+            theta = conv.normalize_angle(anchor.theta + float(k) * (fine_yaw / 4.0))
+            score, inside, hit_rate, coverage = scorer.score_xy(px, py, theta)
+            evaluated += int(px.size)
+            i = int(np.argmax(score))
+            if math.isfinite(score[i]):
+                polished.append(
+                    (
+                        float(score[i]),
+                        conv.Pose2D(float(px[i]), float(py[i]), theta),
+                        _PoseScore(
+                            float(score[i]),
+                            int(inside[i]),
+                            float(hit_rate[i]),
+                            float(coverage[i]),
+                        ),
+                    )
+                )
+        polished.sort(key=lambda item: item[0], reverse=True)
+        for _score, pose, endpoint in polished[:3]:
+            combined, quality, mae = with_rays(pose, endpoint)
+            if combined > best_item[0]:
+                best_item = (combined, pose, endpoint, quality, mae)
+        return best_item
+
+    refined = [
+        item for item in (refine(place[1]) for place in places) if item is not None
+    ]
+    if not refined:
+        raise RuntimeError("global scan match failed; no valid candidate in map bounds")
+    refined.sort(key=lambda item: item[0], reverse=True)
+    best_combined, best_pose, best_eval, best_ray_score, best_ray_mae = refined[0]
+
+    # Best different place: a refined rival, or one the fine search never
+    # reached (its coarse score is a lower bound on what refining would find).
+    second_best = float("-inf")
+    for combined, pose, *_rest in refined[1:]:
+        if _different_place(pose, best_pose):
+            second_best = max(second_best, combined)
+    for combined, pose, _endpoint in ranked:
+        if _different_place(pose, best_pose) and all(
+            _different_place(pose, item[1]) for item in refined
+        ):
+            second_best = max(second_best, combined)
+            break
+
+    # Corridor 180° check on the winner (cheap; breaks common false peaks).
     yaw_choice = choose_yaw_or_flip(
         occ_map,
         scan,
@@ -674,7 +972,6 @@ def global_localize_scan(
     )
     if yaw_choice.flipped:
         best_pose = yaw_choice.pose
-        best_ray_mae = yaw_choice.ray_mae_m
         best_eval = _PoseScore(
             yaw_choice.score,
             best_eval.in_map_points,
@@ -690,8 +987,8 @@ def global_localize_scan(
             range_max_m=range_max,
             step_m=ray_step_m,
         )
+        best_combined = best_eval.score + ray_weight * ((2.0 * best_ray_score) - 1.0)
 
-    best_combined = best_eval.score + ray_weight * ((2.0 * best_ray_score) - 1.0)
     ambiguous = (
         math.isfinite(second_best)
         and math.isfinite(best_combined)
@@ -710,6 +1007,7 @@ def global_localize_scan(
         second_best_score=second_best,
         ambiguous=ambiguous,
         coverage=best_eval.coverage,
+        combined_score=float(best_combined),
     )
 
 

@@ -571,6 +571,13 @@ turned (`snaps_rejected`, above 120°/s over one sample) and the net yaw the
 scan has corrected since the last seed (`bias_deg_s` once 30 s have passed),
 and `yaw_only_applies` counts the heading-only corrections made while driving.
 
+The coarse search grid is sized from the hit tolerance (`hit_radius_cells`):
+about 15 cm and 4° on a 5 cm map. Leave `coarse_position_step_m` /
+`coarse_yaw_step_deg` unset unless a search must be faster; a coarser grid can
+drop the true pose before the fine search sees it. `ambiguous` and
+`second_best_score` compare the winner with the best *different place* (over
+1 m away or facing over 45° differently), not with a neighbouring sample.
+
 Speed/robustness knobs: `local_yaw_window_deg`, `coarse_position_step_m`,
 `coarse_yaw_step_deg`, `max_scan_points`, `min_in_map_points`,
 `min_in_map_ratio`, `hit_radius_cells`, `ray_refine_candidates`,
@@ -689,7 +696,9 @@ is inside them.
 ### Map management (SLAM service)
 
 `list_maps`, `get_active_map`, `set_active_map`, `rename_map`, `delete_map`,
-`clear_map`, `clear_obstacles` (alias `erase_obstacles`; paint free space in a
+`clear_map`, `vision_status` (alias `get_vision_status`; camera keyframes,
+lost-pose recovery and the person mask — see
+`src/semantic/models/README.md`), `clear_obstacles` (alias `erase_obstacles`; paint free space in a
 disk — builtin SLAM; args `x`/`y` or `pose`, `radius_m`, optional `save`),
 `clear_region` (alias `erase_region`; blank an axis-aligned box and drop
 keyframes whose poses fall inside it — builtin SLAM; args `x_min`/`y_min`/

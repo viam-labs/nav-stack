@@ -203,6 +203,10 @@ class BuiltinSlamEngine:
         # Bumped whenever the pose jumps frame (correction / set_pose) so an
         # in-flight match computed in the old frame is not applied.
         self._pose_epoch = 0
+        # Person discs from the vision paint gate. Endpoints inside them are
+        # dropped only while the camera frame is this fresh.
+        self._paint_discs: list = []
+        self._paint_discs_at = 0.0
         self._loop_params = loop_closure.LoopClosureParams(
             min_travel_gap_m=float(cfg.builtin_loop_min_travel_m),
             search_radius_m=float(cfg.builtin_loop_search_radius_m),
@@ -271,6 +275,7 @@ class BuiltinSlamEngine:
         # Optional: SlamService wires this into LocalizationStateTracker so a
         # tick that trusts the published pose clears / avoids ``lost``.
         self._match_outcome_hook = None
+        self._anchor_motion_hook = None
         self._pose_listeners: list = []
         self._last_odom_twist = (0.0, 0.0, 0.0)
         # Forward speed (m/s) guessed from IMU accel when wheel velocity is absent.
@@ -823,6 +828,8 @@ class BuiltinSlamEngine:
     # A new loop edge still this far off after optimizing disagrees with the
     # rest of the graph (likely a false match) and is dropped.
     _LOOP_MAX_CHI2 = 25.0
+    # Camera frame older than this no longer punches holes in the lidar scan.
+    _PAINT_DISC_MAX_AGE_S = 0.2
     _LOOP_REBUILD_MIN_M = 0.08
     _LOOP_REBUILD_MIN_DEG = 1.0
     # Small snaps close after two agreeing detections; multi-meter corridor
@@ -913,6 +920,7 @@ class BuiltinSlamEngine:
 
         with self._graph_job:
             with self._lock:
+                anchor_before = self._node_poses_locked()
                 corr = pg.world_correction(self._pose, matched_pose)
                 cur = len(self._graph) - 1
                 target = conv.compose_poses(corr, self._graph.nodes[cur].pose)
@@ -992,6 +1000,8 @@ class BuiltinSlamEngine:
                     method, first_free, live = "rejected_untrusted_base", None, None
                 else:
                     method, first_free, live = "rejected_no_anchor", None, None
+                anchor_after = self._node_poses_locked()
+            self._emit_anchor_motion(anchor_before, anchor_after)
             if method == "pose_only":
                 result = {"status": "pose_only"}
             elif method.startswith("rejected"):
@@ -1023,6 +1033,45 @@ class BuiltinSlamEngine:
             f"chi2={result.get('loop_chi2', 'n/a')}"
         )
         return out
+
+    def note_paint_discs(self, discs, captured_at: float) -> None:
+        """Remember dynamic-object discs until the next scan paint."""
+        packed = []
+        for disc in discs or []:
+            if isinstance(disc, tuple):
+                x, y, r = disc
+            else:
+                x, y, r = disc.x, disc.y, disc.radius_m
+            if float(r) > 0.0:
+                packed.append((float(x), float(y), float(r)))
+        with self._lock:
+            self._paint_discs = packed
+            self._paint_discs_at = float(captured_at)
+
+    def _fresh_paint_discs(self, now: float) -> list:
+        with self._lock:
+            if not self._paint_discs:
+                return []
+            if float(now) - float(self._paint_discs_at) > self._PAINT_DISC_MAX_AGE_S:
+                return []
+            return list(self._paint_discs)
+
+    def _mask_dynamic_scan(self, scan, now: float):
+        """Blank lidar returns that land on a fresh person (or other mover)."""
+        discs = self._fresh_paint_discs(now)
+        if not discs or scan is None:
+            return scan
+        from dataclasses import replace
+
+        from ..semantic.paint_mask import mask_scan_ranges
+
+        ranges = mask_scan_ranges(
+            np.asarray(scan.ranges, dtype=float),
+            float(scan.angle_min),
+            float(scan.angle_increment),
+            discs,
+        )
+        return replace(scan, ranges=ranges)
 
     def optimize_pose_graph(self) -> dict:
         """Optimize the whole mapping pose graph and re-render the grid."""
@@ -1099,6 +1148,7 @@ class BuiltinSlamEngine:
             if self._graph_revision != revision:
                 info["status"] = "aborted"
                 return info
+            anchor_before = self._node_poses_locked()
             tail = self._graph.apply_poses(snap, poses)
             # Inserts that landed while rendering, after ``extra`` was taken.
             newer = self._graph.scans_after(snap.last_seq)
@@ -1126,6 +1176,8 @@ class BuiltinSlamEngine:
             new_pose = conv.compose_poses(corr, self._pose)
             self._set_corrected_pose_locked(new_pose)
             self._graph_revision += 1
+            anchor_after = self._node_poses_locked()
+        self._emit_anchor_motion(anchor_before, anchor_after)
         info["status"] = "rebuilt"
         info["live_correction"] = {
             "x": round(corr.x, 3),
@@ -2117,9 +2169,12 @@ class BuiltinSlamEngine:
                 if self._graph_revision != revision or self._mode != MODE_MAPPING:
                     out["status"] = "aborted"
                     return out
+                anchor_before = self._node_poses_locked()
                 for e in plan.edges:
                     self._graph.add_edge(e)
                 tail = self._graph.apply_poses(snap, plan.poses)
+                anchor_after = self._node_poses_locked()
+            self._emit_anchor_motion(anchor_before, anchor_after)
             rendered = self._optimize_and_render(None, live_correction=tail)
             if rendered.get("status") != "rebuilt":
                 out["status"] = "aborted"
@@ -2257,6 +2312,23 @@ class BuiltinSlamEngine:
     def get_pose(self) -> conv.Pose2D:
         with self._lock:
             return self._pose
+
+    def vision_anchor(self) -> tuple:
+        """Latest pose-graph node, for hanging a camera keyframe from it.
+
+        Returns ``(node_index, node_pose, {index: pose})``. When the graph is
+        empty, ``node_index`` is ``-1`` and the pose table is empty — callers
+        should fall back to the live pose.
+        """
+        with self._lock:
+            poses = {
+                i: conv.Pose2D(float(n.pose.x), float(n.pose.y), float(n.pose.theta))
+                for i, n in enumerate(self._graph.nodes)
+            }
+            if not poses:
+                return -1, self._pose, {}
+            idx = len(self._graph.nodes) - 1
+            return idx, poses[idx], poses
 
     def get_pose_at(self, t: float) -> Optional[conv.Pose2D]:
         """Map pose at monotonic time ``t``, in the current map frame.
@@ -2875,16 +2947,16 @@ class BuiltinSlamEngine:
         if known < 0.02:
             return False
         try:
-            result = global_localize_scan(
-                occ_map,
-                scan,
-                hint=None,
-                full_map=True,
-                coarse_position_step_m=0.6,
-                coarse_yaw_step_deg=18.0,
-            )
+            result = global_localize_scan(occ_map, scan, hint=None, full_map=True)
         except Exception as exc:  # noqa: BLE001
             self._log(f"seed global localize failed: {exc}")
+            return False
+        if result.ambiguous:
+            # A second place explains the scan nearly as well.
+            self._log(
+                f"seed global localize ambiguous (score={float(result.score):.3f} "
+                f"second={float(result.second_best_score):.3f}); retrying"
+            )
             return False
         score = float(result.score)
         if not math.isfinite(score) or score < self._seed_min_score:
@@ -3111,6 +3183,7 @@ class BuiltinSlamEngine:
         frames: Optional[list] = None,
     ) -> None:
         """Draw one mapping scan at ``pose_snap``. Caller already decided it fits."""
+        scan = self._mask_dynamic_scan(scan, now)
         if frames is None:
             frames = self._mapping_frames()
         with self._lock:
@@ -3118,6 +3191,11 @@ class BuiltinSlamEngine:
             extend_only = not self._baseline_trusted_locked()
             protect = self._session_baseline if extend_only else None
         band_scans = self._band_scans(frames)
+        if band_scans:
+            band_scans = {
+                band: self._mask_dynamic_scan(band_scan, now)
+                for band, band_scan in band_scans.items()
+            }
         primary_band = 0
         if band_scans:
             painted, bands, primary, extras, primary_band = self._paint_height_bands(
@@ -3463,6 +3541,43 @@ class BuiltinSlamEngine:
 
     def set_match_outcome_hook(self, hook) -> None:
         self._match_outcome_hook = hook
+
+    def set_anchor_motion_hook(self, hook) -> None:
+        """``hook(old_poses, new_poses)`` after a pose-graph node moves.
+
+        Camera keyframes anchored to that node follow the same motion. The
+        hook must not call back into the engine.
+        """
+        self._anchor_motion_hook = hook
+
+    def _node_poses_locked(self) -> dict:
+        return {
+            i: conv.Pose2D(float(n.pose.x), float(n.pose.y), float(n.pose.theta))
+            for i, n in enumerate(self._graph.nodes)
+        }
+
+    def _emit_anchor_motion(self, old: dict, new: dict) -> None:
+        hook = self._anchor_motion_hook
+        if hook is None or not old:
+            return
+        changed = False
+        for i, prev in old.items():
+            cur = new.get(i)
+            if cur is None:
+                continue
+            if (
+                abs(prev.x - cur.x) > 1e-6
+                or abs(prev.y - cur.y) > 1e-6
+                or abs(conv.normalize_angle(prev.theta - cur.theta)) > 1e-6
+            ):
+                changed = True
+                break
+        if not changed:
+            return
+        try:
+            hook(old, new)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"anchor motion hook failed: {exc}")
 
     def _emit_match_outcome(self, result: dict) -> None:
         hook = self._match_outcome_hook

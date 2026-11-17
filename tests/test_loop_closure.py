@@ -561,6 +561,44 @@ def test_large_shift_loop_needs_three_agreeing_detections(monkeypatch):
     assert engine.diagnostics()["loop_closure"]["closures"] == 1
 
 
+def _mapping_engine():
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "maps_dir": "/tmp",
+            "mode": "mapping",
+            "builtin_loop_closure": False,
+        }
+    )
+    return BuiltinSlamEngine(cfg, _Sensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+
+
+def test_paint_gate_does_not_store_a_return_on_a_person():
+    engine = _mapping_engine()
+    scan = conv.LaserScan2D(np.array([2.0, 4.0]), 0.0, 0.5, 0.1, 10.0)
+    now = 10.0
+    engine.note_paint_discs([(2.0, 0.0, 0.4)], now)
+    engine._paint_mapping_scan(scan, conv.Pose2D(0.0, 0.0, 0.0), now)  # noqa: SLF001
+    grid = engine._grid  # noqa: SLF001
+    int16 = occ.to_occupancy_int16(grid)
+    near_r, near_c = grid.world_to_cell(2.0, 0.0)
+    far_x = 4.0 * math.cos(0.5)
+    far_y = 4.0 * math.sin(0.5)
+    far_r, far_c = grid.world_to_cell(far_x, far_y)
+    assert int(int16[near_r, near_c]) != 100
+    assert int(int16[far_r, far_c]) == 100
+
+    # A disc from a second ago no longer blanks the beam.
+    engine = _mapping_engine()
+    engine.note_paint_discs([(2.0, 0.0, 0.4)], now - 1.0)
+    engine._paint_mapping_scan(scan, conv.Pose2D(0.0, 0.0, 0.0), now)  # noqa: SLF001
+    grid = engine._grid  # noqa: SLF001
+    int16 = occ.to_occupancy_int16(grid)
+    near_r, near_c = grid.world_to_cell(2.0, 0.0)
+    assert int(int16[near_r, near_c]) == 100
+
+
 def test_set_pose_jump_does_not_become_odometry():
     graph = pg.PoseGraph(node_spacing_m=0.5)
     scan = conv.LaserScan2D(np.array([2.0]), 0.0, 0.0, 0.1, 10.0)
