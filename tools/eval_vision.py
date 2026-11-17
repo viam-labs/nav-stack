@@ -4,11 +4,18 @@
     python tools/fetch_lilocbench.py            # once: ~2 GB subset
     python tools/eval_vision.py place           # place-recognition recall
     python tools/eval_vision.py reloc           # lost-pose recovery, lidar vs camera+lidar
+    python tools/eval_vision.py mapping         # replay a run through SLAM, score the trajectory
 
 ``place`` builds a place index from the mapping run, then asks for each frame
 of a later run whether a keyframe near the true pose is among the top guesses.
 ``reloc`` treats each sampled frame as a kidnapped robot and compares the
 stack's whole-map lidar search with a lidar search seeded by place guesses.
+
+``mapping`` feeds a run's odometry and scans through the SLAM engine in
+mapping mode, on a clock that follows the recording, and compares the pose it
+publishes and the keyframes it ends with against ground truth: with lidar loop
+closure off and on, and with the vision supervisor alongside, landmark loop
+closure off and on.
 
 Results are printed and written as JSON next to the dataset cache.
 """
@@ -30,6 +37,7 @@ from tools.vision_eval.features import ensure_features  # noqa: E402
 from tools.vision_eval.lilocbench import LilocSequence, load_reference_map  # noqa: E402
 from tools.vision_eval.place_eval import evaluate_place  # noqa: E402
 from tools.vision_eval.reloc_eval import evaluate_reloc  # noqa: E402
+from tools.vision_eval.replay import odometry_trajectory, replay_mapping  # noqa: E402
 
 DEFAULT_DATA = Path.home() / "datasets" / "lilocbench"
 DEFAULT_QUERIES = ("dynamics_0", "lt_changes_0")
@@ -71,9 +79,57 @@ def _print_reloc(name: str, result: dict) -> None:
         )
 
 
+MAPPING_VARIANTS = {
+    "odometry": "wheel odometry alone",
+    "lidar_no_loops": "SLAM, lidar loop closure off",
+    "lidar": "SLAM as shipped without a camera",
+    "vision_no_landmark_loops": "SLAM + vision, landmark loop closure off",
+    "vision": "SLAM + vision as shipped",
+}
+
+
+def _run_mapping(seq, feats, cache, variants: Sequence[str]) -> dict:
+    out: dict = {}
+    for name in variants:
+        if name == "odometry":
+            out[name] = {"live": odometry_trajectory(seq).summary()}
+            continue
+        kwargs: dict = {}
+        if name == "lidar_no_loops":
+            kwargs["config"] = {"builtin_loop_closure": False}
+        if name.startswith("vision"):
+            kwargs.update(
+                feats=feats, cache_dir=cache, vision=True,
+                landmark_loops=name == "vision",
+            )
+        out[name] = replay_mapping(seq, log=lambda *_: None, **kwargs).summary()
+        print(f"  {seq.name}: {name} done in {out[name]['wall_s']:.0f} s", flush=True)
+    return out
+
+
+def _print_mapping(name: str, result: dict) -> None:
+    travel = next((r["travel_m"] for r in result.values() if "travel_m" in r), None)
+    length = f", {travel} m of travel" if travel is not None else ""
+    print(f"\n{name}: mapped from scratch{length}. Errors against ground truth.")
+    print(
+        f"  {'variant':<28} {'live pose':<26} {'final keyframes':<18} "
+        f"{'lidar loops':>11} {'landmark loops':>15}"
+    )
+    print(f"  {'':<28} {'rmse    max   heading':<26} {'rmse    max':<18}")
+    for variant, row in result.items():
+        live, final = row["live"], row.get("final_map")
+        final_txt = f"{final['ate_rmse_m']:.2f} m  {final['ate_max_m']:.2f} m" if final else "-"
+        print(
+            f"  {variant:<28} "
+            f"{live['ate_rmse_m']:.2f} m  {live['ate_max_m']:.2f} m  {live['heading_rmse_deg']:4.1f}°    "
+            f"{final_txt:<18} "
+            f"{row.get('loop_closures', '-')!s:>11} {row.get('landmark_loops_applied', '-')!s:>15}"
+        )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("experiment", choices=["place", "reloc"])
+    ap.add_argument("experiment", choices=["place", "reloc", "mapping"])
     ap.add_argument("--data", type=Path, default=DEFAULT_DATA)
     ap.add_argument("--mapping", default="mapping")
     ap.add_argument("--queries", nargs="+", default=list(DEFAULT_QUERIES))
@@ -88,9 +144,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "seed a plain lidar search with that place method (append +patches "
         "to re-rank by matched patches, +fit to refine each guess by camera)",
     )
+    ap.add_argument(
+        "--runs", nargs="+", default=["mapping"], help="mapping only: runs to map from scratch"
+    )
+    ap.add_argument(
+        "--variants",
+        nargs="+",
+        default=list(MAPPING_VARIANTS),
+        choices=list(MAPPING_VARIANTS),
+        help="mapping only: " + "; ".join(f"{k} = {v}" for k, v in MAPPING_VARIANTS.items()),
+    )
     args = ap.parse_args(argv)
 
     cache = args.data / "cache"
+    if args.experiment == "mapping":
+        report = {}
+        t0 = time.monotonic()
+        for name in args.runs:
+            seq = LilocSequence(args.data, name, camera=args.camera)
+            needs_vision = any(v.startswith("vision") for v in args.variants)
+            feats = ensure_features(seq, cache) if needs_vision else None
+            report[name] = _run_mapping(seq, feats, cache, args.variants)
+            _print_mapping(name, report[name])
+        out = cache / "results_mapping.json"
+        out.write_text(json.dumps(report, indent=2))
+        print(f"\n{time.monotonic() - t0:.0f} s; results written to {out}")
+        return 0
     mapping = LilocSequence(args.data, args.mapping, camera=args.camera)
     map_feats = ensure_features(mapping, cache)
     occ = load_reference_map(args.data) if args.experiment == "reloc" else None

@@ -273,6 +273,35 @@ class LilocSequence:
         return conv.merge_scans(scans)
 
 
+    def odometry(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Wheel odometry: stamps, ``(N, 3)`` x/y/yaw in the odom frame, ``(N, 3)`` vx/vy/wz.
+
+        Rows are ``t pos[3] quat[4] pose_cov[36] vel_t[3] vel_r[3] vel_cov[36]``.
+        """
+        raw = np.loadtxt(self.dir / "dingo_velocity_controller" / "odom.txt")
+        qx, qy, qz, qw = raw[:, 4], raw[:, 5], raw[:, 6], raw[:, 7]
+        yaw = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        poses = np.column_stack([raw[:, 1], raw[:, 2], yaw])
+        twists = np.column_stack([raw[:, 44], raw[:, 45], raw[:, 49]])
+        return raw[:, 0].copy(), poses, twists
+
+    def scan_stamps(self) -> np.ndarray:
+        """Stamps of the front lidar (the replay's scan clock)."""
+        return self._load_lidars()[0].stamps
+
+    def scan_before(self, stamp: float) -> Tuple[Optional[conv.LaserScan2D], float]:
+        """Latest merged scan taken at or before ``stamp``, and when it was taken."""
+        lidars = self._load_lidars()
+        i = int(np.searchsorted(lidars[0].stamps, stamp, side="right")) - 1
+        if i < 0:
+            return None, float("nan")
+        taken = float(lidars[0].stamps[i])
+        return self.scan(taken), taken
+
+    def gt_pose(self, stamp: float) -> Optional[conv.Pose2D]:
+        return interpolate_pose(self.gt_stamps, self.gt_poses, stamp)
+
+
 def load_reference_map(root: Path) -> OccupancyMap:
     """The dataset's occupancy grid (ROS map_server png + yaml), in the GT frame."""
     folder = Path(root).expanduser() / "map_office"

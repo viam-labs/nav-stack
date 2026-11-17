@@ -282,6 +282,7 @@ Setting them `true` restores the earlier behaviour, including
 python tools/fetch_lilocbench.py     # ~2 GB subset into ~/datasets/lilocbench
 python tools/eval_vision.py place    # is the true place among the top guesses?
 python tools/eval_vision.py reloc    # kidnapped-robot recovery, lidar vs camera+lidar
+python tools/eval_vision.py mapping  # replay a run through SLAM, score the trajectory
 ```
 
 LILocBench (Uni Bonn) has a 2D lidar, RealSense RGB-D, odometry and
@@ -290,6 +291,49 @@ rearranged furniture. It is licensed CC BY-NC-SA 4.0 and is not part of this
 repo. `reloc --place-methods runtime` runs `recover_pose` itself; other
 method names compare alternatives (see `--help`). DINOv2 tokens are cached
 under `~/datasets/lilocbench/cache`, so re-runs take seconds to minutes.
+
+### Mapping replay
+
+`place` and `reloc` judge one frame at a time. `mapping` feeds a run's
+odometry and scans through the SLAM engine in order, on a clock that follows
+the recording, with the vision supervisor alongside when asked, and compares
+the published pose and the final keyframes with ground truth. The engine is
+stepped as its own threads would step it, with nothing in the background, so
+a replay is repeatable. Detector boxes are cached after the first vision
+replay of a run.
+
+Three runs, each mapped from scratch. Error against ground truth after
+aligning frames, RMSE of the live pose / of the final keyframes:
+
+| Run | Wheel odometry | Lidar loop closure off | Lidar only | + vision, result 0.3 s late | + vision, result at once |
+| --- | --- | --- | --- | --- | --- |
+| mapping (211 m, static) | 0.89 m / - | 0.42 m / 0.43 m | 0.20 m / 0.14 m | 0.19 m / 0.14 m | 0.17 m / 0.13 m |
+| static_0 (212 m, static) | 0.69 m / - | 0.42 m / 0.40 m | 0.08 m / 0.07 m | 0.08 m / 0.06 m | 0.09 m / 0.07 m |
+| dynamics_0 (42 m, crowded) | 0.21 m / - | not run | 0.09 m / 0.09 m | 0.09 m / 0.07 m | 0.15 m / 0.14 m |
+
+- **Lidar loop closure is what holds the map together**: about 190-210
+  closures per 210 m, taking the live error from 0.42 m to 0.08-0.20 m.
+- **Landmark loop closure almost never fires**: 0, 1 and 3 pose-graph edges
+  in the three runs. Of the frame checks on the two long runs, 32-47% had
+  fewer than 3 confirmed landmarks in view, 46-48% had enough in view but no
+  agreeing fit, and 6-15% matched landmarks from different keyframes. With
+  it off the static_0 result was the same (0.09 m / 0.07 m). The three edges
+  in the crowded run coincide with a 2 cm better final map; one short run.
+- **Person masking only applies when the result is immediate**, and then it
+  is not a reliable gain. The mask covers scans within 0.2 s of the camera
+  frame, so a result 0.3 s late never applies and the numbers match lidar
+  alone. Applied at once it improved one static run (0.19 m to 0.17 m),
+  slightly worsened the other (0.08 m to 0.09 m) and clearly worsened the
+  crowded one (0.09 m to 0.15 m), where a person was in 260 of 299 frames.
+  It did keep them out of the map there (occupied cells down by a third).
+  Why the pose gets worse is not yet explained.
+
+`--variants` covers odometry, lidar loop closure off and on, and vision with
+landmark loops off and on; pass `vision_latency_s` to `replay_mapping` for
+the delay.
+
+The replay does not run the service-level tasks (mapping revisit, periodic
+relocalization), and the dataset robot's wheel odometry is not the cart's.
 
 ## Survey density / nav load (rc2+)
 
