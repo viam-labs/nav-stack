@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -218,9 +219,23 @@ def scan_map_fit(
     the map already knows is a miss, even if part of the scan is new ground.
     ``occupied_lookup`` is the cached ``occupied_lookup(occ_map)``.
     """
+    return scan_map_overlap(
+        occ_map, scan, pose, min_score=min_score, occupied_lookup=occupied_lookup
+    )[0]
+
+
+def scan_map_overlap(
+    occ_map: OccupancyMap,
+    scan: conv.LaserScan2D,
+    pose: conv.Pose2D,
+    *,
+    min_score: float = 0.5,
+    occupied_lookup: Optional[np.ndarray] = None,
+) -> Tuple[str, float]:
+    """:func:`scan_map_fit` with the score it was decided on (NaN for ``open``)."""
     scan_xy = scan_endpoints_base_link(scan)
     if scan_xy.shape[0] < 20:
-        return "open"
+        return "open", float("nan")
     c = math.cos(pose.theta)
     s = math.sin(pose.theta)
     wx = pose.x + c * scan_xy[:, 0] - s * scan_xy[:, 1]
@@ -232,7 +247,7 @@ def scan_map_fit(
     rows = np.floor((wy - occ_map.origin_y) / res).astype(np.int32)
     inside = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
     if int(inside.sum()) < 20:
-        return "open"
+        return "open", float("nan")
     rows_c = np.clip(rows, 0, height - 1)
     cols_c = np.clip(cols, 0, width - 1)
     lookup = _lookup_or_build(occ_map, occupied_lookup)
@@ -241,14 +256,101 @@ def scan_map_fit(
     known = hits | free
     n_known = int(known.sum())
     if n_known / float(inside.sum()) < 0.25:
-        return "open"
+        return "open", float("nan")
     # Score only the beams the map can judge. Points past the edge or in
     # unknown cells are how the map grows; they must not veto a scan whose
     # overlap hits walls.
     overlap = (float(hits.sum()) - 0.7 * float(free.sum())) / float(n_known)
-    if overlap >= min_score:
-        return "fit"
-    return "miss"
+    return ("fit" if overlap >= min_score else "miss"), overlap
+
+
+# A height's vote counts a return as on a wall only within this many cells.
+# The wider ring the matcher uses gives a return two cells out partial
+# credit, which is a gradient for a search and too soft for a yes or no.
+_VOTE_TOLERANCE_CELLS = 1
+# A height that judged fewer returns than this share of the best-covered
+# height has seen too little of the map to vote (one slice of a depth
+# camera, a lidar looking mostly at unexplored space).
+_VOTE_MIN_SHARE = 0.5
+
+
+@dataclass(frozen=True)
+class HeightVote:
+    """How well the returns at one height sit on the map at a pose."""
+
+    band: int
+    score: float
+    judged: int
+
+
+def wall_agreement(
+    occ_map: OccupancyMap, scan: conv.LaserScan2D, pose: conv.Pose2D
+) -> Tuple[float, int]:
+    """Score and judged-return count for ``scan`` at ``pose``.
+
+    Of the returns that land where the map knows something: +1 for each
+    within a cell of a wall, -0.7 for each in free space farther from every
+    wall than that. ``(nan, 0)`` when too little of the scan lands on mapped
+    ground to judge, by the same limits as :func:`scan_map_fit`.
+    """
+    scan_xy = scan_endpoints_base_link(scan)
+    if scan_xy.shape[0] < 20:
+        return float("nan"), 0
+    c = math.cos(pose.theta)
+    s = math.sin(pose.theta)
+    wx = pose.x + c * scan_xy[:, 0] - s * scan_xy[:, 1]
+    wy = pose.y + s * scan_xy[:, 0] + c * scan_xy[:, 1]
+    grid = occ_map.grid
+    height, width = grid.shape
+    res = occ_map.resolution
+    cols = np.floor((wx - occ_map.origin_x) / res).astype(np.int32)
+    rows = np.floor((wy - occ_map.origin_y) / res).astype(np.int32)
+    inside = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+    n_inside = int(inside.sum())
+    if n_inside < 20:
+        return float("nan"), 0
+    # Look around each return instead of dilating the whole grid: a few
+    # hundred returns, against a grid of a million cells.
+    near = np.zeros(scan_xy.shape[0], dtype=bool)
+    reach = range(-_VOTE_TOLERANCE_CELLS, _VOTE_TOLERANCE_CELLS + 1)
+    for dr in reach:
+        for dc in reach:
+            r = rows + dr
+            col = cols + dc
+            ok = (r >= 0) & (r < height) & (col >= 0) & (col < width)
+            cells = grid[np.clip(r, 0, height - 1), np.clip(col, 0, width - 1)]
+            near |= ok & (cells >= 50)
+    near &= inside
+    own = grid[np.clip(rows, 0, height - 1), np.clip(cols, 0, width - 1)]
+    free = (own >= 0) & (own < 50) & inside & ~near
+    judged = int(near.sum() + free.sum())
+    if judged / float(n_inside) < 0.25:
+        return float("nan"), 0
+    return (float(near.sum()) - 0.7 * float(free.sum())) / float(judged), judged
+
+
+def height_votes(
+    occ_map: OccupancyMap,
+    band_scans: Mapping[int, conv.LaserScan2D],
+    pose: conv.Pose2D,
+) -> List[HeightVote]:
+    """One vote per height that the map can judge at ``pose``.
+
+    The lidars are bolted to one robot, so a wrong pose shifts every height
+    together. When the walls at one height sit on the map and another height
+    does not, the pose is right and that other height is seeing something
+    new, such as furniture that moved. Scoring the merged scan cannot tell:
+    it keeps the nearest return in each direction, which is the clutter.
+    """
+    votes = []
+    for band, scan in band_scans.items():
+        score, judged = wall_agreement(occ_map, scan, pose)
+        if judged > 0:
+            votes.append(HeightVote(int(band), float(score), int(judged)))
+    if not votes:
+        return []
+    floor = _VOTE_MIN_SHARE * max(v.judged for v in votes)
+    return [v for v in votes if v.judged >= floor]
 
 
 def score_at_pose(

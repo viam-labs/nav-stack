@@ -722,7 +722,14 @@ the last ~2 s plus configured `scan_rate_hz` — with `map_when_still`, expect l
 `scan_hz` while driving; builtin `paint` reports
 `painting` / `extend_only` / `held_turning` / `held_unmatched` / `held_lidar_odom`
 plus match score and whether the resumed baseline is trusted — while untrusted,
-mapping only paints into unknown cells so a torn prior cannot thicken),
+mapping only paints into unknown cells so a torn prior cannot thicken;
+`paint.fit` is the check behind `held_unmatched`: its `score` against its
+`pass_mark`. A scan is painted only when its returns land on walls the map
+already has. With lidars at more than one height, `rule` is `best_height`:
+each height is scored by itself (`heights`, one entry per 25 cm slice) and the
+best one decides, because the lidars share one pose — walls lining up at one
+height confirm it, and another height that disagrees is seeing something new,
+such as furniture that moved. With one height, `rule` is `merged_scan`),
 `set_initial_pose`,
 `global_localize` (lidar scan match against saved map; optional `full_map`,
 `search_radius_m`, `apply`, `local_yaw_window_deg`, `max_scan_points`,
