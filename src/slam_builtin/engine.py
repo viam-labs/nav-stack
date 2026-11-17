@@ -41,6 +41,14 @@ _MAP_INSERT_MIN_SCORE = 0.5
 # about as often as the merged scan did, and passed the right pose 94% of
 # the time against 89%.
 _HEIGHT_VOTE_MIN_SCORE = 0.65
+# A vote this high needs no second look before painting. On that robot's
+# keyframes only poses within about 5 cm reached it; 10 cm off, the median
+# vote was 0.64.
+_HEIGHT_VOTE_CONFIDENT = 0.85
+# A polish is refused when the fit is this much better at the edge of its
+# search than inside it. From a pose 18 cm off, the edge scored 0.22 higher;
+# along a corridor, where position barely changes the fit, 0.02.
+_POLISH_EDGE_GAIN = 0.05
 # In-place turns slower than the hard smear skip still write a rotated wing
 # if they are painted live. Hold them and draw after the robot stops.
 _SPIN_HOLD_YAW_RATE = math.radians(15.0)
@@ -138,9 +146,13 @@ class BuiltinSlamEngine:
         self._paint_last_at = 0.0
         # What the last fit check scored, and against which pass mark.
         self._paint_fit_detail: Optional[dict] = None
+        # Which scan the last pose match was made with (see ``_match_pose``).
+        self._match_detail: Optional[dict] = None
         # Last time we ran a full-circle heading search to unstick paint.
         self._last_heading_recover_at = 0.0
         self._heading_recovers = 0
+        # Times a refused scan was painted after a few-centimetre polish.
+        self._pose_polishes = 0
         self._ticks = 0
         self._updates = 0
         # Match outcomes: applied = pose corrected; held = ran match but kept
@@ -2457,12 +2469,18 @@ class BuiltinSlamEngine:
                 },
                 "last_match_score": self._last_match_score,
                 "last_prior_score": self._last_prior_score,
+                # Which scan the last pose match used: the merged scan, or
+                # the best-fitting lidar height and what each height scored.
+                "match": (
+                    None if self._match_detail is None else dict(self._match_detail)
+                ),
                 "last_scan_age_s": self._last_scan_age_s,
                 "last_scan_latency_s": self._last_scan_latency_s,
                 "yaw_rate_deg_s": round(math.degrees(self._last_yaw_rate), 2),
                 "insert_skips_turning": self._insert_skips_turning,
                 "insert_skips_unmatched": self._insert_skips_unmatched,
                 "heading_recovers": self._heading_recovers,
+                "pose_polishes": self._pose_polishes,
                 "paint": {
                     "state": self._paint_state,
                     "last_fit": self._paint_last_fit,
@@ -2669,11 +2687,8 @@ class BuiltinSlamEngine:
         # Heavy work happens OUTSIDE the lock: matching while holding it
         # blocked every get_pose/get_map (nav planning + pose reads stalled).
         if run_match:
-            matched, score, prior_score, rival_score = scan_match.refine_pose(
-                occ_map,
-                scan,
-                scan_pose,
-                occupied_lookup=self._occupied_lookup_for(occ_map),
+            matched, score, prior_score, rival_score, match_scan = self._match_pose(
+                occ_map, scan, scan_pose
             )
             if matched is not None and capture_motion is not None:
                 matched = conv.compose_poses(matched, capture_motion)
@@ -2682,7 +2697,7 @@ class BuiltinSlamEngine:
             # place the body along the hall still fixes its heading.
             yaw_fix = None
             if self._navigation_active():
-                yaw_fix = self._yaw_only_fix(occ_map, scan, scan_pose)
+                yaw_fix = self._yaw_only_fix(occ_map, match_scan, scan_pose)
             with self._lock:
                 self._last_match_at = now
                 self._last_match_score = score
@@ -3122,13 +3137,91 @@ class BuiltinSlamEngine:
 
     def _height_votes(self, occ_map: OccupancyMap, pose: conv.Pose2D) -> list:
         """Per-height votes for the scan just read; empty with one height."""
+        _bands, votes = self._heights_at(occ_map, pose)
+        return votes
+
+    def _heights_at(self, occ_map: OccupancyMap, pose: conv.Pose2D) -> tuple:
+        """``(band scans, votes)`` for the scan just read; empty with one height."""
         try:
             bands = self._band_scans(self._mapping_frames())
         except Exception:  # noqa: BLE001
-            return []
+            return {}, []
         if len(bands) < 2:
-            return []
-        return scan_match.height_votes(occ_map, bands, pose)
+            return {}, []
+        return bands, scan_match.height_votes(occ_map, bands, pose)
+
+    # One height takes over the pose match from the merged scan only when
+    # the map explains it this much better. Where every height agrees with
+    # the map the merged scan has more walls to match and was the more
+    # precise of the two on a robot's own keyframes.
+    _MATCH_HEIGHT_MARGIN = 0.15
+
+    def _match_pose(
+        self, occ_map: OccupancyMap, scan: conv.LaserScan2D, scan_pose: conv.Pose2D
+    ) -> tuple:
+        """Pose match for the scan just read, and the scan it was made with.
+
+        ``(pose_or_none, score, prior_score, rival_score, scan)``, as
+        ``scan_match.refine_pose`` returns them. The merged scan is matched
+        as always. With lidars at more than one height, each height that can
+        judge the pose is matched too, and one the map explains clearly
+        better takes over, including when its answer is to stay. The merged
+        scan keeps the nearest return in each direction, so furniture at one
+        height can pull the match off the walls another height sees: on a
+        robot with lidars at 0.21 m and 1.2 m the merged scan scored 0.15
+        and asked for a move of 45 cm and 8 degrees, which was rejected,
+        while the 1.2 m lidar alone scored 0.66 for a move of 18 cm that put
+        its walls back on the map.
+        """
+        lookup = self._occupied_lookup_for(occ_map)
+        merged = scan_match.refine_pose(
+            occ_map, scan, scan_pose, occupied_lookup=lookup
+        )
+        bands, votes = self._heights_at(occ_map, scan_pose)
+        if len(votes) < 2:
+            self._match_detail = {"rule": "merged_scan"}
+            return (*merged, scan)
+        from .height_bands import BAND_M
+
+        best = None
+        tried = []
+        for vote in sorted(votes, key=lambda vote: vote.band):
+            band_scan = bands[vote.band]
+            found = scan_match.refine_pose(
+                occ_map, band_scan, scan_pose, occupied_lookup=lookup
+            )
+            if not math.isfinite(found[1]):
+                continue
+            tried.append(
+                {
+                    "z_min_m": round(vote.band * BAND_M, 2),
+                    "z_max_m": round((vote.band + 1) * BAND_M, 2),
+                    "score": round(float(found[1]), 3),
+                    "moves": found[0] is not None,
+                }
+            )
+            if best is None or found[1] > best[0][1]:
+                best = (found, band_scan, len(tried) - 1)
+        merged_score = float(merged[1]) if math.isfinite(merged[1]) else float("-inf")
+        detail = {
+            "merged_score": round(merged_score, 3)
+            if math.isfinite(merged_score)
+            else None,
+            "heights": tried,
+        }
+        if best is None or best[0][1] < merged_score + self._MATCH_HEIGHT_MARGIN:
+            self._match_detail = {"rule": "merged_scan", **detail}
+            return (*merged, scan)
+        found, band_scan, index = best
+        self._match_detail = {
+            "rule": "best_height",
+            "decided_by": {
+                "z_min_m": tried[index]["z_min_m"],
+                "z_max_m": tried[index]["z_max_m"],
+            },
+            **detail,
+        }
+        return (*found, band_scan)
 
     def _scan_fits_map(self, scan: conv.LaserScan2D, pose: conv.Pose2D) -> bool:
         """True when the map does not yet constrain ``pose``, or the scan lands on it."""
@@ -3145,13 +3238,95 @@ class BuiltinSlamEngine:
             occ_map = self._occupancy_for_match()
         except Exception:  # noqa: BLE001
             return None, float("-inf")
-        return scan_match.search_heading(
-            occ_map,
-            scan,
-            pose,
-            min_score=_MAP_INSERT_MIN_SCORE,
-            occupied_lookup=self._occupied_lookup_for(occ_map),
+        lookup = self._occupied_lookup_for(occ_map)
+        bands, votes = self._heights_at(occ_map, pose)
+        if len(votes) < 2:
+            return scan_match.search_heading(
+                occ_map,
+                scan,
+                pose,
+                min_score=_MAP_INSERT_MIN_SCORE,
+                occupied_lookup=lookup,
+            )
+        # Each height searches with its own returns, and a heading counts
+        # only if that height's walls then sit on the map.
+        best: tuple[Optional[conv.Pose2D], float] = (None, float("-inf"))
+        for vote in votes:
+            found, _score = scan_match.search_heading(
+                occ_map,
+                bands[vote.band],
+                pose,
+                min_score=_MAP_INSERT_MIN_SCORE,
+                occupied_lookup=lookup,
+            )
+            if found is None:
+                continue
+            agreement, judged = scan_match.wall_agreement(
+                occ_map, bands[vote.band], found
+            )
+            if judged > 0 and agreement > best[1]:
+                best = (found, float(agreement))
+        if best[0] is None or best[1] < _HEIGHT_VOTE_MIN_SCORE:
+            return None, best[1]
+        return best
+
+    def _paint_pose_by_heights(
+        self, scan_pose: conv.Pose2D
+    ) -> tuple[str, Optional[conv.Pose2D]]:
+        """Where to paint the scan just read, by the best-agreeing height.
+
+        ``("one_height", None)`` when there is nothing to decide here.
+        ``("as_is", None)`` to paint at ``scan_pose``. ``("moved", pose)`` to
+        paint a few centimetres away, where that height's walls sit on the
+        map. ``("refuse", None)`` when no pose that close passes, or when the
+        fit keeps improving toward the edge of the search: the pose is then
+        off by more than a polish should fix, and painting at the edge would
+        draw the walls part-way to where they belong. The pose matcher moves
+        it first.
+        """
+        try:
+            occ_map = self._occupancy_for_match()
+        except Exception:  # noqa: BLE001
+            return "one_height", None
+        bands, votes = self._heights_at(occ_map, scan_pose)
+        if len(votes) < 2:
+            return "one_height", None
+        best = max(votes, key=lambda vote: vote.score)
+        if best.score >= _HEIGHT_VOTE_CONFIDENT:
+            return "as_is", None
+        found, score, edge_gain = scan_match.polish_on_walls(
+            occ_map, bands[best.band], scan_pose
         )
+        detail = dict(self._paint_fit_detail or {})
+        farther = found is not None and edge_gain >= _POLISH_EDGE_GAIN
+        if found is None or farther or score < _HEIGHT_VOTE_MIN_SCORE:
+            detail.update(
+                state="miss",
+                polish="better_fit_farther_away"
+                if farther
+                else "no_pose_nearby_passes",
+            )
+            self._paint_fit_detail = detail
+            return "refuse", None
+        moved = (
+            math.hypot(found.x - scan_pose.x, found.y - scan_pose.y) > 1e-6
+            or abs(conv.normalize_angle(found.theta - scan_pose.theta)) > 1e-9
+        )
+        detail.update(
+            state="fit",
+            score=round(float(score), 3),
+            polish="moved" if moved else "kept",
+        )
+        self._paint_fit_detail = detail
+        return ("moved", found) if moved else ("as_is", None)
+
+    def _snap_pose(self, pose: conv.Pose2D) -> None:
+        with self._lock:
+            self._pose = conv.Pose2D(pose.x, pose.y, pose.theta)
+            # The tick already stored the pose it predicted. Leaving it
+            # there makes the next sample read this step as motion.
+            if self._last_tick_pose is not None:
+                self._last_tick_pose = conv.Pose2D(pose.x, pose.y, pose.theta)
 
     def _snap_pose_yaw(self, yaw: float, *, clear_yaw_rate: bool = False) -> None:
         with self._lock:
@@ -3182,6 +3357,14 @@ class BuiltinSlamEngine:
         if now - self._last_heading_recover_at < self._HEADING_RECOVER_MIN_S:
             return False
         self._last_heading_recover_at = now
+        kind, polished = self._paint_pose_by_heights(scan_pose)
+        if kind == "moved" and polished is not None:
+            live = polished
+            if capture_motion is not None:
+                live = conv.compose_poses(polished, capture_motion)
+            self._snap_pose(live)
+            self._pose_polishes += 1
+            return True
         found, found_score = self._search_heading_for_scan(scan, scan_pose)
         if found is None:
             return False
@@ -3426,6 +3609,20 @@ class BuiltinSlamEngine:
                 ):
                     return
             pose_snap = conv.Pose2D(pose.x, pose.y, pose.theta)
+        # With lidars at more than one height, paint where the deciding
+        # height's walls sit on the map, or not at all.
+        kind, polished = self._paint_pose_by_heights(pose_snap)
+        if kind == "refuse":
+            self._insert_skips_unmatched += 1
+            self._note_paint("held_unmatched", now, fit="miss")
+            return
+        if kind == "moved" and polished is not None:
+            live = polished
+            if capture_motion is not None:
+                live = conv.compose_poses(polished, capture_motion)
+            self._snap_pose(live)
+            self._pose_polishes += 1
+            pose_snap = polished
         self._paint_mapping_scan(scan, pose_snap, now)
 
     def _poses_agree(self, a: conv.Pose2D, b: conv.Pose2D) -> bool:
