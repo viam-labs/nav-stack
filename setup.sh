@@ -42,7 +42,7 @@ fetch_yolo_world_if_needed() {
     # The fetcher keeps a file only when it matches the shipped class list,
     # so an older copy without the person prompt is replaced.
     log "checking YOLO-World indoor ONNX…"
-    python tools/fetch_yolo_world_onnx.py || log "YOLO-World fetch failed (detector landmarks disabled until weights are present)"
+    python tools/fetch_yolo_world_onnx.py || log "YOLO-World fetch failed (people are not masked out of the map until weights are present)"
 }
 
 ensure_python_venv() {

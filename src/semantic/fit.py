@@ -1,10 +1,10 @@
-"""Weighted 2D rigid fit (Umeyama) with RANSAC for landmark pose fixes."""
+"""Weighted 2D rigid fit (Umeyama) with RANSAC: the camera pose against a keyframe."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 

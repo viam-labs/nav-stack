@@ -828,10 +828,6 @@ class BuiltinSlamEngine:
     # A new loop edge still this far off after optimizing disagrees with the
     # rest of the graph (likely a false match) and is dropped.
     _LOOP_MAX_CHI2 = 25.0
-    # A landmark agreement smaller than this is already what the odometry
-    # edge says. Larger disagreements become a loop edge.
-    _LANDMARK_LOOP_MIN_SHIFT_M = 0.08
-    _LANDMARK_LOOP_MIN_SHIFT_DEG = 2.0
     # Camera frame older than this no longer punches holes in the lidar scan.
     _PAINT_DISC_MAX_AGE_S = 0.2
     _LOOP_REBUILD_MIN_M = 0.08
@@ -1035,135 +1031,6 @@ class BuiltinSlamEngine:
             f"score={'n/a' if score is None else f'{float(score):.2f}'} "
             f"sigma={sigma_m:.2f} m {math.degrees(sigma_rad):.1f} deg "
             f"chi2={result.get('loop_chi2', 'n/a')}"
-        )
-        return out
-
-    def add_landmark_loop(
-        self,
-        matched_pose: conv.Pose2D,
-        anchor: int,
-        *,
-        score: Optional[float] = None,
-    ) -> dict:
-        """Add a loop edge from a landmark fit while mapping.
-
-        ``matched_pose`` is where the robot must stand for the live landmark
-        points to sit on their stored map points. ``anchor`` is the keyframe
-        those landmarks belong to. The edge is dropped when it disagrees with
-        the rest of the graph (``_LOOP_MAX_CHI2``).
-        """
-        anchor = int(anchor)
-        with self._lock:
-            if self._mode != MODE_MAPPING:
-                return {"applied": False, "status": "skipped_not_mapping"}
-            n = len(self._graph)
-            if n < 2 or anchor < 0 or anchor >= n - 1:
-                return {"applied": False, "status": "skipped_anchor", "anchor": anchor}
-            cur = n - 1
-            gap = float(self._graph.nodes[cur].travel_m) - float(
-                self._graph.nodes[anchor].travel_m
-            )
-            min_gap = float(self._loop_params.min_travel_gap_m)
-            if gap < min_gap:
-                return {
-                    "applied": False,
-                    "status": "skipped_near",
-                    "anchor": anchor,
-                    "gap_m": round(gap, 2),
-                }
-            if any(
-                e.loop and e.i == anchor and e.j == cur for e in self._graph.edges
-            ):
-                return {
-                    "applied": False,
-                    "status": "skipped_duplicate",
-                    "anchor": anchor,
-                }
-            current = self._pose
-            shift_m = math.hypot(
-                matched_pose.x - current.x, matched_pose.y - current.y
-            )
-            shift_deg = abs(
-                math.degrees(
-                    conv.normalize_angle(matched_pose.theta - current.theta)
-                )
-            )
-            if (
-                shift_m < self._LANDMARK_LOOP_MIN_SHIFT_M
-                and shift_deg < self._LANDMARK_LOOP_MIN_SHIFT_DEG
-            ):
-                return {
-                    "applied": False,
-                    "status": "skipped_agrees",
-                    "anchor": anchor,
-                    "shift_m": round(shift_m, 3),
-                    "shift_deg": round(shift_deg, 2),
-                }
-            allowed_m = max(0.3, self._loop_params.drift_fraction * gap)
-            if (
-                shift_m > allowed_m
-                or shift_deg > self._GRAPH_CORRECTION_MAX_DEG
-            ):
-                return {
-                    "applied": False,
-                    "status": "rejected_implausible",
-                    "anchor": anchor,
-                    "gap_m": round(gap, 2),
-                    "shift_m": round(shift_m, 3),
-                    "shift_deg": round(shift_deg, 2),
-                    "allowed_m": round(allowed_m, 2),
-                }
-        with self._graph_job:
-            with self._lock:
-                if self._mode != MODE_MAPPING or len(self._graph) < 2:
-                    return {"applied": False, "status": "skipped_not_mapping"}
-                cur = len(self._graph) - 1
-                if anchor >= cur:
-                    return {
-                        "applied": False,
-                        "status": "skipped_anchor",
-                        "anchor": anchor,
-                    }
-                if any(
-                    e.loop and e.i == anchor and e.j == cur
-                    for e in self._graph.edges
-                ):
-                    return {
-                        "applied": False,
-                        "status": "skipped_duplicate",
-                        "anchor": anchor,
-                    }
-                corr = pg.world_correction(self._pose, matched_pose)
-                target = conv.compose_poses(corr, self._graph.nodes[cur].pose)
-                rel = conv.compose_poses(
-                    conv.invert_pose(self._graph.nodes[anchor].pose), target
-                )
-                sigma_m, sigma_rad = self._revisit_edge_sigmas(score)
-                edge = pg.GraphEdge(
-                    anchor,
-                    cur,
-                    rel,
-                    pg.info_from_sigmas(sigma_m, sigma_rad),
-                    loop=True,
-                )
-                self._graph.add_edge(edge)
-                new_edges = [edge]
-                first_free = self._live_first_free(anchor + 1)
-            result = self._optimize_and_render(first_free, new_edges=new_edges)
-        status = str(result.get("status", ""))
-        out = {
-            "applied": status == "rebuilt",
-            "status": status,
-            "anchor": anchor,
-            "shift_m": round(shift_m, 3),
-            "shift_deg": round(shift_deg, 2),
-            "gap_m": round(gap, 2),
-        }
-        if "loop_chi2" in result:
-            out["loop_chi2"] = result["loop_chi2"]
-        self._log(
-            f"builtin SLAM landmark loop (anchor={anchor}): {status} "
-            f"shift={shift_m:.2f} m {shift_deg:.1f} deg gap={gap:.1f} m"
         )
         return out
 
@@ -2447,7 +2314,7 @@ class BuiltinSlamEngine:
             return self._pose
 
     def vision_anchor(self) -> tuple:
-        """Latest pose-graph node for embedding-landmark anchoring.
+        """Latest pose-graph node, for hanging a camera keyframe from it.
 
         Returns ``(node_index, node_pose, {index: pose})``. When the graph is
         empty, ``node_index`` is ``-1`` and the pose table is empty — callers
@@ -2462,11 +2329,6 @@ class BuiltinSlamEngine:
                 return -1, self._pose, {}
             idx = len(self._graph.nodes) - 1
             return idx, poses[idx], poses
-
-    def vision_node_travel(self) -> dict:
-        """Path length (m) of each pose-graph node, for landmark loop gaps."""
-        with self._lock:
-            return {i: float(n.travel_m) for i, n in enumerate(self._graph.nodes)}
 
     def get_pose_at(self, t: float) -> Optional[conv.Pose2D]:
         """Map pose at monotonic time ``t``, in the current map frame.
@@ -3683,8 +3545,8 @@ class BuiltinSlamEngine:
     def set_anchor_motion_hook(self, hook) -> None:
         """``hook(old_poses, new_poses)`` after a pose-graph node moves.
 
-        Landmarks anchored to that node follow the same motion. The hook must
-        not call back into the engine.
+        Camera keyframes anchored to that node follow the same motion. The
+        hook must not call back into the engine.
         """
         self._anchor_motion_hook = hook
 
@@ -3715,7 +3577,7 @@ class BuiltinSlamEngine:
         try:
             hook(old, new)
         except Exception as exc:  # noqa: BLE001
-            self._log(f"landmark anchor motion failed: {exc}")
+            self._log(f"anchor motion hook failed: {exc}")
 
     def _emit_match_outcome(self, result: dict) -> None:
         hook = self._match_outcome_hook

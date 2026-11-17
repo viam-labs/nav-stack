@@ -116,6 +116,7 @@ class MapHandle:
             self.occupancy_yaml_path,
             self.root / "map.pgm",
             self.root / "keyframes.npz",
+            # Written by builds that stored vision landmarks; nothing reads it.
             self.root / "embedding_landmarks.npz",
             self.root / "place_index.npz",
             self.root / "vision_keyframes.npz",

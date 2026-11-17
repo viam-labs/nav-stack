@@ -50,9 +50,10 @@ def mutual_matches(query_tokens: np.ndarray, keyframe_tokens: np.ndarray) -> np.
     patches rarely agree both ways, so the count says how much of one picture
     is in the other.
     """
-    sims = np.asarray(query_tokens, dtype=np.float32) @ np.asarray(
-        keyframe_tokens, dtype=np.float32
-    ).T
+    sims = (
+        np.asarray(query_tokens, dtype=np.float32)
+        @ np.asarray(keyframe_tokens, dtype=np.float32).T
+    )
     if sims.size == 0:
         return np.zeros((0, 2), dtype=np.int64)
     best_kf = sims.argmax(axis=1)
@@ -65,7 +66,9 @@ def token_points(frame: VisionFrame, uv: np.ndarray) -> np.ndarray:
     """``(T, 3)`` base_link point for each patch centre; NaN without usable depth."""
     uv = np.asarray(uv, dtype=float).reshape(-1, 2)
     tokens = [
-        PatchToken(row=0, col=0, u=float(u), v=float(v), descriptor=np.zeros(1, np.float32))
+        PatchToken(
+            row=0, col=0, u=float(u), v=float(v), descriptor=np.zeros(1, np.float32)
+        )
         for u, v in uv
     ]
     backproject_patches(frame, tokens, max_range_m=MAX_POINT_RANGE_M)
@@ -129,7 +132,9 @@ class KeyframeIndex:
         if points.shape != (tokens.shape[0], 3):
             raise ValueError("points must be (T, 3), one per token")
         self.keyframe_ids.append(int(keyframe_id))
-        self.keyframe_poses.append(conv.Pose2D(float(pose.x), float(pose.y), float(pose.theta)))
+        self.keyframe_poses.append(
+            conv.Pose2D(float(pose.x), float(pose.y), float(pose.theta))
+        )
         self._pooled.append(l2_normalize(tokens.mean(axis=0)))
         self._tokens.append(self._project(tokens).astype(np.float16))
         self._points.append(points)
@@ -142,7 +147,9 @@ class KeyframeIndex:
             i = self.keyframe_ids.index(int(keyframe_id))
         except ValueError:
             return False
-        self.keyframe_poses[i] = conv.Pose2D(float(pose.x), float(pose.y), float(pose.theta))
+        self.keyframe_poses[i] = conv.Pose2D(
+            float(pose.x), float(pose.y), float(pose.theta)
+        )
         return True
 
     def compress(self, *, seed: int = 0) -> bool:
@@ -159,7 +166,9 @@ class KeyframeIndex:
         _u, _s, vt = np.linalg.svd(bank - mean, full_matrices=False)
         raw = self._tokens
         self._basis = (vt[: self.token_dim].astype(np.float32), mean.astype(np.float32))
-        self._tokens = [self._project(t.astype(np.float32)).astype(np.float16) for t in raw]
+        self._tokens = [
+            self._project(t.astype(np.float32)).astype(np.float16) for t in raw
+        ]
         return True
 
     def rank(
@@ -200,7 +209,9 @@ class KeyframeIndex:
             "compressed": self.compressed,
             "token_dim": int(self._tokens[0].shape[1]) if self._tokens else 0,
             "size_mb": round(
-                sum(t.nbytes + p.nbytes for t, p in zip(self._tokens, self._points)) / 1e6, 1
+                sum(t.nbytes + p.nbytes for t, p in zip(self._tokens, self._points))
+                / 1e6,
+                1,
             ),
         }
 
@@ -245,7 +256,9 @@ class KeyframeIndex:
             index.keyframe_poses = [
                 conv.Pose2D(float(x), float(y), float(t)) for x, y, t in data["poses"]
             ]
-            index._pooled = [row for row in np.asarray(data["pooled"], dtype=np.float32)]
+            index._pooled = [
+                row for row in np.asarray(data["pooled"], dtype=np.float32)
+            ]
             ends = np.cumsum(np.asarray(data["counts"], dtype=np.int64))
             tokens = np.asarray(data["tokens"], dtype=np.float16)
             points = np.asarray(data["points"], dtype=np.float32)
@@ -281,6 +294,8 @@ def keyframe_gap_reached(
 
 def stack_tokens(patches: Sequence[PatchToken]) -> tuple:
     """``(tokens (T, D), uv (T, 2))`` from a frame's patch grid."""
-    tokens = np.stack([np.asarray(p.descriptor, dtype=np.float32).reshape(-1) for p in patches])
+    tokens = np.stack(
+        [np.asarray(p.descriptor, dtype=np.float32).reshape(-1) for p in patches]
+    )
     uv = np.array([[float(p.u), float(p.v)] for p in patches], dtype=np.float32)
     return tokens, uv

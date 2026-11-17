@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export YOLO-Worldv2 ONNX with indoor landmark class prompts baked in.
+"""Export YOLO-Worldv2 ONNX with the indoor class prompts baked in.
 
 Robots normally get this file via ``setup.sh`` / ``tools/fetch_yolo_world_onnx.py``
 (GitHub release asset). Use this script only to rebuild the asset.
@@ -78,7 +78,9 @@ def main() -> int:
 
     if args.classes is not None:
         classes = json.loads(Path(args.classes).read_text())
-        if not isinstance(classes, list) or not all(isinstance(c, str) for c in classes):
+        if not isinstance(classes, list) or not all(
+            isinstance(c, str) for c in classes
+        ):
             print("--classes must be a JSON list of strings", file=sys.stderr)
             return 2
     else:

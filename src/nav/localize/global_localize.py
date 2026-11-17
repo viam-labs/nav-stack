@@ -498,9 +498,13 @@ def tolerance_grid_steps(
     position_step = (radius + 1) * float(resolution)
     tolerance_m = (radius + 0.5) * float(resolution)
     ranges = np.hypot(scan_xy[:, 0], scan_xy[:, 1]) if scan_xy.size else np.zeros(0)
-    far = float(np.percentile(ranges, _YAW_STEP_RANGE_PERCENTILE)) if ranges.size else 1.0
+    far = (
+        float(np.percentile(ranges, _YAW_STEP_RANGE_PERCENTILE)) if ranges.size else 1.0
+    )
     yaw_step = math.degrees(2.0 * tolerance_m / max(far, 1e-3))
-    return position_step, min(_MAX_COARSE_YAW_STEP_DEG, max(_MIN_COARSE_YAW_STEP_DEG, yaw_step))
+    return position_step, min(
+        _MAX_COARSE_YAW_STEP_DEG, max(_MIN_COARSE_YAW_STEP_DEG, yaw_step)
+    )
 
 
 class _BatchScorer:
@@ -521,14 +525,18 @@ class _BatchScorer:
         self._xs = np.asarray(scan_xy[:, 0], dtype=float)
         self._ys = np.asarray(scan_xy[:, 1], dtype=float)
         self._total = int(scan_xy.shape[0])
-        self._min_points = max(int(min_in_map_points), int(self._total * min_in_map_ratio))
+        self._min_points = max(
+            int(min_in_map_points), int(self._total * min_in_map_ratio)
+        )
         # One byte per cell: bit 0 hit (near a wall), bit 1 known free,
         # bit 2 inside the grid. The border of zeros stands for off-grid.
         code = occupied_lookup.astype(np.uint8)
         code |= ((grid >= 0) & (grid < 50)).astype(np.uint8) << 1
         code |= 4
         reach = float(np.hypot(self._xs, self._ys).max()) if self._total else 0.0
-        pad = int(min(math.ceil(reach / occ_map.resolution) + 2, max(height, width) + 2))
+        pad = int(
+            min(math.ceil(reach / occ_map.resolution) + 2, max(height, width) + 2)
+        )
         padded = np.zeros((height + 2 * pad, width + 2 * pad), dtype=np.uint8)
         padded[pad : pad + height, pad : pad + width] = code
         self._flat = padded.ravel()
@@ -574,25 +582,37 @@ class _BatchScorer:
         """
         res = self._map.resolution
         rx, ry = self._rotated(theta)
-        dcol = np.clip(np.floor(frac_x + rx / res), -self._pad, self._pad).astype(np.int64)
-        drow = np.clip(np.floor(frac_y + ry / res), -self._pad, self._pad).astype(np.int64)
+        dcol = np.clip(np.floor(frac_x + rx / res), -self._pad, self._pad).astype(
+            np.int64
+        )
+        drow = np.clip(np.floor(frac_y + ry / res), -self._pad, self._pad).astype(
+            np.int64
+        )
         offsets = drow * self._padded_width + dcol
         base = (rows.astype(np.int64) + self._pad) * self._padded_width + (
             cols.astype(np.int64) + self._pad
         )
         parts = [
-            self._scores(self._flat[base[i : i + _BATCH_POSES, None] + offsets[None, :]])
+            self._scores(
+                self._flat[base[i : i + _BATCH_POSES, None] + offsets[None, :]]
+            )
             for i in range(0, len(base), _BATCH_POSES)
         ]
         return tuple(np.concatenate(col) for col in zip(*parts))
 
-    def score_xy(self, xs: np.ndarray, ys: np.ndarray, theta: float) -> Tuple[np.ndarray, ...]:
+    def score_xy(
+        self, xs: np.ndarray, ys: np.ndarray, theta: float
+    ) -> Tuple[np.ndarray, ...]:
         """Candidates at arbitrary positions, one heading."""
         res = self._map.resolution
         height, width = self._map.grid.shape
         rx, ry = self._rotated(theta)
-        cols = np.floor((xs[:, None] + rx[None, :] - self._map.origin_x) / res).astype(np.int64)
-        rows = np.floor((ys[:, None] + ry[None, :] - self._map.origin_y) / res).astype(np.int64)
+        cols = np.floor((xs[:, None] + rx[None, :] - self._map.origin_x) / res).astype(
+            np.int64
+        )
+        rows = np.floor((ys[:, None] + ry[None, :] - self._map.origin_y) / res).astype(
+            np.int64
+        )
         inside = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
         # Index 0 is in the zero border: an off-grid point reads as off-grid.
         index = np.where(
@@ -647,9 +667,10 @@ def _lattice_cells(
 
 
 def _different_place(a: conv.Pose2D, b: conv.Pose2D) -> bool:
-    return math.hypot(a.x - b.x, a.y - b.y) > _RIVAL_DISTANCE_M or abs(
-        math.degrees(conv.normalize_angle(a.theta - b.theta))
-    ) > _RIVAL_YAW_DEG
+    return (
+        math.hypot(a.x - b.x, a.y - b.y) > _RIVAL_DISTANCE_M
+        or abs(math.degrees(conv.normalize_angle(a.theta - b.theta))) > _RIVAL_YAW_DEG
+    )
 
 
 def global_localize_scan(
@@ -708,9 +729,17 @@ def global_localize_scan(
 
     res = float(occ_map.resolution)
     hit_radius_cells = max(0, int(hit_radius_cells))
-    default_step_m, default_yaw_deg = tolerance_grid_steps(scan_xy, res, hit_radius_cells)
-    coarse_step_m = default_step_m if coarse_position_step_m is None else float(coarse_position_step_m)
-    coarse_yaw_deg = default_yaw_deg if coarse_yaw_step_deg is None else float(coarse_yaw_step_deg)
+    default_step_m, default_yaw_deg = tolerance_grid_steps(
+        scan_xy, res, hit_radius_cells
+    )
+    coarse_step_m = (
+        default_step_m
+        if coarse_position_step_m is None
+        else float(coarse_position_step_m)
+    )
+    coarse_yaw_deg = (
+        default_yaw_deg if coarse_yaw_step_deg is None else float(coarse_yaw_step_deg)
+    )
     stride = max(1, int(round(coarse_step_m / res)))
     coarse_yaw = math.radians(max(1e-3, coarse_yaw_deg))
 
@@ -726,9 +755,16 @@ def global_localize_scan(
     range_max = float(scan.range_max) if math.isfinite(scan.range_max) else 25.0
     evaluated = 0
 
-    def with_rays(pose: conv.Pose2D, endpoint: _PoseScore) -> Tuple[float, float, float]:
+    def with_rays(
+        pose: conv.Pose2D, endpoint: _PoseScore
+    ) -> Tuple[float, float, float]:
         quality, mae = _ray_alignment(
-            occ_map, pose, ray_angles, ray_ranges, range_max_m=range_max, step_m=ray_step_m
+            occ_map,
+            pose,
+            ray_angles,
+            ray_ranges,
+            range_max_m=range_max,
+            step_m=ray_step_m,
         )
         return endpoint.score + ray_weight * ((2.0 * quality) - 1.0), quality, mae
 
@@ -758,7 +794,11 @@ def global_localize_scan(
             )
             evaluated += int(rows.size)
             take = min(_COARSE_KEEP_PER_YAW, score.size)
-            best = np.argpartition(-score, take - 1)[:take] if take < score.size else np.arange(score.size)
+            best = (
+                np.argpartition(-score, take - 1)[:take]
+                if take < score.size
+                else np.arange(score.size)
+            )
             for i in best:
                 if math.isfinite(score[i]):
                     coarse.append(
@@ -766,7 +806,10 @@ def global_localize_scan(
                             float(score[i]),
                             conv.Pose2D(float(cell_x[i]), float(cell_y[i]), theta),
                             _PoseScore(
-                                float(score[i]), int(inside[i]), float(hit_rate[i]), float(coverage[i])
+                                float(score[i]),
+                                int(inside[i]),
+                                float(hit_rate[i]),
+                                float(coverage[i]),
                             ),
                         )
                     )
@@ -810,7 +853,9 @@ def global_localize_scan(
     gx, gy = gx[in_disc], gy[in_disc]
     yaw_count = max(1, int(math.ceil(math.radians(fine_yaw_window_deg) / fine_yaw)))
 
-    def refine(center: conv.Pose2D) -> Optional[Tuple[float, conv.Pose2D, _PoseScore, float, float]]:
+    def refine(
+        center: conv.Pose2D,
+    ) -> Optional[Tuple[float, conv.Pose2D, _PoseScore, float, float]]:
         nonlocal evaluated
         xs, ys = center.x + gx, center.y + gy
         cell_cols = np.floor((xs - occ_map.origin_x) / res).astype(np.int64)
@@ -831,7 +876,11 @@ def global_localize_scan(
             score, inside, hit_rate, coverage = scorer.score_xy(xs, ys, theta)
             evaluated += int(xs.size)
             take = min(_FINE_RAY_CANDIDATES, score.size)
-            best = np.argpartition(-score, take - 1)[:take] if take < score.size else np.arange(score.size)
+            best = (
+                np.argpartition(-score, take - 1)[:take]
+                if take < score.size
+                else np.arange(score.size)
+            )
             for i in best:
                 if math.isfinite(score[i]):
                     found.append(
@@ -839,7 +888,10 @@ def global_localize_scan(
                             float(score[i]),
                             conv.Pose2D(float(xs[i]), float(ys[i]), theta),
                             _PoseScore(
-                                float(score[i]), int(inside[i]), float(hit_rate[i]), float(coverage[i])
+                                float(score[i]),
+                                int(inside[i]),
+                                float(hit_rate[i]),
+                                float(coverage[i]),
                             ),
                         )
                     )
@@ -855,7 +907,9 @@ def global_localize_scan(
         # step, so without this the reported score depends on where the grid
         # happened to fall (0.80 against 0.93 for one office pose).
         anchor = best_item[1]
-        px, py = np.meshgrid(_POLISH_STEPS * (fine_step / 4.0), _POLISH_STEPS * (fine_step / 4.0))
+        px, py = np.meshgrid(
+            _POLISH_STEPS * (fine_step / 4.0), _POLISH_STEPS * (fine_step / 4.0)
+        )
         px, py = anchor.x + px.ravel(), anchor.y + py.ravel()
         polished: List[Tuple[float, conv.Pose2D, _PoseScore]] = []
         for k in _POLISH_STEPS:
@@ -869,7 +923,10 @@ def global_localize_scan(
                         float(score[i]),
                         conv.Pose2D(float(px[i]), float(py[i]), theta),
                         _PoseScore(
-                            float(score[i]), int(inside[i]), float(hit_rate[i]), float(coverage[i])
+                            float(score[i]),
+                            int(inside[i]),
+                            float(hit_rate[i]),
+                            float(coverage[i]),
                         ),
                     )
                 )
@@ -880,7 +937,9 @@ def global_localize_scan(
                 best_item = (combined, pose, endpoint, quality, mae)
         return best_item
 
-    refined = [item for item in (refine(place[1]) for place in places) if item is not None]
+    refined = [
+        item for item in (refine(place[1]) for place in places) if item is not None
+    ]
     if not refined:
         raise RuntimeError("global scan match failed; no valid candidate in map bounds")
     refined.sort(key=lambda item: item[0], reverse=True)

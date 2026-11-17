@@ -8,8 +8,8 @@ Weights are **not** committed to git and are excluded from `module.tar.gz`.
 | Role | Example path | Notes |
 | --- | --- | --- |
 | DINOv2 ViT-S/14 patch tokens | `dinov2_vits14_patches_448.onnx` | Square 448 input → `(1, 1024, 384)` |
-| YOLO-Worldv2 (indoor) | `yolov8s-worldv2-indoor.onnx` | Open-vocab boxes → pooled DINO landmarks |
-| YOLOv8n (COCO) | `yolov8n.onnx` | Works too: `tv`/`clock`/`book`/… as interim |
+| YOLO-Worldv2 (indoor) | `yolov8s-worldv2-indoor.onnx` | Boxes for people and other movers, masked out of the scan while mapping |
+| YOLOv8n (COCO) | `yolov8n.onnx` | Works too: it has `person` |
 | Site head (phase 7) | `head.onnx` | Optional; replaces per-map PCA |
 
 ## Auto-install
@@ -39,174 +39,35 @@ defaults — empty config resolves to:
 ```json
 "vision_enabled": true,
 "vision_cameras": ["camera-top"],
-"vision_input_size": 448,
-"vision_prefer_detections": true
+"vision_input_size": 448
 ```
 
-
-Survey prefers detector boxes: each allowed YOLO-World box pools DINOv2 patch
-tokens into one landmark (much stabler re-ID than dense 14×14 tokens). Dense
-texture patches remain as a small fallback (`vision_dense_fallback_patches`,
-default 16). Override `vision_yolo_onnx` / `vision_detector_classes` only for
-a custom detector (e.g. COCO YOLOv8 — leave classes empty to use COCO-80).
-`vision_landmark_labels` filters which detections become landmarks.
+The detector is only used to find people (and bicycles, cars, motorcycles);
+boxes with any other label are dropped. Override `vision_yolo_onnx` /
+`vision_detector_classes` only for a custom detector (e.g. COCO YOLOv8 —
+leave classes empty to use COCO-80).
 
 Omit `vision_synthetic` (or set `false`). `vision_status.provider` should show
 `OpenVINOExecutionProvider` (or `CPUExecutionProvider`), **not** `synthetic`.
 Intrinsics are auto-read from `Camera.get_properties()` when the camera
-publishes them; see `vision_status.intrinsics_source`.
-
-## Landmark overlay camera
-
-Add a ``viam-labs:nav-stack:vision-camera`` component to stream RGB with
-boxes (green=confirmed, yellow=candidate):
-
-```json
-{
-  "name": "vision-landmarks",
-  "model": "viam-labs:nav-stack:vision-camera",
-  "attributes": {
-    "slam": "slam",
-    "source": "camera-top",
-    "show_candidates": true,
-    "show_confirmed": true,
-    "show_detections": true
-  },
-  "depends_on": ["slam", "camera-top"]
-}
-```
-
-``source`` should be the same RealSense as ``vision_cameras``. Open it in the
-Viam camera stream view. Overlay colors: **green** confirmed, **yellow**
-candidate, **cyan** / **grey** latest YOLO-World boxes (see below).
-**Orange ring + V** = in the latest writeback match pool (image-visible
-confirmed); **magenta ring + P** = unique pair used for the pose fit.
-HUD ``wb=V/P`` are those counts. Plain greens without a ring are
-on the map overlay but not in the last navigation match (e.g. candidate,
-out of range, or not paired). HUD ``yolo=OFF`` means the detector ONNX
-is not loaded; ``yolo=3/10`` means 3 of the 10 latest boxes fed a landmark.
-Set ``show_detections: false`` to hide the detector layer. Check
-``vision_status.yolo_loaded`` / ``yolo_onnx`` if boxes never appear.
-
-Each YOLO box says what became of it in the last surveyed frame:
-
-- **cyan**, labelled with a landmark (``poster =DC23``): the box was located
-  and matched to (or created) that landmark. A thin line joins the box centre
-  to the landmark's square, so a box that fed a landmark stored somewhere
-  else is visible as a long line.
-- **grey**, thin, labelled with a reason: the box made no observation.
-  ``far 9.6m`` / ``near 0.3m`` = outside the 0.4–4.5 m box range,
-  ``mixed depth`` = no patch inside the box is one surface, ``no depth`` = too little valid depth,
-  ``height`` = outside the z gate, ``not a landmark class`` = label not in
-  ``vision_landmark_labels``.
-
-A plain cyan box with a confidence (``poster 0.27``) has not been surveyed
-yet.
-
-Every landmark is drawn as a small square at the projection of its own
-stored point, labelled with its ID and stored depth (``DC124 3.7m``). It is
-never drawn as the YOLO rectangle: a landmark stored in front of or behind
-an object still projects inside that object's box, so a filled box made a
-wrong position look right. The square scales with stored depth, so a
-landmark stored too near draws larger than the object behind it. A **red
-square with a cross** is a landmark the camera currently sees past (see the
-depth audit below); HUD ``air=N`` counts them.
-
-## Depth audit (`landmark_audit`)
-
-A landmark is a claim that a surface exists at its stored point. Each survey
-frame, every landmark that projects into the image has its stored depth
-compared with the depth image in a ~10 cm window:
-
-| Verdict | Meaning |
-| --- | --- |
-| `agrees` | ≥15% of the window reads the stored depth (±max(0.20 m, 8%)) |
-| `seen_through` | ≥80% of the window reads beyond stored + max(0.40 m, 15%), and those readings look like a surface |
-| `occluded` | most of the window is nearer than the stored point |
-| `no_depth` | under 25% of the window has valid depth |
-| `unclear` | none of the above, including far readings that are steep both across and down the image — stereo mismatches on patterned or glossy objects, not a surface |
-
-Three `seen_through` frames in a row flag the landmark; an `agrees` frame
-clears the count; the other verdicts leave it unchanged. While **mapping**
-(or `vision_survey_only`) a flagged landmark, candidate or confirmed, is
-deleted and logged (`vision: dropped landmark DC125 …`), so the real object
-can be re-minted cleanly. A landmark with 30 or more observations is deleted
-only when the camera reads at least 1.2 m past the stored depth; a smaller
-gap stays flagged (red X) instead of throwing away a well-seen object. While
-**localizing** the audit only reports: the
-pose is what is in doubt there, and a wrong pose makes every landmark look
-seen through. For the same reason a frame where at least 4 landmarks are
-seen through and they outnumber the agreeing ones is marked `pose_suspect`
-and changes nothing.
-
-`{"command": "landmark_audit"}` on the SLAM service returns the latest frame's
-rows (`id`, `label`, `status`, `u`, `v`, `stored_depth_m`, `measured_depth_m`,
-`verdict`, `strikes`, `removed`; worst first, at most 200), a `summary` of
-verdict counts, `flagged_ids`, `removed_total` and `recent_removed`.
-`vision_status.depth_audit` carries the counts. Landmarks stored up to 6.5 m
-from the camera are audited.
-
-The reply also lists every detector box of that frame under `boxes`
-(`label`, `conf`, `outcome`, `text`, `depth_m`, `landmark`): the same
-information the overlay draws, so "YOLO sees it but there is no landmark"
-can be answered without the image.
-
-`{"command": "clear_landmarks"}` drops every landmark and deletes the active
-map's `embedding_landmarks.npz`; the occupancy map and the place index are
-kept. Use it before re-surveying.
-
-## Where a detector box's point comes from
-
-The point is read from raw depth in the central 60% of the box. The pixels
-are grouped by depth and the largest group within one surface width
-(2 × max(0.12 m, 6% of depth)) is the object. The box becomes an observation
-only when that group is unambiguous; otherwise it is skipped and counted in
-`vision_status.box_depth`:
-
-| Count | Why the box made no observation |
-| --- | --- |
-| `skipped_sparse_depth` | under 30% of the box core has valid depth |
-| `skipped_mixed_depth` | no surface holds 60% of the valid pixels (object + background, or an occluder) |
-| `skipped_range` | the surface is nearer than 0.4 m or beyond 4.5 m, or the box holds only scattered depth beyond 4.5 m |
-| `skipped_height` | the point is outside `vision_z_min_m` / `vision_z_max_m` |
-
-`used` counts boxes that did. `box_depth.by_label` splits the same counts
-per YOLO label (plus `not_landmark_label`), which shows which classes rarely
-produce a usable surface.
-
-The box range for storing a landmark is 0.4–4.5 m. It was tried out to 6 m,
-and a poster at 5.5 m repeated within one depth step from one pose, but
-landmarks stored at 5.5–6.0 m were deleted on the next viewpoint, where the
-camera read 9–12 m. A box past 4.5 m is labelled `far …m` and is not stored.
-While localizing, that same box out to `landmark_fix_max_range_m` (6 m) can
-still match a landmark that already exists. A detector landmark confirms
-after 5 observations from more than one view, and only when its position has
-scattered by 12 cm or less. Pose writeback pairs confirmed landmarks out to
-6 m and accepts a fit that agrees within `landmark_fix_residual_m` (15 cm).
-It still needs 3 pairs. The live point has to land within 0.45 m of the
-stored one, because the pose is already close.
-
-A box mostly filled by something standing in
-front of the object still lands on that nearer thing: it is a real surface,
-so the audit will not flag it.
+publishes them; see `vision_status.intrinsics_source`. Check
+`vision_status.yolo_loaded` / `yolo_onnx` if nobody is ever masked.
 
 `vision_status.capture_pose` counts frames whose capture-time pose had to
 come from the grab-time stamp (`grab_time_fallbacks`) or that were dropped
 because no capture pose was available and they were over 1 s old
 (`stale_frames_dropped`).
 
-## Pose corrections (defaults — no mode knobs)
+## What vision does (defaults — no mode knobs)
 
 With `vision_enabled: true` the defaults are:
 
-- **mapping**: build landmarks and store a recovery keyframe every 0.75 m or
-  25° (`vision_keyframes.npz` next to the map: the frame's pose, one pooled
+- **mapping**: store a recovery keyframe every 0.75 m or 25°
+  (`vision_keyframes.npz` next to the map: the frame's pose, one pooled
   descriptor, and every patch with its descriptor and 3D point; about 0.2 MB
   per keyframe). A keyframe hangs from its pose-graph node, so a loop closure
-  moves it with the map. Re-seeing at least 3 confirmed landmarks that all
-  belong to one keyframe at least `builtin_loop_min_travel_m` (6 m of path)
-  behind the robot adds a pose-graph loop edge. The edge is dropped if it
-  disagrees with the rest of the graph.
+  moves it with the map. `save_map` writes the file and `clear_map` removes
+  it.
 - **mapping paint**: a detection labelled person, bicycle, car, or motorcycle
   blanks the lidar returns inside that box for 0.2 s, so a passer-by is not
   stored as a wall. Furniture and this robot are not blanked.
@@ -215,7 +76,8 @@ With `vision_enabled: true` the defaults are:
 - **localizing, lost or unknown, base standing still**: lost-pose recovery
   (`vision_recovery`, see below).
 
-Kill switch: `"vision_survey_only": true` (build only, never move the pose).
+Kill switch: `"vision_survey_only": true` (store keyframes, never move the
+pose).
 
 ### Lost-pose recovery (`src/semantic/relocalize.py`)
 
@@ -265,16 +127,42 @@ What the table says:
 
 ### Off by default
 
-- `vision_pose_writeback` (landmark pose fit applied to the pose). While
-  localizing, `apply_map_pose_correction` sets the pose with no scan check,
-  and a pose fitted from the camera alone was wrong about half the time on
-  LILocBench with nothing in the fit to show it.
-- `vision_place_enabled` / `vision_place_retrieval` (VLAD place index and its
-  teleport). Its top guess was the true place for 26-60% of frames, against
-  66-71% for the keyframe patch match.
+`vision_place_enabled` / `vision_place_retrieval` (VLAD place index and its
+teleport: while lost, the top keyframe's pose is applied with no scan check).
+Its top guess was the true place for 26-60% of frames, against 66-71% for the
+keyframe patch match that recovery uses. Setting both `true` restores it,
+including `vision_status.place`.
 
-Setting them `true` restores the earlier behaviour, including
-`vision_status.writeback` and `vision_status.place`.
+### Removed: object landmarks
+
+Earlier builds also stored one landmark per detector box (a pooled descriptor
+and a 3D point, hung from a pose-graph node) and used them to nudge the pose
+while localizing (`vision_pose_writeback`) and to add loop edges while
+mapping. That layer is gone, with its depth audit, the `list_landmarks` /
+`landmark_audit` / `clear_landmarks` commands and the `vision-camera` overlay
+model. Its settings are ignored if a robot config still has them. What was
+measured on LILocBench before removing it:
+
+- **Loop edges almost never formed.** 0, 1 and 3 edges in runs of 211 m,
+  212 m and 42 m, against about 200 lidar loop closures per 210 m. In the
+  first 420 s of the mapping run (786 frames), 302 frames had 3 or more
+  confirmed landmarks projecting into the image. About a third of those
+  paired 3: half the landmarks "in view" were hidden behind something, and
+  the detector found a median 2 of 5 again. 37 fits passed, and all 37 mixed
+  landmarks from several keyframes, which the loop rule refused.
+- **Relaxing that rule did not help.** Letting neighbouring keyframes count
+  as one visit offered 2-3 edges in the whole run. With lidar loop closure on
+  the result was unchanged (0.18 m / 0.14 m against 0.19 m / 0.14 m). With it
+  off, two 3-landmark edges with about 5° of heading error took the live
+  error from 0.42 m to 2.81 m (14 m at worst). One run, experimental rule.
+- **Writeback set the pose with no scan check.** While localizing,
+  `apply_map_pose_correction` takes the pose as given, and a pose fitted from
+  the camera alone was wrong about half the time, with nothing in the fit to
+  show it.
+
+The code is in git history up to commit `7125b4a`. Using the camera to
+*propose* a loop closure (recognise an old keyframe, let the scan match
+compute the edge) would reuse the recovery keyframes; it has not been built.
 
 ## Measuring vision offline
 
@@ -298,77 +186,56 @@ under `~/datasets/lilocbench/cache`, so re-runs take seconds to minutes.
 odometry and scans through the SLAM engine in order, on a clock that follows
 the recording, with the vision supervisor alongside when asked, and compares
 the published pose and the final keyframes with ground truth. The engine is
-stepped as its own threads would step it, with nothing in the background, so
-a replay is repeatable. Detector boxes are cached after the first vision
-replay of a run.
+stepped as its own threads would step it, with nothing in the background.
+Detector boxes are cached after the first vision replay of a run.
 
 Three runs, each mapped from scratch. Error against ground truth after
 aligning frames, RMSE of the live pose / of the final keyframes:
 
-| Run | Wheel odometry | Lidar loop closure off | Lidar only | + vision, result 0.3 s late | + vision, result at once |
+| Run | Wheel odometry | Lidar loop closure off | Lidar only | + person mask, result 0.3 s late | + person mask, result at once |
 | --- | --- | --- | --- | --- | --- |
-| mapping (211 m, static) | 0.89 m / - | 0.42 m / 0.43 m | 0.20 m / 0.14 m | 0.19 m / 0.14 m | 0.17 m / 0.13 m |
+| mapping (211 m, static) | 0.89 m / - | 0.42 m / 0.43 m | 0.20 m / 0.14 m | 0.19 m / 0.13 m | 0.17 m / 0.13 m |
 | static_0 (212 m, static) | 0.69 m / - | 0.42 m / 0.40 m | 0.08 m / 0.07 m | 0.08 m / 0.06 m | 0.09 m / 0.07 m |
-| dynamics_0 (42 m, crowded) | 0.21 m / - | not run | 0.09 m / 0.09 m | 0.09 m / 0.07 m | 0.15 m / 0.14 m |
+| dynamics_0 (42 m, crowded) | 0.21 m / - | not run | 0.09 m / 0.09 m | 0.09 m / 0.09 m | 0.16 m / 0.15 m |
 
 - **Lidar loop closure is what holds the map together**: about 190-210
   closures per 210 m, taking the live error from 0.42 m to 0.08-0.20 m.
-- **Landmark loop closure almost never fires**: 0, 1 and 3 pose-graph edges
-  in the three runs. Of the frame checks on the two long runs, 32-47% had
-  fewer than 3 confirmed landmarks in view, 46-48% had enough in view but no
-  agreeing fit, and 6-15% matched landmarks from different keyframes. With
-  it off the static_0 result was the same (0.09 m / 0.07 m). The three edges
-  in the crowded run coincide with a 2 cm better final map; one short run.
 - **Person masking only applies when the result is immediate**, and then it
   is not a reliable gain. The mask covers scans within 0.2 s of the camera
-  frame, so a result 0.3 s late never applies and the numbers match lidar
-  alone. Applied at once it improved one static run (0.19 m to 0.17 m),
-  slightly worsened the other (0.08 m to 0.09 m) and clearly worsened the
-  crowded one (0.09 m to 0.15 m), where a person was in 260 of 299 frames.
-  It did keep them out of the map there (occupied cells down by a third).
-  Why the pose gets worse is not yet explained.
+  frame, so a result 0.3 s late never applies. Applied at once it improved
+  one static run (0.20 m to 0.17 m), slightly worsened the other (0.08 m to
+  0.09 m) and clearly worsened the crowded one (0.09 m to 0.16 m), where a
+  person was in 260 of 299 frames. It did keep them out of the map there
+  (occupied cells down by a third). Why the pose gets worse is not yet
+  explained.
+- **Differences under 1 cm are noise.** The late-result column changes
+  nothing the engine sees, so it should equal lidar alone. It does on the
+  short run and is within 1 cm on the two long ones.
 
-`--variants` covers odometry, lidar loop closure off and on, and vision with
-landmark loops off and on; pass `vision_latency_s` to `replay_mapping` for
-the delay.
+`--variants` covers `odometry`, `lidar_no_loops`, `lidar`, `vision` (result
+applied at once) and `vision_late` (0.3 s after the frame).
 
 The replay does not run the service-level tasks (mapping revisit, periodic
 relocalization), and the dataset robot's wheel odometry is not the cart's.
 
-## Survey density / nav load (rc2+)
-
-Defaults assume a density pilot, not pose writeback:
+## Nav load
 
 | Attribute | Default | Why |
 | --- | --- | --- |
 | `vision_rate_hz` | `2.0` | One camera. Two RealSense cameras faster than this starved nav |
 | `vision_round_robin` | `true` | One camera per tick when multiple are listed |
-| `vision_z_min_m` / `vision_z_max_m` | `0.25` / `2.0` | Drop floor/ceiling |
-| `vision_max_patches_per_frame` | `64` | Cap dense associations per frame |
-| `vision_prefer_detections` | `true` | Pool DINO inside YOLO boxes first |
-| `vision_dense_fallback_patches` | `0` | Dense only when YOLO is quiet (avoids duplicate IDs) |
-| `vision_associate_radius_m` / `vision_cell_m` | `0.25` / `0.30` | Merge nearby patches |
 | `vision_input_size` | `448` | Must match the ONNX export |
 
-Promotion defaults (code, not config): ≥3 obs, ≥2 views with ≥0.5 m **or**
-≥25° yaw, position std ≤ **0.12 m**. Patch selection is **texture-first**
-(local RGB contrast) so painting interiors survive; distinctiveness is only a
-soft bonus (hard distinctiveness alone dropped coherent artwork).
-
-**Windows / outdoor through glass:** RGB may latch onto a far building while
-depth returns the glass plane — the box looks right from the first viewpoint
-then slides onto the window frame when you turn. Depth support checks reject
-mixed/holey neighborhoods, and ``vision-camera`` hides unstable single-view
-candidates by default (`stable_candidates_only: true`). Prefer indoor opaque
-surfaces (paintings, posters, furniture) for survey.
+While localizing with the pose tracking, no frame is grabbed and no model
+runs. Prefer a single camera in `vision_cameras`.
 
 **Intrinsics / FOV:** prefer live `Camera.get_properties().intrinsic_parameters`
 (auto-scaled to the frame size). `vision_status.intrinsics_source` is
 `camera_properties` when that works, else `fov_config` (lidar `fov_deg` /
 `vfov_deg` fallback — set those only if properties are empty).
 
-Run `clear_landmarks` (or `clear_map`, which also wipes the occupancy map)
-before re-surveying after switching synthetic → DINOv2. Prefer a single camera in `vision_cameras`.
+Keyframes are never stored from the synthetic provider. A map made before
+DINOv2 was loaded needs another mapping pass to collect them.
 
 ## Meerkat GPU runtime
 

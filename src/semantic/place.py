@@ -107,9 +107,7 @@ class PlaceIndex:
             return False
         comps, mean = fit_pca(bank, out_dim=int(pca_dim))
         projected = l2_normalize((bank - mean) @ comps.T)
-        vocab = fit_vocabulary(
-            projected, n_clusters=int(n_clusters), seed=int(seed)
-        )
+        vocab = fit_vocabulary(projected, n_clusters=int(n_clusters), seed=int(seed))
         self.pca_components = comps
         self.pca_mean = mean
         self.vocabulary = vocab
@@ -159,7 +157,9 @@ class PlaceIndex:
         }
 
 
-def fit_pca(descriptors: np.ndarray, *, out_dim: int = 128) -> Tuple[np.ndarray, np.ndarray]:
+def fit_pca(
+    descriptors: np.ndarray, *, out_dim: int = 128
+) -> Tuple[np.ndarray, np.ndarray]:
     """Return (components (out_dim, D), mean (D,))."""
     x = np.asarray(descriptors, dtype=np.float64)
     if x.ndim != 2 or x.shape[0] < 2:

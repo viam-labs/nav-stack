@@ -90,11 +90,16 @@ class ReplaySensors:
         x, y, yaw = self._odom_pose[i]
         vx, vy, wz = self._odom_twist[i]
         return conv.OdomReading(
-            float(vx), float(vy), float(wz), pose=conv.Pose2D(float(x), float(y), float(yaw))
+            float(vx),
+            float(vy),
+            float(wz),
+            pose=conv.Pose2D(float(x), float(y), float(yaw)),
         )
 
 
-def align_se2(est_xy: np.ndarray, truth_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+def align_se2(
+    est_xy: np.ndarray, truth_xy: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, float]:
     """Rotation, translation and yaw that best lay ``est_xy`` on ``truth_xy``."""
     mu_e, mu_t = est_xy.mean(axis=0), truth_xy.mean(axis=0)
     h = (est_xy - mu_e).T @ (truth_xy - mu_t)
@@ -114,7 +119,9 @@ class Trajectory:
     est: np.ndarray  # (N, 3) x, y, yaw in the estimator's own frame
     truth: np.ndarray  # (N, 3) in the ground-truth frame
 
-    def errors(self, *, anchor_s: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def errors(
+        self, *, anchor_s: Optional[float] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Position (m) and heading (deg) error per sample after aligning frames.
 
         With ``anchor_s`` only the first that many seconds set the alignment,
@@ -181,8 +188,8 @@ class ReplayResult:
     logs: List[str] = field(default_factory=list)
     # The occupancy map the engine ended with (``engine.get_map()``).
     map: Optional[dict] = None
-    # Per-frame tallies: what the landmark-loop check concluded, and how many
-    # frames showed a person (and reached the engine while the mask was fresh).
+    # How many frames showed a person, and how many of those reached the
+    # engine while the mask was still fresh.
     vision_trace: Optional[dict] = None
 
     def save_map_png(self, path: Path) -> Path:
@@ -195,7 +202,10 @@ class ReplayResult:
         img[grid >= 65] = 0
         rows, cols = np.nonzero(grid >= 0)
         if rows.size:
-            img = img[max(0, rows.min() - 5) : rows.max() + 6, max(0, cols.min() - 5) : cols.max() + 6]
+            img = img[
+                max(0, rows.min() - 5) : rows.max() + 6,
+                max(0, cols.min() - 5) : cols.max() + 6,
+            ]
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(np.flipud(img)).save(path)
@@ -204,22 +214,25 @@ class ReplayResult:
     def summary(self) -> dict:
         out = {
             "live": self.live.summary(),
-            "final_map": self.final.position_summary() if len(self.final.stamps) >= 3 else None,
+            "final_map": self.final.position_summary()
+            if len(self.final.stamps) >= 3
+            else None,
             "loop_closures": int(self.loop.get("closures", 0)),
             "loop_attempts": int(self.loop.get("attempts", 0)),
             "travel_m": round(self.travel_m, 1),
             "wall_s": round(self.wall_s, 1),
         }
         if self.vision is not None:
-            landmark_loop = self.vision.get("landmark_loop", {})
-            out["landmark_loops_applied"] = int(landmark_loop.get("applied", 0))
-            out["landmark_loop_attempts"] = int(landmark_loop.get("attempts", 0))
-            out["landmarks_confirmed"] = int(self.vision.get("landmarks", {}).get("confirmed", 0))
+            out["recovery_keyframes"] = int(
+                self.vision.get("recovery", {}).get("keyframes", 0)
+            )
             out["vision_trace"] = self.vision_trace
         return out
 
 
-def _slam_config(maps_dir: Path, *, vision: bool, extra: Optional[dict] = None) -> SlamConfig:
+def _slam_config(
+    maps_dir: Path, *, vision: bool, extra: Optional[dict] = None
+) -> SlamConfig:
     cfg: dict = {
         "base": "base",
         "maps_dir": str(maps_dir),
@@ -247,9 +260,16 @@ class CachedWorker:
     first use and kept on disk, so later replays of the same run cost nothing.
     """
 
-    def __init__(self, worker, seq: LilocSequence, feats: FrameFeatures, cache_dir: Path) -> None:
+    def __init__(
+        self, worker, seq: LilocSequence, feats: FrameFeatures, cache_dir: Path
+    ) -> None:
         self._worker, self._seq, self._feats = worker, seq, feats
-        self._path = Path(cache_dir).expanduser() / seq.name / f"camera_{seq.camera}" / "detections.pkl"
+        self._path = (
+            Path(cache_dir).expanduser()
+            / seq.name
+            / f"camera_{seq.camera}"
+            / "detections.pkl"
+        )
         self._boxes: Dict[int, List[Detection]] = {}
         if self._path.is_file():
             self._boxes = pickle.loads(self._path.read_bytes())
@@ -263,7 +283,9 @@ class CachedWorker:
         del scale, pad_x, pad_y
         desc = self._feats.tokens(self.frame)
         tokens = [
-            PatchToken(row=int(r), col=int(c), u=float(u), v=float(v), descriptor=desc[i])
+            PatchToken(
+                row=int(r), col=int(c), u=float(u), v=float(v), descriptor=desc[i]
+            )
             for i, ((r, c), (u, v)) in enumerate(zip(self._feats.grid, self._feats.uv))
         ]
         return tokens, desc.mean(axis=0)
@@ -287,7 +309,6 @@ def replay_mapping(
     feats: Optional[FrameFeatures] = None,
     cache_dir: Optional[Path] = None,
     vision: bool = False,
-    landmark_loops: bool = True,
     vision_latency_s: float = 0.0,
     config: Optional[dict] = None,
     tick_hz: float = 15.0,
@@ -297,9 +318,8 @@ def replay_mapping(
     """Map the run from scratch and compare the engine's poses with ground truth.
 
     ``vision`` runs the vision supervisor on the camera frames alongside
-    (landmarks, person masking, recovery keyframes). ``landmark_loops=False``
-    keeps everything else but stops landmarks adding pose-graph edges, so the
-    two can be told apart. ``config`` overrides SLAM attributes.
+    (person masking, recovery keyframes). ``config`` overrides SLAM
+    attributes.
 
     ``vision_latency_s`` is how long after a frame is taken its result reaches
     the engine. A replay has no inference time of its own, and the person mask
@@ -320,7 +340,7 @@ def replay_mapping(
     # engine drops keyframes when it heals a torn patch of map, so an index
     # does not keep meaning the same keyframe.
     node_stamp: Dict[int, float] = {}
-    trace: dict = {"landmark_loop": {}, "frames_with_people": 0, "frames_masked_in_time": 0}
+    trace: dict = {"frames_with_people": 0, "frames_masked_in_time": 0}
 
     with tempfile.TemporaryDirectory(prefix="nav-replay-") as tmp, clock:
         cfg = _slam_config(Path(tmp), vision=vision, extra=config)
@@ -329,7 +349,11 @@ def replay_mapping(
         store.set_active_map("replay")
         sensors = ReplaySensors(seq, clock)
         engine = BuiltinSlamEngine(
-            cfg, sensors, store, logger=logs.append, rate_hz=tick_hz  # type: ignore[arg-type]
+            cfg,
+            sensors,
+            store,
+            logger=logs.append,
+            rate_hz=tick_hz,  # type: ignore[arg-type]
         )
         engine.configure_mode(MODE_MAPPING, handle.root)
 
@@ -344,33 +368,27 @@ def replay_mapping(
                 get_pose=engine.get_pose,
                 get_pose_at=engine.get_pose_at,
                 get_anchor=engine.vision_anchor,
-                get_node_travel=engine.vision_node_travel,
-                add_landmark_loop=engine.add_landmark_loop if landmark_loops else None,
                 note_paint_discs=engine.note_paint_discs,
                 logger=logs.append,
             )
             supervisor._ensure_worker_loaded()  # noqa: SLF001
             if supervisor._worker.cfg.synthetic:  # noqa: SLF001
-                raise RuntimeError("vision models did not load; replay would not be the real pipeline")
+                raise RuntimeError(
+                    "vision models did not load; replay would not be the real pipeline"
+                )
             cached = CachedWorker(supervisor._worker, seq, feats, cache_dir)  # noqa: SLF001
             engine.set_anchor_motion_hook(supervisor.follow_anchor_motion)
 
-            # Tally what each frame's landmark-loop check and person mask did.
-            real_loop = supervisor._try_landmark_loop  # noqa: SLF001
-
-            def counted_loop(*args, **kwargs):
-                real_loop(*args, **kwargs)
-                last = supervisor._last_landmark_loop or {}  # noqa: SLF001
-                status = str(last.get("status", "cooldown"))
-                trace["landmark_loop"][status] = trace["landmark_loop"].get(status, 0) + 1
-
-            supervisor._try_landmark_loop = counted_loop  # noqa: SLF001
+            # Tally what the person mask did on each frame.
             real_discs = supervisor._note_paint_discs  # noqa: SLF001
 
             def counted_discs(discs, captured_at):
                 if discs:
                     trace["frames_with_people"] += 1
-                    if time.monotonic() - float(captured_at) <= engine._PAINT_DISC_MAX_AGE_S:  # noqa: SLF001
+                    if (
+                        time.monotonic() - float(captured_at)
+                        <= engine._PAINT_DISC_MAX_AGE_S
+                    ):  # noqa: SLF001
                         trace["frames_masked_in_time"] += 1
                 real_discs(discs, captured_at)
 
@@ -397,7 +415,10 @@ def replay_mapping(
                 engine.refresh_map_health()
                 engine.run_loop_closure()
             if supervisor is not None:
-                while frame_i < len(seq) and seq.stamps[frame_i] + vision_latency_s <= stamp:
+                while (
+                    frame_i < len(seq)
+                    and seq.stamps[frame_i] + vision_latency_s <= stamp
+                ):
                     if seq.stamps[frame_i] >= t0:
                         frame = seq.frame(frame_i)
                         frame.stamp = frame.captured_at = clock.of(seq.stamps[frame_i])
@@ -416,7 +437,9 @@ def replay_mapping(
                 (node_stamp.get(n.scans[0].seq) if n.scans else None, n.pose)
                 for n in engine._graph.nodes  # noqa: SLF001
             ]
-            travel = float(engine._graph.nodes[-1].travel_m) if engine._graph.nodes else 0.0  # noqa: SLF001
+            travel = (
+                float(engine._graph.nodes[-1].travel_m) if engine._graph.nodes else 0.0
+            )  # noqa: SLF001
             loop_stats = dict(engine._loop_stats)  # noqa: SLF001
         final_map = engine.get_map()
         vision_status = supervisor.status() if supervisor is not None else None
@@ -439,7 +462,9 @@ def replay_mapping(
             final_rows.append((stamp_i, pose, truth))
     return ReplayResult(
         live=pack(live),
-        final=pack(final_rows) if final_rows else Trajectory(np.zeros(0), np.zeros((0, 3)), np.zeros((0, 3))),
+        final=pack(final_rows)
+        if final_rows
+        else Trajectory(np.zeros(0), np.zeros((0, 3)), np.zeros((0, 3))),
         loop=loop_stats,
         vision=vision_status,
         travel_m=travel,

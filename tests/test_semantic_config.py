@@ -49,34 +49,17 @@ def test_vision_enabled_ok():
 def test_vision_density_defaults():
     cfg = SlamConfig.from_dict({"base": "b", "lidars": _base_lidars()})
     assert cfg.vision_rate_hz == 2.0
-    assert cfg.vision_z_min_m == 0.25
-    assert cfg.vision_z_max_m == 2.0
-    assert cfg.vision_associate_radius_m == 0.25
-    assert cfg.vision_cell_m == 0.30
-    assert cfg.vision_max_patches_per_frame == 64
     assert cfg.vision_round_robin is True
     assert cfg.vision_input_size == 448
     assert cfg.vision_survey_only is False
-    # Camera-only pose appliers are off; lidar-checked recovery is on.
+    # The camera-only pose applier is off; lidar-checked recovery is on.
     assert cfg.vision_recovery is True
-    assert cfg.vision_pose_writeback is False
-    assert cfg.vision_pose_writeback_min_inliers == 3
-    assert cfg.landmark_fix_max_range_m == pytest.approx(6.0)
-    assert cfg.landmark_fix_residual_m == pytest.approx(0.15)
     assert cfg.vision_place_enabled is False
     assert cfg.vision_place_retrieval is False
     assert cfg.vision_place_min_score == 0.55
     assert cfg.vision_place_max_jump_m == 0.75
-    assert cfg.vision_prefer_detections is True
-    assert cfg.vision_dense_fallback_patches == 0
     assert cfg.vision_yolo_conf == 0.10
     assert cfg.vision_detector_classes == []
-    assert "painting" in cfg.vision_landmark_labels
-    assert "tv" in cfg.vision_landmark_labels
-    assert "desk" in cfg.vision_landmark_labels
-    assert "printer" in cfg.vision_landmark_labels
-    for movable in ("book", "chair", "laptop", "bottle", "backpack"):
-        assert movable not in cfg.vision_landmark_labels
 
 
 def test_vision_detector_classes_from_config():
@@ -85,15 +68,24 @@ def test_vision_detector_classes_from_config():
             "base": "b",
             "lidars": _base_lidars(),
             "vision_detector_classes": ["painting", "door", "clock"],
-            "vision_landmark_labels": ["painting", "door"],
-            "vision_prefer_detections": False,
-            "vision_dense_fallback_patches": 8,
         }
     )
     assert cfg.vision_detector_classes == ["painting", "door", "clock"]
-    assert cfg.vision_landmark_labels == ["painting", "door"]
-    assert cfg.vision_prefer_detections is False
-    assert cfg.vision_dense_fallback_patches == 8
+
+
+def test_settings_of_the_removed_landmark_layer_are_ignored():
+    """A robot config written for an earlier build still loads."""
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidars": _base_lidars(),
+            "vision_pose_writeback": True,
+            "vision_landmark_labels": ["painting"],
+            "landmark_fix_max_range_m": 6.0,
+        }
+    )
+    assert not hasattr(cfg, "vision_pose_writeback")
+    assert not hasattr(cfg, "vision_landmark_labels")
 
 
 def test_vision_requires_obstacles_only_optical():

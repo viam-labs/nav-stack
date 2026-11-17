@@ -41,4 +41,6 @@ def fit_to_keyframe(
     k_pose: conv.Pose2D,
 ) -> Optional[CameraFit]:
     """Match two frames' tokens, then fit the live pose from the matched points."""
-    return _fit_to_keyframe(q_points, k_points, mutual_matches(q_tokens, k_tokens), k_pose)
+    return _fit_to_keyframe(
+        q_points, k_points, mutual_matches(q_tokens, k_tokens), k_pose
+    )

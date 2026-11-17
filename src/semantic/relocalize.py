@@ -245,4 +245,6 @@ def recover_pose(
             and other.lidar.score >= winner.lidar.score - RIVAL_SCORE_MARGIN
         ):
             return Recovery("rival_place", winner=winner, hypotheses=hypotheses)
-    return Recovery("accepted", pose=winner.lidar.pose, winner=winner, hypotheses=hypotheses)
+    return Recovery(
+        "accepted", pose=winner.lidar.pose, winner=winner, hypotheses=hypotheses
+    )

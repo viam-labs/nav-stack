@@ -6,8 +6,10 @@ import math
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from src.geom import conversions as conv
+from src.semantic.fit import fit_rigid_2d
 from src.semantic.keyframes import (
     KeyframeIndex,
     keyframe_gap_reached,
@@ -35,14 +37,18 @@ def _scene(rng: np.random.Generator, n: int = 40) -> np.ndarray:
     ).astype(np.float32)
 
 
-def _seen_from(points: np.ndarray, keyframe: conv.Pose2D, live: conv.Pose2D) -> np.ndarray:
+def _seen_from(
+    points: np.ndarray, keyframe: conv.Pose2D, live: conv.Pose2D
+) -> np.ndarray:
     """The same world points, expressed in the live robot's base_link."""
     c, s = math.cos(keyframe.theta), math.sin(keyframe.theta)
     wx = keyframe.x + c * points[:, 0] - s * points[:, 1]
     wy = keyframe.y + s * points[:, 0] + c * points[:, 1]
     c, s = math.cos(live.theta), math.sin(live.theta)
     dx, dy = wx - live.x, wy - live.y
-    return np.column_stack([c * dx + s * dy, -s * dx + c * dy, points[:, 2]]).astype(np.float32)
+    return np.column_stack([c * dx + s * dy, -s * dx + c * dy, points[:, 2]]).astype(
+        np.float32
+    )
 
 
 def test_mutual_matches_keeps_only_pairs_that_pick_each_other():
@@ -62,10 +68,17 @@ def test_rank_reorders_the_pooled_shortlist_by_matched_patches():
     # Keyframe 7 holds the live frame's patches plus clutter that drags its
     # pooled descriptor away; keyframe 8 is nearly the live frame's average
     # repeated, so it pools closer but shares no single patch.
-    index.add(7, conv.Pose2D(1.0, 2.0, 0.0), np.vstack([shared, 3.0 * _unit(rng, 30)]), np.zeros((60, 3)))
+    index.add(
+        7,
+        conv.Pose2D(1.0, 2.0, 0.0),
+        np.vstack([shared, 3.0 * _unit(rng, 30)]),
+        np.zeros((60, 3)),
+    )
     blur = np.tile(shared.mean(axis=0), (60, 1)) + 0.05 * _unit(rng, 60)
     index.add(8, conv.Pose2D(9.0, 9.0, 0.0), blur, np.zeros((60, 3)))
-    pooled = np.stack(index._pooled) @ (shared.mean(axis=0) / np.linalg.norm(shared.mean(axis=0)))  # noqa: SLF001
+    pooled = np.stack(index._pooled) @ (
+        shared.mean(axis=0) / np.linalg.norm(shared.mean(axis=0))
+    )  # noqa: SLF001
     assert pooled[1] > pooled[0]
     hits = index.rank(shared, top_k=2)
     assert [h.keyframe_id for h in hits] == [7, 8]
@@ -103,10 +116,18 @@ def test_saving_an_empty_index_removes_the_file(tmp_path: Path):
 
 def test_keyframe_gap_is_distance_or_turning():
     last = conv.Pose2D(0.0, 0.0, 0.0)
-    assert keyframe_gap_reached(conv.Pose2D(0.1, 0.0, 0.0), None, gap_m=0.75, gap_deg=25.0)
-    assert not keyframe_gap_reached(conv.Pose2D(0.5, 0.0, 0.2), last, gap_m=0.75, gap_deg=25.0)
-    assert keyframe_gap_reached(conv.Pose2D(0.8, 0.0, 0.0), last, gap_m=0.75, gap_deg=25.0)
-    assert keyframe_gap_reached(conv.Pose2D(0.0, 0.0, 0.5), last, gap_m=0.75, gap_deg=25.0)
+    assert keyframe_gap_reached(
+        conv.Pose2D(0.1, 0.0, 0.0), None, gap_m=0.75, gap_deg=25.0
+    )
+    assert not keyframe_gap_reached(
+        conv.Pose2D(0.5, 0.0, 0.2), last, gap_m=0.75, gap_deg=25.0
+    )
+    assert keyframe_gap_reached(
+        conv.Pose2D(0.8, 0.0, 0.0), last, gap_m=0.75, gap_deg=25.0
+    )
+    assert keyframe_gap_reached(
+        conv.Pose2D(0.0, 0.0, 0.5), last, gap_m=0.75, gap_deg=25.0
+    )
 
 
 def test_patch_points_need_depth():
@@ -114,8 +135,12 @@ def test_patch_points_need_depth():
     depth = np.zeros((96, 128), dtype=np.float32)
     depth[:, :64] = 2.0  # left half is a wall 2 m away; right half has no depth
     frame = VisionFrame(
-        camera_name="cam", stamp=0.0, captured_at=0.0,
-        color_rgb=np.zeros((96, 128, 3), np.uint8), depth_m=depth, intrinsics=k,
+        camera_name="cam",
+        stamp=0.0,
+        captured_at=0.0,
+        color_rgb=np.zeros((96, 128, 3), np.uint8),
+        depth_m=depth,
+        intrinsics=k,
         mount_z=1.0,
     )
     points = token_points(frame, np.array([[30.0, 48.0], [100.0, 48.0]]))
@@ -208,8 +233,37 @@ def test_recovery_is_refused_when_another_place_explains_the_scan_nearly_as_well
 
 
 def test_recovery_with_no_keyframes_says_so():
-    out = recover_pose(KeyframeIndex(), np.zeros((4, 32)), np.zeros((4, 3)), lambda *a: None)
+    out = recover_pose(
+        KeyframeIndex(), np.zeros((4, 32)), np.zeros((4, 3)), lambda *a: None
+    )
     assert out.status == "no_keyframes" and not out.accepted
+
+
+def test_fit_rigid_recovers_pose_with_outliers():
+    rng = np.random.default_rng(1)
+    # True pose: translate (1, 0.5), yaw 20 deg.
+    yaw = np.deg2rad(20.0)
+    c, s = np.cos(yaw), np.sin(yaw)
+    live = rng.uniform(-2, 2, size=(40, 2))
+    map_xy = np.column_stack(
+        [c * live[:, 0] - s * live[:, 1] + 1.0, s * live[:, 0] + c * live[:, 1] + 0.5]
+    )
+    # 30% outliers.
+    n_out = 12
+    map_xy[:n_out] += rng.normal(0, 1.5, size=(n_out, 2))
+    result = fit_rigid_2d(
+        live,
+        map_xy,
+        min_inliers=8,
+        residual_m=0.1,
+        ransac_iters=80,
+        rng=rng,
+    )
+    assert result is not None
+    assert result.pose.x == pytest.approx(1.0, abs=0.08)
+    assert result.pose.y == pytest.approx(0.5, abs=0.08)
+    assert result.pose.theta == pytest.approx(yaw, abs=0.08)
+    assert int(result.inliers.sum()) >= 20
 
 
 # --- Supervisor: keyframes while mapping, recovery while lost -----------------
@@ -246,9 +300,14 @@ def _camera_frame() -> VisionFrame:
     depth[:, w // 2 :] = 3.0  # a step, so the points are not one straight wall
     k = CameraIntrinsics(fx=80.0, fy=80.0, cx=80.0, cy=60.0, width=w, height=h)
     return VisionFrame(
-        camera_name="depth-cam", stamp=0.0, captured_at=0.0,
-        color_rgb=np.zeros((h, w, 3), np.uint8), depth_m=depth, intrinsics=k,
-        mount_x=0.1, mount_z=0.6,
+        camera_name="depth-cam",
+        stamp=0.0,
+        captured_at=0.0,
+        color_rgb=np.zeros((h, w, 3), np.uint8),
+        depth_m=depth,
+        intrinsics=k,
+        mount_x=0.1,
+        mount_z=0.6,
     )
 
 
@@ -256,11 +315,19 @@ def _grid_result(seed: int = 0) -> VisionResult:
     rng = np.random.default_rng(seed)
     desc = _unit(rng, 48)
     patches = [
-        PatchToken(row=r, col=c, u=10.0 + 20.0 * c, v=10.0 + 20.0 * r, descriptor=desc[r * 8 + c])
+        PatchToken(
+            row=r,
+            col=c,
+            u=10.0 + 20.0 * c,
+            v=10.0 + 20.0 * r,
+            descriptor=desc[r * 8 + c],
+        )
         for r in range(6)
         for c in range(8)
     ]
-    return VisionResult(camera_name="depth-cam", stamp=0.0, captured_at=0.0, grid_patches=patches)
+    return VisionResult(
+        camera_name="depth-cam", stamp=0.0, captured_at=0.0, grid_patches=patches
+    )
 
 
 class _Rig:

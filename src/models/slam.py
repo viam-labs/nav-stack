@@ -91,9 +91,6 @@ _SLAM_DO_ALIASES = build_alias_map(
         "add_obstacles": ("mark_obstacles",),
         "repair_map": ("repair",),
         "vision_status": ("get_vision_status",),
-        "list_landmarks": ("get_landmarks",),
-        "landmark_audit": ("audit_landmarks",),
-        "clear_landmarks": ("reset_landmarks",),
     }
 )
 
@@ -152,7 +149,7 @@ class SlamService(SLAM):
         # Scan-to-map matcher subprocess (keeps the heavy search off this GIL).
         self._localizer = LocalizeWorker(enabled=True, logger=LOGGER)
         self._localize = LocalizeSupervisor(self)
-        # RGB-D embedding landmarks (survey / exact-localize side-channel).
+        # RGB-D side-channel: recovery keyframes and the person mask.
         self._vision = None
         self._framesystem_task: Optional[asyncio.Task] = None
         self._framesystem_gen = 0
@@ -1639,9 +1636,6 @@ class SlamService(SLAM):
             "add_obstacles": self._cmd_add_obstacles,
             "delete_map": self._cmd_delete_map,
             "vision_status": self._cmd_vision_status,
-            "list_landmarks": self._cmd_list_landmarks,
-            "landmark_audit": self._cmd_landmark_audit,
-            "clear_landmarks": self._cmd_clear_landmarks,
         }
 
     async def do_command(
@@ -1815,9 +1809,9 @@ class SlamService(SLAM):
             try:
                 path = vision.save_to_map_dir(handle.root)
                 if path:
-                    out["embedding_landmarks"] = path
+                    out["vision_keyframes"] = path
             except Exception as exc:  # noqa: BLE001
-                out["embedding_landmarks_error"] = repr(exc)
+                out["vision_keyframes_error"] = repr(exc)
         return out
 
     def _builtin_map_fn(self, name: str):
@@ -2084,7 +2078,7 @@ class SlamService(SLAM):
             await loop.run_in_executor(None, self._reset_live_slam, MODE_MAPPING)
             vision = self._vision
             if vision is not None:
-                vision.reset_landmarks()
+                vision.reset()
         finally:
             self._end_map_reset()
         return {"status": "cleared", "map": handle.name, "mode": MODE_MAPPING}
@@ -2618,61 +2612,6 @@ class SlamService(SLAM):
             return {"enabled": False, "reason": "vision not running"}
         return vision.status()
 
-    def _cmd_list_landmarks(
-        self, command: Mapping[str, ValueTypes]
-    ) -> Mapping[str, ValueTypes]:
-        del command
-        vision = self._vision
-        if vision is None:
-            return {"landmarks": [], "enabled": False}
-        confirmed = vision.landmarks.confirmed()
-        rows = []
-        for lm in confirmed[:200]:
-            rows.append(
-                {
-                    "id": int(lm.landmark_id),
-                    "anchor_node": int(lm.anchor_node),
-                    "rel_xyz": [float(x) for x in lm.rel_xyz],
-                    "map_xyz": (
-                        [float(x) for x in lm.map_xyz] if lm.map_xyz is not None else None
-                    ),
-                    "observations": int(lm.observations),
-                    "status": lm.status.value,
-                    "std_m": float(lm.position_std_m)
-                    if lm.position_std_m == lm.position_std_m
-                    else None,
-                }
-            )
-        return {
-            "enabled": True,
-            "count": len(confirmed),
-            "landmarks": rows,
-            **vision.landmarks.status_dict(),
-        }
-
-    def _cmd_landmark_audit(
-        self, command: Mapping[str, ValueTypes]
-    ) -> Mapping[str, ValueTypes]:
-        """Stored vs measured depth for each landmark in the last survey frame."""
-        del command
-        vision = self._vision
-        if vision is None:
-            return {"enabled": False, "reason": "vision not running", "rows": []}
-        return vision.landmark_audit()
-
-    def _cmd_clear_landmarks(
-        self, command: Mapping[str, ValueTypes]
-    ) -> Mapping[str, ValueTypes]:
-        """Drop all embedding landmarks (memory and saved file); keep the map."""
-        del command
-        vision = self._vision
-        if vision is None:
-            return {"enabled": False, "reason": "vision not running"}
-        store = self._map_store
-        handle = store.active_handle() if store is not None else None
-        out = vision.clear_landmarks(handle.root if handle is not None else None)
-        return {"enabled": True, "status": "cleared", **out}
-
     def _stop_vision(self) -> None:
         vision = self._vision
         self._vision = None
@@ -2696,25 +2635,16 @@ class SlamService(SLAM):
         mgr = self._manager
 
         def _apply_pose_correction(pose, *, score=None, force=False):
-            # Prefer host wrapper (same path as lidar revisit); fall back to engine.
+            # Place-index teleport (off by default). Prefer host wrapper (same
+            # path as lidar revisit); fall back to engine.
             if mgr is not None and hasattr(mgr, "apply_map_pose_correction"):
                 return mgr.apply_map_pose_correction(pose, score=score, force=force)
             return engine.apply_map_pose_correction(pose, score=score, force=force)
 
         def _is_localization_lost() -> bool:
-            # Place apply only when pose is untrusted (lost) or not yet seeded.
+            # Vision moves the pose only when it is untrusted (lost) or not yet seeded.
             state = str(getattr(self._loc_state, "state", "") or "")
             return state in ("lost", "unknown")
-
-        def _is_pose_in_question() -> bool:
-            # Landmark writeback while the scan match is tracking fights the
-            # lidar and comes back every cooldown. Lost, degraded, unknown,
-            # and map-mismatch are the states where that pose is in question.
-            state = str(getattr(self._loc_state, "state", "") or "")
-            return state in ("lost", "unknown", "degraded", "map_mismatch")
-
-        def _add_landmark_loop(pose, anchor, *, score=None):
-            return engine.add_landmark_loop(pose, anchor, score=score)
 
         # Lost-pose recovery runs on a vision worker thread; the scan search
         # and the pose apply run on the module loop.
@@ -2758,9 +2688,6 @@ class SlamService(SLAM):
             get_anchor=_anchor,
             apply_pose_correction=_apply_pose_correction,
             is_localization_lost=_is_localization_lost,
-            is_pose_in_question=_is_pose_in_question,
-            get_node_travel=engine.vision_node_travel,
-            add_landmark_loop=_add_landmark_loop,
             note_paint_discs=engine.note_paint_discs,
             lidar_search=_lidar_search,
             apply_relocalization=_apply_relocalization,

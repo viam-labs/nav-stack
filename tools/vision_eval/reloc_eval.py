@@ -72,11 +72,15 @@ def _errors(pose: conv.Pose2D, truth: conv.Pose2D) -> tuple:
     )
 
 
-def _combined(result: GlobalLocalizeResult, ray_weight: float = LOCAL_RAY_WEIGHT) -> float:
+def _combined(
+    result: GlobalLocalizeResult, ray_weight: float = LOCAL_RAY_WEIGHT
+) -> float:
     return float(result.score) + ray_weight * (2.0 * float(result.ray_score) - 1.0)
 
 
-def lidar_full_map(occ: OccupancyMap, scan: conv.LaserScan2D, truth: conv.Pose2D) -> Attempt:
+def lidar_full_map(
+    occ: OccupancyMap, scan: conv.LaserScan2D, truth: conv.Pose2D
+) -> Attempt:
     result = global_localize_scan(occ, scan, full_map=True)
     err_m, err_deg = _errors(result.pose, truth)
     accepted = (
@@ -129,11 +133,17 @@ def runtime_recovery(
 ) -> Optional[Attempt]:
     """``recover_pose`` as the robot would run it, judged against ground truth."""
 
-    def search(hint: conv.Pose2D, radius_m: float, yaw_window_deg: float) -> Optional[LidarMatch]:
+    def search(
+        hint: conv.Pose2D, radius_m: float, yaw_window_deg: float
+    ) -> Optional[LidarMatch]:
         try:
             result = global_localize_scan(
-                occ, scan, hint=hint, full_map=False,
-                search_radius_m=radius_m, local_yaw_window_deg=yaw_window_deg,
+                occ,
+                scan,
+                hint=hint,
+                full_map=False,
+                search_radius_m=radius_m,
+                local_yaw_window_deg=yaw_window_deg,
             )
         except (RuntimeError, ValueError):
             return None
@@ -143,7 +153,9 @@ def runtime_recovery(
     if recovery.winner is None or recovery.winner.lidar is None:
         return None
     err_m, err_deg = _errors(recovery.winner.lidar.pose, truth)
-    return Attempt(err_m, err_deg, recovery.accepted, float(recovery.winner.lidar.score))
+    return Attempt(
+        err_m, err_deg, recovery.accepted, float(recovery.winner.lidar.score)
+    )
 
 
 def summarize(attempts: Sequence[Optional[Attempt]]) -> Dict[str, float]:
@@ -155,7 +167,8 @@ def summarize(attempts: Sequence[Optional[Attempt]]) -> Dict[str, float]:
         "right": sum(a.right for a in done) / n,
         "accepted_right": sum(a.right and a.accepted for a in done) / n,
         "accepted_wrong": sum((not a.right) and a.accepted for a in done) / n,
-        "refused": sum(not a.accepted for a in done) / n + (len(attempts) - len(done)) / n,
+        "refused": sum(not a.accepted for a in done) / n
+        + (len(attempts) - len(done)) / n,
     }
 
 
@@ -185,7 +198,11 @@ def evaluate_reloc(
     rankings = {
         name: rank_named(
             name[: -len(FIT_SUFFIX)] if name.endswith(FIT_SUFFIX) else name,
-            map_feats, keyframes, query_feats, q_frames, top=top_k,
+            map_feats,
+            keyframes,
+            query_feats,
+            q_frames,
+            top=top_k,
         )
         for name in place_methods
         if name != RUNTIME
@@ -221,15 +238,20 @@ def evaluate_reloc(
                 for h, k in enumerate(ranking.order[n, :top_k]):
                     k = int(k)
                     fit = fit_to_keyframe(
-                        q_tokens, query_points(i),
-                        map_feats.tokens(keyframes[k]), map_points(keyframes[k]), kf_poses[k],
+                        q_tokens,
+                        query_points(i),
+                        map_feats.tokens(keyframes[k]),
+                        map_points(keyframes[k]),
+                        kf_poses[k],
                     )
                     if fit is not None:
                         hints[h] = fit.pose
             runs[f"{name}+lidar"].append(lidar_from_hints(occ, scan, hints, truth))
         if index is not None:
             runs[RUNTIME].append(
-                runtime_recovery(occ, scan, index, query_feats.tokens(i), query_points(i), truth)
+                runtime_recovery(
+                    occ, scan, index, query_feats.tokens(i), query_points(i), truth
+                )
             )
         if (n + 1) % 20 == 0 or n + 1 == len(q_frames):
             log(f"  {query.name}: relocalized {n + 1}/{len(q_frames)}")

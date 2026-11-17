@@ -130,7 +130,11 @@ class _RangeClient:
     def _conn(self) -> http.client.HTTPConnection:
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
+            cls = (
+                http.client.HTTPSConnection
+                if self._https
+                else http.client.HTTPConnection
+            )
             conn = cls(self._host, timeout=120)
             self._local.conn = conn
         return conn
@@ -161,7 +165,9 @@ class _RangeClient:
         raise RuntimeError(f"range fetch failed after {retries} tries: {last}")
 
 
-def extract_member(client: _RangeClient, info: zipfile.ZipInfo, total_size: int) -> bytes:
+def extract_member(
+    client: _RangeClient, info: zipfile.ZipInfo, total_size: int
+) -> bytes:
     """Download and decompress one zip member with a single range request."""
     name_len = len(info.filename.encode("utf-8"))
     want = _LOCAL_HEADER.size + name_len + _HEADER_SLACK + int(info.compress_size)
@@ -342,7 +348,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=list(DEFAULT_SEQUENCES),
         help=f"public-ground-truth sequences: {', '.join(PUBLIC_SEQUENCES)}",
     )
-    ap.add_argument("--cameras", nargs="+", default=["front"], choices=["front", "left", "right"])
+    ap.add_argument(
+        "--cameras", nargs="+", default=["front"], choices=["front", "left", "right"]
+    )
     ap.add_argument("--rate-hz", type=float, default=2.0)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--list", action="store_true", help="print zip contents and exit")

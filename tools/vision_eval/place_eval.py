@@ -80,11 +80,20 @@ def _runtime_vlad(fit_at_end: bool, all_tokens: bool) -> PlaceMethod:
         return state["index"].vlad(tokens_of(feats, i))
 
     if not fit_at_end and not all_tokens:
-        name, note = "shipped", "VLAD, 64 textured tokens, vocabulary fitted on first 8 keyframes"
+        name, note = (
+            "shipped",
+            "VLAD, 64 textured tokens, vocabulary fitted on first 8 keyframes",
+        )
     elif fit_at_end and not all_tokens:
-        name, note = "vlad_refit", "VLAD, 64 textured tokens, vocabulary fitted on all keyframes"
+        name, note = (
+            "vlad_refit",
+            "VLAD, 64 textured tokens, vocabulary fitted on all keyframes",
+        )
     else:
-        name, note = "vlad_refit_all", "VLAD, all 768 tokens, vocabulary fitted on all keyframes"
+        name, note = (
+            "vlad_refit_all",
+            "VLAD, all 768 tokens, vocabulary fitted on all keyframes",
+        )
     return PlaceMethod(name, note, build, describe)
 
 
@@ -107,7 +116,10 @@ def _mean_pool(center: bool) -> PlaceMethod:
 
     if center:
         return PlaceMethod(
-            "mean_centered", "mean of all tokens minus the map-wide mean", build, describe
+            "mean_centered",
+            "mean of all tokens minus the map-wide mean",
+            build,
+            describe,
         )
     return PlaceMethod("mean", "mean of all tokens, nothing fitted", build, describe)
 
@@ -195,12 +207,20 @@ def rank_named(
     if base not in by_name:
         raise ValueError(f"unknown place method {name!r}; have {sorted(by_name)}")
     if base == name:
-        return rank_queries(by_name[base], map_feats, keyframes, query_feats, query_frames, top=top)
+        return rank_queries(
+            by_name[base], map_feats, keyframes, query_feats, query_frames, top=top
+        )
     shortlist = rank_queries(
-        by_name[base], map_feats, keyframes, query_feats, query_frames,
+        by_name[base],
+        map_feats,
+        keyframes,
+        query_feats,
+        query_frames,
         top=max(int(top), PATCH_SHORTLIST),
     )
-    ranked = rerank_by_patches(shortlist, map_feats, keyframes, query_feats, query_frames)
+    ranked = rerank_by_patches(
+        shortlist, map_feats, keyframes, query_feats, query_frames
+    )
     return PlaceRanking(name, ranked.order[:, :top], ranked.scores[:, :top])
 
 
@@ -279,9 +299,17 @@ def evaluate_place(
             "same_heading": recall_at_k(
                 ranking, dist, dyaw, max_dist_m=max_dist_m, max_yaw_deg=max_yaw_deg
             ),
-            "top1_score_right": float(ranking.scores[top1_ok, 0].mean()) if top1_ok.any() else None,
-            "top1_score_wrong": float(ranking.scores[~top1_ok, 0].mean()) if (~top1_ok).any() else None,
-            "top1_margin_right": float(margin[top1_ok].mean()) if top1_ok.any() else None,
-            "top1_margin_wrong": float(margin[~top1_ok].mean()) if (~top1_ok).any() else None,
+            "top1_score_right": float(ranking.scores[top1_ok, 0].mean())
+            if top1_ok.any()
+            else None,
+            "top1_score_wrong": float(ranking.scores[~top1_ok, 0].mean())
+            if (~top1_ok).any()
+            else None,
+            "top1_margin_right": float(margin[top1_ok].mean())
+            if top1_ok.any()
+            else None,
+            "top1_margin_wrong": float(margin[~top1_ok].mean())
+            if (~top1_ok).any()
+            else None,
         }
     return out

@@ -38,7 +38,9 @@ def main() -> int:
         default=ROOT / "src" / "semantic" / "models" / DEFAULT_NAME,
     )
     ap.add_argument("--url", type=str, default=DEFAULT_URL)
-    ap.add_argument("--export", action="store_true", help="skip download; run export_dinov2_onnx.py")
+    ap.add_argument(
+        "--export", action="store_true", help="skip download; run export_dinov2_onnx.py"
+    )
     ap.add_argument("--size", type=int, default=448)
     args = ap.parse_args()
 

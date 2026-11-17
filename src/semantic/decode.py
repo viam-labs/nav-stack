@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import struct
 from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
@@ -114,11 +113,7 @@ def decode_depth_image(
         except Exception:  # noqa: BLE001
             pass
 
-    if (
-        _VIAM_DEPTH_MIME in mime
-        or "viam.dep" in mime
-        or raw[:8] == _VIAM_DEPTH_MAGIC
-    ):
+    if _VIAM_DEPTH_MIME in mime or "viam.dep" in mime or raw[:8] == _VIAM_DEPTH_MAGIC:
         return decode_viam_raw_depth(raw, depth_scale=depth_scale)
 
     if "float" in mime or mime.endswith("f32"):
@@ -162,7 +157,11 @@ def _image_fields(im: Any) -> Tuple[str, str, Optional[bytes], Any]:
         raw_obj = nested
         data_attr = getattr(nested, "data", None)
         mime = mime or str(getattr(nested, "mime_type", "") or "").lower()
-    data = _as_bytes(data_attr) if isinstance(data_attr, (bytes, bytearray, memoryview)) else None
+    data = (
+        _as_bytes(data_attr)
+        if isinstance(data_attr, (bytes, bytearray, memoryview))
+        else None
+    )
     return name, mime, data, raw_obj
 
 

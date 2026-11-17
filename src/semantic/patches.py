@@ -8,7 +8,10 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..geom.conversions import camera_optical_to_sensor_frame, transform_lidar_mount_to_base_link
+from ..geom.conversions import (
+    camera_optical_to_sensor_frame,
+    transform_lidar_mount_to_base_link,
+)
 from .types import CameraIntrinsics, PatchToken, VisionFrame
 
 # D435-class range noise: a * r^2 + b (meters). Conservative vs datasheet.
@@ -19,14 +22,12 @@ _PIXEL_SIGMA = 1.0  # px lateral uncertainty before sub-patch refine
 
 @dataclass(frozen=True)
 class PatchObservation:
-    """A measured patch ready for landmark association."""
+    """A patch with a usable depth: its point and surface normal in base_link."""
 
     token: PatchToken
     point_base: np.ndarray  # (3,)
     normal_base: np.ndarray  # (3,)
     sigma_m: float
-    # Approx half-size (m) of the source YOLO box in the map plane; None for dense.
-    extent_m: Optional[float] = None
 
 
 def depth_sigma_m(range_m: float) -> float:
@@ -169,47 +170,6 @@ def _plane_normal_optical(
     return (normal / n).astype(float)
 
 
-def backproject_pixels(
-    frame: VisionFrame,
-    us: np.ndarray,
-    vs: np.ndarray,
-    depths_m: np.ndarray,
-) -> np.ndarray:
-    """Pixels with a depth each → ``(N, 3)`` points in base_link."""
-    K = frame.intrinsics
-    d = np.asarray(depths_m, dtype=float).reshape(-1)
-    x = (np.asarray(us, dtype=float).reshape(-1) - float(K.cx)) / float(K.fx) * d
-    y = (np.asarray(vs, dtype=float).reshape(-1) - float(K.cy)) / float(K.fy) * d
-    sensor = camera_optical_to_sensor_frame(np.column_stack([x, y, d]))
-    return transform_lidar_mount_to_base_link(
-        sensor,
-        x=frame.mount_x,
-        y=frame.mount_y,
-        z=frame.mount_z,
-        theta=frame.mount_theta,
-        pitch=frame.mount_pitch,
-        roll=frame.mount_roll,
-    )
-
-
-def optical_normal_to_base(frame: VisionFrame, normal_optical: np.ndarray) -> np.ndarray:
-    """Rotate an optical-frame unit normal into base_link (no translation)."""
-    n_sensor = camera_optical_to_sensor_frame(
-        np.asarray(normal_optical, dtype=float).reshape(1, 3)
-    )
-    n_base = transform_lidar_mount_to_base_link(
-        n_sensor,
-        x=0.0,
-        y=0.0,
-        z=0.0,
-        theta=frame.mount_theta,
-        pitch=frame.mount_pitch,
-        roll=frame.mount_roll,
-    )[0]
-    nn = float(np.linalg.norm(n_base))
-    return n_base / nn if nn > 1e-9 else n_base
-
-
 def backproject_patches(
     frame: VisionFrame,
     tokens: Sequence[PatchToken],
@@ -242,7 +202,11 @@ def backproject_patches(
         tok.sigma_m = float("nan")
         if total <= 0 or n_valid / float(total) < float(min_valid_frac):
             continue
-        if not math.isfinite(med) or med < float(min_range_m) or med > float(max_range_m):
+        if (
+            not math.isfinite(med)
+            or med < float(min_range_m)
+            or med > float(max_range_m)
+        ):
             continue
         if math.isfinite(spread) and spread > float(max_spread_frac) * med:
             continue
@@ -355,7 +319,7 @@ def select_survey_tokens(
     distinctiveness_bonus: float = 10.0,
     max_ratio: float = 0.92,
 ) -> List[PatchToken]:
-    """Rank patches for survey: paintings/edges first, flat walls last.
+    """Rank patches for the place index: paintings/edges first, flat walls last.
 
     Hard distinctiveness filtering alone drops painting *interiors* (adjacent
     patches on the same artwork look alike). Texture is the primary signal;
@@ -375,7 +339,7 @@ def select_survey_tokens(
     order = sorted(range(len(toks)), key=_score, reverse=True)
     floor = float(min_texture)
     # Prefer everything above the texture floor; if the scene is bland, still
-    # keep the top-scoring patches so survey is not empty.
+    # keep the top-scoring patches so the frame is not left without any.
     above = [toks[i] for i in order if float(toks[i].texture) >= floor]
     ranked = above if above else [toks[i] for i in order]
     limit = int(max_keep)
@@ -403,34 +367,6 @@ def filter_textured_tokens(
     if limit <= 0 or len(scored) <= limit:
         return scored
     return scored[:limit]
-
-
-def subsample_observations(
-    observations: Sequence[PatchObservation],
-    max_count: int,
-) -> List[PatchObservation]:
-    """Cap associations per frame, preferring textured + low-uncertainty patches."""
-    obs = list(observations)
-    limit = int(max_count)
-    if limit <= 0 or len(obs) <= limit:
-        return obs
-    # Texture first (paintings over walls), then tighter depth as a tie-break.
-    # Stride through the ranked list for spatial coverage.
-    ranked = sorted(
-        obs,
-        key=lambda o: (-float(getattr(o.token, "texture", 0.0)), float(o.sigma_m)),
-    )
-    step = max(1, int(math.ceil(len(ranked) / float(limit))))
-    picked = ranked[::step][:limit]
-    if len(picked) < limit:
-        seen = {id(p) for p in picked}
-        for o in ranked:
-            if id(o) in seen:
-                continue
-            picked.append(o)
-            if len(picked) >= limit:
-                break
-    return picked
 
 
 def distinctiveness_mask(

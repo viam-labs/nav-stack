@@ -75,7 +75,7 @@ def test_backproject_rejects_holes():
 
 
 def test_backproject_rejects_window_edge_depth():
-    """Mixed near-frame + far/hole depth must not become a landmark."""
+    """Mixed near-frame + far/hole depth must not be given a 3D point."""
     frame = _wall_frame(depth_m=1.5)
     h, w = frame.depth_m.shape
     # Left: room glass/wall at 1.5 m; right: invalid (outdoor through glass).
@@ -162,30 +162,6 @@ def test_select_survey_keeps_painting_interior_despite_similar_neighbors():
     assert sum(1 for t in kept if t in arts) >= 2
 
 
-def test_subsample_prefers_higher_texture():
-    from src.semantic.patches import PatchObservation, subsample_observations
-
-    wall = PatchObservation(
-        token=PatchToken(
-            row=0, col=0, u=0.0, v=0.0, descriptor=np.ones(2), texture=3.0
-        ),
-        point_base=np.array([1.0, 0.0, 1.0]),
-        normal_base=np.array([-1.0, 0.0, 0.0]),
-        sigma_m=0.01,  # closer / lower uncertainty than the painting
-    )
-    art = PatchObservation(
-        token=PatchToken(
-            row=0, col=1, u=1.0, v=0.0, descriptor=np.ones(2), texture=40.0
-        ),
-        point_base=np.array([1.5, 0.0, 1.0]),
-        normal_base=np.array([-1.0, 0.0, 0.0]),
-        sigma_m=0.05,
-    )
-    out = subsample_observations([wall, art], 1)
-    assert len(out) == 1
-    assert out[0] is art
-
-
 def test_synthetic_worker_runs():
     frame = _wall_frame()
     worker = VisionWorker(WorkerConfig(synthetic=True, input_short_side=112, patch=14))
@@ -213,22 +189,6 @@ def test_backproject_height_gate():
     # Treat the wall hit as "floor" by raising z_min above mount height.
     dropped = backproject_patches(frame, [tok], z_min_m=0.6, z_max_m=2.0)
     assert dropped == []
-
-
-def test_subsample_observations_caps_count():
-    from src.semantic.patches import PatchObservation, subsample_observations
-
-    toks = [
-        PatchObservation(
-            token=PatchToken(row=i, col=0, u=float(i), v=0.0, descriptor=np.ones(2)),
-            point_base=np.array([1.0, 0.0, 1.0]),
-            normal_base=np.array([-1.0, 0.0, 0.0]),
-            sigma_m=0.01 * (i + 1),
-        )
-        for i in range(20)
-    ]
-    out = subsample_observations(toks, 5)
-    assert len(out) == 5
 
 
 def test_yolo_nms_keeps_highest_conf():

@@ -96,14 +96,20 @@ def test_keyframes_follow_distance_or_turning():
 
 
 def test_recall_counts_a_close_keyframe_in_the_top_k_and_reports_the_ceiling():
-    keyframes = [conv.Pose2D(0.0, 0.0, 0.0), conv.Pose2D(5.0, 0.0, 0.0), conv.Pose2D(0.5, 0.0, math.pi)]
+    keyframes = [
+        conv.Pose2D(0.0, 0.0, 0.0),
+        conv.Pose2D(5.0, 0.0, 0.0),
+        conv.Pose2D(0.5, 0.0, math.pi),
+    ]
     queries = [conv.Pose2D(0.2, 0.0, 0.0), conv.Pose2D(20.0, 0.0, 0.0)]
     dist, dyaw = pose_errors(keyframes, queries)
     # Query 0 ranks the far keyframe first, then the reversed one, then the right one.
     ranking = PlaceRanking("t", np.array([[1, 2, 0], [0, 1, 2]]), np.zeros((2, 3)))
     any_heading = recall_at_k(ranking, dist, dyaw, ks=(1, 2, 3), max_dist_m=1.5)
     assert any_heading == {"possible": 0.5, "top1": 0.0, "top2": 0.5, "top3": 0.5}
-    same = recall_at_k(ranking, dist, dyaw, ks=(1, 2, 3), max_dist_m=1.5, max_yaw_deg=45.0)
+    same = recall_at_k(
+        ranking, dist, dyaw, ks=(1, 2, 3), max_dist_m=1.5, max_yaw_deg=45.0
+    )
     assert same == {"possible": 0.5, "top1": 0.0, "top2": 0.0, "top3": 0.5}
 
 
@@ -139,23 +145,36 @@ from tools.vision_eval.replay import (  # noqa: E402
 
 def test_alignment_removes_the_frame_difference_and_leaves_the_real_error():
     rng = np.random.default_rng(0)
-    truth = np.column_stack([np.cumsum(rng.normal(0.1, 0.05, 80)), np.cumsum(rng.normal(0.0, 0.08, 80))])
+    truth = np.column_stack(
+        [np.cumsum(rng.normal(0.1, 0.05, 80)), np.cumsum(rng.normal(0.0, 0.08, 80))]
+    )
     c, s = math.cos(0.7), math.sin(0.7)
-    est = (truth - (3.0, -1.0)) @ np.array([[c, -s], [s, c]])  # same path, another frame
+    est = (truth - (3.0, -1.0)) @ np.array(
+        [[c, -s], [s, c]]
+    )  # same path, another frame
     rot, shift, yaw = align_se2(est, truth)
     assert np.allclose(est @ rot.T + shift, truth, atol=1e-9)
     assert abs(yaw - 0.7) < 1e-9
 
     stamps = np.arange(80.0)
-    same = Trajectory(stamps, np.column_stack([est, np.zeros(80) - 0.7]), np.column_stack([truth, np.zeros(80)]))
-    assert same.summary()["ate_rmse_m"] < 1e-9 and same.summary()["heading_rmse_deg"] < 1e-6
+    same = Trajectory(
+        stamps,
+        np.column_stack([est, np.zeros(80) - 0.7]),
+        np.column_stack([truth, np.zeros(80)]),
+    )
+    assert (
+        same.summary()["ate_rmse_m"] < 1e-9
+        and same.summary()["heading_rmse_deg"] < 1e-6
+    )
 
 
 def test_drift_is_measured_from_a_known_start_not_fitted_away():
     stamps = np.arange(0.0, 100.0)
     truth = np.column_stack([stamps * 0.1, np.zeros(100), np.zeros(100)])
     est = truth.copy()
-    est[:, 1] = np.where(stamps > 20.0, (stamps - 20.0) * 0.01, 0.0)  # slides sideways after 20 s
+    est[:, 1] = np.where(
+        stamps > 20.0, (stamps - 20.0) * 0.01, 0.0
+    )  # slides sideways after 20 s
     path = Trajectory(stamps, est, truth)
     drift, _yaw = path.errors(anchor_s=20.0)
     assert drift[:21].max() < 1e-9 and drift[-1] == pytest.approx(0.79, abs=1e-6)
@@ -205,13 +224,21 @@ class _RoomRun:
         with np.errstate(divide="ignore", invalid="ignore"):
             tx = np.where(dx > 0, (3.0 - pose.x) / dx, (-3.0 - pose.x) / dx)
             ty = np.where(dy > 0, (2.0 - pose.y) / dy, (-2.0 - pose.y) / dy)
-        ranges = np.minimum(np.where(np.isfinite(tx), tx, np.inf), np.where(np.isfinite(ty), ty, np.inf))
+        ranges = np.minimum(
+            np.where(np.isfinite(tx), tx, np.inf), np.where(np.isfinite(ty), ty, np.inf)
+        )
         return conv.LaserScan2D(ranges, -math.pi, 2 * math.pi / 360, 0.05, 25.0), taken
 
     def odometry(self):
         x = (self._t - 100.0) * 0.3 * self._odom_scale
         poses = np.column_stack([x, np.zeros_like(x), np.zeros_like(x)])
-        twists = np.column_stack([np.full_like(x, 0.3 * self._odom_scale), np.zeros_like(x), np.zeros_like(x)])
+        twists = np.column_stack(
+            [
+                np.full_like(x, 0.3 * self._odom_scale),
+                np.zeros_like(x),
+                np.zeros_like(x),
+            ]
+        )
         return self._t, poses, twists
 
 

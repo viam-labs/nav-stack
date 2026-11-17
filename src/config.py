@@ -1057,15 +1057,16 @@ class SlamConfig:
     robot_radius: Optional[float] = None
     # Builtin simulation: raycast floorplan + in-process SimSensors (see ``sim``).
     sim: SimConfig = field(default_factory=SimConfig)
-    # ---- Vision / embedding landmarks (RGB-D side-channel) ----------------
-    # Off by default. When enabled, each name in ``vision_cameras`` must match
-    # an existing ``lidars[]`` entry with ``obstacles_only: true`` and
-    # ``cloud_frame: camera_optical`` (the RealSense depth cams already used
-    # for avoidance). Mount comes from that entry.
+    # ---- Vision (RGB-D side-channel) --------------------------------------
+    # Camera keyframes for lost-pose recovery, and a person mask while
+    # mapping. Off by default. When enabled, each name in ``vision_cameras``
+    # must match an existing ``lidars[]`` entry with ``obstacles_only: true``
+    # and ``cloud_frame: camera_optical`` (the RealSense depth cams already
+    # used for avoidance). Mount comes from that entry.
     vision_enabled: bool = False
     vision_cameras: List[str] = field(default_factory=list)
-    # One vision camera at 2 Hz. Surveying two RealSense cameras faster than
-    # this starved nav; round-robin still runs one camera per tick.
+    # One vision camera at 2 Hz. Two RealSense cameras faster than this
+    # starved nav; round-robin still runs one camera per tick.
     vision_rate_hz: float = 2.0
     vision_dinov2_onnx: str = ""
     vision_yolo_onnx: str = ""
@@ -1073,17 +1074,9 @@ class SlamConfig:
     vision_synthetic: bool = False  # bench/tests without ONNX weights
     # Square letterbox side for DINOv2 ONNX (must match the exported model).
     vision_input_size: int = 448
-    # Pose correction may use a confirmed landmark this far away. Creating a
-    # landmark still stops at 4.5 m. A live box out to this range can match
-    # one that already exists, and is not stored.
-    landmark_fix_max_range_m: float = 6.0
-    landmark_fix_max_jump_m: float = 1.5
-    # Pairs must agree within this of one pose. 8 cm rejected office fits
-    # whose landmarks had confirmed with up to 12 cm of scatter.
-    landmark_fix_residual_m: float = 0.15
-    # Kill switch: never apply vision pose corrections (still builds landmarks /
-    # place index). Prefer leaving this false — mapping vs localizing is gated
-    # in code so you do not need to retune when switching modes.
+    # Kill switch: never move the pose from vision (keyframes are still
+    # stored). Prefer leaving this false — mapping vs localizing is gated in
+    # code so you do not need to retune when switching modes.
     vision_survey_only: bool = False
     # Lost-pose recovery (src/semantic/relocalize.py): camera keyframes stored
     # while mapping propose places, and the lidar scan search decides. Runs
@@ -1093,19 +1086,11 @@ class SlamConfig:
     # an unchanged scene the lidar alone placed 99% and this path 74%.
     vision_recovery: bool = True
     vision_recovery_cooldown_s: float = 2.0
-    # Landmark pose writeback via apply_map_pose_correction. Off by default:
-    # while localizing that call sets the pose with no scan check, and a pose
-    # fitted from the camera alone was wrong about half the time on LILocBench
-    # with no sign of it in the fit. ``vision_recovery`` replaces it.
-    vision_pose_writeback: bool = False
-    # 2D rigid fit needs 2 points; indoor FOV often only sees 2 fixtures at once.
-    # SE(2) needs ≥3 pairs; 2-point fits invent large yaw from noise.
-    vision_pose_writeback_min_inliers: int = 3
-    vision_pose_writeback_cooldown_s: float = 2.0
     # VLAD place index (superseded by ``vision_recovery`` keyframes; its top
     # guess was the true place for 26-60% of LILocBench frames against 66-71%
     # for the keyframe patch match). Off by default.
     vision_place_enabled: bool = False
+    # A keyframe (place index and recovery alike) every this much travel or turn.
     vision_place_keyframe_min_gap_m: float = 0.75
     vision_place_keyframe_min_gap_deg: float = 25.0
     vision_place_vocab_size: int = 32
@@ -1122,87 +1107,21 @@ class SlamConfig:
     # (current pose is untrusted). Large jumps still need a stronger score.
     vision_place_max_jump_m: float = 0.75
     vision_place_max_jump_deg: float = 25.0
-    # Top hit must beat 2nd by this much or the raw place teleport is refused
-    # (corridor twin). A tied place can still move the pose when one of those
-    # keyframes is confirmed by a 3-landmark fit and the others are not.
+    # Top hit must beat 2nd by this much or the place teleport is refused
+    # (corridor twin).
     vision_place_min_score_margin: float = 0.08
     # Jumps above this require an even stronger score (see supervisor).
     vision_place_large_jump_m: float = 0.40
     vision_place_large_jump_min_score: float = 0.75
     vision_place_cooldown_s: float = 3.0
-    # Height band in base_link (reject floor/ceiling spam). Floor hits from a
-    # chest-height RealSense sit near z≈0; keep wall/artwork band only.
-    vision_z_min_m: float = 0.25
-    vision_z_max_m: float = 2.0
-    # Spatial merge: larger radius/cell collapses dense patch grids into fewer
-    # landmarks (Phase 0.5 density fix).
-    vision_associate_radius_m: float = 0.25
-    vision_cell_m: float = 0.30
-    # Cap observations ingested per camera frame (after height gate).
-    vision_max_patches_per_frame: int = 64
     # One camera per tick (round-robin) when multiple vision_cameras are set.
     vision_round_robin: bool = True
-    # Detector-anchored landmarks (YOLO-World / COCO): pool DINO inside boxes.
-    # Empty detector_classes → COCO-80 names (standard YOLOv8). For YOLO-World
-    # ONNX, set detector_classes to the same prompt list used at export.
-    vision_prefer_detections: bool = True
-    # When YOLO boxes fire, do not also mint dense patch landmarks (they
-    # duplicate detector IDs and dominate map growth). Dense only when quiet.
-    vision_dense_fallback_patches: int = 0
-    # YOLO-World open-vocab scores run lower than COCO YOLOv8; keep soft.
+    # Detector for the person mask. Empty detector_classes → the class list
+    # next to the ONNX file, else COCO-80 names (standard YOLOv8). For a
+    # custom YOLO-World ONNX, set detector_classes to the prompt list used at
+    # export. Open-vocab scores run lower than COCO YOLOv8; keep the floor soft.
     vision_yolo_conf: float = 0.10
     vision_detector_classes: List[str] = field(default_factory=list)
-    vision_landmark_labels: List[str] = field(
-        default_factory=lambda: [
-            # Fixtures / furniture only — omit movables (book, chair, laptop, …).
-            "painting",
-            "poster",
-            "picture",
-            "picture frame",
-            "framed picture",
-            "artwork",
-            "tv",
-            "television",
-            "monitor",
-            "door",
-            "fire extinguisher",
-            "clock",
-            "whiteboard",
-            "bulletin board",
-            "poster board",
-            "sign",
-            "exit sign",
-            "potted plant",
-            "plant",
-            "bookshelf",
-            "cabinet",
-            "filing cabinet",
-            "desk",
-            "office desk",
-            "couch",
-            "bed",
-            "dining table",
-            "counter",
-            "kitchen counter",
-            "toilet",
-            "sink",
-            "refrigerator",
-            "microwave",
-            "oven",
-            "printer",
-            "copier",
-            "water cooler",
-            "drinking fountain",
-            "stairs",
-            "staircase",
-            "elevator",
-            "elevator door",
-            "pillar",
-            "column",
-            "AED",
-            "defibrillator",
-        ]
-    )
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "SlamConfig":
@@ -1224,9 +1143,13 @@ class SlamConfig:
         vision_enabled = bool(d.get("vision_enabled", False))
         vision_cameras_raw = d.get("vision_cameras") or []
         if isinstance(vision_cameras_raw, str):
-            vision_cameras = [vision_cameras_raw.strip()] if vision_cameras_raw.strip() else []
+            vision_cameras = (
+                [vision_cameras_raw.strip()] if vision_cameras_raw.strip() else []
+            )
         else:
-            vision_cameras = [str(name).strip() for name in vision_cameras_raw if str(name).strip()]
+            vision_cameras = [
+                str(name).strip() for name in vision_cameras_raw if str(name).strip()
+            ]
         if vision_enabled and vision_cameras:
             by_name = {lidar.name: lidar for lidar in lidars}
             for name in vision_cameras:
@@ -1238,7 +1161,7 @@ class SlamConfig:
                 if not lidar.obstacles_only:
                     raise ValueError(
                         f"vision camera {name!r} must have obstacles_only=true "
-                        "(depth cams used for embedding landmarks, not SLAM paint)"
+                        "(a depth camera, not a lidar SLAM paints from)"
                     )
                 if lidar.cloud_frame != CLOUD_FRAME_CAMERA_OPTICAL:
                     raise ValueError(
@@ -1246,7 +1169,9 @@ class SlamConfig:
                         f"cloud_frame={CLOUD_FRAME_CAMERA_OPTICAL!r}"
                     )
         elif vision_enabled and not vision_cameras:
-            raise ValueError("vision_enabled requires at least one vision_cameras entry")
+            raise ValueError(
+                "vision_enabled requires at least one vision_cameras entry"
+            )
         footprint = resolve_footprint(d)
         if bool(d.get("crop_inside_footprint", True)):
             stamp_lidar_footprint(lidars, footprint)
@@ -1881,50 +1806,3 @@ class NavCameraConfig:
         # Depend on the navigation service so Viam constructs it (and registers
         # its viz store) before this camera.
         return [self.navigation]
-
-
-@dataclass
-class VisionCameraConfig:
-    """Config for ``viam-labs:nav-stack:vision-camera``.
-
-    Overlays embedding landmarks from the named SLAM service onto a live RGB
-    frame from ``source`` (typically the same RealSense used in
-    ``vision_cameras``).
-    """
-
-    slam: str
-    source: str
-    show_confirmed: bool = True
-    show_candidates: bool = True
-    # Hide single-view candidates (often glass/through-window wrong depth).
-    stable_candidates_only: bool = True
-    show_moved: bool = False
-    # Latest YOLO / YOLO-World boxes from the vision supervisor (cyan).
-    show_detections: bool = True
-    show_labels: bool = True
-    max_landmarks: int = 80
-    box_m: float = 0.12
-
-    @classmethod
-    def from_dict(cls, d: Mapping) -> "VisionCameraConfig":
-        slam = str(d.get("slam") or d.get("slam_service") or "").strip()
-        source = str(d.get("source") or d.get("camera") or "").strip()
-        if not slam:
-            raise ValueError("vision-camera requires attributes.slam")
-        if not source:
-            raise ValueError("vision-camera requires attributes.source")
-        return cls(
-            slam=slam,
-            source=source,
-            show_confirmed=bool(d.get("show_confirmed", True)),
-            show_candidates=bool(d.get("show_candidates", True)),
-            stable_candidates_only=bool(d.get("stable_candidates_only", True)),
-            show_moved=bool(d.get("show_moved", False)),
-            show_detections=bool(d.get("show_detections", True)),
-            show_labels=bool(d.get("show_labels", True)),
-            max_landmarks=max(1, int(d.get("max_landmarks", 80))),
-            box_m=float(d.get("box_m", 0.12)),
-        )
-
-    def required_dependencies(self) -> List[str]:
-        return [self.slam, self.source]

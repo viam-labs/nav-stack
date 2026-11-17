@@ -1,18 +1,11 @@
-"""Shared dataclasses for the vision / embedding-landmark side-channel."""
+"""Shared dataclasses for the vision side-channel."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import List, Optional, Tuple
 
 import numpy as np
-
-
-class LandmarkStatus(str, Enum):
-    CANDIDATE = "candidate"
-    CONFIRMED = "confirmed"
-    MOVED = "moved"
 
 
 @dataclass(frozen=True)
@@ -77,7 +70,7 @@ class PatchToken:
     u: float
     v: float
     descriptor: np.ndarray  # (D,) float32
-    # Local luminance std (0–255) used to prefer paintings/edges over flat walls.
+    # Local luminance std (0–255): textured patches are kept for the place index.
     texture: float = 0.0
     # Filled by backproject_patches when depth is valid.
     point_base: Optional[np.ndarray] = None  # (3,)
@@ -93,10 +86,12 @@ class VisionResult:
     camera_name: str
     stamp: float
     captured_at: float
+    # The most textured patches, for the place index.
     patches: List[PatchToken] = field(default_factory=list)
-    # Every in-image patch, before the survey cull. Lost-pose recovery matches
-    # the whole picture against stored keyframes.
+    # Every in-image patch. Lost-pose recovery matches the whole picture
+    # against stored keyframes.
     grid_patches: List[PatchToken] = field(default_factory=list)
+    # Boxes of the mover classes (person, ...), for the scan mask.
     detections: List[Detection] = field(default_factory=list)
     # Whole-image place descriptor (VLAD / mean-pool); may be empty until fit.
     place_descriptor: Optional[np.ndarray] = None

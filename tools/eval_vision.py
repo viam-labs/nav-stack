@@ -14,8 +14,7 @@ stack's whole-map lidar search with a lidar search seeded by place guesses.
 ``mapping`` feeds a run's odometry and scans through the SLAM engine in
 mapping mode, on a clock that follows the recording, and compares the pose it
 publishes and the keyframes it ends with against ground truth: with lidar loop
-closure off and on, and with the vision supervisor alongside, landmark loop
-closure off and on.
+closure off and on, and with the vision supervisor (person mask) alongside.
 
 Results are printed and written as JSON next to the dataset cache.
 """
@@ -58,7 +57,9 @@ def _print_place(name: str, result: dict) -> None:
         "(and, in the right-hand block, facing within 45°)"
     )
     print(f"  {'method':<18} {'any heading':<26} {'same heading':<26}")
-    print(f"  {'':<18} {'top1  top3  top5  ceiling':<26} {'top1  top3  top5  ceiling':<26}")
+    print(
+        f"  {'':<18} {'top1  top3  top5  ceiling':<26} {'top1  top3  top5  ceiling':<26}"
+    )
     for method, row in result.items():
         a, s = row["any_heading"], row["same_heading"]
         print(
@@ -70,8 +71,12 @@ def _print_place(name: str, result: dict) -> None:
 
 def _print_reloc(name: str, result: dict) -> None:
     first = next(iter(result.values()))
-    print(f"\n{name}: {first['queries']} kidnapped frames (right = within 0.5 m and 15°)")
-    print(f"  {'method':<24} {'right':>6} {'accepted+right':>15} {'accepted+wrong':>15} {'refused':>8}")
+    print(
+        f"\n{name}: {first['queries']} kidnapped frames (right = within 0.5 m and 15°)"
+    )
+    print(
+        f"  {'method':<24} {'right':>6} {'accepted+right':>15} {'accepted+wrong':>15} {'refused':>8}"
+    )
     for method, row in result.items():
         print(
             f"  {method:<24} {_pct(row['right']):>6} {_pct(row['accepted_right']):>15} "
@@ -83,8 +88,8 @@ MAPPING_VARIANTS = {
     "odometry": "wheel odometry alone",
     "lidar_no_loops": "SLAM, lidar loop closure off",
     "lidar": "SLAM as shipped without a camera",
-    "vision_no_landmark_loops": "SLAM + vision, landmark loop closure off",
-    "vision": "SLAM + vision as shipped",
+    "vision": "SLAM + vision (person mask), result applied at once",
+    "vision_late": "SLAM + vision, result 0.3 s after the frame",
 }
 
 
@@ -98,10 +103,10 @@ def _run_mapping(seq, feats, cache, variants: Sequence[str]) -> dict:
         if name == "lidar_no_loops":
             kwargs["config"] = {"builtin_loop_closure": False}
         if name.startswith("vision"):
-            kwargs.update(
-                feats=feats, cache_dir=cache, vision=True,
-                landmark_loops=name == "vision",
-            )
+            kwargs.update(feats=feats, cache_dir=cache, vision=True)
+        if name == "vision_late":
+            # A camera result this late misses the 0.2 s mask window.
+            kwargs["vision_latency_s"] = 0.3
         out[name] = replay_mapping(seq, log=lambda *_: None, **kwargs).summary()
         print(f"  {seq.name}: {name} done in {out[name]['wall_s']:.0f} s", flush=True)
     return out
@@ -113,17 +118,20 @@ def _print_mapping(name: str, result: dict) -> None:
     print(f"\n{name}: mapped from scratch{length}. Errors against ground truth.")
     print(
         f"  {'variant':<28} {'live pose':<26} {'final keyframes':<18} "
-        f"{'lidar loops':>11} {'landmark loops':>15}"
+        f"{'lidar loops':>11} {'frames masked':>14}"
     )
     print(f"  {'':<28} {'rmse    max   heading':<26} {'rmse    max':<18}")
     for variant, row in result.items():
         live, final = row["live"], row.get("final_map")
-        final_txt = f"{final['ate_rmse_m']:.2f} m  {final['ate_max_m']:.2f} m" if final else "-"
+        final_txt = (
+            f"{final['ate_rmse_m']:.2f} m  {final['ate_max_m']:.2f} m" if final else "-"
+        )
+        masked = (row.get("vision_trace") or {}).get("frames_masked_in_time", "-")
         print(
             f"  {variant:<28} "
             f"{live['ate_rmse_m']:.2f} m  {live['ate_max_m']:.2f} m  {live['heading_rmse_deg']:4.1f}°    "
             f"{final_txt:<18} "
-            f"{row.get('loop_closures', '-')!s:>11} {row.get('landmark_loops_applied', '-')!s:>15}"
+            f"{row.get('loop_closures', '-')!s:>11} {masked!s:>14}"
         )
 
 
@@ -134,7 +142,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--mapping", default="mapping")
     ap.add_argument("--queries", nargs="+", default=list(DEFAULT_QUERIES))
     ap.add_argument("--camera", default="front")
-    ap.add_argument("--stride", type=int, default=None, help="use every Nth query frame")
+    ap.add_argument(
+        "--stride", type=int, default=None, help="use every Nth query frame"
+    )
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument(
         "--place-methods",
@@ -145,14 +155,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "to re-rank by matched patches, +fit to refine each guess by camera)",
     )
     ap.add_argument(
-        "--runs", nargs="+", default=["mapping"], help="mapping only: runs to map from scratch"
+        "--runs",
+        nargs="+",
+        default=["mapping"],
+        help="mapping only: runs to map from scratch",
     )
     ap.add_argument(
         "--variants",
         nargs="+",
         default=list(MAPPING_VARIANTS),
         choices=list(MAPPING_VARIANTS),
-        help="mapping only: " + "; ".join(f"{k} = {v}" for k, v in MAPPING_VARIANTS.items()),
+        help="mapping only: "
+        + "; ".join(f"{k} = {v}" for k, v in MAPPING_VARIANTS.items()),
     )
     args = ap.parse_args(argv)
 
@@ -185,8 +199,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _print_place(name, result)
         else:
             result = evaluate_reloc(
-                occ, mapping, map_feats, query, feats, list(args.place_methods),
-                query_stride=args.stride or 4, top_k=args.top_k,
+                occ,
+                mapping,
+                map_feats,
+                query,
+                feats,
+                list(args.place_methods),
+                query_stride=args.stride or 4,
+                top_k=args.top_k,
             )
             _print_reloc(name, result)
         report[name] = result

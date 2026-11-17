@@ -11,7 +11,13 @@ import pytest
 from src.config import SlamConfig
 from src.geom.conversions import Pose2D
 from src.semantic.persist import load_place_index, save_place_index
-from src.semantic.place import PlaceIndex, descriptors_from_patches, fit_pca, fit_vocabulary, l2_normalize
+from src.semantic.place import (
+    PlaceIndex,
+    descriptors_from_patches,
+    fit_pca,
+    fit_vocabulary,
+    l2_normalize,
+)
 from src.semantic.supervisor import VisionSupervisor
 from src.semantic.types import CameraIntrinsics, PatchToken, VisionFrame
 
@@ -146,8 +152,125 @@ def test_supervisor_builds_place_keyframes(tmp_path: Path):
     assert st["enabled"] is True
     assert st["keyframes"] >= 4
     assert st["last_query"] is not None
-    path = vision.save_to_map_dir(tmp_path)
-    # landmarks may be empty with synthetic+height gates; place index should save
+    vision.save_to_map_dir(tmp_path)
     loaded = load_place_index(tmp_path)
     assert loaded is not None
     assert len(loaded.keyframe_ids) >= 4
+
+
+def test_place_index_query_top_k():
+    rng = np.random.default_rng(0)
+    descs = l2_normalize(rng.standard_normal((200, 32)).astype(np.float32))
+    comps, mean = fit_pca(descs, out_dim=16)
+    vocab = fit_vocabulary(descs @ comps.T, n_clusters=8, seed=0)
+    index = PlaceIndex(pca_components=comps, pca_mean=mean, vocabulary=vocab)
+    # Two keyframes with distinct descriptor sets.
+    a = descs[:50]
+    b = descs[50:100]
+    index.add_keyframe(0, Pose2D(0.0, 0.0, 0.0), a)
+    index.add_keyframe(1, Pose2D(5.0, 0.0, 0.0), b)
+    hits = index.query(a[:20], top_k=2)
+    assert hits
+    assert hits[0][0] == 0
+
+
+# --- Place retrieval: the top keyframe's pose, applied only while lost ---------
+
+
+def _retrieval_cfg(**extra) -> SlamConfig:
+    d = {
+        "base": "b",
+        "lidars": _base_lidars(),
+        "vision_enabled": True,
+        "vision_cameras": ["depth-cam"],
+        "vision_synthetic": True,
+        "vision_survey_only": True,
+    }
+    d.update(extra)
+    return SlamConfig.from_dict(d)
+
+
+def test_place_retrieval_skipped_while_tracking():
+    cfg = _retrieval_cfg(
+        mode="localizing",
+        vision_survey_only=False,
+        vision_place_enabled=True,
+        vision_place_retrieval=True,
+    )
+    pose = Pose2D(0.0, 0.0, 0.0)
+    called = []
+
+    def apply(p, *, score=None, force=False):
+        called.append(p)
+        return {"applied": True, "status": "pose_only"}
+
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: pose,
+        get_pose_at=lambda _t: pose,
+        get_anchor=lambda: (0, pose, {0: pose}),
+        apply_pose_correction=apply,
+        is_localization_lost=lambda: False,
+    )
+    descs = l2_normalize(np.eye(8, dtype=np.float32))
+    vision._place.add_keyframe(1, pose, descs)  # noqa: SLF001
+    vision._place.add_keyframe(2, Pose2D(1.0, 0.0, 0.0), descs)  # noqa: SLF001
+    assert vision._place_retrieval_enabled() is False  # noqa: SLF001
+    vision._try_place_retrieval(descs, pose)  # noqa: SLF001
+    assert vision.status()["place"]["last_retrieval"]["status"] == "skipped_tracking"
+    assert called == []
+
+
+def test_place_retrieval_applies_when_lost_large_jump():
+    """Lost: relative jump cap dropped; strong score may teleport."""
+    cfg = _retrieval_cfg(
+        mode="localizing",
+        vision_survey_only=False,
+        vision_place_enabled=True,
+        vision_place_retrieval=True,
+        vision_place_cooldown_s=0.0,
+        vision_place_min_score=0.55,
+        vision_place_large_jump_m=0.40,
+        vision_place_large_jump_min_score=0.75,
+        vision_place_min_score_margin=0.08,
+    )
+    pose = Pose2D(0.0, 0.0, 0.0)
+    target = Pose2D(2.5, 0.0, 0.0)
+    called = []
+
+    def apply(p, *, score=None, force=False):
+        called.append({"pose": p, "score": score, "force": force})
+        return {
+            "applied": True,
+            "status": "pose_only",
+            "shift_m": 2.5,
+            "shift_deg": 0.0,
+        }
+
+    vision = VisionSupervisor(
+        cfg=cfg,
+        cameras={},
+        get_pose=lambda: pose,
+        get_pose_at=lambda _t: pose,
+        get_anchor=lambda: (0, pose, {0: pose}),
+        apply_pose_correction=apply,
+        is_localization_lost=lambda: True,
+    )
+    # Synthetic blocks apply-allowed even if flags are on.
+    vision._worker.cfg.synthetic = False  # noqa: SLF001
+
+    # Distinct means so unfitted mean-pool VLAD ranks the far keyframe first.
+    rng = np.random.default_rng(7)
+    near = l2_normalize(rng.standard_normal((16, 8)).astype(np.float32))
+    far = l2_normalize(rng.standard_normal((16, 8)).astype(np.float32) + 3.0)
+    vision._place.add_keyframe(1, pose, near)  # noqa: SLF001
+    vision._place.add_keyframe(2, target, far)  # noqa: SLF001
+    assert vision._place_retrieval_enabled() is True  # noqa: SLF001
+    vision._try_place_retrieval(far, pose)  # noqa: SLF001
+    last = vision.status()["place"]["last_retrieval"]
+    assert last["status"] == "applied", last
+    assert last["jump_m"] == pytest.approx(2.5, abs=0.01)
+    assert len(called) == 1
+    assert called[0]["force"] is False
+    assert called[0]["pose"].x == pytest.approx(2.5)

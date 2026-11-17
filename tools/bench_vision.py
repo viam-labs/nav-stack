@@ -29,10 +29,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.semantic.onnx_session import available_providers, openvino_gpu_available
-from src.semantic.patches import backproject_patches
-from src.semantic.types import CameraIntrinsics, VisionFrame
-from src.semantic.worker import VisionWorker, WorkerConfig
+from src.semantic.onnx_session import available_providers, openvino_gpu_available  # noqa: E402
+from src.semantic.patches import backproject_patches  # noqa: E402
+from src.semantic.types import CameraIntrinsics, VisionFrame  # noqa: E402
+from src.semantic.worker import VisionWorker, WorkerConfig  # noqa: E402
 
 
 def _percentile(xs: list[float], p: float) -> float:

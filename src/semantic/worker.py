@@ -1,14 +1,13 @@
-"""Vision worker: DINOv2 (+ optional YOLO) inference, latest-frame only."""
+"""Vision worker: DINOv2 patch tokens and YOLO mover boxes, latest-frame only."""
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .detect_landmarks import tokens_inside_detections
 from .patches import patch_grid, select_survey_tokens
 from .place import l2_normalize
 from .types import Detection, PatchToken, VisionFrame, VisionResult
@@ -113,10 +112,9 @@ class WorkerConfig:
     # Class-id → name for the loaded ONNX. Empty → COCO-80 (standard YOLOv8).
     # YOLO-World exports must pass the same prompt list used at export time.
     detector_classes: Tuple[str, ...] = ()
-    # Paint-gate / dynamic obstacle labels (always kept when detected).
+    # Movers masked out of the lidar scan while mapping. Boxes with any other
+    # label are dropped.
     dynamic_labels: Tuple[str, ...] = ("person", "bicycle", "car", "motorcycle")
-    # When non-empty, also keep these labels (landmark proposals). Empty = keep all.
-    landmark_labels: Tuple[str, ...] = field(default_factory=tuple)
 
 
 class VisionWorker:
@@ -222,26 +220,11 @@ class VisionWorker:
         if self._yolo is not None:
             detections = self._run_yolo(color)
 
-        # Texture-first survey select (paintings/edges over flat walls).
-        # Always keep tokens that fall inside YOLO boxes so detector pooling
-        # is not starved by the max_keep=64 cull.
-        # Skip in synthetic mode — RGB-stat tokens need the full grid.
+        # The place index describes a frame by its most textured patches
+        # (paintings/edges over flat walls). Skip in synthetic mode: RGB-stat
+        # tokens need the full grid.
         if tokens and not self.cfg.synthetic:
-            selected = select_survey_tokens(
-                color, tokens, min_texture=8.0, max_keep=64
-            )
-            if detections:
-                in_box = tokens_inside_detections(tokens, detections)
-                seen = {(t.row, t.col, round(float(t.u), 1), round(float(t.v), 1)) for t in selected}
-                merged = list(selected)
-                for t in in_box:
-                    key = (t.row, t.col, round(float(t.u), 1), round(float(t.v), 1))
-                    if key not in seen:
-                        seen.add(key)
-                        merged.append(t)
-                tokens = merged
-            else:
-                tokens = selected
+            tokens = select_survey_tokens(color, tokens, min_texture=8.0, max_keep=64)
 
         infer_ms = (time.perf_counter() - t0) * 1000.0
         self.stats["frames"] += 1
@@ -289,7 +272,9 @@ class VisionWorker:
                     r1 = (br + 1) * gh // 4
                     c0 = bc * gw // 4
                     c1 = (bc + 1) * gw // 4
-                    blocks.append(float(gray[r0:r1, c0:c1].mean()) if r1 > r0 and c1 > c0 else 0.0)
+                    blocks.append(
+                        float(gray[r0:r1, c0:c1].mean()) if r1 > r0 and c1 > c0 else 0.0
+                    )
             vec = np.concatenate([mean, std, np.asarray(blocks, dtype=np.float32)])
             # Bake patch location into the descriptor so synthetic benches keep
             # spatially distinct tokens after the distinctiveness filter.
@@ -422,19 +407,9 @@ class VisionWorker:
         return COCO80_CLASSES
 
     def _keep_detection_label(self, label: str) -> bool:
-        """Keep dynamics always; landmark labels when configured; else all."""
+        """Only movers are kept: nothing else uses a box."""
         lab = str(label).strip().lower()
-        if lab in {x.lower() for x in self.cfg.dynamic_labels}:
-            return True
-        if not self.cfg.landmark_labels:
-            return True
-        allowed = {str(x).strip().lower() for x in self.cfg.landmark_labels}
-        if lab in allowed:
-            return True
-        for a in allowed:
-            if lab in a or a in lab:
-                return True
-        return False
+        return lab in {x.lower() for x in self.cfg.dynamic_labels}
 
     def _run_yolo(self, color: np.ndarray) -> List[Detection]:
         """Minimal YOLOv8 / YOLO-World ONNX postprocess (xyxy + conf + cls)."""
@@ -519,9 +494,7 @@ def _yolo_predictions(out: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
-def _letterbox(
-    img: np.ndarray, size: int
-) -> Tuple[np.ndarray, float, float, float]:
+def _letterbox(img: np.ndarray, size: int) -> Tuple[np.ndarray, float, float, float]:
     h, w = img.shape[:2]
     scale = float(size) / float(max(h, w))
     nh, nw = int(round(h * scale)), int(round(w * scale))

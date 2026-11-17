@@ -23,7 +23,9 @@ from pathlib import Path
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--size", type=int, default=448, help="square input side (multiple of 14)")
+    ap.add_argument(
+        "--size", type=int, default=448, help="square input side (multiple of 14)"
+    )
     ap.add_argument(
         "--out",
         type=Path,
@@ -42,7 +44,9 @@ def main() -> int:
     import torch.nn as nn
 
     print(f"loading dinov2_vits14 via torch.hub (size={size})…")
-    backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", pretrained=True)
+    backbone = torch.hub.load(
+        "facebookresearch/dinov2", "dinov2_vits14", pretrained=True
+    )
     backbone.eval()
 
     class PatchTokens(nn.Module):

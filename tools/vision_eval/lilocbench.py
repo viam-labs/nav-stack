@@ -49,7 +49,9 @@ def _transform(entry: dict) -> np.ndarray:
     return out
 
 
-def mount_from_matrix(mat: np.ndarray) -> Tuple[float, float, float, float, float, float]:
+def mount_from_matrix(
+    mat: np.ndarray,
+) -> Tuple[float, float, float, float, float, float]:
     """``(x, y, z, theta, pitch, roll)`` for ``Rz(theta) Ry(pitch) Rx(roll)``."""
     rot = mat[:3, :3]
     theta = math.atan2(rot[1, 0], rot[0, 0])
@@ -62,8 +64,12 @@ def _intrinsics(path: Path) -> CameraIntrinsics:
     data = yaml.safe_load(path.read_text())
     k = [float(v) for v in data["K"]]
     return CameraIntrinsics(
-        fx=k[0], fy=k[4], cx=k[2], cy=k[5],
-        width=int(data["width"]), height=int(data["height"]),
+        fx=k[0],
+        fy=k[4],
+        cx=k[2],
+        cy=k[5],
+        width=int(data["width"]),
+        height=int(data["height"]),
     )
 
 
@@ -86,7 +92,10 @@ def register_depth_to_color(
     z = depth_m[vs, us].astype(np.float64)
     x = (us - depth_k.cx) / depth_k.fx * z
     y = (vs - depth_k.cy) / depth_k.fy * z
-    pts = np.column_stack([x, y, z]) @ color_from_depth[:3, :3].T + color_from_depth[:3, 3]
+    pts = (
+        np.column_stack([x, y, z]) @ color_from_depth[:3, :3].T
+        + color_from_depth[:3, 3]
+    )
     zc = pts[:, 2]
     ok = zc > 0.05
     pts, zc = pts[ok], zc[ok]
@@ -161,12 +170,14 @@ class LilocSequence:
         base_from_link = tf[("base_link", link)]
         link_from_color = tf[(link, f"camera_{camera}_color_frame")]
         link_from_depth = tf[(link, f"camera_{camera}_depth_frame")]
-        optical = tf[(f"camera_{camera}_color_frame", f"camera_{camera}_color_optical_frame")]
+        optical = tf[
+            (f"camera_{camera}_color_frame", f"camera_{camera}_color_optical_frame")
+        ]
         # Colour sensor body (x forward) in base_link: the stack's mount.
         self.mount = mount_from_matrix(base_from_link @ link_from_color)
         # Depth optical → colour optical, for registration.
-        self._color_from_depth = (
-            np.linalg.inv(link_from_color @ optical) @ (link_from_depth @ optical)
+        self._color_from_depth = np.linalg.inv(link_from_color @ optical) @ (
+            link_from_depth @ optical
         )
 
         self.gt_stamps, self.gt_poses = load_tum_poses(self.dir / "gt_poses.txt")
@@ -203,15 +214,18 @@ class LilocSequence:
 
     def depth(self, i: int) -> np.ndarray:
         """Depth in metres, registered to the colour image."""
-        raw = np.asarray(Image.open(self._depth_paths[i])).astype(np.float32) * DEPTH_UNIT_M
-        return register_depth_to_color(raw, self.depth_k, self.color_k, self._color_from_depth)
+        raw = (
+            np.asarray(Image.open(self._depth_paths[i])).astype(np.float32)
+            * DEPTH_UNIT_M
+        )
+        return register_depth_to_color(
+            raw, self.depth_k, self.color_k, self._color_from_depth
+        )
 
     def frame(self, i: int, *, with_depth: bool = True) -> VisionFrame:
         color = self.color(i)
         depth = (
-            self.depth(i)
-            if with_depth
-            else np.zeros(color.shape[:2], dtype=np.float32)
+            self.depth(i) if with_depth else np.zeros(color.shape[:2], dtype=np.float32)
         )
         x, y, z, theta, pitch, roll = self.mount
         return VisionFrame(
@@ -221,8 +235,12 @@ class LilocSequence:
             color_rgb=color,
             depth_m=depth,
             intrinsics=self.color_k,
-            mount_x=x, mount_y=y, mount_z=z,
-            mount_theta=theta, mount_pitch=pitch, mount_roll=roll,
+            mount_x=x,
+            mount_y=y,
+            mount_z=z,
+            mount_theta=theta,
+            mount_pitch=pitch,
+            mount_roll=roll,
         )
 
     def _load_lidars(self) -> List[_Lidar]:
@@ -244,13 +262,17 @@ class LilocSequence:
                         angle_increment=float(spec["angle_increment"]),
                         range_min=float(spec["range_min"]),
                         range_max=min(float(spec["range_max"]), 25.0),
-                        sensor_pose=conv.Pose2D(float(mat[0, 3]), float(mat[1, 3]), yaw),
+                        sensor_pose=conv.Pose2D(
+                            float(mat[0, 3]), float(mat[1, 3]), yaw
+                        ),
                     )
                 )
             self._lidars = out
         return self._lidars
 
-    def scan(self, stamp: float, *, which: Sequence[str] = ("front", "rear")) -> Optional[conv.LaserScan2D]:
+    def scan(
+        self, stamp: float, *, which: Sequence[str] = ("front", "rear")
+    ) -> Optional[conv.LaserScan2D]:
         """Both lidars nearest ``stamp``, merged around base_link like the stack does."""
         del which
         scans = []
@@ -271,7 +293,6 @@ class LilocSequence:
         if not scans:
             return None
         return conv.merge_scans(scans)
-
 
     def odometry(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Wheel odometry: stamps, ``(N, 3)`` x/y/yaw in the odom frame, ``(N, 3)`` vx/vy/wz.
@@ -306,7 +327,9 @@ def load_reference_map(root: Path) -> OccupancyMap:
     """The dataset's occupancy grid (ROS map_server png + yaml), in the GT frame."""
     folder = Path(root).expanduser() / "map_office"
     meta = yaml.safe_load((folder / "map_office.yaml").read_text())
-    img = np.asarray(Image.open(folder / str(meta["image"])).convert("L")).astype(np.float32)
+    img = np.asarray(Image.open(folder / str(meta["image"])).convert("L")).astype(
+        np.float32
+    )
     occ_prob = img / 255.0 if int(meta.get("negate", 0)) else (255.0 - img) / 255.0
     grid = np.full(img.shape, -1, dtype=np.int16)
     grid[occ_prob > float(meta["occupied_thresh"])] = 100

@@ -22,7 +22,10 @@ from .lilocbench import LilocSequence
 
 DEFAULT_DINOV2 = (
     Path(__file__).resolve().parents[2]
-    / "src" / "semantic" / "models" / "dinov2_vits14_patches_448.onnx"
+    / "src"
+    / "semantic"
+    / "models"
+    / "dinov2_vits14_patches_448.onnx"
 )
 # Tokens the runtime keeps per frame (``VisionWorker.process``).
 RUNTIME_KEEP = 64
@@ -51,7 +54,9 @@ class FrameFeatures:
         return self.tokens(frame)[idx[idx >= 0]]
 
 
-def make_worker(dinov2_onnx: Path = DEFAULT_DINOV2, *, input_size: int = 448) -> VisionWorker:
+def make_worker(
+    dinov2_onnx: Path = DEFAULT_DINOV2, *, input_size: int = 448
+) -> VisionWorker:
     worker = VisionWorker(
         WorkerConfig(
             dinov2_onnx=str(dinov2_onnx),
@@ -91,7 +96,10 @@ def ensure_features(
     n = len(seq)
     if meta_path.is_file():
         meta = json.loads(meta_path.read_text())
-        if int(meta.get("frames", -1)) == n and meta.get("first_stamp") == seq.stamps[0]:
+        if (
+            int(meta.get("frames", -1)) == n
+            and meta.get("first_stamp") == seq.stamps[0]
+        ):
             return FrameFeatures(
                 desc=np.load(desc_path, mmap_mode="r"),
                 uv=np.load(folder / "uv.npy"),
@@ -116,7 +124,9 @@ def ensure_features(
             grid = np.array([[t.row, t.col] for t in tokens], dtype=np.int16)
         desc[i] = np.stack([t.descriptor for t in tokens]).astype(np.float16)
         index_of = {(t.row, t.col): j for j, t in enumerate(tokens)}
-        kept = select_survey_tokens(color, tokens, min_texture=8.0, max_keep=RUNTIME_KEEP)
+        kept = select_survey_tokens(
+            color, tokens, min_texture=8.0, max_keep=RUNTIME_KEEP
+        )
         for j, tok in enumerate(kept[:RUNTIME_KEEP]):
             keep[i, j] = index_of[(tok.row, tok.col)]
         if (i + 1) % 100 == 0 or i + 1 == n:

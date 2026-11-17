@@ -23,7 +23,7 @@ def intrinsics_from_size(
 
     ``fov_deg`` is horizontal; ``vfov_deg`` is vertical (defaults to the same
     angular value only when omitted — prefer passing the camera's real vfov,
-    otherwise painted landmarks drift vertically).
+    otherwise points back-projected from the image drift vertically).
     """
     w = max(1, int(width))
     h = max(1, int(height))

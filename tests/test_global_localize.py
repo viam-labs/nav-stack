@@ -246,10 +246,16 @@ def test_batch_scorer_gives_the_same_scores_as_the_reference():
     xs, ys = rng.uniform(-1.0, 14.0, 200), rng.uniform(-1.0, 9.0, 200)
     score, inside, hit_rate, coverage = scorer.score_xy(xs, ys, 0.9)
     for i in range(200):
-        ref = _score_pose(occ, xy, conv.Pose2D(xs[i], ys[i], 0.9), occupied_lookup=lookup)
-        assert (score[i] == ref.score) or (not np.isfinite(score[i]) and not np.isfinite(ref.score))
+        ref = _score_pose(
+            occ, xy, conv.Pose2D(xs[i], ys[i], 0.9), occupied_lookup=lookup
+        )
+        assert (score[i] == ref.score) or (
+            not np.isfinite(score[i]) and not np.isfinite(ref.score)
+        )
         assert inside[i] == ref.in_map_points
-        assert hit_rate[i] == pytest.approx(ref.hit_rate) and coverage[i] == pytest.approx(ref.coverage)
+        assert hit_rate[i] == pytest.approx(ref.hit_rate) and coverage[
+            i
+        ] == pytest.approx(ref.coverage)
 
     rows, cols, frac_x, frac_y = _lattice_cells(occ, truth.x, truth.y, 3, radius_m=2.0)
     assert rows.size > 300
@@ -263,7 +269,11 @@ def test_batch_scorer_gives_the_same_scores_as_the_reference():
 def test_default_grid_is_sized_from_the_hit_tolerance():
     from src.nav.localize.global_localize import tolerance_grid_steps
 
-    ring = lambda r: np.column_stack([r * np.cos(np.arange(90.0)), r * np.sin(np.arange(90.0))])  # noqa: E731
+    def ring(r):
+        return np.column_stack(
+            [r * np.cos(np.arange(90.0)), r * np.sin(np.arange(90.0))]
+        )
+
     step_m, yaw_deg = tolerance_grid_steps(ring(3.0), 0.05, 2)
     assert step_m == pytest.approx(0.15)
     assert yaw_deg == pytest.approx(math.degrees(2 * 0.125 / 3.0))  # 4.8°
@@ -291,7 +301,9 @@ def test_ambiguous_means_another_place_fits_not_a_neighbouring_sample():
     result = global_localize_scan(twins, _raycast_scan(twins, truth), full_map=True)
     # The same pose in either room explains the scan equally well.
     in_left = math.hypot(result.pose.x - truth.x, result.pose.y - truth.y) < 0.1
-    in_right = math.hypot(result.pose.x - (truth.x + 5.5), result.pose.y - truth.y) < 0.1
+    in_right = (
+        math.hypot(result.pose.x - (truth.x + 5.5), result.pose.y - truth.y) < 0.1
+    )
     assert in_left or in_right
     assert result.ambiguous is True
     assert math.isfinite(result.second_best_score)
@@ -308,7 +320,11 @@ def test_a_local_search_with_no_other_place_in_reach_is_not_ambiguous():
     truth = conv.Pose2D(3.37, 3.12, math.radians(27.0))
     hint = conv.Pose2D(3.6, 2.9, math.radians(40.0))
     result = global_localize_scan(
-        occ, _raycast_scan(occ, truth), hint=hint, search_radius_m=0.6, local_yaw_window_deg=60.0
+        occ,
+        _raycast_scan(occ, truth),
+        hint=hint,
+        search_radius_m=0.6,
+        local_yaw_window_deg=60.0,
     )
     assert math.hypot(result.pose.x - truth.x, result.pose.y - truth.y) < 0.06
     assert result.second_best_score == float("-inf")
