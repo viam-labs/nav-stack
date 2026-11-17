@@ -33,9 +33,13 @@ flowchart LR
 
 ## Prerequisites
 
-- A host running `viam-server` with Python 3 (Linux is typical; macOS can run the
-  builtin path where serial/shm allow).
-- On first deploy, `setup.sh` creates the Python venv and installs pip requirements.
+- A host running `viam-server` (Linux is typical; macOS can run the builtin path
+  where serial/shm allow). The OS Python does not matter: on first deploy,
+  `setup.sh` installs [uv](https://docs.astral.sh/uv/) and Python 3.12 under
+  `~/.viam/nav-stack/uv`, creates the venv, and installs the requirements. This
+  needs internet access to astral.sh, github.com and PyPI. If uv cannot be
+  fetched, setup uses the system `python3` instead, which must be 3.10 or newer;
+  `NAV_STACK_USE_UV=0` forces that path.
 
 ## Configuration
 
@@ -756,7 +760,8 @@ the current map heading in place when XY is already right).
 ## Development
 
 ```bash
-./setup.sh                 # create venv (add python -m pytest tests/    # pure-Python unit tests (no ROS needed)
+./setup.sh                 # create .venv and install requirements (uv + Python 3.12)
+python -m pytest tests/    # pure-Python unit tests (no ROS needed)
 ./build.sh                 # package module.tar.gz
 ```
 
