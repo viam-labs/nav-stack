@@ -729,7 +729,13 @@ already has. With lidars at more than one height, `rule` is `best_height`:
 each height is scored by itself (`heights`, one entry per 25 cm slice) and the
 best one decides, because the lidars share one pose — walls lining up at one
 height confirm it, and another height that disagrees is seeing something new,
-such as furniture that moved. With one height, `rule` is `merged_scan`),
+such as furniture that moved. With one height, `rule` is `merged_scan`.
+Before a marginal scan is painted the pose is polished by a few centimetres
+with that height's score (`paint.fit.polish`: `moved`, `kept`,
+`better_fit_farther_away` when the pose matcher has to move it first,
+`no_pose_nearby_passes`; `pose_polishes` counts the moves). `match` says
+which scan the last pose match used: the merged scan, or one height when the
+map explains it clearly better),
 `set_initial_pose`,
 `global_localize` (lidar scan match against saved map; optional `full_map`,
 `search_radius_m`, `apply`, `local_yaw_window_deg`, `max_scan_points`,
@@ -748,6 +754,25 @@ the current map heading in place when XY is already right).
 ```
 
 Geometry/format conversions and map/location/zone stores are unit-tested directly.
+
+### Offline evaluation
+
+Place recognition, lost-pose recovery and mapping can be scored against
+ground truth on the LILocBench dataset, with no robot:
+
+```bash
+python tools/fetch_lilocbench.py     # once: ~2 GB subset into ~/datasets/lilocbench
+python tools/eval_vision.py place    # place-recognition recall
+python tools/eval_vision.py reloc    # lost-pose recovery, lidar vs camera+lidar
+python tools/eval_vision.py mapping  # replay a run through SLAM, score the trajectory
+```
+
+Off the robot, install the CPU runtime first with `pip install onnxruntime`;
+`requirements-vision.txt` lists only the OpenVINO build. The dataset is
+licensed CC BY-NC-SA 4.0 (non-commercial) and is not part of this repo. See
+`python tools/eval_vision.py --help` for options, and "Measuring vision
+offline" in `src/semantic/models/README.md` for what each mode measures and
+the current results.
  
 ## Scope / notes
 

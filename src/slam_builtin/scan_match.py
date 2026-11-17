@@ -268,9 +268,12 @@ def scan_map_overlap(
 # The wider ring the matcher uses gives a return two cells out partial
 # credit, which is a gradient for a search and too soft for a yes or no.
 _VOTE_TOLERANCE_CELLS = 1
-# A height that judged fewer returns than this share of the best-covered
-# height has seen too little of the map to vote (one slice of a depth
-# camera, a lidar looking mostly at unexplored space).
+# A height with fewer returns than this share of the fullest height is too
+# thin a view to vote (one slice of a depth camera). The count is of
+# returns, not of returns the map could judge: at a pose that is off, a
+# height's wall returns slip behind the walls into unmapped space while
+# another height's furniture returns stay judged, and the clean height must
+# not lose its vote for that.
 _VOTE_MIN_SHARE = 0.5
 
 
@@ -329,6 +332,99 @@ def wall_agreement(
     return (float(near.sum()) - 0.7 * float(free.sum())) / float(judged), judged
 
 
+def polish_on_walls(
+    occ_map: OccupancyMap,
+    scan: conv.LaserScan2D,
+    pose: conv.Pose2D,
+    *,
+    xy_half_m: float = 0.075,
+    xy_step_m: float = 0.025,
+    yaw_half_deg: float = 2.0,
+    yaw_step_deg: float = 1.0,
+) -> Tuple[Optional[conv.Pose2D], float, float]:
+    """Best pose within a few centimetres of ``pose``, by :func:`wall_agreement`.
+
+    The pose matcher steps in 5 cm and 2 degrees and stops short of its
+    target on purpose, so it leaves a residue about that size. A height vote
+    only credits returns within a cell of a wall, and that residue is enough
+    to fail it on sparse walls. This closes the gap with the vote's own
+    score.
+
+    Returns ``(pose, score, edge_gain)``. ``pose`` is the best candidate
+    strictly inside the window. ``edge_gain`` is how much better the best
+    candidate on the window's edge scores than that: a clear gain means the
+    scan fits better still farther out, so the pose is off by more than a
+    polish should fix and painting here would draw the walls part-way to
+    where they belong. Along a corridor the fit barely changes with position,
+    so a small gain there is not that.
+
+    A candidate may not judge fewer returns than ``pose`` does (it would be
+    winning by moving its misses into unmapped space), and among near-equal
+    candidates the one closest to ``pose`` is kept, so a wall that fits
+    anywhere along its length does not slide the pose.
+    """
+    scan_xy = scan_endpoints_base_link(scan)
+    if scan_xy.shape[0] < 20:
+        return None, float("nan"), 0.0
+    _score_here, judged_here = wall_agreement(occ_map, scan, pose)
+    if judged_here <= 0:
+        return None, float("nan"), 0.0
+    grid = occ_map.grid
+    height, width = grid.shape
+    res = occ_map.resolution
+    # One dilation of the grid, then one lookup per return and candidate.
+    near_wall = _inflate_occupied(grid >= 50, _VOTE_TOLERANCE_CELLS)
+    known_free = (grid >= 0) & (grid < 50)
+    offsets = np.arange(-xy_half_m, xy_half_m + 1e-9, xy_step_m)
+    ox, oy = np.meshgrid(offsets, offsets)
+    ox, oy = ox.ravel(), oy.ravel()
+    yaws = np.radians(np.arange(-yaw_half_deg, yaw_half_deg + 1e-9, yaw_step_deg))
+    edge_xy = xy_half_m - 0.5 * xy_step_m
+    edge_yaw = math.radians(yaw_half_deg - 0.5 * yaw_step_deg)
+    floor = judged_here * (1.0 - _COVERAGE_SHED)
+    inner = []
+    edge_top = float("-inf")
+    for dyaw in yaws:
+        yaw = pose.theta + float(dyaw)
+        c, s = math.cos(yaw), math.sin(yaw)
+        rx = c * scan_xy[:, 0] - s * scan_xy[:, 1]
+        ry = s * scan_xy[:, 0] + c * scan_xy[:, 1]
+        cols = np.floor(
+            (pose.x + ox[:, None] + rx[None, :] - occ_map.origin_x) / res
+        ).astype(np.int32)
+        rows = np.floor(
+            (pose.y + oy[:, None] + ry[None, :] - occ_map.origin_y) / res
+        ).astype(np.int32)
+        inside = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+        rows_c = np.clip(rows, 0, height - 1)
+        cols_c = np.clip(cols, 0, width - 1)
+        near = near_wall[rows_c, cols_c] & inside
+        free = known_free[rows_c, cols_c] & inside & ~near
+        n_near = near.sum(axis=1)
+        n_free = free.sum(axis=1)
+        judged = n_near + n_free
+        score = (n_near - 0.7 * n_free) / np.maximum(judged, 1)
+        yaw_on_edge = abs(float(dyaw)) >= edge_yaw
+        for i in np.flatnonzero(judged >= floor):
+            on_edge = yaw_on_edge or abs(ox[i]) >= edge_xy or abs(oy[i]) >= edge_xy
+            if on_edge:
+                edge_top = max(edge_top, float(score[i]))
+            else:
+                inner.append((float(score[i]), float(ox[i]), float(oy[i]), float(dyaw)))
+    if not inner:
+        return None, float("nan"), 0.0
+    top = max(row[0] for row in inner)
+    near_top = [row for row in inner if row[0] >= top - 0.02]
+    score, dx, dy, dyaw = min(
+        near_top,
+        key=lambda row: math.hypot(row[1], row[2]) + 0.05 * abs(math.degrees(row[3])),
+    )
+    found = conv.Pose2D(
+        pose.x + dx, pose.y + dy, conv.normalize_angle(pose.theta + dyaw)
+    )
+    return found, score, max(0.0, edge_top - top)
+
+
 def height_votes(
     occ_map: OccupancyMap,
     band_scans: Mapping[int, conv.LaserScan2D],
@@ -343,14 +439,16 @@ def height_votes(
     it keeps the nearest return in each direction, which is the clutter.
     """
     votes = []
+    returns = {}
     for band, scan in band_scans.items():
         score, judged = wall_agreement(occ_map, scan, pose)
         if judged > 0:
             votes.append(HeightVote(int(band), float(score), int(judged)))
+            returns[int(band)] = int(scan_endpoints_base_link(scan).shape[0])
     if not votes:
         return []
-    floor = _VOTE_MIN_SHARE * max(v.judged for v in votes)
-    return [v for v in votes if v.judged >= floor]
+    floor = _VOTE_MIN_SHARE * max(returns.values())
+    return [v for v in votes if returns[v.band] >= floor]
 
 
 def score_at_pose(
