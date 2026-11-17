@@ -762,13 +762,16 @@ ground truth on the LILocBench dataset, with no robot:
 
 ```bash
 python tools/fetch_lilocbench.py     # once: ~2 GB subset into ~/datasets/lilocbench
+python tools/fetch_dinov2_onnx.py && python tools/fetch_yolo_world_onnx.py   # once: model weights, ~140 MB
 python tools/eval_vision.py place    # place-recognition recall
 python tools/eval_vision.py reloc    # lost-pose recovery, lidar vs camera+lidar
 python tools/eval_vision.py mapping  # replay a run through SLAM, score the trajectory
 ```
 
 Off the robot, install the CPU runtime first with `pip install onnxruntime`;
-`requirements-vision.txt` lists only the OpenVINO build. The dataset is
+`requirements-vision.txt` lists only the OpenVINO build. The weights are
+fetched by hand here because setup installs nothing for vision (a robot
+fetches them itself when vision is enabled). The dataset is
 licensed CC BY-NC-SA 4.0 (non-commercial) and is not part of this repo. See
 `python tools/eval_vision.py --help` for options, and "Measuring vision
 offline" in `src/semantic/models/README.md` for what each mode measures and
