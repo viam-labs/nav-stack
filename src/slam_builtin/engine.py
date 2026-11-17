@@ -34,6 +34,13 @@ from .types import LogOddsGrid
 
 # A scan is drawn only when it lands on walls already in the map.
 _MAP_INSERT_MIN_SCORE = 0.5
+# With lidars at more than one height the best-agreeing height decides (see
+# ``scan_match.height_votes``). The bar is higher than for one merged scan:
+# the best of several scores is easier to reach at a wrong pose. On a robot
+# with lidars at 0.21 m and 1.2 m this refused poses 15 cm or 5 degrees off
+# about as often as the merged scan did, and passed the right pose 94% of
+# the time against 89%.
+_HEIGHT_VOTE_MIN_SCORE = 0.65
 # In-place turns slower than the hard smear skip still write a rotated wing
 # if they are painted live. Hold them and draw after the robot stops.
 _SPIN_HOLD_YAW_RATE = math.radians(15.0)
@@ -129,6 +136,8 @@ class BuiltinSlamEngine:
         self._paint_state = "idle"
         self._paint_last_fit: Optional[str] = None
         self._paint_last_at = 0.0
+        # What the last fit check scored, and against which pass mark.
+        self._paint_fit_detail: Optional[dict] = None
         # Last time we ran a full-circle heading search to unstick paint.
         self._last_heading_recover_at = 0.0
         self._heading_recovers = 0
@@ -2464,6 +2473,13 @@ class BuiltinSlamEngine:
                     ),
                     "last_score": self._last_match_score,
                     "prior_score": self._last_prior_score,
+                    # The check that decides ``last_fit`` (the two scores
+                    # above are the pose matcher's, not this).
+                    "fit": (
+                        None
+                        if self._paint_fit_detail is None
+                        else dict(self._paint_fit_detail)
+                    ),
                     "skips_turning": self._insert_skips_turning,
                     "skips_unmatched": self._insert_skips_unmatched,
                     "map_updates": self._updates,
@@ -3057,18 +3073,62 @@ class BuiltinSlamEngine:
             self._paint_last_fit = str(fit)
 
     def _scan_map_fit(self, scan: conv.LaserScan2D, pose: conv.Pose2D) -> str:
-        """``open``, ``fit``, or ``miss`` for painting ``scan`` at ``pose``."""
+        """``open``, ``fit``, or ``miss`` for painting ``scan`` at ``pose``.
+
+        ``scan`` is the scan just read. With lidars at more than one height,
+        each height is scored by itself and the best one decides; otherwise
+        the merged scan is scored as one.
+        """
         try:
             occ_map = self._occupancy_for_match()
         except Exception:  # noqa: BLE001
             return "open"
-        return scan_match.scan_map_fit(
+        votes = self._height_votes(occ_map, pose)
+        if len(votes) >= 2:
+            from .height_bands import BAND_M
+
+            best = max(votes, key=lambda vote: vote.score)
+            state = "fit" if best.score >= _HEIGHT_VOTE_MIN_SCORE else "miss"
+            self._paint_fit_detail = {
+                "rule": "best_height",
+                "state": state,
+                "score": round(best.score, 3),
+                "pass_mark": _HEIGHT_VOTE_MIN_SCORE,
+                "heights": [
+                    {
+                        "z_min_m": round(vote.band * BAND_M, 2),
+                        "z_max_m": round((vote.band + 1) * BAND_M, 2),
+                        "score": round(vote.score, 3),
+                        "judged": vote.judged,
+                    }
+                    for vote in sorted(votes, key=lambda vote: vote.band)
+                ],
+            }
+            return state
+        state, score = scan_match.scan_map_overlap(
             occ_map,
             scan,
             pose,
             min_score=_MAP_INSERT_MIN_SCORE,
             occupied_lookup=self._occupied_lookup_for(occ_map),
         )
+        self._paint_fit_detail = {
+            "rule": "merged_scan",
+            "state": state,
+            "score": round(score, 3) if math.isfinite(score) else None,
+            "pass_mark": _MAP_INSERT_MIN_SCORE,
+        }
+        return state
+
+    def _height_votes(self, occ_map: OccupancyMap, pose: conv.Pose2D) -> list:
+        """Per-height votes for the scan just read; empty with one height."""
+        try:
+            bands = self._band_scans(self._mapping_frames())
+        except Exception:  # noqa: BLE001
+            return []
+        if len(bands) < 2:
+            return []
+        return scan_match.height_votes(occ_map, bands, pose)
 
     def _scan_fits_map(self, scan: conv.LaserScan2D, pose: conv.Pose2D) -> bool:
         """True when the map does not yet constrain ``pose``, or the scan lands on it."""
