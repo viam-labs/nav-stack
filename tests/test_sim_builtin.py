@@ -263,6 +263,11 @@ def test_repeat_path_resets_pose_ten_times():
     assert max(ends) - min(ends) < 0.15
 
 
+def _node_seqs(engine) -> list:
+    with engine._lock:  # noqa: SLF001
+        return [n.scans[0].seq for n in engine._graph.nodes if n.scans]  # noqa: SLF001
+
+
 def test_sim_clear_region_drops_keyframes_and_allows_remap(tmp_path: Path):
     """Map a stretch, blank a box (occupancy + nodes), drive again into the hole."""
     unregister_sim_world("clear-remap")
@@ -329,9 +334,13 @@ def test_sim_clear_region_drops_keyframes_and_allows_remap(tmp_path: Path):
         cc0, cc1 = sorted((c0, c1))
         before_occ = int(np.sum(grid[rr0 : rr1 + 1, cc0 : cc1 + 1] >= 50))
 
+        kept_before = set(_node_seqs(engine))
         out = host.clear_region(*box)
         assert out["removed_nodes"] >= 1
         assert out["remaining_nodes"] < n_before
+        # Keyframes are told apart by their first scan's sequence number.
+        removed = kept_before - set(_node_seqs(engine))
+        assert removed
         paint = engine.diagnostics()["paint"]
         assert "state" in paint
 
@@ -354,12 +363,20 @@ def test_sim_clear_region_drops_keyframes_and_allows_remap(tmp_path: Path):
         assert int(engine.diagnostics()["paint"]["map_updates"]) > updates_before
 
         map_dir = store.active_handle().root
-        saved = engine.save_map(map_dir, repair=False)
+        # The remap drive may have added keyframes since the clear, and the
+        # engine thread keeps ticking. Holding its lock, nothing can be added
+        # between taking the list and writing it.
+        with engine._lock:  # noqa: SLF001
+            saved_seqs = _node_seqs(engine)
+            saved = engine.save_map(map_dir, repair=False)
         assert saved["keyframes"] in ("saved", "none")
         if saved["keyframes"] == "saved":
             resumed = BuiltinSlamEngine(cfg, sensors, store, rate_hz=5.0)  # type: ignore[arg-type]
             resumed.configure_mode("mapping", map_dir)
-            assert len(resumed._graph) == out["remaining_nodes"]  # noqa: SLF001
+            resumed_seqs = _node_seqs(resumed)
+            # What was saved comes back, and what the clear removed does not.
+            assert resumed_seqs == saved_seqs
+            assert not removed & set(resumed_seqs)
     finally:
         host.shutdown()
         unregister_sim_world("clear-remap")
