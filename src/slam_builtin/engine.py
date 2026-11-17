@@ -1273,6 +1273,10 @@ class BuiltinSlamEngine:
             res = float(self._grid.resolution)
             ox = float(self._grid.origin_x)
             oy = float(self._grid.origin_y)
+            # Lidars at several heights: score each height's grid by itself.
+            band_grids = (
+                dict(self._height_bands) if len(self._height_bands) >= 2 else {}
+            )
             base = self._session_baseline
             base_cells = None
             base_origin = (0.0, 0.0)
@@ -1344,15 +1348,48 @@ class BuiltinSlamEngine:
                     resolution=res,
                 )
                 scope = "since_ok"
-            health = map_health.assess_occupancy(
-                grid, resolution=res, origin_x=ox, origin_y=oy, baseline=baseline
-            )
+            height_rows = None
+            if band_grids:
+                cells = {
+                    band: map_health.align_grid(
+                        occ.to_occupancy_int16(band_grid),
+                        origin_x=float(band_grid.origin_x),
+                        origin_y=float(band_grid.origin_y),
+                        shape=grid.shape,
+                        to_origin_x=ox,
+                        to_origin_y=oy,
+                        resolution=res,
+                    )
+                    for band, band_grid in band_grids.items()
+                    if abs(float(band_grid.resolution) - res) < 1e-9
+                }
+                health, height_rows = map_health.assess_heights(
+                    cells, resolution=res, origin_x=ox, origin_y=oy, baseline=baseline
+                )
+            else:
+                health = map_health.assess_occupancy(
+                    grid, resolution=res, origin_x=ox, origin_y=oy, baseline=baseline
+                )
         except Exception as exc:  # noqa: BLE001
             self._log(f"map health assess failed: {exc}")
             return dict(self._map_health)
         payload = health.as_dict()
         payload["age_s"] = 0.0
         payload["scope"] = scope
+        if height_rows is not None:
+            from .height_bands import BAND_M
+
+            payload["rule"] = "per_height"
+            payload["heights"] = [
+                {
+                    "z_min_m": round(row["band"] * BAND_M, 2),
+                    "z_max_m": round((row["band"] + 1) * BAND_M, 2),
+                    "status": row["raw_status"],
+                    "ghost_frac": row["ghost_frac"],
+                    "occupied_cells": row["occupied_cells"],
+                }
+                for row in height_rows
+            ]
         if self._map_health_base is not None:
             payload["baseline"] = {
                 k: v
@@ -1514,6 +1551,13 @@ class BuiltinSlamEngine:
         if not bool(getattr(cfg, "map_health_auto_clear", False)):
             return None
         if status != "degrading":
+            return None
+        # Clear only for doubled walls. Wall-angle scatter also reads
+        # degrading, but a floor whose walls are not all parallel is not
+        # torn (the same call the resumed-map trust makes): on one robot's
+        # clean single-line walls it read 25-29 degrees per lidar height.
+        if float(health.get("ghost_frac") or 0.0) < float(map_health._DEGRADING_GHOST):
+            self._hotspot_heal_note_skip("not_doubled")
             return None
         if int(track["streak"]) < persist_n:
             return None
@@ -3139,6 +3183,18 @@ class BuiltinSlamEngine:
         """Per-height votes for the scan just read; empty with one height."""
         _bands, votes = self._heights_at(occ_map, pose)
         return votes
+
+    def height_scans(self) -> dict:
+        """Per-height scans of the last lidar read; empty with lidars at one height.
+
+        For searches outside the tick (``global_localize``) that should not
+        let one height's furniture hide another height's walls.
+        """
+        try:
+            bands = self._band_scans(self._mapping_frames())
+        except Exception:  # noqa: BLE001
+            return {}
+        return dict(bands) if len(bands) >= 2 else {}
 
     def _heights_at(self, occ_map: OccupancyMap, pose: conv.Pose2D) -> tuple:
         """``(band scans, votes)`` for the scan just read; empty with one height."""

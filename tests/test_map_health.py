@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from src.slam_builtin import map_health
 
@@ -503,6 +504,7 @@ def test_hotspot_auto_clear_respects_cooldown(tmp_path):
     engine._hotspot_last_clear_at = time.monotonic()  # noqa: SLF001
     health = {
         "status": "degrading",
+        "ghost_frac": 0.42,
         "hotspots": [{"frac": 0.5, "x": 1.0, "y": 2.0}],
     }
     out = engine._maybe_auto_heal_hotspot(health, now=time.monotonic())  # noqa: SLF001
@@ -526,6 +528,7 @@ def test_hotspot_auto_clear_skips_when_too_few_keyframes(tmp_path):
     engine._pose = conv.Pose2D(1.0, 2.0, 0.0)  # noqa: SLF001
     health = {
         "status": "degrading",
+        "ghost_frac": 0.42,
         "hotspots": [{"frac": 0.5, "x": 1.0, "y": 2.0}],
     }
     out = engine._maybe_auto_heal_hotspot(health, now=time.monotonic())  # noqa: SLF001
@@ -548,6 +551,7 @@ def test_hotspot_auto_clear_skips_when_too_far(tmp_path):
     engine._pose = conv.Pose2D(20.0, 20.0, 0.0)  # noqa: SLF001
     health = {
         "status": "degrading",
+        "ghost_frac": 0.42,
         "hotspots": [{"frac": 0.5, "x": 1.0, "y": 2.0}],
     }
     out = engine._maybe_auto_heal_hotspot(health, now=time.monotonic())  # noqa: SLF001
@@ -697,3 +701,116 @@ def test_fresh_map_ok_checkpoint_still_flags_new_double(tmp_path):
     assert out["scope"] == "since_ok"
     assert out["status"] in ("watch", "degrading")
     assert out["hotspots"]
+
+
+# --- Lidars at more than one height ----------------------------------------------
+
+
+# Enough wall for a mature map (2,500 cells), so the score is not held at cold.
+_WALLS = [40, 80, 120, 160, 200, 240, 280]
+
+
+def _wall_cells(shape=(320, 320), *, rows=(), cols=(), span=(20, 300)) -> np.ndarray:
+    """Free floor with straight walls along the given rows and columns."""
+    cells = np.zeros(shape, dtype=np.int16)
+    for r in rows:
+        cells[r, span[0] : span[1]] = 100
+    for c in cols:
+        cells[span[0] : span[1], c] = 100
+    return cells
+
+
+def test_two_heights_that_each_see_one_wall_are_not_a_doubled_wall():
+    # A wall at one height and a shelf 30 cm in front of it at the other.
+    # Fused, they are two ridges with a thin gap: the shape of a wall drawn
+    # twice. Each height alone has single walls.
+    walls = _WALLS
+    low = _wall_cells(rows=[r + 6 for r in walls], cols=[30, 290])
+    high = _wall_cells(rows=walls, cols=[30, 290])
+    fused = np.maximum(low, high)
+    kw = dict(resolution=0.05, origin_x=0.0, origin_y=0.0)
+    whole = map_health.assess_occupancy(fused, **kw)
+    per, rows = map_health.assess_heights({0: low, 4: high}, **kw)
+    assert whole.ghost_frac >= map_health._DEGRADING_GHOST
+    assert per.ghost_frac < map_health._WATCH_GHOST
+    assert [row["band"] for row in rows] == [0, 4]
+    assert all(row["ghost_frac"] < map_health._WATCH_GHOST for row in rows)
+    assert per.occupied_cells == sum(row["occupied_cells"] for row in rows)
+
+
+def test_a_wall_drawn_twice_at_every_height_still_reads_doubled():
+    # A pose error shifts every height together.
+    walls = _WALLS
+    torn = _wall_cells(rows=walls + [r + 7 for r in walls], cols=[30, 290])
+    kw = dict(resolution=0.05, origin_x=0.0, origin_y=0.0)
+    per, _rows = map_health.assess_heights({0: torn, 4: torn.copy()}, **kw)
+    assert per.ghost_frac >= map_health._DEGRADING_GHOST
+    assert per.status == "degrading" and per.hotspots
+
+
+def test_a_height_too_small_to_score_does_not_dilute_the_others():
+    walls = _WALLS
+    torn = _wall_cells(rows=walls + [r + 7 for r in walls], cols=[30, 290])
+    sliver = np.zeros_like(torn)
+    sliver[60, 60:70] = 100  # ten cells: a camera's sliver of a shelf
+    kw = dict(resolution=0.05, origin_x=0.0, origin_y=0.0)
+    alone, _ = map_health.assess_heights({4: torn}, **kw)
+    both, rows = map_health.assess_heights({0: sliver, 4: torn}, **kw)
+    assert rows[0]["status"] == "cold"
+    assert both.ghost_frac == pytest.approx(alone.ghost_frac)
+
+
+def test_engine_scores_each_height_when_it_has_them(tmp_path):
+    from src.slam_builtin import occupancy as occ
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine_heal(tmp_path, map_health_hotspot_persist_n=1)
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    walls = _WALLS
+    low = _wall_cells(rows=[r + 6 for r in walls], cols=[30, 290])
+    high = _wall_cells(rows=walls, cols=[30, 290])
+    kw = dict(resolution=0.05, origin_x=0.0, origin_y=0.0)
+    engine._grid = occ.from_occupancy_int16(np.maximum(low, high), **kw)  # noqa: SLF001
+    engine._height_bands = {  # noqa: SLF001
+        0: occ.from_occupancy_int16(low, **kw),
+        4: occ.from_occupancy_int16(high, **kw),
+    }
+    engine._session_baseline = None  # noqa: SLF001
+    out = engine.refresh_map_health(force=True)
+    assert out["rule"] == "per_height"
+    assert [(h["z_min_m"], h["z_max_m"]) for h in out["heights"]] == [
+        (0.0, 0.25),
+        (1.0, 1.25),
+    ]
+    assert out["ghost_frac"] < map_health._WATCH_GHOST
+    assert out["hotspot_heal"]["clears"] == 0
+
+    # One height only: the fused map is scored, as before. (A fresh engine:
+    # the first, clean score set the since-ok checkpoint on this one.)
+    engine = _engine_heal(tmp_path, map_health_hotspot_persist_n=1)
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    engine._grid = occ.from_occupancy_int16(np.maximum(low, high), **kw)  # noqa: SLF001
+    engine._session_baseline = None  # noqa: SLF001
+    out = engine.refresh_map_health(force=True)
+    assert "rule" not in out and out["ghost_frac"] >= map_health._DEGRADING_GHOST
+
+
+def test_angle_scatter_alone_does_not_auto_clear(tmp_path):
+    import time
+
+    from src.geom import conversions as conv
+    from src.slam_builtin.engine import MODE_MAPPING
+
+    engine = _engine_heal(tmp_path, map_health_hotspot_persist_n=1)
+    engine._mode = MODE_MAPPING  # noqa: SLF001
+    engine._pose = conv.Pose2D(1.0, 2.0, 0.0)  # noqa: SLF001
+    health = {
+        "status": "degrading",
+        "ghost_frac": 0.20,
+        "angle_std_deg": 27.0,
+        "hotspots": [{"frac": 0.5, "x": 1.0, "y": 2.0}],
+    }
+    out = engine._maybe_auto_heal_hotspot(health, now=time.monotonic())  # noqa: SLF001
+    assert out is None
+    assert engine._hotspot_heal["clears"] == 0  # noqa: SLF001
+    assert engine._hotspot_heal["skips"].get("not_doubled", 0) == 1  # noqa: SLF001

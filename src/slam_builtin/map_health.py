@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -168,6 +168,94 @@ def assess_occupancy(
         hotspots=live_hotspots,
         mature=mature,
         raw_status=raw,
+    )
+
+
+def assess_heights(
+    bands: Mapping[int, np.ndarray],
+    *,
+    resolution: float,
+    origin_x: float,
+    origin_y: float,
+    baseline: Optional[np.ndarray] = None,
+    max_hotspots: int = 8,
+) -> Tuple[MapHealth, List[dict]]:
+    """:func:`assess_occupancy` for a map built from lidars at several heights.
+
+    ``bands`` are the per-height grids (same shape and frame as ``baseline``).
+    Each height is scored by itself and the scores are averaged, weighted by
+    each height's wall cells. Scoring the fused map instead pairs a wall seen
+    at one height with a desk edge or shelf seen 20-55 cm in front of it at
+    another, which reads as a wall drawn twice: on a robot with lidars at
+    0.21 m and 1.2 m, the walls one session added scored 27% doubled fused
+    and 14% and 13% per height, and the fused score had already wiped two
+    5 m squares of good map through auto-clear. A real tear comes from the
+    pose, which every height shares, so it shows at every height.
+
+    Returns the combined health and one row per height.
+    """
+    per: List[Tuple[int, MapHealth]] = [
+        (
+            int(band),
+            assess_occupancy(
+                cells,
+                resolution=resolution,
+                origin_x=origin_x,
+                origin_y=origin_y,
+                baseline=baseline,
+                max_hotspots=max_hotspots,
+            ),
+        )
+        for band, cells in sorted(bands.items())
+    ]
+    rows = [{"band": band, **health.as_dict()} for band, health in per]
+    scored = [(band, h) for band, h in per if h.raw_status != "cold"]
+    total = sum(h.occupied_cells for _band, h in per)
+    if not scored:
+        return (
+            MapHealth(
+                status="cold",
+                ghost_frac=0.0,
+                thick_frac=0.0,
+                angle_std_deg=0.0,
+                occupied_cells=total,
+                hotspots=(),
+                mature=False,
+                raw_status="cold",
+            ),
+            rows,
+        )
+    weight = float(sum(h.occupied_cells for _band, h in scored))
+
+    def mean(field: str) -> float:
+        return sum(getattr(h, field) * h.occupied_cells for _band, h in scored) / weight
+
+    ghost_frac = mean("ghost_frac")
+    angle_std = mean("angle_std_deg")
+    mature = total >= _MATURE_OCC_CELLS
+    raw = _status(ghost_frac, angle_std)
+    if not mature and raw in ("watch", "degrading"):
+        status = "cold"
+    else:
+        status = raw
+    hotspots: Tuple[Tuple[float, float, float], ...] = ()
+    if mature and status in ("watch", "degrading"):
+        merged = sorted(
+            (spot for _band, h in scored for spot in h.hotspots), reverse=True
+        )
+        hotspots = tuple(merged[: max(0, int(max_hotspots))])
+    return (
+        MapHealth(
+            status=status,
+            ghost_frac=ghost_frac,
+            thick_frac=mean("thick_frac"),
+            angle_std_deg=angle_std,
+            occupied_cells=total,
+            hotspots=hotspots,
+            mature=mature,
+            raw_status=raw,
+        ),
+        rows,
     )
 
 

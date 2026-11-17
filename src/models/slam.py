@@ -2399,14 +2399,14 @@ class SlamService(SLAM):
             # search (35 cm / 10° did in 46-88% of whole-map office searches).
             return float(command[key]) if command.get(key) is not None else None
 
-        async def _run_match(full_map_override: bool):
+        async def _run_match(full_map_override: bool, match_scan=None):
             default_local_yaw_window = 360.0 if full_map_override else 180.0
             default_ray_weight = 0.55 if full_map_override else 0.35
             default_ray_candidates = 48 if full_map_override else 24
             return await self._localizer.run(
                 "global_localize_scan",
                 occ_map,
-                scan,
+                scan if match_scan is None else match_scan,
                 hint=hint,
                 full_map=full_map_override,
                 search_radius_m=search_radius_m,
@@ -2451,22 +2451,6 @@ class SlamService(SLAM):
                 fallback_used = True
         resolved_full_map = full_map or fallback_used
 
-        prior_score = None
-        prior_ray_mae_m = None
-        if hint is not None:
-            prior_score, prior_ray_mae_m = await self._localizer.run(
-                "score_pose_with_rays",
-                occ_map,
-                scan,
-                hint,
-                max_scan_points=int(command.get("max_scan_points", 240)),
-                min_in_map_points=int(command.get("min_in_map_points", 40)),
-                min_in_map_ratio=float(command.get("min_in_map_ratio", 0.35)),
-                hit_radius_cells=int(command.get("hit_radius_cells", 2)),
-                ray_refine_beams=int(command.get("ray_refine_beams", 64)),
-                ray_step_m=float(command.get("ray_step_m", 0.08)),
-            )
-
         # Refuse to auto-apply a weak or ambiguous full-map peak — that was
         # placing the robot in a "random" corridor that then locked continuous
         # matching. Local refine around a good hint still applies freely.
@@ -2483,31 +2467,94 @@ class SlamService(SLAM):
             )
         )
         refuse_ambiguous = bool(command.get("refuse_ambiguous", resolved_full_map))
-        apply_blocked_reason = None
-        if apply_pose:
-            if float(result.score) < min_apply_score:
-                apply_blocked_reason = "low_score"
-            elif (
-                math.isfinite(float(result.ray_mae_m))
-                and float(result.ray_mae_m) > max_apply_ray_mae_m
-            ):
-                apply_blocked_reason = "high_ray_mae"
-            elif refuse_ambiguous and bool(getattr(result, "ambiguous", False)):
-                apply_blocked_reason = "ambiguous"
 
+        def _gate_reasons(found) -> List[str]:
+            """Every apply limit ``found`` fails, in the order they are reported."""
+            reasons = []
+            if float(found.score) < min_apply_score:
+                reasons.append("low_score")
+            if (
+                math.isfinite(float(found.ray_mae_m))
+                and float(found.ray_mae_m) > max_apply_ray_mae_m
+            ):
+                reasons.append("high_ray_mae")
+            if refuse_ambiguous and bool(getattr(found, "ambiguous", False)):
+                reasons.append("ambiguous")
+            return reasons
+
+        # With lidars at more than one height the merged scan keeps the
+        # nearest return in each direction, so furniture at one height can
+        # hide the walls another height sees. When the merged scan finds no
+        # pose these limits accept, each height searches by itself, and one
+        # that the limits do accept is used instead.
+        height_search = None
+        reasons = _gate_reasons(result)
+        heights = self._height_scans() if reasons else {}
+        if heights:
+            from ..slam_builtin.height_bands import BAND_M
+
+            tried = []
+            usable = []
+            for band in sorted(heights):
+                found = await _run_match(resolved_full_map, heights[band])
+                band_reasons = _gate_reasons(found)
+                tried.append(
+                    {
+                        "z_min_m": round(band * BAND_M, 2),
+                        "z_max_m": round((band + 1) * BAND_M, 2),
+                        "score": round(float(found.score), 3),
+                        "ambiguous": bool(getattr(found, "ambiguous", False)),
+                        "blocked": band_reasons[0] if band_reasons else None,
+                    }
+                )
+                if not band_reasons:
+                    usable.append((float(found.score), band, found))
+            height_search = {"merged_blocked": reasons[0], "heights": tried}
+            if usable:
+                _score, band, found = max(usable, key=lambda item: item[0])
+                result = found
+                scan = heights[band]
+                height_search["used"] = {
+                    "z_min_m": round(band * BAND_M, 2),
+                    "z_max_m": round((band + 1) * BAND_M, 2),
+                }
+
+        prior_score = None
+        prior_ray_mae_m = None
+        if hint is not None:
+            prior_score, prior_ray_mae_m = await self._localizer.run(
+                "score_pose_with_rays",
+                occ_map,
+                scan,
+                hint,
+                max_scan_points=int(command.get("max_scan_points", 240)),
+                min_in_map_points=int(command.get("min_in_map_points", 40)),
+                min_in_map_ratio=float(command.get("min_in_map_ratio", 0.35)),
+                hit_radius_cells=int(command.get("hit_radius_cells", 2)),
+                ray_refine_beams=int(command.get("ray_refine_beams", 64)),
+                ray_step_m=float(command.get("ray_step_m", 0.08)),
+            )
+
+        reasons = _gate_reasons(result) if apply_pose else []
         # Seeded local refine (UI auto-refine / set_initial_pose): if the match
-        # clearly beats the seed prior, apply even when below the absolute score
-        # floor. Otherwise a nearly-right XY with wrong heading stays stuck —
-        # best local peak is often ~0.30 while min_apply_score defaults to 0.35.
+        # clearly beats the seed prior, apply even when below the score limit.
+        # Otherwise a nearly-right XY with wrong heading stays stuck — best
+        # local peak is often ~0.30 while min_apply_score defaults to 0.35.
+        # This relaxes the score limit only, never below a floor, and never
+        # the ray error or ambiguity limits: beating a prior that matches
+        # nothing proves nothing. On a lost cart this applied four matches
+        # scoring -0.11 to -0.14 with 1.7-1.9 m of ray error and turned the
+        # heading through 160 degrees.
         if (
-            apply_pose
-            and apply_blocked_reason == "low_score"
+            "low_score" in reasons
             and not resolved_full_map
             and prior_score is not None
             and math.isfinite(float(prior_score))
             and float(result.score) >= float(prior_score) + 0.08
+            and float(result.score) >= self._SEEDED_APPLY_MIN_SCORE
         ):
-            apply_blocked_reason = None
+            reasons.remove("low_score")
+        apply_blocked_reason = reasons[0] if reasons else None
 
         did_apply = False
         if apply_pose and apply_blocked_reason is None:
@@ -2565,7 +2612,25 @@ class SlamService(SLAM):
         if prior_score is not None:
             out["prior_score"] = prior_score
             out["prior_ray_mae_m"] = prior_ray_mae_m
+        if height_search is not None:
+            out["height_search"] = height_search
         return out
+
+    # A seeded refine that beats its prior may apply below the score limit,
+    # but not below this: about half of the judged returns on a wall. Below
+    # it the scan agrees with the map no better than with empty space.
+    _SEEDED_APPLY_MIN_SCORE = 0.15
+
+    def _height_scans(self) -> dict:
+        """Per-height scans of the last lidar read; empty with one height."""
+        engine = self._engine
+        fn = getattr(engine, "height_scans", None)
+        if not callable(fn):
+            return {}
+        try:
+            return dict(fn())
+        except Exception:  # noqa: BLE001
+            return {}
 
     async def _resolve_relocalize_seed(
         self, command: Mapping[str, ValueTypes]
