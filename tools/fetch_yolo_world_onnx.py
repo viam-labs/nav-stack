@@ -8,6 +8,9 @@ Class prompts live in the sibling ``.classes.json`` (shipped in-module).
   python tools/fetch_yolo_world_onnx.py --export   # force local ultralytics export
 
 Env override: ``NAV_STACK_YOLO_WORLD_URL``.
+
+The module runs this itself the first time vision is enabled
+(``src/semantic/provision.py``), with ``--no-export``.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -29,6 +33,17 @@ DEFAULT_URL = os.environ.get(
     + DEFAULT_NAME,
 )
 _MIN_ONNX_BYTES = 5_000_000
+# A connection that sends nothing for this long is given up on.
+STALL_TIMEOUT_S = 60.0
+
+
+def download(url: str, dest: Path) -> None:
+    """Save ``url`` to ``dest``; a connection that stalls raises instead of hanging."""
+    with (
+        urllib.request.urlopen(url, timeout=STALL_TIMEOUT_S) as resp,
+        open(dest, "wb") as fh,
+    ):
+        shutil.copyfileobj(resp, fh, length=1 << 20)
 
 
 def class_list_rev(classes_path: Path) -> str:
@@ -59,7 +74,7 @@ def write_stamp(onnx_path: Path, classes_path: Path) -> None:
         stamp_path(onnx_path).write_text(expected + "\n")
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--out",
@@ -72,9 +87,14 @@ def main() -> int:
         action="store_true",
         help="skip download; run export_yolo_world_onnx.py",
     )
+    ap.add_argument(
+        "--no-export",
+        action="store_true",
+        help="fail when the download fails, without the local ultralytics export",
+    )
     ap.add_argument("--size", choices=("n", "s", "m", "l", "x"), default="s")
     ap.add_argument("--imgsz", type=int, default=640)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     out: Path = args.out.resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -89,7 +109,7 @@ def main() -> int:
         print(f"downloading {args.url}")
         partial = out.with_suffix(".onnx.partial")
         try:
-            urllib.request.urlretrieve(args.url, partial)
+            download(args.url, partial)
             if partial.stat().st_size < _MIN_ONNX_BYTES:
                 raise RuntimeError(f"download too small ({partial.stat().st_size} B)")
             partial.replace(out)
@@ -104,6 +124,9 @@ def main() -> int:
                     f"download failed ({exc}); keeping existing {out.name}",
                     file=sys.stderr,
                 )
+                return 1
+            if args.no_export:
+                print(f"download failed ({exc})")
                 return 1
             print(f"download failed ({exc}); falling back to local export…")
             if out.is_file():

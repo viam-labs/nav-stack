@@ -4,10 +4,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Exclude large ONNX weights from the module archive (fetch separately on the
-# robot via tools/fetch_dinov2_onnx.py / GitHub release assets).
+# Exclude large ONNX weights from the module archive. The module downloads
+# them (tools/fetch_*_onnx.py, GitHub release assets) the first time vision
+# is enabled; requirements-vision.txt is installed then too.
 tar -czf module.tar.gz \
     --exclude='src/semantic/models/*.onnx' \
+    --exclude='src/semantic/models/*.partial' \
+    --exclude='src/semantic/models/*.stamp' \
     --exclude='**/__pycache__' \
     --exclude='*.pyc' \
     meta.json \

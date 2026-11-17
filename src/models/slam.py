@@ -151,6 +151,11 @@ class SlamService(SLAM):
         self._localize = LocalizeSupervisor(self)
         # RGB-D side-channel: recovery keyframes and the person mask.
         self._vision = None
+        # Installs ONNX Runtime / downloads weights the first time vision is
+        # enabled, then starts the supervisor. ``_vision_runtime`` is its report.
+        self._vision_prepare_task: Optional[asyncio.Task] = None
+        self._vision_prepare_cancel: Optional[threading.Event] = None
+        self._vision_runtime: Optional[dict] = None
         self._framesystem_task: Optional[asyncio.Task] = None
         self._framesystem_gen = 0
         self._framesystem_raw_attrs: Optional[Mapping] = None
@@ -1726,13 +1731,11 @@ class SlamService(SLAM):
         status["localization_check"] = dict(self._last_relocalize_check)
         status["localization_state"] = self._loc_state.snapshot()
         status["revisit_check"] = dict(self._last_revisit_check)
-        if self._vision is not None:
-            status["vision"] = self._vision.status()
-        elif self._cfg is not None:
-            status["vision"] = {
-                "enabled": bool(self._cfg.vision_enabled),
-                "reason": "not_running",
-            }
+        if self._vision is not None or self._cfg is not None:
+            enabled = self._cfg is not None and bool(self._cfg.vision_enabled)
+            status["vision"] = self._vision_report(
+                {"enabled": enabled, "reason": "not_running"}
+            )
         if self._pause_keyframes is not None:
             status["pause_keyframes"] = self._pause_keyframes.status()
         shm_status = self._shm_lidar.status()
@@ -2607,12 +2610,36 @@ class SlamService(SLAM):
         self, command: Mapping[str, ValueTypes]
     ) -> Mapping[str, ValueTypes]:
         del command
+        return self._vision_report({"enabled": False, "reason": "vision not running"})
+
+    def _vision_report(self, idle: Mapping[str, ValueTypes]) -> dict:
+        """Supervisor status, or ``idle`` when there is none, plus the runtime report."""
         vision = self._vision
-        if vision is None:
-            return {"enabled": False, "reason": "vision not running"}
-        return vision.status()
+        runtime = self._vision_runtime
+        task = self._vision_prepare_task
+        if vision is not None:
+            out = dict(vision.status())
+        elif task is not None and not task.done():
+            # Enabled in the config; still installing / downloading.
+            out = {"enabled": True, "reason": "preparing"}
+        else:
+            out = dict(idle)
+        if runtime is not None:
+            out["runtime"] = dict(runtime)
+        return out
 
     def _stop_vision(self) -> None:
+        # Stop a download or install in flight, so nothing outlives the
+        # config that asked for it (or holds up a shutdown).
+        cancel = self._vision_prepare_cancel
+        self._vision_prepare_cancel = None
+        if cancel is not None:
+            cancel.set()
+        task = self._vision_prepare_task
+        self._vision_prepare_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        self._vision_runtime = None
         vision = self._vision
         self._vision = None
         if vision is not None:
@@ -2622,10 +2649,98 @@ class SlamService(SLAM):
                 pass
 
     def _start_vision(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start vision if the config enables it; otherwise nothing is loaded.
+
+        With the real models, ONNX Runtime and the weights are put in place
+        first, on a worker thread (``src/semantic/provision.py``): nothing of
+        vision is installed until a config turns it on, and nothing has to be
+        installed by hand. A step that fails is tried again until it works.
+        """
         self._stop_vision()
         cfg = self._cfg
+        if cfg is None or self._engine is None or not cfg.vision_enabled:
+            return
+        from ..semantic import provision
+
+        if not provision.uses_models(cfg):
+            self._launch_vision(loop)
+            return
+        self._vision_runtime = {"state": "preparing"}
+        cancel = threading.Event()
+        self._vision_prepare_cancel = cancel
+        self._vision_prepare_task = loop.create_task(
+            self._prepare_then_launch_vision(loop, cfg, cancel), name="vision-prepare"
+        )
+
+    async def _prepare_then_launch_vision(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        cfg: SlamConfig,
+        cancel: threading.Event,
+    ) -> None:
+        """Get the runtime in place and start vision, retrying until it is all there."""
+        from ..semantic import provision
+
+        attempts = 0
+        delay = float(provision.RETRY_FIRST_S)
+        detector_ok = False
+        while True:
+            try:
+                report = await asyncio.to_thread(
+                    provision.prepare, cfg, LOGGER.info, cancel=cancel
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                report = {
+                    "state": "failed",
+                    "steps": {"onnxruntime": f"failed: {exc!r}"},
+                }
+            # A reconfigure or close while this ran has already moved on.
+            if cancel.is_set() or self._cfg is not cfg or self._engine is None:
+                return
+            attempts += 1
+            ready = report.get("state") == "ready"
+            runtime = {**report, "attempts": attempts}
+            if not ready:
+                runtime.update(state="retrying", retry_in_s=round(delay))
+            self._vision_runtime = runtime
+            if self._vision is None:
+                # Keyframes and recovery need ONNX Runtime and DINOv2. The
+                # detector only feeds the person mask and may come later.
+                if provision.essentials_ready(report):
+                    detector_ok = provision.step_ok(report, "yolo_world")
+                    try:
+                        self._launch_vision(loop)
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.exception("vision: failed to start")
+                        self._vision_runtime = {
+                            **runtime,
+                            "state": "failed",
+                            "error": repr(exc),
+                        }
+                        return
+            elif not detector_ok and provision.step_ok(report, "yolo_world"):
+                detector_ok = bool(self._vision.load_detector())
+            if ready:
+                return
+            missing = sorted(
+                name
+                for name, outcome in (report.get("steps") or {}).items()
+                if str(outcome).startswith("failed")
+            )
+            LOGGER.warning(
+                "vision: still missing %s; trying again in %.0f s",
+                ", ".join(missing) or "a step",
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2.0, float(provision.RETRY_MAX_S))
+
+    def _launch_vision(self, loop: asyncio.AbstractEventLoop) -> None:
+        cfg = self._cfg
         engine = self._engine
-        if cfg is None or engine is None or not cfg.vision_enabled:
+        if cfg is None or engine is None:
             return
         from ..semantic.supervisor import VisionSupervisor
 

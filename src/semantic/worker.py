@@ -157,26 +157,38 @@ class VisionWorker:
             self._provider = "synthetic"
             self.stats["provider"] = self._provider
             return
-        if self.cfg.yolo_onnx:
-            try:
-                # Keep YOLO-World on CPU FP32. OpenVINO GPU FP16 (used for
-                # DINOv2) collapses open-vocab class scores to ~0 on Meerkat.
-                self._yolo, self._yolo_info = make_session(
-                    self.cfg.yolo_onnx,
-                    cpu_threads=self.cfg.cpu_threads,
-                    prefer_openvino=False,
-                    prefer_cuda=False,
-                )
-                self.stats["yolo_loaded"] = True
-                self.stats["yolo_provider"] = self._yolo_info.provider
-            except Exception as exc:  # noqa: BLE001
-                self.stats["last_error"] = f"yolo: {exc}"
-                self._yolo = None
-                self.stats["yolo_loaded"] = False
-                self.stats["yolo_provider"] = None
-        else:
-            self.stats["yolo_loaded"] = False
-            self.stats["yolo_provider"] = None
+        self.load_detector()
+
+    def load_detector(self) -> bool:
+        """(Re)load the detector from ``cfg.yolo_onnx``; False when there is none.
+
+        Separate from the DINOv2 load so detector weights that arrive after
+        the worker started can be picked up without restarting it.
+        """
+        self.stats["yolo_loaded"] = False
+        self.stats["yolo_provider"] = None
+        if self.cfg.synthetic or not self.cfg.yolo_onnx:
+            self._yolo = None
+            return False
+        from .onnx_session import make_session
+
+        try:
+            # Keep YOLO-World on CPU FP32. OpenVINO GPU FP16 (used for
+            # DINOv2) collapses open-vocab class scores to ~0 on Meerkat.
+            session, info = make_session(
+                self.cfg.yolo_onnx,
+                cpu_threads=self.cfg.cpu_threads,
+                prefer_openvino=False,
+                prefer_cuda=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.stats["last_error"] = f"yolo: {exc}"
+            self._yolo = None
+            return False
+        self._yolo, self._yolo_info = session, info
+        self.stats["yolo_loaded"] = True
+        self.stats["yolo_provider"] = info.provider
+        return True
 
     def close(self) -> None:
         self._dino = None

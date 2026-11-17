@@ -131,12 +131,8 @@ class VisionSupervisor:
         input_size = int(cfg.vision_input_size) if not want_synthetic else 224
         if input_size < 14:
             input_size = 224
-        yolo_path = _resolve_model_path(str(cfg.vision_yolo_onnx or ""))
-        if not str(cfg.vision_yolo_onnx or "").strip() and not want_synthetic:
-            candidate = _resolve_model_path(_DEFAULT_YOLO_WORLD_ONNX)
-            if candidate and Path(candidate).is_file():
-                yolo_path = candidate
-        self._yolo_path = yolo_path or ""
+        yolo_path = self._detector_path(synthetic=want_synthetic)
+        self._yolo_path = yolo_path
         detector_classes = _resolve_detector_classes(
             yolo_path,
             configured=list(cfg.vision_detector_classes or []),
@@ -159,6 +155,40 @@ class VisionSupervisor:
                 f"vision: DINOv2 load failed ({self._worker.stats.get('last_error')}); "
                 "falling back to synthetic"
             )
+
+    def _detector_path(self, *, synthetic: bool) -> str:
+        """The configured detector file, else the default one if it is on disk."""
+        configured = str(self._cfg.vision_yolo_onnx or "").strip()
+        if configured:
+            return _resolve_model_path(configured)
+        if synthetic:
+            return ""
+        candidate = _resolve_model_path(_DEFAULT_YOLO_WORLD_ONNX)
+        return candidate if candidate and Path(candidate).is_file() else ""
+
+    def load_detector(self) -> bool:
+        """Pick up detector weights that arrived after vision started.
+
+        The person mask is not needed to store keyframes or recover a pose,
+        so vision starts without it and this turns it on when the download
+        finishes. Keyframes collected meanwhile are kept.
+        """
+        worker = self._worker
+        if worker.cfg.synthetic:
+            return False
+        path = self._detector_path(synthetic=False)
+        if not path or not Path(path).is_file():
+            return False
+        worker.cfg.detector_classes = _resolve_detector_classes(
+            path, configured=list(self._cfg.vision_detector_classes or [])
+        )
+        worker.cfg.yolo_onnx = path
+        self._yolo_path = path
+        loaded = worker.load_detector()
+        self._log(
+            f"vision: detector {'loaded' if loaded else 'failed to load'} from {path}"
+        )
+        return loaded
 
     def _log(self, msg: str) -> None:
         if self._logger is None:
@@ -259,10 +289,9 @@ class VisionSupervisor:
         )
         if not yolo_loaded:
             self._log(
-                "vision: YOLO detector not loaded, so people are not masked "
-                "out of the map. Ensure setup/run fetched "
-                f"{_DEFAULT_YOLO_WORLD_ONNX} (vision_status.yolo_onnx / "
-                "worker.yolo_loaded)."
+                "vision: detector not loaded, so people are not masked out of "
+                "the map. The default weights are downloaded automatically and "
+                "loaded when they arrive (vision_status.runtime)."
             )
 
     def _stop_loop(self) -> None:

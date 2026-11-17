@@ -9,12 +9,16 @@ Default destination: ``src/semantic/models/dinov2_vits14_patches_448.onnx``
   python tools/fetch_dinov2_onnx.py --export   # force local torch export
 
 Env override: ``NAV_STACK_DINOV2_URL``.
+
+The module runs this itself the first time vision is enabled
+(``src/semantic/provision.py``), with ``--no-export``.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -28,9 +32,21 @@ DEFAULT_URL = os.environ.get(
     "https://github.com/viam-labs/nav-stack/releases/download/v1.2.0-rc6/"
     + DEFAULT_NAME,
 )
+_MIN_ONNX_BYTES = 1_000_000
+# A connection that sends nothing for this long is given up on.
+STALL_TIMEOUT_S = 60.0
 
 
-def main() -> int:
+def download(url: str, dest: Path) -> None:
+    """Save ``url`` to ``dest``; a connection that stalls raises instead of hanging."""
+    with (
+        urllib.request.urlopen(url, timeout=STALL_TIMEOUT_S) as resp,
+        open(dest, "wb") as fh,
+    ):
+        shutil.copyfileobj(resp, fh, length=1 << 20)
+
+
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--out",
@@ -41,27 +57,41 @@ def main() -> int:
     ap.add_argument(
         "--export", action="store_true", help="skip download; run export_dinov2_onnx.py"
     )
+    ap.add_argument(
+        "--no-export",
+        action="store_true",
+        help="fail when the download fails, without the local torch export",
+    )
     ap.add_argument("--size", type=int, default=448)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     out: Path = args.out.resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
-    if out.is_file() and out.stat().st_size > 1_000_000:
+    if out.is_file() and out.stat().st_size > _MIN_ONNX_BYTES:
         print(f"already present: {out} ({out.stat().st_size / 1e6:.1f} MB)")
         return 0
 
     if not args.export:
         print(f"downloading {args.url}")
+        # Download beside the target and rename, so an interrupted download
+        # is never mistaken for the weights.
+        partial = out.with_suffix(".onnx.partial")
         try:
-            urllib.request.urlretrieve(args.url, out)
-            if out.stat().st_size < 1_000_000:
-                raise RuntimeError(f"download too small ({out.stat().st_size} B)")
+            download(args.url, partial)
+            if partial.stat().st_size < _MIN_ONNX_BYTES:
+                raise RuntimeError(f"download too small ({partial.stat().st_size} B)")
+            partial.replace(out)
             print(f"saved {out} ({out.stat().st_size / 1e6:.1f} MB)")
             return 0
         except Exception as exc:  # noqa: BLE001
-            print(f"download failed ({exc}); falling back to local export…")
+            if partial.is_file():
+                partial.unlink()
             if out.is_file():
                 out.unlink()
+            if args.no_export:
+                print(f"download failed ({exc})")
+                return 1
+            print(f"download failed ({exc}); falling back to local export…")
 
     export = ROOT / "tools" / "export_dinov2_onnx.py"
     cmd = [sys.executable, str(export), "--size", str(args.size), "--out", str(out)]

@@ -12,29 +12,50 @@ Weights are **not** committed to git and are excluded from `module.tar.gz`.
 | YOLOv8n (COCO) | `yolov8n.onnx` | Works too: it has `person` |
 | Site head (phase 7) | `head.onnx` | Optional; replaces per-map PCA |
 
-## Auto-install
+## Installed on first use, automatically
 
-`setup.sh` (and `run.sh` on upgrade) install `requirements-vision.txt` and
-fetch `dinov2_vits14_patches_448.onnx` when missing. No manual
-`NAV_STACK_VISION` flag.
+Vision is off by default, and `setup.sh` / `run.sh` install nothing for it.
+Enabling it in the config (below) is the only step. The SLAM service then
+puts the runtime in place in the background (`src/semantic/provision.py`):
 
-To re-fetch / export by hand:
+1. `pip install -r requirements-vision.txt` into the module's environment if
+   ONNX Runtime is missing (the CPU build if the OpenVINO one has no wheel).
+2. Download `dinov2_vits14_patches_448.onnx` (88 MB) if missing.
+3. Download `yolov8s-worldv2-indoor.onnx` (50 MB) if missing or baked from an
+   older class list.
 
-```bash
-python tools/fetch_dinov2_onnx.py
-python tools/fetch_yolo_world_onnx.py
-# Optional local rebuilds (torch / ultralytics):
-python tools/export_dinov2_onnx.py --size 448
-python tools/export_yolo_world_onnx.py
-```
+SLAM and navigation run meanwhile. Vision starts as soon as ONNX Runtime and
+DINOv2 are there; the detector only feeds the person mask and is loaded into
+the running vision when it arrives.
 
-`setup.sh` / `run.sh` fetch both ONNX files automatically when missing.
+Nothing has to be run by hand, including after a failure. If the robot is
+offline or a download fails, the service tries again by itself: after 30 s,
+then doubling up to every 10 minutes, for as long as vision is enabled.
+A robot that was offline gets vision once it is online. Each step has a time
+limit and a download that stalls for 60 s is dropped, so a bad connection
+cannot hold the module.
+
+`vision_status` tells you where it is:
+
+| `vision_status` | Meaning |
+| --- | --- |
+| `"reason": "preparing"` | Not started yet: installing or downloading |
+| `runtime.state` | `preparing` (first attempt), `retrying` (with `retry_in_s`), `ready` |
+| `runtime.steps` | Per step: `present`, `installed`, `fetched`, or `failed: why` |
+| `runtime.attempts` | How many times it has tried |
+
+`tools/fetch_*_onnx.py` are what the service runs, and
+`tools/export_*_onnx.py` rebuild the release assets. A robot does not need
+either run for it.
+
 You do **not** need to set `vision_dinov2_onnx` / `vision_yolo_onnx` for the
 defaults — empty config resolves to:
 
 - `dinov2_vits14_patches_448.onnx`
 - `yolov8s-worldv2-indoor.onnx` (+ class list from
   `yolov8s-worldv2-indoor.classes.json`)
+
+A path you do set is your file and is never downloaded.
 
 ```json
 "vision_enabled": true,

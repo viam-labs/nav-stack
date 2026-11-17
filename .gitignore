@@ -220,9 +220,12 @@ __marimo__/
 .streamlit/secrets.toml
 
 module.tar.gz
-# DINOv2 / YOLO-World weights (setup.sh / tools/fetch_*.py; attach to releases)
+# DINOv2 / YOLO-World weights (tools/fetch_*.py; attach to releases)
 src/semantic/models/*.onnx
+src/semantic/models/*.partial
 src/semantic/models/*.stamp
+# Local model downloads kept beside the repo
+/weights/
 yolov8*-worldv2*.pt
 yolov8*-worldv2*.onnx
 scripts/watch_describe_motion.py
