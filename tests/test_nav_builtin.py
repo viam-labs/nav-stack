@@ -1193,6 +1193,34 @@ def test_pursuit_rotate_to_heading_has_hysteresis():
     assert not done_rot and cmd_exit.vx > 0.0
 
 
+def test_supervisor_takes_rotate_thresholds_from_config():
+    """A 30 degree bend is an arc by default and a spin once the entry is lowered."""
+    from src.config import NavConfig
+    from src.nav.control.controller import pursuit_command
+    from src.nav.control.supervisor import NavSupervisor
+
+    def _follower(builtin: dict) -> FollowerConfig:
+        cfg = NavConfig.from_dict(
+            {"slam_service": "slam", "base": "b", "builtin": builtin}
+        )
+        sup = NavSupervisor(_FakeWorld(Pose2D(1.0, 1.0, 0.0), _empty_map()), cfg)
+        return sup._follower
+
+    current = Pose2D(0.0, 0.0, 0.0)
+    bend = Pose2D(
+        0.6 * math.cos(math.radians(30.0)), 0.6 * math.sin(math.radians(30.0)), 0.0
+    )
+
+    cmd, rotating = pursuit_command(current, bend, cfg=_follower({}))
+    assert not rotating and cmd.vx > 0.0
+
+    tight = _follower({"rotate_in_place_rad": 0.26, "rotate_exit_rad": 0.09})
+    assert tight.rotate_in_place_rad == pytest.approx(0.26)
+    assert tight.rotate_exit_rad == pytest.approx(0.09)
+    cmd, rotating = pursuit_command(current, bend, cfg=tight)
+    assert rotating and cmd.vx == 0.0 and cmd.vtheta > 0.0
+
+
 def test_keep_arc_drivable_preserves_curvature_at_crawl():
     from src.nav.control.controller import DriveCommand, keep_arc_drivable
 

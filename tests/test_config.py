@@ -742,6 +742,29 @@ def test_builtin_recovery_wait_defaults():
     assert tuned.builtin.recovery_wait_duration_s == pytest.approx(3.5)
 
 
+def test_builtin_rotate_in_place_thresholds():
+    cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
+    assert cfg.builtin.rotate_in_place_rad == pytest.approx(math.radians(60.0))
+    assert cfg.builtin.rotate_exit_rad == pytest.approx(math.radians(25.0))
+    tuned = NavConfig.from_dict(
+        {
+            "slam_service": "slam",
+            "base": "b",
+            "builtin": {"rotate_in_place_rad": 0.26, "rotate_exit_rad": 0.09},
+        }
+    )
+    assert tuned.builtin.rotate_in_place_rad == pytest.approx(0.26)
+    assert tuned.builtin.rotate_exit_rad == pytest.approx(0.09)
+    # An exit above the entry would never let the spin start and stay.
+    for bad in (
+        {"rotate_in_place_rad": 0.2, "rotate_exit_rad": 0.3},
+        {"rotate_exit_rad": 0.0},
+        {"rotate_in_place_rad": 0.1},
+    ):
+        with pytest.raises(ValueError, match="rotate_exit_rad"):
+            NavConfig.from_dict({"slam_service": "slam", "base": "b", "builtin": bad})
+
+
 def test_builtin_follower_snake_defaults():
     """Defaults tuned to damp mid-path S-curve hunting on skid-steer."""
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})

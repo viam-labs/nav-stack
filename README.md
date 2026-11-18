@@ -322,6 +322,13 @@ Tune replan rate and recoveries under the `builtin` attribute block
 (`replan_period_s`, `recovery_wait_duration_s`, backup settings). Changes apply
 on reconfigure.
 
+The follower drives arcs through bends and only stops to turn in place when the
+path ahead bears more than `builtin.rotate_in_place_rad` off the heading
+(default 1.05, 60 degrees), turning until it is under `builtin.rotate_exit_rad`
+(default 0.44, 25 degrees). For a base that turns slowly or tracks arcs badly,
+lower both, for example to 0.26 and 0.09, and it turns, drives straight and
+turns again.
+
 Set `"kinematics": "omni"` and a non-zero `max_vel_y` for omnidirectional bases.
 
 ### Navigation with an external SLAM service

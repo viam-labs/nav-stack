@@ -565,6 +565,14 @@ class BuiltinNavConfig:
     max_goal_snap_m: float = 0.5
     # Final approach: cap linear speed within this distance of the goal.
     approach_dist_m: float = 0.35
+    # Stop and turn in place when the path ahead bears more than
+    # ``rotate_in_place_rad`` off the heading, and keep turning until it is
+    # under ``rotate_exit_rad``. Between the two the robot drives an arc. The
+    # defaults suit a base that can hold an arc. Lower both (say 0.26 and
+    # 0.09) for a base that turns slowly or tracks arcs badly, so it turns,
+    # drives straight and turns again.
+    rotate_in_place_rad: float = math.radians(60.0)
+    rotate_exit_rad: float = math.radians(25.0)
     # Post-process global plans (shortcut + resample) before following.
     # Coarser densify: cell-scale jogs feed pure-pursuit κ flicker on straights.
     smooth_path: bool = True
@@ -679,7 +687,13 @@ class BuiltinNavConfig:
             overrides["local_costmap_rate_hz"] = _positive_hz(
                 d["local_costmap_rate_hz"], "local_costmap_rate_hz"
             )
-        return _dataclass_from_dict(cls, d, overrides=overrides)
+        cfg = _dataclass_from_dict(cls, d, overrides=overrides)
+        if not 0.0 < cfg.rotate_exit_rad <= cfg.rotate_in_place_rad:
+            raise ValueError(
+                "builtin.rotate_exit_rad must be above 0 and no larger than "
+                "builtin.rotate_in_place_rad"
+            )
+        return cfg
 
 
 @dataclass

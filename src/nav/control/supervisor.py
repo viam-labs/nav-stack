@@ -277,6 +277,8 @@ class NavSupervisor:
             min_lookahead_m=b.min_lookahead_m,
             max_lookahead_m=b.max_lookahead_m,
             approach_dist_m=b.approach_dist_m,
+            rotate_in_place_rad=b.rotate_in_place_rad,
+            rotate_exit_rad=b.rotate_exit_rad,
             waypoint_tolerance_m=max(0.1, b.xy_goal_tolerance),
             # Keeps translating arcs above the base's inner-wheel "nearly 0 RPM"
             # rejection. From the footprint width when configured, else ≈0.6·r.
