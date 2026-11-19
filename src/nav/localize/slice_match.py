@@ -8,7 +8,7 @@ above low furniture), so we accumulate sparse per-band occupancy grids from
 pause scans during a mapping session and require a revisit-correction pose to
 also agree with every band that has reference data nearby.
 
-Pure Python/numpy (no ROS) so it unit-tests like conversions.py.
+Pure Python/numpy so it unit-tests like conversions.py.
 """
 
 from __future__ import annotations

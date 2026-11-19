@@ -14,7 +14,7 @@ import numpy as np
 
 from ..geom import conversions as conv
 
-# Occupancy conventions match nav-stack / ROS: -1 unknown, 0 free, 100 occupied.
+# Occupancy conventions match nav-stack: -1 unknown, 0 free, 100 occupied.
 _OCCUPIED_MIN = 50
 
 
@@ -126,7 +126,7 @@ class SimWorld:
         seed = seed_pose or conv.Pose2D(1.0, 1.0, 0.0)
         self._seed = conv.Pose2D(seed.x, seed.y, seed.theta)
         self._pose = conv.Pose2D(seed.x, seed.y, seed.theta)
-        self._vx = 0.0  # ROS body m/s
+        self._vx = 0.0  # body m/s, +x forward
         self._vy = 0.0
         self._vtheta = 0.0  # rad/s
         self._last_integrate_at = time.monotonic()
@@ -151,8 +151,8 @@ class SimWorld:
             self._odom_pose = conv.Pose2D(pose.x, pose.y, pose.theta)
             self._last_integrate_at = time.monotonic()
 
-    def set_velocity_ros(self, vx: float, vy: float, vtheta: float) -> None:
-        """Command body-frame twist in ROS convention (x forward, yaw CCW)."""
+    def set_body_velocity(self, vx: float, vy: float, vtheta: float) -> None:
+        """Command body-frame twist (x forward, y left, yaw CCW)."""
         with self._lock:
             self._integrate_unlocked(time.monotonic())
             self._vx = float(vx)
@@ -160,7 +160,7 @@ class SimWorld:
             self._vtheta = float(vtheta)
 
     def stop(self) -> None:
-        self.set_velocity_ros(0.0, 0.0, 0.0)
+        self.set_body_velocity(0.0, 0.0, 0.0)
 
     def get_pose(self) -> conv.Pose2D:
         with self._lock:

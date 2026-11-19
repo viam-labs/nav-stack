@@ -86,8 +86,8 @@ class NavCamera(Camera):
             window_max_x=cfg.window_max_x,
             window_max_y=cfg.window_max_y,
         )
-        # The bridge is resolved lazily per frame: Nav2 bringup is asynchronous,
-        # so the bridge/costmap may not exist yet when this camera configures.
+        # The bridge is resolved lazily per frame: the navigation service may
+        # configure after this camera, so the bridge/costmap may not exist yet.
         LOGGER.info(
             f"nav-stack nav-camera '{self.name}' rendering navigation "
             f"{cfg.navigation!r}"

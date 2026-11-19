@@ -1,4 +1,4 @@
-"""Tests for Nav2 plan-without-execute helpers and DoCommands."""
+"""Tests for plan-without-execute helpers and DoCommands."""
 
 from __future__ import annotations
 

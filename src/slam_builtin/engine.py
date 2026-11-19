@@ -176,7 +176,7 @@ class BuiltinSlamEngine:
         # Anti-oscillation: require two agreeing frames before applying a jump.
         self._pending_match: Optional[conv.Pose2D] = None
         self._pending_count = 0
-        # Cached ROS-style grid for scan matching (invalidated on map edits).
+        # Cached int16 occupancy grid for scan matching (invalidated on map edits).
         self._occ_cache: Optional[OccupancyMap] = None
         self._occ_cache_epoch = -1
         self._match_epoch = 0

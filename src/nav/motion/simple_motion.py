@@ -1,7 +1,7 @@
 """Closed-loop map-frame navigation via Viam base ``SetVelocity``.
 
 Mirrors MiR manual-mode ``drive_to_pose`` but uses SLAM map poses (meters/radians)
-instead of the MiR REST map. No Nav2 required.
+instead of the MiR REST map.
 """
 
 from __future__ import annotations
@@ -48,8 +48,8 @@ class ObstacleConfig:
     """Reactive forward-obstacle avoidance for simple go_to_* motion.
 
     This is *not* a planner: it only slows, stops, or turns the robot away from
-    returns in a forward cone. It cannot route around large obstacles — use Nav2
-    (``navigate_to_*``) for that.
+    returns in a forward cone. It cannot route around large obstacles — use the
+    planner (``navigate_to_*``) for that.
     """
 
     enabled: bool = True
@@ -67,7 +67,7 @@ class ObstacleConfig:
     # corridor wall swept through the front cone (~0.3–0.5 m), then soft loc
     # could resume translating while still misaligned toward an obstacle.
     spin_collision_m: float = 0.22
-    # Ignore scans older than this. Generous by default: MiR rosbridge lidar
+    # Ignore scans older than this. Generous by default: MiR lidar
     # reads can lag, and a too-tight window makes get_base_scan return None so
     # avoidance silently no-ops (robot drives blind).
     max_age_s: float = 2.0
@@ -398,7 +398,7 @@ def compute_drive_command(
     cfg: SimpleMotionConfig,
     linear_mps: float,
 ) -> DriveCommand:
-    """One control step toward ``goal`` in the map frame (ROS body-frame cmd)."""
+    """One control step toward ``goal`` in the map frame (body-frame cmd)."""
     dist = distance_m(current, goal)
     heading_to_goal = math.atan2(goal.y - current.y, goal.x - current.x)
     bearing_error = heading_error_rad(current.theta, heading_to_goal)

@@ -138,7 +138,7 @@ class SimBase(Base):
         vx, vy, vtheta = viam_set_velocity_to_body_twist(
             linear.x, linear.y, angular.z, self._convention
         )
-        self._require_world().set_velocity_ros(vx, vy, vtheta)
+        self._require_world().set_body_velocity(vx, vy, vtheta)
         self._moving = abs(vx) > 1e-6 or abs(vy) > 1e-6 or abs(vtheta) > 1e-6
 
     async def stop(

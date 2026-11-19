@@ -1,4 +1,4 @@
-"""Inflated costmap from an occupancy grid (pure numpy, no ROS)."""
+"""Inflated costmap from an occupancy grid (pure numpy)."""
 
 from __future__ import annotations
 
@@ -450,7 +450,7 @@ def build_costmap(
     the disk → inscribed (hidden so corridors read as workspace). Both stay
     blocked for planning. Between the hard disk and
     ``max(inflation_radius_m, robot_radius_m)`` soft costs decay with clearance
-    past the hard radius (Nav2-style).
+    past the hard radius.
 
     Soft outer radius matches configured ``inflation_radius_m`` (clamped to at
     least the hard disk) — that is what UIs show. An additional low-cost
@@ -525,7 +525,7 @@ def build_costmap(
         soft = within_soft & ~hard
         if soft.any():
             dist_m = dist_all_m[soft]
-            # Nav2-style: decay with clearance past the hard radius so the
+            # Decay with clearance past the hard radius so the
             # outer soft edge stays meaningful and paths prefer open space.
             clearance_m = np.maximum(0.0, dist_m - inscribed_m)
             soft_costs = np.rint(
@@ -576,7 +576,7 @@ _VIZ_SOFT_MAX = 80
 def costs_to_occupancy_viz(costs: np.ndarray) -> np.ndarray:
     """Convert layered uint8 costs to OccupancyGrid-style int16 for nav-camera.
 
-    Nav2 / nav_view colouring expects: -1 unknown, 0 free, 1..80 optional soft
+    nav_view colouring expects: -1 unknown, 0 free, 1..80 optional soft
     inflation, 90 hard clearance (workspace keep-out next to walls), 99
     inscribed (only when the hard disk was not split), 100 lethal.
 

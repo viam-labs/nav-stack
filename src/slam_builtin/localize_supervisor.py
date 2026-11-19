@@ -1314,7 +1314,7 @@ class LocalizeSupervisor:
     ) -> bool:
         """Hold the startup auto-localize until scan matching can actually work.
 
-        A fixed post-reconfigure delay fires while MiR rosbridge sessions are
+        A fixed post-reconfigure delay fires while MiR bridge sessions are
         still connecting and the map is still loading; the
         retry attempts then burn out and the robot stays mislocalized until a
         manual global_localize. Ready = slam process up, a merged scan with
@@ -1593,5 +1593,3 @@ class LocalizeSupervisor:
                 )
                 if attempt < max_attempts:
                     await asyncio.sleep(max(retry_delay_s, 0.0))
-
-    # -- ROS IO --------------------------------------------------------------

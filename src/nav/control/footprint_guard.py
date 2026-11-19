@@ -1,4 +1,4 @@
-"""Footprint collision guard (Nav2 RPP / DWB-style) for a rectangular base.
+"""Footprint collision guard for a rectangular base.
 
 The last stage of every control tick. Given the nominal twist (pursuit or
 DWA), project the *oriented rectangle* along the commanded arc against the
@@ -200,8 +200,8 @@ def obstacle_points(
         if r1 > r0 and c1 > c0:
             # Observed-occupied only: unknown (255) speckle on open floor is
             # not inflated by the planner, so routes pass beside it and a
-            # guard that treated it as solid stalled there (Nav2 RPP likewise
-            # ignores NO_INFORMATION). Real unmapped obstacles come via scan.
+            # guard that treated it as solid stalled there. Real unmapped
+            # obstacles come via scan.
             lethal = costs[r0:r1, c0:c1] == LETHAL
             raw = getattr(local_view.occ, "grid", None)
             if raw is not None and np.shape(raw) == costs.shape:
@@ -274,7 +274,7 @@ class FootprintGuard:
     def _split(self, pose: Pose2D, pts: np.ndarray, padding: Optional[float] = None):
         """Split into (far, near) points relative to the current pose.
 
-        Points inside the body itself are dropped (Nav2 footprint clearing:
+        Points inside the body itself are dropped (footprint clearing:
         self-returns from the chassis/mast, or a stale mark we already
         occupy — a real obstacle there would already be a collision).
         Points between the body and the padding may be passed alongside or

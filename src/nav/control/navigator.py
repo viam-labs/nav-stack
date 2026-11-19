@@ -1,4 +1,4 @@
-"""BuiltinNavigator: navigate / compute_path / cancel / status (no Nav2)."""
+"""BuiltinNavigator: navigate / compute_path / cancel / status."""
 
 from __future__ import annotations
 

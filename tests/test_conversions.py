@@ -483,7 +483,7 @@ def test_parse_odom_from_readings_mir_base_ignores_imu_fields():
 
 def test_parse_odom_from_readings_wheeled_odometry_y_forward():
     """rdk:builtin:wheeled-odometry reports forward velocity on +Y (compass
-    frame); it must be remapped to ROS vx, not treated as lateral motion."""
+    frame); it must be remapped to body vx, not treated as lateral motion."""
     reading = conv.parse_odom_from_readings(
         {
             "position_meters_X": 0.0,
@@ -875,7 +875,7 @@ def test_estimate_scan_motion_rejects_lateral_by_default():
     assert motion.dy == 0.0
 
 
-def test_parse_odom_from_readings_ros_odom_message():
+def test_parse_odom_from_readings_nested_odom_message():
     reading = conv.parse_odom_from_readings(
         {
             "pose": {

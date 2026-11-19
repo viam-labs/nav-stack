@@ -1,14 +1,14 @@
 """Background PCD republisher: ``viam-labs:nav-stack:shm-pointcloud``.
 
 Wraps an existing Viam camera (e.g. ``viam:lidar:rplidar``) and copies each
-``get_point_cloud`` frame into a POSIX shm ring that SLAM/Nav2 can read without
-blocking the ROS scan timer on gRPC.
+``get_point_cloud`` frame into a POSIX shm ring that SLAM and nav can read without
+blocking their scan loops on gRPC.
 
 Until the *source* camera writes shm itself, this is the fallback for Livox /
 depth cams: gRPC still happens, but on a dedicated thread. For Slamtec A1/A3/S1
 prefer ``viam-labs:nav-stack:rplidar``, which talks UART and writes shm directly.
 
-Wire format matches ``viam-shared-memory-test`` (see :mod:`~..ros.pcshm`).
+Wire format matches ``viam-shared-memory-test`` (see :mod:`~..shm.pcshm`).
 """
 
 from __future__ import annotations

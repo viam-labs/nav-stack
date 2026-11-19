@@ -2,7 +2,7 @@
 
 Each scan is aligned (2D point-to-point ICP) against the last few keyscans,
 starting from a constant-velocity guess. A cart with only a lidar and an IMU
-gets its translation from this, the same way ROS lidar-odometry stacks do.
+gets its translation from this, as lidar-odometry stacks usually do.
 """
 
 from __future__ import annotations

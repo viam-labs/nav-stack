@@ -26,7 +26,7 @@ integrating acceleration (drifts quadratically), which is unusable as odometry.
 
 * ``viam`` / ``mir``: keep Y-forward (``vy`` = forward, ``vx`` = right). Do **not**
   apply the body X/Y swap.
-* ``x_forward`` / ``ros``: keep X-forward (``vx`` = forward, ``vy`` = left).
+* ``x_forward``: keep X-forward (``vx`` = forward, ``vy`` = left).
 
 When linear velocity is available but ``trust_pose`` is off, this reader
 dead-reckons an odom ``pose`` from twist (so ``has_pose`` is true for
@@ -71,7 +71,7 @@ class TypedOdomConfig:
     # (y, x) map-frame overload when read.
     trust_pose: bool = False
     # How GetLinearVelocity is framed. ``viam`` / ``mir``: +y is forward (Tracer,
-    # rdk:builtin:wheeled). ``ros``: +x is forward.
+    # rdk:builtin:wheeled). ``x_forward``: +x is forward.
     velocity_convention: str = BASE_VELOCITY_VIAM
 
 

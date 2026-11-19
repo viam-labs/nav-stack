@@ -125,8 +125,8 @@ def test_wheel_path_uses_linear_velocity_and_skips_accel():
         lv=(0.5, 0.0, 0.0),
         la=(1.0, 1.0, 9.81),
     )
-    # Explicit ROS convention: +x forward (legacy test fixture).
-    reading, _ = _read(s, TypedOdomConfig(velocity_convention="ros"))
+    # Explicit X-forward convention.
+    reading, _ = _read(s, TypedOdomConfig(velocity_convention="x_forward"))
     assert reading.vx == pytest.approx(0.5)
     assert reading.vy == pytest.approx(0.0)
     assert reading.vtheta == pytest.approx(math.radians(10.0))
@@ -158,8 +158,8 @@ def test_viam_y_forward_keeps_forward_on_vy():
     assert dbg["velocity_convention"] == "viam"
 
 
-def test_viam_twist_integrator_moves_forward_in_ros_world():
-    """Y-forward body vy integrates to +X in the ROS world (theta=0)."""
+def test_viam_twist_integrator_moves_forward_along_world_x():
+    """Y-forward body vy integrates to +X in the world (theta=0)."""
     s = FakeMovementSensor(
         angular_velocity=True,
         linear_velocity=True,
