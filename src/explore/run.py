@@ -95,6 +95,7 @@ class ExploreRun:
         self._stop_requested = False
         self._abort_home = False
         self._started_at: Optional[float] = None
+        self._ended_at: Optional[float] = None
         self._s = _State()
         self._blacklist = Blacklist()
         self._legs = LegRunner(
@@ -112,12 +113,17 @@ class ExploreRun:
             self._abort_home = True
 
     def status(self) -> dict:
-        elapsed = 0.0 if self._started_at is None else self._clock() - self._started_at
+        if self._started_at is None:
+            elapsed = 0.0
+        else:
+            end = self._ended_at if self._ended_at is not None else self._clock()
+            elapsed = end - self._started_at
         home = self._s.home
         return {
             "phase": self._s.phase,
             "elapsed_s": elapsed,
             "remaining_s": max(0.0, self._p.duration_s - elapsed),
+            "duration_s": self._p.duration_s,
             "legs": self._s.legs,
             "legs_failed": self._s.legs_failed,
             "coverage_cells": self._s.coverage_cells,
@@ -163,6 +169,7 @@ class ExploreRun:
             self._s.last_error = f"{type(exc).__name__}: {exc}"
         finally:
             await self._finish()
+            self._ended_at = self._clock()
         return self.status()
 
     # -- helpers ---------------------------------------------------------------

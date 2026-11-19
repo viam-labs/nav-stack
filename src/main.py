@@ -12,13 +12,14 @@ import sys
 
 from viam.module.module import Module
 
+from .models.explore import ExploreService
+from .models.explore_view import ExploreView
 from .models.nav_camera import NavCamera
 from .models.navigation import NavigationService
 from .models.navigation_external import ExternalNavigationService
 from .models.rplidar_shm import RPLidarShm
 from .models.shm_pointcloud import ShmPointCloud
 from .models.sim_base import SimBase
-from .models.explore import ExploreService
 from .models.slam import SlamService
 from .models.wit_imu import WitImu
 
@@ -47,6 +48,7 @@ async def main() -> None:
     module.add_model_from_registry(RPLidarShm.API, RPLidarShm.MODEL)
     module.add_model_from_registry(WitImu.API, WitImu.MODEL)
     module.add_model_from_registry(ExploreService.API, ExploreService.MODEL)
+    module.add_model_from_registry(ExploreView.API, ExploreView.MODEL)
     await module.start()
 
 

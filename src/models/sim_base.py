@@ -32,6 +32,7 @@ from ..sim import (
     get_sim_world,
     load_sim_map,
     make_builtin_corridor,
+    make_builtin_preset,
     register_sim_world,
 )
 
@@ -82,6 +83,7 @@ class SimBase(Base):
 
         existing = get_sim_world(world_name)
         map_path = attrs.get("map_path")
+        map_preset = attrs.get("map_preset")
         seed = conv.Pose2D(
             float(attrs.get("seed_x", 1.0)),
             float(attrs.get("seed_y", 1.0)),
@@ -103,9 +105,12 @@ class SimBase(Base):
                     "map_path ignored (already loaded)"
                 )
         else:
-            sim_map = (
-                load_sim_map(str(map_path)) if map_path else make_builtin_corridor()
-            )
+            if map_preset:
+                sim_map = make_builtin_preset(str(map_preset))
+            elif map_path:
+                sim_map = load_sim_map(str(map_path))
+            else:
+                sim_map = make_builtin_corridor()
             self._world = SimWorld(
                 sim_map,
                 seed_pose=seed,
