@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..geom import conversions as conv
 from .registry import get_sim_world, register_sim_world
-from .world import SimWorld, load_sim_map, make_builtin_corridor
+from .world import SimWorld, load_sim_map, make_builtin_corridor, make_builtin_preset
 
 
 def ensure_sim_world_from_slam_cfg(cfg) -> SimWorld:
@@ -18,7 +18,13 @@ def ensure_sim_world_from_slam_cfg(cfg) -> SimWorld:
         existing.range_min = float(sim.range_min)
         existing.range_max = float(sim.range_max)
         return existing
-    sim_map = load_sim_map(sim.map_path) if sim.map_path else make_builtin_corridor()
+    preset = getattr(sim, "map_preset", None)
+    if preset:
+        sim_map = make_builtin_preset(preset)
+    elif sim.map_path:
+        sim_map = load_sim_map(sim.map_path)
+    else:
+        sim_map = make_builtin_corridor()
     world = SimWorld(
         sim_map,
         seed_pose=seed,

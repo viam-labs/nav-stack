@@ -12,6 +12,8 @@ import sys
 
 from viam.module.module import Module
 
+from .models.explore import ExploreService
+from .models.explore_view import ExploreView
 from .models.nav_camera import NavCamera
 from .models.navigation import NavigationService
 from .models.navigation_external import ExternalNavigationService
@@ -45,6 +47,8 @@ async def main() -> None:
     module.add_model_from_registry(ShmPointCloud.API, ShmPointCloud.MODEL)
     module.add_model_from_registry(RPLidarShm.API, RPLidarShm.MODEL)
     module.add_model_from_registry(WitImu.API, WitImu.MODEL)
+    module.add_model_from_registry(ExploreService.API, ExploreService.MODEL)
+    module.add_model_from_registry(ExploreView.API, ExploreView.MODEL)
     await module.start()
 
 

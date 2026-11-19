@@ -162,6 +162,13 @@ class _SuspendedNav:
         return out
 
 
+def nav_limits_for_status(cfg: NavConfig) -> dict:
+    return {
+        "max_linear_mps": float(cfg.max_linear_velocity),
+        "max_angular_rad_s": float(cfg.max_vel_theta),
+    }
+
+
 _NAV_DO_ALIASES = build_alias_map(
     {
         "delete_location": ("remove_location",),
@@ -1135,6 +1142,7 @@ class NavServiceBase(NavigationApi, Navigation):
                     status["footprint_length_m"] = diam
                     status["footprint_width_m"] = diam
                 status["robot_radius_m"] = float(cfg.hard_clearance_radius_m())
+                status["limits"] = nav_limits_for_status(cfg)
             except Exception:  # noqa: BLE001
                 pass
             return status

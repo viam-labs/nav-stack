@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -79,6 +79,88 @@ def make_builtin_corridor(
     )
 
 
+def make_builtin_apartment(
+    *,
+    resolution: float = 0.05,
+    width_m: float = 16.0,
+    height_m: float = 12.0,
+) -> SimMap:
+    """Apartment-ish layout: two rooms off a central corridor, a dead-end alcove,
+    and a free-standing pillar — exercises doorways, loop closures and revisits
+    more than the corridor map. Rooms are approximate; the robot_radius=0.22
+    default fits through every doorway with room to spare.
+    """
+    cols = max(32, int(round(width_m / resolution)))
+    rows = max(32, int(round(height_m / resolution)))
+    grid = np.zeros((rows, cols), dtype=np.int16)
+    # Outer walls.
+    grid[0, :] = 100
+    grid[-1, :] = 100
+    grid[:, 0] = 100
+    grid[:, -1] = 100
+
+    door_cells = max(3, int(round(1.1 / resolution)))  # ~1.1 m doorways
+
+    # Horizontal wall at ~40% of height splits the lower corridor from the upper rooms.
+    split_row = int(rows * 0.4)
+    grid[split_row, :] = 100
+    door_center_col = int(cols * 0.6)
+    grid[split_row, door_center_col - door_cells // 2 : door_center_col + door_cells // 2] = 0
+
+    # Upper half: vertical wall at ~45% width separates two rooms; doorway in the top third.
+    v_col = int(cols * 0.45)
+    grid[0:split_row, v_col] = 100
+    door_row_up = int(rows * 0.15)
+    grid[door_row_up - door_cells // 2 : door_row_up + door_cells // 2, v_col] = 0
+
+    # Upper-left small inner room (library/alcove): short horizontal + vertical walls with no doorway
+    # on the long side — forces the robot to find the gap along the short side.
+    inner_row = int(rows * 0.22)
+    inner_col_start = int(cols * 0.08)
+    inner_col_end = int(cols * 0.35)
+    grid[inner_row, inner_col_start:inner_col_end] = 100
+    door_col_inner = inner_col_start + (inner_col_end - inner_col_start) // 3
+    grid[inner_row, door_col_inner - door_cells // 2 : door_col_inner + door_cells // 2] = 0
+
+    # Dead-end alcove jutting into the lower corridor from the bottom wall.
+    alcove_h = int(rows * 0.15)
+    alcove_col_start = int(cols * 0.25)
+    alcove_col_end = int(cols * 0.40)
+    grid[rows - alcove_h, alcove_col_start:alcove_col_end] = 100
+    grid[rows - alcove_h : rows, alcove_col_start] = 100
+    grid[rows - alcove_h : rows, alcove_col_end] = 100
+
+    # Free-standing pillar in the lower corridor (makes nav plan around it).
+    pil_r = int(rows * 0.75)
+    pil_c = int(cols * 0.70)
+    pil_half = max(2, int(round(0.3 / resolution)))  # ~0.6 m square pillar
+    grid[pil_r - pil_half : pil_r + pil_half, pil_c - pil_half : pil_c + pil_half] = 100
+
+    return SimMap(
+        grid=grid,
+        resolution=float(resolution),
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+
+
+_BUILTIN_MAP_PRESETS = {
+    "corridor": make_builtin_corridor,
+    "apartment": make_builtin_apartment,
+}
+
+
+def make_builtin_preset(name: str) -> SimMap:
+    """Resolve a preset name (``"corridor"``, ``"apartment"``, …) to a SimMap."""
+    key = name.strip().lower()
+    if key not in _BUILTIN_MAP_PRESETS:
+        raise ValueError(
+            f"unknown sim map preset {name!r}; "
+            f"choose one of {sorted(_BUILTIN_MAP_PRESETS)}"
+        )
+    return _BUILTIN_MAP_PRESETS[key]()
+
+
 def load_sim_map(path: str | Path) -> SimMap:
     """Load a sim map from ``.npy`` (+ optional ``.json`` meta) or generate builtin."""
     p = Path(path)
@@ -131,6 +213,40 @@ class SimWorld:
         self._vtheta = 0.0  # rad/s
         self._last_integrate_at = time.monotonic()
         self._odom_pose = conv.Pose2D(seed.x, seed.y, seed.theta)
+        self._obstacles: Dict[int, List[Tuple[int, int, int]]] = {}
+        self._next_obstacle_id = 1
+
+    def add_obstacle(self, x: float, y: float, radius_m: float) -> int:
+        with self._lock:
+            grid = self.map.grid
+            r0, c0 = self.map.world_to_cell(x, y)
+            rad = int(math.ceil(radius_m / self.map.resolution))
+            saved: List[Tuple[int, int, int]] = []
+            for r in range(r0 - rad, r0 + rad + 1):
+                for c in range(c0 - rad, c0 + rad + 1):
+                    if not self.map.in_bounds(r, c):
+                        continue
+                    cx, cy = self.map.origin_x + (c + 0.5) * self.map.resolution, (
+                        self.map.origin_y + (r + 0.5) * self.map.resolution
+                    )
+                    if math.hypot(cx - x, cy - y) > radius_m:
+                        continue
+                    saved.append((r, c, int(grid[r, c])))
+                    grid[r, c] = 100
+            oid = self._next_obstacle_id
+            self._next_obstacle_id += 1
+            self._obstacles[oid] = saved
+            return oid
+
+    def remove_obstacle(self, obstacle_id: int) -> None:
+        with self._lock:
+            for r, c, value in self._obstacles.pop(obstacle_id, []):
+                self.map.grid[r, c] = value
+
+    def clear_obstacles(self) -> None:
+        with self._lock:
+            for oid in list(self._obstacles):
+                self.remove_obstacle(oid)
 
     def reset(self, pose: Optional[conv.Pose2D] = None) -> None:
         with self._lock:
