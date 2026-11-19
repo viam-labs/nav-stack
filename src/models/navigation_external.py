@@ -5,7 +5,7 @@ Like ``viam-labs:nav-stack:navigation`` (same Navigation service, shared
 the built-in SLAM model's in-process runtime it drives navigation from an
 **arbitrary Viam ``rdk:service:slam``** dependency.
 
-ROS-free: map and pose come from the SLAM service (``get_grid`` / ``GetPosition``),
+Map and pose come from the SLAM service (``get_grid`` / ``GetPosition``),
 scans from lidar cameras / shm, and drive from ``Base.SetVelocity``.
 """
 

@@ -1,4 +1,4 @@
-"""Unit tests for ROS-free builtin occupancy SLAM."""
+"""Unit tests for builtin occupancy SLAM."""
 
 from __future__ import annotations
 
@@ -31,12 +31,8 @@ def test_slam_backend_default_is_builtin():
 
 
 def test_slam_backend_toolbox_and_invalid():
-    with pytest.raises(
-        ValueError, match="pre-ros-removal|slam_toolbox|no longer supported"
-    ):
-        SlamConfig.from_dict(
-            {"base": "b", "lidar": "front", "slam_backend": "slam_toolbox"}
-        )
+    with pytest.raises(ValueError, match="slam_backend must be"):
+        SlamConfig.from_dict({"base": "b", "lidar": "front", "slam_backend": "other"})
     with pytest.raises(ValueError, match="slam_backend"):
         SlamConfig.from_dict(
             {"base": "b", "lidar": "front", "slam_backend": "cartographer"}

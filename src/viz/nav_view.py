@@ -5,10 +5,10 @@ PNG the Viam app can stream. Side-effect-free so it unit-tests cleanly: the
 nav viz store collects the snapshot; this
 module only draws it.
 
-Coordinate model: occupancy grids are ``nav_msgs/OccupancyGrid``-style, row-major
+Coordinate model: occupancy grids are row-major,
 starting at ``(origin_x, origin_y)`` with +y increasing up the rows. Images have
 row 0 at the top, so the grid is flipped vertically once and every world->pixel
-mapping uses the same flip -> world-up renders as image-up (matches rviz).
+mapping uses the same flip -> world-up renders as image-up.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 
-# Cost values in a nav_msgs/OccupancyGrid costmap: -1 unknown, 0 free,
+# Cost values in an int16 costmap grid: -1 unknown, 0 free,
 # 1..80 optional soft inflation, 90 hard clearance (workspace keep-out),
 # 99 inscribed (legacy unsplit hard disk), 100 lethal. A raw SLAM /map
 # uses 100 = occupied, so the same colouring serves both.
@@ -173,7 +173,7 @@ def _build_frame(
     ox = float(grid_info["origin_x"])
     oy = float(grid_info["origin_y"])
 
-    # Grid row 0 is world-bottom; flip so image row 0 is world-top (rviz-like).
+    # Grid row 0 is world-bottom; flip so image row 0 is world-top.
     full = Image.fromarray(np.flipud(_colorize(grid)), mode="RGB")  # size (w, h)
 
     # Crop box in the flipped (top-origin) image. Full render is the whole grid.

@@ -2,8 +2,6 @@
 
 A Viam navigation stack for mapping, localization, and obstacle-aware navigation
 on any Viam base.
-The last release that still bundled Nav2/slam_toolbox is preserved at git tag
-`pre-ros-removal`.
 
 This module (`viam-labs:nav-stack`) provides:
 
@@ -67,7 +65,7 @@ Per-lidar options include mount pose, `scan_source` (`auto` / `get_laser_scan` /
 `true`, the sensor is used only for obstacle avoidance — not SLAM matching or
 mapping). When `mount` is omitted, the module fills it from the Viam
 framesystem (component → `base`), converting Viam's Y-forward base axes into
-nav-stack's ROS X-forward mounts so scans align with odom. Explicit `mount`
+nav-stack's X-forward mounts so scans align with odom. Explicit `mount`
 still wins. Example depth camera for avoidance only:
 
 ```json
@@ -169,7 +167,7 @@ circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
 | `heading_sensor_yaw_deg` | SLAM | Same mount-yaw correction for the dedicated `heading_sensor` (default `0`) |
 | `gyro_still_threshold_dps` | `wit-imu` | Gyro "still" threshold (register `0x61`) sent on every start, not saved to flash. The factory `0` lets the firmware auto-zero any steady turn: a smooth 5°/s turn lost >90% of its yaw on tracer2a, so nav's gentle steering corrections walked the heading off. `0.05` tracks slow turns within ~0.5% with no drift at rest. `null` leaves the device setting alone (default `0.05`) |
 | lidar `mount.pitch`, `mount.roll` | SLAM | Mount tilt in radians (positive pitch = forward axis tilted down). Levels the cloud before z filtering — even a ~2° mast tilt pulls floor returns into the z band at 15–20 m and imprints phantom borders at max range (default `0`) |
-| `base_velocity_convention` | SLAM | `viam` (default, Y-forward) or `ros` (X-forward); legacy `mir` accepted as alias for `viam` — maps builtin nav `cmd_vel` to Viam base `SetVelocity` axes |
+| `base_velocity_convention` | SLAM | `viam` (default, Y-forward) or `x_forward` (X-forward); legacy `mir` accepted as alias for `viam` — maps builtin nav `cmd_vel` to Viam base `SetVelocity` axes |
 | `scan_max_age_s` | SLAM | Safety cutoff for the `/scan` publish path: if the lidar reports a cache age (`get_laser_scan` `age_s`) above this, skip publishing that cycle rather than feed SLAM/builtin nav a stale, misregistered scan (default `2.0`) |
 | `scan_rate_hz` / `odom_rate_hz` | SLAM | Builtin SLAM tick rate is `max(scan_rate_hz, odom_rate_hz)` (default `10` each). Scan matching stays throttled (~3 Hz) separately. Each match searches ±0.2 m / ±8° around a pose that already fits the scan, and a coarse ±0.6 m / ±24° pass first when it does not (a skid or a spin). Idle, a drift-sized step (≤0.15 m / 8°) applies at once and a larger jump needs two agreeing frames with no rival peak. While a goal is active the same drift step applies when the pose fits (prior ≥ 0.25), the base is not turning hard, and no second wall scores within 0.08 of the winner; a larger slip is walked in at that step only from a strong lone peak (≥ 0.45). `slam_diagnostics.drive_applies` counts those |
 | `control_rate_hz` | Nav | Builtin nav control rate (default `10`). Local costmap refreshes separately (`builtin.local_costmap_rate_hz`, default `10`) so follower ticks stay cheap |
@@ -186,7 +184,7 @@ circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
 | `clearance_m` | Nav | **Hard buffer past the body, on each side** (default `0.2` m). Same inscribed radius for the global planner costmap and the local costmap: half-width (or `robot_radius`) + `clearance_m`. Soft inflation, if any, starts outside this. Set `0` for a body-only hard disk |
 | `inflation_margin_m` | Nav | Optional soft-cost band **past the hard clearance** (additive). E.g. a 0.295 m half-width with `clearance_m: 0.2` and `inflation_margin_m: 0.05` is hard out to 0.495 m and soft out to 0.545 m |
 | `local_inflation_margin_m` | Nav | Extra soft band past the hard clearance for **live scan hits** in the rolling local costmap (additive). Unset means live hits are hard-clearance only |
-| `footprint_width_m`, `footprint_length_m` | Nav | **Recommended for non-square robots.** Given both, planning clearance uses the half-**width** (what must fit through a gap) while rotating in place is gated on the half-**diagonal** (what the body sweeps). A single `robot_radius` has to cover both, so it must be the half-diagonal — which seals every gap narrower than `2 × robot_radius` even where the robot easily fits (a 0.59 m-wide robot refusing an 0.84 m doorway). Also sizes the skid-steer arc envelope from the track. Every command is checked by a **footprint collision guard** (Nav2 RPP/DWB-style): the exact rectangle (padded by `clearance_m`, clamped to 0.04–0.08 m) is projected along the commanded arc against live scan returns and static map walls; speed is regulated by distance-to-collision, a blocked arc is replaced by the nearest free forward arc, and rotation in place happens only when the corners' sweep is free. The guard never reverses — backing up is a supervisor recovery (shared
+| `footprint_width_m`, `footprint_length_m` | Nav | **Recommended for non-square robots.** Given both, planning clearance uses the half-**width** (what must fit through a gap) while rotating in place is gated on the half-**diagonal** (what the body sweeps). A single `robot_radius` has to cover both, so it must be the half-diagonal — which seals every gap narrower than `2 × robot_radius` even where the robot easily fits (a 0.59 m-wide robot refusing an 0.84 m doorway). Also sizes the skid-steer arc envelope from the track. Every command is checked by a **footprint collision guard**: the exact rectangle (padded by `clearance_m`, clamped to 0.04–0.08 m) is projected along the commanded arc against live scan returns and static map walls; speed is regulated by distance-to-collision, a blocked arc is replaced by the nearest free forward arc, and rotation in place happens only when the corners' sweep is free. The guard never reverses — backing up is a supervisor recovery (shared
 `escape` policy: hold → turn → reverse, with one rear-clear gate and one
 reverse command). Base deadband / crawl floors live in `base_envelope` and
 are shared by the guard, the drive sanitizer, and recoveries so a twist that
@@ -256,11 +254,11 @@ For a **bare IMU** movement sensor (Wit, etc. with accel + gyro, no wheel pose),
 
 **Wall-line yaw correction (anti-banana).** Long straight walls drawn as curves usually mean gyro heading walked off while driving parallel to the wall. With `map_when_still` + point-cloud lidars, `wall_yaw_correction` defaults **on**: each accepted pause scan looks for a long side wall (≥ `wall_yaw_min_length_m`) and soft-corrects `/odom` yaw by at most `wall_yaw_max_step_deg` (blended by `wall_yaw_blend`) so the wall lines up with robot +X. Status field `wall_yaw` reports the last observation. Disable with `"wall_yaw_correction": false` if a cluttered side repeatedly misleads the fit.
 
-For **Viam wheeled bases** (`rdk:builtin:wheeled`) and **MiR250** (`viam-labs:mir-base`), keep the default `"base_velocity_convention": "viam"` so forward builtin nav commands map to Viam `linear.y` (Viam wheeled / MiR expect forward on Y, not X). Use `"ros"` only for bases that drive on `linear.x`. Legacy `"mir"` is accepted and normalized to `"viam"`. Odometry from `viam-labs:mir-base:movement` stays in ROS convention and does not need swapping. Nav-stack stops builtin nav motion with `set_velocity(0)` (not `Base.stop()`), so MiR Manualcontrol and `go_to_location` keep working after a navigation cancel or goal completion.
+For **Viam wheeled bases** (`rdk:builtin:wheeled`) and **MiR250** (`viam-labs:mir-base`), keep the default `"base_velocity_convention": "viam"` so forward builtin nav commands map to Viam `linear.y` (Viam wheeled / MiR expect forward on Y, not X). Use `"x_forward"` only for bases that drive on `linear.x`. Legacy `"mir"` is accepted and normalized to `"viam"`. Odometry from `viam-labs:mir-base:movement` is already X-forward and does not need swapping. Nav-stack stops builtin nav motion with `set_velocity(0)` (not `Base.stop()`), so MiR Manualcontrol and `go_to_location` keep working after a navigation cancel or goal completion.
 
 The MiR250 is **differential drive** — use `"kinematics": "differential"` (the default). Configuring `omni` makes builtin nav command lateral velocities the robot cannot execute. Tune lookahead / tolerances under the `builtin` attribute block.
 
-For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a single `get_readings()` per odom tick. It uses **`odom_position_x_m` / `odom_position_y_m` / `odom_yaw_deg`** when present (true `/odom` frame from mir-base ≥ the odom-fields update). Map-frame `position_x_m`/`position_y_m` and fused `yaw_deg` are **not** used for `/odom` — builtin SLAM needs a smooth odom frame. Until mir-base exposes the odom fields, orientation falls back to velocity integration; upgrade mir-base or patch it to publish `odom_*` keys from the parsed `/odom` message. Raise mir-base's `mir_rosbridge_timeout_s` attribute (≥5, on the `viam-labs:mir-base` component, not this module) and `scan_rate_hz` / `odom_rate_hz` (e.g. `15`–`20`) if updates lag.
+For **MiR** movement sensors (`viam-labs:mir-base:movement`), the bridge reads a single `get_readings()` per odom tick. It uses **`odom_position_x_m` / `odom_position_y_m` / `odom_yaw_deg`** when present (true `/odom` frame from mir-base ≥ the odom-fields update). Map-frame `position_x_m`/`position_y_m` and fused `yaw_deg` are **not** used for `/odom` — builtin SLAM needs a smooth odom frame. Until mir-base exposes the odom fields, orientation falls back to velocity integration; upgrade mir-base or patch it to publish `odom_*` keys from the parsed `/odom` message. Raise mir-base's bridge timeout (≥5 s, on the `viam-labs:mir-base` component, not this module) and `scan_rate_hz` / `odom_rate_hz` (e.g. `15`–`20`) if updates lag.
 
 ### Navigation service
 
@@ -451,7 +449,7 @@ Then `npm run dev` in nav-stack-ui. Teleop `sim-base` to map, navigate with `nav
 
 Occupancy colouring: unknown = dark grey, free = light, optional soft inflation = grey→orange gradient, hard `clearance_m` next to walls = amber, lethal = near-black. The camera is workspace: only `clearance_m` around an obstacle is drawn as keep-out. Planning still uses the body+clearance C-space disk (a remaining one-cell gap is room for the robot center). World "up" renders as image up (image-up).
 
-It reads directly from the running navigation service's in-process viz store (found by the `navigation` attribute), so there is no extra ROS process and no round-trip. Because it consumes only builtin nav's standard costmap/plan topics, it works with **any** SLAM backend and with either `navigation` or `navigation-external`.
+It reads directly from the running navigation service's in-process viz store (found by the `navigation` attribute), so there is no extra process and no round-trip. Because it consumes only builtin nav's standard costmap/plan topics, it works with **any** SLAM backend and with either `navigation` or `navigation-external`.
 
 ```json
 {
@@ -628,7 +626,7 @@ await nav.do_command({"command": "get_status"})
 # await nav.do_command({"command": "execute_plan"})
 # Motion MoveOnMap can also preview: move_on_map(..., extra={"preview": true})
 # get_status includes last_cmd_vel plus cmd_vel_history (last ~20 distinct
-# ROS/Viam SetVelocity samples, oldest→newest — survives cancel/stop zeros)
+# body-frame/Viam SetVelocity samples, oldest→newest — survives cancel/stop zeros)
 # Plain-English snapshot of what nav is commanding right now (returns immediately):
 # await nav.do_command({"command": "describe_motion"})
 # → {"summary": "builtin nav navigating (goal 'kitchen' is about 2.5 m ahead and to the
@@ -756,7 +754,8 @@ the current map heading in place when XY is already right).
 ## Development
 
 ```bash
-./setup.sh                 # create venv (add python -m pytest tests/    # pure-Python unit tests (no ROS needed)
+./setup.sh                 # create .venv and install requirements
+python -m pytest tests/    # pure-Python unit tests
 ./build.sh                 # package module.tar.gz
 ```
 

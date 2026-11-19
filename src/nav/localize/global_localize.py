@@ -19,7 +19,7 @@ from ...geom import conversions as conv
 
 @dataclass(frozen=True)
 class OccupancyMap:
-    """Nav2-style occupancy grid (row-major, shape height x width)."""
+    """Occupancy grid (row-major, shape height x width)."""
 
     grid: np.ndarray  # int16: -1 unknown, 0 free, 100 occupied
     resolution: float
@@ -102,7 +102,7 @@ def load_occupancy_from_map_dict(map_data: Mapping) -> OccupancyMap:
 
 
 def _parse_simple_yaml(text: str) -> dict:
-    """Parse the small Nav2 map.yaml files without requiring PyYAML."""
+    """Parse the small map.yaml files without requiring PyYAML."""
     data: dict = {}
     origin_re = re.compile(
         r"^origin\s*:\s*\[\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*\]\s*$"
@@ -178,7 +178,7 @@ def pgm_to_occupancy_grid(
     occupied_thresh: float = 0.65,
     free_thresh: float = 0.196,
 ) -> np.ndarray:
-    """Convert a map_server PGM into ROS occupancy values."""
+    """Convert a map PGM into occupancy values (-1 unknown, 0 free, 100 occupied)."""
     pixels = pgm.astype(np.float32)
     if negate:
         occ_prob = pixels / 255.0
@@ -203,7 +203,7 @@ def load_occupancy_from_map_dir(map_dir: Path) -> Optional[OccupancyMap]:
     if not image_path.is_file():
         return None
     pgm = _read_pgm(image_path)
-    # map_server stores image rows top->bottom while OccupancyGrid is indexed from
+    # The PGM stores image rows top->bottom while OccupancyGrid is indexed from
     # map origin (bottom->top); flip vertically to recover OccupancyGrid layout.
     pgm = np.flipud(pgm)
     grid = pgm_to_occupancy_grid(

@@ -303,7 +303,7 @@ Probes the SetVelocity path without navigating.
 
 | Arg                                 | Notes                                             |
 | ----------------------------------- | ------------------------------------------------- |
-| `vx` / `body_vx_mps` / `ros_vx_mps` | Body forward m/s (default `0`)                    |
+| `vx` / `body_vx_mps`                | Body forward m/s (default `0`)                    |
 | `vy` / `body_vy_mps`                | Body lateral m/s                                  |
 | `vtheta` / `body_vtheta_rad_s`      | Body yaw rate rad/s                               |
 | `angular_z_deg_s`                   | Alt yaw input in deg/s (used if `vtheta` omitted) |

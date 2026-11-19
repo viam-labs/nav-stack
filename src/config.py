@@ -19,15 +19,13 @@ MODE_LOCALIZING = "localizing"
 SLAM_MODES = {MODE_MAPPING, MODE_LOCALIZING}
 
 BASE_VELOCITY_VIAM = "viam"
-# Body frame with +X forward, +Y left (same as classic ROS cmd_vel).
+# Body frame with +X forward, +Y left.
 BASE_VELOCITY_X_FORWARD = "x_forward"
-# Legacy aliases accepted in config.
-BASE_VELOCITY_ROS = "ros"  # alias of x_forward
+# Legacy alias accepted in config.
 BASE_VELOCITY_MIR = "mir"  # alias of viam (Y-forward)
 BASE_VELOCITY_CONVENTIONS = {
     BASE_VELOCITY_VIAM,
     BASE_VELOCITY_X_FORWARD,
-    BASE_VELOCITY_ROS,
     BASE_VELOCITY_MIR,
 }
 # Conventions that put body forward (vx) on Viam ``linear.y``.
@@ -83,7 +81,7 @@ def body_linear_to_viam_mm_s(
     (``vx``), Viam ``linear.x`` = body lateral (``vy``). Matches ``rdk:builtin:wheeled``
     and MiR bases, which only drive on Y.
 
-    ``x_forward`` / ``ros``: Viam ``linear.x`` = body forward, ``linear.y`` = lateral —
+    ``x_forward``: Viam ``linear.x`` = body forward, ``linear.y`` = lateral —
     for bases that consume X as forward.
     """
     if convention in BASE_VELOCITY_Y_FORWARD:
@@ -123,7 +121,7 @@ def sensor_twist_to_body(
     """Map sensor-native body linear twist to nav body (x forward, y left).
 
     ``viam`` / ``mir``: sensor +y is forward, +x is right → body ``(vy, -vx)``.
-    ``x_forward`` / ``ros``: already X-forward / Y-left — pass through.
+    ``x_forward``: already X-forward / Y-left — pass through.
     """
     if convention in BASE_VELOCITY_Y_FORWARD:
         return float(vy), -float(vx)
@@ -179,8 +177,6 @@ class SimConfig:
             )
         if convention == BASE_VELOCITY_MIR:
             convention = BASE_VELOCITY_VIAM
-        if convention == BASE_VELOCITY_ROS:
-            convention = BASE_VELOCITY_X_FORWARD
         map_path = d.get("map_path")
         overrides: Dict[str, Any] = {
             "base_velocity_convention": str(convention),
@@ -309,8 +305,6 @@ class MapSettings:
 
     Config attribute is ``map``. Common knobs ``resolution`` and
     ``max_laser_range`` may also be set at the SLAM service top level.
-    The legacy attribute name ``slam_toolbox`` is still accepted in
-    ``from_dict`` for existing machine configs.
     """
 
     resolution: float = 0.05  # meters/cell
@@ -330,12 +324,6 @@ NAV_BACKENDS = frozenset({NAV_BACKEND_BUILTIN})
 
 SLAM_BACKEND_BUILTIN = "builtin"
 SLAM_BACKENDS = frozenset({SLAM_BACKEND_BUILTIN})
-
-_REMOVED_BACKEND_HINT = (
-    "Legacy backends were removed; use slam_backend/nav_backend "
-    "'builtin' only. For the last ROS-based release, check out git tag "
-    "pre-ros-removal."
-)
 
 # Common nav tuning accepted at the service top level (also under ``builtin``).
 _TOP_LEVEL_NAV_TUNING_KEYS = ("xy_goal_tolerance", "yaw_goal_tolerance")
@@ -483,7 +471,7 @@ def _dataclass_from_dict(
 def _merge_top_level_nav_tuning(d: Mapping) -> dict:
     """Build the ``builtin`` attribute dict: nested block wins over top-level."""
     merged = {key: d[key] for key in _TOP_LEVEL_NAV_TUNING_KEYS if key in d}
-    nested = d.get("builtin") or d.get("nav2") or {}
+    nested = d.get("builtin") or {}
     merged.update(dict(nested))
     return merged
 
@@ -528,8 +516,7 @@ class BuiltinNavConfig:
 
     Config attribute is ``builtin``. Common knobs ``xy_goal_tolerance`` and
     ``yaw_goal_tolerance`` may also be set at the navigation service top
-    level. The legacy attribute name ``nav2`` is still accepted in
-    ``NavConfig.from_dict`` for existing machine configs.
+    level.
     """
 
     # ``lazy_theta_star`` (default) or ``astar``.
@@ -1187,10 +1174,6 @@ class SlamConfig:
         slam_backend = str(
             d.get("slam_backend", SLAM_BACKEND_BUILTIN) or SLAM_BACKEND_BUILTIN
         )
-        if slam_backend in ("slam_toolbox", "toolbox"):
-            raise ValueError(
-                f"slam_backend={slam_backend!r} is no longer supported. {_REMOVED_BACKEND_HINT}"
-            )
         if slam_backend not in SLAM_BACKENDS:
             raise ValueError(
                 f"slam_backend must be {SLAM_BACKEND_BUILTIN!r}, got {slam_backend!r}"
@@ -1207,8 +1190,6 @@ class SlamConfig:
         # Normalize legacy ``mir`` to the canonical Y-forward name.
         if convention == BASE_VELOCITY_MIR:
             convention = BASE_VELOCITY_VIAM
-        if convention == BASE_VELOCITY_ROS:
-            convention = BASE_VELOCITY_X_FORWARD
         # Prefer slam-level convention for the sim world when not overridden in sim{}.
         if "base_velocity_convention" not in (d.get("sim") or {}):
             sim = SimConfig(
@@ -1240,10 +1221,9 @@ class SlamConfig:
         heading_only_odom = bool(d.get("heading_only_odom", False))
         if heading_only_odom:
             imu_odom_mode = IMU_ODOM_NONE
-        # Prefer ``map``; accept legacy ``slam_toolbox`` block from older configs.
         # Top-level ``resolution`` / ``max_laser_range`` fill in when the nested
         # block omits them (nested wins on conflict).
-        stb_raw = dict(d.get("map") or d.get("slam_toolbox") or {})
+        stb_raw = dict(d.get("map") or {})
         for key in ("resolution", "max_laser_range"):
             if key in d and key not in stb_raw:
                 stb_raw[key] = d[key]
@@ -1551,7 +1531,7 @@ class NavConfig:
     simple_stop_distance: float = 0.4  # meters: stop forward + turn away inside this
     simple_slow_distance: float = 1.0  # meters: scale speed down inside this
     # Max scan age (s) still trusted for avoidance. Larger tolerates slower MiR
-    # rosbridge lidar reads; too small makes avoidance fail closed (no drive).
+    # lidar reads; too small makes avoidance fail closed (no drive).
     simple_scan_max_age: float = 2.0
     # Optional stiction floors (m/s and rad/s) for simple go_to_* motion only.
     min_cmd_vel_x: float = 0.0
@@ -1566,10 +1546,6 @@ class NavConfig:
         if kinematics not in KINEMATICS:
             raise ValueError(f"kinematics must be one of {sorted(KINEMATICS)}")
         backend = str(d.get("nav_backend", NAV_BACKEND_BUILTIN) or NAV_BACKEND_BUILTIN)
-        if backend in ("nav2", "ros"):
-            raise ValueError(
-                f"nav_backend={backend!r} is no longer supported. {_REMOVED_BACKEND_HINT}"
-            )
         if backend not in NAV_BACKENDS:
             raise ValueError(
                 f"nav_backend must be {NAV_BACKEND_BUILTIN!r}, got {backend!r}"
@@ -1585,7 +1561,6 @@ class NavConfig:
             "robot_radius": footprint_robot_radius(footprint, defs["robot_radius"]),
             "inflation_margin_m": _optional_positive(d.get("inflation_margin_m")),
             "nav_backend": backend,
-            # Prefer ``builtin``; accept legacy ``nav2`` block from older configs.
             # Top-level goal tolerances fill in when the nested block omits them
             # (nested wins on conflict).
             "builtin": BuiltinNavConfig.from_dict(_merge_top_level_nav_tuning(d)),

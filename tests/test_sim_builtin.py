@@ -48,7 +48,7 @@ def test_sim_world_raycast_hits_walls():
 
 def test_sim_world_integrates_velocity_and_reset():
     world = SimWorld(make_builtin_corridor(), seed_pose=conv.Pose2D(1.0, 1.0, 0.0))
-    world.set_velocity_ros(0.5, 0.0, 0.0)
+    world.set_body_velocity(0.5, 0.0, 0.0)
     time.sleep(0.2)
     pose = world.get_pose()
     assert pose.x > 1.05
@@ -77,7 +77,7 @@ def test_sim_world_collision_blocks_wall():
     # Drive +x into the interior wall at col=width/2 from a free cell.
     world = SimWorld(make_builtin_corridor(), seed_pose=conv.Pose2D(1.0, 3.0, 0.0))
     wall_x = (make_builtin_corridor().width // 2) * 0.05
-    world.set_velocity_ros(2.0, 0.0, 0.0)
+    world.set_body_velocity(2.0, 0.0, 0.0)
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         time.sleep(0.05)
@@ -92,7 +92,7 @@ def test_sim_world_collision_blocks_wall():
 
 def test_sim_world_teleport_syncs_pose():
     world = SimWorld(make_builtin_corridor(), seed_pose=conv.Pose2D(1.0, 1.0, 0.0))
-    world.set_velocity_ros(0.5, 0.0, 0.0)
+    world.set_body_velocity(0.5, 0.0, 0.0)
     time.sleep(0.1)
     world.stop()
     world.teleport(conv.Pose2D(2.5, 2.0, 1.2))
@@ -129,7 +129,7 @@ def test_sim_slam_pose_tracks_world_not_teleport(tmp_path: Path):
     host = BuiltinSlamHost(engine)
     host.start()
     try:
-        world.set_velocity_ros(0.4, 0.0, 0.0)
+        world.set_body_velocity(0.4, 0.0, 0.0)
         time.sleep(0.25)
         world.stop()
         body = world.get_pose()
@@ -152,14 +152,12 @@ def test_sim_slam_pose_tracks_world_not_teleport(tmp_path: Path):
 
 
 def test_sim_config_requires_builtin_backend():
-    with pytest.raises(
-        ValueError, match="slam_toolbox|no longer supported|pre-ros-removal"
-    ):
+    with pytest.raises(ValueError, match="slam_backend must be"):
         SlamConfig.from_dict(
             {
                 "base": "sim-base",
                 "sim": {"enabled": True},
-                "slam_backend": "slam_toolbox",
+                "slam_backend": "other",
             }
         )
 
@@ -220,7 +218,7 @@ def test_sim_slam_maps_while_driving(tmp_path: Path):
     host = BuiltinSlamHost(engine)
     host.start()
     try:
-        world.set_velocity_ros(0.35, 0.0, 0.0)
+        world.set_body_velocity(0.35, 0.0, 0.0)
         deadline = time.monotonic() + 3.0
         occupied = 0
         while time.monotonic() < deadline:
@@ -253,7 +251,7 @@ def test_repeat_path_resets_pose_ten_times():
     ends = []
     for _ in range(10):
         world.reset()
-        world.set_velocity_ros(0.5, 0.0, 0.0)
+        world.set_body_velocity(0.5, 0.0, 0.0)
         time.sleep(0.2)
         world.stop()
         ends.append(world.get_pose().x)
@@ -297,7 +295,7 @@ def test_sim_clear_region_drops_keyframes_and_allows_remap(tmp_path: Path):
     host = BuiltinSlamHost(engine)
     host.start()
     try:
-        world.set_velocity_ros(0.35, 0.0, 0.0)
+        world.set_body_velocity(0.35, 0.0, 0.0)
         deadline = time.monotonic() + 6.0
         while time.monotonic() < deadline:
             time.sleep(0.1)
@@ -353,7 +351,7 @@ def test_sim_clear_region_drops_keyframes_and_allows_remap(tmp_path: Path):
 
         # Remap: drive through the cleared stretch again.
         updates_before = int(engine.diagnostics()["paint"]["map_updates"])
-        world.set_velocity_ros(0.3, 0.0, 0.0)
+        world.set_body_velocity(0.3, 0.0, 0.0)
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             time.sleep(0.1)

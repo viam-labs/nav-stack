@@ -86,16 +86,16 @@ def save_occupancy(
     occupied_thresh: float = 0.65,
     free_thresh: float = 0.196,
 ) -> str:
-    """Write Nav2-style ``map.yaml`` + ``map.pgm`` (image top-down).
+    """Write ``map.yaml`` + ``map.pgm`` (image top-down).
 
     Returns the SHA-1 of the written ``map.pgm`` bytes.
     """
     map_dir.mkdir(parents=True, exist_ok=True)
     int16 = occ.to_occupancy_int16(grid)
-    # OccupancyGrid is bottom-up; map_server PGM is top-down.
+    # The grid is bottom-up; the PGM image is top-down.
     pgm_grid = np.flipud(int16)
 
-    # Encode: unknown=205, free=254, occupied=0 (map_server convention, negate=0).
+    # Encode: unknown=205, free=254, occupied=0 (standard PGM map encoding, negate=0).
     pixels = np.full(pgm_grid.shape, 205, dtype=np.uint8)
     pixels[pgm_grid == 0] = 254
     pixels[pgm_grid >= 50] = 0

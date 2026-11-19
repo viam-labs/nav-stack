@@ -124,7 +124,7 @@ def test_global_localize_rejects_off_map_candidates():
         )
 
 
-def test_pgm_to_occupancy_grid_nav2_values():
+def test_pgm_to_occupancy_grid_values():
     pgm = np.array([[254, 0], [205, 254]], dtype=np.uint8)
     grid = pgm_to_occupancy_grid(pgm)
     assert grid[0, 0] == 0
@@ -158,7 +158,7 @@ def test_load_occupancy_from_map_dir(tmp_path: Path):
     assert occ.origin_x == -1.0
     occ_cells = np.argwhere(occ.grid == 100)
     assert occ_cells.shape[0] == 1
-    # map_server image rows are top->bottom; loader flips into OccupancyGrid layout.
+    # PGM image rows are top->bottom; loader flips into OccupancyGrid layout.
     assert tuple(occ_cells[0]) == (2, 1)
 
 

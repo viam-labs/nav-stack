@@ -159,8 +159,8 @@ def describe_goal_progress(
     if body is None:
         return None
     dist, bearing, _forward, _left = body
-    vx = float(last.get("body_vx_mps", last.get("ros_vx_mps", 0.0)) or 0.0)
-    vth = float(last.get("body_vtheta_rad_s", last.get("ros_vtheta_rad_s", 0.0)) or 0.0)
+    vx = float(last.get("body_vx_mps", 0.0) or 0.0)
+    vth = float(last.get("body_vtheta_rad_s", 0.0) or 0.0)
     moving = abs(vx) >= 0.02 or abs(vth) >= 0.05
     if not moving:
         if dist < 0.3:
@@ -227,9 +227,9 @@ def describe_cmd_vel(
     held_s: Optional[float] = None,
 ) -> str:
     """Describe a single body-frame velocity command sample."""
-    vx = float(last.get("body_vx_mps", last.get("ros_vx_mps", 0.0)) or 0.0)
+    vx = float(last.get("body_vx_mps", 0.0) or 0.0)
     vy = float(last.get("body_vy_mps", 0.0) or 0.0)
-    vth = float(last.get("body_vtheta_rad_s", last.get("ros_vtheta_rad_s", 0.0)) or 0.0)
+    vth = float(last.get("body_vtheta_rad_s", 0.0) or 0.0)
     source = last.get("source") or "unknown"
 
     if abs(vx) < 0.02 and abs(vy) < 0.02 and abs(vth) < 0.05:

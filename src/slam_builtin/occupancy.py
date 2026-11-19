@@ -64,7 +64,7 @@ def from_occupancy_int16(
     origin_x: float,
     origin_y: float,
 ) -> LogOddsGrid:
-    """Seed log-odds from ROS-style int16 occupancy (-1/0/100)."""
+    """Seed log-odds from int16 occupancy (-1/0/100)."""
     g = np.asarray(grid, dtype=np.int16)
     lo = np.zeros(g.shape, dtype=np.float32)
     lo[g >= 50] = _prob_to_logodds(0.9)
@@ -85,7 +85,7 @@ _FREE_THRESH_LO = _prob_to_logodds(FREE_THRESH)
 
 
 def to_occupancy_int16(grid: LogOddsGrid) -> np.ndarray:
-    """Convert log-odds to ROS OccupancyGrid values (-1 unknown, 0 free, 100 occ).
+    """Convert log-odds to int16 occupancy (-1 unknown, 0 free, 100 occ).
 
     Called for every ``get_map`` and every scan-match cache rebuild, so the
     full-grid work is three comparisons; only the (small) mid-probability band

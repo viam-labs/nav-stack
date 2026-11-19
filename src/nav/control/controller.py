@@ -40,7 +40,7 @@ from .footprint_guard import FootprintGuard, obstacle_points
 
 @dataclass
 class FollowerConfig:
-    """Regulated Pure Pursuit (Nav2-style) for diff-drive / skid-steer.
+    """Regulated Pure Pursuit for diff-drive / skid-steer.
 
     Lookahead is velocity-scaled: ``L = clamp(v · lookahead_time_s, min, max)``;
     ``lookahead_m`` is used when the commanded speed is unknown or ~0. Steering
@@ -67,7 +67,7 @@ class FollowerConfig:
     # Rotate-to-heading: stop translating when the lookahead bearing exceeds
     # ``rotate_in_place_rad``; keep rotating until it drops under
     # ``rotate_exit_rad`` (hysteresis so we do not toggle spin/translate).
-    # 60° (not Nav2's 45°): with curvature-regulated speed a 90° corner is a
+    # 60° (not the usual 45°): with curvature-regulated speed a 90° corner is a
     # slow tight arc, and a 45° trigger turned every corner into stop-spin-go.
     rotate_in_place_rad: float = math.radians(60.0)
     rotate_exit_rad: float = math.radians(25.0)
@@ -268,7 +268,7 @@ def _effective_lookahead(
 def update_speed_estimate(prev: float, cmd_vx: float, *, alpha: float = 0.25) -> float:
     """Smoothed forward-speed estimate for the velocity-scaled lookahead.
 
-    Nav2 scales lookahead from *measured* odometry, which the robot's inertia
+    Standard RPP scales lookahead from *measured* odometry, which the robot's inertia
     smooths. We only have the last command; feeding it back raw creates a
     limit cycle (slow → shorter L → less curvature → fast → longer L → ...)
     that shows up as alternating vθ every tick through a corner. A ~0.4 s EMA
@@ -437,8 +437,8 @@ def pursuit_command(
     if abs(kappa) > kappa_max:
         kappa = math.copysign(kappa_max, kappa)
     # Curvature regulation slows v by r/r_min and therefore locks ω at
-    # v_cruise/r_min (~0.7 rad/s here) for every tighter arc. Nav2 does the
-    # same, and only stops to spin once the carrot bearing exceeds
+    # v_cruise/r_min (~0.7 rad/s here) for every tighter arc. Standard RPP does
+    # the same, and only stops to spin once the carrot bearing exceeds
     # rotate_to_heading_min_angle. Holding that ω on a shallow hallway bend
     # yaws through the path and trips our rotate-to-heading. A saturated arc
     # instead closes the current bearing over about half a lookahead time.

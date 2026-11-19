@@ -38,7 +38,7 @@ if [ ! -x "${ROOT}/run.sh" ]; then
 fi
 
 if [ ! -d "${ROOT}/.venv" ]; then
-  echo "[local-sim] creating Python venv via setup.sh (ROS-free)…"
+  echo "[local-sim] creating Python venv via setup.sh…"
   "${ROOT}/setup.sh"
 fi
 

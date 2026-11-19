@@ -72,7 +72,7 @@ def assess_occupancy(
     max_hotspots: int = 8,
     max_side: int = 800,
 ) -> MapHealth:
-    """Score a Nav2-style occupancy grid (-1 unknown, 0 free, ≥50 occupied).
+    """Score an occupancy grid (-1 unknown, 0 free, ≥50 occupied).
 
     With ``baseline`` (same shape and frame as ``grid``, e.g. the map a mapping
     session resumed on), only walls absent from the baseline are scored, so

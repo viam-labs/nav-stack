@@ -486,37 +486,11 @@ def test_loop_rate_hz_config():
         SlamConfig.from_dict({"base": "b", "lidar": "f", "scan_rate_hz": -1})
 
 
-def test_nav_config_nav_backend_nav2_rejected():
-    with pytest.raises(ValueError, match="pre-ros-removal|nav2|no longer supported"):
+def test_nav_config_unknown_nav_backend_rejected():
+    with pytest.raises(ValueError, match="nav_backend must be"):
         NavConfig.from_dict(
-            {"slam_service": "slam", "base": "b", "nav_backend": "nav2"}
+            {"slam_service": "slam", "base": "b", "nav_backend": "other"}
         )
-
-
-def test_nav_config_legacy_nav2_block_alias():
-    """Older machine configs used ``nav2`` for what is now ``builtin``."""
-    cfg = NavConfig.from_dict(
-        {
-            "slam_service": "slam",
-            "base": "b",
-            "nav2": {
-                "xy_goal_tolerance": 0.25,
-                "yaw_goal_tolerance": 0.5,
-            },
-        }
-    )
-    assert cfg.builtin.xy_goal_tolerance == pytest.approx(0.25)
-    assert cfg.builtin.yaw_goal_tolerance == pytest.approx(0.5)
-    # Explicit ``builtin`` wins over legacy ``nav2``.
-    prefer = NavConfig.from_dict(
-        {
-            "slam_service": "slam",
-            "base": "b",
-            "builtin": {"yaw_goal_tolerance": 0.4},
-            "nav2": {"yaw_goal_tolerance": 0.9},
-        }
-    )
-    assert prefer.builtin.yaw_goal_tolerance == pytest.approx(0.4)
 
 
 def test_nav_config_top_level_goal_tolerances():
@@ -706,29 +680,6 @@ def test_slam_config_top_level_resolution():
     assert nested.map.resolution == pytest.approx(0.05)
 
 
-def test_slam_config_legacy_slam_toolbox_block_alias():
-    """Older machine configs used ``slam_toolbox`` for what is now ``map``."""
-    cfg = SlamConfig.from_dict(
-        {
-            "base": "b",
-            "lidar": "front",
-            "mode": "localizing",
-            "slam_toolbox": {"resolution": 0.08},
-        }
-    )
-    assert cfg.map.resolution == pytest.approx(0.08)
-    prefer = SlamConfig.from_dict(
-        {
-            "base": "b",
-            "lidar": "front",
-            "mode": "localizing",
-            "map": {"resolution": 0.05},
-            "slam_toolbox": {"resolution": 0.2},
-        }
-    )
-    assert prefer.map.resolution == pytest.approx(0.05)
-
-
 def test_builtin_recovery_wait_defaults():
     cfg = NavConfig.from_dict({"slam_service": "slam", "base": "b"})
     assert cfg.builtin.recovery_wait_duration_s == pytest.approx(2.0)
@@ -815,16 +766,6 @@ def test_base_velocity_convention_viam_default():
     assert ly == pytest.approx(500.0)
 
 
-def test_base_velocity_convention_ros_alias_normalizes_to_x_forward():
-    cfg = SlamConfig.from_dict(
-        {"base": "b", "lidar": "f", "base_velocity_convention": "ros"}
-    )
-    assert cfg.base_velocity_convention == "x_forward"
-    lx, ly = body_linear_to_viam_mm_s(0.5, -0.1, cfg.base_velocity_convention)
-    assert lx == pytest.approx(500.0)
-    assert ly == pytest.approx(-100.0)
-
-
 def test_base_velocity_convention_x_forward():
     cfg = SlamConfig.from_dict(
         {"base": "b", "lidar": "f", "base_velocity_convention": "x_forward"}
@@ -857,13 +798,13 @@ def test_body_vtheta_to_viam_angular_is_degrees():
 
 
 def test_sensor_twist_to_body_viam_y_forward():
-    # Sensor: forward on y=0.019, no lateral → ROS forward on vx.
-    ros_vx, ros_vy = sensor_twist_to_body(0.0, 0.019, "viam")
-    assert ros_vx == pytest.approx(0.019)
-    assert ros_vy == pytest.approx(0.0)
-    ros_vx, ros_vy = sensor_twist_to_body(0.5, -0.1, "ros")
-    assert ros_vx == pytest.approx(0.5)
-    assert ros_vy == pytest.approx(-0.1)
+    # Sensor: forward on y=0.019, no lateral → body forward on vx.
+    body_vx, body_vy = sensor_twist_to_body(0.0, 0.019, "viam")
+    assert body_vx == pytest.approx(0.019)
+    assert body_vy == pytest.approx(0.0)
+    body_vx, body_vy = sensor_twist_to_body(0.5, -0.1, "x_forward")
+    assert body_vx == pytest.approx(0.5)
+    assert body_vy == pytest.approx(-0.1)
 
 
 def test_min_cmd_vel_defaults_and_legacy_alias():

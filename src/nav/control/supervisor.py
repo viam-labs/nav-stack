@@ -1678,8 +1678,8 @@ class NavSupervisor:
     ) -> tuple[DriveCommand, str]:
         """Twist that takes the scan corridor without a full stop when it can.
 
-        A few degrees is a creep with yaw, the way Nav2 regulated pure
-        pursuit closes a carrot bearing under ~45°. The arc is checked on
+        A few degrees is a creep with yaw, the way regulated pure pursuit
+        closes a carrot bearing under ~45°. The arc is checked on
         the raw scan; if the nose is already touching, fall back to an
         in-place spin so the guard does not zero the command.
         """
@@ -1719,8 +1719,8 @@ class NavSupervisor:
     ) -> bool:
         """Skip a blocking global replan the scan can already drive through.
 
-        Nav2's controller keeps publishing velocity while ComputePathToPose
-        fails. An inscribed centerline stays ``static_blocked`` for a whole
+        A path follower should keep driving while a global replan fails.
+        An inscribed centerline stays ``static_blocked`` for a whole
         corridor, and zeroing the base for that search every second is the
         start/stop. Still replan on a pose jump, a rock, or a real stuck
         nose with no scan opening.

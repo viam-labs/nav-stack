@@ -1,4 +1,4 @@
-"""Tests for ViamWorldIO + get_grid encode/decode (ROS-free nav I/O)."""
+"""Tests for ViamWorldIO + get_grid encode/decode (nav I/O)."""
 
 from __future__ import annotations
 
@@ -88,7 +88,7 @@ async def test_viam_world_io_map_pose_drive():
     await asyncio.to_thread(world.set_velocity, 0.2, 0.0, -1.0)
     base.set_velocity.assert_awaited()
     args = base.set_velocity.await_args
-    # viam convention: ROS vx -> Viam linear.y; angular is deg/s not rad/s
+    # viam convention: body vx -> Viam linear.y; angular is deg/s not rad/s
     assert args.kwargs["linear"].y == pytest.approx(200.0)
     assert args.kwargs["angular"].z == pytest.approx(-math.degrees(1.0))
     drive = world.last_drive()
@@ -520,7 +520,7 @@ async def test_near_zero_rpm_retry_widens_arc_instead_of_spinning():
     await asyncio.to_thread(world.set_velocity, 0.15, 0.0, 0.6)
     assert base.set_velocity.await_count == 2
     retry = base.set_velocity.await_args_list[1].kwargs
-    # Still translating (viam convention: ROS vx → linear.y), faster than asked.
+    # Still translating (viam convention: body vx → linear.y), faster than asked.
     assert retry["linear"].y > 150.0
     assert retry["angular"].z == pytest.approx(math.degrees(0.6))
     drive = world.last_drive()

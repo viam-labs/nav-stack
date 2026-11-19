@@ -324,7 +324,7 @@ class LilocSequence:
 
 
 def load_reference_map(root: Path) -> OccupancyMap:
-    """The dataset's occupancy grid (ROS map_server png + yaml), in the GT frame."""
+    """The dataset's occupancy grid (png + yaml), in the GT frame."""
     folder = Path(root).expanduser() / "map_office"
     meta = yaml.safe_load((folder / "map_office.yaml").read_text())
     img = np.asarray(Image.open(folder / str(meta["image"])).convert("L")).astype(

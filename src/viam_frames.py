@@ -105,13 +105,13 @@ def _matrix_to_mount(T: np.ndarray) -> MountPose:
     )
 
 
-def _viam_y_forward_base_to_ros(T: np.ndarray) -> np.ndarray:
-    """Map a pose expressed in Viam Y-forward ``base`` into ROS X-forward ``base_link``.
+def _viam_y_forward_base_to_x_forward(T: np.ndarray) -> np.ndarray:
+    """Map a pose expressed in Viam Y-forward ``base`` into X-forward ``base_link``.
 
     Viam wheeled / Tracer / MiR: +Y forward, +X right, +Z up.
-    Nav-stack mounts + SLAM map: +X forward, +Y left, +Z up (ROS).
+    Nav-stack mounts + SLAM map: +X forward, +Y left, +Z up.
 
-    ``p_ros = Rz(-π/2) @ p_viam`` so forward (+Y_v) → (+X_r) and right (+X_v) → (−Y_r).
+    ``p_nav = Rz(-π/2) @ p_viam`` so forward (+Y_v) → (+X_n) and right (+X_v) → (−Y_n).
     Odom already applies this via ``base_velocity_convention: viam``; framesystem
     mounts must too or every scan is painted 90° CW relative to drive.
     """
@@ -150,7 +150,7 @@ def pose_of_frame_in_destination(
     Each framesystem entry is the named frame's pose in its parent (observer).
 
     When ``y_forward_base`` is true (Viam/Tracer/MiR ``base``), the result is
-    converted into nav-stack ROS X-forward ``base_link`` axes.
+    converted into nav-stack X-forward ``base_link`` axes.
     """
     frames = _frame_entries(configs)
     if frame_name not in frames and frame_name != destination:
@@ -195,7 +195,7 @@ def pose_of_frame_in_destination(
             )
             return None
     if y_forward_base:
-        T = _viam_y_forward_base_to_ros(T)
+        T = _viam_y_forward_base_to_x_forward(T)
     return _matrix_to_mount(T)
 
 
@@ -302,7 +302,7 @@ def apply_framesystem_to_slam_cfg(
     Mutates existing ``LidarConfig`` objects in place so live sensor facades
     that hold the same instances pick up mounts without a rebuild.
 
-    ``y_forward_base`` converts Viam Y-forward ``base`` poses into ROS X-forward
+    ``y_forward_base`` converts Viam Y-forward ``base`` poses into nav-stack X-forward
     mounts (default True — all Viam bases are Y-forward).
 
     Returns ``(cfg, notes)`` where notes are human-readable resolution lines.
@@ -317,7 +317,7 @@ def apply_framesystem_to_slam_cfg(
 
     if y_forward_base is None:
         # All Viam bases are Y-forward in the framesystem; nav-stack mounts are
-        # ROS X-forward. Always convert unless a caller opts out (tests).
+        # X-forward. Always convert unless a caller opts out (tests).
         y_forward_base = True
 
     base_name = str(getattr(cfg, "base", "") or "base")
@@ -351,7 +351,7 @@ def apply_framesystem_to_slam_cfg(
         # Framesystem pose is the component frame → base. RealSense
         # GetPointCloud is still camera-optical (Z forward). The FS camera
         # orientation is typically an optical/camera_link OV (±90° roll, and
-        # after Y-forward→ROS convert often ±90° yaw) — not the lens aim in
+        # after the Y-forward→X-forward convert often ±90° yaw) — not the lens aim in
         # the map. Using that RPY (with or without optical remap) paints the
         # cloud to the robot's side/rear so ahead-right obstacles never enter
         # the reactive corridor (live: center ray → −Y, grazes with

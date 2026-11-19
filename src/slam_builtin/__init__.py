@@ -1,4 +1,4 @@
-"""ROS-free 2D occupancy SLAM (``slam_backend: builtin``)."""
+"""Builtin 2D occupancy SLAM (``slam_backend: builtin``)."""
 
 from .engine import BuiltinSlamEngine
 from .host import BuiltinSlamHost
