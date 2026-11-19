@@ -2,8 +2,6 @@
 
 A Viam navigation stack for mapping, localization, and obstacle-aware navigation
 on any Viam base.
-The last release that still bundled Nav2/slam_toolbox is preserved at git tag
-`pre-ros-removal`.
 
 This module (`viam-labs:nav-stack`) provides:
 
