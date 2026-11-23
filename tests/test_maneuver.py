@@ -203,19 +203,34 @@ def test_turn_direction_is_kept_when_the_route_is_nearly_behind():
     assert cmd.vtheta < 0.0
 
 
-def test_no_manoeuvre_toward_a_point_inside_an_obstacle():
-    # A bin on the route that is not on the map: the follower's lookahead
-    # point is inside it. The blocked-path logic turns the robot away to go
-    # round; a manoeuvre to face the bin again fought it (bin_on_route).
-    from src.nav.control.maneuver import target_is_free
-
-    bin_face = np.array(_line(HL + 0.25, -0.2, HL + 0.25, 0.2))
-    inside = Pose2D(HL + 0.31, 0.0, 0.0)
+def test_route_passing_close_to_an_obstacle_still_gets_a_manoeuvre():
+    # Live tracer2a (1.3.1-rc4): nose 7.6 cm from furniture, route 74 degrees
+    # to the right through a gap, open floor behind. A check that refused to
+    # plan toward a lookahead point within half a body width of any obstacle
+    # (it was 20 cm from one) left the robot at zero command for 30 s.
+    ahead = _line(HL + 0.076, -0.5, HL + 0.076, 0.5)
+    target = _target(-74, 0.6)
+    beside_route = [[target.x + 0.2, target.y]]
+    pts = np.array(ahead + beside_route)
     g = _guard()
-    assert not target_is_free(g, bin_face, inside)
-    assert target_is_free(g, bin_face, Pose2D(0.0, 1.0, 0.0))
-    # Turned 60 degrees away from it already: the turn back is blocked, but
-    # no manoeuvre starts.
-    pose = Pose2D(0.0, 0.0, math.radians(60.0))
-    res = g.guard(pose, 0.0, -0.6, bin_face, target=inside, max_dist_m=3.0, plan=True)
-    assert res.state != "maneuver" and not g.maneuver.active
+    res = g.guard(START, 0.0, -0.6, pts, target=target, max_dist_m=4.0, plan=True)
+    assert res.state == "maneuver" and g.maneuver.active
+    assert res.vx < 0.0  # backs away from the furniture first
+    pose, closest = START, math.inf
+    for _ in range(1200):
+        want = conv_bearing(pose, target)
+        if abs(want) <= math.radians(20.0):
+            break
+        res = g.guard(
+            pose, 0.0, math.copysign(0.6, want), pts, target=target, plan=True
+        )
+        th = pose.theta + res.vtheta * 0.05
+        pose = Pose2D(
+            pose.x + res.vx * math.cos(th) * 0.05,
+            pose.y + res.vx * math.sin(th) * 0.05,
+            th,
+        )
+        here = np.array([[pose.x, pose.y, pose.theta]])
+        closest = min(closest, float(_rect_dist(here, pts, HL, HW).min()))
+    assert abs(conv_bearing(pose, target)) <= math.radians(20.0)
+    assert closest >= 0.03

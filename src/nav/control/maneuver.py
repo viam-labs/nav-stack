@@ -107,21 +107,6 @@ def _moves_free(
     )
 
 
-def target_is_free(guard: "FootprintGuard", pts: np.ndarray, target: Pose2D) -> bool:
-    """Whether the body could stand on ``target`` at all.
-
-    When the route runs through something that is not on the map, the point
-    the follower steers for sits inside it. Turning to face that point is
-    pointless and fights the blocked-path logic, which is turning the robot
-    away to go round. A manoeuvre is only worth planning toward a point the
-    body could reach.
-    """
-    if not pts.size:
-        return True
-    d2 = (pts[:, 0] - target.x) ** 2 + (pts[:, 1] - target.y) ** 2
-    return bool(d2.min() > guard._hw**2)  # noqa: SLF001
-
-
 def plan_maneuver(
     guard: "FootprintGuard",
     pose: Pose2D,
@@ -284,8 +269,6 @@ class ManeuverRunner:
         """Plan from ``pose`` and return the first command, or None."""
         self.cancel()
         if target is None or self._retry_in > 0 or self._hold > 0:
-            return None
-        if not target_is_free(guard, pts, target):
             return None
         plan = plan_maneuver(guard, pose, pts, target)
         if not plan:
