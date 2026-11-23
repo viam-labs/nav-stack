@@ -43,8 +43,23 @@
       "api": "rdk:component:movement_sensor",
       "model": "viam-labs:nav-stack:wit-imu",
       "short_description": "WitMotion IMU with USB autodetect and POSIX shm for builtin SLAM."
+    },
+    {
+      "api": "rdk:service:generic",
+      "model": "viam-labs:nav-stack:explore",
+      "short_description": "Autonomous mapping drive: goes to the edges of the map until nothing reachable is unexplored, then saves the map and returns home."
+    },
+    {
+      "api": "rdk:component:camera",
+      "model": "viam-labs:nav-stack:explore-view",
+      "short_description": "Nav view plus an exploration-run HUD: phase, time, map coverage, keyframes, goals, frontiers left."
     }
   ],
   "entrypoint": "run.sh",
-  "first_run": "setup.sh"
+  "first_run": "setup.sh",
+  "build": {
+    "build": "./build.sh",
+    "path": "module.tar.gz",
+    "arch": ["linux/amd64", "linux/arm64"]
+  }
 }

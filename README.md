@@ -12,6 +12,7 @@ This module (`viam-labs:nav-stack`) provides:
 | `viam-labs:nav-stack:navigation-external` | `rdk:service:navigation` | Same Navigation service against **any** `rdk:service:slam`. |
 | `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders costmap + plan(s), pose, footprint and goal as a live camera image. |
 | `viam-labs:nav-stack:sim-base` | `rdk:component:base` | Simulated base for hardware-free mapping / nav (`SetVelocity` → raycast world). |
+| `viam-labs:nav-stack:explore` | `rdk:service:generic` | Autonomous mapping drive: goes to the edges of the map until nothing reachable is unexplored, then saves the map and returns home. |
 | `viam-labs:nav-stack:rplidar` / `wit-imu` / `shm-pointcloud` | camera / movement_sensor | Optional sensor helpers with POSIX shm for low-latency reads. |
 
 ## How it works
@@ -357,6 +358,86 @@ Use `viam-labs:nav-stack:navigation-external` to drive builtin navigation from *
 
 Optional attributes: `trust_movement_sensor_pose` (default `false`), `snap_heading` (default `false`), plus the same lidar/odometry tuning fields as the SLAM service and the same `builtin` block as `navigation`. The built-in `navigation` model is unchanged; use it when you map with `nav-stack:slam`.
 
+### Explore service (autonomous mapping drive)
+
+`viam-labs:nav-stack:explore` drives the robot to the edges of what has been
+mapped until nothing reachable is left unexplored (or an optional time budget
+runs out), so builtin SLAM maps the space, then saves the map and returns to
+where it started. It is a client of the SLAM and navigation services and never
+drives the base directly except to stop.
+
+```json
+{
+  "name": "explore",
+  "api": "rdk:service:generic",
+  "model": "viam-labs:nav-stack:explore",
+  "attributes": {
+    "slam_service": "slam",
+    "navigation_service": "navigation",
+    "base": "my-base",
+    "max_linear_mps": 0.4,
+    "max_angular_dps": 30,
+    "home_tolerance_m": 0.5,
+    "min_frontier_m": 0.5
+  }
+}
+```
+
+Requirements checked by `start` (nothing moves if either fails):
+
+- The SLAM service is in `mapping` mode (`start_mapping`).
+- The navigation service's `max_vel_theta` is at or below `max_angular_dps`
+  (default 30°/s ≈ 0.52 rad/s), e.g. `"max_vel_theta": 0.5`. Builtin SLAM drops
+  scans while yawing faster than 45°/s, and nav's default is 1.5 rad/s.
+
+DoCommands:
+
+| Command | Args | Reply |
+| --- | --- | --- |
+| `start` | optional `duration_s` | `{"started": true}` (plus `duration_s` when given) or `{"error": "..."}` |
+| `stop` | — | `{"stopping": true}`; the finish sequence runs as when exploring ends |
+| `status` | — | `{phase, elapsed_s, goals, waypoints, goals_failed, frontier_count, unreachable_frontiers, coverage_cells, keyframes_used, decision_ms, last_error}`, plus `duration_s` / `remaining_s` with a budget, `goal` and `waypoint` while driving to one and `home` once known |
+
+How it picks where to go, once a second while the robot drives:
+
+- **Frontiers** are known free cells next to unknown space. Unknown holes up to
+  about 0.2 m wide (gaps between lidar rays) are filled first, frontier cells
+  within the robot's radius plus 0.2 m are ignored (its body and the lidar's
+  minimum range), and frontiers shorter than `min_frontier_m` are dropped.
+- **One wavefront** from the robot over known free space, kept the robot's
+  radius away from walls, gives the path length to every reachable cell at
+  once. Each frontier's goal is the reachable cell closest to it, nearest the
+  robot. No path is planned per candidate; the map is read in-process from the
+  SLAM service when both run in this module (otherwise through `get_grid`).
+- **Cost** = path length + 0.5 m per radian of turn − 0.3 × frontier length
+  (capped at 6 m). The cheapest frontier wins.
+- **Short legs.** Nav is sent waypoints at most 4 m of path ahead along the
+  wavefront route, not the frontier itself: nav stops and plans the whole
+  path before moving, and a long plan can take many seconds on a busy host.
+  Waypoints prefer cells with 0.2 m of extra room from walls and face along
+  the route.
+- **The robot keeps moving.** The next waypoint is sent when the current one
+  is within 1 m, so nav does not stop and turn on the way. A goal whose
+  frontier is already seen is dropped unless its waypoint is on the way to
+  the next goal, and a live goal is only replaced by one at least 2 m
+  cheaper.
+
+A goal fails when nav reports a failure, it becomes unreachable, the path to
+it has not shrunk by 0.3 m in 30 s, or nav arrives and its frontier is still
+there (glass, a drop, something below or above the lidar). Failed goals are
+blacklisted for 10 minutes within 1 m; `unreachable_frontiers` counts what is
+left out that way, so a run that ends with it above zero has gaps in the map.
+Ten failures in a row end the run.
+
+Exploring ends when three scans in a row find no reachable frontier, when
+`duration_s` runs out, on `stop`, or on an unrecoverable error. **Finish**:
+cancel, `optimize`, `save_map`, navigate home (one retry), else stop in place.
+The map is saved before the drive home. A `stop` received while finishing skips
+the retry of the drive home. Any error from a SLAM or navigation call ends the
+run through the same finish sequence and is reported in `last_error`. A lost
+pose or an unhealthy SLAM is waited out for 60 s, then the run finishes.
+Moving obstacles are left to the navigation service's local costmap.
+
 ### Builtin simulation (no hardware)
 
 Bring up slam + navigation against a raycast floorplan so you can **map**, **localize**, **plan/execute** paths (including from nav-stack-ui), and **repeat** the same path after a pose reset — without real lidars or a wheeled base.
@@ -420,6 +501,7 @@ Notes:
 - Default world is a built-in L-corridor; set `sim.map_path` / `map_path` on sim-base to a `.npy` grid (+ optional sibling `.json` with `resolution`, `origin_x`, `origin_y`).
 - Lidars and movement sensors are omitted when `sim.enabled` is true.
 - Reset pose for repeatable runs: `sim-base` DoCommand `{"command": "reset"}` (optional `x` / `y` / `theta`).
+- Inject obstacles the map does not know about: `sim-base` DoCommand `{"command": "add_obstacle", "x": 2.0, "y": 1.0, "radius_m": 0.3}` (returns an `id`) and `{"command": "clear_obstacles"}`; `get_pose` returns ground truth.
 
 **Local bring-up (viam-server):**
 
