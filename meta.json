@@ -47,7 +47,7 @@
     {
       "api": "rdk:service:generic",
       "model": "viam-labs:nav-stack:explore",
-      "short_description": "Autonomous mapping drive: goes to the edges of the map until nothing reachable is unexplored, then saves the map and returns home."
+      "short_description": "Autonomous mapping drive: explores until nothing reachable is unmapped, then saves and returns home."
     },
     {
       "api": "rdk:component:camera",
