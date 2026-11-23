@@ -374,6 +374,11 @@ def _prev_curvature(prev_cmd: Optional[DriveCommand]) -> Optional[float]:
     return float(prev_cmd.vtheta) / float(prev_cmd.vx)
 
 
+# While turning in place toward a point further than this off the nose, the
+# turn direction is kept (see ``pursuit_command``).
+ROTATE_COMMIT_RAD = math.radians(135.0)
+
+
 def pursuit_command(
     current: Pose2D,
     target: Pose2D,
@@ -412,6 +417,19 @@ def pursuit_command(
         rot_max = min(float(cfg.rotate_vel_rad_s), max_angular)
         rot_floor = min(rot_max, max(motion.min_angular_rad_s, 0.2))
         w = math.copysign(max(min(abs(alpha) * 1.5, rot_max), rot_floor), alpha)
+        # Route nearly straight behind: the bearing flips between +160 and
+        # -160 degrees when the lookahead point moves a few centimetres, and
+        # reversing the turn each time rocked the robot 2 degrees left and
+        # right indefinitely. Keep turning the way it is already turning;
+        # the long way round costs at most 90 degrees.
+        if (
+            abs(alpha) > ROTATE_COMMIT_RAD
+            and prev_cmd is not None
+            and not prev_cmd.done
+            and abs(prev_cmd.vx) < 0.02
+            and abs(prev_cmd.vtheta) > 0.05
+        ):
+            w = math.copysign(abs(w), prev_cmd.vtheta)
         return DriveCommand(0.0, 0.0, w, False), True
 
     y_steer = y_l
@@ -590,6 +608,7 @@ def compute_path_command(
     guard: Optional[FootprintGuard] = None,
     guard_extra_pts: Optional[np.ndarray] = None,
     scan_world_pts: Optional[np.ndarray] = None,
+    allow_maneuver: bool = True,
 ) -> Tuple[DriveCommand, dict]:
     """One control step along ``path``.
 
@@ -730,6 +749,7 @@ def compute_path_command(
             local_active=local_active,
             prev_cmd=prev_cmd,
             pts=guard_pts,
+            allow_maneuver=allow_maneuver,
             meta={
                 "tight": tight,
                 "waypoint_index": idx,
@@ -1084,7 +1104,7 @@ _GUARD_STATE = {
     "clear": "clear",
     "slow": "slow",
     "steer": "narrow",
-    "back_out": "narrow_reverse",
+    "maneuver": "maneuver",
     "rotate": "avoid",
     "blocked": "avoid",
 }
@@ -1105,6 +1125,7 @@ def _guarded_command(
     prev_cmd: Optional[DriveCommand],
     pts,
     meta: dict,
+    allow_maneuver: bool = True,
 ) -> Tuple[DriveCommand, dict]:
     obstacle_on = cfg.obstacle is not None and cfg.obstacle.enabled
     straight = guard.free_distance(current, 0.2, 0.0, pts, 2.0)
@@ -1131,6 +1152,8 @@ def _guarded_command(
             max_dist_m=dist_goal,
             prefer_sign=prefer,
             allow_steer=not in_tolerance,
+            plan=True,
+            maneuver_ok=allow_maneuver,
         )
         spin_blocked = res.rotation_blocked
         state = _GUARD_STATE[res.state]

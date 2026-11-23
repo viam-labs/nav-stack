@@ -45,7 +45,11 @@ def run_final_gate(
     near_x = float("nan")
     near_y = float("nan")
 
-    if corridor_yaw is not None and not tick.loc_hold_motion:
+    # A planned manoeuvre from the footprint guard is a sequence: the older
+    # single-step recoveries (corridor turn, undrivable-nose escape) must not
+    # replace one of its moves with their own.
+    maneuvering = progress.get("obstacle") == "maneuver"
+    if corridor_yaw is not None and not tick.loc_hold_motion and not maneuvering:
         ep.escape_m.yaw_sign = math.copysign(1.0, corridor_yaw)
         if abs(corridor_yaw) >= CORRIDOR_ALIGN_RAD or cmd.vx < LIN_EPS_MPS:
             cmd, label = nav._corridor_motion(  # noqa: SLF001
@@ -111,7 +115,7 @@ def run_final_gate(
             cmd = DriveCommand(veto.vx, cmd.vy, veto.vtheta, cmd.done)
             nav._last_sent_cmd = cmd  # noqa: SLF001
         tick.cmd = cmd
-        if not cmd.done:
+        if not cmd.done and not maneuvering:
             escape_post = ep.escape_m.tick_post(
                 tick.escape_sense(
                     nav,
