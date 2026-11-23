@@ -96,6 +96,27 @@ def _cell_step_cost(costs: np.ndarray, cell: Cell, base_step: float) -> float:
     return base_step * _cost_multiplier(int(costs[cell]))
 
 
+# The searches below read the costmap once per cell visited, millions of times
+# for a long plan. Every per-cell predicate depends only on the 0..255 cost,
+# so they are tabulated once, and the costmap is read as nested lists (numpy
+# scalar indexing costs several times more per read). Results are identical.
+_MULT = tuple(_cost_multiplier(c) for c in range(256))
+_TRAV = tuple(is_traversable(c) for c in range(256))
+_DIAG_STEP = math.hypot(1, 1)
+
+
+def _cost_rows(costs: np.ndarray) -> List[List[int]]:
+    """Costmap as nested lists of 0..255 ints.
+
+    Clipping keeps every predicate unchanged: negatives behave like 0 (free)
+    and anything above 255 like 255 (unknown, non-traversable).
+    """
+    arr = np.asarray(costs)
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr.tolist()
+
+
 def _segment_traversal_cost(costs: np.ndarray, a: Cell, b: Cell) -> float:
     """Bresenham path length with per-cell soft-inflation multipliers.
 
@@ -174,6 +195,85 @@ def line_of_sight(costs: np.ndarray, a: Cell, b: Cell) -> bool:
                 and int(costs[y, x - sx]) <= _LOS_MAX_SOFT_COST
             ):
                 return False
+
+
+_LOS_OK = tuple(_TRAV[c] and c <= _LOS_MAX_SOFT_COST for c in range(256))
+
+
+def _line_of_sight_rows(
+    rows: List[List[int]], h: int, w: int, a: Cell, b: Cell
+) -> bool:
+    """:func:`line_of_sight` on :func:`_cost_rows` output (same cells, same result)."""
+    ok = _LOS_OK
+    y0, x0 = a
+    y1, x1 = b
+    dy = abs(y1 - y0)
+    dx = abs(x1 - x0)
+    sy = 1 if y1 >= y0 else -1
+    sx = 1 if x1 >= x0 else -1
+    err = dx - dy
+    y, x = y0, x0
+    while True:
+        if not (0 <= y < h and 0 <= x < w) or not ok[rows[y][x]]:
+            return False
+        if y == y1 and x == x1:
+            return True
+        e2 = 2 * err
+        stepped_x = False
+        if e2 > -dy:
+            err -= dy
+            x += sx
+            stepped_x = True
+        if e2 < dx:
+            err += dx
+            y += sy
+            if stepped_x:
+                # Corner cut: both flanking orthogonal cells must pass too.
+                yy, xx = y - sy, x - sx
+                if not (0 <= yy < h and 0 <= x < w and ok[rows[yy][x]]):
+                    return False
+                if not (0 <= y < h and 0 <= xx < w and ok[rows[y][xx]]):
+                    return False
+
+
+def _segment_traversal_cost_rows(rows: List[List[int]], a: Cell, b: Cell) -> float:
+    """:func:`_segment_traversal_cost` on :func:`_cost_rows` output.
+
+    Walks the same Bresenham cells and adds the same terms in the same order,
+    so the float result is identical, without building the cell list.
+    """
+    if a == b:
+        return 0.0
+    mult = _MULT
+    y0, x0 = a
+    y1, x1 = b
+    dy = abs(y1 - y0)
+    dx = abs(x1 - x0)
+    sy = 1 if y1 >= y0 else -1
+    sx = 1 if x1 >= x0 else -1
+    err = dx - dy
+    y, x = y0, x0
+    total = 0.0
+    peak = 1.0
+    while y != y1 or x != x1:
+        e2 = 2 * err
+        step = 1.0
+        if e2 > -dy:
+            err -= dy
+            x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+                step = _DIAG_STEP
+        elif e2 < dx:
+            err += dx
+            y += sy
+        m = mult[rows[y][x]]
+        if m > peak:
+            peak = m
+        total += step * m
+    euclid = math.hypot(y1 - y0, x1 - x0)
+    return max(total, euclid * peak)
 
 
 def bresenham_cells(a: Cell, b: Cell) -> List[Cell]:
@@ -320,7 +420,10 @@ def _astar(
     goal: Cell,
 ) -> Optional[List[Cell]]:
     h, w = costs.shape
-    if not is_traversable(int(costs[start])) or not is_traversable(int(costs[goal])):
+    rows = _cost_rows(costs)
+    trav = _TRAV
+    mult = _MULT
+    if not trav[rows[start[0]][start[1]]] or not trav[rows[goal[0]][goal[1]]]:
         return None
 
     open_heap: List[Tuple[float, int, Cell]] = []
@@ -339,14 +442,16 @@ def _astar(
         closed.add(current)
 
         cy, cx = current
+        g_cur = g_score[current]
         for dy, dx, step in _NEIGHBORS:
             ny, nx = cy + dy, cx + dx
             if not (0 <= ny < h and 0 <= nx < w):
                 continue
-            neighbor = (ny, nx)
-            if not is_traversable(int(costs[neighbor])):
+            c = rows[ny][nx]
+            if not trav[c]:
                 continue
-            tentative = g_score[current] + _cell_step_cost(costs, neighbor, step)
+            neighbor = (ny, nx)
+            tentative = g_cur + step * mult[c]
             if tentative >= g_score.get(neighbor, math.inf):
                 continue
             came_from[neighbor] = current
@@ -365,7 +470,10 @@ def _lazy_theta_star(
 ) -> Optional[List[Cell]]:
     """Lazy Theta* (Nash et al.): any-angle paths with deferred LOS checks."""
     h, w = costs.shape
-    if not is_traversable(int(costs[start])) or not is_traversable(int(costs[goal])):
+    rows = _cost_rows(costs)
+    trav = _TRAV
+    mult = _MULT
+    if not trav[rows[start[0]][start[1]]] or not trav[rows[goal[0]][goal[1]]]:
         return None
 
     g_score: dict = {start: 0.0}
@@ -375,11 +483,22 @@ def _lazy_theta_star(
     heapq.heappush(open_heap, (_heuristic(start, goal), counter, start))
     closed: set = set()
     in_open: set = {start}
+    # Chord costs depend only on the two end cells, and most are asked for
+    # more than once (about 2.4x on an apartment map).
+    seg_cache: dict = {}
+
+    def _seg(a: Cell, b: Cell) -> float:
+        key = (a, b)
+        cost = seg_cache.get(key)
+        if cost is None:
+            cost = _segment_traversal_cost_rows(rows, a, b)
+            seg_cache[key] = cost
+        return cost
 
     def _set_vertex(s: Cell) -> None:
         """Validate (or repair) the lazy parent assumption when expanding ``s``."""
         p = parent[s]
-        if p == s or line_of_sight(costs, p, s):
+        if p == s or _line_of_sight_rows(rows, h, w, p, s):
             return
         # No LOS to assumed parent: fall back to best visible closed neighbor.
         best_p = None
@@ -392,12 +511,12 @@ def _lazy_theta_star(
                 continue
             if not (0 <= ny < h and 0 <= nx < w):
                 continue
-            if not is_traversable(int(costs[n])):
+            if not trav[rows[ny][nx]]:
                 continue
-            if not line_of_sight(costs, n, s):
+            if not _line_of_sight_rows(rows, h, w, n, s):
                 continue
             # Euclidean parent→s weighted by soft inflation along the chord.
-            cand = g_score[n] + _segment_traversal_cost(costs, n, s)
+            cand = g_score[n] + _seg(n, s)
             if cand < best_g:
                 best_g = cand
                 best_p = n
@@ -412,9 +531,9 @@ def _lazy_theta_star(
                     continue
                 if not (0 <= ny < h and 0 <= nx < w):
                     continue
-                if not is_traversable(int(costs[n])):
+                if not trav[rows[ny][nx]]:
                     continue
-                cand = g_score[n] + _cell_step_cost(costs, s, step)
+                cand = g_score[n] + step * mult[rows[sy][sx]]
                 if cand < best_g:
                     best_g = cand
                     best_p = n
@@ -426,9 +545,15 @@ def _lazy_theta_star(
     def _compute_cost(s: Cell, sp: Cell) -> None:
         """Lazy update: assume LOS from parent(s) to ``sp`` (Path 2)."""
         ps = parent[s]
+        g_ps = g_score[ps]
+        g_sp = g_score.get(sp, math.inf)
+        # A chord never costs less than its length (multipliers are >= 1), so
+        # skip walking it when even that cannot beat sp's current cost.
+        if g_ps + math.hypot(sp[0] - ps[0], sp[1] - ps[1]) >= g_sp:
+            return
         # Any-angle length × inflation along the assumed parent chord.
-        tentative = g_score[ps] + _segment_traversal_cost(costs, ps, sp)
-        if tentative < g_score.get(sp, math.inf):
+        tentative = g_ps + _seg(ps, sp)
+        if tentative < g_sp:
             parent[sp] = ps
             g_score[sp] = tentative
 
@@ -450,7 +575,7 @@ def _lazy_theta_star(
             sp = (ny, nx)
             if sp in closed:
                 continue
-            if not is_traversable(int(costs[sp])):
+            if not trav[rows[ny][nx]]:
                 continue
             if sp not in in_open and sp not in g_score:
                 g_score[sp] = math.inf
