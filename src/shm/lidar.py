@@ -1,6 +1,6 @@
 """Latest-PCD client over POSIX shm (see :mod:`.pcshm`).
 
-Keeps one mapped reader per ``shm_name`` so the ROS scan timer is a memcpy,
+Keeps one mapped reader per ``shm_name`` so each scan read is a memcpy,
 not ``shm_open``. Writer restarts (unlink + recreate) are detected and the
 reader is reopened.
 """

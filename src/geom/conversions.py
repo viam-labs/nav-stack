@@ -1,11 +1,10 @@
 """Pure-Python geometry and format conversions.
 
-This module deliberately has no ROS dependency so it can be unit-tested without a
-ROS2 installation. It handles:
+Pure numpy, so it unit-tests without a robot. It handles:
 
-* unit conversion between Viam (millimeters, degrees) and ROS (meters, radians)
+* unit conversion between Viam (millimeters, degrees) and nav-stack (meters, radians)
 * 2D yaw <-> quaternion conversion
-* occupancy-grid (Nav2 ``OccupancyGrid``) -> PCD point cloud (Viam SLAM API)
+* occupancy grid -> PCD point cloud (Viam SLAM API)
 * multi-lidar LaserScan merging (scans -> common-frame XY points -> single scan)
 * depth/3D point cloud -> 2D LaserScan ranges
 """
@@ -190,7 +189,7 @@ def costmap_frame_to_map(cm: dict, frame_to_map: Pose2D) -> dict:
     """Re-rasterize an axis-aligned occupancy grid into the map frame.
 
     ``frame_to_map`` is the transform from the costmap's source frame (e.g.
-    odom for Nav2 ``local_costmap``) into map: ``map_xy = frame_to_map ∘ src_xy``.
+    odom for a local costmap) into map: ``map_xy = frame_to_map ∘ src_xy``.
     """
     grid = np.asarray(cm["grid"])
     if grid.ndim != 2 or grid.size == 0:
@@ -236,8 +235,8 @@ def costmap_frame_to_map(cm: dict, frame_to_map: Pose2D) -> dict:
 class OdomReading:
     """Body-frame twist plus optional pose/heading hints from the sensor."""
 
-    vx: float  # m/s, ROS forward
-    vy: float  # m/s, ROS lateral
+    vx: float  # m/s, body forward (+X)
+    vy: float  # m/s, body left (+Y)
     vtheta: float  # rad/s about +Z
     pose: Optional[Pose2D] = None  # full odom-frame pose; replaces integration
     heading_rad: Optional[float] = None  # snap yaw while integrating x/y (MiR-style)
@@ -269,8 +268,8 @@ def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
     return quaternion_to_yaw(float(x), float(y), float(z), float(w))
 
 
-def _parse_ros_odom_pose_block(readings: Mapping) -> Optional[Pose2D]:
-    """Parse a nested ROS ``nav_msgs/Odometry``-style pose from readings."""
+def _parse_nested_odom_pose_block(readings: Mapping) -> Optional[Pose2D]:
+    """Parse a nested ``pose.pose.position`` / ``orientation`` odometry pose."""
     pose_block = readings.get("pose")
     if not isinstance(pose_block, Mapping):
         return None
@@ -519,7 +518,7 @@ def parse_odom_twist_from_readings(readings: Mapping) -> Tuple[float, float, flo
 
     # rdk:builtin:wheeled-odometry (identified by its position_meters_X/Y
     # readings) uses a compass-style body frame: forward velocity is reported
-    # on +Y and X stays zero. Rotate into ROS base_link (x forward, y left)
+    # on +Y and X stays zero. Rotate into base_link (x forward, y left)
     # and take yaw rate from angular_velocity (deg/s, CCW positive).
     if "position_meters_X" in readings and "position_meters_Y" in readings:
         lin_xyz = _xyz_from_reading(readings.get("linear_velocity"))
@@ -546,16 +545,16 @@ def parse_odom_twist_from_readings(readings: Mapping) -> Tuple[float, float, flo
 def parse_odom_pose_from_readings(readings: Mapping) -> Optional[Pose2D]:
     """Extract a full odom-frame 2D pose from movement-sensor ``get_readings`` data.
 
-    Supports nested ROS odometry messages, flat ``x``/``y``/``theta`` keys, and
+    Supports nested odometry messages (``pose.pose``), flat ``x``/``y``/``theta`` keys, and
     ``odom_x``/``odom_y`` aliases. Does **not** treat ``viam-labs:mir-base``
     ``position_x_m``/``position_y_m`` as odom position (those are map-frame).
     """
     if not readings:
         return None
 
-    ros_pose = _parse_ros_odom_pose_block(readings)
-    if ros_pose is not None:
-        return ros_pose
+    nested_pose = _parse_nested_odom_pose_block(readings)
+    if nested_pose is not None:
+        return nested_pose
 
     flat: dict = dict(readings)
     pose_block = readings.get("pose")
@@ -712,7 +711,7 @@ def parse_odom_from_readings(readings: Mapping) -> OdomReading:
 
 
 def viam_pose_to_pose2d(x_mm: float, y_mm: float, theta_deg: float) -> Pose2D:
-    """Convert a Viam SLAM ``Pose`` (mm, degrees) into a ROS-style ``Pose2D``."""
+    """Convert a Viam SLAM ``Pose`` (mm, degrees) into a ``Pose2D`` (m, rad)."""
     return Pose2D(mm_to_m(x_mm), mm_to_m(y_mm), math.radians(theta_deg))
 
 
@@ -734,7 +733,7 @@ def pose2d_to_viam_slam_pose(
     Uses the planar OV convention (``o_z=1``, yaw in ``theta``) that RDK /
     cartographer use. ``yaw_offset_deg`` is added to the reported yaw only —
     useful when the App arrow is a fixed angular bias relative to the map PCD
-    while internal ROS TF is already consistent.
+    while the internal transforms are already consistent.
     """
     x_mm, y_mm, theta_deg = pose2d_to_viam_pose(pose)
     return (
@@ -758,10 +757,10 @@ def occupancy_grid_to_pcd(
     origin_y: float,
     occupied_threshold: int = 65,
 ) -> bytes:
-    """Convert a Nav2 occupancy grid into a binary PCD point cloud.
+    """Convert an occupancy grid into a binary PCD point cloud.
 
     Args:
-        grid: 2D int array (row-major, shape ``(height, width)``) using the ROS
+        grid: 2D int array (row-major, shape ``(height, width)``) using the
             occupancy convention: -1 unknown, 0 free, 100 fully occupied.
         resolution: meters per cell.
         origin_x/origin_y: world coordinates (meters) of cell (0, 0)'s lower-left
@@ -813,7 +812,7 @@ def chunk_bytes(data: bytes, chunk_size: int = 1 << 20) -> List[bytes]:
 
 
 def path_msg_to_points(path_msg, *, max_points: int = 400) -> List[Dict[str, float]]:
-    """Convert a ``nav_msgs/Path``-like object into ``[{x,y,theta}, ...]``.
+    """Convert a path object (``poses[i].pose``) into ``[{x,y,theta}, ...]``.
 
     Downsamples evenly when longer than ``max_points``, keeping endpoints.
     Coordinates are meters / radians in the path's frame (normally ``map``).
@@ -883,7 +882,7 @@ class LidarPoints:
 
 @dataclass
 class LaserScan2D:
-    """A minimal, ROS-agnostic representation of a 2D laser scan."""
+    """A minimal representation of a 2D laser scan."""
 
     ranges: np.ndarray  # shape (N,), meters; inf/nan for no return
     angle_min: float  # radians
@@ -1223,7 +1222,7 @@ def merge_lidar_and_depth_scans(
 def camera_optical_to_sensor_frame(points: np.ndarray) -> np.ndarray:
     """Map camera optical coordinates into the lidar/sensor body frame.
 
-    Optical (RealSense / OpenCV / ROS ``_optical_frame``):
+    Optical (RealSense / OpenCV camera frame):
       X right, Y down, Z forward (into the scene).
 
     Sensor / ``base_link``-style body axes used by mount + z filtering:
@@ -1754,7 +1753,7 @@ def scan_has_returns(scan: LaserScan2D) -> bool:
     return bool(np.any(np.isfinite(r) & (r >= scan.range_min) & (r <= scan.range_max)))
 
 
-# MiR250 laser mounts (meters, radians) — keep in sync with viam-mir-base mir_rosbridge.py.
+# MiR250 laser mounts (meters, radians) — keep in sync with viam-mir-base.
 _MIR250_FRONT_MOUNT = Pose2D(0.315 - 0.004485, 0.205, 0.25 * math.pi)
 _MIR250_BACK_MOUNT = Pose2D(-0.315 - 0.004485, -0.205, -0.75 * math.pi)
 
@@ -1789,7 +1788,7 @@ def _laser_scan_dict_to_points(
     *,
     topic: str = "",
 ) -> LidarPoints:
-    """Convert a MiR/rosbridge LaserScan dict into sensor- and base-frame points."""
+    """Convert a MiR LaserScan dict into sensor- and base-frame points."""
     ranges = scan.get("ranges") or []
     if not ranges:
         return LidarPoints(sensor=np.empty((0, 3)), base_link=np.empty((0, 3)))
@@ -1830,7 +1829,7 @@ def _laser_scan_dict_to_points(
 
 
 def mir_laser_scan_message_to_scan2d(scan: Mapping) -> LaserScan2D:
-    """Convert a rosbridge LaserScan dict to ``LaserScan2D`` (keeps native angles)."""
+    """Convert a MiR LaserScan dict to ``LaserScan2D`` (keeps native angles)."""
     raw_ranges = scan.get("ranges") or []
     n = len(raw_ranges)
     ranges = np.full(n, np.inf, dtype=float)
@@ -1914,7 +1913,7 @@ def merge_accumulated_rotation_only(
 
 
 def _mount_rotation(theta: float, pitch: float = 0.0, roll: float = 0.0) -> np.ndarray:
-    """Sensor->base rotation ``Rz(yaw) @ Ry(pitch) @ Rx(roll)`` (ROS convention).
+    """Sensor->base rotation ``Rz(yaw) @ Ry(pitch) @ Rx(roll)``.
 
     Positive pitch tilts the sensor's forward (+x) axis downward.
     """

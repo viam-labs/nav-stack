@@ -7,7 +7,7 @@ the camera's narrow field of view it vanishes while the body is right next to
 it and the guard is left with the lidar's reading of the upper leg — ~8 cm too
 far (live: three grazes on one table leg).
 
-Like a Nav2 obstacle layer, remembered points are cleared only by the sensor
+Like a costmap obstacle layer, remembered points are cleared only by the sensor
 that marked them: when a newer frame looks at the spot and no longer sees
 anything there. They are also dropped when the body covers them (a real
 obstacle there would be a collision), beyond ``keep_radius_m``, or after

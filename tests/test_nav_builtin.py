@@ -1,4 +1,4 @@
-"""Unit tests for ROS-free builtin costmap + A* planner."""
+"""Unit tests for the builtin costmap + A* planner."""
 
 from __future__ import annotations
 

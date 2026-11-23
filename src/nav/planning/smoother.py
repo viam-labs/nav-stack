@@ -47,7 +47,7 @@ def _shortcut_smooth(
     costs: np.ndarray,
     occ: OccupancyGrid,
 ) -> List[Tuple[float, float]]:
-    """Greedy string-pull using costmap line-of-sight (Nav2 SmoothPath-ish)."""
+    """Greedy string-pull using costmap line-of-sight."""
     if len(points) < 3:
         return list(points)
     pts = list(points)

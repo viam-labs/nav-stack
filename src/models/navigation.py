@@ -2,7 +2,7 @@
 
 Builtin Navigation service over Viam APIs (``ViamWorldIO`` + ``BuiltinNavHost``):
 SLAM ``get_grid`` / ``GetPosition``, lidar shm/cameras, ``Base.SetVelocity``.
-No ROS / Nav2. Or use ``navigation-external`` against any ``rdk:service:slam``.
+Or use ``navigation-external`` against any ``rdk:service:slam``.
 """
 
 from __future__ import annotations

@@ -617,7 +617,7 @@ class SlamService(SLAM):
         on long runs (or after CPU-starved navigation) the map->odom estimate can
         slide with no recovery. Uses a cheap local match each cycle, escalating
         to full-map global_localize (like a manual command) when the local match
-        is untrusted or Nav2 is struggling with recoveries.
+        is untrusted or navigation is struggling with recoveries.
 
         While a goal is active the match stays off, unless the base has been
         sitting still. A stall can fail the goal in about 8 s, so that case is
@@ -1390,7 +1390,7 @@ class SlamService(SLAM):
         return {"lidars": lidars, "odometry": odom_probe}
 
     async def _probe_sensors_builtin(self) -> dict:
-        """Probe via BuiltinSensors (no ROS bridge / IOProvider)."""
+        """Probe via BuiltinSensors."""
         assert self._engine is not None and self._cfg is not None
         sensors = self._engine._sensors  # noqa: SLF001
         lidars: list[dict] = []
@@ -1801,8 +1801,8 @@ class SlamService(SLAM):
         handle = store.active_handle()
         if not handle:
             raise ValueError("no active map")
-        # save_map runs ros2 CLI subprocesses (30-40s timeouts); keep the
-        # event loop free so mapping TF/scans continue while saving.
+        # save_map writes the map files and can take a while; keep the
+        # event loop free so mapping scans continue while saving.
         result = await asyncio.to_thread(mgr.save_map, handle.serialization_stem)
         out = {"status": "saved", "map": handle.name}
         if isinstance(result, Mapping):
@@ -2354,7 +2354,7 @@ class SlamService(SLAM):
         if occ_map is not None:
             return occ_map, "pgm"
         if node is None:
-            raise RuntimeError("ROS bridge not started")
+            raise RuntimeError("SLAM engine not started")
         live = node.get_map()
         if live is None:
             raise RuntimeError(

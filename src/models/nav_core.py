@@ -2223,11 +2223,7 @@ class NavServiceBase(NavigationApi, Navigation):
         node = getattr(runtime.manager, "node", None)
         io = node._io if node is not None else None
 
-        vx = float(
-            command.get(
-                "vx", command.get("body_vx_mps", command.get("ros_vx_mps", 0.0))
-            )
-        )
+        vx = float(command.get("vx", command.get("body_vx_mps", 0.0)))
         vy = float(command.get("vy", command.get("body_vy_mps", 0.0)))
         vtheta = float(command.get("vtheta", command.get("body_vtheta_rad_s", 0.0)))
         if (

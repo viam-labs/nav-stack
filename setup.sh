@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# First-run setup for the nav-stack module (builtin SLAM + nav; no ROS).
+# First-run setup for the nav-stack module (builtin SLAM + nav).
 #
 # Creates the Python venv and pip-installs module requirements.
 set -euo pipefail

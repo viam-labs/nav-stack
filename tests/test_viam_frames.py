@@ -79,12 +79,12 @@ def test_pose_raw_viam_axes_without_y_forward_convert():
     assert abs(m.theta - (-math.pi / 2)) < 1e-6
 
 
-def test_pose_converts_viam_y_forward_base_to_ros_x_forward():
-    """FS is Viam Y-forward; nav-stack mounts are ROS X-forward."""
+def test_pose_converts_viam_y_forward_base_to_x_forward():
+    """FS is Viam Y-forward; nav-stack mounts are X-forward."""
     configs = _tracer_like_frames()
     m = pose_of_frame_in_destination(configs, "rplidar", "base", y_forward_base=True)
     assert m is not None
-    # p_ros = (y_v, -x_v) = (0.24, 0.05)
+    # p_nav = (y_v, -x_v) = (0.24, 0.05)
     assert abs(m.x - 0.24) < 1e-9
     assert abs(m.y - 0.05) < 1e-9
     assert abs(m.z - 0.15) < 1e-9
@@ -96,19 +96,19 @@ def test_fs_mount_round_trips_viam_rotation_and_points():
     """Mount RPY must rebuild Viam's matrix so PCD lands where the 3D scene does."""
     from src.geom.conversions import _mount_rotation, transform_lidar_mount_to_base_link
     from src.lidar.rplidar_protocol import polar_to_xyz_m
-    from src.viam_frames import _pose_to_matrix, _viam_y_forward_base_to_ros
+    from src.viam_frames import _pose_to_matrix, _viam_y_forward_base_to_x_forward
 
     configs = _tracer_like_frames()
     m = pose_of_frame_in_destination(configs, "rplidar", "base", y_forward_base=True)
     assert m is not None
     pose = configs[1].frame.pose_in_observer_frame.pose
-    T_ros = _viam_y_forward_base_to_ros(_pose_to_matrix(pose))
+    T_nav = _viam_y_forward_base_to_x_forward(_pose_to_matrix(pose))
     R_mount = _mount_rotation(m.theta, m.pitch, m.roll)
-    assert np.allclose(T_ros[:3, :3], R_mount, atol=1e-9)
+    assert np.allclose(T_nav[:3, :3], R_mount, atol=1e-9)
 
     xs, ys, zs = polar_to_xyz_m(0.0, 1000.0)
     p_mm = np.array([xs * 1000.0, ys * 1000.0, zs * 1000.0, 1.0])
-    via_T = (T_ros @ p_mm)[:3] / 1000.0
+    via_T = (T_nav @ p_mm)[:3] / 1000.0
     via_mount = transform_lidar_mount_to_base_link(
         np.array([[xs, ys, zs]]),
         x=m.x,
@@ -126,16 +126,16 @@ def test_fs_mount_round_trips_viam_rotation_and_points():
 
 def test_camera_fs_mount_round_trips_rotation():
     from src.geom.conversions import _mount_rotation
-    from src.viam_frames import _pose_to_matrix, _viam_y_forward_base_to_ros
+    from src.viam_frames import _pose_to_matrix, _viam_y_forward_base_to_x_forward
 
     configs = _tracer_like_frames()
     m = pose_of_frame_in_destination(configs, "camera", "base", y_forward_base=True)
     assert m is not None
-    T_ros = _viam_y_forward_base_to_ros(
+    T_nav = _viam_y_forward_base_to_x_forward(
         _pose_to_matrix(configs[2].frame.pose_in_observer_frame.pose)
     )
     assert np.allclose(
-        T_ros[:3, :3], _mount_rotation(m.theta, m.pitch, m.roll), atol=1e-9
+        T_nav[:3, :3], _mount_rotation(m.theta, m.pitch, m.roll), atol=1e-9
     )
 
 

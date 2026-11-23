@@ -1,4 +1,4 @@
-"""Sync lidar + odom reads for the builtin SLAM engine (no ROS)."""
+"""Sync lidar + odom reads for the builtin SLAM engine."""
 
 from __future__ import annotations
 
