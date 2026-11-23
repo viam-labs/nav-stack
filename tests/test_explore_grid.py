@@ -1,4 +1,5 @@
 import base64
+import math
 
 import numpy as np
 
@@ -153,3 +154,21 @@ def test_robot_off_traversable_space_starts_from_nearest_cell():
     scan = scan_frontiers(g, 0.55, 1.5, robot_radius_m=0.2)  # 1 cell from the left wall
     assert scan.start_found and scan.frontiers
     assert not scan_frontiers(g, 5.5, 3.5, robot_radius_m=0.2).start_found
+
+
+def test_waypoint_follows_the_route_and_faces_along_it():
+    g = grid(rows=80, cols=160)
+    g.cells[10:70, 10:150] = 0
+    g.cells[10:55, 80] = 100  # wall from the bottom with a gap above it
+    scan = scan_frontiers(g, 1.0, 1.0, robot_radius_m=0.1, fill_m=0.0)
+    # Far side of the wall: straight line 5 m, route over the top of the wall.
+    wp = scan.waypoint(6.0, 1.0, max_m=3.0)
+    assert not wp.final
+    assert abs(scan.path_m(wp.x, wp.y) - 3.0) < 0.3
+    assert wp.y > 1.5  # climbing toward the gap, not straight at the goal
+    # Faces along the route over the wall, not straight at the goal through it.
+    straight = math.atan2(1.0 - wp.y, 6.0 - wp.x)
+    assert straight < -0.5 and -0.4 < wp.theta < 1.6
+    near = scan.waypoint(2.0, 1.0, max_m=3.0)
+    assert near.final and (near.x, near.y) == (2.0, 1.0)
+    assert abs(near.theta) < 0.3  # arrives heading +x

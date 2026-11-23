@@ -91,19 +91,21 @@ def test_next_goal_is_handed_over_before_arrival():
     assert len(arrivals) <= final["goals"] // 2 + 1
 
 
-def test_goals_face_their_approach_direction():
-    w, clk, slam, nav, run, _ = setup()
-    seen = []
+def test_nav_goals_are_short_waypoints():
+    w, clk, slam, nav, run, _ = setup(make_builtin_apartment(), seed=(2.0, 2.0, 0.0))
+    sent = []
     orig = nav.navigate_to_point
 
     async def nav_to(x, y, theta):
         p = w.get_pose()
-        seen.append((theta, math.atan2(y - p.y, x - p.x)))
+        sent.append(math.hypot(x - p.x, y - p.y))
         await orig(x, y, theta)
 
     nav.navigate_to_point = nav_to
-    asyncio.run(run.run())
-    assert seen and all(abs(t - a) < 1e-6 for t, a in seen[:-1])  # last is home
+    final = asyncio.run(run.run())
+    exploring = sent[:-1]  # the last one is the drive home
+    assert exploring and max(exploring) <= run_mod.WAYPOINT_M + 0.5
+    assert final["waypoints"] == len(exploring) and final["waypoints"] > final["goals"]
 
 
 def test_stop_mid_run_finishes_once():
@@ -305,3 +307,21 @@ def test_robot_off_mapped_space_neither_finishes_nor_fails_its_goal():
         run_mod.scan_frontiers = orig
     assert final["last_error"] == "robot is not in traversable mapped space"
     assert final["goals_failed"] == 0 and clk.now() >= run_mod.OFF_MAP_TICKS_MAX
+
+
+def test_goal_rejected_right_away_is_retried_before_blacklisting():
+    w, clk, slam, nav, run, _ = setup()
+    orig = nav.navigate_to_point
+    calls = []
+
+    async def nav_to(x, y, theta):
+        calls.append((x, y))
+        await orig(x, y, theta)
+        if len(calls) == 1:
+            # Nav's map has not caught up yet: it rejects the first goal.
+            nav._active, nav._state, nav._error = False, "failed", "goal in unknown"
+
+    nav.navigate_to_point = nav_to
+    final = asyncio.run(run.run())
+    assert final["goals_failed"] == 0 and known_fraction(slam, w) > 0.95
+    assert math.hypot(calls[1][0] - calls[0][0], calls[1][1] - calls[0][1]) < 0.75

@@ -15,14 +15,22 @@ import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, List, Optional, Tuple
 
+from viam.logging import getLogger
+
 from .clients import NavClient, NavStatus, Pose, SlamClient
-from .grid import Frontier, FrontierScan, scan_frontiers
+from .grid import Frontier, FrontierScan, Waypoint, scan_frontiers
 from .legs import LegRunner
 from .scoring import Blacklist, cost
 
+LOGGER = getLogger(__name__)
+
 TICK_S = 1.0
-# Send the next goal once the current one is this close, so nav never stops
-# and turns to a final heading in front of a frontier that is already seen.
+# Nav is sent waypoints at most this far (path length) toward the frontier.
+# Nav stops the robot and plans the whole path before moving, and plan time
+# grows quickly with distance: a 20 m plan took 10+ s on a busy cloud sim.
+WAYPOINT_M = 4.0
+# Send the next waypoint once the current one is this close, so nav never
+# stops and turns to a final heading on the way.
 HANDOFF_M = 1.0
 # A goal's frontier counts as seen once no frontier cell is this close to it.
 SEEN_RADIUS_M = 0.5
@@ -30,6 +38,10 @@ SEEN_RADIUS_M = 0.5
 REPLACE_MARGIN_M = 2.0
 # Goals closer than this to the current one are the same frontier.
 SAME_GOAL_M = 0.75
+# Nav plans on its own copy of the map, which can lag the live one by a moment:
+# a goal at the edge of just-seen space may still be unknown to nav. A failure
+# this soon after sending is retried once before the goal is blacklisted.
+QUICK_FAIL_S = 3.0
 PROGRESS_TIMEOUT_S = 30.0
 PROGRESS_MIN_M = 0.3
 # Scans in a row with no reachable frontier before the space counts as mapped
@@ -61,6 +73,7 @@ class _Finish(Exception):
 @dataclass
 class _Goal:
     frontier: Frontier
+    wp: Waypoint
     sent_at: float
     best_path_m: float
     progress_at: float
@@ -70,6 +83,7 @@ class _Goal:
 class _State:
     phase: str = "idle"
     goals: int = 0
+    waypoints: int = 0
     goals_failed: int = 0
     consecutive_failures: int = 0
     coverage_cells: int = 0
@@ -80,6 +94,8 @@ class _State:
     last_error: str = ""
     home: Optional[Pose] = None
     goal: Optional[_Goal] = None
+    last_target: Optional[Tuple[float, float]] = None
+    quick_failed: Optional[Tuple[float, float]] = None
     ticks: int = 0
     off_map_ticks: int = 0
 
@@ -136,6 +152,7 @@ class ExploreRun:
             "phase": self._s.phase,
             "elapsed_s": elapsed,
             "goals": self._s.goals,
+            "waypoints": self._s.waypoints,
             "goals_failed": self._s.goals_failed,
             "coverage_cells": self._s.coverage_cells,
             "frontier_count": self._s.frontier_count,
@@ -152,6 +169,7 @@ class ExploreRun:
         goal = self._s.goal
         if goal is not None:
             out["goal"] = {"x": goal.frontier.goal_x, "y": goal.frontier.goal_y}
+            out["waypoint"] = {"x": goal.wp.x, "y": goal.wp.y}
         home = self._s.home
         if home is not None:
             out["home"] = {"x": home.x, "y": home.y, "theta": home.theta}
@@ -280,10 +298,14 @@ class ExploreRun:
             self._s.frontier_count = open_count
             self._s.unreachable_frontiers = len(ranked) - open_count
             if nxt is not None:
-                await self._send(nxt, pose, now)
+                await self._send(nxt, pose, now, scan)
             if self._s.goal is None and self._best(ranked, now) is None:
                 empty_scans += 1
                 if empty_scans >= EMPTY_SCANS_TO_FINISH:
+                    LOGGER.info(
+                        "explore: no reachable frontiers left (%d skipped after failures)",
+                        self._s.unreachable_frontiers,
+                    )
                     return
             else:
                 empty_scans = 0
@@ -297,10 +319,11 @@ class ExploreRun:
         ranked: List[Frontier],
         now: float,
     ) -> Optional[Frontier]:
-        """The frontier to send now, or None to keep the current goal.
+        """The frontier to head for now, or None to keep the current waypoint.
 
         ``ranked`` is every reachable frontier, cheapest first; the best one is
         re-picked after any blacklist change so a failed goal is never resent.
+        Returning the current frontier sends the next waypoint toward it.
         """
         g = self._s.goal
         if g is None:
@@ -309,13 +332,26 @@ class ExploreRun:
         seen = not scan.frontier_near(f.x, f.y, SEEN_RADIUS_M)
         if not nav.active:
             if nav.state == "succeeded":
-                if not seen:
+                if g.wp.final and not seen:
                     # Arrived but the frontier is still there: it cannot be
                     # cleared from here (glass, a drop, sensor height).
                     self._blacklist.add(f.goal_x, f.goal_y, now)
                 self._goal_reached()
             else:
-                await self._goal_failed(cancel=False)
+                reason = f"nav {nav.state or 'stopped'}"
+                if nav.error:
+                    reason += f": {nav.error}"
+                if now - g.sent_at <= QUICK_FAIL_S and not self._quick_failed_before(f):
+                    LOGGER.info(
+                        "explore: goal (%.2f, %.2f) failed right away (%s); retrying once",
+                        f.goal_x,
+                        f.goal_y,
+                        reason,
+                    )
+                    self._s.quick_failed = (f.goal_x, f.goal_y)
+                    self._s.goal = None
+                else:
+                    await self._goal_failed(reason, cancel=False)
             return self._best(ranked, now)
         remaining = scan.path_m(f.goal_x, f.goal_y)
         stalled = False
@@ -327,23 +363,30 @@ class ExploreRun:
             # Unreachable now, or no progress: blacklist it and move on.
             self._blacklist.add(f.goal_x, f.goal_y, now)
             best = self._best(ranked, now)
-            await self._goal_failed(cancel=best is None)
+            reason = (
+                "no longer reachable"
+                if remaining is None
+                else f"no progress for {PROGRESS_TIMEOUT_S:g} s"
+            )
+            await self._goal_failed(reason, cancel=best is None)
             return best
         best = self._best(ranked, now)
         if best is None:
             if seen:
                 await self._drop_goal(cancel=True)
             return None
+        to_wp = scan.path_m(g.wp.x, g.wp.y)
+        near_wp = to_wp is None or to_wp <= HANDOFF_M
         if math.hypot(best.goal_x - f.goal_x, best.goal_y - f.goal_y) < SAME_GOAL_M:
-            return None
-        if remaining <= HANDOFF_M:
+            # Same frontier: on the last leg drive onto it, else hand over the
+            # next waypoint toward it before reaching this one.
+            return best if near_wp and not g.wp.final else None
+        if near_wp:
             self._goal_reached()
             return best
         if seen:
-            # Keep driving only while the old goal is on the way to the new one.
-            detour = remaining + math.hypot(
-                best.goal_x - f.goal_x, best.goal_y - f.goal_y
-            )
+            # Keep driving only while this waypoint is on the way to the new goal.
+            detour = to_wp + math.hypot(best.goal_x - g.wp.x, best.goal_y - g.wp.y)
             if best.path_m < detour - HANDOFF_M:
                 self._goal_reached()
                 return best
@@ -372,12 +415,41 @@ class ExploreRun:
         open_ = self._open(ranked, now)
         return open_[0] if open_ else None
 
-    async def _send(self, f: Frontier, pose: Pose, now: float) -> None:
+    async def _send(
+        self, f: Frontier, pose: Pose, now: float, scan: FrontierScan
+    ) -> None:
+        """Send nav the next waypoint toward frontier ``f``."""
         self._check_budget()
-        theta = math.atan2(f.goal_y - pose.y, f.goal_x - pose.x)
-        await self._nav.navigate_to_point(f.goal_x, f.goal_y, theta)
-        self._s.goals += 1
-        self._s.goal = _Goal(f, sent_at=now, best_path_m=f.path_m, progress_at=now)
+        wp = scan.waypoint(f.goal_x, f.goal_y, WAYPOINT_M) or Waypoint(
+            f.goal_x, f.goal_y, math.atan2(f.goal_y - pose.y, f.goal_x - pose.x), True
+        )
+        await self._nav.navigate_to_point(wp.x, wp.y, wp.theta)
+        self._s.waypoints += 1
+        last = self._s.last_target
+        if (
+            last is None
+            or math.hypot(f.goal_x - last[0], f.goal_y - last[1]) >= SAME_GOAL_M
+        ):
+            self._s.goals += 1
+            LOGGER.info(
+                "explore: heading for a %.1f m frontier at (%.2f, %.2f), %.1f m away",
+                f.size_m,
+                f.goal_x,
+                f.goal_y,
+                f.path_m,
+            )
+        self._s.last_target = (f.goal_x, f.goal_y)
+        prev = self._s.goal
+        if prev is not None and (
+            math.hypot(prev.frontier.goal_x - f.goal_x, prev.frontier.goal_y - f.goal_y)
+            < SAME_GOAL_M
+        ):
+            # Next leg toward the same frontier: progress keeps counting from
+            # the leg before, so a frontier that never gets closer still times out.
+            best_path_m, progress_at = prev.best_path_m, prev.progress_at
+        else:
+            best_path_m, progress_at = f.path_m, now
+        self._s.goal = _Goal(f, wp, now, best_path_m, progress_at)
 
     def _goal_reached(self) -> None:
         self._s.consecutive_failures = 0
@@ -388,10 +460,23 @@ class ExploreRun:
             await self._nav.cancel()
         self._s.goal = None
 
-    async def _goal_failed(self, *, cancel: bool) -> None:
+    def _quick_failed_before(self, f: Frontier) -> bool:
+        q = self._s.quick_failed
+        return (
+            q is not None and math.hypot(f.goal_x - q[0], f.goal_y - q[1]) < SAME_GOAL_M
+        )
+
+    async def _goal_failed(self, reason: str, *, cancel: bool) -> None:
         g = self._s.goal
         if g is None:
             return
+        LOGGER.info(
+            "explore: goal (%.2f, %.2f) failed (%s); skipping it for %.0f min",
+            g.frontier.goal_x,
+            g.frontier.goal_y,
+            reason,
+            self._blacklist.ttl_s / 60.0,
+        )
         self._blacklist.add(g.frontier.goal_x, g.frontier.goal_y, self._clock())
         await self._drop_goal(cancel=cancel)
         self._s.goals_failed += 1

@@ -302,12 +302,33 @@ class Frontier:
 
 
 @dataclass
+class Waypoint:
+    """Where to send nav next on the way to a frontier goal.
+
+    ``theta`` is the direction of travel at the waypoint, so a robot that does
+    reach it is already facing along the rest of the route. ``final`` means
+    the waypoint is the frontier goal itself.
+    """
+
+    x: float
+    y: float
+    theta: float
+    final: bool
+
+
+# Neighbour offsets for walking the wavefront back toward the robot.
+_STEPS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+
+
+@dataclass
 class FrontierScan:
     grid: OccGrid
     frontier: np.ndarray
     rings: np.ndarray
     frontiers: List[Frontier] = field(default_factory=list)
     start_found: bool = True
+    # Traversable cells with extra room from walls, preferred for waypoints.
+    roomy: Optional[np.ndarray] = None
 
     def frontier_near(self, x: float, y: float, radius_m: float) -> bool:
         g = self.grid
@@ -322,8 +343,10 @@ class FrontierScan:
             return False
         return bool(np.min((rr + r_lo - r) ** 2 + (cc + c_lo - c) ** 2) <= k * k)
 
-    def path_m(self, x: float, y: float, search_m: float = 0.3) -> Optional[float]:
-        """Approximate path length from the robot to (x, y), None if unreachable."""
+    def _reached_cell(
+        self, x: float, y: float, search_m: float = 0.3
+    ) -> Optional[Tuple[int, int]]:
+        """The reached cell nearest (x, y) within ``search_m``."""
         g = self.grid
         r, c = g.to_cell(x, y)
         k = max(1, int(math.ceil(search_m / g.resolution)))
@@ -335,7 +358,77 @@ class FrontierScan:
         if rr.size == 0:
             return None
         i = int(np.argmin((rr + r_lo - r) ** 2 + (cc + c_lo - c) ** 2))
-        return float(self.rings[rr[i] + r_lo, cc[i] + c_lo]) * g.resolution
+        return int(rr[i] + r_lo), int(cc[i] + c_lo)
+
+    def path_m(self, x: float, y: float, search_m: float = 0.3) -> Optional[float]:
+        """Approximate path length from the robot to (x, y), None if unreachable."""
+        cell = self._reached_cell(x, y, search_m)
+        if cell is None:
+            return None
+        return float(self.rings[cell]) * self.grid.resolution
+
+    def _descend(self, cell: Tuple[int, int], stop_ring: int) -> List[Tuple[int, int]]:
+        """Cells from ``cell`` back along the wavefront until ring <= stop_ring."""
+        rings = self.rings
+        rows, cols = rings.shape
+        r, c = cell
+        out = [cell]
+        while rings[r, c] > stop_ring:
+            here = rings[r, c]
+            best = None
+            for dr, dc in _STEPS:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols and 0 <= rings[nr, nc] < here:
+                    if best is None or rings[nr, nc] < rings[best]:
+                        best = (nr, nc)
+            if best is None:
+                break
+            r, c = best
+            out.append(best)
+        return out
+
+    def waypoint(self, x: float, y: float, max_m: float) -> Optional[Waypoint]:
+        """A point at most ``max_m`` of path from the robot toward (x, y).
+
+        Walks the wavefront back from (x, y) to where the remaining path is
+        ``max_m``, then prefers a nearby cell with more room from walls (the
+        shortest route hugs corners). Short nav goals keep each of nav's plans
+        short: plan time grows quickly with distance.
+        """
+        g = self.grid
+        res = g.resolution
+        goal = self._reached_cell(x, y)
+        if goal is None:
+            return None
+        target = int(max_m / res)
+        if self.rings[goal] <= target:
+            # Final leg: face the way the route arrives.
+            back = self._descend(goal, max(0, int(self.rings[goal]) - 10))
+            bx, by = g.to_world(*back[-1])
+            gx, gy = g.to_world(*goal)
+            theta = math.atan2(gy - by, gx - bx) if back[-1] != goal else 0.0
+            return Waypoint(x, y, theta, True)
+        route = self._descend(goal, target)
+        wr, wc = route[-1]
+        if self.roomy is not None and not self.roomy[wr, wc]:
+            k = max(1, int(round(0.4 / res)))
+            r_lo, r_hi = max(0, wr - k), min(g.rows, wr + k + 1)
+            c_lo, c_hi = max(0, wc - k), min(g.cols, wc + k + 1)
+            ring_win = self.rings[r_lo:r_hi, c_lo:c_hi]
+            ok = (
+                self.roomy[r_lo:r_hi, c_lo:c_hi]
+                & (ring_win >= 0)
+                & (ring_win <= target)
+            )
+            rr, cc = np.nonzero(ok)
+            if rr.size:
+                i = int(np.argmin((rr + r_lo - wr) ** 2 + (cc + c_lo - wc) ** 2))
+                wr, wc = int(rr[i] + r_lo), int(cc[i] + c_lo)
+        ahead = route[max(0, len(route) - 11)]  # ~0.5 m further along toward the goal
+        wx, wy = g.to_world(wr, wc)
+        ax, ay = g.to_world(*ahead)
+        theta = math.atan2(ay - wy, ax - wx) if (ax, ay) != (wx, wy) else 0.0
+        return Waypoint(wx, wy, theta, False)
 
 
 def _nearest_traversable(
@@ -380,6 +473,7 @@ def scan_frontiers(
     fill_cells = int(round(fill_m / res))
     g = grid.cropped((x, y), pad_cells=fill_cells + 2)
     trav = traversable_mask(g, robot_radius_m)
+    roomy = traversable_mask(g, robot_radius_m + 0.2)
     front = frontier_mask(g, fill_cells)
     blind = int(math.ceil((robot_radius_m + 0.2 if blind_m is None else blind_m) / res))
     r0, c0 = g.to_cell(x, y)
@@ -390,7 +484,7 @@ def scan_frontiers(
     )
     if start is None:
         empty = np.full(trav.shape, -1, dtype=np.int32)
-        return FrontierScan(g, front, empty, [], start_found=False)
+        return FrontierScan(g, front, empty, [], start_found=False, roomy=roomy)
     rings = wavefront(trav, start)
     reached = rings >= 0
 
@@ -399,7 +493,7 @@ def scan_frontiers(
     free = g.free_mask()
     labels, n = _label(_dilate(front, 1) & free)
     if n == 0:
-        return FrontierScan(g, front, rings, [])
+        return FrontierScan(g, front, rings, [], roomy=roomy)
     labels, depth = _grow_labels(labels, free, int(math.ceil(robot_radius_m / res)) + 2)
 
     sizes = np.bincount(labels[front], minlength=n + 1)
@@ -428,4 +522,4 @@ def scan_frontiers(
             fx, fy = g.to_world(int(fr_r[mine][j]), int(fr_c[mine][j]))
             out.append(Frontier(gx, gy, fx, fy, size_m, float(ring[i]) * res))
     out.sort(key=lambda f: f.path_m)
-    return FrontierScan(g, front, rings, out)
+    return FrontierScan(g, front, rings, out, roomy=roomy)

@@ -398,7 +398,7 @@ DoCommands:
 | --- | --- | --- |
 | `start` | optional `duration_s` | `{"started": true}` (plus `duration_s` when given) or `{"error": "..."}` |
 | `stop` | — | `{"stopping": true}`; the finish sequence runs as when exploring ends |
-| `status` | — | `{phase, elapsed_s, goals, goals_failed, frontier_count, unreachable_frontiers, coverage_cells, keyframes_used, decision_ms, last_error}`, plus `duration_s` / `remaining_s` with a budget, `goal` while driving to one and `home` once known |
+| `status` | — | `{phase, elapsed_s, goals, waypoints, goals_failed, frontier_count, unreachable_frontiers, coverage_cells, keyframes_used, decision_ms, last_error}`, plus `duration_s` / `remaining_s` with a budget, `goal` and `waypoint` while driving to one and `home` once known |
 
 How it picks where to go, once a second while the robot drives:
 
@@ -413,11 +413,16 @@ How it picks where to go, once a second while the robot drives:
   SLAM service when both run in this module (otherwise through `get_grid`).
 - **Cost** = path length + 0.5 m per radian of turn − 0.3 × frontier length
   (capped at 6 m). The cheapest frontier wins.
-- **The robot keeps moving.** The next goal is sent when the current one is
-  within 1 m, so nav does not stop and turn in front of space it has already
-  seen. A goal whose frontier is already seen is dropped unless it lies on the
-  way to the next one, and a live goal is only replaced by one at least 2 m
-  cheaper. Goals face the direction they are approached from.
+- **Short legs.** Nav is sent waypoints at most 4 m of path ahead along the
+  wavefront route, not the frontier itself: nav stops and plans the whole
+  path before moving, and a long plan can take many seconds on a busy host.
+  Waypoints prefer cells with 0.2 m of extra room from walls and face along
+  the route.
+- **The robot keeps moving.** The next waypoint is sent when the current one
+  is within 1 m, so nav does not stop and turn on the way. A goal whose
+  frontier is already seen is dropped unless its waypoint is on the way to
+  the next goal, and a live goal is only replaced by one at least 2 m
+  cheaper.
 
 A goal fails when nav reports a failure, it becomes unreachable, the path to
 it has not shrunk by 0.3 m in 30 s, or nav arrives and its frontier is still
