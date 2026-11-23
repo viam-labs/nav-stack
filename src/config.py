@@ -158,6 +158,9 @@ class SimConfig:
     world_name: str = "default"
     # Optional ``.npy`` (+ sibling ``.json`` meta). Empty → built-in L-corridor.
     map_path: Optional[str] = None
+    # Built-in preset name ("corridor", "apartment"). Takes precedence over
+    # ``map_path`` when set; empty falls through to ``map_path`` or the default.
+    map_preset: Optional[str] = None
     seed_x: float = 1.0
     seed_y: float = 1.0
     seed_theta: float = 0.0
@@ -182,9 +185,11 @@ class SimConfig:
         if convention == BASE_VELOCITY_ROS:
             convention = BASE_VELOCITY_X_FORWARD
         map_path = d.get("map_path")
+        map_preset = d.get("map_preset")
         overrides: Dict[str, Any] = {
             "base_velocity_convention": str(convention),
             "map_path": str(map_path).strip() or None if map_path else None,
+            "map_preset": str(map_preset).strip() or None if map_preset else None,
         }
         if "world_name" in d:
             overrides["world_name"] = str(d.get("world_name") or "default")
@@ -1820,3 +1825,115 @@ class NavCameraConfig:
         # Depend on the navigation service so Viam constructs it (and registers
         # its viz store) before this camera.
         return [self.navigation]
+
+
+@dataclass
+class ExploreConfig:
+    """Config for ``viam-labs:nav-stack:explore``.
+
+    Autonomous mapping drive: explores from the live SLAM grid under a time
+    budget using the navigation service, then saves the map and returns home.
+    """
+
+    slam_service: str
+    navigation_service: str
+    base: str
+    max_linear_mps: float = 0.4
+    max_angular_dps: float = 30.0
+    home_tolerance_m: float = 0.5
+    structure_fraction: float = 0.15
+    revisit_fraction: float = 0.1
+    well_seen_m: float = 4.0
+    keyframe_max: int = 2000
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "ExploreConfig":
+        names = {}
+        for key in ("slam_service", "navigation_service", "base"):
+            value = d.get(key)
+            if not value:
+                raise ValueError(f"explore config requires {key!r}")
+            names[key] = str(value)
+        return cls(
+            **names,
+            max_linear_mps=float(d.get("max_linear_mps", 0.4)),
+            max_angular_dps=float(d.get("max_angular_dps", 30.0)),
+            home_tolerance_m=float(d.get("home_tolerance_m", 0.5)),
+            structure_fraction=float(d.get("structure_fraction", 0.15)),
+            revisit_fraction=float(d.get("revisit_fraction", 0.1)),
+            well_seen_m=float(d.get("well_seen_m", 4.0)),
+            keyframe_max=int(d.get("keyframe_max", 2000)),
+        )
+
+    def required_dependencies(self) -> List[str]:
+        return [self.slam_service, self.navigation_service, self.base]
+
+
+@dataclass
+class ExploreViewConfig:
+    """Config for ``viam-labs:nav-stack:explore-view``.
+
+    Wraps the ``nav-camera`` render and stamps an exploration-status HUD on top
+    (phase, elapsed/remaining, map coverage, keyframe count, leg counters).
+    Reads the nav viz bridge keyed by ``navigation`` and queries the explore
+    service named by ``explore`` via ``do_command({"command": "status"})``.
+    """
+
+    navigation: str
+    explore: str
+    max_dim: int = 700
+    plan_history_len: int = 8
+    robot_radius_m: float = 0.22
+    show_global_plan: bool = True
+    show_local_plan: bool = True
+    show_pose: bool = True
+    show_footprint: bool = True
+    show_goal: bool = True
+    show_history: bool = True
+    window_mode: str = "full"
+    window_size_m: float = 6.0
+    window_min_x: Optional[float] = None
+    window_min_y: Optional[float] = None
+    window_max_x: Optional[float] = None
+    window_max_y: Optional[float] = None
+    # Max wait on the explore status DoCommand before falling back to a
+    # stats-less render. Keeps the camera stream snappy if explore is wedged.
+    status_timeout_s: float = 0.5
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "ExploreViewConfig":
+        def _optf(k: str) -> Optional[float]:
+            v = d.get(k)
+            return None if v is None else float(v)
+
+        navigation = d.get("navigation")
+        explore = d.get("explore")
+        if not navigation:
+            raise ValueError("explore-view config requires 'navigation'")
+        if not explore:
+            raise ValueError("explore-view config requires 'explore'")
+        return cls(
+            navigation=str(navigation),
+            explore=str(explore),
+            max_dim=int(d.get("max_dim", 700)),
+            plan_history_len=int(d.get("plan_history_len", 8)),
+            robot_radius_m=float(d.get("robot_radius_m", 0.22)),
+            show_global_plan=bool(d.get("show_global_plan", True)),
+            show_local_plan=bool(d.get("show_local_plan", True)),
+            show_pose=bool(d.get("show_pose", True)),
+            show_footprint=bool(d.get("show_footprint", True)),
+            show_goal=bool(d.get("show_goal", True)),
+            show_history=bool(d.get("show_history", True)),
+            window_mode=str(d.get("window_mode", "full")).lower(),
+            window_size_m=float(d.get("window_size_m", 6.0)),
+            window_min_x=_optf("window_min_x"),
+            window_min_y=_optf("window_min_y"),
+            window_max_x=_optf("window_max_x"),
+            window_max_y=_optf("window_max_y"),
+            status_timeout_s=float(d.get("status_timeout_s", 0.5)),
+        )
+
+    def required_dependencies(self) -> List[str]:
+        # The navigation service supplies the viz bridge; the explore service
+        # supplies the status DoCommand. Both must be constructed first.
+        return [self.navigation, self.explore]
