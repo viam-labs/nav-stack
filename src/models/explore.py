@@ -1,8 +1,10 @@
 """Autonomous exploration drive: ``viam-labs:nav-stack:explore``.
 
-A generic service that drives the robot around an unmapped space for a time
-budget so the builtin SLAM maps it, then saves the map and returns home.
+A generic service that drives the robot to frontiers (the edge between mapped
+and unknown space) until none are reachable, or an optional time budget runs
+out, so builtin SLAM maps the space; then it saves the map and returns home.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +12,6 @@ import time
 from typing import Any, ClassVar, Mapping, Optional, Sequence, cast
 
 from typing_extensions import Self
-
 from viam.components.base import Base
 from viam.logging import getLogger
 from viam.proto.app.robot import ServiceConfig
@@ -66,7 +67,8 @@ class ExploreService(Generic):
         self._cfg = cfg
         self._slam = cast(SLAM, dependencies[SLAM.get_resource_name(cfg.slam_service)])
         self._nav = cast(
-            Navigation, dependencies[Navigation.get_resource_name(cfg.navigation_service)]
+            Navigation,
+            dependencies[Navigation.get_resource_name(cfg.navigation_service)],
         )
         self._base = cast(Base, dependencies[Base.get_resource_name(cfg.base)])
 
@@ -94,25 +96,24 @@ class ExploreService(Generic):
         cfg = self._cfg
         if cfg is None or self._slam is None or self._nav is None or self._base is None:
             return {"error": "explore service not configured"}
-        try:
-            duration_s = float(command["duration_s"])
-        except (KeyError, TypeError, ValueError):
-            return {"error": "start requires duration_s"}
-        if duration_s <= 0:
-            return {"error": "duration_s must be positive"}
+        duration_s: Optional[float] = None
+        if command.get("duration_s") is not None:
+            try:
+                duration_s = float(command["duration_s"])
+            except (TypeError, ValueError):
+                return {"error": "duration_s must be a number"}
+            if duration_s <= 0:
+                return {"error": "duration_s must be positive"}
         nav = ViamNavClient(self._nav)
-        slam = ViamSlamClient(self._slam)
+        slam = ViamSlamClient(self._slam, cfg.slam_service)
         radius = (await nav.status()).robot_radius_m or 0.3
         params = RunParams(
             duration_s=duration_s,
             max_linear_mps=cfg.max_linear_mps,
             max_angular_dps=cfg.max_angular_dps,
             home_tolerance_m=cfg.home_tolerance_m,
-            structure_fraction=cfg.structure_fraction,
-            revisit_fraction=cfg.revisit_fraction,
-            well_seen_m=cfg.well_seen_m,
-            keyframe_max=cfg.keyframe_max,
             robot_radius_m=radius,
+            min_frontier_m=cfg.min_frontier_m,
         )
         base = self._base
 
@@ -120,7 +121,12 @@ class ExploreService(Generic):
             await base.stop()
 
         run = ExploreRun(
-            nav, slam, params, clock=time.monotonic, sleep=asyncio.sleep, stop_base=stop_base
+            nav,
+            slam,
+            params,
+            clock=time.monotonic,
+            sleep=asyncio.sleep,
+            stop_base=stop_base,
         )
         error = await run.preflight()
         if error is not None:
@@ -128,7 +134,12 @@ class ExploreService(Generic):
         self._run = run
         self._run_task = asyncio.create_task(run.run())
         self._run_task.add_done_callback(self._on_run_done)
-        LOGGER.info("explore run started for %.0f s", duration_s)
+        if duration_s is None:
+            LOGGER.info("explore run started (until no frontiers remain)")
+        else:
+            LOGGER.info("explore run started for at most %.0f s", duration_s)
+        if duration_s is None:
+            return {"started": True}
         return {"started": True, "duration_s": duration_s}
 
     def _on_run_done(self, task: asyncio.Task) -> None:
@@ -143,6 +154,7 @@ class ExploreService(Generic):
 
     async def close(self) -> None:
         if self._run is not None and self._run_active():
+            # Twice: the first ends exploring, the second skips the drive home.
             self._run.request_stop()
             self._run.request_stop()
             try:

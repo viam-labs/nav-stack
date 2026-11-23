@@ -47,12 +47,12 @@
     {
       "api": "rdk:service:generic",
       "model": "viam-labs:nav-stack:explore",
-      "short_description": "Autonomous exploration drive for mapping: frontier and revisit goals under a time budget."
+      "short_description": "Autonomous mapping drive: goes to the edges of the map until nothing reachable is unexplored, then saves the map and returns home."
     },
     {
       "api": "rdk:component:camera",
       "model": "viam-labs:nav-stack:explore-view",
-      "short_description": "Nav view plus an exploration-run HUD: phase, elapsed/remaining, map coverage, keyframes, legs."
+      "short_description": "Nav view plus an exploration-run HUD: phase, time, map coverage, keyframes, goals, frontiers left."
     }
   ],
   "entrypoint": "run.sh",

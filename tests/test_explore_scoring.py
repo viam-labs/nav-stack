@@ -1,5 +1,11 @@
-from src.explore.grid import Candidate
-from src.explore.scoring import Blacklist, Scored, rank, score
+import math
+
+from src.explore.grid import Frontier
+from src.explore.scoring import Blacklist, cost
+
+
+def f(x, y, size_m=1.0, path_m=None):
+    return Frontier(x, y, x, y, size_m, math.hypot(x, y) if path_m is None else path_m)
 
 
 def test_blacklist_radius_and_ttl():
@@ -10,13 +16,17 @@ def test_blacklist_radius_and_ttl():
     assert not b.blocked(5.0, 5.0, now=701.0)
 
 
-def test_score_prefers_gain_per_meter():
-    assert score(100, 10.0) == 10.0
-    assert score(100, 0.1) == 200.0
+def test_cost_prefers_short_paths():
+    assert cost(f(2.0, 0.0), 0, 0, 0) < cost(f(5.0, 0.0), 0, 0, 0)
 
 
-def test_rank_sorts_and_filters():
-    a = Scored(Candidate(0, 0, "frontier"), gain=10, path_len_m=1.0, score=10.0)
-    b = Scored(Candidate(1, 0, "frontier"), gain=50, path_len_m=1.0, score=50.0)
-    c = Scored(Candidate(2, 0, "under_seen"), gain=1, path_len_m=1.0, score=1.0)
-    assert [s.score for s in rank([a, b, c], min_score=5.0)] == [50.0, 10.0]
+def test_cost_prefers_straight_ahead_over_behind():
+    ahead, behind = f(3.0, 0.0), f(-3.0, 0.0)
+    assert cost(ahead, 0, 0, 0) + 1.5 < cost(behind, 0, 0, 0)
+
+
+def test_frontier_size_helps_but_is_capped():
+    small, big = f(3.0, 0.0, size_m=0.5), f(3.0, 0.0, size_m=4.0)
+    assert cost(big, 0, 0, 0) < cost(small, 0, 0, 0)
+    huge_far = f(30.0, 0.0, size_m=500.0)
+    assert cost(f(3.0, 0.0), 0, 0, 0) < cost(huge_far, 0, 0, 0)

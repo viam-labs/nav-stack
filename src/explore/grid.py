@@ -1,11 +1,18 @@
-"""Occupancy grid analysis for exploration: frontiers, visibility, coverage."""
+"""Occupancy grid analysis for exploration: reachable frontiers from one wavefront.
+
+One pass per decision: a wavefront from the robot over traversable known-free
+cells gives the approximate path length to every reachable cell, and the
+frontier (known free cells next to unknown space) is clustered and scored from
+that same field. No per-candidate path planning.
+"""
+
 from __future__ import annotations
 
 import base64
 import math
 from collections import deque
-from dataclasses import dataclass
-from typing import List, Mapping, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -14,13 +21,7 @@ from ..slam_client import parse_get_grid
 UNKNOWN = -1
 FREE = 0
 OCCUPIED = 100
-
-
-@dataclass
-class Candidate:
-    x: float
-    y: float
-    kind: str
+OCCUPIED_THRESHOLD = 50
 
 
 @dataclass
@@ -44,7 +45,9 @@ class OccGrid:
                 return None
             if rows <= 0 or cols <= 0 or cell_size <= 0 or len(raw) != rows * cols:
                 return None
-            arr = np.clip(np.frombuffer(raw, dtype=np.int8), -1, 100).reshape(rows, cols)
+            arr = np.clip(np.frombuffer(raw, dtype=np.int8), -1, 100).reshape(
+                rows, cols
+            )
             return cls(cells=arr, resolution=cell_size, x_min=x_min, y_min=y_min)
         parsed = parse_get_grid(dict(resp))
         if parsed is None:
@@ -52,6 +55,21 @@ class OccGrid:
         rows, cols, cell_size, x_min, y_min, cells = parsed
         arr = np.asarray(cells, dtype=np.int8).reshape(rows, cols)
         return cls(cells=arr, resolution=cell_size, x_min=x_min, y_min=y_min)
+
+    @classmethod
+    def from_map_dict(cls, m: Optional[Mapping]) -> Optional["OccGrid"]:
+        """Builtin SLAM's in-process ``get_map()`` dict (-1 unknown, 0..100)."""
+        if not isinstance(m, Mapping) or m.get("grid") is None:
+            return None
+        try:
+            cells = np.clip(np.asarray(m["grid"]), -1, 100).astype(np.int8)
+            res = float(m["resolution"])
+            x0, y0 = float(m["origin_x"]), float(m["origin_y"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if cells.ndim != 2 or res <= 0:
+            return None
+        return cls(cells=cells, resolution=res, x_min=x0, y_min=y0)
 
     @property
     def rows(self) -> int:
@@ -77,16 +95,46 @@ class OccGrid:
         return 0 <= row < self.rows and 0 <= col < self.cols
 
     def known_free_count(self) -> int:
-        return int(np.count_nonzero(self.cells == FREE))
+        return int(np.count_nonzero(self.free_mask()))
 
     def free_mask(self) -> np.ndarray:
-        return self.cells == FREE
+        return (self.cells >= 0) & (self.cells < OCCUPIED_THRESHOLD)
 
     def occupied_mask(self) -> np.ndarray:
-        return self.cells >= 50
+        return self.cells >= OCCUPIED_THRESHOLD
 
     def unknown_mask(self) -> np.ndarray:
         return self.cells < 0
+
+    def cropped(self, include: Tuple[float, float], pad_cells: int = 2) -> "OccGrid":
+        """Smallest window holding every known cell and ``include``, plus a pad.
+
+        SLAM grids are a fixed canvas much larger than the mapped area; the
+        wavefront only needs the part that has been seen.
+        """
+        known = self.cells >= 0
+        rows_any = np.flatnonzero(known.any(axis=1))
+        cols_any = np.flatnonzero(known.any(axis=0))
+        r, c = self.to_cell(*include)
+        if rows_any.size == 0:
+            r_lo = r_hi = r
+            c_lo = c_hi = c
+        else:
+            r_lo, r_hi = min(int(rows_any[0]), r), max(int(rows_any[-1]), r)
+            c_lo, c_hi = min(int(cols_any[0]), c), max(int(cols_any[-1]), c)
+        r_lo, c_lo = max(0, r_lo - pad_cells), max(0, c_lo - pad_cells)
+        r_hi, c_hi = (
+            min(self.rows, r_hi + pad_cells + 1),
+            min(self.cols, c_hi + pad_cells + 1),
+        )
+        if r_lo >= r_hi or c_lo >= c_hi:
+            return self
+        return OccGrid(
+            cells=self.cells[r_lo:r_hi, c_lo:c_hi],
+            resolution=self.resolution,
+            x_min=self.x_min + c_lo * self.resolution,
+            y_min=self.y_min + r_lo * self.resolution,
+        )
 
 
 def _disk_offsets(radius_cells: int) -> List[Tuple[int, int]]:
@@ -99,128 +147,285 @@ def _disk_offsets(radius_cells: int) -> List[Tuple[int, int]]:
     ]
 
 
+def _shift_or(out: np.ndarray, src: np.ndarray, dr: int, dc: int) -> None:
+    rows, cols = src.shape
+    out[max(0, dr) : rows - max(0, -dr), max(0, dc) : cols - max(0, -dc)] |= src[
+        max(0, -dr) : rows - max(0, dr), max(0, -dc) : cols - max(0, dc)
+    ]
+
+
 def _dilate(mask: np.ndarray, radius_cells: int) -> np.ndarray:
-    out = np.zeros_like(mask, dtype=bool)
-    rows, cols = mask.shape
+    out = mask.copy()
     for dr, dc in _disk_offsets(radius_cells):
-        src = mask[
-            max(0, -dr) : rows - max(0, dr),
-            max(0, -dc) : cols - max(0, dc),
-        ]
-        out[
-            max(0, dr) : rows - max(0, -dr),
-            max(0, dc) : cols - max(0, -dc),
-        ] |= src
+        if dr or dc:
+            _shift_or(out, mask, dr, dc)
     return out
 
 
-def clear_mask(grid: OccGrid, clearance_m: float) -> np.ndarray:
-    """Free cells with no occupied or unknown cell within ``clearance_m``."""
-    radius = int(math.ceil(clearance_m / grid.resolution))
-    blocked = ~grid.free_mask()
-    return grid.free_mask() & ~_dilate(blocked, radius)
+def traversable_mask(grid: OccGrid, robot_radius_m: float) -> np.ndarray:
+    """Known free cells farther than ``robot_radius_m`` from any occupied cell.
+
+    Unknown space is not inflated (nav's costmap does the same), so cells right
+    at the frontier stay usable as goals.
+    """
+    radius = int(math.ceil(robot_radius_m / grid.resolution))
+    return grid.free_mask() & ~_dilate(grid.occupied_mask(), radius)
 
 
-def _frontier_mask(grid: OccGrid) -> np.ndarray:
-    free = grid.free_mask()
+def wavefront(trav: np.ndarray, start: Tuple[int, int]) -> np.ndarray:
+    """Ring index from ``start`` over ``trav`` (-1 where unreachable).
+
+    Alternating 4- and 8-connected rings grow an octagon, so ring count times
+    resolution tracks Euclidean path length within about 6 %. Each step only
+    expands the previous ring's cells, so the cost follows the reached area.
+    """
+    rows, cols = trav.shape
+    r0, c0 = start
+    if not (0 <= r0 < rows and 0 <= c0 < cols) or not trav[r0, c0]:
+        return np.full(trav.shape, -1, dtype=np.int32)
+    w = cols + 2  # one-cell untraversable border: neighbours never leave the array
+    ok = np.zeros((rows + 2, w), dtype=bool)
+    ok[1:-1, 1:-1] = trav
+    ok = ok.ravel()
+    dist = np.full(ok.size, -1, dtype=np.int32)
+    axis = np.array([1, -1, w, -w])
+    both = np.concatenate([axis, [w + 1, w - 1, -w + 1, -w - 1]])
+    ring = np.array([(r0 + 1) * w + c0 + 1])
+    dist[ring] = 0
+    k = 0
+    while ring.size:
+        k += 1
+        nb = (ring[:, None] + (both if k % 2 == 0 else axis)[None, :]).ravel()
+        nb = nb[ok[nb]]
+        nb = np.unique(nb[dist[nb] < 0])
+        dist[nb] = k
+        ring = nb
+    return dist.reshape(rows + 2, w)[1:-1, 1:-1].copy()
+
+
+def frontier_mask(grid: OccGrid, fill_cells: int = 0) -> np.ndarray:
+    """Known free cells with an unknown 4-neighbour.
+
+    ``fill_cells`` > 0 first closes unknown holes up to about twice that many
+    cells wide (gaps between lidar rays, speckle), so only real openings into
+    unseen space count.
+    """
     unknown = grid.unknown_mask()
+    if fill_cells > 0:
+        known = _dilate(~unknown, fill_cells)
+        unknown = _dilate(~known, fill_cells)  # closing: known grows, then shrinks back
     padded = np.pad(unknown, 1, constant_values=False)
     near_unknown = (
         padded[:-2, 1:-1] | padded[2:, 1:-1] | padded[1:-1, :-2] | padded[1:-1, 2:]
     )
-    return free & near_unknown
+    return grid.free_mask() & near_unknown
 
 
-def _clusters(mask: np.ndarray) -> List[List[Tuple[int, int]]]:
-    seen = np.zeros_like(mask, dtype=bool)
+def _label(mask: np.ndarray) -> Tuple[np.ndarray, int]:
+    """8-connected component labels (0 = background). Mask cells are few."""
+    labels = np.zeros(mask.shape, dtype=np.int32)
     rows, cols = mask.shape
-    clusters: List[List[Tuple[int, int]]] = []
+    n = 0
     for r0, c0 in zip(*np.nonzero(mask)):
-        if seen[r0, c0]:
+        if labels[r0, c0]:
             continue
-        seen[r0, c0] = True
+        n += 1
+        labels[r0, c0] = n
         queue = deque([(int(r0), int(c0))])
-        cluster: List[Tuple[int, int]] = []
         while queue:
             r, c = queue.popleft()
-            cluster.append((r, c))
             for dr in (-1, 0, 1):
                 for dc in (-1, 0, 1):
                     nr, nc = r + dr, c + dc
-                    if 0 <= nr < rows and 0 <= nc < cols and mask[nr, nc] and not seen[nr, nc]:
-                        seen[nr, nc] = True
+                    if (
+                        0 <= nr < rows
+                        and 0 <= nc < cols
+                        and mask[nr, nc]
+                        and not labels[nr, nc]
+                    ):
+                        labels[nr, nc] = n
                         queue.append((nr, nc))
-        clusters.append(cluster)
-    return clusters
+    return labels, n
 
 
-def frontier_goals(
-    grid: OccGrid, robot_radius_m: float, min_cluster_cells: int = 6
-) -> List[Candidate]:
-    clear = clear_mask(grid, robot_radius_m)
-    if not clear.any():
-        return []
-    search_cells = int(math.ceil(1.0 / grid.resolution))
-    goals: List[Candidate] = []
-    for cluster in _clusters(_frontier_mask(grid)):
-        if len(cluster) < min_cluster_cells:
-            continue
-        cr, cc = np.mean(np.asarray(cluster, dtype=float), axis=0)
-        r_lo, r_hi = max(0, int(cr) - search_cells), min(grid.rows, int(cr) + search_cells + 1)
-        c_lo, c_hi = max(0, int(cc) - search_cells), min(grid.cols, int(cc) + search_cells + 1)
-        local = np.argwhere(clear[r_lo:r_hi, c_lo:c_hi])
-        if local.size == 0:
-            continue
-        d = np.hypot(local[:, 0] + r_lo - cr, local[:, 1] + c_lo - cc)
-        i = int(np.argmin(d))
-        if d[i] > search_cells:
-            continue
-        x, y = grid.to_world(int(local[i, 0] + r_lo), int(local[i, 1] + c_lo))
-        goals.append(Candidate(x, y, "frontier"))
-    return goals
+def _grow_labels(
+    labels: np.ndarray, allowed: np.ndarray, steps: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Spread each label up to ``steps`` cells (8-connected) over ``allowed``.
+
+    Returns the grown labels and each labelled cell's step count (0 = seed).
+    """
+    rows, cols = labels.shape
+    w = cols + 2
+    ok = np.zeros((rows + 2, w), dtype=bool)
+    ok[1:-1, 1:-1] = allowed
+    ok = ok.ravel()
+    lab = np.zeros((rows + 2, w), dtype=np.int32)
+    lab[1:-1, 1:-1] = labels
+    lab = lab.ravel()
+    depth = np.full(lab.size, -1, dtype=np.int32)
+    offs = np.array([1, -1, w, -w, w + 1, w - 1, -w + 1, -w - 1])
+    ring = np.flatnonzero(lab)
+    depth[ring] = 0
+    for step in range(1, steps + 1):
+        if ring.size == 0:
+            break
+        nb = (ring[:, None] + offs[None, :]).ravel()
+        src = np.repeat(lab[ring], offs.size)
+        keep = ok[nb] & (lab[nb] == 0)
+        nb, src = nb[keep], src[keep]
+        nb, first = np.unique(nb, return_index=True)
+        lab[nb] = src[first]
+        depth[nb] = step
+        ring = nb
+    inner = (slice(1, -1), slice(1, -1))
+    return lab.reshape(rows + 2, w)[inner].copy(), depth.reshape(rows + 2, w)[
+        inner
+    ].copy()
 
 
-def visible_new_cells(
-    grid: OccGrid, x: float, y: float, max_range_m: float = 8.0, n_rays: int = 72
-) -> int:
-    r0, c0 = grid.to_cell(x, y)
-    if not grid.in_bounds(r0, c0):
-        return 0
-    step = grid.resolution / 2.0
-    steps = int(max_range_m / step)
-    angles = 2.0 * math.pi * np.arange(n_rays) / n_rays
-    dist = np.arange(1, steps + 1) * step
-    xs = x + np.outer(np.cos(angles), dist)
-    ys = y + np.outer(np.sin(angles), dist)
-    rows = np.floor((ys - grid.y_min) / grid.resolution + 1e-9).astype(int)
-    cols = np.floor((xs - grid.x_min) / grid.resolution + 1e-9).astype(int)
-    oob = (rows < 0) | (rows >= grid.rows) | (cols < 0) | (cols >= grid.cols)
-    rows_c = np.clip(rows, 0, grid.rows - 1)
-    cols_c = np.clip(cols, 0, grid.cols - 1)
-    cells = grid.cells[rows_c, cols_c]
-    blocked = oob | (cells >= 50)
-    hit = np.cumsum(blocked, axis=1) > 0
-    unknown = (cells < 0) & ~hit
-    linear = rows_c[unknown] * grid.cols + cols_c[unknown]
-    return int(np.unique(linear).size)
+@dataclass
+class Frontier:
+    """One reachable frontier cluster.
+
+    ``goal_*`` is where nav is sent: of the reachable cells closest to the
+    frontier, the one nearest the robot. ``x``/``y`` is the frontier cell
+    nearest that goal (what the goal is meant to reveal).
+    """
+
+    goal_x: float
+    goal_y: float
+    x: float
+    y: float
+    size_m: float
+    path_m: float
 
 
-def under_seen_goals(
+@dataclass
+class FrontierScan:
+    grid: OccGrid
+    frontier: np.ndarray
+    rings: np.ndarray
+    frontiers: List[Frontier] = field(default_factory=list)
+    start_found: bool = True
+
+    def frontier_near(self, x: float, y: float, radius_m: float) -> bool:
+        g = self.grid
+        r, c = g.to_cell(x, y)
+        k = int(math.ceil(radius_m / g.resolution))
+        r_lo, r_hi = max(0, r - k), min(g.rows, r + k + 1)
+        c_lo, c_hi = max(0, c - k), min(g.cols, c + k + 1)
+        if r_lo >= r_hi or c_lo >= c_hi:
+            return False
+        rr, cc = np.nonzero(self.frontier[r_lo:r_hi, c_lo:c_hi])
+        if rr.size == 0:
+            return False
+        return bool(np.min((rr + r_lo - r) ** 2 + (cc + c_lo - c) ** 2) <= k * k)
+
+    def path_m(self, x: float, y: float, search_m: float = 0.3) -> Optional[float]:
+        """Approximate path length from the robot to (x, y), None if unreachable."""
+        g = self.grid
+        r, c = g.to_cell(x, y)
+        k = max(1, int(math.ceil(search_m / g.resolution)))
+        r_lo, r_hi = max(0, r - k), min(g.rows, r + k + 1)
+        c_lo, c_hi = max(0, c - k), min(g.cols, c + k + 1)
+        if r_lo >= r_hi or c_lo >= c_hi:
+            return None
+        rr, cc = np.nonzero(self.rings[r_lo:r_hi, c_lo:c_hi] >= 0)
+        if rr.size == 0:
+            return None
+        i = int(np.argmin((rr + r_lo - r) ** 2 + (cc + c_lo - c) ** 2))
+        return float(self.rings[rr[i] + r_lo, cc[i] + c_lo]) * g.resolution
+
+
+def _nearest_traversable(
+    trav: np.ndarray, cell: Tuple[int, int], max_cells: int
+) -> Optional[Tuple[int, int]]:
+    r, c = cell
+    rows, cols = trav.shape
+    if 0 <= r < rows and 0 <= c < cols and trav[r, c]:
+        return cell
+    r_lo, r_hi = max(0, r - max_cells), min(rows, r + max_cells + 1)
+    c_lo, c_hi = max(0, c - max_cells), min(cols, c + max_cells + 1)
+    if r_lo >= r_hi or c_lo >= c_hi:
+        return None
+    rr, cc = np.nonzero(trav[r_lo:r_hi, c_lo:c_hi])
+    if rr.size == 0:
+        return None
+    d2 = (rr + r_lo - r) ** 2 + (cc + c_lo - c) ** 2
+    i = int(np.argmin(d2))
+    if d2[i] > max_cells * max_cells:
+        return None
+    return int(rr[i] + r_lo), int(cc[i] + c_lo)
+
+
+def scan_frontiers(
     grid: OccGrid,
-    visited: Sequence[Tuple[float, float]],
-    well_seen_m: float,
-    spacing_m: float = 2.0,
-) -> List[Candidate]:
-    step = max(1, int(round(spacing_m / grid.resolution)))
-    free = grid.free_mask()
-    vis = np.asarray(visited, dtype=float).reshape(-1, 2)
-    goals: List[Candidate] = []
-    for r in range(step // 2, grid.rows, step):
-        for c in range(step // 2, grid.cols, step):
-            if not free[r, c]:
+    x: float,
+    y: float,
+    robot_radius_m: float,
+    *,
+    min_frontier_m: float = 0.5,
+    start_search_m: float = 1.0,
+    fill_m: float = 0.1,
+    blind_m: Optional[float] = None,
+) -> FrontierScan:
+    """Reachable frontier clusters around the robot at (x, y), nearest first.
+
+    Frontier cells within ``blind_m`` of the robot (default: its radius plus
+    0.2 m) are ignored: that ring is the body and the lidar's minimum range,
+    which the next few centimetres of motion reveal anyway.
+    """
+    res = grid.resolution
+    fill_cells = int(round(fill_m / res))
+    g = grid.cropped((x, y), pad_cells=fill_cells + 2)
+    trav = traversable_mask(g, robot_radius_m)
+    front = frontier_mask(g, fill_cells)
+    blind = int(math.ceil((robot_radius_m + 0.2 if blind_m is None else blind_m) / res))
+    r0, c0 = g.to_cell(x, y)
+    rr0, cc0 = np.ogrid[: g.rows, : g.cols]
+    front &= (rr0 - r0) ** 2 + (cc0 - c0) ** 2 > blind * blind
+    start = _nearest_traversable(
+        trav, g.to_cell(x, y), int(math.ceil(start_search_m / res))
+    )
+    if start is None:
+        empty = np.full(trav.shape, -1, dtype=np.int32)
+        return FrontierScan(g, front, empty, [], start_found=False)
+    rings = wavefront(trav, start)
+    reached = rings >= 0
+
+    # Bridge 1-cell gaps along a frontier, then grow each cluster's label over
+    # free cells far enough to reach a cell the robot can stand on.
+    free = g.free_mask()
+    labels, n = _label(_dilate(front, 1) & free)
+    if n == 0:
+        return FrontierScan(g, front, rings, [])
+    labels, depth = _grow_labels(labels, free, int(math.ceil(robot_radius_m / res)) + 2)
+
+    sizes = np.bincount(labels[front], minlength=n + 1)
+    cand = reached & (labels > 0)
+    rr, cc = np.nonzero(cand)
+    out: List[Frontier] = []
+    if rr.size:
+        labs = labels[rr, cc]
+        ring = rings[rr, cc]
+        # Per label: closest to the frontier first, then nearest the robot.
+        order = np.lexsort((ring, depth[rr, cc], labs))
+        first = np.ones(order.size, dtype=bool)
+        first[1:] = labs[order][1:] != labs[order][:-1]
+        fr_r, fr_c = np.nonzero(front)
+        fr_lab = labels[fr_r, fr_c]
+        for i in order[first]:
+            lab = int(labs[i])
+            size_m = float(sizes[lab]) * res
+            if size_m < min_frontier_m:
                 continue
-            x, y = grid.to_world(r, c)
-            if vis.size and np.min(np.hypot(vis[:, 0] - x, vis[:, 1] - y)) <= well_seen_m:
-                continue
-            goals.append(Candidate(x, y, "under_seen"))
-    return goals
+            gr, gc = int(rr[i]), int(cc[i])
+            mine = fr_lab == lab
+            d2 = (fr_r[mine] - gr) ** 2 + (fr_c[mine] - gc) ** 2
+            j = int(np.argmin(d2))
+            gx, gy = g.to_world(gr, gc)
+            fx, fy = g.to_world(int(fr_r[mine][j]), int(fr_c[mine][j]))
+            out.append(Frontier(gx, gy, fx, fy, size_m, float(ring[i]) * res))
+    out.sort(key=lambda f: f.path_m)
+    return FrontierScan(g, front, rings, out)

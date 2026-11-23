@@ -105,7 +105,9 @@ def make_builtin_apartment(
     split_row = int(rows * 0.4)
     grid[split_row, :] = 100
     door_center_col = int(cols * 0.6)
-    grid[split_row, door_center_col - door_cells // 2 : door_center_col + door_cells // 2] = 0
+    grid[
+        split_row, door_center_col - door_cells // 2 : door_center_col + door_cells // 2
+    ] = 0
 
     # Upper half: vertical wall at ~45% width separates two rooms; doorway in the top third.
     v_col = int(cols * 0.45)
@@ -120,7 +122,9 @@ def make_builtin_apartment(
     inner_col_end = int(cols * 0.35)
     grid[inner_row, inner_col_start:inner_col_end] = 100
     door_col_inner = inner_col_start + (inner_col_end - inner_col_start) // 3
-    grid[inner_row, door_col_inner - door_cells // 2 : door_col_inner + door_cells // 2] = 0
+    grid[
+        inner_row, door_col_inner - door_cells // 2 : door_col_inner + door_cells // 2
+    ] = 0
 
     # Dead-end alcove jutting into the lower corridor from the bottom wall.
     alcove_h = int(rows * 0.15)
@@ -226,8 +230,9 @@ class SimWorld:
                 for c in range(c0 - rad, c0 + rad + 1):
                     if not self.map.in_bounds(r, c):
                         continue
-                    cx, cy = self.map.origin_x + (c + 0.5) * self.map.resolution, (
-                        self.map.origin_y + (r + 0.5) * self.map.resolution
+                    cx, cy = (
+                        self.map.origin_x + (c + 0.5) * self.map.resolution,
+                        (self.map.origin_y + (r + 0.5) * self.map.resolution),
                     )
                     if math.hypot(cx - x, cy - y) > radius_m:
                         continue

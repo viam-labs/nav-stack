@@ -2,7 +2,8 @@
 
 Same base render as ``nav-camera`` (costmap + plans + pose + footprint + goal),
 with a HUD stamped on top summarising the running explore service's state:
-phase, elapsed/remaining budget, map coverage, keyframe count and leg counts.
+phase, elapsed time (and budget, when set), map coverage, keyframe count, goal
+counts and frontiers left.
 Falls back to the plain nav render when explore isn't started yet or the
 status call times out.
 """
@@ -38,10 +39,8 @@ _HUD_FG = (235, 235, 235, 255)
 _HUD_MUTED = (170, 170, 170, 255)
 _PHASE_COLORS = {
     "idle": (170, 170, 170, 255),
-    "structure": (90, 170, 255, 255),
-    "fill": (120, 220, 120, 255),
-    "revisit": (255, 180, 60, 255),
-    "finish": (230, 140, 60, 255),
+    "exploring": (120, 220, 120, 255),
+    "finishing": (230, 140, 60, 255),
     "done": (200, 200, 200, 255),
 }
 _HUD_LINE_H = 16
@@ -212,9 +211,7 @@ class ExploreView(Camera):
         return {"error": "unknown command"}
 
     # -- compose/HUD ---------------------------------------------------------
-    def _compose(
-        self, snapshot: dict, status: Optional[Mapping[str, object]]
-    ) -> bytes:
+    def _compose(self, snapshot: dict, status: Optional[Mapping[str, object]]) -> bytes:
         base_bytes = self._render_base(snapshot)
         img = Image.open(io.BytesIO(base_bytes)).convert("RGBA")
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -223,9 +220,7 @@ class ExploreView(Camera):
         lines = self._hud_lines(snapshot, status)
         height = _HUD_PAD * 2 + _HUD_LINE_H * len(lines)
         width = min(_HUD_WIDTH, img.size[0] - 8)
-        draw.rectangle(
-            [(4, 4), (4 + width, 4 + height)], fill=_HUD_BG
-        )
+        draw.rectangle([(4, 4), (4 + width, 4 + height)], fill=_HUD_BG)
         y = 4 + _HUD_PAD
         for text, color in lines:
             draw.text((4 + _HUD_PAD, y), text, fill=color)
@@ -259,15 +254,12 @@ class ExploreView(Camera):
             return [("no explore run", _HUD_MUTED)]
         phase = str(status.get("phase", "?"))
         elapsed = float(status.get("elapsed_s") or 0.0)
-        remaining = float(status.get("remaining_s") or 0.0)
-        # Prefer the authoritative budget; fall back to elapsed+remaining for older
-        # explore versions that do not surface duration_s in status.
-        duration = status.get("duration_s")
-        total = float(duration) if duration is not None else elapsed + remaining
-        legs = int(status.get("legs") or 0)
-        legs_failed = int(status.get("legs_failed") or 0)
+        duration = status.get("duration_s") or None  # absent (or 0): no budget
+        goals = int(status.get("goals") or 0)
+        goals_failed = int(status.get("goals_failed") or 0)
         keyframes = int(status.get("keyframes_used") or 0)
         frontiers = int(status.get("frontier_count") or 0)
+        unreachable = int(status.get("unreachable_frontiers") or 0)
         known, area_m2, _shape, _resolution = self._coverage(snapshot)
 
         lines: list[tuple[str, tuple[int, int, int, int]]] = []
@@ -277,18 +269,27 @@ class ExploreView(Camera):
                 _PHASE_COLORS.get(phase, _HUD_FG),
             )
         )
-        lines.append((f"Time:     {_fmt_time(elapsed)} / {_fmt_time(total)}", _HUD_FG))
-        # Reserve a slot for the progress bar; filled with the bar itself.
-        lines.append(("", _HUD_FG))
-        if area_m2 is not None and known is not None:
+        if duration is None:
+            lines.append((f"Time:     {_fmt_time(elapsed)}", _HUD_FG))
+        else:
             lines.append(
-                (f"Mapped:   {area_m2:.1f} m^2 ({known} cells)", _HUD_FG)
+                (
+                    f"Time:     {_fmt_time(elapsed)} / {_fmt_time(float(duration))}",
+                    _HUD_FG,
+                )
             )
+            # Reserve a slot for the progress bar; filled with the bar itself.
+            lines.append(("", _HUD_FG))
+        if area_m2 is not None and known is not None:
+            lines.append((f"Mapped:   {area_m2:.1f} m^2 ({known} cells)", _HUD_FG))
         else:
             lines.append(("Mapped:   n/a", _HUD_MUTED))
         lines.append((f"Fidelity: {keyframes} kf used", _HUD_FG))
-        lines.append((f"Legs:     {legs} total, {legs_failed} failed", _HUD_FG))
-        lines.append((f"Frontier: {frontiers} goals", _HUD_FG))
+        lines.append((f"Goals:    {goals} sent, {goals_failed} failed", _HUD_FG))
+        frontier_line = f"Frontier: {frontiers} open"
+        if unreachable:
+            frontier_line += f", {unreachable} unreachable"
+        lines.append((frontier_line, _HUD_FG))
         return lines
 
     @staticmethod
@@ -297,11 +298,9 @@ class ExploreView(Camera):
             return None
         elapsed = float(status.get("elapsed_s") or 0.0)
         duration = status.get("duration_s")
-        if duration is None:
-            remaining = float(status.get("remaining_s") or 0.0)
-            total = elapsed + remaining
-        else:
-            total = float(duration)
+        if not duration:
+            return None  # no budget: runs until nothing is left to explore
+        total = float(duration)
         if total <= 0:
             return None
         return max(0.0, min(1.0, elapsed / total))
@@ -309,7 +308,9 @@ class ExploreView(Camera):
     @staticmethod
     def _coverage(
         snapshot: Optional[dict],
-    ) -> tuple[Optional[int], Optional[float], Optional[tuple[int, int]], Optional[float]]:
+    ) -> tuple[
+        Optional[int], Optional[float], Optional[tuple[int, int]], Optional[float]
+    ]:
         """Known-cell count and absolute area, both monotonic as mapping progresses.
 
         Returns (known_cells, area_m2, grid_shape, resolution_m). Any value may be
@@ -331,9 +332,7 @@ class ExploreView(Camera):
         resolution = grid_info.get("resolution")
         resolution_f = float(resolution) if resolution else None
         known = int(np.count_nonzero(grid >= 0))
-        area = (
-            known * resolution_f * resolution_f if resolution_f is not None else None
-        )
+        area = known * resolution_f * resolution_f if resolution_f is not None else None
         return (known, area, shape, resolution_f)
 
 

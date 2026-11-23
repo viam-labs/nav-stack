@@ -1,11 +1,20 @@
-"""Goal scoring and failed-goal blacklist for exploration."""
+"""Frontier cost and failed-goal blacklist for exploration."""
+
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Sequence, Tuple
+from typing import List, Tuple
 
-from .grid import Candidate
+from .grid import Frontier
+
+# Metres of path a frontier's size is worth, per metre of frontier, capped so
+# one huge opening far away does not outrank everything near the robot.
+GAIN_PER_M = 0.3
+GAIN_CAP_M = 6.0
+# Metres of path one radian of heading change is worth. Fewer and gentler
+# turns keep scan matching healthy and avoid back-and-forth zig-zags.
+TURN_M_PER_RAD = 0.5
 
 
 @dataclass
@@ -19,20 +28,15 @@ class Blacklist:
 
     def blocked(self, x: float, y: float, now: float) -> bool:
         self._entries = [e for e in self._entries if e[2] > now]
-        return any(math.hypot(ex - x, ey - y) <= self.radius_m for ex, ey, _ in self._entries)
+        return any(
+            math.hypot(ex - x, ey - y) <= self.radius_m for ex, ey, _ in self._entries
+        )
 
 
-def score(gain_cells: int, path_len_m: float, min_path_m: float = 0.5) -> float:
-    return gain_cells / max(path_len_m, min_path_m)
-
-
-@dataclass
-class Scored:
-    candidate: Candidate
-    gain: int
-    path_len_m: float
-    score: float
-
-
-def rank(scored: Sequence[Scored], min_score: float) -> List[Scored]:
-    return sorted((s for s in scored if s.score >= min_score), key=lambda s: -s.score)
+def cost(f: Frontier, x: float, y: float, theta: float) -> float:
+    """Lower is better: path length, plus turning, minus frontier size."""
+    turn = 0.0
+    if math.hypot(f.goal_x - x, f.goal_y - y) > 1e-6:
+        bearing = math.atan2(f.goal_y - y, f.goal_x - x)
+        turn = abs(math.atan2(math.sin(bearing - theta), math.cos(bearing - theta)))
+    return f.path_m + TURN_M_PER_RAD * turn - GAIN_PER_M * min(f.size_m, GAIN_CAP_M)

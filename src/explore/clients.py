@@ -1,10 +1,14 @@
 """Thin async clients over the SLAM and navigation services for exploration."""
+
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol, Tuple
 
 from ..models.nav_api import _localized
+from ..runtime import get_slam
+from .grid import OccGrid
 
 
 @dataclass
@@ -23,7 +27,6 @@ class NavStatus:
     max_angular_rad_s: Optional[float]
     robot_radius_m: Optional[float]
     error: str
-    simple_state: str = ""
 
 
 @dataclass
@@ -31,8 +34,6 @@ class SlamStatus:
     mode: str
     running: bool
     keyframes: int
-    graph_full: bool
-    closures: int
 
 
 class NavClient(Protocol):
@@ -42,13 +43,11 @@ class NavClient(Protocol):
 
     async def navigate_to_point(self, x: float, y: float, theta: float) -> None: ...
 
-    async def go_to_point(self, x: float, y: float, theta: float, velocity_mps: float) -> None: ...
-
     async def cancel(self) -> None: ...
 
 
 class SlamClient(Protocol):
-    async def grid(self) -> Optional[Mapping]: ...
+    async def occupancy(self) -> Optional[OccGrid]: ...
 
     async def status(self) -> SlamStatus: ...
 
@@ -78,7 +77,6 @@ class ViamNavClient:
     async def status(self) -> NavStatus:
         raw = await self._res.do_command({"command": "get_status"})
         limits = raw.get("limits") if isinstance(raw.get("limits"), Mapping) else {}
-        simple = raw.get("simple_nav") if isinstance(raw.get("simple_nav"), Mapping) else {}
         return NavStatus(
             active=bool(raw.get("active", False)),
             state=str(raw.get("state", "")),
@@ -87,7 +85,6 @@ class ViamNavClient:
             max_angular_rad_s=_optf(limits.get("max_angular_rad_s")),
             robot_radius_m=_optf(raw.get("robot_radius_m")),
             error=str(raw.get("error_msg") or raw.get("error") or ""),
-            simple_state=str(simple.get("state", "")),
         )
 
     async def plan_to_point(self, x: float, y: float) -> Tuple[bool, float]:
@@ -99,41 +96,38 @@ class ViamNavClient:
             {"command": "navigate_to_point", "x": x, "y": y, "theta": theta}
         )
 
-    async def go_to_point(self, x: float, y: float, theta: float, velocity_mps: float) -> None:
-        await self._res.do_command(
-            {
-                "command": "go_to_point",
-                "x": x,
-                "y": y,
-                "theta": theta,
-                "wait": False,
-                "velocity_mps": velocity_mps,
-            }
-        )
-
     async def cancel(self) -> None:
         await self._res.do_command({"command": "cancel"})
 
 
 class ViamSlamClient:
-    def __init__(self, resource):
+    def __init__(self, resource, name: Optional[str] = None):
         self._res = resource
+        self._name = name
 
-    async def grid(self) -> Optional[Mapping]:
+    async def occupancy(self) -> Optional[OccGrid]:
+        """The live map, read in-process when SLAM runs in this module.
+
+        Falls back to the ``get_grid`` DoCommand (the whole grid, encoded) when
+        the SLAM service lives in another process.
+        """
+        runtime = get_slam(self._name) if self._name else None
+        node = getattr(getattr(runtime, "manager", None), "node", None)
+        if node is not None and callable(getattr(node, "get_map", None)):
+            return OccGrid.from_map_dict(await asyncio.to_thread(node.get_map))
         raw = await self._res.do_command({"command": "get_grid"})
         if not raw or raw.get("available") is False:
             return None
-        return raw
+        return await asyncio.to_thread(OccGrid.from_get_grid, raw)
 
     async def status(self) -> SlamStatus:
-        raw = await self._res.do_command({"command": "get_status"})
-        loop = raw.get("loop_closure") if isinstance(raw.get("loop_closure"), Mapping) else {}
+        raw = await self._res.do_command(
+            {"command": "get_status", "probe_sensors": False}
+        )
         return SlamStatus(
             mode=str(raw.get("mode", "")),
             running=bool(raw.get("running", False)),
             keyframes=int(raw.get("keyframes") or 0),
-            graph_full=bool(loop.get("graph_full", False)),
-            closures=int(loop.get("closures") or 0),
         )
 
     async def optimize(self) -> None:

@@ -259,7 +259,9 @@ class SimBase(Base):
             return {"x": pose.x, "y": pose.y, "theta": pose.theta}
         if cmd == "add_obstacle":
             oid = world.add_obstacle(
-                float(command["x"]), float(command["y"]), float(command.get("radius_m", 0.2))
+                float(command["x"]),
+                float(command["y"]),
+                float(command.get("radius_m", 0.2)),
             )
             return {"ok": True, "id": oid}
         if cmd == "clear_obstacles":

@@ -235,3 +235,6 @@ sample_configs/.local_sim.generated.json
 
 # superpowers scratch
 .superpowers/
+
+# viam module reload archive
+.VIAM_RELOAD_ARCHIVE.tar.gz

@@ -14,7 +14,7 @@ This module (`viam-labs:nav-stack`) provides:
 | `viam-labs:nav-stack:navigation-external` | `rdk:service:navigation` | Same Navigation service against **any** `rdk:service:slam`. |
 | `viam-labs:nav-stack:nav-camera` | `rdk:component:camera` | Renders costmap + plan(s), pose, footprint and goal as a live camera image. |
 | `viam-labs:nav-stack:sim-base` | `rdk:component:base` | Simulated base for hardware-free mapping / nav (`SetVelocity` → raycast world). |
-| `viam-labs:nav-stack:explore` | `rdk:service:generic` | Autonomous exploration drive for mapping: frontier and revisit goals under a time budget. |
+| `viam-labs:nav-stack:explore` | `rdk:service:generic` | Autonomous mapping drive: goes to the edges of the map until nothing reachable is unexplored, then saves the map and returns home. |
 | `viam-labs:nav-stack:rplidar` / `wit-imu` / `shm-pointcloud` | camera / movement_sensor | Optional sensor helpers with POSIX shm for low-latency reads. |
 
 ## How it works
@@ -362,10 +362,11 @@ Optional attributes: `trust_movement_sensor_pose` (default `false`), `snap_headi
 
 ### Explore service (autonomous mapping drive)
 
-`viam-labs:nav-stack:explore` drives the robot around an unmapped space for a
-time budget so builtin SLAM maps it, then saves the map and returns to where it
-started. It is a client of the SLAM and navigation services and never drives
-the base directly except to stop.
+`viam-labs:nav-stack:explore` drives the robot to the edges of what has been
+mapped until nothing reachable is left unexplored (or an optional time budget
+runs out), so builtin SLAM maps the space, then saves the map and returns to
+where it started. It is a client of the SLAM and navigation services and never
+drives the base directly except to stop.
 
 ```json
 {
@@ -379,10 +380,7 @@ the base directly except to stop.
     "max_linear_mps": 0.4,
     "max_angular_dps": 30,
     "home_tolerance_m": 0.5,
-    "structure_fraction": 0.15,
-    "revisit_fraction": 0.1,
-    "well_seen_m": 4.0,
-    "keyframe_max": 2000
+    "min_frontier_m": 0.5
   }
 }
 ```
@@ -398,30 +396,44 @@ DoCommands:
 
 | Command | Args | Reply |
 | --- | --- | --- |
-| `start` | `duration_s` | `{"started": true, "duration_s": N}` or `{"error": "..."}` |
-| `stop` | — | `{"stopping": true}`; the finish sequence runs as on timeout |
-| `status` | — | `{phase, elapsed_s, remaining_s, legs, legs_failed, coverage_cells, frontier_count, keyframes_used, last_error, home}` |
+| `start` | optional `duration_s` | `{"started": true}` (plus `duration_s` when given) or `{"error": "..."}` |
+| `stop` | — | `{"stopping": true}`; the finish sequence runs as when exploring ends |
+| `status` | — | `{phase, elapsed_s, goals, goals_failed, frontier_count, unreachable_frontiers, coverage_cells, keyframes_used, decision_ms, last_error}`, plus `duration_s` / `remaining_s` with a budget, `goal` while driving to one and `home` once known |
 
-A run has three phases, then a finish. **Structure** (the first
-`structure_fraction` of the budget, or until 60% of `keyframe_max` keyframes):
-a wall-following outer circuit and a few inner loops of at least 12 m, pausing
-2 s facing a wall between legs, so loop closure fires while the keyframe budget
-is fresh. **Fill**: frontier cells and free cells farther than `well_seen_m`
-from any visited pose are scored by expected newly seen cells per planned meter
-and driven with planned navigation. **Revisit** (the last `revisit_fraction`):
-replays each structure circuit once, least-closed first, unless the pose graph
-is full, then returns to fill (or idles) until the budget ends. **Finish** (timeout, `stop`, or an unrecoverable error): cancel,
-`optimize`, `save_map`, navigate home (one retry), else stop in place. The map
-is saved before the drive home. A `stop` received while finishing skips the
-retry of the drive home. Any error from a SLAM or navigation call ends the run
-through the same finish sequence and is reported in `last_error`.
+How it picks where to go, once a second while the robot drives:
 
-Failed legs (error, timeout at 3x the planned time with a 20 s floor, or ending
-more than 1 m from the goal) blacklist the goal for 10 minutes; five in a row
-pause the run for 30 s and twenty end it. A lost pose or an unhealthy SLAM is
-waited out for 60 s, then the run finishes. Moving obstacles are left to the
-navigation service's local costmap; the explore service only avoids goals that
-already failed.
+- **Frontiers** are known free cells next to unknown space. Unknown holes up to
+  about 0.2 m wide (gaps between lidar rays) are filled first, frontier cells
+  within the robot's radius plus 0.2 m are ignored (its body and the lidar's
+  minimum range), and frontiers shorter than `min_frontier_m` are dropped.
+- **One wavefront** from the robot over known free space, kept the robot's
+  radius away from walls, gives the path length to every reachable cell at
+  once. Each frontier's goal is the reachable cell closest to it, nearest the
+  robot. No path is planned per candidate; the map is read in-process from the
+  SLAM service when both run in this module (otherwise through `get_grid`).
+- **Cost** = path length + 0.5 m per radian of turn − 0.3 × frontier length
+  (capped at 6 m). The cheapest frontier wins.
+- **The robot keeps moving.** The next goal is sent when the current one is
+  within 1 m, so nav does not stop and turn in front of space it has already
+  seen. A goal whose frontier is already seen is dropped unless it lies on the
+  way to the next one, and a live goal is only replaced by one at least 2 m
+  cheaper. Goals face the direction they are approached from.
+
+A goal fails when nav reports a failure, it becomes unreachable, the path to
+it has not shrunk by 0.3 m in 30 s, or nav arrives and its frontier is still
+there (glass, a drop, something below or above the lidar). Failed goals are
+blacklisted for 10 minutes within 1 m; `unreachable_frontiers` counts what is
+left out that way, so a run that ends with it above zero has gaps in the map.
+Ten failures in a row end the run.
+
+Exploring ends when three scans in a row find no reachable frontier, when
+`duration_s` runs out, on `stop`, or on an unrecoverable error. **Finish**:
+cancel, `optimize`, `save_map`, navigate home (one retry), else stop in place.
+The map is saved before the drive home. A `stop` received while finishing skips
+the retry of the drive home. Any error from a SLAM or navigation call ends the
+run through the same finish sequence and is reported in `last_error`. A lost
+pose or an unhealthy SLAM is waited out for 60 s, then the run finishes.
+Moving obstacles are left to the navigation service's local costmap.
 
 ### Builtin simulation (no hardware)
 

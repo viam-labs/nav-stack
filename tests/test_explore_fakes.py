@@ -26,7 +26,7 @@ def test_fake_slam_reveals_cells_and_counts_keyframes():
     assert known_fraction(s, w) > 0.05
     s.reveal(conv.Pose2D(1.6, 1.0, 0.0))
     assert asyncio.run(s.status()).keyframes == 2
-    assert asyncio.run(s.grid())["rows"] == w.map.height
+    assert asyncio.run(s.occupancy()).cells.shape == (w.map.height, w.map.width)
 
 
 def test_fake_nav_drives_to_goal_and_reveals():

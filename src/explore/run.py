@@ -1,78 +1,87 @@
-"""Exploration run: structure, fill, revisit, then save the map and go home."""
+"""Exploration run: drive to frontiers until none are left, then save and go home.
+
+Every tick one wavefront scan finds the reachable frontiers and their path
+lengths (no per-candidate planning). The robot keeps moving: the next goal is
+handed to nav shortly before the current one is reached, a goal whose frontier
+has already been seen is dropped unless it lies on the way to the next one,
+and a goal that stops making progress is blacklisted.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import math
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from typing import Awaitable, Callable, List, Optional, Tuple
 
-from .circuits import (
-    circuit_closed,
-    facing_wall_theta,
-    inner_circuit_goals,
-    next_wall_hop,
-)
 from .clients import NavClient, NavStatus, Pose, SlamClient
-from .grid import Candidate, OccGrid, frontier_goals, under_seen_goals, visible_new_cells
-from .legs import LegResult, LegRunner
-from .scoring import Blacklist, Scored, rank, score
+from .grid import Frontier, FrontierScan, scan_frontiers
+from .legs import LegRunner
+from .scoring import Blacklist, cost
 
-HOP_M = 1.5
-STRUCTURE_KEYFRAME_SHARE = 0.6
-STRUCTURE_PAUSE_S = 2.0
-FILL_PAUSE_S = 1.0
-CANDIDATE_CAP = 30
-SCORE_RANGE_M = 8.0
-FAILURES_BEFORE_WAIT = 5
-FAILURE_WAIT_S = 30.0
-FAILURES_BEFORE_FINISH = 20
+TICK_S = 1.0
+# Send the next goal once the current one is this close, so nav never stops
+# and turns to a final heading in front of a frontier that is already seen.
+HANDOFF_M = 1.0
+# A goal's frontier counts as seen once no frontier cell is this close to it.
+SEEN_RADIUS_M = 0.5
+# A live goal is only replaced by a frontier at least this much cheaper.
+REPLACE_MARGIN_M = 2.0
+# Goals closer than this to the current one are the same frontier.
+SAME_GOAL_M = 0.75
+PROGRESS_TIMEOUT_S = 30.0
+PROGRESS_MIN_M = 0.3
+# Scans in a row with no reachable frontier before the space counts as mapped
+# (lets the map catch up with the last scans).
+EMPTY_SCANS_TO_FINISH = 3
+FAILURES_BEFORE_FINISH = 10
 LOST_POSE_POLL_S = 5.0
 LOST_POSE_MAX_S = 60.0
-IDLE_POLL_S = 5.0
-MIN_LEG_M = 1.0
+# Ticks in a row with the robot nowhere near traversable mapped space before
+# the run gives up (squeezed against an obstacle, or the map moved under it).
+OFF_MAP_TICKS_MAX = 30
+SLAM_STATUS_EVERY = 10
 
 
 @dataclass
 class RunParams:
-    duration_s: float
+    duration_s: Optional[float]
     max_linear_mps: float
     max_angular_dps: float
     home_tolerance_m: float
-    structure_fraction: float
-    revisit_fraction: float
-    well_seen_m: float
-    keyframe_max: int
-    min_score: float = 2.0
     robot_radius_m: float = 0.3
-
-
-@dataclass
-class Circuit:
-    waypoints: List[Candidate]
-    closures: int = 0
+    min_frontier_m: float = 0.5
 
 
 class _Finish(Exception):
     pass
 
 
-def _approach_theta(frm: Pose, goal: Candidate) -> float:
-    return math.atan2(goal.y - frm.y, goal.x - frm.x)
+@dataclass
+class _Goal:
+    frontier: Frontier
+    sent_at: float
+    best_path_m: float
+    progress_at: float
 
 
 @dataclass
 class _State:
     phase: str = "idle"
-    legs: int = 0
-    legs_failed: int = 0
+    goals: int = 0
+    goals_failed: int = 0
     consecutive_failures: int = 0
     coverage_cells: int = 0
     frontier_count: int = 0
+    unreachable_frontiers: int = 0
     keyframes_used: int = 0
+    decision_ms: float = 0.0
     last_error: str = ""
     home: Optional[Pose] = None
-    visited: List[Tuple[float, float]] = field(default_factory=list)
-    circuits: List[Circuit] = field(default_factory=list)
+    goal: Optional[_Goal] = None
+    ticks: int = 0
+    off_map_ticks: int = 0
 
 
 class ExploreRun:
@@ -113,25 +122,40 @@ class ExploreRun:
             self._abort_home = True
 
     def status(self) -> dict:
+        """Run state for the ``status`` DoCommand.
+
+        Keys with no value are left out rather than set to None: a DoCommand
+        reply turns None into 0 on the client.
+        """
         if self._started_at is None:
             elapsed = 0.0
         else:
             end = self._ended_at if self._ended_at is not None else self._clock()
             elapsed = end - self._started_at
-        home = self._s.home
-        return {
+        out = {
             "phase": self._s.phase,
             "elapsed_s": elapsed,
-            "remaining_s": max(0.0, self._p.duration_s - elapsed),
-            "duration_s": self._p.duration_s,
-            "legs": self._s.legs,
-            "legs_failed": self._s.legs_failed,
+            "goals": self._s.goals,
+            "goals_failed": self._s.goals_failed,
             "coverage_cells": self._s.coverage_cells,
             "frontier_count": self._s.frontier_count,
+            # Frontiers left out after failed goals: the map is incomplete there.
+            "unreachable_frontiers": self._s.unreachable_frontiers,
             "keyframes_used": self._s.keyframes_used,
+            "decision_ms": round(self._s.decision_ms, 1),
             "last_error": self._s.last_error,
-            "home": None if home is None else {"x": home.x, "y": home.y, "theta": home.theta},
         }
+        duration = self._p.duration_s
+        if duration is not None:
+            out["duration_s"] = duration
+            out["remaining_s"] = max(0.0, duration - elapsed)
+        goal = self._s.goal
+        if goal is not None:
+            out["goal"] = {"x": goal.frontier.goal_x, "y": goal.frontier.goal_y}
+        home = self._s.home
+        if home is not None:
+            out["home"] = {"x": home.x, "y": home.y, "theta": home.theta}
+        return out
 
     async def preflight(self) -> Optional[str]:
         slam = await self._slam.status()
@@ -140,7 +164,9 @@ class ExploreRun:
         nav = await self._nav.status()
         limit = math.radians(self._p.max_angular_dps)
         if nav.max_angular_rad_s is None:
-            return "nav angular limit unknown; navigation get_status has no limits field"
+            return (
+                "nav angular limit unknown; navigation get_status has no limits field"
+            )
         if nav.max_angular_rad_s > limit + 1e-9:
             return (
                 f"nav angular limit {nav.max_angular_rad_s:.2f} rad/s exceeds explore "
@@ -158,11 +184,7 @@ class ExploreRun:
         try:
             pose = await self._require_pose()
             self._s.home = pose
-            self._s.visited.append((pose.x, pose.y))
-            await self._structure_phase()
-            await self._fill_phase()
-            await self._revisit_phase()
-            await self._idle_fill()
+            await self._explore()
         except _Finish:
             pass
         except Exception as exc:  # noqa: BLE001
@@ -182,11 +204,10 @@ class ExploreRun:
             return 0.0
         return self._clock() - self._started_at
 
-    def _remaining(self) -> float:
-        return self._p.duration_s - self._elapsed()
-
     def _check_budget(self) -> None:
-        if self._stop_requested or self._remaining() <= 0.0:
+        if self._stop_requested:
+            raise _Finish()
+        if self._p.duration_s is not None and self._elapsed() >= self._p.duration_s:
             raise _Finish()
 
     async def _set_phase(self, phase: str) -> None:
@@ -211,204 +232,186 @@ class ExploreRun:
             await self._sleep(LOST_POSE_POLL_S)
             waited += LOST_POSE_POLL_S
 
-    async def _grid(self) -> Optional[OccGrid]:
-        raw = await self._slam.grid()
-        if raw is None:
-            return None
-        grid = await asyncio.to_thread(OccGrid.from_get_grid, raw)
-        if grid is not None:
-            self._s.coverage_cells = grid.known_free_count()
-        return grid
-
-    async def _keyframes(self) -> int:
-        st = await self._slam.status()
-        self._s.keyframes_used = st.keyframes
-        return st.keyframes
-
-    async def _leg(
-        self, goal: Candidate, *, planned: bool, length_m: float, theta: Optional[float] = None
-    ) -> LegResult:
-        self._check_budget()
-        self._s.legs += 1
-        result = await self._legs.run(
-            goal.x, goal.y, theta if theta is not None else 0.0,
-            planned=planned, planned_length_m=length_m,
-        )
-        if result.reason == "canceled" and self._stop_requested:
-            raise _Finish()
-        if result.reason == "lost_pose":
-            await self._require_pose()
-        if result.ok:
-            self._s.consecutive_failures = 0
-            if result.end_pose is not None:
-                self._s.visited.append((result.end_pose.x, result.end_pose.y))
-            return result
-        self._s.legs_failed += 1
-        self._s.consecutive_failures += 1
-        self._blacklist.add(goal.x, goal.y, self._clock())
-        if self._s.consecutive_failures >= FAILURES_BEFORE_FINISH:
-            self._s.last_error = f"too many failed legs ({self._s.consecutive_failures} in a row)"
-            raise _Finish()
-        if self._s.consecutive_failures % FAILURES_BEFORE_WAIT == 0:
-            await self._sleep(FAILURE_WAIT_S)
-        return result
-
-    async def _pose(self) -> Pose:
-        st = await self._nav.status()
-        if st.pose is None or not st.localized:
-            return await self._require_pose()
-        return st.pose
-
-    # -- phases ----------------------------------------------------------------
-    def _structure_budget_left(self, keyframes: int) -> bool:
-        return (
-            self._elapsed() < self._p.structure_fraction * self._p.duration_s
-            and keyframes < STRUCTURE_KEYFRAME_SHARE * self._p.keyframe_max
-        )
-
-    async def _structure_phase(self) -> None:
-        await self._set_phase("structure")
-        start = await self._pose()
-        outer = Circuit(waypoints=[])
-        closures_before = (await self._slam.status()).closures
-        path_m = 0.0
-        far_m = 0.0
-        prev_travel: Optional[Tuple[float, float]] = None
-        pose = start
-        while self._structure_budget_left(await self._keyframes()):
+    # -- exploring -------------------------------------------------------------
+    async def _explore(self) -> None:
+        await self._set_phase("exploring")
+        empty_scans = 0
+        while True:
             self._check_budget()
-            pose = await self._pose()
-            grid = await self._grid()
-            hop = None
-            if grid is not None:
-                hop = await asyncio.to_thread(
-                    next_wall_hop, grid, pose, hop_m=HOP_M, prev_travel=prev_travel
-                )
-            if hop is None or self._blacklist.blocked(hop.x, hop.y, self._clock()):
-                break
-            theta = facing_wall_theta(grid, Pose(hop.x, hop.y, 0.0))
-            result = await self._leg(hop, planned=False, length_m=HOP_M, theta=theta)
-            if result.ok and result.end_pose is not None:
-                end = result.end_pose
-                prev_travel = (end.x - pose.x, end.y - pose.y)
-                path_m += math.hypot(*prev_travel)
-                far_m = max(far_m, math.hypot(end.x - start.x, end.y - start.y))
-                pose = end
-                outer.waypoints.append(hop)
-            await self._sleep(STRUCTURE_PAUSE_S)
-            if circuit_closed(path_m, pose, start, far_m=far_m):
-                break
-        if outer.waypoints:
-            outer.closures = (await self._slam.status()).closures - closures_before
-            self._s.circuits.append(outer)
-        inner = 0
-        while inner < 3 and self._structure_budget_left(await self._keyframes()):
-            grid = await self._grid()
+            nav = await self._nav.status()
+            if not nav.localized or nav.pose is None:
+                await self._drop_goal(cancel=True)
+                await self._require_pose()
+                continue
+            pose = nav.pose
+            self._s.ticks += 1
+            if self._s.ticks % SLAM_STATUS_EVERY == 1:
+                self._s.keyframes_used = (await self._slam.status()).keyframes
+            grid = await self._slam.occupancy()
             if grid is None:
-                break
-            goals = await asyncio.to_thread(
-                inner_circuit_goals, grid, await self._pose(), clearance_m=self._p.robot_radius_m * 3
+                await self._sleep(TICK_S)
+                continue
+            self._s.coverage_cells = grid.known_free_count()
+            t0 = time.perf_counter()
+            scan = await asyncio.to_thread(
+                scan_frontiers,
+                grid,
+                pose.x,
+                pose.y,
+                self._p.robot_radius_m,
+                min_frontier_m=self._p.min_frontier_m,
             )
-            if len(goals) < 2:
-                break
-            circuit = Circuit(waypoints=goals)
-            before = (await self._slam.status()).closures
-            await self._drive_circuit(circuit, pause_s=STRUCTURE_PAUSE_S, structure=True)
-            circuit.closures = (await self._slam.status()).closures - before
-            self._s.circuits.append(circuit)
-            inner += 1
-
-    async def _drive_circuit(self, circuit: Circuit, *, pause_s: float, structure: bool) -> int:
-        driven = 0
-        for goal in circuit.waypoints:
-            if structure and not self._structure_budget_left(await self._keyframes()):
-                return driven
-            self._check_budget()
-            if self._blacklist.blocked(goal.x, goal.y, self._clock()):
+            self._s.decision_ms = (time.perf_counter() - t0) * 1000.0
+            if not scan.start_found:
+                # Not "nothing left": keep the current goal and let nav move.
+                self._s.off_map_ticks += 1
+                if self._s.off_map_ticks >= OFF_MAP_TICKS_MAX:
+                    self._s.last_error = "robot is not in traversable mapped space"
+                    raise _Finish()
+                await self._sleep(TICK_S)
                 continue
-            here = await self._pose()
-            if math.hypot(goal.x - here.x, goal.y - here.y) <= MIN_LEG_M:
-                continue
-            feasible, length = await self._nav.plan_to_point(goal.x, goal.y)
-            if not feasible:
-                continue
-            grid = await self._grid()
-            theta = None if grid is None else facing_wall_theta(grid, Pose(goal.x, goal.y, 0.0))
-            if theta is None:
-                theta = _approach_theta(here, goal)
-            await self._leg(goal, planned=True, length_m=length, theta=theta)
-            driven += 1
-            await self._sleep(pause_s)
-        return driven
-
-    async def _candidates(self) -> List[Scored]:
-        grid = await self._grid()
-        if grid is None:
-            self._s.frontier_count = 0
-            return []
-        pose = await self._pose()
-        now = self._clock()
-        frontiers = await asyncio.to_thread(frontier_goals, grid, self._p.robot_radius_m)
-        self._s.frontier_count = len(frontiers)
-        under = await asyncio.to_thread(
-            under_seen_goals, grid, self._s.visited, self._p.well_seen_m
-        )
-        pool = [c for c in frontiers + under if not self._blacklist.blocked(c.x, c.y, now)]
-        pool.sort(key=lambda c: math.hypot(c.x - pose.x, c.y - pose.y))
-        scored: List[Scored] = []
-        for cand in pool[:CANDIDATE_CAP]:
-            feasible, length = await self._nav.plan_to_point(cand.x, cand.y)
-            if not feasible:
-                continue
-            gain = await asyncio.to_thread(
-                visible_new_cells, grid, cand.x, cand.y, max_range_m=SCORE_RANGE_M
+            self._s.off_map_ticks = 0
+            now = self._clock()
+            ranked = sorted(
+                scan.frontiers, key=lambda f: cost(f, pose.x, pose.y, pose.theta)
             )
-            scored.append(Scored(cand, gain, length, score(gain, length)))
-        return rank(scored, self._p.min_score)
-
-    async def _fill_leg(self, best: Scored) -> None:
-        here = await self._pose()
-        theta = _approach_theta(here, best.candidate)
-        await self._leg(best.candidate, planned=True, length_m=best.path_len_m, theta=theta)
-        await self._sleep(FILL_PAUSE_S)
-
-    async def _fill_phase(self) -> None:
-        await self._set_phase("fill")
-        while self._remaining() > self._p.revisit_fraction * self._p.duration_s:
-            self._check_budget()
-            ranked = await self._candidates()
-            if not ranked:
-                return
-            await self._fill_leg(ranked[0])
-
-    async def _revisit_phase(self) -> None:
-        if not self._s.circuits:
-            return
-        for circuit in sorted(self._s.circuits, key=lambda c: c.closures):
-            slam = await self._slam.status()
-            self._s.keyframes_used = slam.keyframes
-            if slam.graph_full or slam.keyframes >= self._p.keyframe_max:
-                return
-            if self._s.phase != "revisit":
-                await self._set_phase("revisit")
-            self._check_budget()
-            await self._drive_circuit(circuit, pause_s=STRUCTURE_PAUSE_S, structure=False)
-
-    async def _idle_fill(self) -> None:
-        await self._set_phase("fill")
-        while self._remaining() > 0.0:
-            self._check_budget()
-            ranked = await self._candidates()
-            if ranked:
-                await self._fill_leg(ranked[0])
+            nxt = await self._decide(nav, pose, scan, ranked, now)
+            open_count = len(self._open(ranked, now))
+            self._s.frontier_count = open_count
+            self._s.unreachable_frontiers = len(ranked) - open_count
+            if nxt is not None:
+                await self._send(nxt, pose, now)
+            if self._s.goal is None and self._best(ranked, now) is None:
+                empty_scans += 1
+                if empty_scans >= EMPTY_SCANS_TO_FINISH:
+                    return
             else:
-                await self._sleep(IDLE_POLL_S)
+                empty_scans = 0
+            await self._sleep(TICK_S)
 
+    async def _decide(
+        self,
+        nav: NavStatus,
+        pose: Pose,
+        scan: FrontierScan,
+        ranked: List[Frontier],
+        now: float,
+    ) -> Optional[Frontier]:
+        """The frontier to send now, or None to keep the current goal.
+
+        ``ranked`` is every reachable frontier, cheapest first; the best one is
+        re-picked after any blacklist change so a failed goal is never resent.
+        """
+        g = self._s.goal
+        if g is None:
+            return self._best(ranked, now)
+        f = g.frontier
+        seen = not scan.frontier_near(f.x, f.y, SEEN_RADIUS_M)
+        if not nav.active:
+            if nav.state == "succeeded":
+                if not seen:
+                    # Arrived but the frontier is still there: it cannot be
+                    # cleared from here (glass, a drop, sensor height).
+                    self._blacklist.add(f.goal_x, f.goal_y, now)
+                self._goal_reached()
+            else:
+                await self._goal_failed(cancel=False)
+            return self._best(ranked, now)
+        remaining = scan.path_m(f.goal_x, f.goal_y)
+        stalled = False
+        if remaining is not None and remaining < g.best_path_m - PROGRESS_MIN_M:
+            g.best_path_m, g.progress_at = remaining, now
+        elif now - g.progress_at > PROGRESS_TIMEOUT_S:
+            stalled = True
+        if remaining is None or stalled:
+            # Unreachable now, or no progress: blacklist it and move on.
+            self._blacklist.add(f.goal_x, f.goal_y, now)
+            best = self._best(ranked, now)
+            await self._goal_failed(cancel=best is None)
+            return best
+        best = self._best(ranked, now)
+        if best is None:
+            if seen:
+                await self._drop_goal(cancel=True)
+            return None
+        if math.hypot(best.goal_x - f.goal_x, best.goal_y - f.goal_y) < SAME_GOAL_M:
+            return None
+        if remaining <= HANDOFF_M:
+            self._goal_reached()
+            return best
+        if seen:
+            # Keep driving only while the old goal is on the way to the new one.
+            detour = remaining + math.hypot(
+                best.goal_x - f.goal_x, best.goal_y - f.goal_y
+            )
+            if best.path_m < detour - HANDOFF_M:
+                self._goal_reached()
+                return best
+            return None
+        current = next(
+            (
+                c
+                for c in scan.frontiers
+                if math.hypot(c.goal_x - f.goal_x, c.goal_y - f.goal_y) < SAME_GOAL_M
+            ),
+            None,
+        )
+        if current is not None and (
+            cost(best, pose.x, pose.y, pose.theta) + REPLACE_MARGIN_M
+            < cost(current, pose.x, pose.y, pose.theta)
+        ):
+            return best
+        return None
+
+    def _open(self, ranked: List[Frontier], now: float) -> List[Frontier]:
+        return [
+            f for f in ranked if not self._blacklist.blocked(f.goal_x, f.goal_y, now)
+        ]
+
+    def _best(self, ranked: List[Frontier], now: float) -> Optional[Frontier]:
+        open_ = self._open(ranked, now)
+        return open_[0] if open_ else None
+
+    async def _send(self, f: Frontier, pose: Pose, now: float) -> None:
+        self._check_budget()
+        theta = math.atan2(f.goal_y - pose.y, f.goal_x - pose.x)
+        await self._nav.navigate_to_point(f.goal_x, f.goal_y, theta)
+        self._s.goals += 1
+        self._s.goal = _Goal(f, sent_at=now, best_path_m=f.path_m, progress_at=now)
+
+    def _goal_reached(self) -> None:
+        self._s.consecutive_failures = 0
+        self._s.goal = None
+
+    async def _drop_goal(self, *, cancel: bool) -> None:
+        if self._s.goal is not None and cancel:
+            await self._nav.cancel()
+        self._s.goal = None
+
+    async def _goal_failed(self, *, cancel: bool) -> None:
+        g = self._s.goal
+        if g is None:
+            return
+        self._blacklist.add(g.frontier.goal_x, g.frontier.goal_y, self._clock())
+        await self._drop_goal(cancel=cancel)
+        self._s.goals_failed += 1
+        self._s.consecutive_failures += 1
+        if self._s.consecutive_failures >= FAILURES_BEFORE_FINISH:
+            self._s.last_error = (
+                f"too many failed goals ({self._s.consecutive_failures} in a row)"
+            )
+            raise _Finish()
+
+    # -- finish ----------------------------------------------------------------
     async def _finish(self) -> None:
         await self._set_phase("finishing")
+        self._s.goal = None
         errors: List[str] = []
-        for name, step in (("cancel", self._nav.cancel), ("optimize", self._slam.optimize),
-                           ("save_map", self._slam.save_map)):
+        for name, step in (
+            ("cancel", self._nav.cancel),
+            ("optimize", self._slam.optimize),
+            ("save_map", self._slam.save_map),
+        ):
             try:
                 await step()
             except Exception as exc:  # noqa: BLE001
@@ -439,17 +442,24 @@ class ExploreRun:
                 errors.append(f"base stop failed: {exc}")
         if errors:
             joined = "; ".join(errors)
-            self._s.last_error = f"{self._s.last_error}; {joined}" if self._s.last_error else joined
+            self._s.last_error = (
+                f"{self._s.last_error}; {joined}" if self._s.last_error else joined
+            )
         await self._set_phase("done")
 
     async def _go_home(self, home: Pose) -> Tuple[bool, str]:
         pose = (await self._nav.status()).pose
         feasible, length = await self._nav.plan_to_point(home.x, home.y)
         if not feasible:
-            length = 0.0 if pose is None else math.hypot(home.x - pose.x, home.y - pose.y)
+            length = (
+                0.0 if pose is None else math.hypot(home.x - pose.x, home.y - pose.y)
+            )
         self._stop_requested = False
         result = await self._legs.run(
-            home.x, home.y, home.theta,
-            planned=True, planned_length_m=length, goal_tolerance_m=self._p.home_tolerance_m,
+            home.x,
+            home.y,
+            home.theta,
+            planned_length_m=length,
+            goal_tolerance_m=self._p.home_tolerance_m,
         )
         return result.ok, result.reason

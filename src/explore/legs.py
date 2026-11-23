@@ -1,11 +1,12 @@
 """Execute one navigation leg and classify how it ended."""
+
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
-from .clients import NavClient, Pose
+from .clients import NavClient, NavStatus, Pose
 
 ACTIVATION_GRACE_S = 3.0
 STATUS_ERROR_LIMIT = 3
@@ -58,7 +59,6 @@ class LegRunner:
         y: float,
         theta: float,
         *,
-        planned: bool,
         planned_length_m: float,
         goal_tolerance_m: float = 1.0,
     ) -> LegResult:
@@ -67,13 +67,7 @@ class LegRunner:
         before = await self._status()
         if not before.localized:
             return LegResult(False, "lost_pose", before.pose, 0.0)
-        if planned:
-            await self._nav.navigate_to_point(x, y, theta)
-        else:
-            await self._nav.go_to_point(x, y, theta, velocity_mps=self._max_linear_mps)
-
-        def leg_state(status: NavStatus) -> str:
-            return status.state if planned else status.simple_state
+        await self._nav.navigate_to_point(x, y, theta)
 
         def done(ok: bool, reason: str, pose: Optional[Pose]) -> LegResult:
             return LegResult(ok, reason, pose, self._clock() - start)
@@ -87,14 +81,17 @@ class LegRunner:
             if not status.localized:
                 await self._nav.cancel()
                 return done(False, "lost_pose", status.pose)
-            state = leg_state(status)
-            started = started or status.active or state != leg_state(before)
+            state = status.state
+            started = started or status.active or state != before.state
             if not status.active and started:
                 if state in ("failed", "canceled"):
                     return done(False, state, status.pose)
                 if state == "succeeded":
                     pose = status.pose
-                    if pose is None or math.hypot(pose.x - x, pose.y - y) > goal_tolerance_m:
+                    if (
+                        pose is None
+                        or math.hypot(pose.x - x, pose.y - y) > goal_tolerance_m
+                    ):
                         return done(False, "far_from_goal", pose)
                     return done(True, "", pose)
             if not started and self._clock() - start > ACTIVATION_GRACE_S:

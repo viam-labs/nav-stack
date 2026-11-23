@@ -1,7 +1,7 @@
 """Fakes for exploration tests: SLAM that reveals a sim world, nav that drives lines."""
+
 from __future__ import annotations
 
-import base64
 import math
 from collections import deque
 from typing import List, Optional, Tuple
@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from src.explore.clients import NavStatus, Pose, SlamStatus
+from src.explore.grid import OccGrid
 from src.geom import conversions as conv
 from src.sim.world import SimWorld
 
@@ -25,12 +26,10 @@ class FakeClock:
 
 
 class FakeSlam:
-    def __init__(self, world: SimWorld, *, keyframe_max: int = 2000, n_rays: int = 90,
-                 max_range_m: float = 8.0):
+    def __init__(self, world: SimWorld, *, n_rays: int = 360, max_range_m: float = 8.0):
         self.world = world
         self.base_map = np.array(world.map.grid, copy=True)
         self.known = np.full(self.base_map.shape, -1, dtype=np.int8)
-        self.keyframe_max = keyframe_max
         self.n_rays = n_rays
         self.max_range_m = max_range_m
         self.mode = "mapping"
@@ -38,15 +37,7 @@ class FakeSlam:
         self.saved = 0
         self.optimized = 0
         self.keyframes = 0
-        self.closures = 0
-        self._path_m = 0.0
-        self._last_pose: Optional[conv.Pose2D] = None
         self._last_kf: Optional[conv.Pose2D] = None
-        self._kf_log: List[Tuple[float, float, float]] = []
-
-    @property
-    def graph_full(self) -> bool:
-        return self.keyframes >= self.keyframe_max
 
     def _cell(self, x: float, y: float) -> Tuple[int, int]:
         m = self.world.map
@@ -56,58 +47,49 @@ class FakeSlam:
         )
 
     def reveal(self, pose: conv.Pose2D) -> None:
+        """Mark every cell a 360-ray scan from ``pose`` passes (free) or hits."""
         m = self.world.map
         step = m.resolution / 2.0
-        steps = int(self.max_range_m / step)
-        rows, cols = self.base_map.shape
-        for k in range(self.n_rays):
-            ang = pose.theta + 2.0 * math.pi * k / self.n_rays
-            dx, dy = math.cos(ang) * step, math.sin(ang) * step
-            x, y = pose.x, pose.y
-            for _ in range(steps):
-                x += dx
-                y += dy
-                r, c = self._cell(x, y)
-                if not (0 <= r < rows and 0 <= c < cols):
-                    break
-                if self.base_map[r, c] >= 50:
-                    self.known[r, c] = 100
-                    break
-                self.known[r, c] = 0
-        if self._last_pose is not None:
-            self._path_m += math.hypot(pose.x - self._last_pose.x, pose.y - self._last_pose.y)
-        self._last_pose = conv.Pose2D(pose.x, pose.y, pose.theta)
+        dist = np.arange(1, int(self.max_range_m / step) + 1) * step
+        ang = pose.theta + 2.0 * math.pi * np.arange(self.n_rays) / self.n_rays
+        rows = np.floor(
+            (pose.y + np.outer(np.sin(ang), dist) - m.origin_y) / m.resolution + 1e-9
+        )
+        cols = np.floor(
+            (pose.x + np.outer(np.cos(ang), dist) - m.origin_x) / m.resolution + 1e-9
+        )
+        rows, cols = rows.astype(int), cols.astype(int)
+        h, w = self.base_map.shape
+        oob = (rows < 0) | (rows >= h) | (cols < 0) | (cols >= w)
+        rows, cols = np.clip(rows, 0, h - 1), np.clip(cols, 0, w - 1)
+        stop = oob | (self.base_map[rows, cols] >= 50)
+        first = np.where(stop.any(axis=1), stop.argmax(axis=1), dist.size)
+        j = np.arange(dist.size)[None, :]
+        before = j < first[:, None]
+        self.known[rows[before], cols[before]] = 0
+        hit = (j == first[:, None]) & ~oob
+        self.known[rows[hit], cols[hit]] = 100
         moved = self._last_kf is None or (
             math.hypot(pose.x - self._last_kf.x, pose.y - self._last_kf.y) >= 0.5
-            or abs(conv.normalize_angle(pose.theta - self._last_kf.theta)) >= math.radians(20)
+            or abs(conv.normalize_angle(pose.theta - self._last_kf.theta))
+            >= math.radians(20)
         )
-        if moved and not self.graph_full:
+        if moved:
             self.keyframes += 1
             self._last_kf = conv.Pose2D(pose.x, pose.y, pose.theta)
-            for kx, ky, kpath in self._kf_log:
-                if self._path_m - kpath > 6.0 and math.hypot(kx - pose.x, ky - pose.y) < 1.5:
-                    self.closures += 1
-                    break
-            self._kf_log.append((pose.x, pose.y, self._path_m))
 
-    async def grid(self):
+    async def occupancy(self) -> OccGrid:
         m = self.world.map
-        return {
-            "rows": int(self.known.shape[0]),
-            "cols": int(self.known.shape[1]),
-            "cellSize": float(m.resolution),
-            "xMin": float(m.origin_x),
-            "yMin": float(m.origin_y),
-            "data": base64.b64encode(self.known.astype(np.int8).tobytes()).decode(),
-        }
+        return OccGrid(
+            cells=self.known.copy(),
+            resolution=float(m.resolution),
+            x_min=float(m.origin_x),
+            y_min=float(m.origin_y),
+        )
 
     async def status(self) -> SlamStatus:
         return SlamStatus(
-            mode=self.mode,
-            running=self.running,
-            keyframes=self.keyframes,
-            graph_full=self.graph_full,
-            closures=self.closures,
+            mode=self.mode, running=self.running, keyframes=self.keyframes
         )
 
     async def optimize(self) -> None:
@@ -118,8 +100,15 @@ class FakeSlam:
 
 
 class FakeNav:
-    def __init__(self, world: SimWorld, slam: FakeSlam, clock: FakeClock, *,
-                 speed_mps: float = 0.4, max_angular_rad_s: float = 0.5):
+    def __init__(
+        self,
+        world: SimWorld,
+        slam: FakeSlam,
+        clock: FakeClock,
+        *,
+        speed_mps: float = 0.4,
+        max_angular_rad_s: float = 0.5,
+    ):
         self.world = world
         self.slam = slam
         self.clock = clock
@@ -139,7 +128,9 @@ class FakeNav:
         self._bfs_parent: Optional[np.ndarray] = None
         self._bfs_dist: Optional[np.ndarray] = None
 
-    def _line_blocked(self, grid: np.ndarray, a: Tuple[float, float], b: Tuple[float, float]) -> bool:
+    def _line_blocked(
+        self, grid: np.ndarray, a: Tuple[float, float], b: Tuple[float, float]
+    ) -> bool:
         m = self.world.map
         n = max(1, int(math.hypot(b[0] - a[0], b[1] - a[1]) / (m.resolution / 2.0)))
         for i in range(n + 1):
@@ -166,7 +157,12 @@ class FakeNav:
             r, c = queue.popleft()
             for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols and dist[nr, nc] < 0 and grid[nr, nc] < 50:
+                if (
+                    0 <= nr < rows
+                    and 0 <= nc < cols
+                    and dist[nr, nc] < 0
+                    and grid[nr, nc] < 50
+                ):
                     dist[nr, nc] = dist[r, c] + 1
                     parent[nr, nc] = r * cols + c
                     queue.append((nr, nc))
@@ -178,7 +174,10 @@ class FakeNav:
         goal = self.slam._cell(x, y)
         self._bfs(start)
         rows, cols = self._bfs_dist.shape
-        if not (0 <= goal[0] < rows and 0 <= goal[1] < cols) or self._bfs_dist[goal] < 0:
+        if (
+            not (0 <= goal[0] < rows and 0 <= goal[1] < cols)
+            or self._bfs_dist[goal] < 0
+        ):
             return None
         m = self.world.map
         cells = []
@@ -188,8 +187,13 @@ class FakeNav:
             lin = int(self._bfs_parent[cur])
             cur = (lin // cols, lin % cols)
         cells.reverse()
-        path = [(m.origin_x + (c + 0.5) * m.resolution, m.origin_y + (r + 0.5) * m.resolution)
-                for r, c in cells]
+        path = [
+            (
+                m.origin_x + (c + 0.5) * m.resolution,
+                m.origin_y + (r + 0.5) * m.resolution,
+            )
+            for r, c in cells
+        ]
         if path:
             path[-1] = (x, y)
         else:
@@ -205,9 +209,8 @@ class FakeNav:
         length = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
         return True, round(float(length), 6)
 
-    def _start(self, x: float, y: float, theta: float, *, planned: bool = True) -> None:
+    def _start(self, x: float, y: float, theta: float) -> None:
         self.legs += 1
-        self._planned = planned
         self.last_theta = theta
         self._goal = (x, y, theta)
         self._last_t = self.clock.now()
@@ -222,9 +225,6 @@ class FakeNav:
 
     async def navigate_to_point(self, x: float, y: float, theta: float) -> None:
         self._start(x, y, theta)
-
-    async def go_to_point(self, x: float, y: float, theta: float, velocity_mps: float) -> None:
-        self._start(x, y, theta, planned=False)
 
     async def cancel(self) -> None:
         self.cancels += 1
@@ -268,16 +268,14 @@ class FakeNav:
             self.slam.reveal(self.world.get_pose())
         self._advance()
         p = self.world.get_pose()
-        planned = getattr(self, "_planned", True)
         return NavStatus(
             active=self._active,
-            state=self._state if planned else "canceled",
+            state=self._state,
             pose=None if self.lose_pose else Pose(p.x, p.y, p.theta),
             localized=not self.lose_pose,
             max_angular_rad_s=self.max_angular_rad_s,
             robot_radius_m=0.3,
             error=self._error,
-            simple_state="idle" if planned else self._state,
         )
 
 
@@ -285,4 +283,6 @@ def known_fraction(slam: FakeSlam, world: SimWorld) -> float:
     truth_free = slam.base_map == 0
     if not truth_free.any():
         return 0.0
-    return float(np.count_nonzero(truth_free & (slam.known == 0)) / np.count_nonzero(truth_free))
+    return float(
+        np.count_nonzero(truth_free & (slam.known == 0)) / np.count_nonzero(truth_free)
+    )

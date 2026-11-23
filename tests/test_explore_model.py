@@ -3,6 +3,7 @@ import asyncio
 from src.config import ExploreConfig
 from src.models.explore import ExploreService
 
+
 class Rec:
     def __init__(self, replies):
         self.replies, self.calls = replies, []
@@ -19,7 +20,12 @@ def make(slam_mode="mapping", ang=0.5):
     svc = ExploreService("explore")
     svc._slam = Rec(
         {
-            "get_status": {"mode": slam_mode, "running": True, "keyframes": 0, "loop_closure": {}},
+            "get_status": {
+                "mode": slam_mode,
+                "running": True,
+                "keyframes": 0,
+                "loop_closure": {},
+            },
             "get_grid": {"available": False},
         }
     )
@@ -48,11 +54,32 @@ def test_start_refuses_when_slam_not_mapping():
     svc = make(slam_mode="localizing")
     out = asyncio.run(svc.do_command({"command": "start", "duration_s": 10}))
     assert "mapping" in out["error"]
-    assert not any(c["command"] in ("navigate_to_point", "go_to_point") for c in svc._nav.calls)
+    assert not any(c["command"] == "navigate_to_point" for c in svc._nav.calls)
+
+
+def test_start_without_duration_runs_until_mapped():
+    svc = make()
+
+    async def go():
+        a = await svc.do_command({"command": "start"})
+        await svc.do_command({"command": "stop"})
+        await svc._run_task
+        return a, await svc.do_command({"command": "status"})
+
+    a, st = asyncio.run(go())
+    assert a == {"started": True}
+    assert "duration_s" not in st and "remaining_s" not in st
+
+
+def test_start_rejects_bad_duration():
+    out = asyncio.run(make().do_command({"command": "start", "duration_s": "soon"}))
+    assert "duration_s" in out["error"]
 
 
 def test_stop_without_run_is_an_error():
-    assert asyncio.run(make().do_command({"command": "stop"})) == {"error": "no active run"}
+    assert asyncio.run(make().do_command({"command": "stop"})) == {
+        "error": "no active run"
+    }
 
 
 def test_start_twice_is_an_error_and_stop_ends_run():

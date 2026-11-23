@@ -1,5 +1,8 @@
 import asyncio
 
+import numpy as np
+
+from src import runtime
 from src.explore.clients import ViamNavClient, ViamSlamClient
 
 
@@ -27,7 +30,9 @@ def test_nav_status_parses_pose_limits_and_localized():
 
 
 def test_nav_status_without_pose_is_not_localized():
-    st = asyncio.run(ViamNavClient(Recorder({"active": False, "state": "idle"})).status())
+    st = asyncio.run(
+        ViamNavClient(Recorder({"active": False, "state": "idle"})).status()
+    )
     assert st.pose is None and not st.localized and st.max_angular_rad_s is None
 
 
@@ -47,38 +52,40 @@ def test_plan_to_point_returns_feasible_and_length():
     assert rec.calls[0]["command"] == "plan_to_point" and rec.calls[0]["x"] == 1.0
 
 
-def test_go_to_point_sends_velocity_and_no_wait():
-    rec = Recorder({"status": "ok"})
-    asyncio.run(ViamNavClient(rec).go_to_point(1.0, 2.0, 0.0, velocity_mps=0.4))
-    assert rec.calls[0] == {
-        "command": "go_to_point",
-        "x": 1.0,
-        "y": 2.0,
-        "theta": 0.0,
-        "wait": False,
-        "velocity_mps": 0.4,
-    }
+def test_slam_status_skips_sensor_probes():
+    rec = Recorder({"mode": "mapping", "running": True, "keyframes": 12})
+    st = asyncio.run(ViamSlamClient(rec).status())
+    assert (st.mode, st.running, st.keyframes) == ("mapping", True, 12)
+    assert rec.calls[0] == {"command": "get_status", "probe_sensors": False}
 
 
-def test_slam_status_and_grid():
-    raw = {
-        "mode": "mapping",
-        "running": True,
-        "keyframes": 12,
-        "loop_closure": {"graph_full": False, "closures": 2},
-    }
-    st = asyncio.run(ViamSlamClient(Recorder(raw)).status())
-    assert (st.mode, st.keyframes, st.graph_full, st.closures) == ("mapping", 12, False, 2)
-    none_grid = ViamSlamClient(Recorder({"available": False, "reason": "no_map"}))
-    assert asyncio.run(none_grid.grid()) is None
+def test_occupancy_falls_back_to_get_grid():
+    none_grid = ViamSlamClient(
+        Recorder({"available": False, "reason": "no_map"}), "slam"
+    )
+    assert asyncio.run(none_grid.occupancy()) is None
 
 
-def test_nav_status_exposes_simple_nav_state():
-    raw = {
-        "active": False,
-        "state": "canceled",
-        "pose": {"x": 1.0, "y": 2.0, "theta": 0.0},
-        "simple_nav": {"state": "succeeded", "motion": "simple"},
-    }
-    st = asyncio.run(ViamNavClient(Recorder(raw)).status())
-    assert st.state == "canceled" and st.simple_state == "succeeded"
+def test_occupancy_reads_in_process_slam_map_without_docommand():
+    class Node:
+        def get_map(self):
+            return {
+                "grid": np.zeros((4, 5), dtype=np.int16),
+                "resolution": 0.05,
+                "origin_x": 0.0,
+                "origin_y": 0.0,
+                "generation": 1,
+            }
+
+    class Manager:
+        node = Node()
+
+    rec = Recorder({})
+    runtime.register_slam(
+        "explore-test-slam", runtime.SlamRuntime(Manager(), None, None)
+    )
+    try:
+        g = asyncio.run(ViamSlamClient(rec, "explore-test-slam").occupancy())
+    finally:
+        runtime.unregister_slam("explore-test-slam")
+    assert g.cells.shape == (4, 5) and rec.calls == []

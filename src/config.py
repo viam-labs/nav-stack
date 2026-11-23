@@ -1831,8 +1831,9 @@ class NavCameraConfig:
 class ExploreConfig:
     """Config for ``viam-labs:nav-stack:explore``.
 
-    Autonomous mapping drive: explores from the live SLAM grid under a time
-    budget using the navigation service, then saves the map and returns home.
+    Autonomous mapping drive: sends the navigation service to frontiers of the
+    live SLAM grid until none are reachable (or ``start``'s optional
+    ``duration_s`` runs out), then saves the map and returns home.
     """
 
     slam_service: str
@@ -1841,10 +1842,8 @@ class ExploreConfig:
     max_linear_mps: float = 0.4
     max_angular_dps: float = 30.0
     home_tolerance_m: float = 0.5
-    structure_fraction: float = 0.15
-    revisit_fraction: float = 0.1
-    well_seen_m: float = 4.0
-    keyframe_max: int = 2000
+    # Frontiers shorter than this are ignored (map speckle, gaps under furniture).
+    min_frontier_m: float = 0.5
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "ExploreConfig":
@@ -1859,10 +1858,7 @@ class ExploreConfig:
             max_linear_mps=float(d.get("max_linear_mps", 0.4)),
             max_angular_dps=float(d.get("max_angular_dps", 30.0)),
             home_tolerance_m=float(d.get("home_tolerance_m", 0.5)),
-            structure_fraction=float(d.get("structure_fraction", 0.15)),
-            revisit_fraction=float(d.get("revisit_fraction", 0.1)),
-            well_seen_m=float(d.get("well_seen_m", 4.0)),
-            keyframe_max=int(d.get("keyframe_max", 2000)),
+            min_frontier_m=float(d.get("min_frontier_m", 0.5)),
         )
 
     def required_dependencies(self) -> List[str]:
