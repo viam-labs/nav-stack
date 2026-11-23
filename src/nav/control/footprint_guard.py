@@ -47,6 +47,9 @@ BACK_OUT_SPEED_MPS = 0.12
 # Rear must be free this far (over a 0.5 m look) before a reverse starts.
 BACK_OUT_CHECK_M = 0.5
 BACK_OUT_MIN_FREE_M = 0.15
+# How much closer the body may get to a point it is already within
+# ``min_gap_m`` of (numerical slack only).
+TOUCHING_SLACK_M = 0.002
 
 
 @dataclass(frozen=True)
@@ -305,10 +308,13 @@ class FootprintGuard:
         pts = pts[~body]
         near = _inside(here, pts, self._hl + p, self._hw + p)[0]
         near_pts = pts[near]
-        floor = np.maximum(
-            self.cfg.min_gap_m,
-            _rect_dist(here, near_pts, self._hl, self._hw)[0] - self.cfg.near_slack_m,
-        )
+        dist = _rect_dist(here, near_pts, self._hl, self._hw)[0]
+        floor = np.maximum(self.cfg.min_gap_m, dist - self.cfg.near_slack_m)
+        # A point already closer than ``min_gap_m`` (parked against a table
+        # leg, or lidar noise on one 2 cm away) used to fail that floor at the
+        # current pose, which blocked every motion, including straight away
+        # from it. Such a point may not be approached, but it may be left.
+        floor = np.minimum(floor, np.maximum(0.0, dist - TOUCHING_SLACK_M))
         return pts[~near], near_pts, floor
 
     def _hits(
@@ -450,6 +456,12 @@ class FootprintGuard:
                 alt = self.best_forward_arc(pose, pts, target, horizon, prefer_sign)
                 if alt is not None:
                     return GuardResult(alt[0], alt[1], "steer", alt[2], True)
+                # No turn and nothing forward (nose against a desk, route off
+                # to the side): the only way to make room is backwards.
+                back = self._back_out(pose, pts, target, any_bearing=True)
+                self._backing_out = back is not None
+                if back is not None:
+                    return back
             return GuardResult(0.0, 0.0, "blocked", 0.0, True)
 
         if vx > 0.0:
@@ -498,7 +510,12 @@ class FootprintGuard:
         return GuardResult(0.0, 0.0, "blocked", free, True)
 
     def _back_out(
-        self, pose: Pose2D, pts: np.ndarray, target: Optional[Pose2D]
+        self,
+        pose: Pose2D,
+        pts: np.ndarray,
+        target: Optional[Pose2D],
+        *,
+        any_bearing: bool = False,
     ) -> Optional[GuardResult]:
         """Straight reverse when the turn is blocked and the route is behind.
 
@@ -513,7 +530,11 @@ class FootprintGuard:
         bearing = conv.normalize_angle(
             math.atan2(target.y - pose.y, target.x - pose.x) - pose.theta
         )
-        if not self._backing_out and abs(bearing) <= BACK_OUT_BEARING_RAD:
+        if (
+            not any_bearing
+            and not self._backing_out
+            and abs(bearing) <= BACK_OUT_BEARING_RAD
+        ):
             return None
         free = self.free_distance(pose, -BACK_OUT_SPEED_MPS, 0.0, pts, BACK_OUT_CHECK_M)
         if math.isfinite(free) and free < BACK_OUT_MIN_FREE_M:
