@@ -894,3 +894,48 @@ def test_get_scan_drops_cache_when_no_lidars_configured():
     # max_age_s <= 0 asks not to expire, matching a missed lidar read.
     world._scan_cache_at = time.monotonic() - 10.0  # noqa: SLF001
     assert world.get_scan(0.0) is first
+
+
+def test_slam_mode_comes_from_the_in_process_provider_not_the_client_stub():
+    # Under viam-server the slam dependency is a gRPC client stub with no
+    # ``slam_mode``. Nav then never knew SLAM was mapping, and ran its
+    # mid-drive localization check every 0.75 s (tracer2a's 1 deg/s turns).
+    class Stub:  # like viam.services.slam.client.SLAMClient: no slam_mode
+        pass
+
+    def make(**kw):
+        return ViamWorldIO(
+            slam=Stub(),
+            base=MagicMock(),
+            loop=asyncio.new_event_loop(),
+            cameras={},
+            lidars=[],
+            base_velocity_convention="viam",
+            viz=NavVizStore(),
+            **kw,
+        )
+
+    assert make().slam_mode() is None
+    assert make(slam_mode_provider=lambda: "mapping").slam_mode() == "mapping"
+    assert make(slam_mode_provider=lambda: None).slam_mode() is None
+
+    def boom():
+        raise RuntimeError("registry gone")
+
+    assert make(slam_mode_provider=boom).slam_mode() is None
+
+
+def test_navigation_wires_slam_mode_to_the_registered_slam_service():
+    from src import runtime
+    from src.models.navigation import _slam_mode_provider
+
+    class Svc:
+        def slam_mode(self):
+            return "mapping"
+
+    runtime.register_slam_service("mode-test-slam", Svc())
+    try:
+        assert _slam_mode_provider("mode-test-slam")() == "mapping"
+    finally:
+        runtime.unregister_slam_service("mode-test-slam")
+    assert _slam_mode_provider("mode-test-slam")() is None

@@ -131,6 +131,17 @@ def _localization_check_provider(slam_service_name: str):
     return _get
 
 
+def _slam_mode_provider(slam_service_name: str):
+    """``mapping`` / ``localizing`` from the SLAM service in this process."""
+
+    def _get():
+        svc = get_slam_service(slam_service_name)
+        fn = getattr(svc, "slam_mode", None)
+        return fn() if callable(fn) else None
+
+    return _get
+
+
 def _in_process_map_provider(slam_service_name: str):
     """Sync occupancy dict from the current SLAM host (re-resolves each call)."""
 
@@ -241,6 +252,7 @@ class NavigationService(NavServiceBase):
             map_provider=_in_process_map_provider(cfg.slam_service),
             localization_hold_provider=_localization_hold_provider(cfg.slam_service),
             localization_check_provider=_localization_check_provider(cfg.slam_service),
+            slam_mode_provider=_slam_mode_provider(cfg.slam_service),
             scan_provider=(
                 (lambda max_age_s, s=slam_rt.sim_sensors: s.get_scan(max_age_s))
                 if slam_rt.sim_sensors is not None
