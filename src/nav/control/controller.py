@@ -1084,6 +1084,7 @@ _GUARD_STATE = {
     "clear": "clear",
     "slow": "slow",
     "steer": "narrow",
+    "back_out": "narrow_reverse",
     "rotate": "avoid",
     "blocked": "avoid",
 }

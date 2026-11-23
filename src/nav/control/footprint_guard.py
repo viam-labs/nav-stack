@@ -40,6 +40,14 @@ from ..motion.base_envelope import (
 from ..planning.costmap import LETHAL
 from ..types import Pose2D
 
+# Back out (straight reverse) when an in-place turn is blocked and the route
+# lies more than this far off the nose; see FootprintGuard._back_out.
+BACK_OUT_BEARING_RAD = math.radians(100.0)
+BACK_OUT_SPEED_MPS = 0.12
+# Rear must be free this far (over a 0.5 m look) before a reverse starts.
+BACK_OUT_CHECK_M = 0.5
+BACK_OUT_MIN_FREE_M = 0.15
+
 
 @dataclass(frozen=True)
 class GuardConfig:
@@ -269,6 +277,12 @@ class FootprintGuard:
         self.cfg = cfg
         self._hl = cfg.length_m / 2.0
         self._hw = cfg.width_m / 2.0
+        # Set once a back-out starts and kept until the follower drives
+        # forward again (the turn is done). While set, a blocked turn keeps
+        # reversing whatever the bearing: part-way through the turn at the
+        # mouth of a pocket the route is no longer "behind", and a forward
+        # arc there drives back in.
+        self._backing_out = False
 
     # --- primitives ---------------------------------------------------
     def _split(self, pose: Pose2D, pts: np.ndarray, padding: Optional[float] = None):
@@ -429,11 +443,17 @@ class FootprintGuard:
             if free >= min(cfg.rot_horizon_rad, abs(vtheta) * 0.5 + cfg.rot_step_rad):
                 return GuardResult(0.0, vtheta, "clear", math.inf, False)
             if allow_steer:
+                back = self._back_out(pose, pts, target)
+                self._backing_out = back is not None
+                if back is not None:
+                    return back
                 alt = self.best_forward_arc(pose, pts, target, horizon, prefer_sign)
                 if alt is not None:
                     return GuardResult(alt[0], alt[1], "steer", alt[2], True)
             return GuardResult(0.0, 0.0, "blocked", 0.0, True)
 
+        if vx > 0.0:
+            self._backing_out = False
         free = self.free_distance(pose, vx, vtheta, pts, horizon)
         v_ok = self._regulate(vx, free)
         need = cfg.alt_min_free_m if allow_steer else cfg.stop_gap_m + 0.02
@@ -476,6 +496,29 @@ class FootprintGuard:
                     if self.free_rotation(pose, sg, pts) >= cfg.rot_horizon_rad * 0.5:
                         return GuardResult(0.0, sg * 0.4, "rotate", free, False)
         return GuardResult(0.0, 0.0, "blocked", free, True)
+
+    def _back_out(
+        self, pose: Pose2D, pts: np.ndarray, target: Optional[Pose2D]
+    ) -> Optional[GuardResult]:
+        """Straight reverse when the turn is blocked and the route is behind.
+
+        Nose-in somewhere the body fits but cannot spin (a gap between desks,
+        a dead-end pocket), every forward arc goes deeper, and the bounded
+        escape reverse was undone by the next forward crawl: the robot pecked
+        in place for minutes. Backing out the way it came is the only motion
+        that makes room to turn.
+        """
+        if target is None:
+            return None
+        bearing = conv.normalize_angle(
+            math.atan2(target.y - pose.y, target.x - pose.x) - pose.theta
+        )
+        if not self._backing_out and abs(bearing) <= BACK_OUT_BEARING_RAD:
+            return None
+        free = self.free_distance(pose, -BACK_OUT_SPEED_MPS, 0.0, pts, BACK_OUT_CHECK_M)
+        if math.isfinite(free) and free < BACK_OUT_MIN_FREE_M:
+            return None
+        return GuardResult(-BACK_OUT_SPEED_MPS, 0.0, "back_out", free, True)
 
     def best_forward_arc(
         self,

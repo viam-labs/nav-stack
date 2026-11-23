@@ -824,6 +824,43 @@ def _segment_crosses_lethal(
     return False
 
 
+def _nearest_free_without_crossing(
+    costs: np.ndarray, start: Cell, max_steps: int
+) -> Optional[Cell]:
+    """Nearest traversable cell reachable from ``start`` through inflation only.
+
+    Breadth-first over cells that are not obstacles themselves (inflation
+    around obstacles may be crossed; lethal and unknown cells may not), at
+    most ``max_steps`` cells out.
+    """
+    h, w = costs.shape
+    rows = _cost_rows(costs)
+    r0, c0 = start
+    if not (0 <= r0 < h and 0 <= c0 < w):
+        return None
+    seen = {start}
+    ring = [start]
+    for _ in range(max(1, int(max_steps))):
+        nxt = []
+        for r, c in ring:
+            for dr, dc, _step in _NEIGHBORS:
+                nr, nc = r + dr, c + dc
+                cell = (nr, nc)
+                if not (0 <= nr < h and 0 <= nc < w) or cell in seen:
+                    continue
+                seen.add(cell)
+                cost = rows[nr][nc]
+                if _TRAV[cost]:
+                    return cell
+                if cost >= LETHAL:  # an obstacle itself, or unknown
+                    continue
+                nxt.append(cell)
+        ring = nxt
+        if not ring:
+            return None
+    return None
+
+
 def plan_on_costmap(
     occ: OccupancyGrid,
     costs: np.ndarray,
@@ -870,9 +907,18 @@ def plan_on_costmap(
         costs, occ, (start.x, start.y), start_xy
     ):
         # Snapping out of our own inflation is fine; snapping *through* an
-        # obstacle (to the free side of a plug) is a teleport.
-        start_xy = None
-        start_cell = None
+        # obstacle (to the free side of a plug) is a teleport. The nearest
+        # free cell in a straight line is often across a wall when the robot
+        # sits in a pocket narrower than its inflated radius, so look for the
+        # nearest one it can reach without crossing an obstacle: the way out.
+        start_cell = _nearest_free_without_crossing(
+            costs, occ.world_to_cell(start.x, start.y), snap_radius_cells * 3
+        )
+        start_xy = (
+            occ.cell_to_world(start_cell[0], start_cell[1])
+            if start_cell is not None
+            else None
+        )
     gr, gc = occ.world_to_cell(goal.x, goal.y)
     goal_cell = nearest_free_cell(costs, gr, gc, max_radius_cells=snap_radius_cells)
     if goal_cell is None:
