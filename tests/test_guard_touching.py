@@ -71,3 +71,38 @@ def test_boxed_in_on_every_side_stays_blocked():
         POSE, 0.0, 0.5, np.array(desk + behind), target=_target(84), max_dist_m=3.0
     )
     assert res.state == "blocked" and res.vx == 0.0 and res.vtheta == 0.0
+
+
+def _drive(g, pts, target, pose, ticks=400, dt=0.05):
+    """Ask for a left turn every tick and integrate what the guard allows."""
+    flips, last, xs = 0, 0, []
+    for _ in range(ticks):
+        res = g.guard(pose, 0.0, 0.5, pts, target=target, max_dist_m=3.0)
+        sign = (res.vx > 1e-3) - (res.vx < -1e-3)
+        if sign and last and sign != last:
+            flips += 1
+        last = sign or last
+        th = pose.theta + res.vtheta * dt
+        pose = Pose2D(
+            pose.x + res.vx * math.cos(th) * dt, pose.y + res.vx * math.sin(th) * dt, th
+        )
+        xs.append(pose.x)
+    return flips, xs, pose
+
+
+@pytest.mark.parametrize(
+    "desk_m,leg_x,leg_gap,bearing",
+    [(0.2, -0.05, 0.06, 80), (0.3, 0.2, 0.03, 40), (0.1, -0.05, 0.06, 40)],
+)
+def test_making_room_to_turn_commits_to_a_direction(desk_m, leg_x, leg_gap, bearing):
+    # Live tracer2a (1.3.1-rc1): a leg a few cm off the right flank blocks
+    # the turn and a desk ahead leaves a short forward arc. The guard chose
+    # forward or reverse afresh every tick, flipped about every 0.3 s and
+    # stayed inside 9 cm for 30 s. These layouts flipped 46-76 times in 20 s.
+    g = _guard()
+    leg = [[leg_x, -HW - leg_gap]]
+    desk = [[HL + desk_m, y] for y in np.linspace(-0.8, 0.8, 33)]
+    flips, xs, pose = _drive(g, np.array(leg + desk), _target(bearing), POSE)
+    assert flips <= 2, flips
+    # It makes room and turns toward the route.
+    assert pose.theta > math.radians(bearing - 15.0)

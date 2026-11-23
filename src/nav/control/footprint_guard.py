@@ -40,8 +40,8 @@ from ..motion.base_envelope import (
 from ..planning.costmap import LETHAL
 from ..types import Pose2D
 
-# Back out (straight reverse) when an in-place turn is blocked and the route
-# lies more than this far off the nose; see FootprintGuard._back_out.
+# When an in-place turn is blocked, start by backing out (straight reverse)
+# if the route lies more than this far off the nose; see _make_room.
 BACK_OUT_BEARING_RAD = math.radians(100.0)
 BACK_OUT_SPEED_MPS = 0.12
 # Rear must be free this far (over a 0.5 m look) before a reverse starts.
@@ -280,12 +280,13 @@ class FootprintGuard:
         self.cfg = cfg
         self._hl = cfg.length_m / 2.0
         self._hw = cfg.width_m / 2.0
-        # Set once a back-out starts and kept until the follower drives
-        # forward again (the turn is done). While set, a blocked turn keeps
-        # reversing whatever the bearing: part-way through the turn at the
-        # mouth of a pocket the route is no longer "behind", and a forward
-        # arc there drives back in.
-        self._backing_out = False
+        # Direction (+1 forward, -1 reverse, 0 none) the guard is translating
+        # to make room for a blocked turn. Kept until the follower drives
+        # forward again (the turn is done) or that direction is blocked.
+        # Re-deciding every tick pecked in place: a few cm forward made the
+        # forward arc too short, a few cm back made it long enough again
+        # (tracer2a, 30 s inside 9 cm).
+        self._room_dir = 0
 
     # --- primitives ---------------------------------------------------
     def _split(self, pose: Pose2D, pts: np.ndarray, padding: Optional[float] = None):
@@ -449,23 +450,11 @@ class FootprintGuard:
             if free >= min(cfg.rot_horizon_rad, abs(vtheta) * 0.5 + cfg.rot_step_rad):
                 return GuardResult(0.0, vtheta, "clear", math.inf, False)
             if allow_steer:
-                back = self._back_out(pose, pts, target)
-                self._backing_out = back is not None
-                if back is not None:
-                    return back
-                alt = self.best_forward_arc(pose, pts, target, horizon, prefer_sign)
-                if alt is not None:
-                    return GuardResult(alt[0], alt[1], "steer", alt[2], True)
-                # No turn and nothing forward (nose against a desk, route off
-                # to the side): the only way to make room is backwards.
-                back = self._back_out(pose, pts, target, any_bearing=True)
-                self._backing_out = back is not None
-                if back is not None:
-                    return back
+                return self._make_room(pose, pts, target, horizon, prefer_sign)
             return GuardResult(0.0, 0.0, "blocked", 0.0, True)
 
         if vx > 0.0:
-            self._backing_out = False
+            self._room_dir = 0
         free = self.free_distance(pose, vx, vtheta, pts, horizon)
         v_ok = self._regulate(vx, free)
         need = cfg.alt_min_free_m if allow_steer else cfg.stop_gap_m + 0.02
@@ -509,37 +498,47 @@ class FootprintGuard:
                         return GuardResult(0.0, sg * 0.4, "rotate", free, False)
         return GuardResult(0.0, 0.0, "blocked", free, True)
 
-    def _back_out(
+    def _make_room(
         self,
         pose: Pose2D,
         pts: np.ndarray,
         target: Optional[Pose2D],
-        *,
-        any_bearing: bool = False,
-    ) -> Optional[GuardResult]:
-        """Straight reverse when the turn is blocked and the route is behind.
+        horizon: float,
+        prefer_sign: float,
+    ) -> GuardResult:
+        """Translate to make room for a turn that is blocked here.
 
         Nose-in somewhere the body fits but cannot spin (a gap between desks,
-        a dead-end pocket), every forward arc goes deeper, and the bounded
-        escape reverse was undone by the next forward crawl: the robot pecked
-        in place for minutes. Backing out the way it came is the only motion
-        that makes room to turn.
+        a dead-end pocket, a leg beside the flank), the turn only becomes
+        possible somewhere else. Pick a direction once and keep it until it
+        is blocked, then try the other; the turn itself is re-checked every
+        tick by the caller. Starts in reverse when the route is behind the
+        robot (forward would go deeper), else forward.
         """
-        if target is None:
-            return None
-        bearing = conv.normalize_angle(
-            math.atan2(target.y - pose.y, target.x - pose.x) - pose.theta
-        )
-        if (
-            not any_bearing
-            and not self._backing_out
-            and abs(bearing) <= BACK_OUT_BEARING_RAD
-        ):
-            return None
-        free = self.free_distance(pose, -BACK_OUT_SPEED_MPS, 0.0, pts, BACK_OUT_CHECK_M)
-        if math.isfinite(free) and free < BACK_OUT_MIN_FREE_M:
-            return None
-        return GuardResult(-BACK_OUT_SPEED_MPS, 0.0, "back_out", free, True)
+        first = self._room_dir
+        if first == 0:
+            first = 1
+            if target is not None:
+                bearing = conv.normalize_angle(
+                    math.atan2(target.y - pose.y, target.x - pose.x) - pose.theta
+                )
+                if abs(bearing) > BACK_OUT_BEARING_RAD:
+                    first = -1
+        for direction in (first, -first):
+            if direction > 0:
+                alt = self.best_forward_arc(pose, pts, target, horizon, prefer_sign)
+                if alt is not None:
+                    self._room_dir = 1
+                    return GuardResult(alt[0], alt[1], "steer", alt[2], True)
+            else:
+                free = self.free_distance(
+                    pose, -BACK_OUT_SPEED_MPS, 0.0, pts, BACK_OUT_CHECK_M
+                )
+                if not math.isfinite(free) or free >= BACK_OUT_MIN_FREE_M:
+                    self._room_dir = -1
+                    return GuardResult(-BACK_OUT_SPEED_MPS, 0.0, "back_out", free, True)
+        self._room_dir = 0
+        return GuardResult(0.0, 0.0, "blocked", 0.0, True)
 
     def best_forward_arc(
         self,
