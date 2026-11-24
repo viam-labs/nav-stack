@@ -117,13 +117,11 @@ class FakeNav:
         clock: FakeClock,
         *,
         speed_mps: float = 0.4,
-        max_angular_rad_s: float = 0.5,
     ):
         self.world = world
         self.slam = slam
         self.clock = clock
         self.speed_mps = speed_mps
-        self.max_angular_rad_s = max_angular_rad_s
         self.lose_pose = False
         # Navigation's reason for not trusting a pose it does have.
         self.untrusted = ""
@@ -285,7 +283,6 @@ class FakeNav:
             state=self._state,
             pose=None if self.lose_pose else Pose(p.x, p.y, p.theta),
             localized=not self.lose_pose and not self.untrusted,
-            max_angular_rad_s=self.max_angular_rad_s,
             robot_radius_m=0.3,
             error=self._error,
             not_localized_reason=self.untrusted,

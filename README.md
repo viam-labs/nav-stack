@@ -376,19 +376,19 @@ drives the base directly except to stop.
     "navigation_service": "navigation",
     "base": "my-base",
     "max_linear_mps": 0.4,
-    "max_angular_dps": 30,
     "home_tolerance_m": 0.5,
     "min_frontier_m": 0.5
   }
 }
 ```
 
-Requirements checked by `start` (nothing moves if either fails):
+`start` refuses, before anything moves, unless the SLAM service is in
+`mapping` mode (`start_mapping`).
 
-- The SLAM service is in `mapping` mode (`start_mapping`).
-- The navigation service's `max_vel_theta` is at or below `max_angular_dps`
-  (default 30°/s ≈ 0.52 rad/s), e.g. `"max_vel_theta": 0.5`. Builtin SLAM drops
-  scans while yawing faster than 45°/s, and nav's default is 1.5 rad/s.
+The robot turns as fast as the navigation service's `max_vel_theta` allows
+(default 1.5 rad/s, about 86°/s). Builtin SLAM holds the scans it takes during
+an in-place turn and draws them once the robot is still and a scan lines up
+with the map.
 
 DoCommands:
 

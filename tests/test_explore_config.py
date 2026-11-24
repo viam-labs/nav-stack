@@ -8,7 +8,6 @@ def test_explore_config_defaults():
         {"slam_service": "slam", "navigation_service": "navigation", "base": "base"}
     )
     assert cfg.max_linear_mps == 0.4
-    assert cfg.max_angular_dps == 30.0
     assert cfg.home_tolerance_m == 0.5
     assert cfg.min_frontier_m == 0.5
     assert cfg.required_dependencies() == ["slam", "navigation", "base"]

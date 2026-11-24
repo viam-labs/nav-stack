@@ -1817,7 +1817,6 @@ class ExploreConfig:
     navigation_service: str
     base: str
     max_linear_mps: float = 0.4
-    max_angular_dps: float = 30.0
     home_tolerance_m: float = 0.5
     # Frontiers shorter than this are ignored (map speckle, gaps under furniture).
     min_frontier_m: float = 0.5
@@ -1833,7 +1832,6 @@ class ExploreConfig:
         return cls(
             **names,
             max_linear_mps=float(d.get("max_linear_mps", 0.4)),
-            max_angular_dps=float(d.get("max_angular_dps", 30.0)),
             home_tolerance_m=float(d.get("home_tolerance_m", 0.5)),
             min_frontier_m=float(d.get("min_frontier_m", 0.5)),
         )
