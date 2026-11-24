@@ -6,6 +6,7 @@ import contextlib
 import functools
 import math
 import shutil
+import sys
 import threading
 import time
 from collections import deque
@@ -157,6 +158,9 @@ class BuiltinSlamEngine:
         # loop that stalls reports having waited behind.
         self._busy: dict = {}
         self._stall_logged_at = 0.0
+        self._stall_where = ""
+        self._tick_began_at: Optional[float] = None
+        self._watch_thread: Optional[threading.Thread] = None
         # Where the last map rebuild stood partway through (see
         # ``_RENDER_CHECKPOINT_LAG``), and the box clears it had applied.
         self._render_ckpt: Optional[pg.RenderCheckpoint] = None
@@ -377,6 +381,12 @@ class BuiltinSlamEngine:
             daemon=True,
         )
         self._loop_thread.start()
+        self._watch_thread = threading.Thread(
+            target=self._watch_loop,
+            name="builtin-slam-watch",
+            daemon=True,
+        )
+        self._watch_thread.start()
         self._log(f"builtin SLAM engine started ({self._mode})")
 
     def stop(self) -> None:
@@ -384,11 +394,12 @@ class BuiltinSlamEngine:
         self._running = False
         self._repair_cancel.set()
         self._loop_event.set()
-        for thr in (self._thread, self._loop_thread):
+        for thr in (self._thread, self._loop_thread, self._watch_thread):
             if thr is not None and thr.is_alive():
                 thr.join(timeout=2.0)
         self._thread = None
         self._loop_thread = None
+        self._watch_thread = None
 
     def configure_mode(self, mode: str, map_dir: Optional[Path] = None) -> None:
         self._finish_or_cancel_repair(map_dir)
@@ -2840,6 +2851,7 @@ class BuiltinSlamEngine:
         time.sleep(0.001)
 
     def _note_stall(self, gap_s: float, now: float) -> None:
+        where, self._stall_where = self._stall_where, ""
         if now - self._stall_logged_at < self._STALL_LOG_EVERY_S:
             return
         self._stall_logged_at = now
@@ -2849,7 +2861,39 @@ class BuiltinSlamEngine:
         self._log(
             f"builtin SLAM: update loop stalled {gap_s:.1f} s "
             f"(busy with: {busy or 'nothing it tracks'})"
+            + (f"; the loop was in {where}" if where else "")
         )
+
+    @staticmethod
+    def _where(frame, depth: int = 6) -> str:
+        """``file:line function`` for the innermost frames, innermost first."""
+        parts = []
+        while frame is not None and len(parts) < depth:
+            code = frame.f_code
+            parts.append(
+                f"{Path(code.co_filename).name}:{frame.f_lineno} {code.co_name}"
+            )
+            frame = frame.f_back
+        return " < ".join(parts)
+
+    def _watch_loop(self) -> None:
+        """Note where the update loop is whenever one turn of it runs long.
+
+        A stall is only known once it is over, and by then the loop is
+        somewhere else. This looks while it is still stuck.
+        """
+        seen = None
+        while self._running:
+            time.sleep(0.25)
+            began = self._tick_began_at
+            thread = self._thread
+            if began is None or began == seen or thread is None:
+                continue
+            if time.monotonic() - began < self._STALL_LOG_S:
+                continue
+            seen = began
+            frame = sys._current_frames().get(thread.ident)  # noqa: SLF001
+            self._stall_where = self._where(frame)
 
     def _loop(self) -> None:
         last = None
@@ -2858,12 +2902,14 @@ class BuiltinSlamEngine:
             if last is not None and t0 - last > self._STALL_LOG_S:
                 self._note_stall(t0 - last, t0)
             last = t0
+            self._tick_began_at = t0
             try:
                 self._tick()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"builtin SLAM tick failed: {exc}")
             else:
                 self._persist_pose(force=False)
+            self._tick_began_at = None
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, self._period - elapsed))
 
@@ -3824,6 +3870,10 @@ class BuiltinSlamEngine:
         )
         return True
 
+    # Scans painted when a turn ends, of all those held during it. The last
+    # one, taken stopped, is always among them.
+    _SPIN_PAINT_MAX = 6
+
     def _flush_spin_hold(
         self,
         scan: conv.LaserScan2D,
@@ -3858,8 +3908,18 @@ class BuiltinSlamEngine:
             # uses ``end`` directly, so snap the live pose the same way.
             self._snap_pose_yaw(found.theta, clear_yaw_rate=True)
         corrected = rewind_spin_poses([item[1] for item in held], end)
-        for (held_scan, _pose, frames, held_now), paint_at in zip(held, corrected):
-            self._paint_mapping_scan(held_scan, paint_at, held_now, frames=frames)
+        # A turn holds a scan every tick: 30 for a quarter turn. Painting
+        # them all in this one update kept the loop from reading odometry
+        # for seconds on a large map, where each paint works over the whole
+        # grid. A handful spread across the turn draw the same room.
+        count = len(held)
+        shown = min(count, self._SPIN_PAINT_MAX)
+        keep = sorted(
+            {round(i * (count - 1) / max(1, shown - 1)) for i in range(shown)}
+        )
+        for i in keep:
+            held_scan, _pose, frames, held_now = held[i]
+            self._paint_mapping_scan(held_scan, corrected[i], held_now, frames=frames)
 
     def _paint_mapping_scan(
         self,
@@ -4543,17 +4603,36 @@ class BuiltinSlamEngine:
     _MAX_BODY_YAW_RATE = math.radians(120.0)
     _YAW_STEP_WINDOW_S = 0.5
 
-    def _plausible_yaw_step(self, gap_s: float, prev_yaw_rate: float) -> float:
+    # The update loop itself can fall behind while the reader keeps up, and
+    # the step it then sees is real. On one robot the loop stalled 2.8 s in
+    # the middle of a turn that reached 32 deg/s; the 91 degrees that followed
+    # were refused as a jump, the heading was left a quarter turn out and the
+    # whole pose went with it. So the turn is taken at the rate the gyro shows
+    # at either end of the gap, not only before it, with a quarter over for
+    # one still speeding up. A parked cart shows no rate at either end, so a
+    # magnetometer flip there is refused as before, and the hold still caps
+    # how long any rate can account for.
+    _YAW_STEP_RATE_MARGIN = 1.25
+
+    def _plausible_yaw_step(
+        self, gap_s: float, prev_yaw_rate: float, yaw_rate: float = 0.0
+    ) -> float:
         """Most yaw one odom sample can honestly carry.
 
         The body's top rate over the sample gap (never less than a nominal
-        period, never more than half a second), or the turn already underway
-        held across a stalled read for as long as the reader holds it.
+        period, never more than half a second), or a turn measured just
+        before or just after a late sample, for as long as the reader holds
+        a twist across a stalled read.
         """
         gap = max(0.0, float(gap_s))
         window = min(max(gap, self._period), self._YAW_STEP_WINDOW_S)
         hold = min(gap, self._ODOM_YAW_HOLD_MAX_S)
-        return max(self._MAX_BODY_YAW_RATE * window, abs(prev_yaw_rate) * hold)
+        turning = max(abs(prev_yaw_rate), abs(yaw_rate))
+        return max(
+            self._MAX_BODY_YAW_RATE * window,
+            abs(prev_yaw_rate) * hold,
+            self._YAW_STEP_RATE_MARGIN * turning * hold,
+        )
 
     def _predict(self, odom: Optional[conv.OdomReading], now: float) -> conv.Pose2D:
         if odom is None:
@@ -4585,7 +4664,7 @@ class BuiltinSlamEngine:
                 return self._pose
             delta = conv.compose_poses(conv.invert_pose(prev), odom.pose)
             gap_s = (now - prev_at) if prev_at is not None else 0.0
-            max_yaw = self._plausible_yaw_step(gap_s, prev_yaw_rate)
+            max_yaw = self._plausible_yaw_step(gap_s, prev_yaw_rate, odom.vtheta)
             # Prefer dedicated heading_sensor deltas for yaw so velocity-only
             # wheel odom does not dead-reckon heading from gyro vtheta alone.
             # A step the body cannot have turned is a magnetometer snap; the
@@ -4641,7 +4720,9 @@ class BuiltinSlamEngine:
                     odom.heading_rad - self._last_odom_heading
                 )
                 # Reject magnetometer jumps; fall back to gyro integration.
-                if abs(heading_delta) <= self._plausible_yaw_step(gap_s, prev_yaw_rate):
+                if abs(heading_delta) <= self._plausible_yaw_step(
+                    gap_s, prev_yaw_rate, odom.vtheta
+                ):
                     dth = heading_delta
                 else:
                     self._heading_snaps += 1
