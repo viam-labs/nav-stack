@@ -451,6 +451,47 @@ def paint_scan(grid: LogOddsGrid, pose: conv.Pose2D, s: GraphScan) -> LogOddsGri
     )
 
 
+@dataclass
+class RenderCheckpoint:
+    """A render stopped after its first ``nodes`` keyframes, to start later ones from.
+
+    A loop closure moves the keyframes since its anchor, usually the last few
+    dozen, and leaves the rest where they were. Drawing those again gives the
+    same cells every time, and was most of a rebuild: at 830 keyframes all of
+    them were redrawn to move the last 40.
+    """
+
+    nodes: int
+    poses: np.ndarray
+    seqs: np.ndarray
+    last_seq: int
+    base: Optional[LogOddsGrid]
+    resolution: float
+    bands: dict
+
+    def fits(
+        self,
+        snap: GraphSnapshot,
+        poses: np.ndarray,
+        base: Optional[LogOddsGrid],
+        resolution: float,
+    ) -> bool:
+        """True when ``snap`` at ``poses`` starts with exactly what was drawn here."""
+        if self.nodes > len(snap) or base is not self.base:
+            return False
+        if abs(float(resolution) - self.resolution) > 1e-12:
+            return False
+        if not np.array_equal(np.asarray(poses)[: self.nodes], self.poses):
+            return False
+        return np.array_equal(_scan_seqs(snap, self.nodes), self.seqs)
+
+
+def _scan_seqs(snap: GraphSnapshot, nodes: int) -> np.ndarray:
+    return np.array(
+        [s.seq for scans in snap.scans[:nodes] for s in scans], dtype=np.int64
+    )
+
+
 def render_grid(
     snap: GraphSnapshot,
     *,
@@ -463,6 +504,9 @@ def render_grid(
     extra: Optional[Sequence[Tuple[conv.Pose2D, GraphScan]]] = None,
     clears: Sequence[Tuple[int, Callable[[LogOddsGrid], object]]] = (),
     bands_out: Optional[dict] = None,
+    resume: Optional[RenderCheckpoint] = None,
+    keep_at: Optional[int] = None,
+    kept: Optional[list] = None,
 ) -> LogOddsGrid:
     """Ray-cast stored scans at (optimized) node poses into a fresh grid.
 
@@ -472,27 +516,43 @@ def render_grid(
     ``clears`` are ``(seq, apply)`` edits. ``apply`` runs on every band once
     the scans up to ``seq`` are drawn, so only later scans paint over it.
     ``bands_out`` receives the per-band grids when there is more than one.
+
+    ``resume`` starts from an earlier render's :class:`RenderCheckpoint`
+    instead of an empty grid, when it still fits; the caller vouches that the
+    clears it had applied have not changed. ``keep_at`` asks for a new
+    checkpoint once that many keyframes are drawn, appended to ``kept``. Both
+    are for a render of every keyframe in order (``nodes`` unset) and give
+    cell for cell what the full render gives.
     """
     from .height_bands import compress_bands, cover_bands
 
-    if base is not None:
-        seed = occ.copy_grid(base)
-    elif center is not None:
-        size = 20.0
-        seed = occ.empty_grid(
-            resolution=resolution,
-            size_m=size,
-            origin_x=center[0] - size / 2.0,
-            origin_y=center[1] - size / 2.0,
-        )
-    else:
-        seed = occ.empty_grid(resolution=resolution)
-    bands: dict = {0: seed}
     poses = snap.poses if poses is None else poses
-    order = range(len(snap)) if nodes is None else nodes
-    total = len(order)
     pending = sorted(clears, key=lambda item: item[0])
     next_clear = 0
+    first = 0
+    if nodes is not None or center is not None:
+        resume = keep_at = None
+    if resume is not None and resume.fits(snap, poses, base, resolution):
+        bands: dict = {b: occ.copy_grid(g) for b, g in resume.bands.items()}
+        first = resume.nodes
+        next_clear = sum(1 for seq, _apply in pending if seq < resume.last_seq)
+    else:
+        if base is not None:
+            seed = occ.copy_grid(base)
+        elif center is not None:
+            size = 20.0
+            seed = occ.empty_grid(
+                resolution=resolution,
+                size_m=size,
+                origin_x=center[0] - size / 2.0,
+                origin_y=center[1] - size / 2.0,
+            )
+        else:
+            seed = occ.empty_grid(resolution=resolution)
+        bands = {0: seed}
+    order = range(first, len(snap)) if nodes is None else nodes
+    total = len(order)
+    last_seq = int(resume.last_seq) if first else -1
 
     def _clear_before(seq: float) -> None:
         nonlocal next_clear
@@ -502,7 +562,9 @@ def render_grid(
             next_clear += 1
 
     def _paint(pose: conv.Pose2D, scan: GraphScan) -> None:
+        nonlocal last_seq
         _clear_before(scan.seq)
+        last_seq = int(scan.seq)
         band = int(getattr(scan, "band", 0))
         grid = bands.get(band)
         if grid is None:
@@ -515,6 +577,18 @@ def render_grid(
         bands[band] = paint_scan(grid, pose, scan)
 
     for k, i in enumerate(order):
+        if keep_at is not None and kept is not None and i == keep_at and i > first:
+            kept.append(
+                RenderCheckpoint(
+                    nodes=int(i),
+                    poses=np.array(np.asarray(poses)[:i], dtype=float, copy=True),
+                    seqs=_scan_seqs(snap, int(i)),
+                    last_seq=last_seq,
+                    base=base,
+                    resolution=float(resolution),
+                    bands={b: occ.copy_grid(g) for b, g in bands.items()},
+                )
+            )
         p = poses[i]
         node_pose = conv.Pose2D(float(p[0]), float(p[1]), float(p[2]))
         for s in snap.scans[i]:

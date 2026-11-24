@@ -206,3 +206,36 @@ def test_no_search_while_the_robot_is_turning(tmp_path):
     engine._last_yaw_rate = math.radians(40.0)  # noqa: SLF001
     assert engine.recover_position_if_held() is None
     assert engine.paint_hold()["recover"]["attempts"] == 0
+
+
+def test_searches_that_place_nothing_come_less_often_until_the_robot_moves(tmp_path):
+    """A robot standing still gets the same answer each time, at a second or
+    two of matching per search on its own computer."""
+    engine, _merged = _held_engine(tmp_path, held_s=10.0)
+    # Nothing nearby is better than where it is: two identical views.
+    walls = _room_ranges(SLIPPED)
+    frames = engine._sensors.mapping_frames()  # noqa: SLF001
+    for frame in frames:
+        frame.cloud_xyz = np.column_stack(
+            [
+                walls * np.cos(-math.pi + np.arange(BEAMS) * (2 * math.pi / BEAMS)),
+                walls * np.sin(-math.pi + np.arange(BEAMS) * (2 * math.pi / BEAMS)),
+                frame.cloud_xyz[: len(walls), 2],
+            ]
+        )
+    with engine._lock:  # noqa: SLF001
+        engine._last_scan_obj = _scan(walls)  # noqa: SLF001
+
+    def later(seconds: float):
+        engine._recover_last_at -= seconds  # noqa: SLF001
+        return engine.recover_position_if_held()
+
+    first = engine.recover_position_if_held()
+    assert first is not None and first["recovered"] is False
+    assert later(3.0) is None  # the wait doubled to 4 s
+    assert later(2.0) is not None  # 5 s since the last one
+    assert later(5.0) is None  # and doubled again, to 8 s
+    # A meter driven is a new view: no need to wait the rest out.
+    engine._paint_miss_travel_m += 1.2  # noqa: SLF001
+    assert engine.recover_position_if_held() is not None
+    assert engine.paint_hold()["recover"]["attempts"] == 3

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 import shutil
@@ -150,7 +151,19 @@ class BuiltinSlamEngine:
         # how far the robot has driven on odometry alone since then.
         self._paint_miss_since: Optional[float] = None
         self._paint_miss_travel_m = 0.0
+        # (keyframes examined, of how many, since when) for a running repair.
+        self._repair_progress: Optional[tuple] = None
+        # Long jobs under way, by name, and when each began: what an update
+        # loop that stalls reports having waited behind.
+        self._busy: dict = {}
+        self._stall_logged_at = 0.0
+        # Where the last map rebuild stood partway through (see
+        # ``_RENDER_CHECKPOINT_LAG``), and the box clears it had applied.
+        self._render_ckpt: Optional[pg.RenderCheckpoint] = None
+        self._render_ckpt_clears: tuple = ()
         self._recover_last_at = 0.0
+        self._recover_period_s = self._RECOVER_MIN_PERIOD_S
+        self._recover_travel_m = 0.0
         # What the last position search of this run of misses concluded.
         self._recover_verdict: Optional[str] = None
         self._recover_stats: dict = {"attempts": 0, "recovered": 0, "last": None}
@@ -739,6 +752,7 @@ class BuiltinSlamEngine:
 
     def _reset_graph_locked(self) -> None:
         self._graph.clear()
+        self._render_ckpt = None
         self._graph_frozen = 0
         self._grid_edits = []
         self._grid_edits_saved = 0
@@ -777,6 +791,7 @@ class BuiltinSlamEngine:
             saved.last_seq,
             session_gap_m=self._loop_params.min_travel_gap_m,
         )
+        self._render_ckpt = None
         self._graph_frozen = len(saved.nodes)
         # Render base only (map under the oldest keyframes, often None).
         # _session_baseline stays the loaded image: health and trust score
@@ -1119,14 +1134,48 @@ class BuiltinSlamEngine:
     # many may be left to draw under it (a few milliseconds each).
     _LATE_SCAN_ROUNDS = 4
     _LATE_SCANS_UNDER_LOCK = 4
+    # A rebuild keeps its render as it stood this many keyframes before the
+    # newest, and the next rebuild starts from there when no earlier keyframe
+    # moved. On a robot's mapping session the loop anchors were 15 to 85
+    # keyframes back; a longer loop draws every keyframe as before.
+    _RENDER_CHECKPOINT_LAG = 128
+
+    @classmethod
+    def _clears_before(cls, edits: list, seq: int) -> tuple:
+        """The box clears a render has applied once scans up to ``seq`` are drawn."""
+        return tuple(e for e in edits if cls._seq_scoped(e) and int(e[5]) < seq)
+
+    def _render_checkpoint_locked(self) -> Optional[pg.RenderCheckpoint]:
+        """The last rebuild's checkpoint, unless a clear it applied has changed."""
+        ckpt = self._render_ckpt
+        if ckpt is None:
+            return None
+        if self._clears_before(self._grid_edits, ckpt.last_seq) != (
+            self._render_ckpt_clears
+        ):
+            self._render_ckpt = None
+            return None
+        return ckpt
+
+    # An optimize request waits this long for a job already working on the
+    # graph (a map repair runs for minutes), then gives up for now.
+    _OPTIMIZE_WAIT_S = 10.0
 
     def optimize_pose_graph(self) -> dict:
         """Optimize the whole mapping pose graph and re-render the grid."""
-        with self._lock:
-            if self._mode != MODE_MAPPING or len(self._graph) < 2:
-                return {"status": "skipped", "nodes": len(self._graph)}
-        with self._graph_job:
+        if not self._graph_job.acquire(timeout=self._OPTIMIZE_WAIT_S):
+            return {"status": "busy"}
+        try:
+            # Checked once the graph is ours, not before the wait for it.
+            # Checked first, a request that queued behind a repair outlived a
+            # switch to localizing, rendered the emptied graph and replaced
+            # the loaded map with a blank grid, which was then saved.
+            with self._lock:
+                if self._mode != MODE_MAPPING or len(self._graph) < 2:
+                    return {"status": "skipped", "nodes": len(self._graph)}
             return self._optimize_and_render(1)
+        finally:
+            self._graph_job.release()
 
     def _optimize_and_render(
         self,
@@ -1136,6 +1185,18 @@ class BuiltinSlamEngine:
         live_correction: Optional[conv.Pose2D] = None,
     ) -> dict:
         """Optimize (unless ``first_free`` is None), re-render, swap. Holds ``_graph_job``."""
+        with self._doing("map rebuild"):
+            return self._rebuild(
+                first_free, new_edges=new_edges, live_correction=live_correction
+            )
+
+    def _rebuild(
+        self,
+        first_free: Optional[int],
+        *,
+        new_edges: Optional[list] = None,
+        live_correction: Optional[conv.Pose2D] = None,
+    ) -> dict:
         with self._lock:
             snap = self._graph.snapshot()
             base = self._graph_base
@@ -1144,6 +1205,11 @@ class BuiltinSlamEngine:
         n = len(snap)
         poses = snap.poses
         info: dict = {"nodes": n, "edges": len(snap.edges)}
+        if n == 0:
+            # Nothing to draw. Rendering no keyframes gives a blank grid, and
+            # swapping that in would erase whatever map is loaded.
+            info["status"] = "skipped"
+            return info
         if first_free is not None and n > 1:
             window = max(1, int(self._cfg.builtin_loop_max_window_nodes))
             ff = max(1, int(first_free), n - window)
@@ -1178,8 +1244,14 @@ class BuiltinSlamEngine:
             drawn_seq = self._graph.last_seq
             rendered_edits = len(self._grid_edits)
             clears = self._render_clears(self._grid_edits)
+            edits_then = list(self._grid_edits)
+            resume = self._render_checkpoint_locked()
+        if resume is not None and not resume.fits(snap, poses, base, res):
+            # A keyframe it covers moved (a long loop), or the map changed.
+            resume = None
         started = perf_counter()
         bands: dict = {}
+        kept: list = []
         grid = pg.render_grid(
             snap,
             resolution=res,
@@ -1188,7 +1260,12 @@ class BuiltinSlamEngine:
             extra=extra,
             clears=clears,
             bands_out=bands,
+            resume=resume,
+            keep_at=max(0, n - self._RENDER_CHECKPOINT_LAG),
+            kept=kept,
+            progress=self._yield_cpu,
         )
+        info["drawn_nodes"] = n - (resume.nodes if resume is not None else 0)
         # Scans keep being stored while that draws (five seconds and more at
         # 500 keyframes). Draw those too before taking the pose lock, until
         # only a handful are left. Rendering everything again under the lock
@@ -1218,6 +1295,11 @@ class BuiltinSlamEngine:
             late = self._graph.scans_since(snap, poses, drawn_seq)
             tail = self._graph.apply_poses(snap, poses)
             grid = pg.paint_more(grid, bands, late)
+            if kept:
+                self._render_ckpt = kept[0]
+                self._render_ckpt_clears = self._clears_before(
+                    edits_then, kept[0].last_seq
+                )
             self._replay_after_render_locked(grid, rendered_edits)
             for band_grid in bands.values():
                 self._replay_after_render_locked(band_grid, rendered_edits)
@@ -1259,8 +1341,10 @@ class BuiltinSlamEngine:
             if not self._running:
                 break
             try:
-                self.refresh_map_health()
-                self.run_loop_closure()
+                with self._doing("map health check"):
+                    self.refresh_map_health()
+                with self._doing("loop closure search"):
+                    self.run_loop_closure()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"builtin SLAM loop closure failed: {exc}")
             try:
@@ -2004,7 +2088,8 @@ class BuiltinSlamEngine:
                 f"{result.get('status')} node={cur} anchor={match.anchor} "
                 f"gap={match.gap_m:.1f} m shift={shift_m:.2f} m {shift_deg:.1f} deg "
                 f"score={match.fit:.2f} (prior {match.prior_fit:.2f}) "
-                f"opt={result.get('optimize_ms')} ms render={result.get('render_ms')} ms"
+                f"opt={result.get('optimize_ms')} ms render={result.get('render_ms')} ms "
+                f"({result.get('drawn_nodes')} of {result.get('nodes')} keyframes drawn)"
             )
             return {**stats["last"], **result}
         finally:
@@ -2012,8 +2097,18 @@ class BuiltinSlamEngine:
 
     def save_map(self, map_dir: Path, *, repair: bool = True) -> dict:
         """Write map.pgm/yaml (+ keyframes.npz) and, when mapping, check repair."""
+        with self._doing("map save"):
+            return self._save_map(map_dir, repair=repair)
+
+    def _save_map(self, map_dir: Path, *, repair: bool = True) -> dict:
         map_dir = Path(map_dir)
         keep_keyframes = bool(getattr(self._cfg, "builtin_save_keyframes", True))
+        if self._would_blank_saved_map(map_dir):
+            self._log(
+                f"save refused: the live map is blank and {map_dir.name} on disk "
+                "is not; keeping the saved map"
+            )
+            return {"status": "refused_empty", "keyframes": "kept"}
         with self._lock:
             old_sha = graph_store.file_sha1(map_dir / "map.pgm")
             sha = persistence.save_occupancy(map_dir, self._grid)
@@ -2056,6 +2151,25 @@ class BuiltinSlamEngine:
         ):
             out["repair"] = self.start_repair(map_dir, apply="auto", reason="save")
         return out
+
+    def _would_blank_saved_map(self, map_dir: Path) -> bool:
+        """True when saving now would write a blank grid over a map that has one.
+
+        No mapping run ends with nothing observed, and ``clear_map`` deletes
+        the saved files instead of saving over them, so this only happens
+        when something has gone wrong with the live grid.
+        """
+        with self._lock:
+            grid = self._grid
+        if np.any(np.abs(grid.log_odds) > 1e-6):
+            return False
+        if not (Path(map_dir) / "map.pgm").is_file():
+            return False
+        try:
+            saved = persistence.load_log_odds(map_dir)
+        except Exception:  # noqa: BLE001
+            return False
+        return saved is not None and bool(np.any(np.abs(saved.log_odds) > 1e-6))
 
     def _graph_payload_locked(self) -> dict:
         snap = self._graph.snapshot()
@@ -2170,20 +2284,52 @@ class BuiltinSlamEngine:
                 f"waiting up to {wait_s:.0f} s for map repair to finish "
                 f"before reloading {target.name}"
             )
-            thread.join(wait_s)
+            deadline = time.monotonic() + wait_s
+            while thread.is_alive():
+                now = time.monotonic()
+                left = deadline - now
+                if left <= 0.0:
+                    self._log("map repair still running; cancelling it for the switch")
+                    break
+                # A repair that cannot finish in the time left is not worth
+                # the wait: every switch soon after a save used to stand for
+                # the full two minutes and then cancel it anyway.
+                eta = self._repair_eta_s(now)
+                if eta is not None and eta > left:
+                    self._log(
+                        f"map repair needs about {eta:.0f} s more; "
+                        "cancelling it for the switch"
+                    )
+                    break
+                thread.join(min(0.25, left))
             if not thread.is_alive():
                 # The repair moved the live pose with the map; reload from it.
                 self._persist_pose(force=True)
                 return
-            self._log("map repair still running; cancelling it for the switch")
         self._repair_cancel.set()
+
+    # Keyframes a repair must have examined before its pace says anything.
+    _REPAIR_ETA_MIN_DONE = 10
+
+    def _repair_eta_s(self, now: float) -> Optional[float]:
+        """Seconds the running repair still needs to examine the graph, if known."""
+        progress = self._repair_progress
+        if progress is None:
+            return None
+        done, total, started = progress
+        if done < self._REPAIR_ETA_MIN_DONE:
+            return None
+        return (now - started) / done * max(0, total - done)
 
     def _repair_job(self, map_dir: Optional[Path], apply, reason: str) -> None:
         try:
-            result = self.run_repair(apply=apply, map_dir=map_dir, reason=reason)
+            with self._doing(f"map repair ({reason})"):
+                result = self.run_repair(apply=apply, map_dir=map_dir, reason=reason)
         except Exception as exc:  # noqa: BLE001
             result = {"status": "failed", "error": str(exc)}
             self._log(f"map repair ({reason}) failed: {exc}")
+        finally:
+            self._repair_progress = None
         result.update(state="done", reason=reason, finished_at=time.time())
         self._repair_status = result
 
@@ -2228,13 +2374,22 @@ class BuiltinSlamEngine:
                 res = float(self._grid.resolution)
                 revision = self._graph_revision
                 edits = list(self._grid_edits)
+            began = time.monotonic()
+
+            def step(done: int, total: int) -> None:
+                self._repair_progress = (int(done), int(total), began)
+                self._yield_cpu()
+
             plan = repair.plan_repair(
                 snap,
                 resolution=res,
                 params=params,
                 base=base if trusted else None,
                 should_stop=self._repair_cancel.is_set,
+                progress=step,
             )
+            # What is left (two renders and the swap) is seconds, not minutes.
+            self._repair_progress = None
             out: dict = {"status": "no_corrections", **plan.summary()}
             if not plan.clusters:
                 self._log(
@@ -2311,6 +2466,7 @@ class BuiltinSlamEngine:
             poses=poses,
             base=base,
             clears=self._render_clears(edits),
+            progress=self._yield_cpu,
         )
         for edit in edits:
             if not self._seq_scoped(edit):
@@ -2658,9 +2814,50 @@ class BuiltinSlamEngine:
             }
 
     # -- loop ----------------------------------------------------------------
+    # The update loop runs ten times a second. This long between two of its
+    # turns means odometry went unread and the pose stood still while the
+    # robot moved; say so, and what the module was busy with.
+    _STALL_LOG_S = 1.0
+    _STALL_LOG_EVERY_S = 5.0
+
+    @contextlib.contextmanager
+    def _doing(self, what: str):
+        """Mark a long job so a stalled update loop can name it."""
+        self._busy[what] = time.monotonic()
+        try:
+            yield
+        finally:
+            self._busy.pop(what, None)
+
+    @staticmethod
+    def _yield_cpu(*_progress) -> None:
+        """Let the update loop, navigation and the sensors run.
+
+        A long job in one thread of this process holds the others to a few
+        milliseconds in every five or worse, for as long as it runs. Called
+        between keyframes by the jobs that take seconds.
+        """
+        time.sleep(0.001)
+
+    def _note_stall(self, gap_s: float, now: float) -> None:
+        if now - self._stall_logged_at < self._STALL_LOG_EVERY_S:
+            return
+        self._stall_logged_at = now
+        busy = ", ".join(
+            f"{what} for {now - since:.0f} s" for what, since in self._busy.items()
+        )
+        self._log(
+            f"builtin SLAM: update loop stalled {gap_s:.1f} s "
+            f"(busy with: {busy or 'nothing it tracks'})"
+        )
+
     def _loop(self) -> None:
+        last = None
         while self._running:
             t0 = time.monotonic()
+            if last is not None and t0 - last > self._STALL_LOG_S:
+                self._note_stall(t0 - last, t0)
+            last = t0
             try:
                 self._tick()
             except Exception as exc:  # noqa: BLE001
@@ -3183,6 +3380,8 @@ class BuiltinSlamEngine:
                 self._paint_miss_since = float(now)
                 self._paint_miss_travel_m = 0.0
                 self._recover_verdict = None
+                self._recover_period_s = self._RECOVER_MIN_PERIOD_S
+                self._recover_travel_m = 0.0
         elif state in ("painting", "extend_only"):
             self._paint_miss_since = None
             self._paint_miss_travel_m = 0.0
@@ -3195,8 +3394,13 @@ class BuiltinSlamEngine:
     # it. This long with no scan painted is past what the tick recovers from
     # on its own; a doorway or a moved chair clears in a second or two.
     _RECOVER_AFTER_S = 3.0
-    # One search is a quarter of a second of matching.
+    # One search is a second or two of matching on a robot's computer. A
+    # robot that has not moved gets the same answer again, so each search
+    # that places nothing doubles the wait for the next, up to the longest;
+    # a meter driven since the last one is a new view and brings it forward.
     _RECOVER_MIN_PERIOD_S = 2.0
+    _RECOVER_MAX_PERIOD_S = 16.0
+    _RECOVER_NEW_VIEW_M = 1.0
 
     def paint_hold(self) -> dict:
         """How long scans have gone unpainted for not fitting the map.
@@ -3240,7 +3444,14 @@ class BuiltinSlamEngine:
             since = self._paint_miss_since
             if since is None or now - since < self._RECOVER_AFTER_S:
                 return None
-            if now - self._recover_last_at < self._RECOVER_MIN_PERIOD_S:
+            waited = now - self._recover_last_at
+            new_view = (
+                self._paint_miss_travel_m - self._recover_travel_m
+                >= self._RECOVER_NEW_VIEW_M
+            )
+            if waited < self._RECOVER_MIN_PERIOD_S or (
+                waited < self._recover_period_s and not new_view
+            ):
                 return None
             # A scan taken in a turn is smeared; the paint check waits too.
             if self._last_yaw_rate > _SPIN_HOLD_YAW_RATE:
@@ -3249,6 +3460,7 @@ class BuiltinSlamEngine:
             if scan is None:
                 return None
             self._recover_last_at = now
+            self._recover_travel_m = self._paint_miss_travel_m
             epoch = self._pose_epoch
             capture_motion = self._scan_capture_motion()
             scan_pose = self._pose
@@ -3267,7 +3479,8 @@ class BuiltinSlamEngine:
             return None
         from . import position_recover
 
-        found = position_recover.find_position(occ_map, scan, bands, scan_pose)
+        with self._doing("position search"):
+            found = position_recover.find_position(occ_map, scan, bands, scan_pose)
         outcome = found.as_dict()
         outcome.update(held_s=round(held_s, 1), travel_m=round(travel_m, 2))
         new_pose = None
@@ -3285,6 +3498,11 @@ class BuiltinSlamEngine:
             self._recover_stats["last"] = {"at": time.time(), **outcome}
             if self._paint_miss_since is not None:
                 self._recover_verdict = str(outcome["reason"])
+            self._recover_period_s = (
+                self._RECOVER_MIN_PERIOD_S
+                if new_pose is not None
+                else min(2.0 * self._recover_period_s, self._RECOVER_MAX_PERIOD_S)
+            )
         if new_pose is None:
             return outcome
         self._notify_pose_listeners(new_pose)

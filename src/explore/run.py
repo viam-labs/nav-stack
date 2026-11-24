@@ -61,6 +61,11 @@ PROGRESS_MIN_M = 0.3
 # (lets the map catch up with the last scans).
 EMPTY_SCANS_TO_FINISH = 3
 FAILURES_BEFORE_FINISH = 10
+# Ticks in a row in which a call to navigation or SLAM failed before the run
+# ends on that error.
+CALL_ERRORS_BEFORE_FINISH = 5
+# The drive home starts within this long of the run ending, or not at all.
+FINISH_HOME_WITHIN_S = 60.0
 LOST_POSE_POLL_S = 5.0
 LOST_POSE_MAX_S = 60.0
 # Ticks in a row with the robot nowhere near traversable mapped space before
@@ -143,6 +148,7 @@ class _State:
     lost_at: List[Tuple[float, float]] = field(default_factory=list)
     ticks: int = 0
     off_map_ticks: int = 0
+    empty_scans: int = 0
 
 
 class ExploreRun:
@@ -302,70 +308,94 @@ class ExploreRun:
     # -- exploring -------------------------------------------------------------
     async def _explore(self) -> None:
         await self._set_phase("exploring")
-        empty_scans = 0
+        errors = 0
         while True:
-            self._check_budget()
-            nav = await self._nav.status()
-            if not nav.localized or nav.pose is None:
-                await self._drop_goal(cancel=True)
-                await self._require_pose()
-                continue
-            pose = nav.pose
-            hold = await self._slam.paint_hold()
-            if hold.held_s <= 0.0:
-                self._remember_painted(pose)
-            elif hold.held_s >= LOST_PAUSE_S:
-                await self._get_back_on_the_map(pose, hold)
-                continue
-            self._s.ticks += 1
-            if self._s.ticks % SLAM_STATUS_EVERY == 1:
-                self._s.keyframes_used = (await self._slam.status()).keyframes
-            grid = await self._slam.occupancy()
-            if grid is None:
-                await self._sleep(TICK_S)
-                continue
-            self._s.coverage_cells = grid.known_free_count()
-            t0 = time.perf_counter()
-            scan = await asyncio.to_thread(
-                scan_frontiers,
-                grid,
-                pose.x,
-                pose.y,
-                self._p.robot_radius_m,
-                min_frontier_m=self._p.min_frontier_m,
-            )
-            self._s.decision_ms = (time.perf_counter() - t0) * 1000.0
-            if not scan.start_found:
-                # Not "nothing left": keep the current goal and let nav move.
-                self._s.off_map_ticks += 1
-                if self._s.off_map_ticks >= OFF_MAP_TICKS_MAX:
-                    self._s.last_error = "robot is not in traversable mapped space"
-                    raise _Finish()
-                await self._sleep(TICK_S)
-                continue
-            self._s.off_map_ticks = 0
-            now = self._clock()
-            ranked = sorted(
-                scan.frontiers, key=lambda f: cost(f, pose.x, pose.y, pose.theta)
-            )
-            self._track(ranked)
-            nxt = await self._decide(nav, pose, scan, ranked, now)
-            open_count = len(self._open(ranked, now))
-            self._s.frontier_count = open_count
-            self._s.unreachable_frontiers = len(ranked) - open_count
-            if nxt is not None:
-                await self._send(nxt, pose, now, scan)
-            if self._s.goal is None and not self._open(ranked, now):
-                empty_scans += 1
-                if empty_scans >= EMPTY_SCANS_TO_FINISH:
-                    LOGGER.info(
-                        "explore: no reachable frontiers left (%d skipped after failures)",
-                        self._s.unreachable_frontiers,
-                    )
-                    return
-            else:
-                empty_scans = 0
+            try:
+                done = await self._explore_tick()
+                errors = 0
+            except _Finish:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # One call to navigation or SLAM that fails is not the end of
+                # a mapping run: on one robot a single "context canceled",
+                # while the module was busy for a few seconds, ended a run
+                # that was going well.
+                errors += 1
+                if errors >= CALL_ERRORS_BEFORE_FINISH:
+                    raise
+                LOGGER.warning(
+                    "explore: %s: %s (%d in a row); trying again",
+                    type(exc).__name__,
+                    exc,
+                    errors,
+                )
+                done = False
+            if done:
+                return
             await self._sleep(TICK_S)
+
+    async def _explore_tick(self) -> bool:
+        """One look at the map and one decision. True when nothing is left to map."""
+        self._check_budget()
+        nav = await self._nav.status()
+        if not nav.localized or nav.pose is None:
+            await self._drop_goal(cancel=True)
+            await self._require_pose()
+            return False
+        pose = nav.pose
+        hold = await self._slam.paint_hold()
+        if hold.held_s <= 0.0:
+            self._remember_painted(pose)
+        elif hold.held_s >= LOST_PAUSE_S:
+            await self._get_back_on_the_map(pose, hold)
+            return False
+        self._s.ticks += 1
+        if self._s.ticks % SLAM_STATUS_EVERY == 1:
+            self._s.keyframes_used = (await self._slam.status()).keyframes
+        grid = await self._slam.occupancy()
+        if grid is None:
+            return False
+        self._s.coverage_cells = grid.known_free_count()
+        t0 = time.perf_counter()
+        scan = await asyncio.to_thread(
+            scan_frontiers,
+            grid,
+            pose.x,
+            pose.y,
+            self._p.robot_radius_m,
+            min_frontier_m=self._p.min_frontier_m,
+        )
+        self._s.decision_ms = (time.perf_counter() - t0) * 1000.0
+        if not scan.start_found:
+            # Not "nothing left": keep the current goal and let nav move.
+            self._s.off_map_ticks += 1
+            if self._s.off_map_ticks >= OFF_MAP_TICKS_MAX:
+                self._s.last_error = "robot is not in traversable mapped space"
+                raise _Finish()
+            return False
+        self._s.off_map_ticks = 0
+        now = self._clock()
+        ranked = sorted(
+            scan.frontiers, key=lambda f: cost(f, pose.x, pose.y, pose.theta)
+        )
+        self._track(ranked)
+        nxt = await self._decide(nav, pose, scan, ranked, now)
+        open_count = len(self._open(ranked, now))
+        self._s.frontier_count = open_count
+        self._s.unreachable_frontiers = len(ranked) - open_count
+        if nxt is not None:
+            await self._send(nxt, pose, now, scan)
+        if self._s.goal is None and not self._open(ranked, now):
+            self._s.empty_scans += 1
+            if self._s.empty_scans >= EMPTY_SCANS_TO_FINISH:
+                LOGGER.info(
+                    "explore: no reachable frontiers left (%d skipped after failures)",
+                    self._s.unreachable_frontiers,
+                )
+                return True
+        else:
+            self._s.empty_scans = 0
+        return False
 
     # -- lost while mapping -----------------------------------------------------
     def _remember_painted(self, pose: Pose) -> None:
@@ -751,15 +781,34 @@ class ExploreRun:
         await self._set_phase("finishing")
         self._s.goal = None
         errors: List[str] = []
-        for name, step in (
-            ("cancel", self._nav.cancel),
-            ("optimize", self._slam.optimize),
-            ("save_map", self._slam.save_map),
-        ):
+        began = self._clock()
+        steps = [("cancel", self._nav.cancel)]
+        # The map is explore's to optimize and save only while SLAM is still
+        # mapping it. On one robot this step ran seven minutes late, after a
+        # person had saved the map and switched SLAM to localizing.
+        try:
+            still_mapping = (await self._slam.status()).mode == "mapping"
+        except Exception:  # noqa: BLE001
+            still_mapping = True
+        if still_mapping:
+            steps += [
+                ("optimize", self._slam.optimize),
+                ("save_map", self._slam.save_map),
+            ]
+        else:
+            errors.append("SLAM is no longer mapping; map left as it is")
+            self._s.skip_home = True
+            self._s.skip_home_reason = "SLAM is no longer mapping"
+        for name, step in steps:
             try:
                 await step()
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{name} failed: {exc}")
+        if not self._s.skip_home and self._clock() - began > FINISH_HOME_WITHIN_S:
+            # A robot that sets off by itself minutes after its run ended is
+            # a surprise to whoever has walked up to it since.
+            self._s.skip_home = True
+            self._s.skip_home_reason = "finishing took too long"
         home = self._s.home
         went_home = False
         reason = "no home pose"

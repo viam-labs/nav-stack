@@ -906,6 +906,8 @@ class SlamConfig:
     builtin_repair_max_s: float = 600.0
     # start_localizing / start_mapping on the map a repair is still working
     # on waits this long for it to land; past that the repair is cancelled.
+    # A repair whose own pace shows it cannot finish in this time is cancelled
+    # at once instead of after the wait.
     builtin_repair_switch_wait_s: float = 120.0
     # Allow mapping revisit / loop-closure corrections while the robot is
     # moving. Default on for continuous-scan backends (builtin); off when

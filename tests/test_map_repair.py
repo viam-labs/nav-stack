@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -486,3 +487,29 @@ def test_repair_apply_arg():
     assert _repair_apply_arg("dry_run") is False
     with pytest.raises(ValueError):
         _repair_apply_arg("maybe")
+
+
+def test_a_switch_does_not_wait_for_a_repair_that_cannot_finish_in_time(tmp_path):
+    """Live tracer2a: every switch soon after a save stood for two minutes.
+
+    The repair of that map takes 200 s and more, so the wait ran out and the
+    repair was cancelled anyway.
+    """
+    engine = _engine(tmp_path)
+    map_dir = tmp_path / "m"
+    engine.save_map(map_dir, repair=False)
+    job = threading.Thread(target=lambda: engine._repair_cancel.wait(20.0))  # noqa: SLF001
+    engine._repair_cancel.clear()  # noqa: SLF001
+    job.start()
+    engine._repair_thread = job  # noqa: SLF001
+    engine._repair_map_dir = map_dir  # noqa: SLF001
+    # 50 of 1,000 keyframes examined in a minute: about 19 minutes to go.
+    engine._repair_progress = (50, 1000, time.monotonic() - 60.0)  # noqa: SLF001
+
+    started = time.monotonic()
+    engine.configure_mode(MODE_LOCALIZING, map_dir)
+
+    assert time.monotonic() - started < 5.0
+    assert engine._repair_cancel.is_set()  # noqa: SLF001
+    job.join(timeout=5.0)
+    assert not job.is_alive()

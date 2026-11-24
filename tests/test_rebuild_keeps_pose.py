@@ -167,3 +167,17 @@ def test_late_scans_at_two_heights_land_in_their_own_height_band(tmp_path, monke
     assert np.array_equal(grid.log_odds, fresh.log_odds)
     for band, band_grid in bands.items():
         assert np.array_equal(band_grid.log_odds, fresh_bands[band].log_odds)
+
+
+def test_a_stalled_update_loop_says_what_the_module_was_busy_with(tmp_path):
+    engine = _engine(tmp_path)
+    said = []
+    engine._log = said.append  # noqa: SLF001
+    now = 1000.0
+    with engine._doing("map rebuild"):  # noqa: SLF001
+        engine._note_stall(3.2, now)  # noqa: SLF001
+        engine._note_stall(2.0, now + 1.0)  # noqa: SLF001  (too soon to say it again)
+    engine._note_stall(1.5, now + 10.0)  # noqa: SLF001
+    assert len(said) == 2
+    assert "stalled 3.2 s" in said[0] and "map rebuild" in said[0]
+    assert "nothing it tracks" in said[1]

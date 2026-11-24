@@ -426,11 +426,23 @@ def _paint_rays(
                 return
         np.add.at(lo, (rows, cols), np.float32(delta))
 
+    def _clamp() -> None:
+        # Only cells between the sensor and its endpoints can have changed.
+        # Clamping the whole grid after every scan was more than half the
+        # cost of a map rebuild: three million cells, three thousand times.
+        r0 = max(0, min(int(row0), int(rows1.min())))
+        r1 = min(h - 1, max(int(row0), int(rows1.max())))
+        c0 = max(0, min(int(col0), int(cols1.min())))
+        c1 = min(w - 1, max(int(col0), int(cols1.max())))
+        if r0 <= r1 and c0 <= c1:
+            box = lo[r0 : r1 + 1, c0 : c1 + 1]
+            np.clip(box, L_MIN, L_MAX, out=box)
+
     if max_steps <= 0:
         inside = (rows1 >= 0) & (rows1 < h) & (cols1 >= 0) & (cols1 < w)
         if np.any(inside):
             _add(rows1[inside], cols1[inside], L_OCC)
-            np.clip(lo, L_MIN, L_MAX, out=lo)
+            _clamp()
         return
 
     t = np.arange(max_steps + 1, dtype=np.float64)
@@ -451,4 +463,4 @@ def _paint_rays(
     hit = (rows1 >= 0) & (rows1 < h) & (cols1 >= 0) & (cols1 < w)
     if np.any(hit):
         _add(rows1[hit], cols1[hit], L_OCC)
-    np.clip(lo, L_MIN, L_MAX, out=lo)
+    _clamp()

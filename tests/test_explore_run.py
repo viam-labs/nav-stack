@@ -578,3 +578,79 @@ def test_the_trail_gives_a_pose_that_far_back_or_its_start():
     assert len(run._s.trail) == 8  # noqa: SLF001
     assert run._trail_point(2.0).x == 1.5  # noqa: SLF001
     assert run._trail_point(50.0).x == 0.0  # noqa: SLF001
+
+
+# --- One failed call, and a finish that comes late -------------------------------
+
+
+def test_one_failed_call_to_navigation_does_not_end_the_run():
+    """Live tracer2a: a single "context canceled" ended a run that was going well."""
+    w, clk, slam, nav, run, _ = setup()
+    orig = nav.status
+    failed = []
+
+    async def status():
+        if 5.0 <= clk.now() and len(failed) < 3:
+            failed.append(clk.now())
+            raise RuntimeError("context canceled")
+        return await orig()
+
+    nav.status = status
+    final = asyncio.run(run.run())
+    assert len(failed) == 3
+    assert final["last_error"] == "" and known_fraction(slam, w) > 0.95
+
+
+def test_calls_that_keep_failing_end_the_run_on_that_error():
+    w, clk, slam, nav, run, _ = setup()
+    orig = nav.status
+    calls = []
+
+    async def status():
+        if clk.now() >= 5.0 and run.status()["phase"] == "exploring":
+            calls.append(clk.now())
+            raise RuntimeError("context canceled")
+        return await orig()
+
+    nav.status = status
+    final = asyncio.run(run.run())
+    assert len(calls) == run_mod.CALL_ERRORS_BEFORE_FINISH
+    assert final["last_error"].startswith("RuntimeError: context canceled")
+
+
+def test_finish_leaves_the_map_alone_once_slam_has_stopped_mapping():
+    """Live tracer2a: explore's finish ran seven minutes late and saved a blank map.
+
+    By then a person had saved the map and switched SLAM to localizing.
+    """
+    w, clk, slam, nav, run, stops = setup(duration_s=20.0)
+    orig = slam.status
+
+    async def status():
+        st = await orig()
+        if clk.now() >= 20.0:
+            st.mode = "localizing"
+        return st
+
+    slam.status = status
+    sent = _record_goals(nav, run)
+    final = asyncio.run(run.run())
+    assert slam.saved == 0 and slam.optimized == 0
+    assert "SLAM is no longer mapping" in final["last_error"]
+    # And it does not set off for home either.
+    assert not [goal for goal in sent if goal[0] == "finishing"] and stops
+
+
+def test_a_finish_that_took_minutes_does_not_then_drive_home():
+    w, clk, slam, nav, run, stops = setup(duration_s=20.0)
+
+    async def slow_save():
+        await clk.sleep(run_mod.FINISH_HOME_WITHIN_S + 30.0)
+        slam.saved += 1
+
+    slam.save_map = slow_save
+    sent = _record_goals(nav, run)
+    final = asyncio.run(run.run())
+    assert slam.saved == 1
+    assert "return home failed: finishing took too long" in final["last_error"]
+    assert not [goal for goal in sent if goal[0] == "finishing"] and stops
