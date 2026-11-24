@@ -6,8 +6,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol, Tuple
 
-from ..models.nav_api import _localized
-from ..runtime import get_slam
+from ..models.nav_api import _localized, not_localized_reason
+from ..runtime import get_slam, get_slam_service
 from .grid import OccGrid
 
 
@@ -27,6 +27,8 @@ class NavStatus:
     max_angular_rad_s: Optional[float]
     robot_radius_m: Optional[float]
     error: str
+    # Why ``localized`` is false, when navigation knows; else empty.
+    not_localized_reason: str = ""
 
 
 @dataclass
@@ -34,6 +36,31 @@ class SlamStatus:
     mode: str
     running: bool
     keyframes: int
+
+
+@dataclass
+class PaintHold:
+    """SLAM's report that scans have stopped fitting the map.
+
+    ``held_s`` is 0 while scans are being painted. ``verdict`` is what SLAM's
+    own position search last concluded during this hold (empty before the
+    first search). It is reported, not acted on: only painting again counts
+    as being back on the map.
+    """
+
+    held_s: float = 0.0
+    travel_m: float = 0.0
+    verdict: str = ""
+
+
+@dataclass
+class PendingJump:
+    """A place meters from the pose that SLAM found once and is checking again."""
+
+    shift_m: float = 0.0
+    shift_deg: float = 0.0
+    confirm_count: int = 0
+    confirm_needed: int = 0
 
 
 class NavClient(Protocol):
@@ -50,6 +77,10 @@ class SlamClient(Protocol):
     async def occupancy(self) -> Optional[OccGrid]: ...
 
     async def status(self) -> SlamStatus: ...
+
+    async def paint_hold(self) -> PaintHold: ...
+
+    async def pending_jump(self) -> Optional[PendingJump]: ...
 
     async def optimize(self) -> None: ...
 
@@ -77,14 +108,16 @@ class ViamNavClient:
     async def status(self) -> NavStatus:
         raw = await self._res.do_command({"command": "get_status"})
         limits = raw.get("limits") if isinstance(raw.get("limits"), Mapping) else {}
+        localized = localized_from_status(raw)
         return NavStatus(
             active=bool(raw.get("active", False)),
             state=str(raw.get("state", "")),
             pose=_pose_from(raw.get("pose")),
-            localized=localized_from_status(raw),
+            localized=localized,
             max_angular_rad_s=_optf(limits.get("max_angular_rad_s")),
             robot_radius_m=_optf(raw.get("robot_radius_m")),
             error=str(raw.get("error_msg") or raw.get("error") or ""),
+            not_localized_reason="" if localized else not_localized_reason(raw),
         )
 
     async def plan_to_point(self, x: float, y: float) -> Tuple[bool, float]:
@@ -128,6 +161,44 @@ class ViamSlamClient:
             mode=str(raw.get("mode", "")),
             running=bool(raw.get("running", False)),
             keyframes=int(raw.get("keyframes") or 0),
+        )
+
+    async def paint_hold(self) -> PaintHold:
+        """Whether scans have stopped fitting the map (builtin SLAM in this module).
+
+        Read in-process: it is asked every tick, and ``get_status`` is a large
+        reply. A SLAM service in another process reports no hold.
+        """
+        runtime = get_slam(self._name) if self._name else None
+        node = getattr(getattr(runtime, "manager", None), "node", None)
+        read = getattr(node, "paint_hold", None)
+        if not callable(read):
+            return PaintHold()
+        raw = read() or {}
+        return PaintHold(
+            held_s=float(raw.get("held_s") or 0.0),
+            travel_m=float(raw.get("travel_m") or 0.0),
+            verdict=str(raw.get("verdict") or ""),
+        )
+
+    async def pending_jump(self) -> Optional[PendingJump]:
+        """A jump of meters SLAM is yet to confirm (builtin SLAM in this module).
+
+        Read in-process, like the paint hold. A SLAM service in another
+        process reports none.
+        """
+        service = get_slam_service(self._name) if self._name else None
+        read = getattr(service, "pending_pose_jump", None)
+        if not callable(read):
+            return None
+        raw = read()
+        if not isinstance(raw, Mapping):
+            return None
+        return PendingJump(
+            shift_m=float(raw.get("shift_m") or 0.0),
+            shift_deg=float(raw.get("shift_deg") or 0.0),
+            confirm_count=int(raw.get("confirm_count") or 0),
+            confirm_needed=int(raw.get("confirm_needed") or 0),
         )
 
     async def optimize(self) -> None:

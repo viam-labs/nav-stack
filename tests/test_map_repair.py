@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -335,6 +336,67 @@ def test_repair_leaves_a_healthy_map_alone(tmp_path):
     assert _ghost_fraction(engine._grid, truth) < 0.03  # noqa: SLF001
 
 
+def _repair_held_while_planning(engine, monkeypatch):
+    """Start a repair whose planning waits for ``release``; returns once it plans."""
+    planning, release = threading.Event(), threading.Event()
+    real_plan = repair.plan_repair
+
+    def slow_plan(*args, **kwargs):
+        planning.set()
+        release.wait(30.0)
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(repair, "plan_repair", slow_plan)
+    result: dict = {}
+    job = threading.Thread(
+        target=lambda: result.update(engine.run_repair(apply="auto", reason="save"))
+    )
+    job.start()
+    assert planning.wait(10.0)
+    return job, release, result
+
+
+def test_loop_closure_keeps_running_while_a_repair_plans(tmp_path, monkeypatch):
+    """Live tracer2a: a repair started by a save planned for ten minutes.
+
+    It held the graph the whole time. Loop closure found it busy on every
+    try, 1,781 attempts before and 1,781 a minute later, while the robot
+    explored a loop of about 100 m and mapped a hallway a second time.
+    """
+    engine, _truth, _poses = _torn_loop(tmp_path, gyro_scale=1.04)
+    engine._cfg.builtin_loop_closure = True  # noqa: SLF001
+    job, release, _result = _repair_held_while_planning(engine, monkeypatch)
+    try:
+        attempts = engine._loop_stats["attempts"]  # noqa: SLF001
+        assert engine.run_loop_closure()["status"] != "busy"
+        assert engine._loop_stats["attempts"] == attempts + 1  # noqa: SLF001
+    finally:
+        release.set()
+        job.join(timeout=120.0)
+    assert not job.is_alive()
+
+
+def test_a_repair_planned_for_a_map_since_corrected_is_dropped(tmp_path, monkeypatch):
+    """The optimize before a save no longer waits behind a repair, and a
+    repair planned on the poses from before it is not applied over it."""
+    engine, _truth, _poses = _torn_loop(tmp_path, gyro_scale=1.04)
+    logged: list = []
+    engine._logger = logged.append  # noqa: SLF001
+    job, release, result = _repair_held_while_planning(engine, monkeypatch)
+    try:
+        started = time.monotonic()
+        assert engine.optimize_pose_graph()["status"] == "rebuilt"
+        assert time.monotonic() - started < engine._OPTIMIZE_WAIT_S  # noqa: SLF001
+        after_optimize = engine._graph.snapshot().poses.copy()  # noqa: SLF001
+    finally:
+        release.set()
+        job.join(timeout=120.0)
+    assert not job.is_alive()
+    assert result["status"] == "aborted" and result["stopped"] is True
+    assert np.array_equal(engine._graph.snapshot().poses, after_optimize)  # noqa: SLF001
+    assert any("the map was corrected while it ran" in line for line in logged)
+
+
 def test_save_map_starts_background_repair_only_while_mapping(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -486,3 +548,29 @@ def test_repair_apply_arg():
     assert _repair_apply_arg("dry_run") is False
     with pytest.raises(ValueError):
         _repair_apply_arg("maybe")
+
+
+def test_a_switch_does_not_wait_for_a_repair_that_cannot_finish_in_time(tmp_path):
+    """Live tracer2a: every switch soon after a save stood for two minutes.
+
+    The repair of that map takes 200 s and more, so the wait ran out and the
+    repair was cancelled anyway.
+    """
+    engine = _engine(tmp_path)
+    map_dir = tmp_path / "m"
+    engine.save_map(map_dir, repair=False)
+    job = threading.Thread(target=lambda: engine._repair_cancel.wait(20.0))  # noqa: SLF001
+    engine._repair_cancel.clear()  # noqa: SLF001
+    job.start()
+    engine._repair_thread = job  # noqa: SLF001
+    engine._repair_map_dir = map_dir  # noqa: SLF001
+    # 50 of 1,000 keyframes examined in a minute: about 19 minutes to go.
+    engine._repair_progress = (50, 1000, time.monotonic() - 60.0)  # noqa: SLF001
+
+    started = time.monotonic()
+    engine.configure_mode(MODE_LOCALIZING, map_dir)
+
+    assert time.monotonic() - started < 5.0
+    assert engine._repair_cancel.is_set()  # noqa: SLF001
+    job.join(timeout=5.0)
+    assert not job.is_alive()

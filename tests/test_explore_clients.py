@@ -43,7 +43,8 @@ def test_nav_status_untrusted_is_not_localized():
         "pose": {"x": 0, "y": 0, "theta": 0},
         "localization_check": {"status": "nav_hold"},
     }
-    assert not asyncio.run(ViamNavClient(Recorder(raw)).status()).localized
+    st = asyncio.run(ViamNavClient(Recorder(raw)).status())
+    assert not st.localized and st.not_localized_reason == "last check: nav_hold"
 
 
 def test_plan_to_point_returns_feasible_and_length():
@@ -89,3 +90,51 @@ def test_occupancy_reads_in_process_slam_map_without_docommand():
     finally:
         runtime.unregister_slam("explore-test-slam")
     assert g.cells.shape == (4, 5) and rec.calls == []
+
+
+def test_paint_hold_is_read_in_process_and_is_empty_for_slam_elsewhere():
+    class Node:
+        def paint_hold(self):
+            return {"held_s": 7.5, "travel_m": 3.2, "verdict": "ambiguous"}
+
+    class Manager:
+        node = Node()
+
+    rec = Recorder({})
+    runtime.register_slam(
+        "explore-test-slam", runtime.SlamRuntime(Manager(), None, None)
+    )
+    try:
+        hold = asyncio.run(ViamSlamClient(rec, "explore-test-slam").paint_hold())
+    finally:
+        runtime.unregister_slam("explore-test-slam")
+    assert (hold.held_s, hold.travel_m, hold.verdict) == (7.5, 3.2, "ambiguous")
+    # SLAM in another process: no hold, and no status call on every tick.
+    none = asyncio.run(ViamSlamClient(rec, "slam-elsewhere").paint_hold())
+    assert none.held_s == 0.0 and rec.calls == []
+
+
+def test_pending_jump_is_read_in_process_and_is_none_for_slam_elsewhere():
+    class Service:
+        jump = {
+            "shift_m": 3.38,
+            "shift_deg": 2.7,
+            "confirm_count": 1,
+            "confirm_needed": 2,
+        }
+
+        def pending_pose_jump(self):
+            return self.jump
+
+    service = Service()
+    runtime.register_slam_service("slam-jump", service)
+    try:
+        res = Recorder({})
+        jump = asyncio.run(ViamSlamClient(res, "slam-jump").pending_jump())
+        assert (jump.shift_m, jump.confirm_count, jump.confirm_needed) == (3.38, 1, 2)
+        service.jump = None
+        assert asyncio.run(ViamSlamClient(res, "slam-jump").pending_jump()) is None
+        assert res.calls == []
+    finally:
+        runtime.unregister_slam_service("slam-jump")
+    assert asyncio.run(ViamSlamClient(Recorder({}), "elsewhere").pending_jump()) is None

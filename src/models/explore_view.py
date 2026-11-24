@@ -39,7 +39,11 @@ _HUD_FG = (235, 235, 235, 255)
 _HUD_MUTED = (170, 170, 170, 255)
 _PHASE_COLORS = {
     "idle": (170, 170, 170, 255),
+    # Navigation has no pose it trusts yet; nothing moves until it does.
+    "waiting_for_pose": (235, 200, 80, 255),
     "exploring": (120, 220, 120, 255),
+    # Scans stopped fitting the map; getting the robot back onto it.
+    "relocating": (235, 90, 90, 255),
     "finishing": (230, 140, 60, 255),
     "done": (200, 200, 200, 255),
 }

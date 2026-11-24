@@ -151,14 +151,14 @@ circular `robot_radius` model and SLAM crops a `robot_radius` disc. `0` and
 | `mapping_revisit_interval_s` / `_search_radius_m` / `_wide_radius_m` | SLAM | Check interval (default `20` s) and tiered search radii: local first (default `5` m), wider on weak match (default `12` m) |
 | `mapping_revisit_min_score` / `_max_ray_mae_m` / `_full_map_min_score` | SLAM | Match quality gates (defaults `0.6` / `0.8` m). The full-map fallback is off (`mapping_revisit_full_map_fallback`); if enabled it needs the stricter `0.75` score since self-similar offices produce convincing wrong corridors |
 | `mapping_revisit_min_shift_m` / `_min_shift_deg` / `_max_shift_m` | SLAM | Correct only when the match moved at least `1.0` m / `10°` from the current pose and no more than `10` m (larger = likely false match) |
-| `builtin_loop_closure` | SLAM | Builtin automatic loop closure while mapping. Keyframes (every `builtin_loop_node_spacing_m` `0.5` m / `_deg` `20°`) form a pose graph; each new keyframe's last ~2 m of scans is matched against a submap rendered from **older keyframes only** (≥ `builtin_loop_min_travel_m` `6` m of path behind), so the drifted copy being painted now cannot confirm itself. Two consecutive agreeing matches add loop edges, the graph is optimized (error spread along the loop, not dumped on the last pose), and the grid is re-rendered from the corrected keyframes — removing doubled walls. Revisit-watchdog corrections and `optimize_pose_graph` use the same graph. Status: `slam_diagnostics.loop_closure`. Default `true` |
+| `builtin_loop_closure` | SLAM | Builtin automatic loop closure while mapping. Keyframes (every `builtin_loop_node_spacing_m` `0.5` m / `_deg` `20°`) form a pose graph; each new keyframe's last ~2 m of scans is matched against a submap rendered from **older keyframes only** (≥ `builtin_loop_min_travel_m` `6` m of path behind), so the drifted copy being painted now cannot confirm itself. Two consecutive agreeing matches add loop edges, the graph is optimized (error spread along the loop, not dumped on the last pose), and the grid is re-rendered from the corrected keyframes — removing doubled walls. The render runs off the pose lock; scans stored while it runs are drawn onto the result, and the robot's motion meanwhile stays in the pose. It starts from where the last render stood 128 keyframes before the newest when no earlier keyframe moved, so a typical rebuild draws a hundred-odd keyframes however large the map is (a loop that reaches farther back draws them all). Revisit-watchdog corrections and `optimize_pose_graph` use the same graph. Status: `slam_diagnostics.loop_closure`. Default `true` |
 | `builtin_loop_search_radius_m` / `_search_window_m` / `_search_window_deg` / `_min_score` | SLAM | Loop detection: correlative search ±`8` m / ±`45°` around the current estimate, accept fit ≥ `0.55`. A long loop can use that whole window; translation larger than ~10% of the distance driven since the old place is still refused. Matches at the window edge or ambiguous in both axes are rejected; along a featureless corridor only the sideways correction carries weight |
 | `builtin_loop_check_interval_s` / `_scans_per_node` / `_max_window_nodes` / `builtin_mapping_keyframe_max` | SLAM | Detection at most every `2` s; scans kept per keyframe for re-rendering (`2`); newest keyframes moved per optimization (`900`); keyframes per mapping session (`2000`, ~1 km — past that loop closure stops for the session but the map is kept) |
 | `builtin_save_keyframes` | SLAM | `save_map` also writes the keyframe pose graph (`keyframes.npz`: node poses, kept scans, edges, obstacle edits) tied to that `map.pgm` by hash. `start_mapping` on the map reloads them as graph nodes that live loop closure / revisit anchor to but do not move; `repair_map` can re-solve them. Ignored if `map.pgm` changed without it (older maps resume on the flat image as before). Default `true` |
 | `map_health_auto_heal` / `map_health_auto_clear` | SLAM | Mid-session heal while builtin mapping: track the top ghost hotspot, tighten revisit, and auto `clear_region` when a **mature** map stays `degrading` near the robot for `map_health_hotspot_persist_n` time-spaced samples (≥40 keyframes, within 6 m). Immature maps stay `cold` (no hotspots). Fresh maps snapshot an ok checkpoint and score only walls added since then (`scope=since_ok`) so re-driving known territory does not look like tearing. It clears only for doubled walls (≥35% of new wall cells), never for wall-angle scatter alone, which a floor with non-parallel walls has anyway. With lidars at more than one height each height is scored by itself and the scores are averaged (`map_health.rule` = `per_height`, one row per 25 cm slice in `heights`): fused, a wall at one height and a shelf 20–55 cm in front of it at another look like a wall drawn twice, and on a robot with lidars at 0.21 m and 1.2 m that alone wiped two 5 m squares of good map in one session. Defaults on for builtin mapping. Set `map_health_auto_clear: false` to track only. Status: `slam_diagnostics.hotspot_heal` |
 | `map_health_hotspot_persist_n` / `_match_m` / `map_health_auto_clear_pad_m` / `_cooldown_s` / `_min_keyframes` / `_near_m` | SLAM | Persist gate (`6`, ≥5 s apart), match radius (`3` m), clear AABB half-size (`2.5` m), cooldown (`90` s), min keyframes before clear (`40`), max distance from robot to hotspot (`6` m) |
 | `builtin_repair_on_save` / `builtin_repair_max_s` | SLAM | After `save_map` while mapping, run map repair in the background (`repair_status`) and apply it only when the map was torn (health `watch`/`degrading`), every correction was confirmed by ≥3 consecutive agreeing keyframes and fit the graph, ghost walls drop by ≥25%, and wall angles / health did not get worse. Applying backs up the previous files to `pre_repair/` (`undo_repair`) and re-saves. Time budget `600` s. Default `true` |
-| `builtin_repair_switch_wait_s` | SLAM | `start_localizing` / `start_mapping` on the map a repair is still working on waits up to this long (default `120` s) for it to finish, then loads the repaired files; past that the repair is cancelled. Switching to another map cancels it right away |
+| `builtin_repair_switch_wait_s` | SLAM | `start_localizing` / `start_mapping` on the map a repair is still working on waits up to this long (default `120` s) for it to finish, then loads the repaired files; past that the repair is cancelled, and it is cancelled at once when its own pace shows it cannot finish in that time (a repair of a large map takes minutes). Switching to another map cancels it right away |
 | `mapping_revisit_slice_verify` | SLAM | Multi-height-slice veto for revisit corrections (3D lidar only). The 2D map holds one z-band silhouette and desk clutter is self-similar in it; this records sparse per-band grids (knee + head height by default) from trusted pause scans and rejects a proposed correction whose pose disagrees with any band that has reference data there. Default `true` |
 | `mapping_revisit_slice_bands` / `_slice_min_hit_rate` / `_slice_resolution_m` | SLAM | Extra height bands as `[z_min, z_max]` pairs in meters (default `[[0.15, 0.45], [1.6, 2.4]]`), per-band hit-rate gate (default `0.4`), and grid cell size (default `0.15` m) |
 | `mapping_revisit_keyframes` | SLAM | Store a pause keyframe (2D endpoints + height slices + map pose) on every accepted `map_when_still` `/scan` publish, and match against those views when occupancy revisit scores are weak — helps when you stop at different places/angles than the first visit. Default `true` |
@@ -396,7 +396,7 @@ DoCommands:
 | --- | --- | --- |
 | `start` | optional `duration_s` | `{"started": true}` (plus `duration_s` when given) or `{"error": "..."}` |
 | `stop` | — | `{"stopping": true}`; the finish sequence runs as when exploring ends |
-| `status` | — | `{phase, elapsed_s, goals, waypoints, goals_failed, frontier_count, unreachable_frontiers, coverage_cells, keyframes_used, decision_ms, last_error}`, plus `duration_s` / `remaining_s` with a budget, `goal` and `waypoint` while driving to one and `home` once known |
+| `status` | — | `{phase, elapsed_s, goals, waypoints, goals_failed, frontier_count, unreachable_frontiers, coverage_cells, keyframes_used, decision_ms, last_error, relocations}`, plus `duration_s` / `remaining_s` with a budget, `goal` and `waypoint` while driving to one and `home` once known |
 
 How it picks where to go, once a second while the robot drives:
 
@@ -432,13 +432,46 @@ Ten failures in a row end the run. Two goals in a row that time out with the
 robot still in the same place end it at once with `last_error` "robot cannot
 move from (x, y)" and no drive home: it is boxed in and needs moving by hand.
 
+**When scans stop being painted** (builtin SLAM's `paint.held_s`, read every
+tick), nothing new is being mapped and the pose is running on wheel odometry.
+After 6 s of that explore gets the robot back onto the map by itself:
+
+1. It cancels the goal and stands still for 6 s (`phase` `relocating`). SLAM
+   searches for the robot every 2 s, and a stopped scan is the cleanest it gets.
+2. If scans are still not being painted, it drives back along its own trail to
+   where the map was last being painted: 2 m back, then 5, 10 and 20 m. It
+   stops the moment scans are painted again (two ticks in a row) and goes back
+   to exploring. Nothing else counts as being back on the map, including
+   SLAM's search reporting that nowhere nearby fits better.
+3. If the trail runs out first, the run ends where the robot stands with
+   `last_error` "lost near (x, y)" and no drive home, for a person to
+   relocalize it.
+
+The first time this happens somewhere the robot goes straight back for another
+try. If it happens again within 3 m of an earlier time, the frontier it was
+heading for fails like any other goal and is skipped for 10 minutes.
+
+`relocations` counts how often this happened in a run.
+
+**When SLAM has a jump to confirm.** The mapping revisit check moves the pose
+by meters only after two looks that agree. While it is between them (its
+status is `awaiting_confirm`), explore cancels its goal and stands still
+(`phase` `relocating`), and scans painted again do not count as being back on
+the map. SLAM paints nothing in that time (`paint` state
+`held_pose_in_doubt`) and takes its second look about 3 s after the first.
+Then explore carries on from wherever the pose is. A jump still undecided
+after 30 s is left to SLAM and not waited on again for a minute.
+
 Exploring ends when three scans in a row find no reachable frontier, when
 `duration_s` runs out, on `stop`, or on an unrecoverable error. **Finish**:
 cancel, `optimize`, `save_map`, navigate home (one retry), else stop in place.
 The map is saved before the drive home. A `stop` received while finishing skips
 the retry of the drive home. Any error from a SLAM or navigation call ends the
 run through the same finish sequence and is reported in `last_error`. A lost
-pose or an unhealthy SLAM is waited out for 60 s, then the run finishes.
+pose or an unhealthy SLAM is waited out for 60 s (`phase` `waiting_for_pose`,
+at the start of a run or during it), then the run finishes with `last_error`
+"no trusted pose for 60 s" and the reason navigation gave. A `stop` ends the
+wait within 5 s.
 Moving obstacles are left to the navigation service's local costmap.
 
 ### Builtin simulation (no hardware)
@@ -811,6 +844,8 @@ one-shot lidar/odom read; includes measured `scan_hz` / `lidar_read_hz` over
 the last ~2 s plus configured `scan_rate_hz` — with `map_when_still`, expect low
 `scan_hz` while driving; builtin `paint` reports
 `painting` / `extend_only` / `held_turning` / `held_unmatched` / `held_lidar_odom`
+/ `held_pose_in_doubt` (the revisit check has the scan fitting a place meters
+away and is yet to confirm it; for 30 s at most)
 plus match score and whether the resumed baseline is trusted — while untrusted,
 mapping only paints into unknown cells so a torn prior cannot thicken;
 `paint.fit` is the check behind `held_unmatched`: its `score` against its
@@ -825,7 +860,22 @@ with that height's score (`paint.fit.polish`: `moved`, `kept`,
 `better_fit_farther_away` when the pose matcher has to move it first,
 `no_pose_nearby_passes`; `pose_polishes` counts the moves). `match` says
 which scan the last pose match used: the merged scan, or one height when the
-map explains it clearly better),
+map explains it clearly better. `paint.held_s` and `paint.travel_m` are the
+seconds and meters since a scan last fit the map, 0 while mapping normally.
+After 3 s of that the pose is off by more than the tick recovers from (any
+heading, or about half a meter), and SLAM searches up to 6 m around it for
+where the robot is, each lidar height by itself, every 2 s until a scan is
+painted. It moves the live pose only when the search found no second place
+nearly as good and the deciding height sits on the walls there much better
+than where it was. Then either every other height fits better there too, or
+the deciding height passes the paint check there by itself and clearly beats
+anything any height scores at the old pose (another height may be seeing
+furniture the map does not have, as for painting). The map and
+the pose graph are not touched: nothing is painted while held, so they hold
+none of the error. `paint.verdict` is the last search's answer: `recovered`,
+`no_better_place` (the pose is as good as anywhere nearby, so the room or the
+map is what changed), or why a better place was not taken (`ambiguous`,
+`weak_fit`, `heights_disagree`); `paint.recover` counts attempts and moves),
 `set_initial_pose`,
 `global_localize` (lidar scan match against saved map; optional `full_map`,
 `search_radius_m`, `apply`, `local_yaw_window_deg`, `max_scan_points`,
