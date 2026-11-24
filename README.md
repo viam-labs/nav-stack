@@ -459,7 +459,10 @@ cancel, `optimize`, `save_map`, navigate home (one retry), else stop in place.
 The map is saved before the drive home. A `stop` received while finishing skips
 the retry of the drive home. Any error from a SLAM or navigation call ends the
 run through the same finish sequence and is reported in `last_error`. A lost
-pose or an unhealthy SLAM is waited out for 60 s, then the run finishes.
+pose or an unhealthy SLAM is waited out for 60 s (`phase` `waiting_for_pose`,
+at the start of a run or during it), then the run finishes with `last_error`
+"no trusted pose for 60 s" and the reason navigation gave. A `stop` ends the
+wait within 5 s.
 Moving obstacles are left to the navigation service's local costmap.
 
 ### Builtin simulation (no hardware)

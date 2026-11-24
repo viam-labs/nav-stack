@@ -925,6 +925,51 @@ def test_periodic_relocalize_cycle_corrects_on_drift():
     assert relocalize_cmd["pose"]["x"] == pytest.approx(1.0)
 
 
+def test_mode_switch_forgets_a_jump_left_awaiting_confirmation(tmp_path: Path):
+    """Localizing left a large jump at confirm 1/2; mapping never clears it.
+
+    On one robot navigation then reported no trusted pose for the whole
+    mapping session, and explore waited a minute and gave up.
+    """
+    from src.models.nav_api import _localized
+
+    slam = _relocalize_slam()
+    slam._global_localize = AsyncMock(
+        return_value={
+            "status": "matched",
+            "score": 0.68,
+            "ray_mae_m": 0.57,
+            "pose": {"x": 1.9, "y": 0.0, "theta": 0.0},
+        }
+    )
+    slam.do_command = AsyncMock(return_value={"status": "relocalizing"})
+    check = slam._last_relocalize_check
+    slam._last_revisit_check.update({"status": "awaiting_confirm"})
+    asyncio.run(slam._periodic_relocalize_cycle())
+    nav_status = {"active": False, "pose": {"x": 0.0, "y": 0.0, "theta": 0.0}}
+    assert check["status"] == "awaiting_confirm"
+    assert not _localized({**nav_status, "localization_check": dict(check)})
+
+    store = MapStore(str(tmp_path))
+    store.create_map("floor1")
+    store.set_active_map("floor1")
+    slam._map_store = store
+    slam._reset_slice_library = MagicMock()
+    slam._localizer = MagicMock()
+    del slam.do_command
+
+    async def switch():
+        return await slam.do_command({"command": "start_mapping"})
+
+    assert asyncio.run(switch())["status"] == "mapping"
+
+    # The same dicts, emptied: navigation holds a reference to them.
+    assert slam._last_relocalize_check is check and check["status"] == "idle"
+    assert slam._last_revisit_check == {"status": "idle"}
+    assert slam._pose_jump_gate.snapshot()["confirm_count"] == 0
+    assert _localized({**nav_status, "localization_check": dict(check)})
+
+
 def test_periodic_relocalize_cycle_applies_small_jump_immediately():
     slam = _relocalize_slam(
         periodic_relocalize_min_shift_m=0.2,

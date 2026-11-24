@@ -1093,6 +1093,7 @@ class NavServiceBase(NavigationApi, Navigation):
 
         def _status():
             status = mgr.nav_status()
+            driving = bool(status.get("active"))
             simple = dict(self._simple_nav_status)
             status["simple_nav"] = simple
             if simple.get("state") == "active":
@@ -1112,7 +1113,11 @@ class NavServiceBase(NavigationApi, Navigation):
             if isinstance(state, dict):
                 status["localization_state"] = dict(state)
             pose = status.get("pose")
-            if not isinstance(pose, dict) or "x" not in pose:
+            if not driving or not isinstance(pose, dict) or "x" not in pose:
+                # Between goals the status is the last goal's final one, and
+                # its pose is where that goal ended. On one robot SLAM was
+                # given a new pose after a goal and this still reported the
+                # old one, 4.1 m away and facing the other way.
                 live = self._live_map_pose_dict(mgr)
                 if live is not None:
                     status["pose"] = live

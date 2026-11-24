@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol, Tuple
 
-from ..models.nav_api import _localized
+from ..models.nav_api import _localized, not_localized_reason
 from ..runtime import get_slam
 from .grid import OccGrid
 
@@ -27,6 +27,8 @@ class NavStatus:
     max_angular_rad_s: Optional[float]
     robot_radius_m: Optional[float]
     error: str
+    # Why ``localized`` is false, when navigation knows; else empty.
+    not_localized_reason: str = ""
 
 
 @dataclass
@@ -94,14 +96,16 @@ class ViamNavClient:
     async def status(self) -> NavStatus:
         raw = await self._res.do_command({"command": "get_status"})
         limits = raw.get("limits") if isinstance(raw.get("limits"), Mapping) else {}
+        localized = localized_from_status(raw)
         return NavStatus(
             active=bool(raw.get("active", False)),
             state=str(raw.get("state", "")),
             pose=_pose_from(raw.get("pose")),
-            localized=localized_from_status(raw),
+            localized=localized,
             max_angular_rad_s=_optf(limits.get("max_angular_rad_s")),
             robot_radius_m=_optf(raw.get("robot_radius_m")),
             error=str(raw.get("error_msg") or raw.get("error") or ""),
+            not_localized_reason="" if localized else not_localized_reason(raw),
         )
 
     async def plan_to_point(self, x: float, y: float) -> Tuple[bool, float]:

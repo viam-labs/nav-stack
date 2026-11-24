@@ -447,6 +447,9 @@ class SlamService(SLAM):
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
         self._cancel_startup_global_localize_task()
+        # Again, now that the old mode's checks are cancelled: one of them
+        # may have published while the new session was loading.
+        self._forget_pose_checks()
         self._schedule_periodic_relocalize(loop)
         self._schedule_mapping_revisit(loop)
         self._schedule_startup_global_localize(loop)
@@ -767,6 +770,26 @@ class SlamService(SLAM):
 
     def _publish_relocalize_check(self, result: Mapping[str, ValueTypes]) -> dict:
         return self._localize._publish_relocalize_check(result)
+
+    def _forget_pose_checks(self) -> None:
+        """Drop the last relocalize and revisit verdicts: a new session has begun.
+
+        They describe the pose and map of the session that just ended, and
+        navigation reads them to decide whether it has a pose it can trust.
+        Nothing in mapping replaces a relocalize verdict. On one robot a
+        large jump was left awaiting its second confirmation when SLAM went
+        from localizing back to mapping; navigation reported no trusted pose
+        for the whole mapping session, and explore accepted a start, waited
+        a minute for a pose and gave up without moving.
+        """
+        for check in (self._last_relocalize_check, self._last_revisit_check):
+            # Emptied in place: navigation holds these same dicts.
+            check.clear()
+            check["status"] = "idle"
+        self._pose_jump_gate.clear()
+        self._soft_nav_hold_since = None
+        self._soft_nav_hold_released = False
+        self._last_relocalize_check["state"] = self._loc_state.snapshot()
 
     def _mark_pose_seeded(self, reason: str) -> None:
         """A pose was placed by hand or by an applied search: tracking again."""
@@ -1469,6 +1492,7 @@ class SlamService(SLAM):
         stem = handle.serialization_stem if handle else None
         self._manager.start_slam(stem, mode)
         self._cfg.mode = mode
+        self._forget_pose_checks()
         # Slice reference geometry is pose-graph-relative; a (re)started SLAM
         # session invalidates it.
         self._reset_slice_library()
@@ -1483,6 +1507,7 @@ class SlamService(SLAM):
         if mode == MODE_MAPPING and mgr.slam_running() and mgr.reset_slam_map():
             if self._cfg is not None:
                 self._cfg.mode = mode
+            self._forget_pose_checks()
             # The in-place reset wiped the pose graph, so pose-graph-relative
             # slice/keyframe references are stale too.
             self._reset_slice_library()

@@ -288,20 +288,41 @@ class ExploreRun:
         await asyncio.sleep(0)
 
     async def _require_pose(self) -> Pose:
+        """The pose, once navigation trusts one and SLAM is running.
+
+        The wait is its own phase and is logged with its reason. On one
+        robot a start was accepted, sat at "idle" for a minute with nothing
+        in the log, and ended: it looked like a start that never happened.
+        """
         waited = 0.0
+        phase = self._s.phase
         while True:
+            self._check_budget()
             nav = await self._nav.status()
             slam = await self._slam.status()
             self._s.keyframes_used = slam.keyframes
             if nav.localized and nav.pose is not None and slam.running:
+                if waited > 0.0:
+                    LOGGER.info("explore: has a pose again after %.0f s", waited)
+                    await self._set_phase(phase)
                 return nav.pose
+            if nav.pose is None:
+                why = "navigation has no pose"
+            elif not nav.localized:
+                why = nav.not_localized_reason or "navigation does not trust its pose"
+            else:
+                why = "SLAM is not running"
             if waited >= LOST_POSE_MAX_S:
                 self._s.last_error = (
-                    f"lost pose for {LOST_POSE_MAX_S:g} s"
-                    if not (nav.localized and nav.pose is not None)
-                    else "slam not running"
+                    f"no trusted pose for {LOST_POSE_MAX_S:g} s ({why})"
                 )
+                LOGGER.warning("explore: %s", self._s.last_error)
                 raise _Finish()
+            if waited == 0.0:
+                LOGGER.info(
+                    "explore: waiting up to %g s for a pose (%s)", LOST_POSE_MAX_S, why
+                )
+                await self._set_phase("waiting_for_pose")
             await self._sleep(LOST_POSE_POLL_S)
             waited += LOST_POSE_POLL_S
 

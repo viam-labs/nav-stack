@@ -158,8 +158,8 @@ def _localized(status: Mapping[str, Any]) -> bool:
     return True
 
 
-def not_localized_message(status: Mapping[str, Any]) -> str:
-    """Goal refusal that says why and what to do, when the watchdog knows."""
+def not_localized_reason(status: Mapping[str, Any]) -> str:
+    """Why the pose is not trusted, when the watchdog knows; else empty."""
     from ..nav.localize.loc_state import describe_state
 
     state = status.get("localization_state")
@@ -167,14 +167,23 @@ def not_localized_message(status: Mapping[str, Any]) -> str:
         check = status.get("localization_check")
         state = check.get("state") if isinstance(check, Mapping) else None
     text = describe_state(state)
-    if text:
-        return f"not localized ({text}); a new goal cannot start"
     check = status.get("localization_check")
-    if isinstance(check, Mapping) and check.get("status"):
-        return (
-            f"not localized (last check: {check.get('status')}); "
-            "a new goal cannot start"
-        )
+    last = check.get("status") if isinstance(check, Mapping) else None
+    # "tracking" explains nothing when the pose is refused anyway: the last
+    # check is then what refused it.
+    tracking = isinstance(state, Mapping) and state.get("state") == "tracking"
+    if text and not (tracking and last):
+        return text
+    if last:
+        return f"last check: {last}"
+    return text or ""
+
+
+def not_localized_message(status: Mapping[str, Any]) -> str:
+    """Goal refusal that says why and what to do, when the watchdog knows."""
+    reason = not_localized_reason(status)
+    if reason:
+        return f"not localized ({reason}); a new goal cannot start"
     return "not localized; a new goal cannot start"
 
 

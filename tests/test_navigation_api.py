@@ -220,6 +220,56 @@ def test_idle_status_fills_pose_from_slam():
     assert status["pose"]["theta"] == pytest.approx(1.38)
 
 
+def test_idle_status_reports_where_the_robot_is_not_where_the_last_goal_ended():
+    """One robot's numbers: SLAM was given a new pose after a canceled goal."""
+    nav, mgr = _configured(
+        {
+            "active": False,
+            "state": "canceled",
+            "pose": {"x": -8.14, "y": -52.59, "theta": -2.60},
+            "motion": "builtin",
+        }
+    )
+    mgr.get_pose_in_map.return_value = Pose2D(-7.29, -48.53, 2.09)
+    status = asyncio.run(nav.do_command({"command": "get_status"}))
+    assert status["pose"] == pytest.approx({"x": -7.29, "y": -48.53, "theta": 2.09})
+
+
+def test_idle_status_keeps_the_last_pose_when_slam_has_none():
+    nav, mgr = _configured()
+    mgr.get_pose_in_map.return_value = None
+    mgr.node.get_pose_in_map.return_value = None
+    status = asyncio.run(nav.do_command({"command": "get_status"}))
+    assert status["pose"] == {"x": 1.0, "y": 2.0, "theta": 0.5}
+
+
+def test_status_while_driving_keeps_the_control_loops_pose():
+    nav, mgr = _configured(
+        {
+            "active": True,
+            "state": "active",
+            "pose": {"x": 3.0, "y": 4.0, "theta": 0.1},
+            "motion": "builtin",
+        }
+    )
+    mgr.get_pose_in_map.return_value = Pose2D(9.0, 9.0, 0.0)
+    status = asyncio.run(nav.do_command({"command": "get_status"}))
+    assert status["pose"] == {"x": 3.0, "y": 4.0, "theta": 0.1}
+    mgr.get_pose_in_map.assert_not_called()
+
+
+def test_not_localized_reason_names_the_check_that_refused_a_tracking_pose():
+    """One robot's status: the tracker said tracking, a stale check said no."""
+    from src.models.nav_api import not_localized_reason
+
+    status = {
+        "localization_check": {"status": "awaiting_confirm"},
+        "localization_state": {"state": "tracking", "since_s": 260.7},
+    }
+    assert not_localized_reason(status) == "last check: awaiting_confirm"
+    assert not_localized_reason({}) == ""
+
+
 def test_navigate_to_point_refuses_when_pose_is_missing():
     nav, mgr = _configured(
         {"active": False, "state": "idle", "pose": None, "motion": "builtin"}

@@ -137,8 +137,68 @@ def test_lost_pose_waits_then_finishes():
     w, clk, slam, nav, run, stops = setup()
     nav.lose_pose = True
     final = asyncio.run(run.run())
-    assert final["last_error"].startswith("lost pose") and 60.0 <= clk.now() < 120.0
+    assert final["last_error"].startswith(
+        "no trusted pose for 60 s (navigation has no pose)"
+    )
+    assert 60.0 <= clk.now() < 120.0
     assert slam.saved == 1 and stops == [1] and final["goals"] == 0
+
+
+def _run_watching(run, each_step):
+    """Run to the end, calling ``each_step()`` between the run's own steps."""
+
+    async def go():
+        task = asyncio.ensure_future(run.run())
+        while not task.done():
+            each_step()
+            await asyncio.sleep(0)
+        return await task
+
+    return asyncio.run(go())
+
+
+def test_a_start_with_no_trusted_pose_says_it_is_waiting_and_why():
+    """One robot's case: a pose check left at "awaiting confirm" by an earlier
+    localizing session. The start was accepted, the phase stayed "idle" for a
+    minute with nothing logged, and the run ended."""
+    w, clk, slam, nav, run, stops = setup()
+    nav.untrusted = "last check: awaiting_confirm"
+    phases = []
+    final = _run_watching(run, lambda: phases.append(run.status()["phase"]))
+    assert "waiting_for_pose" in phases and "exploring" not in phases
+    assert final["last_error"].startswith(
+        "no trusted pose for 60 s (last check: awaiting_confirm)"
+    )
+    assert final["goals"] == 0 and nav.legs == 0
+
+
+def test_a_pose_that_becomes_trusted_during_the_wait_starts_the_run():
+    w, clk, slam, nav, run, _ = setup()
+    nav.untrusted = "last check: awaiting_confirm"
+    phases = []
+
+    def step():
+        phases.append(run.status()["phase"])
+        if clk.now() >= 10.0:
+            nav.untrusted = ""
+
+    final = _run_watching(run, step)
+    assert final["phase"] == "done" and final["last_error"] == ""
+    assert final["goals"] >= 1 and known_fraction(slam, w) > 0.9
+    assert phases.index("waiting_for_pose") < phases.index("exploring")
+
+
+def test_stop_ends_the_wait_for_a_pose():
+    w, clk, slam, nav, run, _ = setup()
+    nav.lose_pose = True
+
+    def step():
+        if clk.now() >= 10.0:
+            run.request_stop()
+
+    final = _run_watching(run, step)
+    assert final["phase"] == "done" and clk.now() < 30.0
+    assert "no trusted pose" not in final["last_error"]
 
 
 def test_wrong_slam_mode_refuses_before_moving():

@@ -43,7 +43,8 @@ def test_nav_status_untrusted_is_not_localized():
         "pose": {"x": 0, "y": 0, "theta": 0},
         "localization_check": {"status": "nav_hold"},
     }
-    assert not asyncio.run(ViamNavClient(Recorder(raw)).status()).localized
+    st = asyncio.run(ViamNavClient(Recorder(raw)).status())
+    assert not st.localized and st.not_localized_reason == "last check: nav_hold"
 
 
 def test_plan_to_point_returns_feasible_and_length():
