@@ -872,7 +872,11 @@ al., IROS 2025, Table III): the SLAM engine localizes through each public run
 in the dataset's own map, from the true first pose and from ten starts drawn
 from the paper's spread (0.2 m, 0.2 m, 10°), and every pose is compared with
 ground truth in the map frame with no alignment, so its numbers sit next to
-the paper's AMCL and other baselines. It needs `lt_changes_dynamics_0` too:
+the paper's AMCL and other baselines. Each run is scored twice: the SLAM
+engine alone (like for like with the paper's localizers), and with the SLAM
+service around it as on a robot, so its startup localize (the drawn start is
+then the robot's saved last pose) and periodic relocalize watchdog run on the
+recording's clock. It needs `lt_changes_dynamics_0` too:
 `python tools/fetch_lilocbench.py --sequences lt_changes_dynamics_0`.
 
 Off the robot, install the CPU runtime first with `pip install onnxruntime`;

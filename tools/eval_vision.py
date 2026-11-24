@@ -51,6 +51,11 @@ DEFAULT_QUERIES = ("dynamics_0", "lt_changes_0")
 # moved furniture, both.
 TRACKING_QUERIES = ("static_0", "dynamics_0", "lt_changes_0", "lt_changes_dynamics_0")
 LIDAR_SETS = {"both": ("front", "rear"), "front": ("front",)}
+LOCALIZERS = {
+    "engine": "the SLAM engine alone (like for like with the paper's localizers)",
+    "service": "the SLAM service around it, as on a robot: startup localize and "
+    "periodic relocalize",
+}
 
 
 def _print_tracking(name: str, result: dict) -> None:
@@ -58,7 +63,7 @@ def _print_tracking(name: str, result: dict) -> None:
         f"\n{name}: pose tracking in the dataset's map, every pose against ground truth"
     )
     print(
-        f"  {'lidars':<12} {'start':<14} {'rmse cm':>8} {'max cm':>8} {'<5cm %':>7} "
+        f"  {'lidars':<14} {'start':<12} {'rmse cm':>8} {'max cm':>8} {'<5cm %':>7} "
         f"{'<10cm %':>8} {'rmse deg':>9} {'max deg':>8} {'<2deg %':>8} {'<4deg %':>8}"
     )
 
@@ -70,7 +75,7 @@ def _print_tracking(name: str, result: dict) -> None:
             return f"{text:>{width}}"
 
         print(
-            f"  {label:<12} {start:<14} {cell('rmse_cm', 8, 2)} {cell('max_cm', 8, 1)} "
+            f"  {label:<14} {start:<12} {cell('rmse_cm', 8, 2)} {cell('max_cm', 8, 1)} "
             f"{cell('under_5cm_pct', 7, 1)} {cell('under_10cm_pct', 8, 1)} "
             f"{cell('heading_rmse_deg', 9, 2)} {cell('heading_max_deg', 8, 1)} "
             f"{cell('under_2deg_pct', 8, 1)} {cell('under_4deg_pct', 8, 1)}"
@@ -203,6 +208,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="tracking only: both lidars as the stack runs, or the front one "
         "the dataset's map was drawn from",
     )
+    ap.add_argument(
+        "--localizer",
+        nargs="+",
+        default=list(LOCALIZERS),
+        choices=list(LOCALIZERS),
+        help="tracking only: " + "; ".join(f"{k} = {v}" for k, v in LOCALIZERS.items()),
+    )
     ap.add_argument("--camera", default="front")
     ap.add_argument(
         "--stride", type=int, default=None, help="use every Nth query frame"
@@ -240,9 +252,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for name in args.queries or TRACKING_QUERIES:
             seq = LilocSequence(args.data, name, camera=args.camera)
             report[name] = {}
-            for label in args.lidars:
-                seq.lidars = LIDAR_SETS[label]
-                report[name][label] = evaluate_tracking(seq, ref, starts=args.starts)
+            for who in args.localizer:
+                for label in args.lidars:
+                    seq.lidars = LIDAR_SETS[label]
+                    report[name][f"{label} {who}"] = evaluate_tracking(
+                        seq, ref, starts=args.starts, service=who == "service"
+                    )
             _print_tracking(name, report[name])
         out = cache / "results_tracking.json"
         out.parent.mkdir(parents=True, exist_ok=True)

@@ -21,16 +21,22 @@ publishes and as the benchmark scores it. The same pose compared at the
 moment it is read is also reported (``at_read_*``): that adds up to one
 odometry period (70 ms here) of lag while driving.
 
-Only the engine is exercised. The localization watchdog and periodic
-relocalize of the SLAM service are not part of the replay.
+With ``service=True`` the SLAM service runs around the engine as it does on
+a robot: its startup localize (a robot restarting near its last saved pose)
+and its periodic relocalize watchdog, on the recording's clock. Its scan
+matching runs in-process and its background work inline, so the replay stays
+deterministic. Without it, only the engine is exercised, which is the
+like-for-like comparison with the paper's localizers.
 """
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import math
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -59,6 +65,9 @@ class TrackingRun:
     truth: np.ndarray  # (N, 3) ground truth at ``stamps``, map frame
     truth_at_read: np.ndarray  # (N, 3) ground truth when the pose was read
     wall_s: float
+    # With the service: each pose it set, as (stamp, before, after).
+    service_moves: List[tuple] = field(default_factory=list)
+    service_log: List[str] = field(default_factory=list)
 
     @staticmethod
     def _errors(est: np.ndarray, truth: np.ndarray):
@@ -78,6 +87,7 @@ class TrackingRun:
             "at_read_rmse_cm": float(100.0 * np.sqrt(np.mean(late**2))),
             "at_read_max_cm": float(100.0 * late.max()),
             "at_read_heading_rmse_deg": float(np.sqrt(np.mean(late_yaw**2))),
+            "service_moves": len(self.service_moves),
             "samples": int(pos.size),
             "rmse_cm": float(100.0 * np.sqrt(np.mean(pos**2))),
             "max_cm": float(100.0 * pos.max()),
@@ -113,6 +123,105 @@ def write_map(ref: OccupancyMap, folder: Path) -> None:
     persistence.save_occupancy(Path(folder), grid)
 
 
+class _InlineExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Runs each job at once on the caller's thread.
+
+    The service hands its scan matching to a thread. Run there, it would
+    finish at a different point of the recording on every replay.
+    """
+
+    def submit(self, fn, /, *args, **kwargs):
+        done: concurrent.futures.Future = concurrent.futures.Future()
+        try:
+            done.set_result(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 - handed to the awaiting task
+            done.set_exception(exc)
+        return done
+
+
+class _Recorder:
+    """Stands in for a module logger and keeps what was said."""
+
+    def __init__(self) -> None:
+        self.lines: List[str] = []
+
+    def _keep(self, msg, *args, **_kw) -> None:
+        try:
+            self.lines.append(str(msg) % args if args else str(msg))
+        except (TypeError, ValueError):
+            self.lines.append(str(msg))
+
+    info = warning = debug = error = exception = _keep
+
+
+def _settle(loop: asyncio.AbstractEventLoop) -> None:
+    """Run the service's tasks until all are waiting on the recording's clock."""
+    while True:
+        loop.run_until_complete(asyncio.sleep(0))
+        if not loop._ready:  # noqa: SLF001
+            return
+
+
+class _Service:
+    """The SLAM service around a replayed engine, ticking on the replay clock."""
+
+    def __init__(self, engine, cfg, store, sensors) -> None:
+        from src.models import slam as slam_module
+        from src.nav.localize.localize_worker import LocalizeWorker
+        from src.slam_builtin import localize_supervisor
+        from src.slam_builtin.host import BuiltinSlamHost
+
+        self.log = _Recorder()
+        self._patched = [
+            (module, module.LOGGER) for module in (slam_module, localize_supervisor)
+        ]
+        for module, _old in self._patched:
+            module.LOGGER = self.log
+        svc = slam_module.SlamService("slam")
+        svc._cfg = cfg  # noqa: SLF001
+        svc._map_store = store  # noqa: SLF001
+        svc._engine = engine  # noqa: SLF001
+        host = BuiltinSlamHost(engine)
+        # The replay ticks the engine itself; its threads never start.
+        host.slam_running = lambda: True
+        svc._manager = host  # noqa: SLF001
+        svc._localizer = LocalizeWorker(enabled=False)  # noqa: SLF001
+        engine.set_match_outcome_hook(svc._on_tick_match_outcome)  # noqa: SLF001
+
+        async def read_scan(bands):
+            scan = sensors.get_scan(2.0)
+            if scan is None or not conv.scan_has_returns(scan):
+                raise RuntimeError("no lidar returns available for global_localize")
+            return scan, ([np.empty((0, 2)) for _ in bands] if bands else [])
+
+        svc._read_merged_scan_and_bands = read_scan  # noqa: SLF001
+        self.svc = svc
+        self.loop = asyncio.new_event_loop()
+        self.loop.set_default_executor(_InlineExecutor(max_workers=1))
+
+    def start(self) -> None:
+        """Load the map and restored pose, then start the robot's checks."""
+        svc = self.svc
+        svc._start_mode(MODE_LOCALIZING)  # noqa: SLF001
+        svc._schedule_startup_global_localize(self.loop)  # noqa: SLF001
+        svc._schedule_periodic_relocalize(self.loop)  # noqa: SLF001
+        _settle(self.loop)
+
+    def step(self) -> None:
+        _settle(self.loop)
+
+    def close(self) -> None:
+        svc = self.svc
+        svc._cancel_periodic_relocalize_task()  # noqa: SLF001
+        svc._cancel_startup_global_localize_task()  # noqa: SLF001
+        try:
+            _settle(self.loop)
+        finally:
+            self.loop.close()
+            for module, old in self._patched:
+                module.LOGGER = old
+
+
 def track(
     seq: LilocSequence,
     ref: OccupancyMap,
@@ -121,8 +230,13 @@ def track(
     tick_hz: float = 15.0,
     max_seconds: Optional[float] = None,
     config: Optional[dict] = None,
+    service: bool = False,
 ) -> TrackingRun:
-    """Localize through ``seq`` in ``ref`` from ``start`` (default: the true first pose)."""
+    """Localize through ``seq`` in ``ref`` from ``start`` (default: the true first pose).
+
+    With ``service`` the robot's SLAM service runs around the engine, and
+    ``start`` is the pose it restarts from (its saved last pose).
+    """
     t_wall = time.perf_counter()
     t0, t1 = _span(seq)
     if max_seconds is not None:
@@ -133,6 +247,8 @@ def track(
     start = first if start is None else start
     clock = ReplayClock(t0)
     rows = []
+    moves: List[tuple] = []
+    driver: Optional[_Service] = None
     with tempfile.TemporaryDirectory(prefix="nav-track-") as tmp, clock:
         cfg = _slam_config(
             Path(tmp), vision=False, extra={"mode": MODE_LOCALIZING, **(config or {})}
@@ -149,13 +265,29 @@ def track(
             logger=lambda _msg: None,
             rate_hz=tick_hz,  # type: ignore[arg-type]
         )
-        engine.configure_mode(MODE_LOCALIZING, handle.root)
-        engine.set_pose(start)
+        if service:
+            # A robot restarting: its last pose is saved with the map.
+            persistence.save_last_pose(handle.root, start)
+            driver = _Service(engine, cfg, store, sensors)
+            real_set_pose = engine.set_pose
+
+            def set_pose(pose: conv.Pose2D) -> None:
+                before = engine.get_pose()
+                real_set_pose(pose)
+                moves.append((clock.stamp(clock.now), before, pose))
+
+            engine.set_pose = set_pose
+            driver.start()
+        else:
+            engine.configure_mode(MODE_LOCALIZING, handle.root)
+            engine.set_pose(start)
         period = 1.0 / float(tick_hz)
         stamp = t0
         while stamp <= t1:
             clock.now = clock.of(stamp)
             engine._tick()  # noqa: SLF001
+            if driver is not None:
+                driver.step()
             taken = sensors.odom_taken
             truth = seq.gt_pose(taken) if math.isfinite(taken) else None
             now = seq.gt_pose(stamp)
@@ -170,6 +302,8 @@ def track(
                     )
                 )
             stamp += period
+        if driver is not None:
+            driver.close()
     return TrackingRun(
         start=start,
         stamps=np.array([r[0] for r in rows]),
@@ -177,6 +311,8 @@ def track(
         truth=np.array([r[2] for r in rows]),
         truth_at_read=np.array([r[3] for r in rows]),
         wall_s=time.perf_counter() - t_wall,
+        service_moves=moves,
+        service_log=list(driver.log.lines) if driver is not None else [],
     )
 
 
@@ -211,21 +347,23 @@ def evaluate_tracking(
     starts: int = 10,
     seed: int = 0,
     max_seconds: Optional[float] = None,
+    service: bool = False,
     log=print,
 ) -> dict:
     """One run from the true first pose, then ``starts`` from drawn poses."""
     first = seq.gt_pose(_span(seq)[0])
-    exact = track(seq, ref, first, max_seconds=max_seconds)
+    exact = track(seq, ref, first, max_seconds=max_seconds, service=service)
     lidars = list(getattr(seq, "lidars", ()))
     out: dict = {"lidars": lidars, "true_start": exact.summary()}
+    who = "service" if service else "engine"
     log(
-        f"  {seq.name} [{'+'.join(lidars)}]: true start "
+        f"  {seq.name} [{'+'.join(lidars)}, {who}]: true start "
         f"{out['true_start']['rmse_cm']:.2f} cm rmse in {exact.wall_s:.0f} s"
     )
     if starts > 0:
         runs = []
         for i, start in enumerate(perturbed_starts(first, starts, seed=seed)):
-            run = track(seq, ref, start, max_seconds=max_seconds)
+            run = track(seq, ref, start, max_seconds=max_seconds, service=service)
             summary = run.summary()
             summary["start_offset_m"] = float(
                 math.hypot(start.x - first.x, start.y - first.y)
@@ -235,7 +373,7 @@ def evaluate_tracking(
             )
             runs.append(summary)
             log(
-                f"  {seq.name} [{'+'.join(lidars)}]: start {i + 1}/{starts} "
+                f"  {seq.name} [{'+'.join(lidars)}, {who}]: start {i + 1}/{starts} "
                 f"({summary['start_offset_m']:.2f} m, {summary['start_offset_deg']:.0f} deg off) "
                 f"{summary['rmse_cm']:.2f} cm rmse"
             )

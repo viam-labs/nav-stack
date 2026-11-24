@@ -342,3 +342,40 @@ def test_evaluation_reports_the_true_start_and_the_spread_over_drawn_starts():
     drawn = out["drawn_starts"]
     assert len(drawn["runs"]) == 2 and "rmse_cm" in drawn["mean"]
     assert all(r["start_offset_m"] >= 0.0 for r in drawn["runs"])
+
+
+def test_with_the_service_a_restart_a_meter_off_is_put_right():
+    """The engine alone cannot pull a pose 1 m off back onto the walls.
+
+    A robot restarting from a saved pose that far off is put right by the
+    SLAM service's startup localize, which the replay runs on the
+    recording's clock.
+    """
+    room = _room_map()
+    first = _RoomRun(seconds=10.0).gt_pose(100.0 + 1.0 / 15.0)
+    start = conv.Pose2D(first.x + 1.0, first.y, first.theta)
+
+    alone = track(_RoomRun(seconds=10.0), room, start)
+    pos, _ = alone.errors()
+    assert pos[-15:].max() > 0.5 and alone.service_moves == []
+
+    served = track(_RoomRun(seconds=10.0), room, start, service=True)
+    pos, _ = served.errors()
+    assert pos[-15:].max() < 0.05
+    assert len(served.service_moves) == 1
+    stamp, before, after = served.service_moves[0]
+    assert np.hypot(before.x - after.x, before.y - after.y) > 0.8
+    assert any("startup" in line for line in served.service_log)
+
+
+def test_the_service_replay_repeats_exactly():
+    room = _room_map()
+    first = _RoomRun(seconds=10.0).gt_pose(100.0 + 1.0 / 15.0)
+    start = conv.Pose2D(first.x, first.y + 0.8, first.theta)
+    a = track(_RoomRun(seconds=10.0), room, start, service=True)
+    b = track(_RoomRun(seconds=10.0), room, start, service=True)
+    assert np.array_equal(a.est, b.est) and a.service_log == b.service_log
+    # The service's loggers are put back afterwards.
+    from src.models import slam as slam_module
+
+    assert type(slam_module.LOGGER).__name__ != "_Recorder"
