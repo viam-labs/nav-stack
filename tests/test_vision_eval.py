@@ -273,3 +273,72 @@ def test_replaying_a_run_maps_it_and_scores_the_pose_against_truth():
     grid = np.asarray(result.map["grid"])
     assert (grid >= 65).sum() > 100 and (grid == 0).sum() > 1000
     assert time.monotonic() < 1e9 and callable(time.monotonic)
+
+
+# --- Pose tracking in a known map -----------------------------------------------
+
+from src.nav.localize.global_localize import OccupancyMap  # noqa: E402
+from tools.vision_eval.tracking_eval import (  # noqa: E402
+    START_STD,
+    evaluate_tracking,
+    perturbed_starts,
+    track,
+)
+
+
+def _room_map() -> OccupancyMap:
+    """The 6 m x 4 m room ``_RoomRun`` drives in, as the dataset's map would draw it."""
+    res = 0.05
+    grid = np.full((120, 160), -1, dtype=np.int16)  # 8 m x 6 m around the room
+    ox, oy = -4.0, -3.0
+    xs = ox + (np.arange(160) + 0.5) * res
+    ys = oy + (np.arange(120) + 0.5) * res
+    gx, gy = np.meshgrid(xs, ys)
+    inside = (np.abs(gx) < 3.0) & (np.abs(gy) < 2.0)
+    grid[inside] = 0
+    wall = inside & ((np.abs(gx) > 3.0 - res) | (np.abs(gy) > 2.0 - res))
+    grid[wall] = 100
+    return OccupancyMap(grid=grid, resolution=res, origin_x=ox, origin_y=oy)
+
+
+def test_tracking_follows_the_robot_in_the_map_and_scores_without_alignment():
+    # Odometry over-reads distance by 10%; the map has to hold the pose.
+    run = track(_RoomRun(odom_scale=1.1), _room_map())
+    summary = run.summary()
+    assert summary["samples"] > 100
+    assert summary["rmse_cm"] < 5.0 and summary["under_10cm_pct"] > 95.0
+    assert summary["heading_rmse_deg"] < 2.0
+    # Odometry alone would have ended 0.24 m long.
+    assert np.hypot(*(run.est[-1, :2] - run.truth[-1, :2])) < 0.08
+    # Scored against the truth at the time of the data, not re-fitted.
+    pos, _yaw = run.errors()
+    assert pos.size == run.stamps.size == run.truth.shape[0]
+
+
+def test_a_start_off_by_the_benchmarks_spread_is_pulled_onto_the_map():
+    room = _room_map()
+    first = _RoomRun().gt_pose(100.0 + 1.0 / 15.0)
+    start = conv.Pose2D(first.x + 0.15, first.y - 0.1, first.theta + math.radians(6.0))
+    run = track(_RoomRun(), room, start)
+    pos, yaw = run.errors()
+    assert pos[0] > 0.1  # it did start off
+    assert pos[-20:].max() < 0.05 and yaw[-20:].max() < 2.0
+
+
+def test_drawn_starts_follow_the_benchmarks_spread_and_repeat_with_the_seed():
+    first = conv.Pose2D(1.0, 2.0, 0.5)
+    starts = perturbed_starts(first, 400, seed=3)
+    dx = np.array([s.x - first.x for s in starts])
+    dth = np.array([conv.normalize_angle(s.theta - first.theta) for s in starts])
+    assert np.std(dx) == pytest.approx(START_STD[0], rel=0.15)
+    assert np.std(dth) == pytest.approx(START_STD[2], rel=0.15)
+    again = perturbed_starts(first, 400, seed=3)
+    assert [(s.x, s.y, s.theta) for s in again] == [(s.x, s.y, s.theta) for s in starts]
+
+
+def test_evaluation_reports_the_true_start_and_the_spread_over_drawn_starts():
+    out = evaluate_tracking(_RoomRun(), _room_map(), starts=2, log=lambda *_: None)
+    assert out["true_start"]["rmse_cm"] < 5.0
+    drawn = out["drawn_starts"]
+    assert len(drawn["runs"]) == 2 and "rmse_cm" in drawn["mean"]
+    assert all(r["start_offset_m"] >= 0.0 for r in drawn["runs"])

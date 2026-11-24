@@ -5,6 +5,7 @@
     python tools/eval_vision.py place           # place-recognition recall
     python tools/eval_vision.py reloc           # lost-pose recovery, lidar vs camera+lidar
     python tools/eval_vision.py mapping         # replay a run through SLAM, score the trajectory
+    python tools/eval_vision.py tracking        # localize in the dataset's map, as the benchmark does
 
 ``place`` builds a place index from the mapping run, then asks for each frame
 of a later run whether a keyframe near the true pose is among the top guesses.
@@ -15,6 +16,11 @@ stack's whole-map lidar search with a lidar search seeded by place guesses.
 mapping mode, on a clock that follows the recording, and compares the pose it
 publishes and the keyframes it ends with against ground truth: with lidar loop
 closure off and on, and with the vision supervisor (person mask) alongside.
+
+``tracking`` runs the SLAM engine in localizing mode on the dataset's own map,
+from the true first pose and from ten drawn around it, and scores every pose
+against ground truth with no alignment: the benchmark paper's pose-tracking
+protocol and columns (Trekel et al., IROS 2025, Table III).
 
 Results are printed and written as JSON next to the dataset cache.
 """
@@ -37,9 +43,45 @@ from tools.vision_eval.lilocbench import LilocSequence, load_reference_map  # no
 from tools.vision_eval.place_eval import evaluate_place  # noqa: E402
 from tools.vision_eval.reloc_eval import evaluate_reloc  # noqa: E402
 from tools.vision_eval.replay import odometry_trajectory, replay_mapping  # noqa: E402
+from tools.vision_eval.tracking_eval import evaluate_tracking  # noqa: E402
 
 DEFAULT_DATA = Path.home() / "datasets" / "lilocbench"
 DEFAULT_QUERIES = ("dynamics_0", "lt_changes_0")
+# Every run with public ground truth after the mapping run: static, people,
+# moved furniture, both.
+TRACKING_QUERIES = ("static_0", "dynamics_0", "lt_changes_0", "lt_changes_dynamics_0")
+LIDAR_SETS = {"both": ("front", "rear"), "front": ("front",)}
+
+
+def _print_tracking(name: str, result: dict) -> None:
+    print(
+        f"\n{name}: pose tracking in the dataset's map, every pose against ground truth"
+    )
+    print(
+        f"  {'lidars':<12} {'start':<14} {'rmse cm':>8} {'max cm':>8} {'<5cm %':>7} "
+        f"{'<10cm %':>8} {'rmse deg':>9} {'max deg':>8} {'<2deg %':>8} {'<4deg %':>8}"
+    )
+
+    def row(label, start, m, sd=None):
+        def cell(key, width, nd):
+            if sd is None:
+                return f"{m[key]:>{width}.{nd}f}"
+            text = f"{m[key]:.{nd}f}±{sd[key]:.{nd}f}"
+            return f"{text:>{width}}"
+
+        print(
+            f"  {label:<12} {start:<14} {cell('rmse_cm', 8, 2)} {cell('max_cm', 8, 1)} "
+            f"{cell('under_5cm_pct', 7, 1)} {cell('under_10cm_pct', 8, 1)} "
+            f"{cell('heading_rmse_deg', 9, 2)} {cell('heading_max_deg', 8, 1)} "
+            f"{cell('under_2deg_pct', 8, 1)} {cell('under_4deg_pct', 8, 1)}"
+        )
+
+    for label, res in result.items():
+        row(label, "true pose", res["true_start"])
+        drawn = res.get("drawn_starts")
+        if drawn:
+            n = len(drawn["runs"])
+            row(label, f"{n} drawn", drawn["mean"], drawn["std"])
 
 
 def _pct(value: Optional[float]) -> str:
@@ -137,10 +179,30 @@ def _print_mapping(name: str, result: dict) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("experiment", choices=["place", "reloc", "mapping"])
+    ap.add_argument("experiment", choices=["place", "reloc", "mapping", "tracking"])
     ap.add_argument("--data", type=Path, default=DEFAULT_DATA)
     ap.add_argument("--mapping", default="mapping")
-    ap.add_argument("--queries", nargs="+", default=list(DEFAULT_QUERIES))
+    ap.add_argument(
+        "--queries",
+        nargs="+",
+        default=None,
+        help=f"runs to query (default {' '.join(DEFAULT_QUERIES)}; "
+        f"tracking: {' '.join(TRACKING_QUERIES)})",
+    )
+    ap.add_argument(
+        "--starts",
+        type=int,
+        default=10,
+        help="tracking only: drawn starting poses after the true one",
+    )
+    ap.add_argument(
+        "--lidars",
+        nargs="+",
+        default=list(LIDAR_SETS),
+        choices=list(LIDAR_SETS),
+        help="tracking only: both lidars as the stack runs, or the front one "
+        "the dataset's map was drawn from",
+    )
     ap.add_argument("--camera", default="front")
     ap.add_argument(
         "--stride", type=int, default=None, help="use every Nth query frame"
@@ -171,6 +233,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     cache = args.data / "cache"
+    if args.experiment == "tracking":
+        ref = load_reference_map(args.data)
+        report = {}
+        t0 = time.monotonic()
+        for name in args.queries or TRACKING_QUERIES:
+            seq = LilocSequence(args.data, name, camera=args.camera)
+            report[name] = {}
+            for label in args.lidars:
+                seq.lidars = LIDAR_SETS[label]
+                report[name][label] = evaluate_tracking(seq, ref, starts=args.starts)
+            _print_tracking(name, report[name])
+        out = cache / "results_tracking.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, indent=2))
+        print(f"\n{time.monotonic() - t0:.0f} s; results written to {out}")
+        return 0
     if args.experiment == "mapping":
         report = {}
         t0 = time.monotonic()
@@ -189,7 +267,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     occ = load_reference_map(args.data) if args.experiment == "reloc" else None
     report = {}
     t0 = time.monotonic()
-    for name in args.queries:
+    for name in args.queries or DEFAULT_QUERIES:
         query = LilocSequence(args.data, name, camera=args.camera)
         feats = ensure_features(query, cache)
         if args.experiment == "place":

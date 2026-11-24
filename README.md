@@ -855,8 +855,8 @@ Geometry/format conversions and map/location/zone stores are unit-tested directl
 
 ### Offline evaluation
 
-Place recognition, lost-pose recovery and mapping can be scored against
-ground truth on the LILocBench dataset, with no robot:
+Place recognition, lost-pose recovery, mapping and localization can be scored
+against ground truth on the LILocBench dataset, with no robot:
 
 ```bash
 python tools/fetch_lilocbench.py     # once: ~2 GB subset into ~/datasets/lilocbench
@@ -864,7 +864,16 @@ python tools/fetch_dinov2_onnx.py && python tools/fetch_yolo_world_onnx.py   # o
 python tools/eval_vision.py place    # place-recognition recall
 python tools/eval_vision.py reloc    # lost-pose recovery, lidar vs camera+lidar
 python tools/eval_vision.py mapping  # replay a run through SLAM, score the trajectory
+python tools/eval_vision.py tracking # localize in the dataset's map, as the benchmark scores localizers
 ```
+
+`tracking` follows the benchmark paper's pose-tracking protocol (Trekel et
+al., IROS 2025, Table III): the SLAM engine localizes through each public run
+in the dataset's own map, from the true first pose and from ten starts drawn
+from the paper's spread (0.2 m, 0.2 m, 10°), and every pose is compared with
+ground truth in the map frame with no alignment, so its numbers sit next to
+the paper's AMCL and other baselines. It needs `lt_changes_dynamics_0` too:
+`python tools/fetch_lilocbench.py --sequences lt_changes_dynamics_0`.
 
 Off the robot, install the CPU runtime first with `pip install onnxruntime`;
 `requirements-vision.txt` lists only the OpenVINO build. The weights are

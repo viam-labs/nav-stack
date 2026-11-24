@@ -144,6 +144,7 @@ class _Lidar:
     range_min: float
     range_max: float
     sensor_pose: conv.Pose2D
+    name: str = ""
 
 
 class LilocSequence:
@@ -205,6 +206,9 @@ class LilocSequence:
             self._color_paths.append(color[stamp])
             self._depth_paths.append(depth[depth_stamps[best]])
         self._lidars: Optional[List[_Lidar]] = None
+        # Which 2D lidars make up a scan: both, as the stack merges them, or
+        # one (the dataset's reference map was drawn from the front one).
+        self.lidars: Tuple[str, ...] = ("front", "rear")
 
     def __len__(self) -> int:
         return len(self.stamps)
@@ -265,18 +269,24 @@ class LilocSequence:
                         sensor_pose=conv.Pose2D(
                             float(mat[0, 3]), float(mat[1, 3]), yaw
                         ),
+                        name=which,
                     )
                 )
             self._lidars = out
         return self._lidars
 
     def scan(
-        self, stamp: float, *, which: Sequence[str] = ("front", "rear")
+        self, stamp: float, *, which: Optional[Sequence[str]] = None
     ) -> Optional[conv.LaserScan2D]:
-        """Both lidars nearest ``stamp``, merged around base_link like the stack does."""
-        del which
+        """The lidars nearest ``stamp``, merged around base_link like the stack does.
+
+        ``which`` defaults to ``self.lidars``.
+        """
+        use = tuple(self.lidars if which is None else which)
         scans = []
         for lidar in self._load_lidars():
+            if lidar.name not in use:
+                continue
             i = int(np.argmin(np.abs(lidar.stamps - stamp)))
             if abs(float(lidar.stamps[i]) - stamp) > MAX_SCAN_GAP_S:
                 continue
