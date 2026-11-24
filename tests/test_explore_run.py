@@ -325,3 +325,85 @@ def test_goal_rejected_right_away_is_retried_before_blacklisting():
     final = asyncio.run(run.run())
     assert final["goals_failed"] == 0 and known_fraction(slam, w) > 0.95
     assert math.hypot(calls[1][0] - calls[0][0], calls[1][1] - calls[0][1]) < 0.75
+
+
+def test_stuck_robot_ends_the_run_and_says_so():
+    # Live tracer2a: wedged between furniture, every goal timed out after 30 s
+    # and explore kept picking new ones. Two in a row from the same pose now
+    # end the run with a clear error and no drive home.
+    w, clk, slam, nav, run, stops = setup(
+        make_builtin_apartment(), seed=(2.0, 2.0, 0.0)
+    )
+    nav.speed_mps = 0.0  # nav accepts goals but the robot never moves
+    final = asyncio.run(run.run())
+    assert "cannot move" in final["last_error"]
+    assert final["goals_failed"] == 1  # the second stall ends the run instead
+    assert (
+        2 * run_mod.PROGRESS_TIMEOUT_S < clk.now() < 2 * run_mod.PROGRESS_TIMEOUT_S + 15
+    )
+    assert slam.saved == 1 and stops == [1]
+    assert "robot cannot move" in final["last_error"].split("return home failed: ")[-1]
+
+
+def test_a_frontier_must_persist_before_it_becomes_a_goal():
+    w, clk, slam, nav, run, _ = setup()
+    sent_at = []
+    orig = nav.navigate_to_point
+
+    async def nav_to(x, y, theta):
+        sent_at.append(clk.now())
+        await orig(x, y, theta)
+
+    nav.navigate_to_point = nav_to
+    asyncio.run(run.run())
+    # The first goal waits for FRONTIER_PERSIST_SCANS scans, one per tick.
+    assert sent_at[0] >= (run_mod.FRONTIER_PERSIST_SCANS - 1) * run_mod.TICK_S
+
+
+def test_track_counts_consecutive_scans_and_drops_flicker():
+    from src.explore.grid import Frontier
+
+    w, clk, slam, nav, run, _ = setup()
+    a = Frontier(1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    moved = Frontier(1.4, 1.0, 1.4, 1.0, 1.0, 1.0)  # same frontier, robot moved
+    other = Frontier(5.0, 5.0, 5.0, 5.0, 0.7, 6.0)
+    run._track([a])
+    run._track([moved, other])
+    assert run._age(moved) == 2 and run._age(other) == 1
+    assert run._best([other, moved], now=0.0) is None  # neither is old enough
+    run._track([moved])  # `other` flickered out
+    assert run._best([moved], now=0.0) is moved
+    run._track([moved, other])
+    assert run._age(other) == 1  # starts again from one
+
+
+def test_live_goal_is_not_replaced_before_the_dwell_time():
+    from src.explore.clients import NavStatus, Pose
+    from src.explore.grid import Frontier, Waypoint
+
+    w, clk, slam, nav, run, _ = setup()
+    pose = Pose(0.0, 0.0, 0.0)
+    far = Frontier(8.0, 0.0, 8.0, 0.0, 1.0, 8.0)
+    near = Frontier(2.0, 0.0, 2.0, 0.0, 1.0, 2.0)
+
+    class Scan:
+        frontiers = [near, far]
+
+        def frontier_near(self, x, y, r):
+            return True  # the live goal's frontier is still there
+
+        def path_m(self, x, y, search_m=0.3):
+            return math.hypot(x, y)
+
+    for _ in range(run_mod.FRONTIER_PERSIST_SCANS):
+        run._track([near, far])
+    active = NavStatus(True, "active", pose, True, 0.5, 0.3, "")
+
+    def decide(now, started):
+        run._s.goal = run_mod._Goal(
+            far, Waypoint(4.0, 0.0, 0.0, False), started, 8.0, now, started
+        )
+        return asyncio.run(run._decide(active, pose, Scan(), [near, far], now))
+
+    assert decide(now=103.0, started=100.0) is None  # 3 s in: keep going
+    assert decide(now=106.0, started=100.0) is near  # past the dwell: switch

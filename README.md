@@ -409,8 +409,9 @@ How it picks where to go, once a second while the robot drives:
   once. Each frontier's goal is the reachable cell closest to it, nearest the
   robot. No path is planned per candidate; the map is read in-process from the
   SLAM service when both run in this module (otherwise through `get_grid`).
-- **Cost** = path length + 0.5 m per radian of turn − 0.3 × frontier length
-  (capped at 6 m). The cheapest frontier wins.
+- **Cost** = path length + 1.0 m per radian of turn − 0.3 × frontier length
+  (capped at 6 m). The cheapest frontier wins, once it has been found in 3
+  scans in a row: small frontiers flicker in and out as the map settles.
 - **Short legs.** Nav is sent waypoints at most 4 m of path ahead along the
   wavefront route, not the frontier itself: nav stops and plans the whole
   path before moving, and a long plan can take many seconds on a busy host.
@@ -420,14 +421,16 @@ How it picks where to go, once a second while the robot drives:
   is within 1 m, so nav does not stop and turn on the way. A goal whose
   frontier is already seen is dropped unless its waypoint is on the way to
   the next goal, and a live goal is only replaced by one at least 2 m
-  cheaper.
+  cheaper, and not in its first 5 s.
 
 A goal fails when nav reports a failure, it becomes unreachable, the path to
 it has not shrunk by 0.3 m in 30 s, or nav arrives and its frontier is still
 there (glass, a drop, something below or above the lidar). Failed goals are
 blacklisted for 10 minutes within 1 m; `unreachable_frontiers` counts what is
 left out that way, so a run that ends with it above zero has gaps in the map.
-Ten failures in a row end the run.
+Ten failures in a row end the run. Two goals in a row that time out with the
+robot still in the same place end it at once with `last_error` "robot cannot
+move from (x, y)" and no drive home: it is boxed in and needs moving by hand.
 
 Exploring ends when three scans in a row find no reachable frontier, when
 `duration_s` runs out, on `stop`, or on an unrecoverable error. **Finish**:
