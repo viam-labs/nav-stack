@@ -3891,10 +3891,6 @@ class BuiltinSlamEngine:
         )
         return True
 
-    # Scans painted when a turn ends, of all those held during it. The last
-    # one, taken stopped, is always among them.
-    _SPIN_PAINT_MAX = 6
-
     def _flush_spin_hold(
         self,
         scan: conv.LaserScan2D,
@@ -3929,18 +3925,18 @@ class BuiltinSlamEngine:
             # uses ``end`` directly, so snap the live pose the same way.
             self._snap_pose_yaw(found.theta, clear_yaw_rate=True)
         corrected = rewind_spin_poses([item[1] for item in held], end)
-        # A turn holds a scan every tick: 30 for a quarter turn. Painting
-        # them all in this one update kept the loop from reading odometry
-        # for seconds on a large map, where each paint works over the whole
-        # grid. A handful spread across the turn draw the same room.
-        count = len(held)
-        shown = min(count, self._SPIN_PAINT_MAX)
-        keep = sorted(
-            {round(i * (count - 1) / max(1, shown - 1)) for i in range(shown)}
+        # A turn holds a scan every tick: 30 for a quarter turn. They are all
+        # drawn, and the map is published once. Painting them one at a time
+        # copied, aligned and collapsed the whole grid for each, which held
+        # the update loop for seconds on a large map.
+        self._paint_mapping_scans(
+            [
+                (held_scan, paint_at, held_now, frames)
+                for (held_scan, _pose, frames, held_now), paint_at in zip(
+                    held, corrected
+                )
+            ]
         )
-        for i in keep:
-            held_scan, _pose, frames, held_now = held[i]
-            self._paint_mapping_scan(held_scan, corrected[i], held_now, frames=frames)
 
     def _paint_mapping_scan(
         self,
@@ -3951,72 +3947,119 @@ class BuiltinSlamEngine:
         frames: Optional[list] = None,
     ) -> None:
         """Draw one mapping scan at ``pose_snap``. Caller already decided it fits."""
-        scan = self._mask_dynamic_scan(scan, now)
-        if frames is None:
-            frames = self._mapping_frames()
+        self._paint_mapping_scans([(scan, pose_snap, now, frames)])
+
+    def _paint_mapping_scans(self, items: list) -> None:
+        """Draw ``(scan, pose, now, frames)`` items in order; publish the map once.
+
+        The map that results is the one drawing them one at a time gives:
+        every scan lands in its height band in the same order, and the
+        published grid is collapsed from the bands. What is saved is the
+        copying, aligning and collapsing of the whole grid between scans.
+        """
+        prepared = []
+        for scan, pose_snap, now, frames in items:
+            scan = self._mask_dynamic_scan(scan, now)
+            if frames is None:
+                frames = self._mapping_frames()
+            band_scans = self._band_scans(frames)
+            if band_scans:
+                band_scans = {
+                    band: self._mask_dynamic_scan(band_scan, now)
+                    for band, band_scan in band_scans.items()
+                }
+            prepared.append((scan, pose_snap, now, band_scans))
+        if not prepared:
+            return
+        if len({bool(item[3]) for item in prepared}) > 1:
+            # Some with height bands and some without: drawn into different
+            # grids, so one publish each, in order.
+            for item in prepared:
+                self._paint_prepared([item])
+            return
+        self._paint_prepared(prepared)
+
+    def _paint_prepared(self, prepared: list) -> None:
+        from .height_bands import compress_bands
+
         with self._lock:
             src = self._grid
             extend_only = not self._baseline_trusted_locked()
             protect = self._session_baseline if extend_only else None
-        band_scans = self._band_scans(frames)
-        if band_scans:
-            band_scans = {
-                band: self._mask_dynamic_scan(band_scan, now)
-                for band, band_scan in band_scans.items()
-            }
-        primary_band = 0
-        if band_scans:
-            painted, bands, primary, extras, primary_band = self._paint_height_bands(
-                pose_snap, band_scans, src, extend_only=extend_only, protect=protect
-            )
+            stored = dict(self._height_bands)
+        drawn = []
+        if prepared[0][3]:
+            bands = {b: occ.copy_grid(g) for b, g in stored.items()}
+            if not bands and np.any(np.abs(src.log_odds) > 0.05):
+                bands[0] = occ.copy_grid(src)
+            for scan, pose_snap, now, band_scans in prepared:
+                self._insert_band_scans(
+                    bands,
+                    pose_snap,
+                    band_scans,
+                    src,
+                    extend_only=extend_only,
+                    protect=protect,
+                )
+                first_band, primary = next(iter(band_scans.items()))
+                extras = list(band_scans.items())[1:]
+                drawn.append((scan, pose_snap, now, primary, extras, int(first_band)))
+            painted = compress_bands(bands)
         else:
-            painted = occ.insert_scan(
-                occ.copy_grid(src),
-                pose_snap.x,
-                pose_snap.y,
-                pose_snap.theta,
-                np.asarray(scan.ranges, dtype=float),
-                float(scan.angle_min),
-                float(scan.angle_increment),
-                range_min=float(scan.range_min),
-                range_max=float(scan.range_max)
-                if math.isfinite(scan.range_max)
-                else 30.0,
-                extend_only=extend_only,
-                protect=protect,
-            )
             bands = None
-            primary, extras = scan, None
-        hook = None
+            painted = occ.copy_grid(src)
+            for scan, pose_snap, now, _bands in prepared:
+                painted = occ.insert_scan(
+                    painted,
+                    pose_snap.x,
+                    pose_snap.y,
+                    pose_snap.theta,
+                    np.asarray(scan.ranges, dtype=float),
+                    float(scan.angle_min),
+                    float(scan.angle_increment),
+                    range_min=float(scan.range_min),
+                    range_max=float(scan.range_max)
+                    if math.isfinite(scan.range_max)
+                    else 30.0,
+                    extend_only=extend_only,
+                    protect=protect,
+                )
+                drawn.append((scan, pose_snap, now, scan, None, 0))
+        hooks = []
         with self._lock:
             if self._grid is not src:
                 return
             self._grid = painted
             if bands is not None:
                 self._height_bands = bands
-            self._last_insert_pose = pose_snap
-            self._last_insert_at = now
-            self._updates += 1
-            self._note_paint(
-                "extend_only" if extend_only else "painting", now, fit="fit"
-            )
-            if self._mode == MODE_MAPPING:
-                hook = self._keyframe_hook
-                nodes = len(self._graph)
-                self._graph.add_scan(pose_snap, primary, band=primary_band, also=extras)
-                if (
-                    len(self._graph) > nodes
-                    and self._loop_closure_enabled()
-                    and now - self._loop_last_attempt_at
-                    >= float(self._cfg.builtin_loop_check_interval_s)
-                ):
-                    self._loop_event.set()
+            for scan, pose_snap, now, primary, extras, primary_band in drawn:
+                self._last_insert_pose = pose_snap
+                self._last_insert_at = now
+                self._updates += 1
+                self._note_paint(
+                    "extend_only" if extend_only else "painting", now, fit="fit"
+                )
+                if self._mode == MODE_MAPPING:
+                    hook = self._keyframe_hook
+                    nodes = len(self._graph)
+                    self._graph.add_scan(
+                        pose_snap, primary, band=primary_band, also=extras
+                    )
+                    if (
+                        len(self._graph) > nodes
+                        and self._loop_closure_enabled()
+                        and now - self._loop_last_attempt_at
+                        >= float(self._cfg.builtin_loop_check_interval_s)
+                    ):
+                        self._loop_event.set()
+                    if hook is not None:
+                        hooks.append((hook, scan, pose_snap))
+                if self._updates % 20 == 0:
+                    self._generation += 1
             # The next scan is judged against this paint. Leaving the match
             # grid stale would let a wrong heading draw for another 20 scans.
             self._invalidate_occ_cache()
-            if self._updates % 20 == 0:
-                self._generation += 1
-        if hook is not None:
+        for hook, scan, pose_snap in hooks:
             try:
                 hook(scan, [], pose_snap)
             except Exception as exc:  # noqa: BLE001
@@ -4061,21 +4104,23 @@ class BuiltinSlamEngine:
             range_max=range_max,
         )
 
-    def _paint_height_bands(
-        self,
+    @staticmethod
+    def _insert_band_scans(
+        bands: dict,
         pose: conv.Pose2D,
         scans: dict,
         src: LogOddsGrid,
         *,
         extend_only: bool = False,
         protect: Optional[LogOddsGrid] = None,
-    ):
-        from .height_bands import compress_bands, cover_bands
+    ) -> None:
+        """Draw one read's per-height scans into ``bands`` (updated in place).
 
-        with self._lock:
-            bands = {b: occ.copy_grid(g) for b, g in self._height_bands.items()}
-            if not bands and np.any(np.abs(src.log_odds) > 0.05):
-                bands[0] = occ.copy_grid(src)
+        The bands are left aligned to one origin and shape, as the next scan
+        and the collapse into one grid need them.
+        """
+        from .height_bands import cover_bands
+
         for band, scan in scans.items():
             base = bands.get(band)
             if base is None:
@@ -4100,11 +4145,12 @@ class BuiltinSlamEngine:
                 extend_only=extend_only,
                 protect=protect,
             )
-        bands = cover_bands(bands)
-        fused = compress_bands(bands)
-        items = list(scans.items())
-        primary_band, primary = items[0]
-        return fused, bands, primary, items[1:], int(primary_band)
+        shapes = {(g.origin_x, g.origin_y, g.log_odds.shape) for g in bands.values()}
+        if len(shapes) > 1:
+            # A scan past the edge grew one band; the others grow to match.
+            aligned = cover_bands(bands)
+            bands.clear()
+            bands.update(aligned)
 
     def _maybe_insert_scan(
         self,

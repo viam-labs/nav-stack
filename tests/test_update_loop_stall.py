@@ -18,7 +18,15 @@ import pytest
 from src.geom import conversions as conv
 from src.slam_builtin.engine import BuiltinSlamEngine
 
-from .test_paint_fit_heights import _engine, _room_ranges, _scan
+from .test_paint_fit_heights import (
+    LOW_Z,
+    TOP_Z,
+    _cloud,
+    _cluttered,
+    _engine,
+    _room_ranges,
+    _scan,
+)
 
 TURN = math.radians(-32.0)  # rad/s, as on the robot
 
@@ -78,32 +86,69 @@ def test_a_snap_larger_than_the_turn_could_make_is_refused(tmp_path):
     assert turned == pytest.approx(0.0, abs=0.5)
 
 
-def test_a_turn_is_painted_from_a_handful_of_its_scans(tmp_path):
-    """Forty scans held through a turn used to be painted in one update."""
-    engine = _engine(tmp_path)
-    headings = np.radians(np.linspace(-170.0, 0.0, 40))
-    held = []
-    for k, theta in enumerate(headings[:-1]):
-        pose = conv.Pose2D(0.0, 0.0, float(theta))
-        held.append((_scan(_room_ranges(pose)), pose, [], 10.0 + 0.1 * k))
-    last = conv.Pose2D(0.0, 0.0, float(headings[-1]))
+def _turn(n: int) -> list:
+    headings = np.radians(np.linspace(-170.0, 0.0, n))
+    return [conv.Pose2D(0.0, 0.0, float(theta)) for theta in headings]
+
+
+def _two_heights_at(pose: conv.Pose2D) -> list:
+    """One lidar read at 0.21 m and 1.2 m: furniture low, walls high."""
+    walls = _room_ranges(pose)
+    low = _cluttered(walls, share=0.34)
+    frames = []
+    for ranges, z in ((low, LOW_Z), (walls, TOP_Z)):
+        frame = _scan(ranges)
+        frame.cloud_xyz = _cloud(ranges, z)
+        frames.append(frame)
+    return frames
+
+
+def test_every_scan_of_a_turn_is_painted_and_the_map_published_once(
+    tmp_path, monkeypatch
+):
+    """Forty scans held through a turn used to be painted one publish each.
+
+    Each publish copied, aligned and collapsed the whole grid: on the robot's
+    3 million cell map, 30 scans took 329 ms on a laptop and several times
+    that on the robot, all inside one update. A replay of a recorded run
+    (``dynamics_0``) showed painting only six of them instead cost accuracy:
+    0.086 m to 0.149 m pose error.
+    """
+    from src.slam_builtin import height_bands
+
+    poses = _turn(40)
+    reads = [_two_heights_at(p) for p in poses]
+    one_by_one = _engine(tmp_path / "a")
+    for k, (pose, frames) in enumerate(zip(poses, reads)):
+        one_by_one._paint_mapping_scan(  # noqa: SLF001
+            _scan(_room_ranges(pose)), pose, 10.0 + 0.1 * k, frames=frames
+        )
+
+    engine = _engine(tmp_path / "b")
+    engine._sensors.mapping_frames = lambda: reads[-1]  # noqa: SLF001
     with engine._lock:  # noqa: SLF001
-        engine._pose = last  # noqa: SLF001
-        engine._spin_hold = held  # noqa: SLF001
-    painted = []
-    paint = engine._paint_mapping_scan  # noqa: SLF001
+        engine._pose = poses[-1]  # noqa: SLF001
+        engine._spin_hold = [  # noqa: SLF001
+            (_scan(_room_ranges(p)), p, f, 10.0 + 0.1 * k)
+            for k, (p, f) in enumerate(zip(poses[:-1], reads[:-1]))
+        ]
+    collapses = []
+    real = height_bands.compress_bands
+    monkeypatch.setattr(
+        height_bands, "compress_bands", lambda b: collapses.append(1) or real(b)
+    )
+    engine._flush_spin_hold(_scan(_room_ranges(poses[-1])), 14.0, None)  # noqa: SLF001
 
-    def record(scan, pose, now, **kw):
-        painted.append(round(math.degrees(pose.theta)))
-        return paint(scan, pose, now, **kw)
-
-    engine._paint_mapping_scan = record  # noqa: SLF001
-    engine._flush_spin_hold(_scan(_room_ranges(last)), 14.0, None)  # noqa: SLF001
-
-    assert len(painted) == BuiltinSlamEngine._SPIN_PAINT_MAX  # noqa: SLF001
-    # Spread over the whole turn, and the stopped scan at its end is one.
-    assert painted[0] == -170 and painted[-1] == 0
-    assert all(b - a >= 20 for a, b in zip(painted, painted[1:]))
+    assert len(collapses) == 1  # the whole turn, published once
+    assert engine._updates == one_by_one._updates == 40  # noqa: SLF001
+    assert len(engine._graph) == len(one_by_one._graph)  # noqa: SLF001
+    assert np.array_equal(engine._grid.log_odds, one_by_one._grid.log_odds)  # noqa: SLF001
+    assert set(engine._height_bands) == set(one_by_one._height_bands) == {0, 4}  # noqa: SLF001
+    for band, grid in engine._height_bands.items():  # noqa: SLF001
+        assert np.array_equal(
+            grid.log_odds,
+            one_by_one._height_bands[band].log_odds,  # noqa: SLF001
+        )
     assert engine._spin_hold == []  # noqa: SLF001
 
 
