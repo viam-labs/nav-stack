@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol, Tuple
 
 from ..models.nav_api import _localized, not_localized_reason
-from ..runtime import get_slam
+from ..runtime import get_slam, get_slam_service
 from .grid import OccGrid
 
 
@@ -53,6 +53,16 @@ class PaintHold:
     verdict: str = ""
 
 
+@dataclass
+class PendingJump:
+    """A place meters from the pose that SLAM found once and is checking again."""
+
+    shift_m: float = 0.0
+    shift_deg: float = 0.0
+    confirm_count: int = 0
+    confirm_needed: int = 0
+
+
 class NavClient(Protocol):
     async def status(self) -> NavStatus: ...
 
@@ -69,6 +79,8 @@ class SlamClient(Protocol):
     async def status(self) -> SlamStatus: ...
 
     async def paint_hold(self) -> PaintHold: ...
+
+    async def pending_jump(self) -> Optional[PendingJump]: ...
 
     async def optimize(self) -> None: ...
 
@@ -167,6 +179,26 @@ class ViamSlamClient:
             held_s=float(raw.get("held_s") or 0.0),
             travel_m=float(raw.get("travel_m") or 0.0),
             verdict=str(raw.get("verdict") or ""),
+        )
+
+    async def pending_jump(self) -> Optional[PendingJump]:
+        """A jump of meters SLAM is yet to confirm (builtin SLAM in this module).
+
+        Read in-process, like the paint hold. A SLAM service in another
+        process reports none.
+        """
+        service = get_slam_service(self._name) if self._name else None
+        read = getattr(service, "pending_pose_jump", None)
+        if not callable(read):
+            return None
+        raw = read()
+        if not isinstance(raw, Mapping):
+            return None
+        return PendingJump(
+            shift_m=float(raw.get("shift_m") or 0.0),
+            shift_deg=float(raw.get("shift_deg") or 0.0),
+            confirm_count=int(raw.get("confirm_count") or 0),
+            confirm_needed=int(raw.get("confirm_needed") or 0),
         )
 
     async def optimize(self) -> None:

@@ -142,6 +142,9 @@ class BuiltinSlamEngine:
         self._last_lin_rate = 0.0
         self._insert_skips_unmatched = 0
         self._insert_skips_turning = 0
+        # Painting waits until this time (see ``hold_paint_while_pose_in_doubt``).
+        self._pose_in_doubt = False
+        self._pose_in_doubt_until = 0.0
         # Operator-facing paint status (see diagnostics ``paint``).
         self._paint_state = "idle"
         self._paint_last_fit: Optional[str] = None
@@ -3076,6 +3079,8 @@ class BuiltinSlamEngine:
                 # No scan match: the pose is a guess. Painting there doubles walls.
                 self._lo_inserts_held += 1
                 self._note_paint("held_lidar_odom", now)
+            elif time.monotonic() < self._pose_in_doubt_until:
+                self._note_paint("held_pose_in_doubt", now)
             elif self._spinning(yaw_rate, lin_rate):
                 # A turn smears a scan and the wheel heading is the part that
                 # slips. Hold the frames and draw them once a still scan lines
@@ -3468,6 +3473,29 @@ class BuiltinSlamEngine:
     _RECOVER_MIN_PERIOD_S = 2.0
     _RECOVER_MAX_PERIOD_S = 16.0
     _RECOVER_NEW_VIEW_M = 1.0
+
+    # A hold that nothing renews ends by itself after this long.
+    _POSE_IN_DOUBT_MAX_S = 30.0
+
+    def hold_paint_while_pose_in_doubt(self, in_doubt: bool) -> None:
+        """Stop painting while a wider check has the robot somewhere else.
+
+        The mapping revisit check needs two looks that agree before it moves
+        the pose by meters. Painting went on between them, at the pose in
+        doubt, and a few seconds of that makes the scan fit where the robot
+        thinks it is. On one robot the first look had the scan fitting a
+        place 3.38 m away; the second found nothing wrong, the jump was
+        dropped, and a hallway was mapped a second time beside the first.
+        One run of doubt holds painting for ``_POSE_IN_DOUBT_MAX_S`` at most,
+        however often it is repeated: a check that never settles must not
+        stop the map from growing.
+        """
+        if not in_doubt:
+            self._pose_in_doubt_until = 0.0
+            self._pose_in_doubt = False
+        elif not self._pose_in_doubt:
+            self._pose_in_doubt = True
+            self._pose_in_doubt_until = time.monotonic() + self._POSE_IN_DOUBT_MAX_S
 
     def paint_hold(self) -> dict:
         """How long scans have gone unpainted for not fitting the map.

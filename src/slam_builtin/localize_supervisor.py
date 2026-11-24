@@ -37,6 +37,7 @@ class LocalizeSupervisor:
     def _publish_revisit_check(self, result: Mapping[str, ValueTypes]) -> dict:
         self.host._last_revisit_check.clear()
         self.host._last_revisit_check.update(result)
+        self.host._sync_paint_with_pending_jump()
         return dict(self.host._last_revisit_check)
 
     async def _flip_current_map_yaw(self) -> Mapping[str, ValueTypes]:

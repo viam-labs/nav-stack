@@ -453,6 +453,15 @@ heading for fails like any other goal and is skipped for 10 minutes.
 
 `relocations` counts how often this happened in a run.
 
+**When SLAM has a jump to confirm.** The mapping revisit check moves the pose
+by meters only after two looks that agree. While it is between them (its
+status is `awaiting_confirm`), explore cancels its goal and stands still
+(`phase` `relocating`), and scans painted again do not count as being back on
+the map. SLAM paints nothing in that time (`paint` state
+`held_pose_in_doubt`) and takes its second look about 3 s after the first.
+Then explore carries on from wherever the pose is. A jump still undecided
+after 30 s is left to SLAM and not waited on again for a minute.
+
 Exploring ends when three scans in a row find no reachable frontier, when
 `duration_s` runs out, on `stop`, or on an unrecoverable error. **Finish**:
 cancel, `optimize`, `save_map`, navigate home (one retry), else stop in place.
@@ -835,6 +844,8 @@ one-shot lidar/odom read; includes measured `scan_hz` / `lidar_read_hz` over
 the last ~2 s plus configured `scan_rate_hz` — with `map_when_still`, expect low
 `scan_hz` while driving; builtin `paint` reports
 `painting` / `extend_only` / `held_turning` / `held_unmatched` / `held_lidar_odom`
+/ `held_pose_in_doubt` (the revisit check has the scan fitting a place meters
+away and is yet to confirm it; for 30 s at most)
 plus match score and whether the resumed baseline is trusted — while untrusted,
 mapping only paints into unknown cells so a torn prior cannot thicken;
 `paint.fit` is the check behind `held_unmatched`: its `score` against its

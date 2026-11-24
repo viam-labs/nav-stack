@@ -112,3 +112,29 @@ def test_paint_hold_is_read_in_process_and_is_empty_for_slam_elsewhere():
     # SLAM in another process: no hold, and no status call on every tick.
     none = asyncio.run(ViamSlamClient(rec, "slam-elsewhere").paint_hold())
     assert none.held_s == 0.0 and rec.calls == []
+
+
+def test_pending_jump_is_read_in_process_and_is_none_for_slam_elsewhere():
+    class Service:
+        jump = {
+            "shift_m": 3.38,
+            "shift_deg": 2.7,
+            "confirm_count": 1,
+            "confirm_needed": 2,
+        }
+
+        def pending_pose_jump(self):
+            return self.jump
+
+    service = Service()
+    runtime.register_slam_service("slam-jump", service)
+    try:
+        res = Recorder({})
+        jump = asyncio.run(ViamSlamClient(res, "slam-jump").pending_jump())
+        assert (jump.shift_m, jump.confirm_count, jump.confirm_needed) == (3.38, 1, 2)
+        service.jump = None
+        assert asyncio.run(ViamSlamClient(res, "slam-jump").pending_jump()) is None
+        assert res.calls == []
+    finally:
+        runtime.unregister_slam_service("slam-jump")
+    assert asyncio.run(ViamSlamClient(Recorder({}), "elsewhere").pending_jump()) is None

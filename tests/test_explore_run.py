@@ -2,7 +2,7 @@ import asyncio
 import math
 
 from src.explore import run as run_mod
-from src.explore.clients import PaintHold, Pose
+from src.explore.clients import PaintHold, PendingJump, Pose
 from src.explore.grid import Frontier, Waypoint
 from src.explore.run import ExploreRun, RunParams
 from src.geom import conversions as conv
@@ -553,6 +553,134 @@ def test_a_lost_robot_drives_back_to_where_it_was_painting():
     assert min(math.hypot(back[0][1] - x, back[0][2] - y) for x, y in visited) < 0.6
     # Exploring went on afterwards.
     assert sent.index(back[0]) < len(sent) - 1 and sent[-1][0] != "relocating"
+
+
+# --- SLAM has a jump to confirm ---------------------------------------------------
+# Live tracer2a: SLAM's revisit check had the scan fitting a place 3.38 m from
+# the pose, look 1 of 2. In the same second scans were painted again where the
+# robot stood, explore set off, the second look found nothing wrong, and a
+# hallway was mapped a second time beside the first.
+
+TRACER_JUMP = PendingJump(
+    shift_m=3.38, shift_deg=2.7, confirm_count=1, confirm_needed=2
+)
+
+
+def _record_goal_times(nav, run, clk):
+    """When each goal was sent to nav, and the phase explore was in."""
+    sent = []
+    orig = nav.navigate_to_point
+
+    async def go(x, y, theta):
+        sent.append((clk.now(), run.status()["phase"]))
+        await orig(x, y, theta)
+
+    nav.navigate_to_point = go
+    return sent
+
+
+def test_explore_stands_still_until_slam_has_taken_its_second_look():
+    w, clk, slam, nav, run, stops = setup(
+        make_builtin_apartment(), seed=(2.0, 2.0, 0.0)
+    )
+    standing, settled = [], []
+
+    def jump():
+        if settled or clk.now() < 20.0:
+            return None
+        if run.status()["phase"] == "relocating":
+            standing.append(clk.now())
+        # The second look comes three seconds after the robot stops.
+        if standing and clk.now() - standing[0] >= 3.0:
+            settled.append(clk.now())
+            return None
+        return TRACER_JUMP
+
+    slam.jump = jump
+    sent = _record_goal_times(nav, run, clk)
+    final = asyncio.run(run.run())
+    assert final["last_error"] == "" and known_fraction(slam, w) > 0.95
+    # Stopped within a tick or two of the jump appearing, and sent nothing
+    # until SLAM had settled it.
+    assert stops and 20.0 <= standing[0] <= 22.0
+    assert not [t for t, _phase in sent if standing[0] <= t < settled[0]]
+    assert [t for t, _phase in sent if t >= settled[0]]
+    # Scans never stopped fitting: this is not counted as getting lost.
+    assert final["relocations"] == 0
+
+
+def test_scans_painted_again_do_not_send_explore_off_while_a_jump_is_pending():
+    w, clk, slam, nav, run, _ = setup(make_builtin_apartment(), seed=(2.0, 2.0, 0.0))
+    stopped, painting_again = [], []
+
+    def placed():
+        pose = w.get_pose()
+        if run.status()["phase"] != "relocating":
+            return False
+        stopped.append((pose.x, pose.y))
+        # Scans fit again 1.5 m back from where the robot stopped.
+        return math.hypot(pose.x - stopped[0][0], pose.y - stopped[0][1]) >= 1.5
+
+    lost = _lost_from(clk, 20.0, placed)
+
+    def hold():
+        out = lost()
+        if clk.now() >= 20.0 and out.held_s <= 0.0 and not painting_again:
+            painting_again.append(clk.now())
+        return out
+
+    def jump():
+        # SLAM's first look lands in the second the scans are painted again,
+        # and its second look five seconds later.
+        if painting_again and clk.now() - painting_again[0] < 5.0:
+            return TRACER_JUMP
+        return None
+
+    slam.hold, slam.jump = hold, jump
+    sent = _record_goal_times(nav, run, clk)
+    final = asyncio.run(run.run())
+    assert final["last_error"] == "" and final["relocations"] == 1
+    exploring = [
+        t for t, phase in sent if phase == "exploring" and t > painting_again[0]
+    ]
+    assert exploring and exploring[0] >= painting_again[0] + 5.0
+    assert known_fraction(slam, w) > 0.95
+
+
+def test_a_jump_slam_never_settles_does_not_park_the_run():
+    w, clk, slam, nav, run, _ = setup(make_builtin_apartment(), seed=(2.0, 2.0, 0.0))
+    slam.jump = lambda: TRACER_JUMP if clk.now() >= 20.0 else None
+    phases = []
+    final = _run_watching(
+        run, lambda: phases.append((clk.now(), run.status()["phase"]))
+    )
+    assert final["phase"] == "done" and final["last_error"] == ""
+    assert known_fraction(slam, w) > 0.95
+    stood = [t for t, phase in phases if phase == "relocating"]
+    moved_on = [t for t, phase in phases if phase == "exploring" and t > stood[0]]
+    assert stood[0] <= 22.0
+    assert moved_on[0] <= stood[0] + run_mod.JUMP_WAIT_MAX_S + 2.0
+    # Left alone for a while after that, not stood for again at once.
+    again = [t for t in stood if t > moved_on[0]]
+    assert not again or again[0] >= moved_on[0] + run_mod.JUMP_IGNORE_S - 2.0
+
+
+def test_a_jump_slam_takes_drops_the_trail_laid_at_the_old_poses():
+    w, clk, slam, nav, run, _ = setup()
+    here = w.get_pose()
+    trail = [Pose(0.0, 0.0, 0.0), Pose(0.5, 0.0, 0.0)]
+
+    # The robot stood still and its pose is 3.38 m from where it was.
+    run._s.trail = list(trail)  # noqa: SLF001
+    run._jump_from = Pose(here.x + 3.38, here.y, here.theta)  # noqa: SLF001
+    asyncio.run(run._jump_ended(3.0))  # noqa: SLF001
+    assert run._s.trail == []  # noqa: SLF001
+
+    # SLAM dropped the jump: the pose is where it was, and so is the trail.
+    run._s.trail = list(trail)  # noqa: SLF001
+    run._jump_from = Pose(here.x, here.y, here.theta)  # noqa: SLF001
+    asyncio.run(run._jump_ended(3.0))  # noqa: SLF001
+    assert run._s.trail == trail  # noqa: SLF001
 
 
 def test_a_robot_that_stays_lost_ends_the_run_where_it_stands():

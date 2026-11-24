@@ -17,7 +17,7 @@ from typing import Awaitable, Callable, List, Optional, Tuple
 
 from viam.logging import getLogger
 
-from .clients import NavClient, NavStatus, PaintHold, Pose, SlamClient
+from .clients import NavClient, NavStatus, PaintHold, PendingJump, Pose, SlamClient
 from .grid import Frontier, FrontierScan, Waypoint, scan_frontiers
 from .legs import LegRunner
 from .scoring import Blacklist, cost
@@ -91,6 +91,14 @@ PAINTING_CONFIRM_TICKS = 2
 # Painting lost again within this distance of an earlier loss: the frontier
 # the robot was heading for is skipped like any other failed goal.
 LOST_SAME_PLACE_M = 3.0
+# SLAM moves the pose by meters only after two looks that agree, and takes the
+# second about 3 s after the first. Explore stands still that long. A jump
+# still undecided after this is left to SLAM, and not waited on again for a
+# while: a place that keeps matching two ways must not park the run.
+JUMP_WAIT_MAX_S = 30.0
+JUMP_IGNORE_S = 60.0
+# The pose moved at least this far while the robot stood: SLAM took the jump.
+JUMP_MOVED_M = 0.5
 SLAM_STATUS_EVERY = 10
 
 
@@ -175,6 +183,10 @@ class ExploreRun:
         self._s = _State()
         self._hold = PaintHold()
         self._painting_ticks = 0
+        self._jump: Optional[PendingJump] = None
+        self._jump_since = 0.0
+        self._jump_from: Optional[Pose] = None
+        self._jump_ignore_until = 0.0
         self._blacklist = Blacklist()
         self._legs = LegRunner(
             nav,
@@ -364,6 +376,9 @@ class ExploreRun:
             await self._require_pose()
             return False
         pose = nav.pose
+        if await self._poll_jump() is not None:
+            await self._stand_for_jump()
+            return False
         hold = await self._slam.paint_hold()
         if hold.held_s <= 0.0:
             self._remember_painted(pose)
@@ -445,19 +460,98 @@ class ExploreRun:
         self._check_budget()
         await self._sleep(TICK_S)
         self._hold = await self._slam.paint_hold()
-        self._painting_ticks = (
-            self._painting_ticks + 1 if self._hold.held_s <= 0.0 else 0
-        )
+        # Not while SLAM has the robot somewhere else: scans fitting here is
+        # then the thing in doubt.
+        jump = await self._poll_jump()
+        painted = self._hold.held_s <= 0.0 and jump is None
+        self._painting_ticks = self._painting_ticks + 1 if painted else 0
         return self._painting_ticks >= PAINTING_CONFIRM_TICKS
 
     async def _painting_within(self, seconds: float) -> bool:
-        """Stand still up to ``seconds``; True once scans are painted again."""
+        """Stand still up to ``seconds``; True once scans are painted again.
+
+        The wait starts over while SLAM has a jump to take a second look at,
+        so the robot is still standing here when it does.
+        """
         waited = 0.0
-        while waited < seconds:
+        limit = seconds
+        while waited < limit:
             if await self._painting():
                 return True
             waited += TICK_S
+            if self._jump is not None:
+                limit = min(waited + seconds, seconds + 2.0 * JUMP_WAIT_MAX_S)
         return False
+
+    # -- a jump SLAM is yet to confirm ---------------------------------------------
+    async def _poll_jump(self) -> Optional[PendingJump]:
+        """SLAM's jump awaiting its second look, if any.
+
+        Says so in the log when one appears and when it ends, and gives up on
+        one SLAM has not settled in ``JUMP_WAIT_MAX_S``.
+        """
+        now = self._clock()
+        jump = None
+        if now >= self._jump_ignore_until:
+            jump = await self._slam.pending_jump()
+        was, self._jump = self._jump, jump
+        if jump is not None and was is None:
+            self._jump_since = now
+            self._jump_from = (await self._nav.status()).pose
+            LOGGER.info(
+                "explore: SLAM has the scan fitting a place %.1f m from the pose "
+                "(look %d of %d); standing still for its next look",
+                jump.shift_m,
+                jump.confirm_count,
+                jump.confirm_needed,
+            )
+        elif jump is None and was is not None:
+            await self._jump_ended(now - self._jump_since)
+        elif jump is not None and now - self._jump_since >= JUMP_WAIT_MAX_S:
+            self._jump = None
+            self._jump_ignore_until = now + JUMP_IGNORE_S
+            LOGGER.warning(
+                "explore: SLAM has not settled that jump in %g s; "
+                "carrying on without waiting for it",
+                JUMP_WAIT_MAX_S,
+            )
+        return self._jump
+
+    async def _jump_ended(self, after_s: float) -> None:
+        was, now = self._jump_from, (await self._nav.status()).pose
+        moved = (
+            0.0
+            if was is None or now is None
+            else math.hypot(now.x - was.x, now.y - was.y)
+        )
+        if moved < JUMP_MOVED_M:
+            LOGGER.info("explore: SLAM dropped that jump after %.0f s", after_s)
+            return
+        # The trail was laid at poses SLAM has since moved away from.
+        self._s.trail.clear()
+        LOGGER.info(
+            "explore: SLAM moved the pose %.2f m after %.0f s; carrying on from there",
+            moved,
+            after_s,
+        )
+
+    async def _stand_for_jump(self) -> None:
+        """Stand still until SLAM has confirmed or dropped its pending jump.
+
+        SLAM moves the pose by meters only after two looks that agree. On one
+        robot the first look had the scan fitting a place 3.38 m from the
+        pose. In the same second scans were painted again where the robot
+        stood, explore set off, the second look found nothing wrong, and a
+        hallway was mapped a second time beside the first.
+        """
+        await self._drop_goal(cancel=True)
+        await self._stop_base()
+        await self._set_phase("relocating")
+        while self._jump is not None:
+            self._check_budget()
+            await self._sleep(TICK_S)
+            await self._poll_jump()
+        await self._set_phase("exploring")
 
     async def _drive_back(self, pose: Pose, target: Pose) -> bool:
         """Drive to ``target``; True as soon as scans are painted again."""

@@ -970,6 +970,64 @@ def test_mode_switch_forgets_a_jump_left_awaiting_confirmation(tmp_path: Path):
     assert _localized({**nav_status, "localization_check": dict(check)})
 
 
+def test_a_jump_awaiting_its_second_look_holds_paint_and_is_reported():
+    """tracer2a's first look: 3.38 m and 2.7 degrees from the pose, 1 of 2."""
+    slam = _relocalize_slam(mode="mapping")
+    hold = slam._manager.hold_paint_while_pose_in_doubt
+    assert slam.pending_pose_jump() is None
+
+    slam._publish_revisit_check(
+        {
+            "status": "awaiting_confirm",
+            "shift_m": 3.38,
+            "shift_deg": 2.7,
+            "jump_shift_m": 3.38,
+            "jump_shift_deg": 2.7,
+            "confirm_count": 1,
+            "confirm_needed": 2,
+        }
+    )
+    hold.assert_called_with(True)
+    assert slam.pending_pose_jump() == {
+        "shift_m": 3.38,
+        "shift_deg": 2.7,
+        "confirm_count": 1,
+        "confirm_needed": 2,
+    }
+
+    # The second look finds nothing wrong, or takes the jump: painting goes on.
+    slam._publish_revisit_check({"status": "ok", "shift_m": 0.07})
+    hold.assert_called_with(False)
+    assert slam.pending_pose_jump() is None
+
+    # A session that starts with one pending lets go of it too.
+    slam._publish_revisit_check({"status": "awaiting_confirm"})
+    hold.assert_called_with(True)
+    slam._forget_pose_checks()
+    hold.assert_called_with(False)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_s"), [("awaiting_confirm", 3.0), ("ok", 20.0)]
+)
+def test_the_second_look_at_a_pending_jump_is_not_left_for_the_usual_wait(
+    monkeypatch, status, expected_s
+):
+    slam = _relocalize_slam(mode="mapping")
+    slam._manager.mapping_revisit_interval_s = lambda default_s: 20.0
+    slam._last_revisit_check.update({"status": status})
+    slept = []
+
+    async def stop_after_first_sleep(seconds):
+        slept.append(seconds)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_first_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(slam._run_mapping_revisit(interval_s=20.0))
+    assert slept == [expected_s]
+
+
 def test_periodic_relocalize_cycle_applies_small_jump_immediately():
     slam = _relocalize_slam(
         periodic_relocalize_min_shift_m=0.2,

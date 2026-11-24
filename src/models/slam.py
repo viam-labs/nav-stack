@@ -486,6 +486,10 @@ class SlamService(SLAM):
                     sleep_s = float(mgr.mapping_revisit_interval_s(interval_s))
                 except Exception:  # noqa: BLE001
                     sleep_s = float(interval_s)
+            if self._last_revisit_check.get("status") == "awaiting_confirm":
+                # The robot stands and nothing is painted until the second
+                # look: take it as soon as the first has had time to settle.
+                sleep_s = 0.0
             await asyncio.sleep(max(3.0, sleep_s))
             try:
                 await self._mapping_revisit_cycle()
@@ -790,6 +794,35 @@ class SlamService(SLAM):
         self._soft_nav_hold_since = None
         self._soft_nav_hold_released = False
         self._last_relocalize_check["state"] = self._loc_state.snapshot()
+        self._sync_paint_with_pending_jump()
+
+    def pending_pose_jump(self) -> Optional[dict]:
+        """A jump of meters that a check has found once and is yet to confirm.
+
+        Navigation holds the drive on the same status. Explore reads this, in
+        this process, so that it neither sets off again nor drives back along
+        its trail before the second look.
+        """
+        for check in (self._last_revisit_check, self._last_relocalize_check):
+            if check.get("status") != "awaiting_confirm":
+                continue
+            return {
+                "shift_m": float(
+                    check.get("jump_shift_m") or check.get("shift_m") or 0.0
+                ),
+                "shift_deg": float(
+                    check.get("jump_shift_deg") or check.get("shift_deg") or 0.0
+                ),
+                "confirm_count": int(check.get("confirm_count") or 0),
+                "confirm_needed": int(check.get("confirm_needed") or 0),
+            }
+        return None
+
+    def _sync_paint_with_pending_jump(self) -> None:
+        """Hold mapping paint for as long as the revisit check awaits its second look."""
+        hold = getattr(self._manager, "hold_paint_while_pose_in_doubt", None)
+        if callable(hold):
+            hold(self._last_revisit_check.get("status") == "awaiting_confirm")
 
     def _mark_pose_seeded(self, reason: str) -> None:
         """A pose was placed by hand or by an applied search: tracking again."""

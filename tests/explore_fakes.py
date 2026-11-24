@@ -40,6 +40,8 @@ class FakeSlam:
         self._last_kf: Optional[conv.Pose2D] = None
         # Tests replace this to say when scans stop fitting the map.
         self.hold = lambda: PaintHold()
+        # Tests replace this to say SLAM has a jump awaiting its second look.
+        self.jump = lambda: None
 
     def _cell(self, x: float, y: float) -> Tuple[int, int]:
         m = self.world.map
@@ -96,6 +98,9 @@ class FakeSlam:
 
     async def paint_hold(self) -> PaintHold:
         return self.hold()
+
+    async def pending_jump(self):
+        return self.jump()
 
     async def optimize(self) -> None:
         self.optimized += 1
