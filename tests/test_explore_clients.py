@@ -15,7 +15,7 @@ class Recorder:
         return self.reply
 
 
-def test_nav_status_parses_pose_limits_and_localized():
+def test_nav_status_parses_pose_and_localized():
     raw = {
         "active": False,
         "state": "succeeded",
@@ -25,7 +25,7 @@ def test_nav_status_parses_pose_limits_and_localized():
         "error_msg": "",
     }
     st = asyncio.run(ViamNavClient(Recorder(raw)).status())
-    assert st.pose.x == 1.0 and st.max_angular_rad_s == 1.5 and st.robot_radius_m == 0.3
+    assert st.pose.x == 1.0 and st.robot_radius_m == 0.3
     assert st.localized and st.state == "succeeded"
 
 
@@ -33,7 +33,7 @@ def test_nav_status_without_pose_is_not_localized():
     st = asyncio.run(
         ViamNavClient(Recorder({"active": False, "state": "idle"})).status()
     )
-    assert st.pose is None and not st.localized and st.max_angular_rad_s is None
+    assert st.pose is None and not st.localized
 
 
 def test_nav_status_untrusted_is_not_localized():

@@ -14,7 +14,6 @@ def params(duration_s=None, **kw):
     base = dict(
         duration_s=duration_s,
         max_linear_mps=0.4,
-        max_angular_dps=30.0,
         home_tolerance_m=0.5,
     )
     base.update(kw)
@@ -208,13 +207,6 @@ def test_wrong_slam_mode_refuses_before_moving():
     final = asyncio.run(run.run())
     assert final["phase"] == "done" and "mapping" in final["last_error"]
     assert final["goals"] == 0 and slam.saved == 0
-
-
-def test_angular_limit_refuses_before_moving():
-    w, clk, slam, nav, run, _ = setup()
-    nav.max_angular_rad_s = 1.5
-    final = asyncio.run(run.run())
-    assert "angular" in final["last_error"] and final["goals"] == 0
 
 
 def test_blocked_goal_is_blacklisted_and_run_survives():

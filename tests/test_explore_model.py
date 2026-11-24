@@ -16,7 +16,7 @@ class Rec:
         self.calls.append({"command": "base_stop"})
 
 
-def make(slam_mode="mapping", ang=0.5):
+def make(slam_mode="mapping"):
     svc = ExploreService("explore")
     svc._slam = Rec(
         {
@@ -35,7 +35,6 @@ def make(slam_mode="mapping", ang=0.5):
                 "active": False,
                 "state": "idle",
                 "pose": {"x": 0, "y": 0, "theta": 0},
-                "limits": {"max_linear_mps": 0.4, "max_angular_rad_s": ang},
             }
         }
     )

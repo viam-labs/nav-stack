@@ -106,7 +106,6 @@ SLAM_STATUS_EVERY = 10
 class RunParams:
     duration_s: Optional[float]
     max_linear_mps: float
-    max_angular_dps: float
     home_tolerance_m: float
     robot_radius_m: float = 0.3
     min_frontier_m: float = 0.5
@@ -246,17 +245,6 @@ class ExploreRun:
         slam = await self._slam.status()
         if slam.mode != "mapping":
             return f"slam mode must be mapping (got {slam.mode or 'unknown'})"
-        nav = await self._nav.status()
-        limit = math.radians(self._p.max_angular_dps)
-        if nav.max_angular_rad_s is None:
-            return (
-                "nav angular limit unknown; navigation get_status has no limits field"
-            )
-        if nav.max_angular_rad_s > limit + 1e-9:
-            return (
-                f"nav angular limit {nav.max_angular_rad_s:.2f} rad/s exceeds explore "
-                f"max_angular_dps {self._p.max_angular_dps:g} ({limit:.2f} rad/s)"
-            )
         return None
 
     async def run(self) -> dict:
