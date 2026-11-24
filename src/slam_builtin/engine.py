@@ -3496,6 +3496,9 @@ class BuiltinSlamEngine:
                 self._set_corrected_pose_keeping_odom_locked(new_pose)
                 self._recover_stats["recovered"] += 1
             self._recover_stats["last"] = {"at": time.time(), **outcome}
+            # The wait for the next search runs from the end of this one, so
+            # a slow computer still gets the time between them.
+            self._recover_last_at = time.monotonic()
             if self._paint_miss_since is not None:
                 self._recover_verdict = str(outcome["reason"])
             self._recover_period_s = (
