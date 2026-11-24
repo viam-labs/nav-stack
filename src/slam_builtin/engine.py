@@ -724,6 +724,19 @@ class BuiltinSlamEngine:
         self._lo_last_at = None
         self._lo_map_updates = None
 
+    def _set_corrected_pose_keeping_odom_locked(self, pose: conv.Pose2D) -> None:
+        """Correct the pose without forgetting where odometry last stood.
+
+        A loop closure or a position recover moves the map frame under the
+        robot; the robot did not jump. What the wheels did since the last
+        tick still happened, and the next tick has to add it. Clearing the
+        odometry anchors here dropped that motion: 2 m of it when a rebuild
+        had kept ticks from running for four seconds.
+        """
+        odom = (self._last_odom_pose, self._last_odom_heading, self._last_odom_time)
+        self._set_corrected_pose_locked(pose)
+        self._last_odom_pose, self._last_odom_heading, self._last_odom_time = odom
+
     def _reset_graph_locked(self) -> None:
         self._graph.clear()
         self._graph_frozen = 0
@@ -1102,6 +1115,11 @@ class BuiltinSlamEngine:
         )
         return replace(scan, ranges=ranges)
 
+    # Rounds of drawing late scans before the pose lock is taken, and how
+    # many may be left to draw under it (a few milliseconds each).
+    _LATE_SCAN_ROUNDS = 4
+    _LATE_SCANS_UNDER_LOCK = 4
+
     def optimize_pose_graph(self) -> dict:
         """Optimize the whole mapping pose graph and re-render the grid."""
         with self._lock:
@@ -1156,7 +1174,8 @@ class BuiltinSlamEngine:
                     return info
             poses = res_opt.poses
         with self._lock:
-            extra = self._graph.scans_after(snap.last_seq)
+            extra = self._graph.scans_since(snap, poses, snap.last_seq)
+            drawn_seq = self._graph.last_seq
             rendered_edits = len(self._grid_edits)
             clears = self._render_clears(self._grid_edits)
         started = perf_counter()
@@ -1170,6 +1189,22 @@ class BuiltinSlamEngine:
             clears=clears,
             bands_out=bands,
         )
+        # Scans keep being stored while that draws (five seconds and more at
+        # 500 keyframes). Draw those too before taking the pose lock, until
+        # only a handful are left. Rendering everything again under the lock
+        # to include them stopped every tick for as long as the render took:
+        # the pose froze while the robot drove on.
+        for _ in range(self._LATE_SCAN_ROUNDS):
+            with self._lock:
+                if self._graph_revision != revision:
+                    info["status"] = "aborted"
+                    return info
+                late = self._graph.scans_since(snap, poses, drawn_seq)
+                newest_seq = self._graph.last_seq
+            if len(late) <= self._LATE_SCANS_UNDER_LOCK:
+                break
+            grid = pg.paint_more(grid, bands, late)
+            drawn_seq = newest_seq
         render_ms = (perf_counter() - started) * 1000.0
         self._loop_stats["last_render_ms"] = round(render_ms, 1)
         info["render_ms"] = round(render_ms, 1)
@@ -1178,19 +1213,11 @@ class BuiltinSlamEngine:
                 info["status"] = "aborted"
                 return info
             anchor_before = self._node_poses_locked()
+            # The few stored since the last round, at the poses they are
+            # about to get.
+            late = self._graph.scans_since(snap, poses, drawn_seq)
             tail = self._graph.apply_poses(snap, poses)
-            # Inserts that landed while rendering, after ``extra`` was taken.
-            newer = self._graph.scans_after(snap.last_seq)
-            if len(newer) != len(extra):
-                grid = pg.render_grid(
-                    snap,
-                    resolution=res,
-                    poses=poses,
-                    base=base,
-                    extra=newer,
-                    clears=clears,
-                    bands_out=bands,
-                )
+            grid = pg.paint_more(grid, bands, late)
             self._replay_after_render_locked(grid, rendered_edits)
             for band_grid in bands.values():
                 self._replay_after_render_locked(band_grid, rendered_edits)
@@ -1203,7 +1230,7 @@ class BuiltinSlamEngine:
             self._last_loop_rebuild_at = time.monotonic()
             corr = live_correction if live_correction is not None else tail
             new_pose = conv.compose_poses(corr, self._pose)
-            self._set_corrected_pose_locked(new_pose)
+            self._set_corrected_pose_keeping_odom_locked(new_pose)
             self._graph_revision += 1
             anchor_after = self._node_poses_locked()
         self._emit_anchor_motion(anchor_before, anchor_after)
@@ -3253,7 +3280,7 @@ class BuiltinSlamEngine:
                 # Carry the robot's motion since the scan across the move.
                 corr = pg.world_correction(scan_pose, found.pose)
                 new_pose = conv.compose_poses(corr, self._pose)
-                self._set_corrected_pose_locked(new_pose)
+                self._set_corrected_pose_keeping_odom_locked(new_pose)
                 self._recover_stats["recovered"] += 1
             self._recover_stats["last"] = {"at": time.time(), **outcome}
             if self._paint_miss_since is not None:

@@ -108,17 +108,6 @@ def test_paint_hold_is_read_in_process_and_is_empty_for_slam_elsewhere():
     finally:
         runtime.unregister_slam("explore-test-slam")
     assert (hold.held_s, hold.travel_m, hold.verdict) == (7.5, 3.2, "ambiguous")
-    assert hold.lost
     # SLAM in another process: no hold, and no status call on every tick.
     none = asyncio.run(ViamSlamClient(rec, "slam-elsewhere").paint_hold())
-    assert none.held_s == 0.0 and not none.lost and rec.calls == []
-
-
-def test_a_hold_counts_as_lost_until_slam_says_the_pose_is_fine():
-    from src.explore.clients import PaintHold
-
-    assert not PaintHold().lost
-    assert PaintHold(held_s=4.0).lost
-    assert PaintHold(held_s=4.0, verdict="heights_disagree").lost
-    assert not PaintHold(held_s=4.0, verdict="recovered").lost
-    assert not PaintHold(held_s=4.0, verdict="no_better_place").lost
+    assert none.held_s == 0.0 and rec.calls == []

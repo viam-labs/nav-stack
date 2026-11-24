@@ -3,6 +3,7 @@ import math
 
 from src.explore import run as run_mod
 from src.explore.clients import PaintHold, Pose
+from src.explore.grid import Frontier, Waypoint
 from src.explore.run import ExploreRun, RunParams
 from src.geom import conversions as conv
 from src.sim.world import SimWorld, make_builtin_apartment, make_builtin_corridor
@@ -503,19 +504,69 @@ def test_a_robot_that_stays_lost_ends_the_run_where_it_stands():
     final = asyncio.run(run.run())
     assert final["last_error"].startswith("lost near (")
     assert "return home failed: robot is lost" in final["last_error"]
-    # Stood still, drove back twice, then stopped for good: no drive home.
-    assert [goal[0] for goal in sent if goal[0] != "exploring"] == ["relocating"] * 2
+    # Stood still, drove back farther each time until the trail ran out, then
+    # stopped for good: no drive home.
+    back = [goal for goal in sent if goal[0] != "exploring"]
+    assert 2 <= len(back) <= len(run_mod.BACKTRACK_M)
+    assert {goal[0] for goal in back} == {"relocating"}
+    assert len({goal[1:] for goal in back}) == len(back)  # never the same place twice
     assert slam.saved == 1 and stops
-    assert clk.now() < 20.0 + 150.0
+    assert clk.now() < 20.0 + 400.0
 
 
-def test_a_room_that_changed_does_not_stop_exploring():
-    """Scans miss, and SLAM says nowhere nearby fits better: the pose is fine."""
+def test_slam_finding_nowhere_better_is_not_being_back_on_the_map():
+    """Live tracer2a, 1.3.1-rc9: 36 m and five minutes with nothing painted.
+
+    The robot started to drive back, SLAM's search reported that nowhere
+    nearby fit better than the pose it had, explore took that for being back
+    on the map, and turned around. Five times.
+    """
     w, clk, slam, nav, run, _ = setup(make_builtin_apartment(), seed=(2.0, 2.0, 0.0))
-    slam.hold = lambda: PaintHold(held_s=60.0, verdict="no_better_place")
+    stopped = []
+    painted_again = []
+
+    def hold():
+        t = clk.now()
+        if painted_again or t < 20.0:
+            return PaintHold()
+        pose = w.get_pose()
+        if run.status()["phase"] == "relocating":
+            stopped.append((pose.x, pose.y))
+        # Scans fit again 1.5 m back from where the robot stopped.
+        if (
+            stopped
+            and math.hypot(pose.x - stopped[0][0], pose.y - stopped[0][1]) >= 1.5
+        ):
+            painted_again.append(t)
+            return PaintHold()
+        return PaintHold(held_s=t - 20.0, travel_m=1.0, verdict="no_better_place")
+
+    slam.hold = hold
+    sent = _record_goals(nav, run)
     final = asyncio.run(run.run())
-    assert final["last_error"] == "" and final["relocations"] == 0
-    assert known_fraction(slam, w) > 0.95
+    assert final["last_error"] == "" and final["relocations"] == 1
+    # It stopped, and it drove back until scans were painted again.
+    assert len([goal for goal in sent if goal[0] == "relocating"]) == 1
+    assert painted_again
+
+
+def test_a_second_loss_near_the_same_place_skips_that_frontier():
+    _, clk, _, _, run, _ = setup()
+    frontier = Frontier(5.0, 1.0, 5.2, 1.0, 1.0, 3.0)
+    goal = run_mod._Goal(frontier, Waypoint(5.0, 1.0, 0.0, True), 0.0, 3.0, 0.0)  # noqa: SLF001
+
+    def blocked():
+        return run._blacklist.blocked(5.0, 1.0, clk.now())  # noqa: SLF001
+
+    # Once can be a slip anywhere: straight back for another try.
+    asyncio.run(run._note_lost_place(Pose(4.0, 1.0, 0.0), goal))  # noqa: SLF001
+    assert run.status()["goals_failed"] == 0 and not blocked()
+    # Somewhere else gets a first try of its own.
+    asyncio.run(run._note_lost_place(Pose(4.0, 9.0, 0.0), goal))  # noqa: SLF001
+    assert run.status()["goals_failed"] == 0 and not blocked()
+    # Again near the first place: that frontier is a failed goal.
+    asyncio.run(run._note_lost_place(Pose(4.5, 1.5, 0.0), goal))  # noqa: SLF001
+    assert run.status()["goals_failed"] == 1 and blocked()
 
 
 def test_the_trail_gives_a_pose_that_far_back_or_its_start():

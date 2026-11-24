@@ -396,6 +396,37 @@ class PoseGraph:
             self.nodes[i].pose = conv.compose_poses(correction, self.nodes[i].pose)
 
     # -- rendering ----------------------------------------------------------
+    def scans_since(
+        self, snap: GraphSnapshot, new_poses: np.ndarray, seq: int
+    ) -> List[Tuple[conv.Pose2D, GraphScan]]:
+        """Scans stored after ``seq``, where ``apply_poses`` is about to put them.
+
+        For drawing scans that arrive while a render of ``snap`` at
+        ``new_poses`` is running, before those poses are applied: a snapshot
+        node gets its new pose, and a node added since rides along with the
+        last snapshot node, exactly as :meth:`apply_poses` moves it.
+        """
+        n = len(snap)
+        if n == 0:
+            return self.scans_after(seq)
+        last = new_poses[n - 1]
+        tail = world_correction(
+            snap.pose(n - 1),
+            conv.Pose2D(float(last[0]), float(last[1]), float(last[2])),
+        )
+        out = []
+        for i, node in enumerate(self.nodes):
+            late = [s for s in node.scans if s.seq > seq]
+            if not late:
+                continue
+            if i < n:
+                p = new_poses[i]
+                pose = conv.Pose2D(float(p[0]), float(p[1]), float(p[2]))
+            else:
+                pose = conv.compose_poses(tail, node.pose)
+            out.extend((conv.compose_poses(pose, s.rel), s) for s in late)
+        return out
+
     def scans_after(self, seq: int) -> List[Tuple[conv.Pose2D, GraphScan]]:
         out = []
         for n in self.nodes:
@@ -500,6 +531,44 @@ def render_grid(
     aligned = cover_bands(bands)
     if bands_out is not None:
         bands_out.update(aligned)
+    return compress_bands(aligned)
+
+
+def paint_more(
+    grid: LogOddsGrid,
+    bands: dict,
+    scans: Sequence[Tuple[conv.Pose2D, GraphScan]],
+) -> LogOddsGrid:
+    """Draw ``scans`` onto a finished :func:`render_grid` result.
+
+    ``grid`` is what that render returned and ``bands`` its ``bands_out``
+    (empty with one height); ``bands`` is updated in place. For scans stored
+    while the render ran: drawing a few more costs milliseconds, where
+    rendering the whole graph again to include them costs as long as the
+    render did.
+    """
+    from .height_bands import compress_bands, cover_bands
+
+    if not scans:
+        return grid
+    work = dict(bands) if bands else {0: grid}
+    for pose, scan in scans:
+        band = int(getattr(scan, "band", 0))
+        target = work.get(band)
+        if target is None:
+            first = work[0] if 0 in work else next(iter(work.values()))
+            target = LogOddsGrid(
+                log_odds=np.zeros_like(first.log_odds),
+                resolution=first.resolution,
+                origin_x=first.origin_x,
+                origin_y=first.origin_y,
+            )
+        work[band] = paint_scan(target, pose, scan)
+    if len(work) == 1:
+        return next(iter(work.values()))
+    aligned = cover_bands(work)
+    bands.clear()
+    bands.update(aligned)
     return compress_bands(aligned)
 
 

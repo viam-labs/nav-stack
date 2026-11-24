@@ -40,22 +40,15 @@ class SlamStatus:
 class PaintHold:
     """SLAM's report that scans have stopped fitting the map.
 
-    ``held_s`` is 0 while mapping normally. ``verdict`` is what SLAM's own
-    position search last concluded during this hold (empty before the first
-    search): ``recovered``, ``no_better_place``, or why it could not tell.
+    ``held_s`` is 0 while scans are being painted. ``verdict`` is what SLAM's
+    own position search last concluded during this hold (empty before the
+    first search). It is reported, not acted on: only painting again counts
+    as being back on the map.
     """
 
     held_s: float = 0.0
     travel_m: float = 0.0
     verdict: str = ""
-
-    @property
-    def lost(self) -> bool:
-        """Scans miss and SLAM has not said the pose is fine."""
-        return self.held_s > 0.0 and self.verdict not in (
-            "recovered",
-            "no_better_place",
-        )
 
 
 class NavClient(Protocol):
