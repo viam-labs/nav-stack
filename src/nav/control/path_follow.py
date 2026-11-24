@@ -60,7 +60,7 @@ def run_path_follow(
         guard_extra_pts=tick.mem_pts,
         scan_world_pts=tick.scan_world_pts,
         # The block policy has committed to a heading round an obstacle on
-        # the route: that turn is its, not a manoeuvre's.
+        # the route: that turn is its, not a maneuver's.
         allow_maneuver=tick.corridor_yaw is None,
     )
     ep.rotate_active = bool(progress.get("rotate_to_heading"))
@@ -111,7 +111,7 @@ def run_path_follow(
     }
 
     if obs_state == "maneuver":
-        # The guard is part-way through a planned manoeuvre. The escape
+        # The guard is part-way through a planned maneuver. The escape
         # machine's own bounded reverse / wait freeze would replace its moves.
         ep.escape_m.reset()
         escape_pre = EscapeResult()

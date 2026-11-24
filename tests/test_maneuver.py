@@ -1,4 +1,4 @@
-"""Multi-point manoeuvres for a turn the body cannot make where it stands."""
+"""Multi-point maneuvers for a turn the body cannot make where it stands."""
 
 import math
 import time
@@ -41,7 +41,7 @@ def _boxed_like_tracer2a():
 
 
 def _pocket(width=0.85):
-    """Nose-in: walls each side and across the nose, open 0.3 m behind centre."""
+    """Nose-in: walls each side and across the nose, open 0.3 m behind center."""
     h = width / 2
     return np.array(
         _line(-0.3, h, 1.2, h) + _line(-0.3, -h, 1.2, -h) + _line(1.2, -h, 1.2, h)
@@ -162,7 +162,7 @@ def test_following_the_plan_turns_to_the_route_without_touching(name, bearing):
     assert seconds < 60.0
 
 
-def test_veto_calls_do_not_disturb_a_running_manoeuvre():
+def test_veto_calls_do_not_disturb_a_running_maneuver():
     pts = _boxed_like_tracer2a()
     g = _guard()
     target = _target(94)
@@ -203,7 +203,7 @@ def test_turn_direction_is_kept_when_the_route_is_nearly_behind():
     assert cmd.vtheta < 0.0
 
 
-def test_route_passing_close_to_an_obstacle_still_gets_a_manoeuvre():
+def test_route_passing_close_to_an_obstacle_still_gets_a_maneuver():
     # Live tracer2a (1.3.1-rc4): nose 7.6 cm from furniture, route 74 degrees
     # to the right through a gap, open floor behind. A check that refused to
     # plan toward a lookahead point within half a body width of any obstacle
@@ -234,3 +234,22 @@ def test_route_passing_close_to_an_obstacle_still_gets_a_manoeuvre():
         closest = min(closest, float(_rect_dist(here, pts, HL, HW).min()))
     assert abs(conv_bearing(pose, target)) <= math.radians(20.0)
     assert closest >= 0.03
+
+
+def test_a_half_run_maneuver_is_dropped_when_the_follower_stops_turning():
+    pts = _boxed_like_tracer2a()
+    target = _target(94)
+    for vx, w in ((0.0, 0.0), (-0.05, 0.0), (0.2, 0.0)):
+        g = _guard()
+        g.guard(START, 0.0, 0.6, pts, target=target, max_dist_m=3.0, plan=True)
+        assert g.maneuver.active
+        # At the goal (zero), the short reverse there, or driving on.
+        g.guard(START, vx, w, np.empty((0, 2)), target=target, plan=True)
+        assert not g.maneuver.active, (vx, w)
+
+
+def test_plan_description_for_logs():
+    from src.nav.control.maneuver import Segment, describe
+
+    plan = [Segment(BACK, 0.15), Segment(RIGHT, math.radians(70))]
+    assert describe(plan) == "back 15 cm, right 70 deg"

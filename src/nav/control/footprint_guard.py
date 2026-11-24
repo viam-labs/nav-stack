@@ -274,7 +274,7 @@ class FootprintGuard:
         self.cfg = cfg
         self._hl = cfg.length_m / 2.0
         self._hw = cfg.width_m / 2.0
-        # Multi-point manoeuvre for a turn that is blocked where the body
+        # Multi-point maneuver for a turn that is blocked where the body
         # stands (see ``maneuver``). Only the follower's own call (``plan``)
         # starts, advances or cancels it; veto calls leave it alone.
         self.maneuver = ManeuverRunner()
@@ -435,10 +435,10 @@ class FootprintGuard:
         """Shape one command so the rectangle does not hit anything.
 
         ``plan`` marks the follower's own call for this tick. Only that call
-        may run a multi-point manoeuvre when a turn is blocked; the final
+        may run a multi-point maneuver when a turn is blocked; the final
         gate's veto calls (``plan=False``) only check a command.
         ``maneuver_ok=False`` says something else owns the turn this tick
-        (the blocked-path logic is steering round an obstacle): no manoeuvre
+        (the blocked-path logic is steering round an obstacle): no maneuver
         is started and a running one is dropped.
         """
         cfg = self.cfg
@@ -451,9 +451,13 @@ class FootprintGuard:
             horizon = max(0.1, min(horizon, float(max_dist_m) + cfg.stop_gap_m + 0.05))
         if abs(vx) < 1e-3:
             if abs(vtheta) < 1e-3:
+                if plan:
+                    # The follower wants nothing (at the goal): a half-run
+                    # maneuver must not resume later from a stale start.
+                    self.maneuver.cancel()
                 return GuardResult(0.0, 0.0, "clear", math.inf, False)
             if plan and self.maneuver.active:
-                # Mid-manoeuvre: finish it. It may be turning the other way
+                # Mid-maneuver: finish it. It may be turning the other way
                 # or translating to make the room this turn needs.
                 move = self.maneuver.step(self, pose, pts)
                 if move is not None:
@@ -475,15 +479,16 @@ class FootprintGuard:
                         return GuardResult(
                             move[0], move[1], "maneuver", math.inf, False
                         )
-                # No manoeuvre within reach: creep along a free forward arc
+                # No maneuver within reach: creep along a free forward arc
                 # in case the room to turn is further on.
                 alt = self.best_forward_arc(pose, pts, target, horizon, prefer_sign)
                 if alt is not None:
                     return GuardResult(alt[0], alt[1], "steer", alt[2], True)
             return GuardResult(0.0, 0.0, "blocked", 0.0, True)
 
-        if plan and vx > 0.0:
-            # The follower is driving again: any manoeuvre has done its job.
+        if plan:
+            # The follower is translating again (driving on, or its short
+            # reverse at the goal): any maneuver has done its job.
             self.maneuver.cancel()
         free = self.free_distance(pose, vx, vtheta, pts, horizon)
         v_ok = self._regulate(vx, free)

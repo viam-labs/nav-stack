@@ -376,7 +376,7 @@ def _boxed_in():
     ],
 )
 def test_gets_out_when_boxed_in_beside_furniture(monkeypatch, bearing, noise, seed):
-    # Before the manoeuvre search every one of these shuffled a few cm forward
+    # Before the maneuver search every one of these shuffled a few cm forward
     # and back until the time cap without turning.
     grid, start, extras = _boxed_in()
     b = math.radians(bearing)

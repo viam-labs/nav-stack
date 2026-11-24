@@ -1,4 +1,4 @@
-"""Multi-point manoeuvres for a turn the body cannot make where it stands.
+"""Multi-point maneuvers for a turn the body cannot make where it stands.
 
 A rectangular body beside furniture often cannot turn toward its route in
 place: the tail swings into whatever is next to it. A person would turn the
@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
+from viam.logging import getLogger
 
 from ...geom import conversions as conv
 from ..motion.base_envelope import ANG_EPS_RAD_S, LIN_EPS_MPS
@@ -27,6 +28,8 @@ from ..types import Pose2D
 
 if TYPE_CHECKING:
     from .footprint_guard import FootprintGuard
+
+LOGGER = getLogger(__name__)
 
 FORWARD, BACK, LEFT, RIGHT = "F", "B", "L", "R"
 
@@ -66,7 +69,7 @@ _HEURISTIC_WEIGHT = 1.0
 @dataclass(frozen=True)
 class Segment:
     kind: str  # F | B | L | R
-    amount: float  # metres or radians
+    amount: float  # meters or radians
 
 
 def _margins(guard: "FootprintGuard") -> Tuple[float, float]:
@@ -201,8 +204,19 @@ def _segments(parent: dict, goal_key) -> List[Segment]:
     return out
 
 
+def describe(plan: List[Segment]) -> str:
+    """Short text for logs: ``back 15 cm, right 70 deg``."""
+    names = {FORWARD: "forward", BACK: "back", LEFT: "left", RIGHT: "right"}
+    return ", ".join(
+        f"{names[s.kind]} {s.amount * 100:.0f} cm"
+        if s.kind in (FORWARD, BACK)
+        else f"{names[s.kind]} {math.degrees(s.amount):.0f} deg"
+        for s in plan
+    )
+
+
 class ManeuverRunner:
-    """Executes a planned manoeuvre one control tick at a time.
+    """Executes a planned maneuver one control tick at a time.
 
     ``step`` returns ``(vx, vtheta)`` while the plan is running and ``None``
     once it has finished or can no longer be followed. Every command is
@@ -256,6 +270,11 @@ class ManeuverRunner:
             self._hold -= 1
 
     def _abort(self) -> None:
+        LOGGER.info(
+            "maneuver: move %d of %d no longer fits; re-planning",
+            self._i + 1,
+            len(self._plan),
+        )
         self.cancel()
         self._hold = self.ABORT_HOLD_TICKS
 
@@ -276,6 +295,13 @@ class ManeuverRunner:
             return None
         self._plan = plan
         self.plans_made += 1
+        LOGGER.info(
+            "maneuver: turn blocked at (%.2f, %.2f, %.0f deg); plan %s",
+            pose.x,
+            pose.y,
+            math.degrees(pose.theta),
+            describe(plan),
+        )
         return self.step(guard, pose, pts)
 
     def step(

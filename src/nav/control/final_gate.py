@@ -45,7 +45,7 @@ def run_final_gate(
     near_x = float("nan")
     near_y = float("nan")
 
-    # A planned manoeuvre from the footprint guard is a sequence: the older
+    # A planned maneuver from the footprint guard is a sequence: the older
     # single-step recoveries (corridor turn, undrivable-nose escape) must not
     # replace one of its moves with their own.
     maneuvering = progress.get("obstacle") == "maneuver"
