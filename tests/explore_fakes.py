@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from src.explore.clients import NavStatus, Pose, SlamStatus
+from src.explore.clients import NavStatus, PaintHold, Pose, SlamStatus
 from src.explore.grid import OccGrid
 from src.geom import conversions as conv
 from src.sim.world import SimWorld
@@ -38,6 +38,8 @@ class FakeSlam:
         self.optimized = 0
         self.keyframes = 0
         self._last_kf: Optional[conv.Pose2D] = None
+        # Tests replace this to say when scans stop fitting the map.
+        self.hold = lambda: PaintHold()
 
     def _cell(self, x: float, y: float) -> Tuple[int, int]:
         m = self.world.map
@@ -91,6 +93,9 @@ class FakeSlam:
         return SlamStatus(
             mode=self.mode, running=self.running, keyframes=self.keyframes
         )
+
+    async def paint_hold(self) -> PaintHold:
+        return self.hold()
 
     async def optimize(self) -> None:
         self.optimized += 1

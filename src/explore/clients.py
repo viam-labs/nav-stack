@@ -36,6 +36,28 @@ class SlamStatus:
     keyframes: int
 
 
+@dataclass
+class PaintHold:
+    """SLAM's report that scans have stopped fitting the map.
+
+    ``held_s`` is 0 while mapping normally. ``verdict`` is what SLAM's own
+    position search last concluded during this hold (empty before the first
+    search): ``recovered``, ``no_better_place``, or why it could not tell.
+    """
+
+    held_s: float = 0.0
+    travel_m: float = 0.0
+    verdict: str = ""
+
+    @property
+    def lost(self) -> bool:
+        """Scans miss and SLAM has not said the pose is fine."""
+        return self.held_s > 0.0 and self.verdict not in (
+            "recovered",
+            "no_better_place",
+        )
+
+
 class NavClient(Protocol):
     async def status(self) -> NavStatus: ...
 
@@ -50,6 +72,8 @@ class SlamClient(Protocol):
     async def occupancy(self) -> Optional[OccGrid]: ...
 
     async def status(self) -> SlamStatus: ...
+
+    async def paint_hold(self) -> PaintHold: ...
 
     async def optimize(self) -> None: ...
 
@@ -128,6 +152,24 @@ class ViamSlamClient:
             mode=str(raw.get("mode", "")),
             running=bool(raw.get("running", False)),
             keyframes=int(raw.get("keyframes") or 0),
+        )
+
+    async def paint_hold(self) -> PaintHold:
+        """Whether scans have stopped fitting the map (builtin SLAM in this module).
+
+        Read in-process: it is asked every tick, and ``get_status`` is a large
+        reply. A SLAM service in another process reports no hold.
+        """
+        runtime = get_slam(self._name) if self._name else None
+        node = getattr(getattr(runtime, "manager", None), "node", None)
+        read = getattr(node, "paint_hold", None)
+        if not callable(read):
+            return PaintHold()
+        raw = read() or {}
+        return PaintHold(
+            held_s=float(raw.get("held_s") or 0.0),
+            travel_m=float(raw.get("travel_m") or 0.0),
+            verdict=str(raw.get("verdict") or ""),
         )
 
     async def optimize(self) -> None:

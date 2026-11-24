@@ -396,7 +396,7 @@ DoCommands:
 | --- | --- | --- |
 | `start` | optional `duration_s` | `{"started": true}` (plus `duration_s` when given) or `{"error": "..."}` |
 | `stop` | — | `{"stopping": true}`; the finish sequence runs as when exploring ends |
-| `status` | — | `{phase, elapsed_s, goals, waypoints, goals_failed, frontier_count, unreachable_frontiers, coverage_cells, keyframes_used, decision_ms, last_error}`, plus `duration_s` / `remaining_s` with a budget, `goal` and `waypoint` while driving to one and `home` once known |
+| `status` | — | `{phase, elapsed_s, goals, waypoints, goals_failed, frontier_count, unreachable_frontiers, coverage_cells, keyframes_used, decision_ms, last_error, relocations}`, plus `duration_s` / `remaining_s` with a budget, `goal` and `waypoint` while driving to one and `home` once known |
 
 How it picks where to go, once a second while the robot drives:
 
@@ -431,6 +431,23 @@ left out that way, so a run that ends with it above zero has gaps in the map.
 Ten failures in a row end the run. Two goals in a row that time out with the
 robot still in the same place end it at once with `last_error` "robot cannot
 move from (x, y)" and no drive home: it is boxed in and needs moving by hand.
+
+**When scans stop fitting the map** (builtin SLAM's `paint.held_s`, read every
+tick), nothing new is being mapped and the pose is running on wheel odometry.
+After 6 s of that, unless SLAM's own position search says the pose is fine
+(`no_better_place`), explore gets the robot back onto the map by itself:
+
+1. It cancels the goal and stands still for 6 s (`phase` `relocating`). SLAM
+   searches for the robot every 2 s, and a stopped scan is the cleanest it gets.
+2. If that does not place it, it drives back along its own trail to where the
+   map was last being painted, 2 m back and then 5 m back, and stops the moment
+   scans fit again. A second time on the way to the same frontier, that frontier
+   is skipped for 10 minutes.
+3. If the robot is still not on the map, the run ends where it stands with
+   `last_error` "lost near (x, y)" and no drive home, for a person to
+   relocalize it.
+
+`relocations` counts how often this happened in a run.
 
 Exploring ends when three scans in a row find no reachable frontier, when
 `duration_s` runs out, on `stop`, or on an unrecoverable error. **Finish**:
@@ -825,7 +842,19 @@ with that height's score (`paint.fit.polish`: `moved`, `kept`,
 `better_fit_farther_away` when the pose matcher has to move it first,
 `no_pose_nearby_passes`; `pose_polishes` counts the moves). `match` says
 which scan the last pose match used: the merged scan, or one height when the
-map explains it clearly better),
+map explains it clearly better. `paint.held_s` and `paint.travel_m` are the
+seconds and meters since a scan last fit the map, 0 while mapping normally.
+After 3 s of that the pose is off by more than the tick recovers from (any
+heading, or about half a meter), and SLAM searches up to 6 m around it for
+where the robot is, each lidar height by itself, every 2 s until a scan is
+painted. It moves the live pose only when the search found no second place
+nearly as good, the deciding height sits on the walls there and much better
+than where it was, and every other height fits better there too. The map and
+the pose graph are not touched: nothing is painted while held, so they hold
+none of the error. `paint.verdict` is the last search's answer: `recovered`,
+`no_better_place` (the pose is as good as anywhere nearby, so the room or the
+map is what changed), or why a better place was not taken (`ambiguous`,
+`weak_fit`, `heights_disagree`); `paint.recover` counts attempts and moves),
 `set_initial_pose`,
 `global_localize` (lidar scan match against saved map; optional `full_map`,
 `search_radius_m`, `apply`, `local_yaw_window_deg`, `max_scan_points`,

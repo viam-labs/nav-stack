@@ -17,7 +17,7 @@ from typing import Awaitable, Callable, List, Optional, Tuple
 
 from viam.logging import getLogger
 
-from .clients import NavClient, NavStatus, Pose, SlamClient
+from .clients import NavClient, NavStatus, PaintHold, Pose, SlamClient
 from .grid import Frontier, FrontierScan, Waypoint, scan_frontiers
 from .legs import LegRunner
 from .scoring import Blacklist, cost
@@ -66,6 +66,21 @@ LOST_POSE_MAX_S = 60.0
 # Ticks in a row with the robot nowhere near traversable mapped space before
 # the run gives up (squeezed against an obstacle, or the map moved under it).
 OFF_MAP_TICKS_MAX = 30
+# No scan has fit the map for this long, and SLAM has not said the pose is
+# fine: stop driving. Nothing new is being mapped, and every meter driven on
+# wheel odometry alone takes the pose farther from where SLAM can find it.
+LOST_PAUSE_S = 6.0
+# Standing still, SLAM searches for the robot every two seconds.
+LOST_STILL_S = 6.0
+# Where the map was being painted, one pose every half meter, newest last.
+TRAIL_SPACING_M = 0.5
+TRAIL_MAX = 80
+# How far back along that trail to drive, in turn, when standing still does
+# not put the robot back on the map. On one robot a person driving it back to
+# ground it had just mapped got scans fitting again.
+BACKTRACK_M = (2.0, 5.0)
+BACKTRACK_TIMEOUT_S = 45.0
+LOST_SAME_FRONTIER_M = 2.0
 SLAM_STATUS_EVERY = 10
 
 
@@ -115,6 +130,12 @@ class _State:
     # Pose at the last goal that timed out with no progress.
     stalled_at: Optional[Pose] = None
     skip_home: bool = False
+    skip_home_reason: str = "robot cannot move"
+    # Poses where the map was being painted (see TRAIL_SPACING_M).
+    trail: List[Pose] = field(default_factory=list)
+    relocations: int = 0
+    # Frontier the robot was heading for the last time it had to drive back.
+    lost_toward: Optional[Tuple[float, float]] = None
     ticks: int = 0
     off_map_ticks: int = 0
 
@@ -141,6 +162,7 @@ class ExploreRun:
         self._started_at: Optional[float] = None
         self._ended_at: Optional[float] = None
         self._s = _State()
+        self._hold = PaintHold()
         self._blacklist = Blacklist()
         self._legs = LegRunner(
             nav,
@@ -180,6 +202,8 @@ class ExploreRun:
             "keyframes_used": self._s.keyframes_used,
             "decision_ms": round(self._s.decision_ms, 1),
             "last_error": self._s.last_error,
+            # Times scans stopped fitting the map and the run had to stop.
+            "relocations": self._s.relocations,
         }
         duration = self._p.duration_s
         if duration is not None:
@@ -281,6 +305,12 @@ class ExploreRun:
                 await self._require_pose()
                 continue
             pose = nav.pose
+            hold = await self._slam.paint_hold()
+            if hold.held_s <= 0.0:
+                self._remember_painted(pose)
+            elif hold.lost and hold.held_s >= LOST_PAUSE_S:
+                await self._recover_position(pose, hold)
+                continue
             self._s.ticks += 1
             if self._s.ticks % SLAM_STATUS_EVERY == 1:
                 self._s.keyframes_used = (await self._slam.status()).keyframes
@@ -330,6 +360,134 @@ class ExploreRun:
             else:
                 empty_scans = 0
             await self._sleep(TICK_S)
+
+    # -- lost while mapping -----------------------------------------------------
+    def _remember_painted(self, pose: Pose) -> None:
+        trail = self._s.trail
+        if trail and math.hypot(pose.x - trail[-1].x, pose.y - trail[-1].y) < (
+            TRAIL_SPACING_M
+        ):
+            return
+        trail.append(pose)
+        del trail[:-TRAIL_MAX]
+
+    def _trail_point(self, back_m: float) -> Optional[Pose]:
+        """The pose ``back_m`` back along the trail, or its start if shorter."""
+        trail = self._s.trail
+        if len(trail) < 2:
+            return None
+        walked = 0.0
+        for newer, older in zip(reversed(trail), reversed(trail[:-1])):
+            walked += math.hypot(newer.x - older.x, newer.y - older.y)
+            if walked >= back_m:
+                return older
+        return trail[0] if walked >= 1.0 else None
+
+    async def _placed_within(self, seconds: float) -> bool:
+        """Stand still up to ``seconds``; True once SLAM has the robot again."""
+        waited = 0.0
+        while waited < seconds:
+            self._check_budget()
+            await self._sleep(TICK_S)
+            waited += TICK_S
+            self._hold = await self._slam.paint_hold()
+            if not self._hold.lost:
+                return True
+        return False
+
+    async def _drive_back(self, target: Pose) -> bool:
+        """Drive to ``target``; True as soon as SLAM has the robot again."""
+        await self._nav.navigate_to_point(target.x, target.y, target.theta)
+        start = self._clock()
+        started = False
+        while True:
+            self._check_budget()
+            await self._sleep(TICK_S)
+            self._hold = await self._slam.paint_hold()
+            if not self._hold.lost:
+                await self._nav.cancel()
+                return True
+            nav = await self._nav.status()
+            started = started or nav.active
+            if started and not nav.active:
+                return False
+            waited = self._clock() - start
+            if waited > BACKTRACK_TIMEOUT_S or (not started and waited > QUICK_FAIL_S):
+                await self._nav.cancel()
+                return False
+
+    async def _recover_position(self, pose: Pose, hold: PaintHold) -> None:
+        """Get the robot back onto the map when scans have stopped fitting it.
+
+        First stand still: SLAM searches for the robot by itself, and a
+        stopped scan is the cleanest one it gets. If that does not place it,
+        drive back along the trail to where the map was last being painted,
+        a little farther each time. Exploring resumes when a scan is painted,
+        when SLAM moves the pose, or when SLAM finds nowhere better (the room
+        changed, not the pose). Otherwise the run ends where the robot
+        stands: driving on, or home, would be on a pose known to be wrong.
+        """
+        goal = self._s.goal
+        await self._drop_goal(cancel=True)
+        await self._stop_base()
+        await self._set_phase("relocating")
+        self._s.relocations += 1
+        self._hold = hold
+        LOGGER.info(
+            "explore: no scan has fit the map for %.0f s (%.1f m driven); "
+            "stopped at (%.2f, %.2f) for SLAM to find the robot",
+            hold.held_s,
+            hold.travel_m,
+            pose.x,
+            pose.y,
+        )
+        how = "standing still"
+        placed = await self._placed_within(LOST_STILL_S)
+        if not placed and goal is not None:
+            # Painting stopped on the way to this frontier. Once can be a
+            # slip anywhere; twice near the same one, try the others first.
+            at = (goal.frontier.goal_x, goal.frontier.goal_y)
+            before = self._s.lost_toward
+            if before is not None and math.hypot(
+                at[0] - before[0], at[1] - before[1]
+            ) < (LOST_SAME_FRONTIER_M):
+                self._blacklist.add(at[0], at[1], self._clock())
+            self._s.lost_toward = at
+        for back_m in () if placed else BACKTRACK_M:
+            target = self._trail_point(back_m)
+            if target is None:
+                break
+            LOGGER.info(
+                "explore: still not on the map; driving back %.0f m to "
+                "(%.2f, %.2f), where the map was last being painted",
+                back_m,
+                target.x,
+                target.y,
+            )
+            how = f"driving back {back_m:g} m"
+            placed = await self._drive_back(target) or await self._placed_within(
+                LOST_STILL_S
+            )
+            if placed:
+                break
+        if not placed:
+            self._s.last_error = (
+                f"lost near ({pose.x:.2f}, {pose.y:.2f}): no scan has fit the map "
+                f"for {self._hold.held_s:.0f} s, and neither standing still nor "
+                "driving back put the robot on it again "
+                f"(SLAM: {self._hold.verdict or 'no search ran'}); relocalize "
+                "it and start explore again"
+            )
+            self._s.skip_home = True
+            self._s.skip_home_reason = "robot is lost"
+            LOGGER.warning("explore: %s", self._s.last_error)
+            raise _Finish()
+        LOGGER.info(
+            "explore: back on the map after %s (%s); exploring again",
+            how,
+            self._hold.verdict or "a scan fit",
+        )
+        await self._set_phase("exploring")
 
     async def _decide(
         self,
@@ -580,7 +738,7 @@ class ExploreRun:
         went_home = False
         reason = "no home pose"
         if self._s.skip_home:
-            reason = "robot cannot move"
+            reason = self._s.skip_home_reason
         elif home is not None:
             for attempt in range(2):
                 if attempt and self._abort_home:

@@ -146,6 +146,14 @@ class BuiltinSlamEngine:
         self._paint_last_at = 0.0
         # What the last fit check scored, and against which pass mark.
         self._paint_fit_detail: Optional[dict] = None
+        # When scans stopped fitting the map, with none painted since, and
+        # how far the robot has driven on odometry alone since then.
+        self._paint_miss_since: Optional[float] = None
+        self._paint_miss_travel_m = 0.0
+        self._recover_last_at = 0.0
+        # What the last position search of this run of misses concluded.
+        self._recover_verdict: Optional[str] = None
+        self._recover_stats: dict = {"attempts": 0, "recovered": 0, "last": None}
         # Which scan the last pose match was made with (see ``_match_pose``).
         self._match_detail: Optional[dict] = None
         # Last time we ran a full-circle heading search to unstick paint.
@@ -1228,6 +1236,10 @@ class BuiltinSlamEngine:
                 self.run_loop_closure()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"builtin SLAM loop closure failed: {exc}")
+            try:
+                self.recover_position_if_held()
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"builtin SLAM position recover failed: {exc}")
 
     # Recompute at most this often; also forced when the grid generation moves.
     _MAP_HEALTH_MIN_S = 5.0
@@ -2544,6 +2556,9 @@ class BuiltinSlamEngine:
                     ),
                     "skips_turning": self._insert_skips_turning,
                     "skips_unmatched": self._insert_skips_unmatched,
+                    # Seconds and meters since a scan last fit the map, and
+                    # what the position search has done about it.
+                    **self.paint_hold(),
                     "map_updates": self._updates,
                     "baseline_trusted": self._baseline_trusted_locked(),
                     "extend_only": not self._baseline_trusted_locked(),
@@ -2680,6 +2695,10 @@ class BuiltinSlamEngine:
             before = self._pose
             predicted = self._predict(odom, now)
             self._pose = predicted
+            if self._paint_miss_since is not None:
+                self._paint_miss_travel_m += math.hypot(
+                    predicted.x - before.x, predicted.y - before.y
+                )
             self._record_odom_step(before, predicted, now)
             self._last_tick_pose, self._last_tick_at = predicted, now
             yaw_rate = 0.0
@@ -3130,6 +3149,127 @@ class BuiltinSlamEngine:
         self._paint_last_at = float(now)
         if fit is not None:
             self._paint_last_fit = str(fit)
+        # A turn or a lidar-odometry hold says nothing about the pose, so
+        # only a painted scan ends a run of misses.
+        if state == "held_unmatched":
+            if self._paint_miss_since is None:
+                self._paint_miss_since = float(now)
+                self._paint_miss_travel_m = 0.0
+                self._recover_verdict = None
+        elif state in ("painting", "extend_only"):
+            self._paint_miss_since = None
+            self._paint_miss_travel_m = 0.0
+            self._recover_verdict = None
+
+    # -- position recovery while paint is held ------------------------------
+    # The tick puts the pose back after a turn (any heading) and after a slip
+    # of up to about half a meter. Past that every scan misses, nothing is
+    # painted, and the pose runs on wheel odometry until a person relocalizes
+    # it. This long with no scan painted is past what the tick recovers from
+    # on its own; a doorway or a moved chair clears in a second or two.
+    _RECOVER_AFTER_S = 3.0
+    # One search is a quarter of a second of matching.
+    _RECOVER_MIN_PERIOD_S = 2.0
+
+    def paint_hold(self) -> dict:
+        """How long scans have gone unpainted for not fitting the map.
+
+        ``held_s`` is 0 while mapping normally. ``travel_m`` is the distance
+        driven since, on odometry alone. ``verdict`` is what the last position
+        search of this hold concluded: ``recovered`` (the pose was moved),
+        ``no_better_place`` (the pose is as good as anywhere nearby, so the
+        room or the map is what changed), any other reason (a better place
+        exists but was not safe to take: the robot is probably lost), or
+        empty before the first search.
+        """
+        now = time.monotonic()
+        with self._lock:
+            since = self._paint_miss_since
+            held = self._mode == MODE_MAPPING and since is not None
+            return {
+                "held_s": round(now - since, 1) if held else 0.0,
+                "travel_m": round(self._paint_miss_travel_m, 2) if held else 0.0,
+                "verdict": (self._recover_verdict or "") if held else "",
+                "recover": {
+                    "attempts": self._recover_stats["attempts"],
+                    "recovered": self._recover_stats["recovered"],
+                    "last": None
+                    if self._recover_stats["last"] is None
+                    else dict(self._recover_stats["last"]),
+                },
+            }
+
+    def recover_position_if_held(self) -> Optional[dict]:
+        """Re-find the pose on the map when no scan has fit it for a while.
+
+        Moves the live pose only. No keyframe is added while paint is held,
+        so the map and the pose graph hold none of the error. Returns the
+        search outcome, or ``None`` when there was nothing to do.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if self._mode != MODE_MAPPING:
+                return None
+            since = self._paint_miss_since
+            if since is None or now - since < self._RECOVER_AFTER_S:
+                return None
+            if now - self._recover_last_at < self._RECOVER_MIN_PERIOD_S:
+                return None
+            # A scan taken in a turn is smeared; the paint check waits too.
+            if self._last_yaw_rate > _SPIN_HOLD_YAW_RATE:
+                return None
+            scan = self._last_scan_obj
+            if scan is None:
+                return None
+            self._recover_last_at = now
+            epoch = self._pose_epoch
+            capture_motion = self._scan_capture_motion()
+            scan_pose = self._pose
+            if capture_motion is not None:
+                scan_pose = conv.compose_poses(
+                    scan_pose, conv.invert_pose(capture_motion)
+                )
+            held_s = now - since
+            travel_m = self._paint_miss_travel_m
+            # The per-height scans of the same lidar read as ``scan``.
+            frames = self._mapping_frames()
+        try:
+            occ_map = self._occupancy_for_match()
+            bands = self._band_scans(frames)
+        except Exception:  # noqa: BLE001
+            return None
+        from . import position_recover
+
+        found = position_recover.find_position(occ_map, scan, bands, scan_pose)
+        outcome = found.as_dict()
+        outcome.update(held_s=round(held_s, 1), travel_m=round(travel_m, 2))
+        new_pose = None
+        with self._lock:
+            self._recover_stats["attempts"] += 1
+            if found.pose is not None and self._pose_epoch != epoch:
+                # A loop closure moved the pose while this searched.
+                outcome.update(recovered=False, reason="pose_moved")
+            elif found.pose is not None:
+                # Carry the robot's motion since the scan across the move.
+                corr = pg.world_correction(scan_pose, found.pose)
+                new_pose = conv.compose_poses(corr, self._pose)
+                self._set_corrected_pose_locked(new_pose)
+                self._recover_stats["recovered"] += 1
+            self._recover_stats["last"] = {"at": time.time(), **outcome}
+            if self._paint_miss_since is not None:
+                self._recover_verdict = str(outcome["reason"])
+        if new_pose is None:
+            return outcome
+        self._notify_pose_listeners(new_pose)
+        self._persist_pose(force=True)
+        self._log(
+            "mapping position recover: moved the pose "
+            f"{found.shift_m:.2f} m {found.shift_deg:.1f} deg to "
+            f"({new_pose.x:.2f}, {new_pose.y:.2f}) after {held_s:.0f} s and "
+            f"{travel_m:.1f} m with no scan fitting the map "
+            f"(fit {outcome.get('score_before')} -> {outcome.get('score_after')})"
+        )
+        return outcome
 
     def _scan_map_fit(self, scan: conv.LaserScan2D, pose: conv.Pose2D) -> str:
         """``open``, ``fit``, or ``miss`` for painting ``scan`` at ``pose``.

@@ -126,6 +126,10 @@ class BuiltinSlamHost:
     ) -> Dict:
         return self._engine.apply_map_pose_correction(pose, score=score, force=force)
 
+    def paint_hold(self) -> Dict:
+        """How long scans have gone unpainted, and what the position search found."""
+        return dict(self._engine.paint_hold())
+
     def set_still_keyframe_hook(self, hook) -> None:
         self._still_keyframe_hook = hook
         self._engine.set_keyframe_hook(self._forward_still_keyframe)

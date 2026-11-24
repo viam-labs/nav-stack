@@ -89,3 +89,36 @@ def test_occupancy_reads_in_process_slam_map_without_docommand():
     finally:
         runtime.unregister_slam("explore-test-slam")
     assert g.cells.shape == (4, 5) and rec.calls == []
+
+
+def test_paint_hold_is_read_in_process_and_is_empty_for_slam_elsewhere():
+    class Node:
+        def paint_hold(self):
+            return {"held_s": 7.5, "travel_m": 3.2, "verdict": "ambiguous"}
+
+    class Manager:
+        node = Node()
+
+    rec = Recorder({})
+    runtime.register_slam(
+        "explore-test-slam", runtime.SlamRuntime(Manager(), None, None)
+    )
+    try:
+        hold = asyncio.run(ViamSlamClient(rec, "explore-test-slam").paint_hold())
+    finally:
+        runtime.unregister_slam("explore-test-slam")
+    assert (hold.held_s, hold.travel_m, hold.verdict) == (7.5, 3.2, "ambiguous")
+    assert hold.lost
+    # SLAM in another process: no hold, and no status call on every tick.
+    none = asyncio.run(ViamSlamClient(rec, "slam-elsewhere").paint_hold())
+    assert none.held_s == 0.0 and not none.lost and rec.calls == []
+
+
+def test_a_hold_counts_as_lost_until_slam_says_the_pose_is_fine():
+    from src.explore.clients import PaintHold
+
+    assert not PaintHold().lost
+    assert PaintHold(held_s=4.0).lost
+    assert PaintHold(held_s=4.0, verdict="heights_disagree").lost
+    assert not PaintHold(held_s=4.0, verdict="recovered").lost
+    assert not PaintHold(held_s=4.0, verdict="no_better_place").lost

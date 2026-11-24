@@ -2,6 +2,7 @@ import asyncio
 import math
 
 from src.explore import run as run_mod
+from src.explore.clients import PaintHold, Pose
 from src.explore.run import ExploreRun, RunParams
 from src.geom import conversions as conv
 from src.sim.world import SimWorld, make_builtin_apartment, make_builtin_corridor
@@ -407,3 +408,122 @@ def test_live_goal_is_not_replaced_before_the_dwell_time():
 
     assert decide(now=103.0, started=100.0) is None  # 3 s in: keep going
     assert decide(now=106.0, started=100.0) is near  # past the dwell: switch
+
+
+# --- Scans stop fitting the map -------------------------------------------------
+# Live tracer2a: the pose slid 2.2 m while mapping. SLAM painted nothing more,
+# and explore drove the robot between frontiers for five minutes on that pose.
+
+
+def _record_goals(nav, run):
+    """Every goal sent to nav, with the phase explore was in."""
+    sent = []
+    orig = nav.navigate_to_point
+
+    async def go(x, y, theta):
+        sent.append((run.status()["phase"], x, y))
+        await orig(x, y, theta)
+
+    nav.navigate_to_point = go
+    return sent
+
+
+def _lost_from(clk, at_s, placed):
+    """A hold that starts at ``at_s`` and lasts until ``placed()`` is true."""
+    done = []
+
+    def hold():
+        t = clk.now()
+        if done or t < at_s:
+            return PaintHold()
+        if placed():
+            done.append(t)
+            return PaintHold()
+        return PaintHold(held_s=t - at_s, travel_m=1.0, verdict="ambiguous")
+
+    return hold
+
+
+def test_a_lost_robot_stops_and_carries_on_once_slam_places_it():
+    w, clk, slam, nav, run, stops = setup(
+        make_builtin_apartment(), seed=(2.0, 2.0, 0.0)
+    )
+    stopped = []
+
+    def placed():
+        # SLAM finds the robot three seconds after it stops moving.
+        if run.status()["phase"] == "relocating":
+            stopped.append(clk.now())
+        return bool(stopped) and clk.now() - stopped[0] >= 3.0
+
+    slam.hold = _lost_from(clk, 20.0, placed)
+    sent = _record_goals(nav, run)
+    final = asyncio.run(run.run())
+    assert final["last_error"] == "" and final["relocations"] == 1
+    assert known_fraction(slam, w) > 0.95
+    # Stopped within a tick of the hold reaching the limit, and never drove back.
+    assert 20.0 + run_mod.LOST_PAUSE_S <= stopped[0] <= 22.0 + run_mod.LOST_PAUSE_S
+    assert stops and not [goal for goal in sent if goal[0] == "relocating"]
+
+
+def test_a_lost_robot_drives_back_to_where_it_was_painting():
+    w, clk, slam, nav, run, _ = setup(make_builtin_apartment(), seed=(2.0, 2.0, 0.0))
+    visited = []
+    stopped = []
+
+    def placed():
+        pose = w.get_pose()
+        if clk.now() < 20.0:
+            visited.append((pose.x, pose.y))
+        if run.status()["phase"] != "relocating":
+            return False
+        stopped.append((pose.x, pose.y))
+        # Scans fit again 1.5 m from where the robot stopped.
+        return math.hypot(pose.x - stopped[0][0], pose.y - stopped[0][1]) >= 1.5
+
+    slam.hold = lambda: (placed() if clk.now() < 20.0 else None) or lost()
+    lost = _lost_from(clk, 20.0, placed)
+    sent = _record_goals(nav, run)
+    final = asyncio.run(run.run())
+    assert final["last_error"] == "" and final["relocations"] == 1
+    back = [goal for goal in sent if goal[0] == "relocating"]
+    assert len(back) == 1
+    # The way back is a place it had already been, before the scans stopped fitting.
+    assert min(math.hypot(back[0][1] - x, back[0][2] - y) for x, y in visited) < 0.6
+    # Exploring went on afterwards.
+    assert sent.index(back[0]) < len(sent) - 1 and sent[-1][0] != "relocating"
+
+
+def test_a_robot_that_stays_lost_ends_the_run_where_it_stands():
+    w, clk, slam, nav, run, stops = setup(
+        make_builtin_apartment(), seed=(2.0, 2.0, 0.0)
+    )
+    slam.hold = _lost_from(clk, 20.0, lambda: False)
+    sent = _record_goals(nav, run)
+    final = asyncio.run(run.run())
+    assert final["last_error"].startswith("lost near (")
+    assert "return home failed: robot is lost" in final["last_error"]
+    # Stood still, drove back twice, then stopped for good: no drive home.
+    assert [goal[0] for goal in sent if goal[0] != "exploring"] == ["relocating"] * 2
+    assert slam.saved == 1 and stops
+    assert clk.now() < 20.0 + 150.0
+
+
+def test_a_room_that_changed_does_not_stop_exploring():
+    """Scans miss, and SLAM says nowhere nearby fits better: the pose is fine."""
+    w, clk, slam, nav, run, _ = setup(make_builtin_apartment(), seed=(2.0, 2.0, 0.0))
+    slam.hold = lambda: PaintHold(held_s=60.0, verdict="no_better_place")
+    final = asyncio.run(run.run())
+    assert final["last_error"] == "" and final["relocations"] == 0
+    assert known_fraction(slam, w) > 0.95
+
+
+def test_the_trail_gives_a_pose_that_far_back_or_its_start():
+    _, _, _, _, run, _ = setup()
+    assert run._trail_point(2.0) is None  # noqa: SLF001
+    for i in range(8):
+        run._remember_painted(Pose(0.5 * i, 0.0, 0.0))  # noqa: SLF001
+        run._remember_painted(Pose(0.5 * i + 0.1, 0.0, 0.0))  # noqa: SLF001  (too close)
+    assert len(run._s.trail) == 8  # noqa: SLF001
+    assert run._trail_point(2.0).x == 1.5  # noqa: SLF001
+    assert run._trail_point(50.0).x == 0.0  # noqa: SLF001
