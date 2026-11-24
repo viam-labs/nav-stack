@@ -2377,6 +2377,12 @@ class BuiltinSlamEngine:
             window_nodes=max(1, int(cfg.builtin_loop_max_window_nodes)),
             max_s=float(getattr(cfg, "builtin_repair_max_s", 600.0)),
         )
+        # The graph is held only while it is copied, and again to apply the
+        # result. The minutes between are spent on the copy. Held throughout,
+        # it kept live loop closure and the optimize before a save from
+        # running at all: on one robot a repair started by a save ran for ten
+        # minutes, the robot explored a 100 m loop in that time with no loop
+        # closure, and mapped a hallway a second time 2 m beside the first.
         with self._graph_job:
             with self._lock:
                 snap = self._graph.snapshot()
@@ -2385,54 +2391,69 @@ class BuiltinSlamEngine:
                 res = float(self._grid.resolution)
                 revision = self._graph_revision
                 edits = list(self._grid_edits)
-            began = time.monotonic()
+        began = time.monotonic()
 
-            def step(done: int, total: int) -> None:
-                self._repair_progress = (int(done), int(total), began)
-                self._yield_cpu()
+        def step(done: int, total: int) -> None:
+            self._repair_progress = (int(done), int(total), began)
+            self._yield_cpu()
 
-            plan = repair.plan_repair(
-                snap,
-                resolution=res,
-                params=params,
-                base=base if trusted else None,
-                should_stop=self._repair_cancel.is_set,
-                progress=step,
+        def outdated() -> bool:
+            # A live correction redrew the map: this plan is for the old one.
+            return self._graph_revision != revision
+
+        plan = repair.plan_repair(
+            snap,
+            resolution=res,
+            params=params,
+            base=base if trusted else None,
+            should_stop=lambda: self._repair_cancel.is_set() or outdated(),
+            progress=step,
+        )
+        # What is left (two renders and the swap) is seconds, not minutes.
+        self._repair_progress = None
+        out: dict = {"status": "no_corrections", **plan.summary()}
+        if outdated():
+            out["status"] = "aborted"
+            self._log(
+                f"map repair ({reason}): stopped after {plan.examined} keyframes; "
+                "the map was corrected while it ran"
             )
-            # What is left (two renders and the swap) is seconds, not minutes.
-            self._repair_progress = None
-            out: dict = {"status": "no_corrections", **plan.summary()}
-            if not plan.clusters:
-                self._log(
-                    f"map repair ({reason}): nothing to correct "
-                    f"({plan.matched}/{plan.examined} keyframes matched, "
-                    f"{plan.rejected} rejected)"
-                )
-                return out
-            before = self._assess_render(snap, snap.poses, base, edits, res)
-            after = self._assess_render(snap, plan.poses, base, edits, res)
-            confident, not_confident = repair.verdict(before, after, plan, params)
-            out.update(
-                before=before.as_dict(),
-                after=after.as_dict(),
-                confident=confident,
-                not_confident=not_confident,
+            return out
+        if not plan.clusters:
+            self._log(
+                f"map repair ({reason}): nothing to correct "
+                f"({plan.matched}/{plan.examined} keyframes matched, "
+                f"{plan.rejected} rejected)"
             )
-            if apply == "auto":
-                do_apply = confident
-            elif apply is True or apply == "force":
-                do_apply = repair.acceptable(before, after, plan)
-            else:
-                do_apply = False
-            if not do_apply:
-                out["status"] = "planned" if apply in (False, "never") else "kept"
-                self._log(
-                    f"map repair ({reason}): not applied "
-                    f"({', '.join(not_confident) or 'dry run'}); "
-                    f"ghost {before.ghost_frac:.2f}->{after.ghost_frac:.2f} "
-                    f"angle_std {before.angle_std_deg:.1f}->"
-                    f"{after.angle_std_deg:.1f}deg"
-                )
+            return out
+        before = self._assess_render(snap, snap.poses, base, edits, res)
+        after = self._assess_render(snap, plan.poses, base, edits, res)
+        confident, not_confident = repair.verdict(before, after, plan, params)
+        out.update(
+            before=before.as_dict(),
+            after=after.as_dict(),
+            confident=confident,
+            not_confident=not_confident,
+        )
+        if apply == "auto":
+            do_apply = confident
+        elif apply is True or apply == "force":
+            do_apply = repair.acceptable(before, after, plan)
+        else:
+            do_apply = False
+        if not do_apply:
+            out["status"] = "planned" if apply in (False, "never") else "kept"
+            self._log(
+                f"map repair ({reason}): not applied "
+                f"({', '.join(not_confident) or 'dry run'}); "
+                f"ghost {before.ghost_frac:.2f}->{after.ghost_frac:.2f} "
+                f"angle_std {before.angle_std_deg:.1f}->"
+                f"{after.angle_std_deg:.1f}deg"
+            )
+            return out
+        with self._graph_job:
+            if outdated():
+                out["status"] = "aborted"
                 return out
             backup = self._backup_map_files(map_dir) if map_dir is not None else False
             with self._lock:
