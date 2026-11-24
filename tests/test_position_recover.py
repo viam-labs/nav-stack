@@ -74,7 +74,7 @@ def test_a_pose_that_is_right_stays_put_when_the_room_has_changed():
     assert found.pose is None and found.reason == "no_better_place"
 
 
-def test_one_height_cannot_move_the_pose_against_the_other():
+def test_one_height_cannot_move_the_pose_against_one_that_fits_where_it_is():
     """The top lidar fits 1.8 m away; the low lidar fits where the robot is."""
     room = _room_map()
     top = _room_ranges(TRUTH)
@@ -86,6 +86,35 @@ def test_one_height_cannot_move_the_pose_against_the_other():
 
     assert found.pose is None
     assert found.reason == "heights_disagree"
+
+
+def test_the_best_height_decides_when_another_sees_what_the_map_does_not():
+    """Live tracer2a, 1.7 m off after a restart.
+
+    The 1.2 m lidar sat on walls on four sides at the right place. The 0.21 m
+    lidar sees furniture standing in front of those walls, and scored worse at
+    the right place than at the wrong one, where it happened to line up with
+    one wall. Asking every height to agree left the robot lost.
+    """
+    room = _room_map()
+    top = _room_ranges(TRUTH)
+    # Fits the wrong pose a little (well short of the paint check) and the
+    # right pose not at all.
+    low = _cluttered(_room_ranges(SLIPPED), share=0.4)
+    bands = _bands(low, top)
+    votes = {v.band: v.score for v in scan_match.height_votes(room, bands, SLIPPED)}
+    assert 0.2 < max(votes.values()) < pr.MIN_SCORE_ALONE
+
+    found = pr.find_position(room, _scan(np.minimum(low, top)), bands, SLIPPED)
+
+    assert found.reason == "recovered" and found.pose is not None
+    assert _far(found.pose, TRUTH) < 0.06 and found.score_after > 0.9
+
+
+def test_a_height_deciding_alone_must_pass_the_paint_check():
+    from src.slam_builtin.engine import _HEIGHT_VOTE_MIN_SCORE
+
+    assert pr.MIN_SCORE_ALONE == _HEIGHT_VOTE_MIN_SCORE
 
 
 def test_two_places_that_look_the_same_are_refused():

@@ -17,6 +17,15 @@ all heights within 10 cm of each other.
 safe to apply while mapping. It only says where the robot is. Nothing in the
 map or the pose graph moves: while paint is held no keyframe is added, so
 the error is in the live pose alone.
+
+The heights do not always agree, and the paint check already knows why: one
+of them is seeing things the map does not have. On the same robot, 1.7 m off
+after a restart, the 1.2 m lidar sat on walls on four sides at the right
+place (0.79 over 500 returns, from -0.09) while the 0.21 m lidar, which there
+sees furniture standing in front of those walls, scored worse at the right
+place than at the wrong one (-0.04 against 0.26). So the best height decides
+here as it does for painting, and a height that does not back it raises the
+bar instead of vetoing.
 """
 
 from __future__ import annotations
@@ -36,15 +45,24 @@ RADII_M = (3.0, 6.0)
 # Total heading window. Heading comes from the gyro and was right when the
 # position was 2.2 m off; a wrong heading alone is recovered by the tick.
 YAW_WINDOW_DEG = 60.0
-# The deciding height must sit on walls this well at the new pose, and this
-# much better than at the old one. 0.5 is seven returns in ten on a wall.
+# With every other height backing it, the deciding height must sit on walls
+# this well at the new pose. 0.5 is seven returns in ten on a wall.
 MIN_SCORE = 0.5
+# The deciding height must fit this much better than it does at the old pose.
 MIN_GAIN = 0.4
-# With one height there is no second opinion, so it has to fit better.
-MIN_SCORE_ONE_HEIGHT = 0.6
-# Every other height has to agree that the new pose is better.
+# Another height backs the new pose when it fits this much better there too.
 OTHER_HEIGHT_MIN_GAIN = 0.2
 OTHER_HEIGHT_MIN_COVERAGE = 0.5
+# Without that backing (or with one height only) the deciding height has to
+# pass the mapping paint check by itself at the new pose (the engine's
+# ``_HEIGHT_VOTE_MIN_SCORE``), and beat the best any height does at the old
+# pose by this much. A height that fits the old pose well keeps the robot
+# there.
+MIN_SCORE_ALONE = 0.65
+MIN_LEAD_ALONE = 0.2
+# The new pose may not judge much less of the scan than the old one: that is
+# winning by moving the misses into unmapped space.
+MIN_COVERAGE = 0.9
 # Closer than this the tick's own matcher can reach it.
 MIN_SHIFT_M = 0.3
 MIN_SHIFT_RAD = math.radians(6.0)
@@ -138,15 +156,15 @@ def find_position(
     same lidar read (empty with lidars at one height); ``pose`` is where the
     robot believes that read was taken.
 
-    Each height searches by itself. The best-fitting answer is kept only if
-    its search found no second place nearly as good, it sits on the walls
-    much better than ``pose`` does, and every other height also fits better
-    there than at ``pose``. Lidars bolted to one robot move together, so a
-    wrong place that happens to suit one height does not suit the others.
+    Each height searches by itself. An answer is kept only if its search
+    found no second place nearly as good and it sits on the walls much better
+    than ``pose`` does. Then either every other height fits better there
+    too, or this height alone passes the paint check there and clearly beats
+    anything any height scores at ``pose``.
     """
     judges = _judges(scan, bands)
-    min_score = MIN_SCORE_ONE_HEIGHT if len(judges) == 1 else MIN_SCORE
     before = {band: _agreement(occ_map, s, pose) for band, s in judges.items()}
+    best_before = max((s for s, _n in before.values() if s is not None), default=0.0)
     # ``no_better_place``: nowhere nearby explains the scan clearly better
     # than ``pose`` does, so the pose is not what is wrong (the room changed,
     # or the map is). Any other reason: a clearly better place exists and it
@@ -166,21 +184,28 @@ def find_position(
             except ValueError:
                 continue
             settled = _settle(occ_map, band_scan, found.pose)
-            score, _judged = _agreement(occ_map, band_scan, settled)
+            score, judged = _agreement(occ_map, band_scan, settled)
             if score is None:
                 continue
             shift_m = math.hypot(settled.x - pose.x, settled.y - pose.y)
             shift_rad = abs(conv.normalize_angle(settled.theta - pose.theta))
-            score_before = before[band][0]
+            score_before, judged_before = before[band]
             if shift_m < MIN_SHIFT_M and shift_rad < MIN_SHIFT_RAD:
                 continue
             if score - (score_before if score_before is not None else 0.0) < MIN_GAIN:
                 continue
+            backed = len(judges) > 1 and _others_back(
+                occ_map, judges, before, band, settled
+            )
             if found.ambiguous:
                 reason = "ambiguous"
-            elif score < min_score:
+            elif judged < MIN_COVERAGE * judged_before:
                 reason = "weak_fit"
-            elif not _others_agree(occ_map, judges, before, band, settled):
+            elif backed:
+                reason = "recovered" if score >= MIN_SCORE else "weak_fit"
+            elif score < MIN_SCORE_ALONE:
+                reason = "weak_fit"
+            elif score < best_before + MIN_LEAD_ALONE:
                 reason = "heights_disagree"
             else:
                 reason = "recovered"
@@ -205,13 +230,14 @@ def find_position(
     return Recovery(None, "no_better_place", radius_m=float(radii_m[-1]))
 
 
-def _others_agree(
+def _others_back(
     occ_map: OccupancyMap,
     judges: Mapping,
     before: Mapping,
     decided_by,
     pose: conv.Pose2D,
 ) -> bool:
+    """True when every other height also fits clearly better at ``pose``."""
     for band, band_scan in judges.items():
         if band == decided_by:
             continue

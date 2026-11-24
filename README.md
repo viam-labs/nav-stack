@@ -848,8 +848,11 @@ After 3 s of that the pose is off by more than the tick recovers from (any
 heading, or about half a meter), and SLAM searches up to 6 m around it for
 where the robot is, each lidar height by itself, every 2 s until a scan is
 painted. It moves the live pose only when the search found no second place
-nearly as good, the deciding height sits on the walls there and much better
-than where it was, and every other height fits better there too. The map and
+nearly as good and the deciding height sits on the walls there much better
+than where it was. Then either every other height fits better there too, or
+the deciding height passes the paint check there by itself and clearly beats
+anything any height scores at the old pose (another height may be seeing
+furniture the map does not have, as for painting). The map and
 the pose graph are not touched: nothing is painted while held, so they hold
 none of the error. `paint.verdict` is the last search's answer: `recovered`,
 `no_better_place` (the pose is as good as anywhere nearby, so the room or the
