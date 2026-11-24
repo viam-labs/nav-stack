@@ -118,6 +118,7 @@ class ViamWorldIO:
         scan_provider: Optional[Callable[[float], Optional[conv.LaserScan2D]]] = None,
         localization_hold_provider: Optional[Callable[[], Optional[dict]]] = None,
         localization_check_provider: Optional[Callable[[], Optional[dict]]] = None,
+        slam_mode_provider: Optional[Callable[[], Optional[str]]] = None,
     ):
         self._slam = slam
         self._base = base
@@ -150,6 +151,7 @@ class ViamWorldIO:
         self._scan_provider = scan_provider
         self._localization_hold_provider = localization_hold_provider
         self._localization_check_provider = localization_check_provider
+        self._slam_mode_provider = slam_mode_provider
         self._zone_masks = None  # optional ZoneMaskPublisher from BuiltinNavHost
         self._skip_get_laser_scan: set[str] = set()
         self._map_cache: Optional[dict] = None
@@ -1208,7 +1210,23 @@ class ViamWorldIO:
         return check if isinstance(check, dict) else None
 
     def slam_mode(self) -> Optional[str]:
-        """``mapping`` or ``localizing`` from the in-process SLAM service."""
+        """``mapping`` or ``localizing`` from the in-process SLAM service.
+
+        Under viam-server the ``slam`` dependency is a gRPC client stub with
+        no ``slam_mode``, so nav never saw ``mapping`` on a real robot and ran
+        its mid-drive localization check against the half-built map: stop,
+        settle 0.5 s, check (skipped: not localizing), resume, every 0.75 s.
+        Turns came out as 0.15 s pulses, about 1 deg/s. The provider reads
+        the SLAM service registered in this process instead.
+        """
+        provider = self._slam_mode_provider
+        if provider is not None:
+            try:
+                mode = provider()
+            except Exception:  # noqa: BLE001 - never block drive on a mode read
+                mode = None
+            if mode:
+                return str(mode)
         slam = self._slam
         fn = getattr(slam, "slam_mode", None)
         if not callable(fn):

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from ..motion.simple_motion import DriveCommand, distance_m
 from .controller import compute_path_command
+from .escape import EscapeResult
 from .replan_controller import apply_escape_pre_replan
 
 if TYPE_CHECKING:
@@ -58,6 +59,9 @@ def run_path_follow(
         guard=nav._guard,  # noqa: SLF001
         guard_extra_pts=tick.mem_pts,
         scan_world_pts=tick.scan_world_pts,
+        # The block policy has committed to a heading round an obstacle on
+        # the route: that turn is its, not a maneuver's.
+        allow_maneuver=tick.corridor_yaw is None,
     )
     ep.rotate_active = bool(progress.get("rotate_to_heading"))
     ep.local_planner_active = bool(progress.get("local_planner"))
@@ -106,7 +110,13 @@ def run_path_follow(
         "distance_remaining_m": distance_m(tick.pose, tick.goal),
     }
 
-    escape_pre = ep.escape_m.tick_pre(tick.escape_sense(nav, ep))
+    if obs_state == "maneuver":
+        # The guard is part-way through a planned maneuver. The escape
+        # machine's own bounded reverse / wait freeze would replace its moves.
+        ep.escape_m.reset()
+        escape_pre = EscapeResult()
+    else:
+        escape_pre = ep.escape_m.tick_pre(tick.escape_sense(nav, ep))
     if escape_pre.replan_trigger is not None:
         outcome = apply_escape_pre_replan(
             nav, ep, tick, trigger=escape_pre.replan_trigger

@@ -39,6 +39,11 @@ from ..motion.base_envelope import (
 )
 from ..planning.costmap import LETHAL
 from ..types import Pose2D
+from .maneuver import ManeuverRunner
+
+# How much closer the body may get to a point it is already within
+# ``min_gap_m`` of (numerical slack only).
+TOUCHING_SLACK_M = 0.002
 
 
 @dataclass(frozen=True)
@@ -80,7 +85,7 @@ class GuardConfig:
 class GuardResult:
     vx: float
     vtheta: float
-    state: str  # clear | slow | steer | rotate | blocked
+    state: str  # clear | slow | steer | rotate | blocked | maneuver
     free_m: float
     rotation_blocked: bool
 
@@ -269,6 +274,10 @@ class FootprintGuard:
         self.cfg = cfg
         self._hl = cfg.length_m / 2.0
         self._hw = cfg.width_m / 2.0
+        # Multi-point maneuver for a turn that is blocked where the body
+        # stands (see ``maneuver``). Only the follower's own call (``plan``)
+        # starts, advances or cancels it; veto calls leave it alone.
+        self.maneuver = ManeuverRunner()
 
     # --- primitives ---------------------------------------------------
     def _split(self, pose: Pose2D, pts: np.ndarray, padding: Optional[float] = None):
@@ -291,10 +300,13 @@ class FootprintGuard:
         pts = pts[~body]
         near = _inside(here, pts, self._hl + p, self._hw + p)[0]
         near_pts = pts[near]
-        floor = np.maximum(
-            self.cfg.min_gap_m,
-            _rect_dist(here, near_pts, self._hl, self._hw)[0] - self.cfg.near_slack_m,
-        )
+        dist = _rect_dist(here, near_pts, self._hl, self._hw)[0]
+        floor = np.maximum(self.cfg.min_gap_m, dist - self.cfg.near_slack_m)
+        # A point already closer than ``min_gap_m`` (parked against a table
+        # leg, or lidar noise on one 2 cm away) used to fail that floor at the
+        # current pose, which blocked every motion, including straight away
+        # from it. Such a point may not be approached, but it may be left.
+        floor = np.minimum(floor, np.maximum(0.0, dist - TOUCHING_SLACK_M))
         return pts[~near], near_pts, floor
 
     def _hits(
@@ -417,23 +429,67 @@ class FootprintGuard:
         max_dist_m: Optional[float] = None,
         prefer_sign: float = 0.0,
         allow_steer: bool = True,
+        plan: bool = False,
+        maneuver_ok: bool = True,
     ) -> GuardResult:
+        """Shape one command so the rectangle does not hit anything.
+
+        ``plan`` marks the follower's own call for this tick. Only that call
+        may run a multi-point maneuver when a turn is blocked; the final
+        gate's veto calls (``plan=False``) only check a command.
+        ``maneuver_ok=False`` says something else owns the turn this tick
+        (the blocked-path logic is steering round an obstacle): no maneuver
+        is started and a running one is dropped.
+        """
         cfg = self.cfg
+        if plan:
+            self.maneuver.tick()
+            if not maneuver_ok:
+                self.maneuver.cancel()
         horizon = cfg.horizon_m
         if max_dist_m is not None:
             horizon = max(0.1, min(horizon, float(max_dist_m) + cfg.stop_gap_m + 0.05))
         if abs(vx) < 1e-3:
             if abs(vtheta) < 1e-3:
+                if plan:
+                    # The follower wants nothing (at the goal): a half-run
+                    # maneuver must not resume later from a stale start.
+                    self.maneuver.cancel()
                 return GuardResult(0.0, 0.0, "clear", math.inf, False)
+            if plan and self.maneuver.active:
+                # Mid-maneuver: finish it. It may be turning the other way
+                # or translating to make the room this turn needs.
+                move = self.maneuver.step(self, pose, pts)
+                if move is not None:
+                    return GuardResult(move[0], move[1], "maneuver", math.inf, False)
+            if plan and maneuver_ok and self.maneuver.holding:
+                # A plan was just abandoned. Stand still for a moment, then
+                # plan again from where the robot now is.
+                return GuardResult(0.0, 0.0, "maneuver", math.inf, False)
             free = self.free_rotation(pose, math.copysign(1.0, vtheta), pts)
             if free >= min(cfg.rot_horizon_rad, abs(vtheta) * 0.5 + cfg.rot_step_rad):
                 return GuardResult(0.0, vtheta, "clear", math.inf, False)
             if allow_steer:
+                if plan and maneuver_ok:
+                    # The turn does not fit here. Search for a short sequence
+                    # of moves (other way, back up, ...) that ends facing the
+                    # route with room to drive.
+                    move = self.maneuver.start(self, pose, pts, target)
+                    if move is not None:
+                        return GuardResult(
+                            move[0], move[1], "maneuver", math.inf, False
+                        )
+                # No maneuver within reach: creep along a free forward arc
+                # in case the room to turn is further on.
                 alt = self.best_forward_arc(pose, pts, target, horizon, prefer_sign)
                 if alt is not None:
                     return GuardResult(alt[0], alt[1], "steer", alt[2], True)
             return GuardResult(0.0, 0.0, "blocked", 0.0, True)
 
+        if plan:
+            # The follower is translating again (driving on, or its short
+            # reverse at the goal): any maneuver has done its job.
+            self.maneuver.cancel()
         free = self.free_distance(pose, vx, vtheta, pts, horizon)
         v_ok = self._regulate(vx, free)
         need = cfg.alt_min_free_m if allow_steer else cfg.stop_gap_m + 0.02

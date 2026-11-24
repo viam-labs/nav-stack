@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, List, Optional, Tuple
 
 from viam.logging import getLogger
@@ -36,6 +36,15 @@ HANDOFF_M = 1.0
 SEEN_RADIUS_M = 0.5
 # A live goal is only replaced by a frontier at least this much cheaper.
 REPLACE_MARGIN_M = 2.0
+# ... and only after the live goal has been pursued this long. On tracer2a
+# three goal changes in five seconds (west, south-east, west) spun the robot
+# 112 degrees beside furniture and left it wedged.
+GOAL_MIN_DWELL_S = 5.0
+# A frontier must be found in this many scans in a row before it can become
+# a goal. Small frontiers flicker in and out as the map settles; one that
+# vanished 1.2 s after it was chosen caused the spin above.
+FRONTIER_PERSIST_SCANS = 3
+FRONTIER_TRACK_M = 1.0
 # Goals closer than this to the current one are the same frontier.
 SAME_GOAL_M = 0.75
 # Nav plans on its own copy of the map, which can lag the live one by a moment:
@@ -43,6 +52,10 @@ SAME_GOAL_M = 0.75
 # this soon after sending is retried once before the goal is blacklisted.
 QUICK_FAIL_S = 3.0
 PROGRESS_TIMEOUT_S = 30.0
+# Two goals in a row that time out with the robot still in the same place
+# mean it cannot move at all: stop and say so, every other goal needs it to.
+STUCK_MOVE_M = 0.2
+STUCK_TURN_RAD = math.radians(20.0)
 PROGRESS_MIN_M = 0.3
 # Scans in a row with no reachable frontier before the space counts as mapped
 # (lets the map catch up with the last scans).
@@ -77,6 +90,7 @@ class _Goal:
     sent_at: float
     best_path_m: float
     progress_at: float
+    started_at: float = 0.0
 
 
 @dataclass
@@ -96,6 +110,11 @@ class _State:
     goal: Optional[_Goal] = None
     last_target: Optional[Tuple[float, float]] = None
     quick_failed: Optional[Tuple[float, float]] = None
+    # (x, y, scans seen in a row) for each frontier in the latest scan.
+    tracks: List[Tuple[float, float, int]] = field(default_factory=list)
+    # Pose at the last goal that timed out with no progress.
+    stalled_at: Optional[Pose] = None
+    skip_home: bool = False
     ticks: int = 0
     off_map_ticks: int = 0
 
@@ -293,13 +312,14 @@ class ExploreRun:
             ranked = sorted(
                 scan.frontiers, key=lambda f: cost(f, pose.x, pose.y, pose.theta)
             )
+            self._track(ranked)
             nxt = await self._decide(nav, pose, scan, ranked, now)
             open_count = len(self._open(ranked, now))
             self._s.frontier_count = open_count
             self._s.unreachable_frontiers = len(ranked) - open_count
             if nxt is not None:
                 await self._send(nxt, pose, now, scan)
-            if self._s.goal is None and self._best(ranked, now) is None:
+            if self._s.goal is None and not self._open(ranked, now):
                 empty_scans += 1
                 if empty_scans >= EMPTY_SCANS_TO_FINISH:
                     LOGGER.info(
@@ -359,6 +379,28 @@ class ExploreRun:
             g.best_path_m, g.progress_at = remaining, now
         elif now - g.progress_at > PROGRESS_TIMEOUT_S:
             stalled = True
+        if stalled:
+            was = self._s.stalled_at
+            if (
+                was is not None
+                and math.hypot(pose.x - was.x, pose.y - was.y) < STUCK_MOVE_M
+                and abs(
+                    math.atan2(
+                        math.sin(pose.theta - was.theta),
+                        math.cos(pose.theta - was.theta),
+                    )
+                )
+                < STUCK_TURN_RAD
+            ):
+                self._s.last_error = (
+                    f"robot cannot move from ({pose.x:.2f}, {pose.y:.2f}): two goals in a "
+                    "row made no progress. It is probably boxed in and needs moving by hand"
+                )
+                self._s.skip_home = True
+                LOGGER.info("explore: %s", self._s.last_error)
+                await self._drop_goal(cancel=True)
+                raise _Finish()
+            self._s.stalled_at = pose
         if remaining is None or stalled:
             # Unreachable now, or no progress: blacklist it and move on.
             self._blacklist.add(f.goal_x, f.goal_y, now)
@@ -399,8 +441,10 @@ class ExploreRun:
             ),
             None,
         )
-        if current is not None and (
-            cost(best, pose.x, pose.y, pose.theta) + REPLACE_MARGIN_M
+        if (
+            current is not None
+            and now - g.started_at >= GOAL_MIN_DWELL_S
+            and cost(best, pose.x, pose.y, pose.theta) + REPLACE_MARGIN_M
             < cost(current, pose.x, pose.y, pose.theta)
         ):
             return best
@@ -412,8 +456,37 @@ class ExploreRun:
         ]
 
     def _best(self, ranked: List[Frontier], now: float) -> Optional[Frontier]:
-        open_ = self._open(ranked, now)
-        return open_[0] if open_ else None
+        """Cheapest frontier that is not blacklisted and has persisted."""
+        for f in self._open(ranked, now):
+            if self._age(f) >= FRONTIER_PERSIST_SCANS:
+                return f
+        return None
+
+    def _age(self, f: Frontier) -> int:
+        return max(
+            (
+                n
+                for x, y, n in self._s.tracks
+                if math.hypot(f.goal_x - x, f.goal_y - y) < 1e-6
+            ),
+            default=0,
+        )
+
+    def _track(self, frontiers: List[Frontier]) -> None:
+        """Count how many scans in a row each frontier has been found."""
+        prev = self._s.tracks
+        tracks: List[Tuple[float, float, int]] = []
+        for f in frontiers:
+            seen = max(
+                (
+                    n
+                    for x, y, n in prev
+                    if math.hypot(f.goal_x - x, f.goal_y - y) <= FRONTIER_TRACK_M
+                ),
+                default=0,
+            )
+            tracks.append((f.goal_x, f.goal_y, seen + 1))
+        self._s.tracks = tracks
 
     async def _send(
         self, f: Frontier, pose: Pose, now: float, scan: FrontierScan
@@ -447,12 +520,14 @@ class ExploreRun:
             # Next leg toward the same frontier: progress keeps counting from
             # the leg before, so a frontier that never gets closer still times out.
             best_path_m, progress_at = prev.best_path_m, prev.progress_at
+            started_at = prev.started_at
         else:
-            best_path_m, progress_at = f.path_m, now
-        self._s.goal = _Goal(f, wp, now, best_path_m, progress_at)
+            best_path_m, progress_at, started_at = f.path_m, now, now
+        self._s.goal = _Goal(f, wp, now, best_path_m, progress_at, started_at)
 
     def _goal_reached(self) -> None:
         self._s.consecutive_failures = 0
+        self._s.stalled_at = None
         self._s.goal = None
 
     async def _drop_goal(self, *, cancel: bool) -> None:
@@ -504,7 +579,9 @@ class ExploreRun:
         home = self._s.home
         went_home = False
         reason = "no home pose"
-        if home is not None:
+        if self._s.skip_home:
+            reason = "robot cannot move"
+        elif home is not None:
             for attempt in range(2):
                 if attempt and self._abort_home:
                     reason = "stop requested"

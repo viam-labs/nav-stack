@@ -13,8 +13,10 @@ from .grid import Frontier
 GAIN_PER_M = 0.3
 GAIN_CAP_M = 6.0
 # Metres of path one radian of heading change is worth. Fewer and gentler
-# turns keep scan matching healthy and avoid back-and-forth zig-zags.
-TURN_M_PER_RAD = 0.5
+# turns keep scan matching healthy and avoid back-and-forth zig-zags, and a
+# rectangular body turning round beside furniture is how it gets wedged:
+# turning round costs as much as about 3 m of driving.
+TURN_M_PER_RAD = 1.0
 
 
 @dataclass

@@ -299,3 +299,99 @@ def test_max_linear_velocity_caps_and_reaches_commanded_speed(
     assert r.state == "succeeded", d
     peak = max(abs(vx) for *_, vx, _ in r.trace)
     assert peak == pytest.approx(max_linear_velocity), d
+
+
+def _pocket(width, depth_in, mapped):
+    """Nose-in in a dead-end pocket the body fits in but cannot turn in.
+
+    The goal is behind the robot, outside. Live tracer2a (1.3.0, exploring):
+    the follower alternated a forward crawl and a bounded reverse for minutes
+    and every replan failed, so the robot never left.
+    """
+    g = sim.blank(10.0, 6.0)
+    y0, y1 = 3.0 - width / 2, 3.0 + width / 2
+    walls = [
+        (5.0, y0 - 0.1, 7.5, y0),
+        (5.0, y1, 7.5, y1 + 0.1),
+        (7.5, y0 - 0.1, 7.6, y1 + 0.1),
+    ]
+    extras = []
+    for wall in walls:
+        if mapped:
+            sim.box(g, *wall)
+        else:
+            extras.append(wall)
+    return g, Pose2D(5.0 + depth_in, 3.0, 0.0), Pose2D(2.0, 3.0, math.pi), extras
+
+
+@pytest.mark.parametrize("mapped", [True, False])
+@pytest.mark.parametrize("width", [0.75, 0.85])
+@pytest.mark.parametrize("depth", [1.0, 1.9])
+def test_backs_out_of_a_pocket_too_narrow_to_turn_in(monkeypatch, width, depth, mapped):
+    grid, start, goal, extras = _pocket(width, depth, mapped)
+    r = sim.run(
+        grid,
+        start,
+        goal,
+        extra_obstacles=extras,
+        monkeypatch=monkeypatch,
+        max_sim_s=90.0,
+    )
+    d = _detail(r)
+    assert r.contacts == 0, "body contact: " + d
+    assert r.state == "succeeded", d
+    assert r.sim_s < 70.0, d
+    # Backs straight out: never crawls deeper into the pocket.
+    assert max(x for _t, x, _y, _vx, _w in r.trace) <= start.x + 0.05, d
+
+
+def _boxed_in():
+    """Parked beside low furniture, as tracer2a was (1.3.1-rc3).
+
+    Furniture 5.5 cm off the right flank from mid-body back, a cabinet 25 cm
+    past the nose on the right half, a wall 25 cm behind; open floor on the
+    left. None of it is on the map. The body cannot turn in place either way
+    for long, and has about 15 cm of travel fore and aft.
+    """
+    g = sim.blank(10.0, 8.0)
+    x, y = 5.0, 4.0  # facing +x; the right side is -y
+    hw, hl = sim.WIDTH / 2, sim.LENGTH / 2
+    extras = [
+        (x - 0.35, y - hw - 0.105, x - 0.10, y - hw - 0.055),
+        (x + hl + 0.25, y - 0.6, x + hl + 0.30, y + 0.05),
+        (x - hl - 0.30, y - 0.6, x - hl - 0.25, y + 0.3),
+    ]
+    return g, Pose2D(x, y, 0.0), extras
+
+
+@pytest.mark.parametrize(
+    "bearing,noise,seed",
+    [
+        (94, False, 0),  # route to the open side
+        (150, False, 0),  # route behind, on the open side
+        (-120, False, 0),  # route behind, past the furniture
+        (94, True, 1),
+        (150, True, 3),
+        (-120, True, 4),
+    ],
+)
+def test_gets_out_when_boxed_in_beside_furniture(monkeypatch, bearing, noise, seed):
+    # Before the maneuver search every one of these shuffled a few cm forward
+    # and back until the time cap without turning.
+    grid, start, extras = _boxed_in()
+    b = math.radians(bearing)
+    goal = Pose2D(start.x + 3.0 * math.cos(b), start.y + 3.0 * math.sin(b), 0.0)
+    r = sim.run(
+        grid,
+        start,
+        goal,
+        extra_obstacles=extras,
+        monkeypatch=monkeypatch,
+        max_sim_s=120.0,
+        noise=noise,
+        seed=seed,
+    )
+    d = _detail(r)
+    assert r.contacts == 0, "body contact: " + d
+    assert r.state == "succeeded", d
+    assert r.sim_s < 100.0, d
