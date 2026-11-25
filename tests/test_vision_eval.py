@@ -273,3 +273,184 @@ def test_replaying_a_run_maps_it_and_scores_the_pose_against_truth():
     grid = np.asarray(result.map["grid"])
     assert (grid >= 65).sum() > 100 and (grid == 0).sum() > 1000
     assert time.monotonic() < 1e9 and callable(time.monotonic)
+
+
+# --- Pose tracking in a known map -----------------------------------------------
+
+from src.nav.localize.global_localize import OccupancyMap  # noqa: E402
+from tools.vision_eval.tracking_eval import (  # noqa: E402
+    START_STD,
+    evaluate_tracking,
+    perturbed_starts,
+    track,
+)
+
+
+def _room_map() -> OccupancyMap:
+    """The 6 m x 4 m room ``_RoomRun`` drives in, as the dataset's map would draw it."""
+    res = 0.05
+    grid = np.full((120, 160), -1, dtype=np.int16)  # 8 m x 6 m around the room
+    ox, oy = -4.0, -3.0
+    xs = ox + (np.arange(160) + 0.5) * res
+    ys = oy + (np.arange(120) + 0.5) * res
+    gx, gy = np.meshgrid(xs, ys)
+    inside = (np.abs(gx) < 3.0) & (np.abs(gy) < 2.0)
+    grid[inside] = 0
+    wall = inside & ((np.abs(gx) > 3.0 - res) | (np.abs(gy) > 2.0 - res))
+    grid[wall] = 100
+    return OccupancyMap(grid=grid, resolution=res, origin_x=ox, origin_y=oy)
+
+
+def test_tracking_follows_the_robot_in_the_map_and_scores_without_alignment():
+    # Odometry over-reads distance by 10%; the map has to hold the pose.
+    run = track(_RoomRun(odom_scale=1.1), _room_map())
+    summary = run.summary()
+    assert summary["samples"] > 100
+    assert summary["rmse_cm"] < 5.0 and summary["under_10cm_pct"] > 95.0
+    assert summary["heading_rmse_deg"] < 2.0
+    # Odometry alone would have ended 0.24 m long.
+    assert np.hypot(*(run.est[-1, :2] - run.truth[-1, :2])) < 0.08
+    # Scored against the truth at the time of the data, not re-fitted.
+    pos, _yaw = run.errors()
+    assert pos.size == run.stamps.size == run.truth.shape[0]
+
+
+def test_a_start_off_by_the_benchmarks_spread_is_pulled_onto_the_map():
+    room = _room_map()
+    first = _RoomRun().gt_pose(100.0 + 1.0 / 15.0)
+    start = conv.Pose2D(first.x + 0.15, first.y - 0.1, first.theta + math.radians(6.0))
+    run = track(_RoomRun(), room, start)
+    pos, yaw = run.errors()
+    assert pos[0] > 0.1  # it did start off
+    assert pos[-20:].max() < 0.05 and yaw[-20:].max() < 2.0
+
+
+def test_drawn_starts_follow_the_benchmarks_spread_and_repeat_with_the_seed():
+    first = conv.Pose2D(1.0, 2.0, 0.5)
+    starts = perturbed_starts(first, 400, seed=3)
+    dx = np.array([s.x - first.x for s in starts])
+    dth = np.array([conv.normalize_angle(s.theta - first.theta) for s in starts])
+    assert np.std(dx) == pytest.approx(START_STD[0], rel=0.15)
+    assert np.std(dth) == pytest.approx(START_STD[2], rel=0.15)
+    again = perturbed_starts(first, 400, seed=3)
+    assert [(s.x, s.y, s.theta) for s in again] == [(s.x, s.y, s.theta) for s in starts]
+
+
+def test_evaluation_reports_the_true_start_and_the_spread_over_drawn_starts():
+    out = evaluate_tracking(_RoomRun(), _room_map(), starts=2, log=lambda *_: None)
+    assert out["true_start"]["rmse_cm"] < 5.0
+    drawn = out["drawn_starts"]
+    assert len(drawn["runs"]) == 2 and "rmse_cm" in drawn["mean"]
+    assert all(r["start_offset_m"] >= 0.0 for r in drawn["runs"])
+
+
+def test_with_the_service_a_restart_a_meter_off_is_put_right():
+    """The engine alone cannot pull a pose 1 m off back onto the walls.
+
+    A robot restarting from a saved pose that far off is put right by the
+    SLAM service's startup localize, which the replay runs on the
+    recording's clock.
+    """
+    room = _room_map()
+    first = _RoomRun(seconds=10.0).gt_pose(100.0 + 1.0 / 15.0)
+    start = conv.Pose2D(first.x + 1.0, first.y, first.theta)
+
+    alone = track(_RoomRun(seconds=10.0), room, start)
+    pos, _ = alone.errors()
+    assert pos[-15:].max() > 0.5 and alone.service_moves == []
+
+    served = track(_RoomRun(seconds=10.0), room, start, service=True)
+    pos, _ = served.errors()
+    assert pos[-15:].max() < 0.05
+    assert len(served.service_moves) == 1
+    stamp, before, after = served.service_moves[0]
+    assert np.hypot(before.x - after.x, before.y - after.y) > 0.8
+    assert any("startup" in line for line in served.service_log)
+
+
+def test_the_service_replay_repeats_exactly():
+    room = _room_map()
+    first = _RoomRun(seconds=10.0).gt_pose(100.0 + 1.0 / 15.0)
+    start = conv.Pose2D(first.x, first.y + 0.8, first.theta)
+    a = track(_RoomRun(seconds=10.0), room, start, service=True)
+    b = track(_RoomRun(seconds=10.0), room, start, service=True)
+    assert np.array_equal(a.est, b.est) and a.service_log == b.service_log
+    # The service's loggers are put back afterwards.
+    from src.models import slam as slam_module
+
+    assert type(slam_module.LOGGER).__name__ != "_Recorder"
+
+
+# --- The challenge's scoring and format --------------------------------------------
+
+from tools.vision_eval.challenge import (  # noqa: E402
+    load_tum,
+    pose_scores,
+    run_errors,
+    score_submission,
+    write_tum,
+)
+
+
+def test_each_pose_earns_the_score_of_the_tightest_band_it_is_in():
+    pos = np.array([0.01, 0.03, 0.03, 0.15, 0.5])
+    yaw = np.array([0.5, 1.5, 4.5, 9.0, 0.0])
+    # 2 cm/1 deg -> 100; 4 cm/2 deg -> 80; 3 cm but 4.5 deg -> 20 (10 cm/5 deg);
+    # 15 cm/9 deg -> 10; 50 cm -> 0.
+    assert list(pose_scores(pos, yaw)) == [100.0, 80.0, 20.0, 10.0, 0.0]
+
+
+def test_a_submission_round_trips_with_one_pose_per_stamp(tmp_path):
+    stamps = np.array([1.0, 1.0, 2.0, 3.0])  # two ticks shared an odometry sample
+    poses = np.array(
+        [[0.0, 0.0, 0.1], [0.5, 0.0, 0.2], [1.0, 0.0, -3.0], [2.0, 1.0, 3.0]]
+    )
+    write_tum(tmp_path / "run_1.txt", stamps, poses)
+    t, p = load_tum(tmp_path / "run_1.txt")
+    assert list(t) == [1.0, 2.0, 3.0]
+    assert p[0] == pytest.approx([0.5, 0.0, 0.2])  # the later estimate is kept
+    assert p[2, 2] == pytest.approx(3.0)
+
+
+def test_run_errors_hold_the_localizer_before_its_first_pose_and_score_from_the_start():
+    gt_t = np.arange(0.0, 10.0, 0.5)
+    gt_p = np.column_stack([gt_t, np.zeros_like(gt_t), np.zeros_like(gt_t)])
+    loc_t = np.array([4.0, 9.5])
+    loc_p = np.array([[4.0, 0.0, 0.0], [9.5, 0.0, 0.0]])
+    pos, yaw = run_errors(gt_t, gt_p, 2.0, loc_t, loc_p)
+    assert pos.size == (gt_t >= 2.0).sum()
+    # Before its first pose the localizer is held there: 2 m off at t = 2.
+    assert pos[0] == pytest.approx(2.0) and pos[-1] == pytest.approx(0.0)
+    assert yaw.max() == pytest.approx(0.0)
+
+
+def test_a_submission_is_scored_on_the_runs_whose_ground_truth_is_here(tmp_path):
+    """A data folder holding one run scores that run, not a missing-file error."""
+    gt_t = np.arange(0.0, 300.0, 0.5)
+    gt_p = np.column_stack([gt_t * 0.01, np.zeros_like(gt_t), np.zeros_like(gt_t)])
+    write_tum(tmp_path / "data" / "static_0" / "gt_poses.txt", gt_t, gt_p)
+    for k in (1, 2, 3):
+        write_tum(tmp_path / "sub" / "static_0" / f"run_{k}.txt", gt_t, gt_p)
+    scores = score_submission(tmp_path / "sub", tmp_path / "data")
+    assert list(scores["sequences"]) == ["static_0"]
+    assert scores["overall"] == pytest.approx(100.0)
+
+
+def test_the_services_lost_filter_does_not_commit_in_a_room_that_looks_the_same_both_ways():
+    """A bare rectangle looks identical turned half a turn: two equal clusters.
+
+    Run through the SLAM service as on a robot with no saved pose: its lost
+    filter must keep both rather than hand one to the tracker.
+    """
+    room = _room_map()
+    run = track(
+        _RoomRun(seconds=10.0), room, service=True, global_start=True, lost_filter=True
+    )
+    assert run.lost_filter is not None and run.lost_filter["updates"] > 0
+    assert run.lost_filter["handovers"] == 0
+    assert run.lost_filter["phase"] == "finding"
+
+
+def test_the_lost_filter_is_part_of_the_service():
+    with pytest.raises(ValueError):
+        track(_RoomRun(seconds=1.0), _room_map(), service=False, lost_filter=True)

@@ -34,6 +34,7 @@ def occupancy_map_from_int16(
 
 # Endpoints within this many cells of a wall count as hits.
 _INFLATE_CELLS = 2
+INFLATE_CELLS = _INFLATE_CELLS
 
 
 def occupied_lookup(

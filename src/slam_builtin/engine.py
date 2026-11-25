@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Optional
@@ -87,6 +88,17 @@ def rewind_spin_poses(odom_poses: list, end: conv.Pose2D) -> list:
     return out
 
 
+@dataclass(frozen=True)
+class _MatchBase:
+    """The last match grid built, to patch where scans painted since."""
+
+    geom: tuple  # origin, resolution, shape, whether cleared holes are masked
+    int16: np.ndarray
+    lookup: np.ndarray
+    known_cells: int
+    patches: int  # patched builds since the last full one
+
+
 class BuiltinSlamEngine:
     """In-process 2D occupancy mapping + localization."""
 
@@ -136,6 +148,9 @@ class BuiltinSlamEngine:
         # Relative motion between two times is frame-independent, so a scan
         # can be matched at the pose it was taken from even across corrections.
         self._odom_chain = conv.Pose2D(0.0, 0.0, 0.0)
+        # Odometry followed while localizing waits for its first seed.
+        self._unseeded_odom_pose: Optional[conv.Pose2D] = None
+        self._unseeded_odom_at: Optional[float] = None
         self._odom_hist: deque = deque(maxlen=64)
         self._last_scan_latency_s = float("nan")
         self._last_yaw_rate = 0.0
@@ -206,6 +221,10 @@ class BuiltinSlamEngine:
         self._pending_count = 0
         # Cached int16 occupancy grid for scan matching (invalidated on map edits).
         self._occ_cache: Optional[OccupancyMap] = None
+        # The last match grid built, and the world boxes painted since; None
+        # when something else changed and only a full build will do.
+        self._occ_base: Optional[_MatchBase] = None
+        self._occ_dirty: Optional[list] = None
         self._occ_cache_epoch = -1
         self._match_epoch = 0
         self._occ_cache_known = 0.0
@@ -2574,11 +2593,17 @@ class BuiltinSlamEngine:
         self._log(f"map repair undone; restored files from {backup.name}/")
         return {"status": "restored", "mode": mode}
 
-    def _invalidate_occ_cache(self) -> None:
+    def _invalidate_occ_cache(self, touched: Optional[list] = None) -> None:
+        """The match grid is out of date: everywhere, or only in ``touched`` world boxes."""
         self._match_epoch += 1
         self._occ_cache = None
         self._occ_cache_lookup = None
         self._occ_cache_epoch = -1
+        if touched is None:
+            self._occ_dirty = None
+            self._occ_base = None
+        elif self._occ_dirty is not None:
+            self._occ_dirty.extend(touched)
 
     def _occupancy_for_match(self) -> OccupancyMap:
         """Scan-match grid. The int16 convert runs outside the pose lock."""
@@ -2591,29 +2616,123 @@ class BuiltinSlamEngine:
             grid = self._grid
             epoch = self._match_epoch
             has_clears = any(e[0] == "clear_box" for e in self._grid_edits)
-        int16 = occ.to_occupancy_int16(grid)
-        if has_clears:
-            # A cleared hole is free to the planner but says nothing about
-            # where the walls are. Judged as free, every return from a wall
-            # inside it counted against the scan and painting never resumed.
-            int16[grid.log_odds == np.float32(occ.CLEARED_LOG_ODDS)] = -1
+            base = self._occ_base
+            dirty = None if self._occ_dirty is None else list(self._occ_dirty)
+        geom = (
+            float(grid.origin_x),
+            float(grid.origin_y),
+            float(grid.resolution),
+            grid.log_odds.shape,
+            bool(has_clears),
+        )
+        patched = None
+        if (
+            base is not None
+            and dirty is not None
+            and base.geom == geom
+            and base.patches < self._OCC_PATCHES_BEFORE_FULL
+        ):
+            patched = self._patched_match_grid(base, grid, dirty, has_clears)
+        if patched is not None:
+            int16, lookup, known_cells = patched
+            patches = base.patches + 1
+        else:
+            int16 = occ.to_occupancy_int16(grid)
+            if has_clears:
+                # A cleared hole is free to the planner but says nothing about
+                # where the walls are. Judged as free, every return from a wall
+                # inside it counted against the scan and painting never resumed.
+                int16[grid.log_odds == np.float32(occ.CLEARED_LOG_ODDS)] = -1
+            lookup = scan_match.occupied_lookup(
+                scan_match.occupancy_map_from_int16(
+                    int16,
+                    resolution=grid.resolution,
+                    origin_x=grid.origin_x,
+                    origin_y=grid.origin_y,
+                )
+            )
+            known_cells = int(np.count_nonzero(int16 >= 0))
+            patches = 0
         occ_map = scan_match.occupancy_map_from_int16(
             int16,
             resolution=grid.resolution,
             origin_x=grid.origin_x,
             origin_y=grid.origin_y,
         )
-        lookup = scan_match.occupied_lookup(occ_map)
-        known = float(np.mean(int16 >= 0))
+        known = known_cells / float(int16.size) if int16.size else 0.0
         with self._lock:
             if self._grid is grid and self._match_epoch == epoch:
                 self._occ_cache = occ_map
                 self._occ_cache_lookup = lookup
                 self._occ_cache_epoch = epoch
                 self._occ_cache_known = known
+                self._occ_base = _MatchBase(geom, int16, lookup, known_cells, patches)
+                self._occ_dirty = []
             elif self._occ_cache is None:
                 self._occ_cache_known = known
         return occ_map
+
+    # Rebuild the whole match grid after this many patched ones, so nothing
+    # a patch could miss lasts long.
+    _OCC_PATCHES_BEFORE_FULL = 50
+
+    @staticmethod
+    def _patched_match_grid(
+        base: "_MatchBase", grid: LogOddsGrid, dirty: list, has_clears: bool
+    ) -> Optional[tuple]:
+        """``base`` brought up to ``grid`` where ``dirty`` says it changed, else None.
+
+        Every step is cell by cell except the wall dilation, which is redone
+        over the changed box plus its reach, so the result is the full build's.
+        """
+        int16 = base.int16
+        lookup = base.lookup
+        known_cells = base.known_cells
+        if not dirty:
+            return int16, lookup, known_cells
+        h, w = int16.shape
+        res = float(grid.resolution)
+        x0 = min(b[0] for b in dirty)
+        y0 = min(b[1] for b in dirty)
+        x1 = max(b[2] for b in dirty)
+        y1 = max(b[3] for b in dirty)
+        c0 = max(0, int(math.floor((x0 - grid.origin_x) / res)) - 1)
+        r0 = max(0, int(math.floor((y0 - grid.origin_y) / res)) - 1)
+        c1 = min(w, int(math.ceil((x1 - grid.origin_x) / res)) + 1)
+        r1 = min(h, int(math.ceil((y1 - grid.origin_y) / res)) + 1)
+        if r0 >= r1 or c0 >= c1:
+            return int16, lookup, known_cells
+        if (r1 - r0) * (c1 - c0) > 0.5 * h * w:
+            return None  # most of the map: a full build is as cheap
+        int16 = int16.copy()
+        old = int16[r0:r1, c0:c1]
+        known_cells -= int(np.count_nonzero(old >= 0))
+        lo = grid.log_odds[r0:r1, c0:c1]
+        new = occ.to_occupancy_int16(
+            LogOddsGrid(log_odds=lo, resolution=res, origin_x=0.0, origin_y=0.0)
+        )
+        if has_clears:
+            new[lo == np.float32(occ.CLEARED_LOG_ODDS)] = -1
+        int16[r0:r1, c0:c1] = new
+        known_cells += int(np.count_nonzero(new >= 0))
+        # The dilation reaches ``k`` cells: redo it over the box grown by k,
+        # from the walls in the box grown by 2k.
+        k = int(scan_match.INFLATE_CELLS)
+        lr0, lr1 = max(0, r0 - k), min(h, r1 + k)
+        lc0, lc1 = max(0, c0 - k), min(w, c1 + k)
+        sr0, sr1 = max(0, lr0 - k), min(h, lr1 + k)
+        sc0, sc1 = max(0, lc0 - k), min(w, lc1 + k)
+        window = scan_match.occupied_lookup(
+            OccupancyMap(
+                grid=int16[sr0:sr1, sc0:sc1],
+                resolution=res,
+                origin_x=0.0,
+                origin_y=0.0,
+            )
+        )
+        lookup = lookup.copy()
+        lookup[lr0:lr1, lc0:lc1] = window[lr0 - sr0 : lr1 - sr0, lc0 - sc0 : lc1 - sc0]
+        return int16, lookup, known_cells
 
     def _occupied_lookup_for(self, occ_map: OccupancyMap) -> Optional[np.ndarray]:
         """Cached wall mask for ``occ_map`` when it is the current cache entry."""
@@ -2681,6 +2800,43 @@ class BuiltinSlamEngine:
                 break
         return conv.compose_poses(conv.invert_pose(c_at), c_new)
 
+    def _follow_odom_unseeded(
+        self, odom: Optional[conv.OdomReading], now: float
+    ) -> None:
+        """Extend the odometry chain while the map pose waits for its first seed.
+
+        Only the chain moves. The pose, the odometry state ``_predict`` keeps
+        and the twist the service reads (it takes a robot with no pose yet as
+        parked) stay as they were, so nothing but the lost filter sees it.
+        """
+        if odom is None:
+            return
+        prev_at = self._unseeded_odom_at
+        self._unseeded_odom_at = now
+        if odom.pose is not None:
+            prev = self._unseeded_odom_pose
+            self._unseeded_odom_pose = odom.pose
+            if prev is None:
+                return
+            step = conv.compose_poses(conv.invert_pose(prev), odom.pose)
+            gap = max(0.0, now - prev_at) if prev_at is not None else 0.0
+            if math.hypot(step.x, step.y) > max(0.5, 0.6 * gap):
+                return  # an odometry reset, not motion
+        else:
+            if prev_at is None:
+                return
+            dt = min(max(0.0, now - prev_at), 0.5)
+            if getattr(self._cfg, "base_velocity_convention", "viam") in (
+                BASE_VELOCITY_Y_FORWARD
+            ):
+                fwd, left = float(odom.vy), -float(odom.vx)
+            else:
+                fwd, left = float(odom.vx), float(odom.vy)
+            step = conv.Pose2D(fwd * dt, left * dt, float(odom.vtheta) * dt)
+        # The chain only: ``_odom_hist`` (scan-timing compensation) stays as
+        # it was before seeding.
+        self._odom_chain = conv.compose_poses(self._odom_chain, step)
+
     def _record_odom_step(
         self, before: conv.Pose2D, after: conv.Pose2D, now: float
     ) -> None:
@@ -2707,6 +2863,26 @@ class BuiltinSlamEngine:
     def get_odom_twist(self) -> tuple[float, float, float]:
         with self._lock:
             return self._last_odom_twist
+
+    def odometry_chain(self) -> conv.Pose2D:
+        """Odometry alone, composed since the engine started (no scan corrections)."""
+        with self._lock:
+            return self._odom_chain
+
+    def latest_scan(self) -> Optional[conv.LaserScan2D]:
+        """The newest merged scan the engine has read."""
+        return self._last_scan_obj
+
+    def awaiting_seed(self) -> bool:
+        """Localizing with no pose yet: no saved pose, no full-map seed landed."""
+        with self._lock:
+            return self._mode == MODE_LOCALIZING and self._seed_localize_pending
+
+    def localization_map(self) -> tuple[int, OccupancyMap]:
+        """``(identity, map)`` the scans are matched against; identity changes with the map."""
+        occ = self._occupancy_for_match()
+        with self._lock:
+            return id(self._grid), occ
 
     def get_map(self) -> dict:
         with self._lock:
@@ -2994,6 +3170,9 @@ class BuiltinSlamEngine:
         if seed_pending:
             # Hold absolute pose at whatever set_pose/origin is until a full-map
             # seed lands — do not odom-integrate from an assumed start point.
+            # The odometry chain still follows, for the lost filter.
+            with self._lock:
+                self._follow_odom_unseeded(odom, now)
             if scan is None:
                 return
             if now - self._last_seed_attempt_at < 2.0:
@@ -4035,6 +4214,7 @@ class BuiltinSlamEngine:
             protect = self._session_baseline if extend_only else None
             stored = dict(self._height_bands)
         drawn = []
+        touched: list = []
         if prepared[0][3]:
             bands = {b: occ.copy_grid(g) for b, g in stored.items()}
             if not bands and np.any(np.abs(src.log_odds) > 0.05):
@@ -4047,6 +4227,7 @@ class BuiltinSlamEngine:
                     src,
                     extend_only=extend_only,
                     protect=protect,
+                    touched=touched,
                 )
                 first_band, primary = next(iter(band_scans.items()))
                 extras = list(band_scans.items())[1:]
@@ -4070,6 +4251,7 @@ class BuiltinSlamEngine:
                     else 30.0,
                     extend_only=extend_only,
                     protect=protect,
+                    touched=touched,
                 )
                 drawn.append((scan, pose_snap, now, scan, None, 0))
         hooks = []
@@ -4105,7 +4287,7 @@ class BuiltinSlamEngine:
                     self._generation += 1
             # The next scan is judged against this paint. Leaving the match
             # grid stale would let a wrong heading draw for another 20 scans.
-            self._invalidate_occ_cache()
+            self._invalidate_occ_cache(touched=touched)
         for hook, scan, pose_snap in hooks:
             try:
                 hook(scan, [], pose_snap)
@@ -4160,6 +4342,7 @@ class BuiltinSlamEngine:
         *,
         extend_only: bool = False,
         protect: Optional[LogOddsGrid] = None,
+        touched: Optional[list] = None,
     ) -> None:
         """Draw one read's per-height scans into ``bands`` (updated in place).
 
@@ -4191,6 +4374,7 @@ class BuiltinSlamEngine:
                 range_max=limit if math.isfinite(limit) else 30.0,
                 extend_only=extend_only,
                 protect=protect,
+                touched=touched,
             )
         shapes = {(g.origin_x, g.origin_y, g.log_odds.shape) for g in bands.values()}
         if len(shapes) > 1:

@@ -67,6 +67,7 @@ class ReplaySensors:
         self._odom_t, self._odom_pose, self._odom_twist = seq.odometry()
         self._scan: Optional[conv.LaserScan2D] = None
         self._scan_taken = float("nan")
+        self.odom_taken = float("nan")
 
     def get_scan(self, max_age_s: float = 2.0, *, fresh: bool = False):
         del fresh
@@ -87,6 +88,9 @@ class ReplaySensors:
         i = int(np.searchsorted(self._odom_t, stamp, side="right")) - 1
         if i < 0:
             return None
+        # When the sample the engine is given was taken: the pose it then
+        # publishes describes the robot at that moment, not at the tick.
+        self.odom_taken = float(self._odom_t[i])
         x, y, yaw = self._odom_pose[i]
         vx, vy, wz = self._odom_twist[i]
         return conv.OdomReading(

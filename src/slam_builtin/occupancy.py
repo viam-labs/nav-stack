@@ -302,8 +302,13 @@ def insert_scan(
     max_beams: int = 180,
     extend_only: bool = False,
     protect: Optional[LogOddsGrid] = None,
+    touched: Optional[list] = None,
 ) -> LogOddsGrid:
     """Ray-cast a lidar scan into the log-odds grid (mutates + may expand).
+
+    ``touched``, when given, receives the world box ``(x0, y0, x1, y1)`` of
+    the cells this scan can have changed: those between the sensor and its
+    endpoints.
 
     With ``extend_only``, only unobserved cells are written — already free or
     occupied cells stay put. Used when the resumed map baseline is untrusted
@@ -366,6 +371,19 @@ def insert_scan(
         protect_lo=protect_lo,
         protect_offset=protect_offset,
     )
+    if touched is not None:
+        r0 = min(int(row0), int(rows1.min()))
+        r1 = max(int(row0), int(rows1.max())) + 1
+        c0 = min(int(col0), int(cols1.min()))
+        c1 = max(int(col0), int(cols1.max())) + 1
+        touched.append(
+            (
+                grid.origin_x + c0 * res,
+                grid.origin_y + r0 * res,
+                grid.origin_x + c1 * res,
+                grid.origin_y + r1 * res,
+            )
+        )
     return grid
 
 

@@ -5,6 +5,8 @@
     python tools/eval_vision.py place           # place-recognition recall
     python tools/eval_vision.py reloc           # lost-pose recovery, lidar vs camera+lidar
     python tools/eval_vision.py mapping         # replay a run through SLAM, score the trajectory
+    python tools/eval_vision.py tracking        # localize in the dataset's map, as the benchmark does
+    python tools/eval_vision.py challenge       # find and track with no initial pose, as the challenge scores it
 
 ``place`` builds a place index from the mapping run, then asks for each frame
 of a later run whether a keyframe near the true pose is among the top guesses.
@@ -15,6 +17,18 @@ stack's whole-map lidar search with a lidar search seeded by place guesses.
 mapping mode, on a clock that follows the recording, and compares the pose it
 publishes and the keyframes it ends with against ground truth: with lidar loop
 closure off and on, and with the vision supervisor (person mask) alongside.
+
+``tracking`` runs the SLAM engine in localizing mode on the dataset's own map,
+from the true first pose and from ten drawn around it, and scores every pose
+against ground truth with no alignment: the benchmark paper's pose-tracking
+protocol and columns (Trekel et al., IROS 2025, Table III).
+
+``challenge`` runs the localizer the way the benchmark's public challenge
+does: from 0, 120 and 240 s into each public run (0, 30 and 60 s for the
+short one), with no initial pose, to the end. It writes the runs in the
+challenge's submission format and scores them with the challenge's bands,
+next to the challenge's own AMCL example when that has been fetched
+(``tools/fetch_lilocbench.py --challenge-example``).
 
 Results are printed and written as JSON next to the dataset cache.
 """
@@ -37,9 +51,52 @@ from tools.vision_eval.lilocbench import LilocSequence, load_reference_map  # no
 from tools.vision_eval.place_eval import evaluate_place  # noqa: E402
 from tools.vision_eval.reloc_eval import evaluate_reloc  # noqa: E402
 from tools.vision_eval.replay import odometry_trajectory, replay_mapping  # noqa: E402
+from tools.vision_eval.tracking_eval import CameraCheck, evaluate_tracking, track  # noqa: E402
 
 DEFAULT_DATA = Path.home() / "datasets" / "lilocbench"
 DEFAULT_QUERIES = ("dynamics_0", "lt_changes_0")
+# Every run with public ground truth after the mapping run: static, people,
+# moved furniture, both.
+TRACKING_QUERIES = ("static_0", "dynamics_0", "lt_changes_0", "lt_changes_dynamics_0")
+LIDAR_SETS = {"both": ("front", "rear"), "front": ("front",)}
+LOCALIZERS = {
+    "engine": "the SLAM engine alone (like for like with the paper's localizers)",
+    "service": "the SLAM service around it, as on a robot: startup localize and "
+    "periodic relocalize",
+    "emcl2": "a particle filter with expansion resetting (after Ueda's emcl2), "
+    "for comparison",
+}
+
+
+def _print_tracking(name: str, result: dict) -> None:
+    print(
+        f"\n{name}: pose tracking in the dataset's map, every pose against ground truth"
+    )
+    print(
+        f"  {'lidars':<14} {'start':<12} {'rmse cm':>8} {'max cm':>8} {'<5cm %':>7} "
+        f"{'<10cm %':>8} {'rmse deg':>9} {'max deg':>8} {'<2deg %':>8} {'<4deg %':>8}"
+    )
+
+    def row(label, start, m, sd=None):
+        def cell(key, width, nd):
+            if sd is None:
+                return f"{m[key]:>{width}.{nd}f}"
+            text = f"{m[key]:.{nd}f}±{sd[key]:.{nd}f}"
+            return f"{text:>{width}}"
+
+        print(
+            f"  {label:<14} {start:<12} {cell('rmse_cm', 8, 2)} {cell('max_cm', 8, 1)} "
+            f"{cell('under_5cm_pct', 7, 1)} {cell('under_10cm_pct', 8, 1)} "
+            f"{cell('heading_rmse_deg', 9, 2)} {cell('heading_max_deg', 8, 1)} "
+            f"{cell('under_2deg_pct', 8, 1)} {cell('under_4deg_pct', 8, 1)}"
+        )
+
+    for label, res in result.items():
+        row(label, "true pose", res["true_start"])
+        drawn = res.get("drawn_starts")
+        if drawn:
+            n = len(drawn["runs"])
+            row(label, f"{n} drawn", drawn["mean"], drawn["std"])
 
 
 def _pct(value: Optional[float]) -> str:
@@ -135,12 +192,130 @@ def _print_mapping(name: str, result: dict) -> None:
         )
 
 
+def _run_challenge(args, cache: Path) -> int:
+    from tools.vision_eval.challenge import (
+        START_TIMES,
+        groups_line,
+        score_submission,
+        write_tum,
+    )
+
+    ref = load_reference_map(args.data)
+    t0 = time.monotonic()
+    report = {}
+    for who in args.localizer:
+        for label in args.lidars:
+            name = (
+                f"{label}_{who}"
+                + ("_lost_filter" if args.lost_filter else "")
+                + ("_camera" if args.lost_filter_camera else "")
+            )
+            folder = cache / "challenge" / name
+            for seq_name in args.queries or START_TIMES:
+                seq = LilocSequence(args.data, seq_name, camera=args.camera)
+                seq.lidars = LIDAR_SETS[label]
+                seq.deskew = None if args.deskew == "none" else args.deskew
+                camera = None
+                if args.lost_filter_camera:
+                    mapping = LilocSequence(args.data, args.mapping, camera=args.camera)
+                    camera = CameraCheck(seq, mapping, cache)
+                for k, start in enumerate(START_TIMES[seq_name], 1):
+                    run = track(
+                        seq,
+                        ref,
+                        service=who == "service",
+                        start_offset_s=start,
+                        global_start=True,
+                        lost_filter=args.lost_filter,
+                        camera=camera,
+                    )
+                    for line in run.service_log:
+                        if line.startswith("lost filter"):
+                            print(f"    {line}", flush=True)
+                    write_tum(folder / seq_name / f"run_{k}.txt", run.stamps, run.est)
+                    print(
+                        f"  {name} {seq_name} run_{k}: {run.wall_s:.0f} s", flush=True
+                    )
+            (folder / "description.json").write_text(
+                json.dumps(
+                    {
+                        "name": f"nav-stack {name}",
+                        "pdf_url": "",
+                        "code_url": "",
+                        "short_description": "scan-matching tracker; replayed offline",
+                    },
+                    indent=2,
+                )
+            )
+            report[name] = score_submission(folder, args.data)
+    amcl = args.data / "challenge" / "amcl_example"
+    if amcl.is_dir():
+        report["amcl_example"] = score_submission(amcl, args.data)
+    print("\nchallenge scores (0-100; bands from 2 cm / 1 deg to 20 cm / 10 deg)")
+    for name, scores in report.items():
+        print(f"  {name:<34} overall {scores['overall']:5.1f} | {groups_line(scores)}")
+    out = cache / "results_challenge.json"
+    out.write_text(json.dumps(report, indent=2))
+    print(f"\n{time.monotonic() - t0:.0f} s; results written to {out}")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("experiment", choices=["place", "reloc", "mapping"])
+    ap.add_argument(
+        "experiment", choices=["place", "reloc", "mapping", "tracking", "challenge"]
+    )
     ap.add_argument("--data", type=Path, default=DEFAULT_DATA)
     ap.add_argument("--mapping", default="mapping")
-    ap.add_argument("--queries", nargs="+", default=list(DEFAULT_QUERIES))
+    ap.add_argument(
+        "--queries",
+        nargs="+",
+        default=None,
+        help=f"runs to query (default {' '.join(DEFAULT_QUERIES)}; "
+        f"tracking: {' '.join(TRACKING_QUERIES)})",
+    )
+    ap.add_argument(
+        "--starts",
+        type=int,
+        default=10,
+        help="tracking only: drawn starting poses after the true one",
+    )
+    ap.add_argument(
+        "--lidars",
+        nargs="+",
+        default=list(LIDAR_SETS),
+        choices=list(LIDAR_SETS),
+        help="tracking only: both lidars as the stack runs, or the front one "
+        "the dataset's map was drawn from",
+    )
+    ap.add_argument(
+        "--deskew",
+        choices=["none", "first", "last"],
+        default="none",
+        help="tracking only: undo the robot's motion during each lidar sweep, "
+        "taking a scan's stamp as the time of its first or last beam",
+    )
+    ap.add_argument(
+        "--lost-filter",
+        action="store_true",
+        help="tracking and challenge: the SLAM service's lost filter (a particle "
+        "filter over the whole map that finds a robot with no pose) is on; it is "
+        "off otherwise, so runs compare with and without it",
+    )
+    ap.add_argument(
+        "--lost-filter-camera",
+        action="store_true",
+        help="challenge only, with --lost-filter: the filter does not hand over "
+        "or move the tracker while the camera's place ranking clearly backs "
+        "another place (keyframes from the --mapping run)",
+    )
+    ap.add_argument(
+        "--localizer",
+        nargs="+",
+        default=["engine", "service"],
+        choices=list(LOCALIZERS),
+        help="tracking only: " + "; ".join(f"{k} = {v}" for k, v in LOCALIZERS.items()),
+    )
     ap.add_argument("--camera", default="front")
     ap.add_argument(
         "--stride", type=int, default=None, help="use every Nth query frame"
@@ -171,6 +346,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     cache = args.data / "cache"
+    if args.experiment == "challenge":
+        return _run_challenge(args, cache)
+    if args.experiment == "tracking":
+        ref = load_reference_map(args.data)
+        report = {}
+        t0 = time.monotonic()
+        for name in args.queries or TRACKING_QUERIES:
+            seq = LilocSequence(args.data, name, camera=args.camera)
+            seq.deskew = None if args.deskew == "none" else args.deskew
+            report[name] = {}
+            for who in args.localizer:
+                for label in args.lidars:
+                    seq.lidars = LIDAR_SETS[label]
+                    report[name][f"{label} {who}"] = evaluate_tracking(
+                        seq,
+                        ref,
+                        starts=args.starts,
+                        localizer=who,
+                        lost_filter=args.lost_filter,
+                    )
+            _print_tracking(name, report[name])
+        out = cache / "results_tracking.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, indent=2))
+        print(f"\n{time.monotonic() - t0:.0f} s; results written to {out}")
+        return 0
     if args.experiment == "mapping":
         report = {}
         t0 = time.monotonic()
@@ -181,6 +382,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report[name] = _run_mapping(seq, feats, cache, args.variants)
             _print_mapping(name, report[name])
         out = cache / "results_mapping.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(report, indent=2))
         print(f"\n{time.monotonic() - t0:.0f} s; results written to {out}")
         return 0
@@ -189,7 +391,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     occ = load_reference_map(args.data) if args.experiment == "reloc" else None
     report = {}
     t0 = time.monotonic()
-    for name in args.queries:
+    for name in args.queries or DEFAULT_QUERIES:
         query = LilocSequence(args.data, name, camera=args.camera)
         feats = ensure_features(query, cache)
         if args.experiment == "place":
