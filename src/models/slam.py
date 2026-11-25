@@ -447,6 +447,9 @@ class SlamService(SLAM):
         self._cancel_periodic_relocalize_task()
         self._cancel_mapping_revisit_task()
         self._cancel_startup_global_localize_task()
+        # Again, now that the old mode's checks are cancelled: one of them
+        # may have published while the new session was loading.
+        self._forget_pose_checks()
         self._schedule_periodic_relocalize(loop)
         self._schedule_mapping_revisit(loop)
         self._schedule_startup_global_localize(loop)
@@ -483,6 +486,10 @@ class SlamService(SLAM):
                     sleep_s = float(mgr.mapping_revisit_interval_s(interval_s))
                 except Exception:  # noqa: BLE001
                     sleep_s = float(interval_s)
+            if self._last_revisit_check.get("status") == "awaiting_confirm":
+                # The robot stands and nothing is painted until the second
+                # look: take it as soon as the first has had time to settle.
+                sleep_s = 0.0
             await asyncio.sleep(max(3.0, sleep_s))
             try:
                 await self._mapping_revisit_cycle()
@@ -767,6 +774,55 @@ class SlamService(SLAM):
 
     def _publish_relocalize_check(self, result: Mapping[str, ValueTypes]) -> dict:
         return self._localize._publish_relocalize_check(result)
+
+    def _forget_pose_checks(self) -> None:
+        """Drop the last relocalize and revisit verdicts: a new session has begun.
+
+        They describe the pose and map of the session that just ended, and
+        navigation reads them to decide whether it has a pose it can trust.
+        Nothing in mapping replaces a relocalize verdict. On one robot a
+        large jump was left awaiting its second confirmation when SLAM went
+        from localizing back to mapping; navigation reported no trusted pose
+        for the whole mapping session, and explore accepted a start, waited
+        a minute for a pose and gave up without moving.
+        """
+        for check in (self._last_relocalize_check, self._last_revisit_check):
+            # Emptied in place: navigation holds these same dicts.
+            check.clear()
+            check["status"] = "idle"
+        self._pose_jump_gate.clear()
+        self._soft_nav_hold_since = None
+        self._soft_nav_hold_released = False
+        self._last_relocalize_check["state"] = self._loc_state.snapshot()
+        self._sync_paint_with_pending_jump()
+
+    def pending_pose_jump(self) -> Optional[dict]:
+        """A jump of meters that a check has found once and is yet to confirm.
+
+        Navigation holds the drive on the same status. Explore reads this, in
+        this process, so that it neither sets off again nor drives back along
+        its trail before the second look.
+        """
+        for check in (self._last_revisit_check, self._last_relocalize_check):
+            if check.get("status") != "awaiting_confirm":
+                continue
+            return {
+                "shift_m": float(
+                    check.get("jump_shift_m") or check.get("shift_m") or 0.0
+                ),
+                "shift_deg": float(
+                    check.get("jump_shift_deg") or check.get("shift_deg") or 0.0
+                ),
+                "confirm_count": int(check.get("confirm_count") or 0),
+                "confirm_needed": int(check.get("confirm_needed") or 0),
+            }
+        return None
+
+    def _sync_paint_with_pending_jump(self) -> None:
+        """Hold mapping paint for as long as the revisit check awaits its second look."""
+        hold = getattr(self._manager, "hold_paint_while_pose_in_doubt", None)
+        if callable(hold):
+            hold(self._last_revisit_check.get("status") == "awaiting_confirm")
 
     def _mark_pose_seeded(self, reason: str) -> None:
         """A pose was placed by hand or by an applied search: tracking again."""
@@ -1469,6 +1525,7 @@ class SlamService(SLAM):
         stem = handle.serialization_stem if handle else None
         self._manager.start_slam(stem, mode)
         self._cfg.mode = mode
+        self._forget_pose_checks()
         # Slice reference geometry is pose-graph-relative; a (re)started SLAM
         # session invalidates it.
         self._reset_slice_library()
@@ -1483,6 +1540,7 @@ class SlamService(SLAM):
         if mode == MODE_MAPPING and mgr.slam_running() and mgr.reset_slam_map():
             if self._cfg is not None:
                 self._cfg.mode = mode
+            self._forget_pose_checks()
             # The in-place reset wiped the pose graph, so pose-graph-relative
             # slice/keyframe references are stale too.
             self._reset_slice_library()

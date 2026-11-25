@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from src.explore.clients import NavStatus, Pose, SlamStatus
+from src.explore.clients import NavStatus, PaintHold, Pose, SlamStatus
 from src.explore.grid import OccGrid
 from src.geom import conversions as conv
 from src.sim.world import SimWorld
@@ -38,6 +38,10 @@ class FakeSlam:
         self.optimized = 0
         self.keyframes = 0
         self._last_kf: Optional[conv.Pose2D] = None
+        # Tests replace this to say when scans stop fitting the map.
+        self.hold = lambda: PaintHold()
+        # Tests replace this to say SLAM has a jump awaiting its second look.
+        self.jump = lambda: None
 
     def _cell(self, x: float, y: float) -> Tuple[int, int]:
         m = self.world.map
@@ -92,6 +96,12 @@ class FakeSlam:
             mode=self.mode, running=self.running, keyframes=self.keyframes
         )
 
+    async def paint_hold(self) -> PaintHold:
+        return self.hold()
+
+    async def pending_jump(self):
+        return self.jump()
+
     async def optimize(self) -> None:
         self.optimized += 1
 
@@ -107,14 +117,14 @@ class FakeNav:
         clock: FakeClock,
         *,
         speed_mps: float = 0.4,
-        max_angular_rad_s: float = 0.5,
     ):
         self.world = world
         self.slam = slam
         self.clock = clock
         self.speed_mps = speed_mps
-        self.max_angular_rad_s = max_angular_rad_s
         self.lose_pose = False
+        # Navigation's reason for not trusting a pose it does have.
+        self.untrusted = ""
         self.block_all = False
         self.cancels = 0
         self.legs = 0
@@ -272,10 +282,10 @@ class FakeNav:
             active=self._active,
             state=self._state,
             pose=None if self.lose_pose else Pose(p.x, p.y, p.theta),
-            localized=not self.lose_pose,
-            max_angular_rad_s=self.max_angular_rad_s,
+            localized=not self.lose_pose and not self.untrusted,
             robot_radius_m=0.3,
             error=self._error,
+            not_localized_reason=self.untrusted,
         )
 
 

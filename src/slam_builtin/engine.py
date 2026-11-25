@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 import shutil
+import sys
 import threading
 import time
 from collections import deque
@@ -140,12 +142,38 @@ class BuiltinSlamEngine:
         self._last_lin_rate = 0.0
         self._insert_skips_unmatched = 0
         self._insert_skips_turning = 0
+        # Painting waits until this time (see ``hold_paint_while_pose_in_doubt``).
+        self._pose_in_doubt = False
+        self._pose_in_doubt_until = 0.0
         # Operator-facing paint status (see diagnostics ``paint``).
         self._paint_state = "idle"
         self._paint_last_fit: Optional[str] = None
         self._paint_last_at = 0.0
         # What the last fit check scored, and against which pass mark.
         self._paint_fit_detail: Optional[dict] = None
+        # When scans stopped fitting the map, with none painted since, and
+        # how far the robot has driven on odometry alone since then.
+        self._paint_miss_since: Optional[float] = None
+        self._paint_miss_travel_m = 0.0
+        # (keyframes examined, of how many, since when) for a running repair.
+        self._repair_progress: Optional[tuple] = None
+        # Long jobs under way, by name, and when each began: what an update
+        # loop that stalls reports having waited behind.
+        self._busy: dict = {}
+        self._stall_logged_at = 0.0
+        self._stall_where = ""
+        self._tick_began_at: Optional[float] = None
+        self._watch_thread: Optional[threading.Thread] = None
+        # Where the last map rebuild stood partway through (see
+        # ``_RENDER_CHECKPOINT_LAG``), and the box clears it had applied.
+        self._render_ckpt: Optional[pg.RenderCheckpoint] = None
+        self._render_ckpt_clears: tuple = ()
+        self._recover_last_at = 0.0
+        self._recover_period_s = self._RECOVER_MIN_PERIOD_S
+        self._recover_travel_m = 0.0
+        # What the last position search of this run of misses concluded.
+        self._recover_verdict: Optional[str] = None
+        self._recover_stats: dict = {"attempts": 0, "recovered": 0, "last": None}
         # Which scan the last pose match was made with (see ``_match_pose``).
         self._match_detail: Optional[dict] = None
         # Last time we ran a full-circle heading search to unstick paint.
@@ -356,6 +384,12 @@ class BuiltinSlamEngine:
             daemon=True,
         )
         self._loop_thread.start()
+        self._watch_thread = threading.Thread(
+            target=self._watch_loop,
+            name="builtin-slam-watch",
+            daemon=True,
+        )
+        self._watch_thread.start()
         self._log(f"builtin SLAM engine started ({self._mode})")
 
     def stop(self) -> None:
@@ -363,11 +397,12 @@ class BuiltinSlamEngine:
         self._running = False
         self._repair_cancel.set()
         self._loop_event.set()
-        for thr in (self._thread, self._loop_thread):
+        for thr in (self._thread, self._loop_thread, self._watch_thread):
             if thr is not None and thr.is_alive():
                 thr.join(timeout=2.0)
         self._thread = None
         self._loop_thread = None
+        self._watch_thread = None
 
     def configure_mode(self, mode: str, map_dir: Optional[Path] = None) -> None:
         self._finish_or_cancel_repair(map_dir)
@@ -716,8 +751,22 @@ class BuiltinSlamEngine:
         self._lo_last_at = None
         self._lo_map_updates = None
 
+    def _set_corrected_pose_keeping_odom_locked(self, pose: conv.Pose2D) -> None:
+        """Correct the pose without forgetting where odometry last stood.
+
+        A loop closure or a position recover moves the map frame under the
+        robot; the robot did not jump. What the wheels did since the last
+        tick still happened, and the next tick has to add it. Clearing the
+        odometry anchors here dropped that motion: 2 m of it when a rebuild
+        had kept ticks from running for four seconds.
+        """
+        odom = (self._last_odom_pose, self._last_odom_heading, self._last_odom_time)
+        self._set_corrected_pose_locked(pose)
+        self._last_odom_pose, self._last_odom_heading, self._last_odom_time = odom
+
     def _reset_graph_locked(self) -> None:
         self._graph.clear()
+        self._render_ckpt = None
         self._graph_frozen = 0
         self._grid_edits = []
         self._grid_edits_saved = 0
@@ -756,6 +805,7 @@ class BuiltinSlamEngine:
             saved.last_seq,
             session_gap_m=self._loop_params.min_travel_gap_m,
         )
+        self._render_ckpt = None
         self._graph_frozen = len(saved.nodes)
         # Render base only (map under the oldest keyframes, often None).
         # _session_baseline stays the loaded image: health and trust score
@@ -1094,13 +1144,52 @@ class BuiltinSlamEngine:
         )
         return replace(scan, ranges=ranges)
 
+    # Rounds of drawing late scans before the pose lock is taken, and how
+    # many may be left to draw under it (a few milliseconds each).
+    _LATE_SCAN_ROUNDS = 4
+    _LATE_SCANS_UNDER_LOCK = 4
+    # A rebuild keeps its render as it stood this many keyframes before the
+    # newest, and the next rebuild starts from there when no earlier keyframe
+    # moved. On a robot's mapping session the loop anchors were 15 to 85
+    # keyframes back; a longer loop draws every keyframe as before.
+    _RENDER_CHECKPOINT_LAG = 128
+
+    @classmethod
+    def _clears_before(cls, edits: list, seq: int) -> tuple:
+        """The box clears a render has applied once scans up to ``seq`` are drawn."""
+        return tuple(e for e in edits if cls._seq_scoped(e) and int(e[5]) < seq)
+
+    def _render_checkpoint_locked(self) -> Optional[pg.RenderCheckpoint]:
+        """The last rebuild's checkpoint, unless a clear it applied has changed."""
+        ckpt = self._render_ckpt
+        if ckpt is None:
+            return None
+        if self._clears_before(self._grid_edits, ckpt.last_seq) != (
+            self._render_ckpt_clears
+        ):
+            self._render_ckpt = None
+            return None
+        return ckpt
+
+    # An optimize request waits this long for a job already working on the
+    # graph (a map repair runs for minutes), then gives up for now.
+    _OPTIMIZE_WAIT_S = 10.0
+
     def optimize_pose_graph(self) -> dict:
         """Optimize the whole mapping pose graph and re-render the grid."""
-        with self._lock:
-            if self._mode != MODE_MAPPING or len(self._graph) < 2:
-                return {"status": "skipped", "nodes": len(self._graph)}
-        with self._graph_job:
+        if not self._graph_job.acquire(timeout=self._OPTIMIZE_WAIT_S):
+            return {"status": "busy"}
+        try:
+            # Checked once the graph is ours, not before the wait for it.
+            # Checked first, a request that queued behind a repair outlived a
+            # switch to localizing, rendered the emptied graph and replaced
+            # the loaded map with a blank grid, which was then saved.
+            with self._lock:
+                if self._mode != MODE_MAPPING or len(self._graph) < 2:
+                    return {"status": "skipped", "nodes": len(self._graph)}
             return self._optimize_and_render(1)
+        finally:
+            self._graph_job.release()
 
     def _optimize_and_render(
         self,
@@ -1110,6 +1199,18 @@ class BuiltinSlamEngine:
         live_correction: Optional[conv.Pose2D] = None,
     ) -> dict:
         """Optimize (unless ``first_free`` is None), re-render, swap. Holds ``_graph_job``."""
+        with self._doing("map rebuild"):
+            return self._rebuild(
+                first_free, new_edges=new_edges, live_correction=live_correction
+            )
+
+    def _rebuild(
+        self,
+        first_free: Optional[int],
+        *,
+        new_edges: Optional[list] = None,
+        live_correction: Optional[conv.Pose2D] = None,
+    ) -> dict:
         with self._lock:
             snap = self._graph.snapshot()
             base = self._graph_base
@@ -1118,6 +1219,11 @@ class BuiltinSlamEngine:
         n = len(snap)
         poses = snap.poses
         info: dict = {"nodes": n, "edges": len(snap.edges)}
+        if n == 0:
+            # Nothing to draw. Rendering no keyframes gives a blank grid, and
+            # swapping that in would erase whatever map is loaded.
+            info["status"] = "skipped"
+            return info
         if first_free is not None and n > 1:
             window = max(1, int(self._cfg.builtin_loop_max_window_nodes))
             ff = max(1, int(first_free), n - window)
@@ -1148,11 +1254,18 @@ class BuiltinSlamEngine:
                     return info
             poses = res_opt.poses
         with self._lock:
-            extra = self._graph.scans_after(snap.last_seq)
+            extra = self._graph.scans_since(snap, poses, snap.last_seq)
+            drawn_seq = self._graph.last_seq
             rendered_edits = len(self._grid_edits)
             clears = self._render_clears(self._grid_edits)
+            edits_then = list(self._grid_edits)
+            resume = self._render_checkpoint_locked()
+        if resume is not None and not resume.fits(snap, poses, base, res):
+            # A keyframe it covers moved (a long loop), or the map changed.
+            resume = None
         started = perf_counter()
         bands: dict = {}
+        kept: list = []
         grid = pg.render_grid(
             snap,
             resolution=res,
@@ -1161,7 +1274,28 @@ class BuiltinSlamEngine:
             extra=extra,
             clears=clears,
             bands_out=bands,
+            resume=resume,
+            keep_at=max(0, n - self._RENDER_CHECKPOINT_LAG),
+            kept=kept,
+            progress=self._yield_cpu,
         )
+        info["drawn_nodes"] = n - (resume.nodes if resume is not None else 0)
+        # Scans keep being stored while that draws (five seconds and more at
+        # 500 keyframes). Draw those too before taking the pose lock, until
+        # only a handful are left. Rendering everything again under the lock
+        # to include them stopped every tick for as long as the render took:
+        # the pose froze while the robot drove on.
+        for _ in range(self._LATE_SCAN_ROUNDS):
+            with self._lock:
+                if self._graph_revision != revision:
+                    info["status"] = "aborted"
+                    return info
+                late = self._graph.scans_since(snap, poses, drawn_seq)
+                newest_seq = self._graph.last_seq
+            if len(late) <= self._LATE_SCANS_UNDER_LOCK:
+                break
+            grid = pg.paint_more(grid, bands, late)
+            drawn_seq = newest_seq
         render_ms = (perf_counter() - started) * 1000.0
         self._loop_stats["last_render_ms"] = round(render_ms, 1)
         info["render_ms"] = round(render_ms, 1)
@@ -1170,18 +1304,15 @@ class BuiltinSlamEngine:
                 info["status"] = "aborted"
                 return info
             anchor_before = self._node_poses_locked()
+            # The few stored since the last round, at the poses they are
+            # about to get.
+            late = self._graph.scans_since(snap, poses, drawn_seq)
             tail = self._graph.apply_poses(snap, poses)
-            # Inserts that landed while rendering, after ``extra`` was taken.
-            newer = self._graph.scans_after(snap.last_seq)
-            if len(newer) != len(extra):
-                grid = pg.render_grid(
-                    snap,
-                    resolution=res,
-                    poses=poses,
-                    base=base,
-                    extra=newer,
-                    clears=clears,
-                    bands_out=bands,
+            grid = pg.paint_more(grid, bands, late)
+            if kept:
+                self._render_ckpt = kept[0]
+                self._render_ckpt_clears = self._clears_before(
+                    edits_then, kept[0].last_seq
                 )
             self._replay_after_render_locked(grid, rendered_edits)
             for band_grid in bands.values():
@@ -1195,7 +1326,7 @@ class BuiltinSlamEngine:
             self._last_loop_rebuild_at = time.monotonic()
             corr = live_correction if live_correction is not None else tail
             new_pose = conv.compose_poses(corr, self._pose)
-            self._set_corrected_pose_locked(new_pose)
+            self._set_corrected_pose_keeping_odom_locked(new_pose)
             self._graph_revision += 1
             anchor_after = self._node_poses_locked()
         self._emit_anchor_motion(anchor_before, anchor_after)
@@ -1224,10 +1355,16 @@ class BuiltinSlamEngine:
             if not self._running:
                 break
             try:
-                self.refresh_map_health()
-                self.run_loop_closure()
+                with self._doing("map health check"):
+                    self.refresh_map_health()
+                with self._doing("loop closure search"):
+                    self.run_loop_closure()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"builtin SLAM loop closure failed: {exc}")
+            try:
+                self.recover_position_if_held()
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"builtin SLAM position recover failed: {exc}")
 
     # Recompute at most this often; also forced when the grid generation moves.
     _MAP_HEALTH_MIN_S = 5.0
@@ -1965,7 +2102,8 @@ class BuiltinSlamEngine:
                 f"{result.get('status')} node={cur} anchor={match.anchor} "
                 f"gap={match.gap_m:.1f} m shift={shift_m:.2f} m {shift_deg:.1f} deg "
                 f"score={match.fit:.2f} (prior {match.prior_fit:.2f}) "
-                f"opt={result.get('optimize_ms')} ms render={result.get('render_ms')} ms"
+                f"opt={result.get('optimize_ms')} ms render={result.get('render_ms')} ms "
+                f"({result.get('drawn_nodes')} of {result.get('nodes')} keyframes drawn)"
             )
             return {**stats["last"], **result}
         finally:
@@ -1973,8 +2111,18 @@ class BuiltinSlamEngine:
 
     def save_map(self, map_dir: Path, *, repair: bool = True) -> dict:
         """Write map.pgm/yaml (+ keyframes.npz) and, when mapping, check repair."""
+        with self._doing("map save"):
+            return self._save_map(map_dir, repair=repair)
+
+    def _save_map(self, map_dir: Path, *, repair: bool = True) -> dict:
         map_dir = Path(map_dir)
         keep_keyframes = bool(getattr(self._cfg, "builtin_save_keyframes", True))
+        if self._would_blank_saved_map(map_dir):
+            self._log(
+                f"save refused: the live map is blank and {map_dir.name} on disk "
+                "is not; keeping the saved map"
+            )
+            return {"status": "refused_empty", "keyframes": "kept"}
         with self._lock:
             old_sha = graph_store.file_sha1(map_dir / "map.pgm")
             sha = persistence.save_occupancy(map_dir, self._grid)
@@ -2017,6 +2165,25 @@ class BuiltinSlamEngine:
         ):
             out["repair"] = self.start_repair(map_dir, apply="auto", reason="save")
         return out
+
+    def _would_blank_saved_map(self, map_dir: Path) -> bool:
+        """True when saving now would write a blank grid over a map that has one.
+
+        No mapping run ends with nothing observed, and ``clear_map`` deletes
+        the saved files instead of saving over them, so this only happens
+        when something has gone wrong with the live grid.
+        """
+        with self._lock:
+            grid = self._grid
+        if np.any(np.abs(grid.log_odds) > 1e-6):
+            return False
+        if not (Path(map_dir) / "map.pgm").is_file():
+            return False
+        try:
+            saved = persistence.load_log_odds(map_dir)
+        except Exception:  # noqa: BLE001
+            return False
+        return saved is not None and bool(np.any(np.abs(saved.log_odds) > 1e-6))
 
     def _graph_payload_locked(self) -> dict:
         snap = self._graph.snapshot()
@@ -2131,20 +2298,52 @@ class BuiltinSlamEngine:
                 f"waiting up to {wait_s:.0f} s for map repair to finish "
                 f"before reloading {target.name}"
             )
-            thread.join(wait_s)
+            deadline = time.monotonic() + wait_s
+            while thread.is_alive():
+                now = time.monotonic()
+                left = deadline - now
+                if left <= 0.0:
+                    self._log("map repair still running; cancelling it for the switch")
+                    break
+                # A repair that cannot finish in the time left is not worth
+                # the wait: every switch soon after a save used to stand for
+                # the full two minutes and then cancel it anyway.
+                eta = self._repair_eta_s(now)
+                if eta is not None and eta > left:
+                    self._log(
+                        f"map repair needs about {eta:.0f} s more; "
+                        "cancelling it for the switch"
+                    )
+                    break
+                thread.join(min(0.25, left))
             if not thread.is_alive():
                 # The repair moved the live pose with the map; reload from it.
                 self._persist_pose(force=True)
                 return
-            self._log("map repair still running; cancelling it for the switch")
         self._repair_cancel.set()
+
+    # Keyframes a repair must have examined before its pace says anything.
+    _REPAIR_ETA_MIN_DONE = 10
+
+    def _repair_eta_s(self, now: float) -> Optional[float]:
+        """Seconds the running repair still needs to examine the graph, if known."""
+        progress = self._repair_progress
+        if progress is None:
+            return None
+        done, total, started = progress
+        if done < self._REPAIR_ETA_MIN_DONE:
+            return None
+        return (now - started) / done * max(0, total - done)
 
     def _repair_job(self, map_dir: Optional[Path], apply, reason: str) -> None:
         try:
-            result = self.run_repair(apply=apply, map_dir=map_dir, reason=reason)
+            with self._doing(f"map repair ({reason})"):
+                result = self.run_repair(apply=apply, map_dir=map_dir, reason=reason)
         except Exception as exc:  # noqa: BLE001
             result = {"status": "failed", "error": str(exc)}
             self._log(f"map repair ({reason}) failed: {exc}")
+        finally:
+            self._repair_progress = None
         result.update(state="done", reason=reason, finished_at=time.time())
         self._repair_status = result
 
@@ -2181,6 +2380,12 @@ class BuiltinSlamEngine:
             window_nodes=max(1, int(cfg.builtin_loop_max_window_nodes)),
             max_s=float(getattr(cfg, "builtin_repair_max_s", 600.0)),
         )
+        # The graph is held only while it is copied, and again to apply the
+        # result. The minutes between are spent on the copy. Held throughout,
+        # it kept live loop closure and the optimize before a save from
+        # running at all: on one robot a repair started by a save ran for ten
+        # minutes, the robot explored a 100 m loop in that time with no loop
+        # closure, and mapped a hallway a second time 2 m beside the first.
         with self._graph_job:
             with self._lock:
                 snap = self._graph.snapshot()
@@ -2189,45 +2394,69 @@ class BuiltinSlamEngine:
                 res = float(self._grid.resolution)
                 revision = self._graph_revision
                 edits = list(self._grid_edits)
-            plan = repair.plan_repair(
-                snap,
-                resolution=res,
-                params=params,
-                base=base if trusted else None,
-                should_stop=self._repair_cancel.is_set,
+        began = time.monotonic()
+
+        def step(done: int, total: int) -> None:
+            self._repair_progress = (int(done), int(total), began)
+            self._yield_cpu()
+
+        def outdated() -> bool:
+            # A live correction redrew the map: this plan is for the old one.
+            return self._graph_revision != revision
+
+        plan = repair.plan_repair(
+            snap,
+            resolution=res,
+            params=params,
+            base=base if trusted else None,
+            should_stop=lambda: self._repair_cancel.is_set() or outdated(),
+            progress=step,
+        )
+        # What is left (two renders and the swap) is seconds, not minutes.
+        self._repair_progress = None
+        out: dict = {"status": "no_corrections", **plan.summary()}
+        if outdated():
+            out["status"] = "aborted"
+            self._log(
+                f"map repair ({reason}): stopped after {plan.examined} keyframes; "
+                "the map was corrected while it ran"
             )
-            out: dict = {"status": "no_corrections", **plan.summary()}
-            if not plan.clusters:
-                self._log(
-                    f"map repair ({reason}): nothing to correct "
-                    f"({plan.matched}/{plan.examined} keyframes matched, "
-                    f"{plan.rejected} rejected)"
-                )
-                return out
-            before = self._assess_render(snap, snap.poses, base, edits, res)
-            after = self._assess_render(snap, plan.poses, base, edits, res)
-            confident, not_confident = repair.verdict(before, after, plan, params)
-            out.update(
-                before=before.as_dict(),
-                after=after.as_dict(),
-                confident=confident,
-                not_confident=not_confident,
+            return out
+        if not plan.clusters:
+            self._log(
+                f"map repair ({reason}): nothing to correct "
+                f"({plan.matched}/{plan.examined} keyframes matched, "
+                f"{plan.rejected} rejected)"
             )
-            if apply == "auto":
-                do_apply = confident
-            elif apply is True or apply == "force":
-                do_apply = repair.acceptable(before, after, plan)
-            else:
-                do_apply = False
-            if not do_apply:
-                out["status"] = "planned" if apply in (False, "never") else "kept"
-                self._log(
-                    f"map repair ({reason}): not applied "
-                    f"({', '.join(not_confident) or 'dry run'}); "
-                    f"ghost {before.ghost_frac:.2f}->{after.ghost_frac:.2f} "
-                    f"angle_std {before.angle_std_deg:.1f}->"
-                    f"{after.angle_std_deg:.1f}deg"
-                )
+            return out
+        before = self._assess_render(snap, snap.poses, base, edits, res)
+        after = self._assess_render(snap, plan.poses, base, edits, res)
+        confident, not_confident = repair.verdict(before, after, plan, params)
+        out.update(
+            before=before.as_dict(),
+            after=after.as_dict(),
+            confident=confident,
+            not_confident=not_confident,
+        )
+        if apply == "auto":
+            do_apply = confident
+        elif apply is True or apply == "force":
+            do_apply = repair.acceptable(before, after, plan)
+        else:
+            do_apply = False
+        if not do_apply:
+            out["status"] = "planned" if apply in (False, "never") else "kept"
+            self._log(
+                f"map repair ({reason}): not applied "
+                f"({', '.join(not_confident) or 'dry run'}); "
+                f"ghost {before.ghost_frac:.2f}->{after.ghost_frac:.2f} "
+                f"angle_std {before.angle_std_deg:.1f}->"
+                f"{after.angle_std_deg:.1f}deg"
+            )
+            return out
+        with self._graph_job:
+            if outdated():
+                out["status"] = "aborted"
                 return out
             backup = self._backup_map_files(map_dir) if map_dir is not None else False
             with self._lock:
@@ -2272,6 +2501,7 @@ class BuiltinSlamEngine:
             poses=poses,
             base=base,
             clears=self._render_clears(edits),
+            progress=self._yield_cpu,
         )
         for edit in edits:
             if not self._seq_scoped(edit):
@@ -2544,6 +2774,9 @@ class BuiltinSlamEngine:
                     ),
                     "skips_turning": self._insert_skips_turning,
                     "skips_unmatched": self._insert_skips_unmatched,
+                    # Seconds and meters since a scan last fit the map, and
+                    # what the position search has done about it.
+                    **self.paint_hold(),
                     "map_updates": self._updates,
                     "baseline_trusted": self._baseline_trusted_locked(),
                     "extend_only": not self._baseline_trusted_locked(),
@@ -2616,15 +2849,91 @@ class BuiltinSlamEngine:
             }
 
     # -- loop ----------------------------------------------------------------
+    # The update loop runs ten times a second. This long between two of its
+    # turns means odometry went unread and the pose stood still while the
+    # robot moved; say so, and what the module was busy with.
+    _STALL_LOG_S = 1.0
+    _STALL_LOG_EVERY_S = 5.0
+
+    @contextlib.contextmanager
+    def _doing(self, what: str):
+        """Mark a long job so a stalled update loop can name it."""
+        self._busy[what] = time.monotonic()
+        try:
+            yield
+        finally:
+            self._busy.pop(what, None)
+
+    @staticmethod
+    def _yield_cpu(*_progress) -> None:
+        """Let the update loop, navigation and the sensors run.
+
+        A long job in one thread of this process holds the others to a few
+        milliseconds in every five or worse, for as long as it runs. Called
+        between keyframes by the jobs that take seconds.
+        """
+        time.sleep(0.001)
+
+    def _note_stall(self, gap_s: float, now: float) -> None:
+        where, self._stall_where = self._stall_where, ""
+        if now - self._stall_logged_at < self._STALL_LOG_EVERY_S:
+            return
+        self._stall_logged_at = now
+        busy = ", ".join(
+            f"{what} for {now - since:.0f} s" for what, since in self._busy.items()
+        )
+        self._log(
+            f"builtin SLAM: update loop stalled {gap_s:.1f} s "
+            f"(busy with: {busy or 'nothing it tracks'})"
+            + (f"; the loop was in {where}" if where else "")
+        )
+
+    @staticmethod
+    def _where(frame, depth: int = 6) -> str:
+        """``file:line function`` for the innermost frames, innermost first."""
+        parts = []
+        while frame is not None and len(parts) < depth:
+            code = frame.f_code
+            parts.append(
+                f"{Path(code.co_filename).name}:{frame.f_lineno} {code.co_name}"
+            )
+            frame = frame.f_back
+        return " < ".join(parts)
+
+    def _watch_loop(self) -> None:
+        """Note where the update loop is whenever one turn of it runs long.
+
+        A stall is only known once it is over, and by then the loop is
+        somewhere else. This looks while it is still stuck.
+        """
+        seen = None
+        while self._running:
+            time.sleep(0.25)
+            began = self._tick_began_at
+            thread = self._thread
+            if began is None or began == seen or thread is None:
+                continue
+            if time.monotonic() - began < self._STALL_LOG_S:
+                continue
+            seen = began
+            frame = sys._current_frames().get(thread.ident)  # noqa: SLF001
+            self._stall_where = self._where(frame)
+
     def _loop(self) -> None:
+        last = None
         while self._running:
             t0 = time.monotonic()
+            if last is not None and t0 - last > self._STALL_LOG_S:
+                self._note_stall(t0 - last, t0)
+            last = t0
+            self._tick_began_at = t0
             try:
                 self._tick()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"builtin SLAM tick failed: {exc}")
             else:
                 self._persist_pose(force=False)
+            self._tick_began_at = None
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, self._period - elapsed))
 
@@ -2680,6 +2989,10 @@ class BuiltinSlamEngine:
             before = self._pose
             predicted = self._predict(odom, now)
             self._pose = predicted
+            if self._paint_miss_since is not None:
+                self._paint_miss_travel_m += math.hypot(
+                    predicted.x - before.x, predicted.y - before.y
+                )
             self._record_odom_step(before, predicted, now)
             self._last_tick_pose, self._last_tick_at = predicted, now
             yaw_rate = 0.0
@@ -2766,6 +3079,8 @@ class BuiltinSlamEngine:
                 # No scan match: the pose is a guess. Painting there doubles walls.
                 self._lo_inserts_held += 1
                 self._note_paint("held_lidar_odom", now)
+            elif time.monotonic() < self._pose_in_doubt_until:
+                self._note_paint("held_pose_in_doubt", now)
             elif self._spinning(yaw_rate, lin_rate):
                 # A turn smears a scan and the wheel heading is the part that
                 # slips. Hold the frames and draw them once a still scan lines
@@ -3130,6 +3445,174 @@ class BuiltinSlamEngine:
         self._paint_last_at = float(now)
         if fit is not None:
             self._paint_last_fit = str(fit)
+        # A turn or a lidar-odometry hold says nothing about the pose, so
+        # only a painted scan ends a run of misses.
+        if state == "held_unmatched":
+            if self._paint_miss_since is None:
+                self._paint_miss_since = float(now)
+                self._paint_miss_travel_m = 0.0
+                self._recover_verdict = None
+                self._recover_period_s = self._RECOVER_MIN_PERIOD_S
+                self._recover_travel_m = 0.0
+        elif state in ("painting", "extend_only"):
+            self._paint_miss_since = None
+            self._paint_miss_travel_m = 0.0
+            self._recover_verdict = None
+
+    # -- position recovery while paint is held ------------------------------
+    # The tick puts the pose back after a turn (any heading) and after a slip
+    # of up to about half a meter. Past that every scan misses, nothing is
+    # painted, and the pose runs on wheel odometry until a person relocalizes
+    # it. This long with no scan painted is past what the tick recovers from
+    # on its own; a doorway or a moved chair clears in a second or two.
+    _RECOVER_AFTER_S = 3.0
+    # One search is a second or two of matching on a robot's computer. A
+    # robot that has not moved gets the same answer again, so each search
+    # that places nothing doubles the wait for the next, up to the longest;
+    # a meter driven since the last one is a new view and brings it forward.
+    _RECOVER_MIN_PERIOD_S = 2.0
+    _RECOVER_MAX_PERIOD_S = 16.0
+    _RECOVER_NEW_VIEW_M = 1.0
+
+    # A hold that nothing renews ends by itself after this long.
+    _POSE_IN_DOUBT_MAX_S = 30.0
+
+    def hold_paint_while_pose_in_doubt(self, in_doubt: bool) -> None:
+        """Stop painting while a wider check has the robot somewhere else.
+
+        The mapping revisit check needs two looks that agree before it moves
+        the pose by meters. Painting went on between them, at the pose in
+        doubt, and a few seconds of that makes the scan fit where the robot
+        thinks it is. On one robot the first look had the scan fitting a
+        place 3.38 m away; the second found nothing wrong, the jump was
+        dropped, and a hallway was mapped a second time beside the first.
+        One run of doubt holds painting for ``_POSE_IN_DOUBT_MAX_S`` at most,
+        however often it is repeated: a check that never settles must not
+        stop the map from growing.
+        """
+        if not in_doubt:
+            self._pose_in_doubt_until = 0.0
+            self._pose_in_doubt = False
+        elif not self._pose_in_doubt:
+            self._pose_in_doubt = True
+            self._pose_in_doubt_until = time.monotonic() + self._POSE_IN_DOUBT_MAX_S
+
+    def paint_hold(self) -> dict:
+        """How long scans have gone unpainted for not fitting the map.
+
+        ``held_s`` is 0 while mapping normally. ``travel_m`` is the distance
+        driven since, on odometry alone. ``verdict`` is what the last position
+        search of this hold concluded: ``recovered`` (the pose was moved),
+        ``no_better_place`` (the pose is as good as anywhere nearby, so the
+        room or the map is what changed), any other reason (a better place
+        exists but was not safe to take: the robot is probably lost), or
+        empty before the first search.
+        """
+        now = time.monotonic()
+        with self._lock:
+            since = self._paint_miss_since
+            held = self._mode == MODE_MAPPING and since is not None
+            return {
+                "held_s": round(now - since, 1) if held else 0.0,
+                "travel_m": round(self._paint_miss_travel_m, 2) if held else 0.0,
+                "verdict": (self._recover_verdict or "") if held else "",
+                "recover": {
+                    "attempts": self._recover_stats["attempts"],
+                    "recovered": self._recover_stats["recovered"],
+                    "last": None
+                    if self._recover_stats["last"] is None
+                    else dict(self._recover_stats["last"]),
+                },
+            }
+
+    def recover_position_if_held(self) -> Optional[dict]:
+        """Re-find the pose on the map when no scan has fit it for a while.
+
+        Moves the live pose only. No keyframe is added while paint is held,
+        so the map and the pose graph hold none of the error. Returns the
+        search outcome, or ``None`` when there was nothing to do.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if self._mode != MODE_MAPPING:
+                return None
+            since = self._paint_miss_since
+            if since is None or now - since < self._RECOVER_AFTER_S:
+                return None
+            waited = now - self._recover_last_at
+            new_view = (
+                self._paint_miss_travel_m - self._recover_travel_m
+                >= self._RECOVER_NEW_VIEW_M
+            )
+            if waited < self._RECOVER_MIN_PERIOD_S or (
+                waited < self._recover_period_s and not new_view
+            ):
+                return None
+            # A scan taken in a turn is smeared; the paint check waits too.
+            if self._last_yaw_rate > _SPIN_HOLD_YAW_RATE:
+                return None
+            scan = self._last_scan_obj
+            if scan is None:
+                return None
+            self._recover_last_at = now
+            self._recover_travel_m = self._paint_miss_travel_m
+            epoch = self._pose_epoch
+            capture_motion = self._scan_capture_motion()
+            scan_pose = self._pose
+            if capture_motion is not None:
+                scan_pose = conv.compose_poses(
+                    scan_pose, conv.invert_pose(capture_motion)
+                )
+            held_s = now - since
+            travel_m = self._paint_miss_travel_m
+            # The per-height scans of the same lidar read as ``scan``.
+            frames = self._mapping_frames()
+        try:
+            occ_map = self._occupancy_for_match()
+            bands = self._band_scans(frames)
+        except Exception:  # noqa: BLE001
+            return None
+        from . import position_recover
+
+        with self._doing("position search"):
+            found = position_recover.find_position(occ_map, scan, bands, scan_pose)
+        outcome = found.as_dict()
+        outcome.update(held_s=round(held_s, 1), travel_m=round(travel_m, 2))
+        new_pose = None
+        with self._lock:
+            self._recover_stats["attempts"] += 1
+            if found.pose is not None and self._pose_epoch != epoch:
+                # A loop closure moved the pose while this searched.
+                outcome.update(recovered=False, reason="pose_moved")
+            elif found.pose is not None:
+                # Carry the robot's motion since the scan across the move.
+                corr = pg.world_correction(scan_pose, found.pose)
+                new_pose = conv.compose_poses(corr, self._pose)
+                self._set_corrected_pose_keeping_odom_locked(new_pose)
+                self._recover_stats["recovered"] += 1
+            self._recover_stats["last"] = {"at": time.time(), **outcome}
+            # The wait for the next search runs from the end of this one, so
+            # a slow computer still gets the time between them.
+            self._recover_last_at = time.monotonic()
+            if self._paint_miss_since is not None:
+                self._recover_verdict = str(outcome["reason"])
+            self._recover_period_s = (
+                self._RECOVER_MIN_PERIOD_S
+                if new_pose is not None
+                else min(2.0 * self._recover_period_s, self._RECOVER_MAX_PERIOD_S)
+            )
+        if new_pose is None:
+            return outcome
+        self._notify_pose_listeners(new_pose)
+        self._persist_pose(force=True)
+        self._log(
+            "mapping position recover: moved the pose "
+            f"{found.shift_m:.2f} m {found.shift_deg:.1f} deg to "
+            f"({new_pose.x:.2f}, {new_pose.y:.2f}) after {held_s:.0f} s and "
+            f"{travel_m:.1f} m with no scan fitting the map "
+            f"(fit {outcome.get('score_before')} -> {outcome.get('score_after')})"
+        )
+        return outcome
 
     def _scan_map_fit(self, scan: conv.LaserScan2D, pose: conv.Pose2D) -> str:
         """``open``, ``fit``, or ``miss`` for painting ``scan`` at ``pose``.
@@ -3470,8 +3953,18 @@ class BuiltinSlamEngine:
             # uses ``end`` directly, so snap the live pose the same way.
             self._snap_pose_yaw(found.theta, clear_yaw_rate=True)
         corrected = rewind_spin_poses([item[1] for item in held], end)
-        for (held_scan, _pose, frames, held_now), paint_at in zip(held, corrected):
-            self._paint_mapping_scan(held_scan, paint_at, held_now, frames=frames)
+        # A turn holds a scan every tick: 30 for a quarter turn. They are all
+        # drawn, and the map is published once. Painting them one at a time
+        # copied, aligned and collapsed the whole grid for each, which held
+        # the update loop for seconds on a large map.
+        self._paint_mapping_scans(
+            [
+                (held_scan, paint_at, held_now, frames)
+                for (held_scan, _pose, frames, held_now), paint_at in zip(
+                    held, corrected
+                )
+            ]
+        )
 
     def _paint_mapping_scan(
         self,
@@ -3482,72 +3975,119 @@ class BuiltinSlamEngine:
         frames: Optional[list] = None,
     ) -> None:
         """Draw one mapping scan at ``pose_snap``. Caller already decided it fits."""
-        scan = self._mask_dynamic_scan(scan, now)
-        if frames is None:
-            frames = self._mapping_frames()
+        self._paint_mapping_scans([(scan, pose_snap, now, frames)])
+
+    def _paint_mapping_scans(self, items: list) -> None:
+        """Draw ``(scan, pose, now, frames)`` items in order; publish the map once.
+
+        The map that results is the one drawing them one at a time gives:
+        every scan lands in its height band in the same order, and the
+        published grid is collapsed from the bands. What is saved is the
+        copying, aligning and collapsing of the whole grid between scans.
+        """
+        prepared = []
+        for scan, pose_snap, now, frames in items:
+            scan = self._mask_dynamic_scan(scan, now)
+            if frames is None:
+                frames = self._mapping_frames()
+            band_scans = self._band_scans(frames)
+            if band_scans:
+                band_scans = {
+                    band: self._mask_dynamic_scan(band_scan, now)
+                    for band, band_scan in band_scans.items()
+                }
+            prepared.append((scan, pose_snap, now, band_scans))
+        if not prepared:
+            return
+        if len({bool(item[3]) for item in prepared}) > 1:
+            # Some with height bands and some without: drawn into different
+            # grids, so one publish each, in order.
+            for item in prepared:
+                self._paint_prepared([item])
+            return
+        self._paint_prepared(prepared)
+
+    def _paint_prepared(self, prepared: list) -> None:
+        from .height_bands import compress_bands
+
         with self._lock:
             src = self._grid
             extend_only = not self._baseline_trusted_locked()
             protect = self._session_baseline if extend_only else None
-        band_scans = self._band_scans(frames)
-        if band_scans:
-            band_scans = {
-                band: self._mask_dynamic_scan(band_scan, now)
-                for band, band_scan in band_scans.items()
-            }
-        primary_band = 0
-        if band_scans:
-            painted, bands, primary, extras, primary_band = self._paint_height_bands(
-                pose_snap, band_scans, src, extend_only=extend_only, protect=protect
-            )
+            stored = dict(self._height_bands)
+        drawn = []
+        if prepared[0][3]:
+            bands = {b: occ.copy_grid(g) for b, g in stored.items()}
+            if not bands and np.any(np.abs(src.log_odds) > 0.05):
+                bands[0] = occ.copy_grid(src)
+            for scan, pose_snap, now, band_scans in prepared:
+                self._insert_band_scans(
+                    bands,
+                    pose_snap,
+                    band_scans,
+                    src,
+                    extend_only=extend_only,
+                    protect=protect,
+                )
+                first_band, primary = next(iter(band_scans.items()))
+                extras = list(band_scans.items())[1:]
+                drawn.append((scan, pose_snap, now, primary, extras, int(first_band)))
+            painted = compress_bands(bands)
         else:
-            painted = occ.insert_scan(
-                occ.copy_grid(src),
-                pose_snap.x,
-                pose_snap.y,
-                pose_snap.theta,
-                np.asarray(scan.ranges, dtype=float),
-                float(scan.angle_min),
-                float(scan.angle_increment),
-                range_min=float(scan.range_min),
-                range_max=float(scan.range_max)
-                if math.isfinite(scan.range_max)
-                else 30.0,
-                extend_only=extend_only,
-                protect=protect,
-            )
             bands = None
-            primary, extras = scan, None
-        hook = None
+            painted = occ.copy_grid(src)
+            for scan, pose_snap, now, _bands in prepared:
+                painted = occ.insert_scan(
+                    painted,
+                    pose_snap.x,
+                    pose_snap.y,
+                    pose_snap.theta,
+                    np.asarray(scan.ranges, dtype=float),
+                    float(scan.angle_min),
+                    float(scan.angle_increment),
+                    range_min=float(scan.range_min),
+                    range_max=float(scan.range_max)
+                    if math.isfinite(scan.range_max)
+                    else 30.0,
+                    extend_only=extend_only,
+                    protect=protect,
+                )
+                drawn.append((scan, pose_snap, now, scan, None, 0))
+        hooks = []
         with self._lock:
             if self._grid is not src:
                 return
             self._grid = painted
             if bands is not None:
                 self._height_bands = bands
-            self._last_insert_pose = pose_snap
-            self._last_insert_at = now
-            self._updates += 1
-            self._note_paint(
-                "extend_only" if extend_only else "painting", now, fit="fit"
-            )
-            if self._mode == MODE_MAPPING:
-                hook = self._keyframe_hook
-                nodes = len(self._graph)
-                self._graph.add_scan(pose_snap, primary, band=primary_band, also=extras)
-                if (
-                    len(self._graph) > nodes
-                    and self._loop_closure_enabled()
-                    and now - self._loop_last_attempt_at
-                    >= float(self._cfg.builtin_loop_check_interval_s)
-                ):
-                    self._loop_event.set()
+            for scan, pose_snap, now, primary, extras, primary_band in drawn:
+                self._last_insert_pose = pose_snap
+                self._last_insert_at = now
+                self._updates += 1
+                self._note_paint(
+                    "extend_only" if extend_only else "painting", now, fit="fit"
+                )
+                if self._mode == MODE_MAPPING:
+                    hook = self._keyframe_hook
+                    nodes = len(self._graph)
+                    self._graph.add_scan(
+                        pose_snap, primary, band=primary_band, also=extras
+                    )
+                    if (
+                        len(self._graph) > nodes
+                        and self._loop_closure_enabled()
+                        and now - self._loop_last_attempt_at
+                        >= float(self._cfg.builtin_loop_check_interval_s)
+                    ):
+                        self._loop_event.set()
+                    if hook is not None:
+                        hooks.append((hook, scan, pose_snap))
+                if self._updates % 20 == 0:
+                    self._generation += 1
             # The next scan is judged against this paint. Leaving the match
             # grid stale would let a wrong heading draw for another 20 scans.
             self._invalidate_occ_cache()
-            if self._updates % 20 == 0:
-                self._generation += 1
-        if hook is not None:
+        for hook, scan, pose_snap in hooks:
             try:
                 hook(scan, [], pose_snap)
             except Exception as exc:  # noqa: BLE001
@@ -3592,21 +4132,23 @@ class BuiltinSlamEngine:
             range_max=range_max,
         )
 
-    def _paint_height_bands(
-        self,
+    @staticmethod
+    def _insert_band_scans(
+        bands: dict,
         pose: conv.Pose2D,
         scans: dict,
         src: LogOddsGrid,
         *,
         extend_only: bool = False,
         protect: Optional[LogOddsGrid] = None,
-    ):
-        from .height_bands import compress_bands, cover_bands
+    ) -> None:
+        """Draw one read's per-height scans into ``bands`` (updated in place).
 
-        with self._lock:
-            bands = {b: occ.copy_grid(g) for b, g in self._height_bands.items()}
-            if not bands and np.any(np.abs(src.log_odds) > 0.05):
-                bands[0] = occ.copy_grid(src)
+        The bands are left aligned to one origin and shape, as the next scan
+        and the collapse into one grid need them.
+        """
+        from .height_bands import cover_bands
+
         for band, scan in scans.items():
             base = bands.get(band)
             if base is None:
@@ -3631,11 +4173,12 @@ class BuiltinSlamEngine:
                 extend_only=extend_only,
                 protect=protect,
             )
-        bands = cover_bands(bands)
-        fused = compress_bands(bands)
-        items = list(scans.items())
-        primary_band, primary = items[0]
-        return fused, bands, primary, items[1:], int(primary_band)
+        shapes = {(g.origin_x, g.origin_y, g.log_odds.shape) for g in bands.values()}
+        if len(shapes) > 1:
+            # A scan past the edge grew one band; the others grow to match.
+            aligned = cover_bands(bands)
+            bands.clear()
+            bands.update(aligned)
 
     def _maybe_insert_scan(
         self,
@@ -4155,17 +4698,36 @@ class BuiltinSlamEngine:
     _MAX_BODY_YAW_RATE = math.radians(120.0)
     _YAW_STEP_WINDOW_S = 0.5
 
-    def _plausible_yaw_step(self, gap_s: float, prev_yaw_rate: float) -> float:
+    # The update loop itself can fall behind while the reader keeps up, and
+    # the step it then sees is real. On one robot the loop stalled 2.8 s in
+    # the middle of a turn that reached 32 deg/s; the 91 degrees that followed
+    # were refused as a jump, the heading was left a quarter turn out and the
+    # whole pose went with it. So the turn is taken at the rate the gyro shows
+    # at either end of the gap, not only before it, with a quarter over for
+    # one still speeding up. A parked cart shows no rate at either end, so a
+    # magnetometer flip there is refused as before, and the hold still caps
+    # how long any rate can account for.
+    _YAW_STEP_RATE_MARGIN = 1.25
+
+    def _plausible_yaw_step(
+        self, gap_s: float, prev_yaw_rate: float, yaw_rate: float = 0.0
+    ) -> float:
         """Most yaw one odom sample can honestly carry.
 
         The body's top rate over the sample gap (never less than a nominal
-        period, never more than half a second), or the turn already underway
-        held across a stalled read for as long as the reader holds it.
+        period, never more than half a second), or a turn measured just
+        before or just after a late sample, for as long as the reader holds
+        a twist across a stalled read.
         """
         gap = max(0.0, float(gap_s))
         window = min(max(gap, self._period), self._YAW_STEP_WINDOW_S)
         hold = min(gap, self._ODOM_YAW_HOLD_MAX_S)
-        return max(self._MAX_BODY_YAW_RATE * window, abs(prev_yaw_rate) * hold)
+        turning = max(abs(prev_yaw_rate), abs(yaw_rate))
+        return max(
+            self._MAX_BODY_YAW_RATE * window,
+            abs(prev_yaw_rate) * hold,
+            self._YAW_STEP_RATE_MARGIN * turning * hold,
+        )
 
     def _predict(self, odom: Optional[conv.OdomReading], now: float) -> conv.Pose2D:
         if odom is None:
@@ -4197,7 +4759,7 @@ class BuiltinSlamEngine:
                 return self._pose
             delta = conv.compose_poses(conv.invert_pose(prev), odom.pose)
             gap_s = (now - prev_at) if prev_at is not None else 0.0
-            max_yaw = self._plausible_yaw_step(gap_s, prev_yaw_rate)
+            max_yaw = self._plausible_yaw_step(gap_s, prev_yaw_rate, odom.vtheta)
             # Prefer dedicated heading_sensor deltas for yaw so velocity-only
             # wheel odom does not dead-reckon heading from gyro vtheta alone.
             # A step the body cannot have turned is a magnetometer snap; the
@@ -4253,7 +4815,9 @@ class BuiltinSlamEngine:
                     odom.heading_rad - self._last_odom_heading
                 )
                 # Reject magnetometer jumps; fall back to gyro integration.
-                if abs(heading_delta) <= self._plausible_yaw_step(gap_s, prev_yaw_rate):
+                if abs(heading_delta) <= self._plausible_yaw_step(
+                    gap_s, prev_yaw_rate, odom.vtheta
+                ):
                     dth = heading_delta
                 else:
                     self._heading_snaps += 1

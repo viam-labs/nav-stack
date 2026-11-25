@@ -76,8 +76,7 @@
       "attributes": {
         "slam_service": "slam",
         "navigation_service": "nav",
-        "base": "sim-base",
-        "max_angular_dps": 60
+        "base": "sim-base"
       }
     }
   ]

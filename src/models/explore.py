@@ -110,7 +110,6 @@ class ExploreService(Generic):
         params = RunParams(
             duration_s=duration_s,
             max_linear_mps=cfg.max_linear_mps,
-            max_angular_dps=cfg.max_angular_dps,
             home_tolerance_m=cfg.home_tolerance_m,
             robot_radius_m=radius,
             min_frontier_m=cfg.min_frontier_m,

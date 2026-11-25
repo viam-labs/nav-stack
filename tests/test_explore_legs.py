@@ -38,7 +38,6 @@ def st(active, state, x=0.0, y=0.0, localized=True):
         state=state,
         pose=Pose(x, y, 0.0),
         localized=localized,
-        max_angular_rad_s=0.5,
         robot_radius_m=0.3,
         error="",
     )
