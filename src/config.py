@@ -961,6 +961,11 @@ class SlamConfig:
             "search_radius_m": 6.0,
         }
     )
+    # Lost filter (localizing mode only): a particle filter over the whole map
+    # that finds a robot with no pose, as it drives, and checks in the
+    # background when the scans stop fitting (slam_builtin/lost_filter.py).
+    lost_filter: bool = True
+    lost_filter_rate_hz: float = 10.0
     # Periodic localization drift watchdog (localizing mode only). Runs a cheap
     # local scan-match on an interval and re-localizes when pose has drifted.
     periodic_relocalize: bool = True

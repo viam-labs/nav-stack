@@ -136,6 +136,9 @@ class BuiltinSlamEngine:
         # Relative motion between two times is frame-independent, so a scan
         # can be matched at the pose it was taken from even across corrections.
         self._odom_chain = conv.Pose2D(0.0, 0.0, 0.0)
+        # Odometry followed while localizing waits for its first seed.
+        self._unseeded_odom_pose: Optional[conv.Pose2D] = None
+        self._unseeded_odom_at: Optional[float] = None
         self._odom_hist: deque = deque(maxlen=64)
         self._last_scan_latency_s = float("nan")
         self._last_yaw_rate = 0.0
@@ -2662,6 +2665,43 @@ class BuiltinSlamEngine:
                 break
         return conv.compose_poses(conv.invert_pose(c_at), c_new)
 
+    def _follow_odom_unseeded(
+        self, odom: Optional[conv.OdomReading], now: float
+    ) -> None:
+        """Extend the odometry chain while the map pose waits for its first seed.
+
+        Only the chain moves. The pose, the odometry state ``_predict`` keeps
+        and the twist the service reads (it takes a robot with no pose yet as
+        parked) stay as they were, so nothing but the lost filter sees it.
+        """
+        if odom is None:
+            return
+        prev_at = self._unseeded_odom_at
+        self._unseeded_odom_at = now
+        if odom.pose is not None:
+            prev = self._unseeded_odom_pose
+            self._unseeded_odom_pose = odom.pose
+            if prev is None:
+                return
+            step = conv.compose_poses(conv.invert_pose(prev), odom.pose)
+            gap = max(0.0, now - prev_at) if prev_at is not None else 0.0
+            if math.hypot(step.x, step.y) > max(0.5, 0.6 * gap):
+                return  # an odometry reset, not motion
+        else:
+            if prev_at is None:
+                return
+            dt = min(max(0.0, now - prev_at), 0.5)
+            if getattr(self._cfg, "base_velocity_convention", "viam") in (
+                BASE_VELOCITY_Y_FORWARD
+            ):
+                fwd, left = float(odom.vy), -float(odom.vx)
+            else:
+                fwd, left = float(odom.vx), float(odom.vy)
+            step = conv.Pose2D(fwd * dt, left * dt, float(odom.vtheta) * dt)
+        # The chain only: ``_odom_hist`` (scan-timing compensation) stays as
+        # it was before seeding.
+        self._odom_chain = conv.compose_poses(self._odom_chain, step)
+
     def _record_odom_step(
         self, before: conv.Pose2D, after: conv.Pose2D, now: float
     ) -> None:
@@ -2688,6 +2728,26 @@ class BuiltinSlamEngine:
     def get_odom_twist(self) -> tuple[float, float, float]:
         with self._lock:
             return self._last_odom_twist
+
+    def odometry_chain(self) -> conv.Pose2D:
+        """Odometry alone, composed since the engine started (no scan corrections)."""
+        with self._lock:
+            return self._odom_chain
+
+    def latest_scan(self) -> Optional[conv.LaserScan2D]:
+        """The newest merged scan the engine has read."""
+        return self._last_scan_obj
+
+    def awaiting_seed(self) -> bool:
+        """Localizing with no pose yet: no saved pose, no full-map seed landed."""
+        with self._lock:
+            return self._mode == MODE_LOCALIZING and self._seed_localize_pending
+
+    def localization_map(self) -> tuple[int, OccupancyMap]:
+        """``(identity, map)`` the scans are matched against; identity changes with the map."""
+        occ = self._occupancy_for_match()
+        with self._lock:
+            return id(self._grid), occ
 
     def get_map(self) -> dict:
         with self._lock:
@@ -2975,6 +3035,9 @@ class BuiltinSlamEngine:
         if seed_pending:
             # Hold absolute pose at whatever set_pose/origin is until a full-map
             # seed lands — do not odom-integrate from an assumed start point.
+            # The odometry chain still follows, for the lost filter.
+            with self._lock:
+                self._follow_odom_unseeded(odom, now)
             if scan is None:
                 return
             if now - self._last_seed_attempt_at < 2.0:

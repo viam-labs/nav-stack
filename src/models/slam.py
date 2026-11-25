@@ -62,6 +62,12 @@ from ..shm.lidar import ShmPointCloudClient
 from ..slam_builtin import BuiltinSlamEngine, BuiltinSlamHost
 from ..slam_builtin.io_sensors import BuiltinSensors
 from ..slam_builtin.localize_supervisor import LocalizeSupervisor
+from ..slam_builtin.lost_filter import (
+    CameraJudge,
+    LostFilter,
+    ParticleParams,
+    distance_field,
+)
 from ..viam_frames import (
     apply_framesystem_to_slam_cfg,
     fetch_frame_system_config,
@@ -129,6 +135,12 @@ class SlamService(SLAM):
         self._startup_localize_started_at: Optional[float] = None
         self._startup_localize_local = False
         self._periodic_relocalize_task: Optional[asyncio.Task] = None
+        # Particle filter over the whole map for a robot with no pose or the
+        # wrong one (localizing mode); ``_lost_filter_camera`` lets a camera
+        # place check hold back its hand-overs.
+        self._lost_filter_task: Optional[asyncio.Task] = None
+        self._lost_filter: Optional[LostFilter] = None
+        self._lost_filter_camera: Optional[CameraJudge] = None
         self._nav_stopped_since: Optional[float] = None
         self._mapping_revisit_task: Optional[asyncio.Task] = None
         self._last_relocalize_check: dict = {"status": "idle"}
@@ -327,10 +339,16 @@ class SlamService(SLAM):
         self._startup_localize_started_at = None
 
     def _cancel_periodic_relocalize_task(self) -> None:
+        """Stop the localizing-mode watchdogs: periodic relocalize and the lost filter."""
         task = self._periodic_relocalize_task
         if task is not None and not task.done():
             task.cancel()
         self._periodic_relocalize_task = None
+        task = self._lost_filter_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._lost_filter_task = None
+        self._lost_filter = None
 
     def _cancel_mapping_revisit_task(self) -> None:
         task = self._mapping_revisit_task
@@ -608,14 +626,71 @@ class SlamService(SLAM):
         return await self._localize._stuck_pose_refine()
 
     def _schedule_periodic_relocalize(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start the localizing-mode watchdogs: periodic relocalize and the lost filter."""
         cfg = self._cfg
-        if cfg is None or cfg.mode != MODE_LOCALIZING or not cfg.periodic_relocalize:
+        if cfg is None or cfg.mode != MODE_LOCALIZING:
+            return
+        if cfg.lost_filter and self._engine is not None:
+            self._lost_filter_task = loop.create_task(
+                self._run_lost_filter(period_s=1.0 / max(1.0, cfg.lost_filter_rate_hz))
+            )
+        if not cfg.periodic_relocalize:
             return
         self._periodic_relocalize_task = loop.create_task(
             self._run_periodic_relocalize(
                 interval_s=max(1.0, float(cfg.periodic_relocalize_interval_s)),
             )
         )
+
+    async def _run_lost_filter(self, *, period_s: float) -> None:
+        """Step the lost filter on the engine's odometry and newest scan (localizing mode).
+
+        It starts searching the whole map when the engine has no pose (no
+        saved pose and no full-map seed yet), and otherwise watches the scans'
+        fit and searches in the background when they stop fitting. A pose it
+        hands over goes in the way an initial pose does. The filter's work
+        runs off the event loop; it updates only after the robot has moved.
+        """
+        loop = asyncio.get_running_loop()
+        fields: Dict[int, np.ndarray] = {}
+        logged = 0
+        while True:
+            await asyncio.sleep(period_s)
+            engine, mgr = self._engine, self._manager
+            if engine is None or mgr is None:
+                continue
+            ident, occ = engine.localization_map()
+            filt = self._lost_filter
+            if filt is None or filt.map_id != ident:
+                if ident not in fields:
+                    fields.clear()
+                    fields[ident] = await loop.run_in_executor(
+                        None, distance_field, occ, ParticleParams().max_dist
+                    )
+                filt = LostFilter(
+                    occ,
+                    has_pose=not engine.awaiting_seed(),
+                    camera=self._lost_filter_camera,
+                    field=fields[ident],
+                    clock_origin=time.monotonic(),
+                )
+                filt.map_id = ident
+                self._lost_filter = filt
+                logged = 0
+            handover = await loop.run_in_executor(
+                None,
+                filt.step,
+                time.monotonic(),
+                engine.odometry_chain(),
+                engine.latest_scan(),
+                engine.get_pose(),
+            )
+            new = min(filt.log_count - logged, len(filt.log))
+            for line in list(filt.log)[len(filt.log) - new :] if new > 0 else []:
+                LOGGER.info(line)
+            logged = filt.log_count
+            if handover is not None:
+                mgr.set_initial_pose(handover.pose)
 
     async def _run_periodic_relocalize(self, *, interval_s: float) -> None:
         """Background drift watchdog: periodically re-localize when pose drifts.
@@ -1788,6 +1863,8 @@ class SlamService(SLAM):
             ]
         status["localization_check"] = dict(self._last_relocalize_check)
         status["localization_state"] = self._loc_state.snapshot()
+        if self._lost_filter is not None:
+            status["lost_filter"] = self._lost_filter.status()
         status["revisit_check"] = dict(self._last_revisit_check)
         if self._vision is not None or self._cfg is not None:
             enabled = self._cfg is not None and bool(self._cfg.vision_enabled)

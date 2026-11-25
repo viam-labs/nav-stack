@@ -230,7 +230,7 @@ def _run_challenge(args, cache: Path) -> int:
                         camera=camera,
                     )
                     for line in run.service_log:
-                        if line.startswith("lost finder"):
+                        if line.startswith("lost filter"):
                             print(f"    {line}", flush=True)
                     write_tum(folder / seq_name / f"run_{k}.txt", run.stamps, run.est)
                     print(
@@ -298,8 +298,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--lost-filter",
         action="store_true",
-        help="tracking and challenge: a particle filter over the whole map "
-        "finds the robot when it has no pose, then hands over to the tracker",
+        help="tracking and challenge: the SLAM service's lost filter (a particle "
+        "filter over the whole map that finds a robot with no pose) is on; it is "
+        "off otherwise, so runs compare with and without it",
     )
     ap.add_argument(
         "--lost-filter-camera",

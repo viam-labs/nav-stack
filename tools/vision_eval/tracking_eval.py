@@ -68,6 +68,8 @@ class TrackingRun:
     # With the service: each pose it set, as (stamp, before, after).
     service_moves: List[tuple] = field(default_factory=list)
     service_log: List[str] = field(default_factory=list)
+    # The SLAM service's lost filter at the end of the run, when it was on.
+    lost_filter: Optional[dict] = None
 
     @staticmethod
     def _errors(est: np.ndarray, truth: np.ndarray):
@@ -328,290 +330,6 @@ class CameraCheck:
         )
 
 
-class _LostFinder:
-    """A particle filter over the whole map, for when the tracker has no pose or the wrong one.
-
-    With no pose, it starts with particles spread over every free cell,
-    follows odometry and scans as AMCL does, and once one cluster holds
-    nearly all the weight and has stayed tight over ``CONFIRM_TRAVEL_M`` of
-    driving, hands that pose to the engine (as a relocalize would).
-
-    After that it watches. When the scans have not sat on the walls at the
-    tracker's pose for ``BAD_FIT_S``, it searches the whole map again in the
-    background while the tracker carries on. If the search settles where
-    the tracker already is, the tracker was right and the room has changed;
-    nothing moves. If it settles elsewhere, both poses are scored against the
-    last ``HISTORY_S`` of scans, each carried back along odometry, and the
-    tracker is moved only when the new place fits clearly better.
-
-    With a ``camera`` (a ``CameraCheck``), neither a hand-over nor a move
-    happens while the camera clearly backs another place. The filter then
-    starts over with most of its particles around the place the camera
-    backs and the rest over the map, and asks again after another
-    ``CONFIRM_TRAVEL_M`` of driving.
-    """
-
-    # The cloud stays about 0.2 m and 8 degrees wide once it has found the
-    # robot (the odometry noise keeps it so); the tracker takes it from there.
-    SHARE = 0.9
-    SPREAD_M = 0.3
-    SPREAD_DEG = 10.0
-    CONFIRM_UPDATES = 3
-    # Rooms that look alike fool one scan; driving out of them does not.
-    CONFIRM_TRAVEL_M = 1.5
-    # Scans that do not sit on the walls at the tracker's pose for this long
-    # start a background check.
-    BAD_FIT = 0.25
-    BAD_FIT_S = 8.0
-    # A check that has not settled in this long is dropped; after a check,
-    # wait this long before the next.
-    CHECK_MAX_S = 90.0
-    CHECK_COOLDOWN_S = 30.0
-    # The searched place replaces the tracker's only when it explains the
-    # recent scans this much better, on average.
-    SWITCH_MARGIN = 0.1
-    SAME_PLACE_M = 1.0
-    SAME_PLACE_DEG = 20.0
-    HISTORY_S = 10.0
-    HISTORY_EVERY_S = 0.5
-
-    def __init__(
-        self,
-        ref: OccupancyMap,
-        seq: LilocSequence,
-        engine,
-        *,
-        has_pose: bool = False,
-        camera: Optional[CameraCheck] = None,
-    ) -> None:
-        from .amcl import Amcl, AmclParams, distance_field
-
-        self.camera = camera
-
-        params = AmclParams(
-            min_particles=1000,
-            max_particles=20000,
-            z_hit=0.95,
-            z_rand=0.05,
-            update_min_d=0.1,
-            update_min_a=0.1,
-        )
-        key = id(ref)
-        if key not in _AMCL_FIELDS:
-            _AMCL_FIELDS[key] = distance_field(ref, params.max_dist)
-        self.pf = Amcl(
-            ref, conv.Pose2D(0.0, 0.0, 0.0), params=params, field=_AMCL_FIELDS[key]
-        )
-        self.seq, self.engine, self.ref = seq, engine, ref
-        self.odom_t, self.odom_pose, _twist = seq.odometry()
-        # "finding" (no pose yet), "watching", or "checking" (background search).
-        self.phase = "watching" if has_pose else "finding"
-        if not has_pose:
-            self.pf.scatter()
-        self.agree = 0
-        self.agree_from: Optional[np.ndarray] = None
-        self.bad_since: Optional[float] = None
-        self.last_fit_at = -1.0
-        self.check_started = 0.0
-        self.quiet_until = -1.0
-        self.history: List[tuple] = []  # (stamp, odom pose (3,), scan)
-        self.last_history_at = -1.0
-        self.log: List[str] = []
-
-    def _at(self, stamp: float) -> float:
-        return stamp - float(self.seq.gt_stamps[0])
-
-    def _odom(self, stamp: float) -> Optional[np.ndarray]:
-        i = int(np.searchsorted(self.odom_t, stamp, side="right")) - 1
-        return None if i < 0 else np.array(self.odom_pose[i], dtype=float)
-
-    def _remember(self, stamp: float, odom: np.ndarray) -> None:
-        if stamp - self.last_history_at < self.HISTORY_EVERY_S:
-            return
-        scan, _taken = self.seq.scan_before(stamp)
-        if scan is None:
-            return
-        self.last_history_at = stamp
-        self.history.append((stamp, odom.copy(), scan))
-        while self.history and stamp - self.history[0][0] > self.HISTORY_S:
-            self.history.pop(0)
-
-    def _recent_fit(self, pose: conv.Pose2D, odom_now: np.ndarray) -> float:
-        """Mean wall fit of the recent scans, each from ``pose`` carried back along odometry."""
-        from src.slam_builtin import scan_match
-
-        now = conv.Pose2D(*map(float, odom_now))
-        fits = []
-        for _stamp, odom_then, scan in self.history:
-            back = conv.compose_poses(
-                conv.invert_pose(now), conv.Pose2D(*map(float, odom_then))
-            )
-            fit, judged = scan_match.wall_agreement(
-                self.ref, scan, conv.compose_poses(pose, back)
-            )
-            fits.append(fit if judged and math.isfinite(fit) else -1.0)
-        return float(np.mean(fits)) if fits else float("nan")
-
-    def _watch(self, stamp: float) -> None:
-        from src.slam_builtin import scan_match
-
-        if stamp - self.last_fit_at < 1.0 or stamp < self.quiet_until:
-            return
-        self.last_fit_at = stamp
-        scan, _taken = self.seq.scan_before(stamp)
-        if scan is None:
-            return
-        fit, judged = scan_match.wall_agreement(self.ref, scan, self.engine.get_pose())
-        if judged and math.isfinite(fit) and fit >= self.BAD_FIT:
-            self.bad_since = None
-            return
-        if self.bad_since is None:
-            self.bad_since = stamp
-        if stamp - self.bad_since < self.BAD_FIT_S:
-            return
-        self.pf.scatter()
-        self.phase = "checking"
-        self.check_started = stamp
-        self.agree, self.agree_from, self.bad_since = 0, None, None
-        self.log.append(
-            f"lost finder: scans stopped fitting; checking in the background "
-            f"{self._at(stamp):.1f} s into the run"
-        )
-
-    def _settled(self, stamp: float, odom: np.ndarray) -> Optional[conv.Pose2D]:
-        """Run the filter one step; the pose once it has settled, else None."""
-        if not self.pf.odometry(conv.Pose2D(*map(float, odom))):
-            return None
-        scan, _taken = self.seq.scan_before(stamp)
-        if scan is None:
-            return None
-        self.pf.update(scan)
-        found = self.pf.converged()
-        if found is None:
-            self.agree, self.agree_from = 0, None
-            return None
-        _pose, share, spread, spread_deg = found
-        tight = (
-            share >= self.SHARE
-            and spread <= self.SPREAD_M
-            and spread_deg <= self.SPREAD_DEG
-        )
-        if not tight:
-            self.agree, self.agree_from = 0, None
-            return None
-        self.agree += 1
-        if self.agree_from is None:
-            self.agree_from = odom[:2].copy()
-        travelled = float(np.hypot(*(odom[:2] - self.agree_from)))
-        if self.agree < self.CONFIRM_UPDATES or travelled < self.CONFIRM_TRAVEL_M:
-            return None
-        return self.pf.estimate()
-
-    def _hand_over(self, pose: conv.Pose2D, stamp: float, why: str) -> None:
-        self.engine.set_pose(pose)
-        truth = self.seq.gt_pose(stamp)
-        off = (
-            f", {math.hypot(pose.x - truth.x, pose.y - truth.y):.2f} m from truth"
-            if truth is not None
-            else ""
-        )
-        self.log.append(
-            f"lost finder: {why} ({pose.x:.2f}, {pose.y:.2f}) "
-            f"{self._at(stamp):.1f} s into the run{off}"
-        )
-
-    def _camera_vetoes(self, pose: conv.Pose2D, stamp: float, what: str) -> bool:
-        if self.camera is None:
-            return False
-        why, places = self.camera.judge(pose, stamp)
-        if why is None:
-            return False
-        # Search again, around the place the camera backs as well as everywhere:
-        # the particles there still have to fit the scans. Then confirm over
-        # more driving before the next hand-over.
-        self.pf.seed(places)
-        self.agree, self.agree_from = 0, None
-        truth = self.seq.gt_pose(stamp)
-        off = (
-            f", {math.hypot(pose.x - truth.x, pose.y - truth.y):.2f} m from truth"
-            if truth is not None
-            else ""
-        )
-        cx = float(np.mean([p.x for p in places])) if places else float("nan")
-        cy = float(np.mean([p.y for p in places])) if places else float("nan")
-        camera_off = (
-            f", {math.hypot(cx - truth.x, cy - truth.y):.2f} m from truth"
-            if truth is not None and places
-            else ""
-        )
-        self.log.append(
-            f"lost finder: {what} ({pose.x:.2f}, {pose.y:.2f}) held back: {why}{off}; "
-            f"searching again around ({cx:.2f}, {cy:.2f}){camera_off} "
-            f"{self._at(stamp):.1f} s into the run"
-        )
-        return True
-
-    def step(self, stamp: float, clock) -> None:
-        del clock
-        odom = self._odom(stamp)
-        if odom is None:
-            return
-        self._remember(stamp, odom)
-        if self.phase == "watching":
-            self._watch(stamp)
-            return
-        found = self._settled(stamp, odom)
-        if self.phase == "finding":
-            if found is not None and not self._camera_vetoes(found, stamp, "hand-over"):
-                self._hand_over(found, stamp, "handed over")
-                self.phase = "watching"
-            return
-        # Checking: the tracker carries on until the search says otherwise.
-        if found is None:
-            if stamp - self.check_started > self.CHECK_MAX_S:
-                self.phase = "watching"
-                self.quiet_until = stamp + self.CHECK_COOLDOWN_S
-                self.log.append(
-                    f"lost finder: check did not settle; tracker kept "
-                    f"{self._at(stamp):.1f} s into the run"
-                )
-            return
-        tracker = self.engine.get_pose()
-        apart = math.hypot(found.x - tracker.x, found.y - tracker.y)
-        turned = abs(math.degrees(conv.normalize_angle(found.theta - tracker.theta)))
-        same_place = apart < self.SAME_PLACE_M and turned < self.SAME_PLACE_DEG
-        if not same_place:
-            new_fit = self._recent_fit(found, odom)
-            old_fit = self._recent_fit(tracker, odom)
-            if new_fit >= old_fit + self.SWITCH_MARGIN and self._camera_vetoes(
-                found, stamp, "move"
-            ):
-                # Keep checking: the search may settle elsewhere before CHECK_MAX_S.
-                return
-        self.phase = "watching"
-        self.quiet_until = stamp + self.CHECK_COOLDOWN_S
-        if same_place:
-            self.log.append(
-                f"lost finder: check agrees with the tracker "
-                f"{self._at(stamp):.1f} s into the run"
-            )
-            return
-        if new_fit >= old_fit + self.SWITCH_MARGIN:
-            self._hand_over(
-                found,
-                stamp,
-                f"moved the tracker {apart:.1f} m "
-                f"(fit {old_fit:.2f} -> {new_fit:.2f}) to",
-            )
-        else:
-            self.log.append(
-                f"lost finder: check found ({found.x:.2f}, {found.y:.2f}), "
-                f"{apart:.1f} m away, but it fits no better "
-                f"({new_fit:.2f} vs {old_fit:.2f}); tracker kept "
-                f"{self._at(stamp):.1f} s into the run"
-            )
-
-
 def track(
     seq: LilocSequence,
     ref: OccupancyMap,
@@ -649,8 +367,18 @@ def track(
     moves: List[tuple] = []
     driver: Optional[_Service] = None
     with tempfile.TemporaryDirectory(prefix="nav-track-") as tmp, clock:
+        if lost_filter and not service:
+            raise ValueError(
+                "the lost filter runs in the SLAM service; use service=True"
+            )
         cfg = _slam_config(
-            Path(tmp), vision=False, extra={"mode": MODE_LOCALIZING, **(config or {})}
+            Path(tmp),
+            vision=False,
+            extra={
+                "mode": MODE_LOCALIZING,
+                "lost_filter": bool(lost_filter),
+                **(config or {}),
+            },
         )
         store = MapStore(tmp)
         handle = store.get_or_create_map("reference")
@@ -670,6 +398,12 @@ def track(
             if not global_start:
                 persistence.save_last_pose(handle.root, start)
             driver = _Service(engine, cfg, store, sensors)
+            if camera is not None:
+                # The service asks on its own clock; the camera check knows
+                # the recording's.
+                driver.svc._lost_filter_camera = (  # noqa: SLF001
+                    lambda pose, now: camera.judge(pose, clock.stamp(now))
+                )
             real_set_pose = engine.set_pose
 
             def set_pose(pose: conv.Pose2D) -> None:
@@ -685,16 +419,9 @@ def track(
                 engine.set_pose(start)
         period = 1.0 / float(tick_hz)
         stamp = t0
-        finder = (
-            _LostFinder(ref, seq, engine, has_pose=not global_start, camera=camera)
-            if lost_filter
-            else None
-        )
         while stamp <= t1:
             clock.now = clock.of(stamp)
             engine._tick()  # noqa: SLF001
-            if finder is not None:
-                finder.step(stamp, clock)
             if driver is not None:
                 driver.step()
             taken = sensors.odom_taken
@@ -711,7 +438,10 @@ def track(
                     )
                 )
             stamp += period
+        lost = None
         if driver is not None:
+            filt = driver.svc._lost_filter  # noqa: SLF001
+            lost = filt.status() if filt is not None else None
             driver.close()
     return TrackingRun(
         start=start,
@@ -721,8 +451,8 @@ def track(
         truth_at_read=np.array([r[3] for r in rows]),
         wall_s=time.perf_counter() - t_wall,
         service_moves=moves,
-        service_log=(list(driver.log.lines) if driver is not None else [])
-        + (finder.log if finder is not None else []),
+        service_log=(list(driver.log.lines) if driver is not None else []),
+        lost_filter=lost,
     )
 
 
@@ -778,7 +508,8 @@ def evaluate_tracking(
             start,
             max_seconds=max_seconds,
             service=who == "service",
-            lost_filter=lost_filter,
+            # The lost filter is part of the SLAM service.
+            lost_filter=lost_filter and who == "service",
         )
 
     first = seq.gt_pose(_span(seq)[0])

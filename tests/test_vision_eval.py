@@ -436,13 +436,21 @@ def test_a_submission_is_scored_on_the_runs_whose_ground_truth_is_here(tmp_path)
     assert scores["overall"] == pytest.approx(100.0)
 
 
-def test_the_lost_filter_does_not_commit_in_a_room_that_looks_the_same_both_ways():
+def test_the_services_lost_filter_does_not_commit_in_a_room_that_looks_the_same_both_ways():
     """A bare rectangle looks identical turned half a turn: two equal clusters.
 
-    The filter must keep both rather than hand one to the tracker.
+    Run through the SLAM service as on a robot with no saved pose: its lost
+    filter must keep both rather than hand one to the tracker.
     """
     room = _room_map()
     run = track(
-        _RoomRun(seconds=10.0), room, service=False, global_start=True, lost_filter=True
+        _RoomRun(seconds=10.0), room, service=True, global_start=True, lost_filter=True
     )
-    assert not [line for line in run.service_log if "handed over" in line]
+    assert run.lost_filter is not None and run.lost_filter["updates"] > 0
+    assert run.lost_filter["handovers"] == 0
+    assert run.lost_filter["phase"] == "finding"
+
+
+def test_the_lost_filter_is_part_of_the_service():
+    with pytest.raises(ValueError):
+        track(_RoomRun(seconds=1.0), _room_map(), service=False, lost_filter=True)
