@@ -7,7 +7,7 @@
 What it runs (each a separate tools/eval_vision.py process, ``--jobs`` at a time):
 
 - **mapping** from scratch on ``mapping``, ``static_0`` and ``dynamics_0``
-  (people walking, where slam_toolbox fed both lidars broke): live pose and
+  (people walking): live pose and
   final keyframe error.
 - **tracking** (the LILocBench paper's protocol, true start, the SLAM
   service as on a robot) on ``static_0``, ``dynamics_0`` (people walking),
