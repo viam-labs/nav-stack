@@ -51,7 +51,7 @@ from tools.vision_eval.lilocbench import LilocSequence, load_reference_map  # no
 from tools.vision_eval.place_eval import evaluate_place  # noqa: E402
 from tools.vision_eval.reloc_eval import evaluate_reloc  # noqa: E402
 from tools.vision_eval.replay import odometry_trajectory, replay_mapping  # noqa: E402
-from tools.vision_eval.tracking_eval import evaluate_tracking, track  # noqa: E402
+from tools.vision_eval.tracking_eval import CameraCheck, evaluate_tracking, track  # noqa: E402
 
 DEFAULT_DATA = Path.home() / "datasets" / "lilocbench"
 DEFAULT_QUERIES = ("dynamics_0", "lt_changes_0")
@@ -205,12 +205,20 @@ def _run_challenge(args, cache: Path) -> int:
     report = {}
     for who in args.localizer:
         for label in args.lidars:
-            name = f"{label}_{who}" + ("_lost_filter" if args.lost_filter else "")
+            name = (
+                f"{label}_{who}"
+                + ("_lost_filter" if args.lost_filter else "")
+                + ("_camera" if args.lost_filter_camera else "")
+            )
             folder = cache / "challenge" / name
             for seq_name in args.queries or START_TIMES:
                 seq = LilocSequence(args.data, seq_name, camera=args.camera)
                 seq.lidars = LIDAR_SETS[label]
                 seq.deskew = None if args.deskew == "none" else args.deskew
+                camera = None
+                if args.lost_filter_camera:
+                    mapping = LilocSequence(args.data, args.mapping, camera=args.camera)
+                    camera = CameraCheck(seq, mapping, cache)
                 for k, start in enumerate(START_TIMES[seq_name], 1):
                     run = track(
                         seq,
@@ -219,7 +227,11 @@ def _run_challenge(args, cache: Path) -> int:
                         start_offset_s=start,
                         global_start=True,
                         lost_filter=args.lost_filter,
+                        camera=camera,
                     )
+                    for line in run.service_log:
+                        if line.startswith("lost finder"):
+                            print(f"    {line}", flush=True)
                     write_tum(folder / seq_name / f"run_{k}.txt", run.stamps, run.est)
                     print(
                         f"  {name} {seq_name} run_{k}: {run.wall_s:.0f} s", flush=True
@@ -288,6 +300,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="tracking and challenge: a particle filter over the whole map "
         "finds the robot when it has no pose, then hands over to the tracker",
+    )
+    ap.add_argument(
+        "--lost-filter-camera",
+        action="store_true",
+        help="challenge only, with --lost-filter: the filter does not hand over "
+        "or move the tracker while the camera's place ranking clearly backs "
+        "another place (keyframes from the --mapping run)",
     )
     ap.add_argument(
         "--localizer",

@@ -222,6 +222,112 @@ class _Service:
                 module.LOGGER = old
 
 
+class CameraCheck:
+    """Whether the camera backs a place, ranked the way the runtime ranks keyframes.
+
+    The keyframes are the mapping run's camera frames the runtime would keep
+    (0.75 m or 25 degrees apart). For each camera frame of the last
+    ``WINDOW_S``, the runtime's place ranking (VLAD shortlist, reordered by
+    matched patches) names its ``TOP`` keyframes; each is carried forward
+    along odometry to now. A place is backed by the frames that name a
+    keyframe within ``NEAR_M`` of it. The camera vetoes a place when another
+    place is backed by ``MARGIN`` more of the frames: rooms that look alike
+    to a lidar seldom look alike to a camera.
+
+    The keyframes' poses are the mapping run's ground truth here, where a
+    robot has its own map's poses; at a ``NEAR_M`` test the difference is
+    small.
+    """
+
+    WINDOW_S = 10.0
+    NEAR_M = 2.0
+    TOP = 3
+    MARGIN = 0.2
+    METHOD = "shipped+patches"
+
+    def __init__(self, seq: LilocSequence, mapping: LilocSequence, cache: Path) -> None:
+        from .features import ensure_features
+        from .place_eval import select_keyframes
+
+        self.map_feats = ensure_features(mapping, cache)
+        self.keyframes = select_keyframes(mapping.poses)
+        self.kf_poses = [mapping.poses[k] for k in self.keyframes]
+        self.feats = ensure_features(seq, cache)
+        self.stamps = np.asarray(seq.stamps, dtype=float)
+        self.odom_t, self.odom_pose, _twist = seq.odometry()
+        self._named: Dict[int, np.ndarray] = {}
+
+    def _odom(self, stamp: float) -> conv.Pose2D:
+        i = max(0, int(np.searchsorted(self.odom_t, stamp, side="right")) - 1)
+        return conv.Pose2D(*map(float, self.odom_pose[i]))
+
+    def _named_keyframes(self, frames: List[int]) -> None:
+        from .place_eval import rank_named
+
+        todo = [f for f in frames if f not in self._named]
+        if not todo:
+            return
+        ranking = rank_named(
+            self.METHOD, self.map_feats, self.keyframes, self.feats, todo, top=self.TOP
+        )
+        for n, f in enumerate(todo):
+            self._named[f] = ranking.order[n]
+
+    def backing(self, pose: conv.Pose2D, stamp: float) -> Optional[tuple]:
+        """(share of frames backing ``pose``, share backing the best place, frames)."""
+        frames = [
+            int(i)
+            for i in np.nonzero(
+                (self.stamps <= stamp) & (self.stamps > stamp - self.WINDOW_S)
+            )[0]
+        ]
+        if not frames:
+            return None
+        self._named_keyframes(frames)
+        now = self._odom(stamp)
+        named = []  # (frame, keyframe pose carried forward to ``stamp``)
+        for f in frames:
+            moved = conv.compose_poses(
+                conv.invert_pose(self._odom(float(self.stamps[f]))), now
+            )
+            for k in self._named[f]:
+                named.append((f, conv.compose_poses(self.kf_poses[int(k)], moved)))
+        frame_of = np.array([f for f, _p in named])
+        pts = np.array([[p.x, p.y] for _f, p in named])
+
+        def near(x: float, y: float) -> np.ndarray:
+            return np.hypot(pts[:, 0] - x, pts[:, 1] - y) < self.NEAR_M
+
+        def backed(x: float, y: float) -> int:
+            return len(set(frame_of[near(x, y)].tolist()))
+
+        counts = [backed(p.x, p.y) for _f, p in named]
+        top = int(np.argmax(counts))
+        best_poses = [
+            named[i][1] for i in np.nonzero(near(*pts[top]))[0]
+        ]  # the views that name the best place
+        return (
+            backed(pose.x, pose.y) / len(frames),
+            counts[top] / len(frames),
+            len(frames),
+            best_poses,
+        )
+
+    def judge(self, pose: conv.Pose2D, stamp: float) -> tuple:
+        """``(why the camera rejects pose, or None; poses of the place it backs)``."""
+        got = self.backing(pose, stamp)
+        if got is None:
+            return None, []
+        mine, best, frames, best_poses = got
+        if mine >= best - self.MARGIN:
+            return None, best_poses
+        return (
+            f"camera backs another place ({100 * best:.0f}% of {frames} frames "
+            f"against {100 * mine:.0f}%)",
+            best_poses,
+        )
+
+
 class _LostFinder:
     """A particle filter over the whole map, for when the tracker has no pose or the wrong one.
 
@@ -237,6 +343,12 @@ class _LostFinder:
     nothing moves. If it settles elsewhere, both poses are scored against the
     last ``HISTORY_S`` of scans, each carried back along odometry, and the
     tracker is moved only when the new place fits clearly better.
+
+    With a ``camera`` (a ``CameraCheck``), neither a hand-over nor a move
+    happens while the camera clearly backs another place. The filter then
+    starts over with most of its particles around the place the camera
+    backs and the rest over the map, and asks again after another
+    ``CONFIRM_TRAVEL_M`` of driving.
     """
 
     # The cloud stays about 0.2 m and 8 degrees wide once it has found the
@@ -264,9 +376,17 @@ class _LostFinder:
     HISTORY_EVERY_S = 0.5
 
     def __init__(
-        self, ref: OccupancyMap, seq: LilocSequence, engine, *, has_pose: bool = False
+        self,
+        ref: OccupancyMap,
+        seq: LilocSequence,
+        engine,
+        *,
+        has_pose: bool = False,
+        camera: Optional[CameraCheck] = None,
     ) -> None:
         from .amcl import Amcl, AmclParams, distance_field
+
+        self.camera = camera
 
         params = AmclParams(
             min_particles=1000,
@@ -400,6 +520,37 @@ class _LostFinder:
             f"{self._at(stamp):.1f} s into the run{off}"
         )
 
+    def _camera_vetoes(self, pose: conv.Pose2D, stamp: float, what: str) -> bool:
+        if self.camera is None:
+            return False
+        why, places = self.camera.judge(pose, stamp)
+        if why is None:
+            return False
+        # Search again, around the place the camera backs as well as everywhere:
+        # the particles there still have to fit the scans. Then confirm over
+        # more driving before the next hand-over.
+        self.pf.seed(places)
+        self.agree, self.agree_from = 0, None
+        truth = self.seq.gt_pose(stamp)
+        off = (
+            f", {math.hypot(pose.x - truth.x, pose.y - truth.y):.2f} m from truth"
+            if truth is not None
+            else ""
+        )
+        cx = float(np.mean([p.x for p in places])) if places else float("nan")
+        cy = float(np.mean([p.y for p in places])) if places else float("nan")
+        camera_off = (
+            f", {math.hypot(cx - truth.x, cy - truth.y):.2f} m from truth"
+            if truth is not None and places
+            else ""
+        )
+        self.log.append(
+            f"lost finder: {what} ({pose.x:.2f}, {pose.y:.2f}) held back: {why}{off}; "
+            f"searching again around ({cx:.2f}, {cy:.2f}){camera_off} "
+            f"{self._at(stamp):.1f} s into the run"
+        )
+        return True
+
     def step(self, stamp: float, clock) -> None:
         del clock
         odom = self._odom(stamp)
@@ -411,7 +562,7 @@ class _LostFinder:
             return
         found = self._settled(stamp, odom)
         if self.phase == "finding":
-            if found is not None:
+            if found is not None and not self._camera_vetoes(found, stamp, "hand-over"):
                 self._hand_over(found, stamp, "handed over")
                 self.phase = "watching"
             return
@@ -428,16 +579,23 @@ class _LostFinder:
         tracker = self.engine.get_pose()
         apart = math.hypot(found.x - tracker.x, found.y - tracker.y)
         turned = abs(math.degrees(conv.normalize_angle(found.theta - tracker.theta)))
+        same_place = apart < self.SAME_PLACE_M and turned < self.SAME_PLACE_DEG
+        if not same_place:
+            new_fit = self._recent_fit(found, odom)
+            old_fit = self._recent_fit(tracker, odom)
+            if new_fit >= old_fit + self.SWITCH_MARGIN and self._camera_vetoes(
+                found, stamp, "move"
+            ):
+                # Keep checking: the search may settle elsewhere before CHECK_MAX_S.
+                return
         self.phase = "watching"
         self.quiet_until = stamp + self.CHECK_COOLDOWN_S
-        if apart < self.SAME_PLACE_M and turned < self.SAME_PLACE_DEG:
+        if same_place:
             self.log.append(
                 f"lost finder: check agrees with the tracker "
                 f"{self._at(stamp):.1f} s into the run"
             )
             return
-        new_fit = self._recent_fit(found, odom)
-        old_fit = self._recent_fit(tracker, odom)
         if new_fit >= old_fit + self.SWITCH_MARGIN:
             self._hand_over(
                 found,
@@ -466,11 +624,13 @@ def track(
     start_offset_s: float = 0.0,
     global_start: bool = False,
     lost_filter: bool = False,
+    camera: Optional[CameraCheck] = None,
 ) -> TrackingRun:
     """Localize through ``seq`` in ``ref`` from ``start`` (default: the true first pose).
 
     With ``service`` the robot's SLAM service runs around the engine, and
-    ``start`` is the pose it restarts from (its saved last pose).
+    ``start`` is the pose it restarts from (its saved last pose). ``camera``
+    lets the lost filter ask the camera before it moves the tracker.
     """
     t_wall = time.perf_counter()
     t0, t1 = _span(seq)
@@ -526,7 +686,7 @@ def track(
         period = 1.0 / float(tick_hz)
         stamp = t0
         finder = (
-            _LostFinder(ref, seq, engine, has_pose=not global_start)
+            _LostFinder(ref, seq, engine, has_pose=not global_start, camera=camera)
             if lost_filter
             else None
         )

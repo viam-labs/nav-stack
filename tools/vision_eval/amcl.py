@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -114,6 +114,33 @@ class Amcl:
         self.y = self.occ.origin_y + (rows[pick] + self.rng.random(n)) * self.res
         self.th = self.rng.uniform(-math.pi, math.pi, n)
         self.w = np.full(n, 1.0 / n)
+
+    def seed(
+        self,
+        poses: Sequence[conv.Pose2D],
+        *,
+        share: float = 0.7,
+        std=(0.5, 0.5, math.radians(25.0)),
+    ) -> None:
+        """Start over with ``share`` of the particles around ``poses``, the rest over the map.
+
+        For a hint from elsewhere (the camera naming a place): the particles
+        around it still have to earn their weight from the scans, and the
+        ones spread over the map keep the filter from betting everything on
+        the hint.
+        """
+        n = int(self.p.max_particles)
+        k = min(n, int(round(n * float(share)))) if poses else 0
+        self.scatter(n)
+        if k == 0:
+            return
+        pick = self.rng.integers(0, len(poses), k)
+        px = np.array([p.x for p in poses])[pick]
+        py = np.array([p.y for p in poses])[pick]
+        pth = np.array([p.theta for p in poses])[pick] + self.rng.normal(0.0, std[2], k)
+        self.x[:k] = px + self.rng.normal(0.0, std[0], k)
+        self.y[:k] = py + self.rng.normal(0.0, std[1], k)
+        self.th[:k] = np.arctan2(np.sin(pth), np.cos(pth))
 
     def converged(self) -> Optional[tuple]:
         """``(pose, share, spread_m, spread_deg)`` of the heaviest cluster, or None."""
