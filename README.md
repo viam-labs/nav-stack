@@ -865,6 +865,7 @@ python tools/eval_vision.py place    # place-recognition recall
 python tools/eval_vision.py reloc    # lost-pose recovery, lidar vs camera+lidar
 python tools/eval_vision.py mapping  # replay a run through SLAM, score the trajectory
 python tools/eval_vision.py tracking # localize in the dataset's map, as the benchmark scores localizers
+python tools/eval_vision.py challenge --lost-filter  # find the robot with no initial pose, as the challenge scores it
 ```
 
 `tracking` follows the benchmark paper's pose-tracking protocol (Trekel et
@@ -878,6 +879,15 @@ service around it as on a robot, so its startup localize (the drawn start is
 then the robot's saved last pose) and periodic relocalize watchdog run on the
 recording's clock. It needs `lt_changes_dynamics_0` too:
 `python tools/fetch_lilocbench.py --sequences lt_changes_dynamics_0`.
+
+`challenge` runs the benchmark's public challenge protocol: from several
+start times into each run, with no initial pose, scored in bands from 2 cm /
+1° (100) to 20 cm / 10° (10). Fetching with `--challenge-example` adds the
+challenge's own AMCL entry, which is scored alongside. `--lost-filter` adds a
+particle filter over the whole map that finds the robot when it has no pose
+and hands over to the tracker. For comparison, `--localizer emcl2` runs an
+expansion-resetting particle filter instead of the tracker, and
+`--deskew last` removes the robot's motion during each lidar sweep.
 
 Off the robot, install the CPU runtime first with `pip install onnxruntime`;
 `requirements-vision.txt` lists only the OpenVINO build. The weights are

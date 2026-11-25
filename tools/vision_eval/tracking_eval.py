@@ -222,6 +222,137 @@ class _Service:
                 module.LOGGER = old
 
 
+class _LostFinder:
+    """A particle filter over the whole map that runs only while the robot has no pose.
+
+    It starts with particles spread over every free cell, follows odometry
+    and scans as AMCL does, and once one cluster holds nearly all the weight
+    and is tight, hands that pose to the engine (as a relocalize would) and
+    stops.
+    """
+
+    # The cloud stays about 0.2 m and 8 degrees wide once it has found the
+    # robot (the odometry noise keeps it so); the tracker takes it from there.
+    SHARE = 0.9
+    SPREAD_M = 0.3
+    SPREAD_DEG = 10.0
+    CONFIRM_UPDATES = 3
+    # Rooms that look alike fool one scan; driving out of them does not.
+    CONFIRM_TRAVEL_M = 1.5
+    # After a hand-over: this many seconds in a row of scans that do not sit
+    # on the walls at the tracker's pose start the search again.
+    BAD_FIT = 0.25
+    BAD_FIT_S = 8.0
+
+    def __init__(self, ref: OccupancyMap, seq: LilocSequence, engine) -> None:
+        from .amcl import Amcl, AmclParams, distance_field
+
+        params = AmclParams(
+            min_particles=1000,
+            max_particles=20000,
+            z_hit=0.95,
+            z_rand=0.05,
+            update_min_d=0.1,
+            update_min_a=0.1,
+        )
+        key = id(ref)
+        if key not in _AMCL_FIELDS:
+            _AMCL_FIELDS[key] = distance_field(ref, params.max_dist)
+        self.pf = Amcl(
+            ref, conv.Pose2D(0.0, 0.0, 0.0), params=params, field=_AMCL_FIELDS[key]
+        )
+        self.pf.scatter()
+        self.seq, self.engine = seq, engine
+        self.odom_t, self.odom_pose, _twist = seq.odometry()
+        self.done = False
+        self.agree = 0
+        self.agree_from: Optional[np.ndarray] = None
+        self.bad_since: Optional[float] = None
+        self.last_check = -1.0
+        self.restarts = 0
+        self.log: List[str] = []
+
+    def _watch(self, stamp: float) -> None:
+        """After a hand-over: start again if the tracker's scans stop fitting."""
+        from src.slam_builtin import scan_match
+
+        if stamp - self.last_check < 1.0:
+            return
+        self.last_check = stamp
+        scan, _taken = self.seq.scan_before(stamp)
+        if scan is None:
+            return
+        fit, judged = scan_match.wall_agreement(
+            self.pf.occ, scan, self.engine.get_pose()
+        )
+        bad = judged == 0 or not math.isfinite(fit) or fit < self.BAD_FIT
+        if not bad:
+            self.bad_since = None
+            return
+        if self.bad_since is None:
+            self.bad_since = stamp
+        if stamp - self.bad_since >= self.BAD_FIT_S:
+            self.pf.scatter()
+            self.done = False
+            self.agree = 0
+            self.agree_from = None
+            self.bad_since = None
+            self.restarts += 1
+            self.log.append(
+                f"lost finder: scans stopped fitting; searching again "
+                f"{stamp - self.seq.gt_stamps[0]:.1f} s into the run"
+            )
+
+    def step(self, stamp: float, clock) -> None:
+        if self.done:
+            self._watch(stamp)
+            return
+        i = int(np.searchsorted(self.odom_t, stamp, side="right")) - 1
+        if i < 0:
+            return
+        x, y, yaw = self.odom_pose[i]
+        if not self.pf.odometry(conv.Pose2D(float(x), float(y), float(yaw))):
+            return
+        scan, _taken = self.seq.scan_before(stamp)
+        if scan is None:
+            return
+        self.pf.update(scan)
+        found = self.pf.converged()
+        if found is None:
+            self.agree = 0
+            self.agree_from = None
+            return
+        pose, share, spread, spread_deg = found
+        tight = (
+            share >= self.SHARE
+            and spread <= self.SPREAD_M
+            and spread_deg <= self.SPREAD_DEG
+        )
+        self.agree = self.agree + 1 if tight else 0
+        if not tight:
+            self.agree_from = None
+            return
+        odom_now = np.array(self.odom_pose[i, :2], dtype=float)
+        if self.agree_from is None:
+            self.agree_from = odom_now
+        travelled = float(np.hypot(*(odom_now - self.agree_from)))
+        if self.agree < self.CONFIRM_UPDATES or travelled < self.CONFIRM_TRAVEL_M:
+            return
+        here = self.pf.estimate()
+        self.engine.set_pose(here)
+        self.done = True
+        truth = self.seq.gt_pose(stamp)
+        off = (
+            f", {math.hypot(here.x - truth.x, here.y - truth.y):.2f} m from truth"
+            if truth is not None
+            else ""
+        )
+        self.log.append(
+            f"lost finder: handed over ({here.x:.2f}, {here.y:.2f}) after "
+            f"{self.pf.updates} updates, {stamp - self.seq.gt_stamps[0]:.1f} s into the run{off}"
+        )
+
+
 def track(
     seq: LilocSequence,
     ref: OccupancyMap,
@@ -231,6 +362,9 @@ def track(
     max_seconds: Optional[float] = None,
     config: Optional[dict] = None,
     service: bool = False,
+    start_offset_s: float = 0.0,
+    global_start: bool = False,
+    lost_filter: bool = False,
 ) -> TrackingRun:
     """Localize through ``seq`` in ``ref`` from ``start`` (default: the true first pose).
 
@@ -239,6 +373,10 @@ def track(
     """
     t_wall = time.perf_counter()
     t0, t1 = _span(seq)
+    if start_offset_s:
+        t0 = max(t0, float(seq.gt_stamps[0]) + float(start_offset_s))
+        while seq.gt_pose(t0) is None and t0 < t1:
+            t0 += 0.01
     if max_seconds is not None:
         t1 = min(t1, t0 + float(max_seconds))
     first = seq.gt_pose(t0)
@@ -266,8 +404,10 @@ def track(
             rate_hz=tick_hz,  # type: ignore[arg-type]
         )
         if service:
-            # A robot restarting: its last pose is saved with the map.
-            persistence.save_last_pose(handle.root, start)
+            # A robot restarting: its last pose is saved with the map, unless
+            # it has to find itself from nothing.
+            if not global_start:
+                persistence.save_last_pose(handle.root, start)
             driver = _Service(engine, cfg, store, sensors)
             real_set_pose = engine.set_pose
 
@@ -280,12 +420,18 @@ def track(
             driver.start()
         else:
             engine.configure_mode(MODE_LOCALIZING, handle.root)
-            engine.set_pose(start)
+            if not global_start:
+                engine.set_pose(start)
         period = 1.0 / float(tick_hz)
         stamp = t0
+        finder = (
+            _LostFinder(ref, seq, engine) if (lost_filter and global_start) else None
+        )
         while stamp <= t1:
             clock.now = clock.of(stamp)
             engine._tick()  # noqa: SLF001
+            if finder is not None:
+                finder.step(stamp, clock)
             if driver is not None:
                 driver.step()
             taken = sensors.odom_taken
@@ -312,7 +458,8 @@ def track(
         truth_at_read=np.array([r[3] for r in rows]),
         wall_s=time.perf_counter() - t_wall,
         service_moves=moves,
-        service_log=list(driver.log.lines) if driver is not None else [],
+        service_log=(list(driver.log.lines) if driver is not None else [])
+        + (finder.log if finder is not None else []),
     )
 
 
@@ -348,14 +495,33 @@ def evaluate_tracking(
     seed: int = 0,
     max_seconds: Optional[float] = None,
     service: bool = False,
+    localizer: Optional[str] = None,
+    lost_filter: bool = False,
     log=print,
 ) -> dict:
-    """One run from the true first pose, then ``starts`` from drawn poses."""
+    """One run from the true first pose, then ``starts`` from drawn poses.
+
+    ``localizer``: ``engine``, ``service`` (same as ``service=True``) or
+    ``emcl2`` (the particle filter in ``emcl``, seeded per start).
+    """
+    who = localizer or ("service" if service else "engine")
+
+    def run_from(start, i):
+        if who == "emcl2":
+            return track_emcl(seq, ref, start, seed=i, max_seconds=max_seconds)
+        return track(
+            seq,
+            ref,
+            start,
+            max_seconds=max_seconds,
+            service=who == "service",
+            lost_filter=lost_filter,
+        )
+
     first = seq.gt_pose(_span(seq)[0])
-    exact = track(seq, ref, first, max_seconds=max_seconds, service=service)
+    exact = run_from(first, 0)
     lidars = list(getattr(seq, "lidars", ()))
     out: dict = {"lidars": lidars, "true_start": exact.summary()}
-    who = "service" if service else "engine"
     log(
         f"  {seq.name} [{'+'.join(lidars)}, {who}]: true start "
         f"{out['true_start']['rmse_cm']:.2f} cm rmse in {exact.wall_s:.0f} s"
@@ -363,7 +529,7 @@ def evaluate_tracking(
     if starts > 0:
         runs = []
         for i, start in enumerate(perturbed_starts(first, starts, seed=seed)):
-            run = track(seq, ref, start, max_seconds=max_seconds, service=service)
+            run = run_from(start, i + 1)
             summary = run.summary()
             summary["start_offset_m"] = float(
                 math.hypot(start.x - first.x, start.y - first.y)
@@ -379,3 +545,152 @@ def evaluate_tracking(
             )
         out["drawn_starts"] = {"runs": runs, **_mean_std(runs)}
     return out
+
+
+def track_emcl(
+    seq: LilocSequence,
+    ref: OccupancyMap,
+    start: Optional[conv.Pose2D] = None,
+    *,
+    refine: bool = False,
+    seed: int = 0,
+    tick_hz: float = 15.0,
+    max_seconds: Optional[float] = None,
+    params=None,
+) -> TrackingRun:
+    """Localize with the expansion-resetting particle filter (``emcl.Emcl``).
+
+    Particles start spread around ``start`` as the paper spreads them around
+    the true pose. With ``refine`` the stack's scan matcher refines the
+    filter's estimate against the map after every scan, and that refined
+    pose is what is published (the filter itself is not told).
+    """
+    from src.slam_builtin import scan_match
+
+    from .emcl import Emcl
+
+    t_wall = time.perf_counter()
+    t0, t1 = _span(seq)
+    if max_seconds is not None:
+        t1 = min(t1, t0 + float(max_seconds))
+    first = seq.gt_pose(t0)
+    start = first if start is None else start
+    odom_t, odom_pose, _twist = seq.odometry()
+    pf = Emcl(ref, start, START_STD, params=params, seed=seed)
+    lookup = scan_match.occupied_lookup(ref) if refine else None
+    correction = conv.Pose2D(0.0, 0.0, 0.0)
+    last_taken = float("nan")
+    rows = []
+    period = 1.0 / float(tick_hz)
+    stamp = t0
+    while stamp <= t1:
+        i = int(np.searchsorted(odom_t, stamp, side="right")) - 1
+        if i >= 0:
+            x, y, yaw = odom_pose[i]
+            pf.move(conv.Pose2D(float(x), float(y), float(yaw)))
+            scan, taken = seq.scan_before(stamp)
+            if scan is not None and taken != last_taken:
+                last_taken = taken
+                pf.weigh(scan)
+                if refine:
+                    est = pf.estimate()
+                    found = scan_match.refine_pose(
+                        ref, scan, est, occupied_lookup=lookup
+                    )
+                    correction = (
+                        conv.compose_poses(found[0], conv.invert_pose(est))
+                        if found[0] is not None
+                        else conv.Pose2D(0.0, 0.0, 0.0)
+                    )
+            pose = conv.compose_poses(correction, pf.estimate())
+            taken_odom = float(odom_t[i])
+            truth = seq.gt_pose(taken_odom)
+            now = seq.gt_pose(stamp)
+            if truth is not None and now is not None:
+                rows.append(
+                    (
+                        taken_odom,
+                        (pose.x, pose.y, pose.theta),
+                        (truth.x, truth.y, truth.theta),
+                        (now.x, now.y, now.theta),
+                    )
+                )
+        stamp += period
+    return TrackingRun(
+        start=start,
+        stamps=np.array([r[0] for r in rows]),
+        est=np.array([r[1] for r in rows]),
+        truth=np.array([r[2] for r in rows]),
+        truth_at_read=np.array([r[3] for r in rows]),
+        wall_s=time.perf_counter() - t_wall,
+        service_log=[f"expansion resets: {pf.resets}"],
+    )
+
+
+_AMCL_FIELDS: Dict[int, np.ndarray] = {}
+
+
+def track_amcl(
+    seq: LilocSequence,
+    ref: OccupancyMap,
+    start: Optional[conv.Pose2D] = None,
+    *,
+    seed: int = 0,
+    tick_hz: float = 15.0,
+    max_seconds: Optional[float] = None,
+    params=None,
+) -> TrackingRun:
+    """Localize with adaptive Monte Carlo localization (``amcl.Amcl``).
+
+    Particles start spread around ``start`` as the paper spreads them around
+    the true pose. The published pose is the filter's last estimate carried
+    forward by odometry, as AMCL publishes it.
+    """
+    from .amcl import Amcl, AmclParams, distance_field
+
+    t_wall = time.perf_counter()
+    t0, t1 = _span(seq)
+    if max_seconds is not None:
+        t1 = min(t1, t0 + float(max_seconds))
+    first = seq.gt_pose(t0)
+    start = first if start is None else start
+    p = params or AmclParams()
+    key = id(ref)
+    if key not in _AMCL_FIELDS:
+        _AMCL_FIELDS[key] = distance_field(ref, p.max_dist)
+    pf = Amcl(ref, start, START_STD, params=p, seed=seed, field=_AMCL_FIELDS[key])
+    odom_t, odom_pose, _twist = seq.odometry()
+    rows = []
+    period = 1.0 / float(tick_hz)
+    stamp = t0
+    while stamp <= t1:
+        i = int(np.searchsorted(odom_t, stamp, side="right")) - 1
+        if i >= 0:
+            x, y, yaw = odom_pose[i]
+            if pf.odometry(conv.Pose2D(float(x), float(y), float(yaw))):
+                scan, _taken = seq.scan_before(stamp)
+                if scan is not None:
+                    pf.update(scan)
+            pose = pf.estimate()
+            taken_odom = float(odom_t[i])
+            truth = seq.gt_pose(taken_odom)
+            now = seq.gt_pose(stamp)
+            if truth is not None and now is not None:
+                rows.append(
+                    (
+                        taken_odom,
+                        (pose.x, pose.y, pose.theta),
+                        (truth.x, truth.y, truth.theta),
+                        (now.x, now.y, now.theta),
+                    )
+                )
+        stamp += period
+    return TrackingRun(
+        start=start,
+        stamps=np.array([r[0] for r in rows]),
+        est=np.array([r[1] for r in rows]),
+        truth=np.array([r[2] for r in rows]),
+        truth_at_read=np.array([r[3] for r in rows]),
+        wall_s=time.perf_counter() - t_wall,
+        service_log=[f"filter updates: {pf.updates}"],
+    )

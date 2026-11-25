@@ -379,3 +379,57 @@ def test_the_service_replay_repeats_exactly():
     from src.models import slam as slam_module
 
     assert type(slam_module.LOGGER).__name__ != "_Recorder"
+
+
+# --- The challenge's scoring and format --------------------------------------------
+
+from tools.vision_eval.challenge import (  # noqa: E402
+    load_tum,
+    pose_scores,
+    run_errors,
+    write_tum,
+)
+
+
+def test_each_pose_earns_the_score_of_the_tightest_band_it_is_in():
+    pos = np.array([0.01, 0.03, 0.03, 0.15, 0.5])
+    yaw = np.array([0.5, 1.5, 4.5, 9.0, 0.0])
+    # 2 cm/1 deg -> 100; 4 cm/2 deg -> 80; 3 cm but 4.5 deg -> 20 (10 cm/5 deg);
+    # 15 cm/9 deg -> 10; 50 cm -> 0.
+    assert list(pose_scores(pos, yaw)) == [100.0, 80.0, 20.0, 10.0, 0.0]
+
+
+def test_a_submission_round_trips_with_one_pose_per_stamp(tmp_path):
+    stamps = np.array([1.0, 1.0, 2.0, 3.0])  # two ticks shared an odometry sample
+    poses = np.array(
+        [[0.0, 0.0, 0.1], [0.5, 0.0, 0.2], [1.0, 0.0, -3.0], [2.0, 1.0, 3.0]]
+    )
+    write_tum(tmp_path / "run_1.txt", stamps, poses)
+    t, p = load_tum(tmp_path / "run_1.txt")
+    assert list(t) == [1.0, 2.0, 3.0]
+    assert p[0] == pytest.approx([0.5, 0.0, 0.2])  # the later estimate is kept
+    assert p[2, 2] == pytest.approx(3.0)
+
+
+def test_run_errors_hold_the_localizer_before_its_first_pose_and_score_from_the_start():
+    gt_t = np.arange(0.0, 10.0, 0.5)
+    gt_p = np.column_stack([gt_t, np.zeros_like(gt_t), np.zeros_like(gt_t)])
+    loc_t = np.array([4.0, 9.5])
+    loc_p = np.array([[4.0, 0.0, 0.0], [9.5, 0.0, 0.0]])
+    pos, yaw = run_errors(gt_t, gt_p, 2.0, loc_t, loc_p)
+    assert pos.size == (gt_t >= 2.0).sum()
+    # Before its first pose the localizer is held there: 2 m off at t = 2.
+    assert pos[0] == pytest.approx(2.0) and pos[-1] == pytest.approx(0.0)
+    assert yaw.max() == pytest.approx(0.0)
+
+
+def test_the_lost_filter_does_not_commit_in_a_room_that_looks_the_same_both_ways():
+    """A bare rectangle looks identical turned half a turn: two equal clusters.
+
+    The filter must keep both rather than hand one to the tracker.
+    """
+    room = _room_map()
+    run = track(
+        _RoomRun(seconds=10.0), room, service=False, global_start=True, lost_filter=True
+    )
+    assert not [line for line in run.service_log if "handed over" in line]

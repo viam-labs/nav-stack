@@ -145,6 +145,7 @@ class _Lidar:
     range_max: float
     sensor_pose: conv.Pose2D
     name: str = ""
+    time_increment: float = 0.0
 
 
 class LilocSequence:
@@ -209,6 +210,11 @@ class LilocSequence:
         # Which 2D lidars make up a scan: both, as the stack merges them, or
         # one (the dataset's reference map was drawn from the front one).
         self.lidars: Tuple[str, ...] = ("front", "rear")
+        # Undo the robot's motion during each sweep: None, or whether a
+        # scan's stamp is the time of its "first" or "last" beam. Every
+        # return is moved into the robot's frame at the reference stamp.
+        self.deskew: Optional[str] = None
+        self._odom_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
     def __len__(self) -> int:
         return len(self.stamps)
@@ -270,6 +276,7 @@ class LilocSequence:
                             float(mat[0, 3]), float(mat[1, 3]), yaw
                         ),
                         name=which,
+                        time_increment=float(spec.get("time_increment", 0.0) or 0.0),
                     )
                 )
             self._lidars = out
@@ -283,6 +290,8 @@ class LilocSequence:
         ``which`` defaults to ``self.lidars``.
         """
         use = tuple(self.lidars if which is None else which)
+        if self.deskew is not None:
+            return self._deskewed_scan(stamp, use)
         scans = []
         for lidar in self._load_lidars():
             if lidar.name not in use:
@@ -303,6 +312,60 @@ class LilocSequence:
         if not scans:
             return None
         return conv.merge_scans(scans)
+
+    def _odom_at(self, stamps: np.ndarray) -> np.ndarray:
+        """Wheel-odometry poses at ``stamps``, interpolated: ``(N, 3)``."""
+        if self._odom_cache is None:
+            t, poses, _twists = self.odometry()
+            self._odom_cache = (
+                t,
+                np.column_stack([poses[:, :2], np.unwrap(poses[:, 2])]),
+            )
+        t, poses = self._odom_cache
+        return np.column_stack([np.interp(stamps, t, poses[:, k]) for k in range(3)])
+
+    def _deskewed_scan(
+        self, stamp: float, use: Sequence[str]
+    ) -> Optional[conv.LaserScan2D]:
+        """Both lidars nearest ``stamp``, each return moved to the robot's pose at ``stamp``."""
+        ref = self._odom_at(np.array([stamp]))[0]
+        c0, s0 = math.cos(ref[2]), math.sin(ref[2])
+        points = []
+        for lidar in self._load_lidars():
+            if lidar.name not in use:
+                continue
+            i = int(np.argmin(np.abs(lidar.stamps - stamp)))
+            if abs(float(lidar.stamps[i]) - stamp) > MAX_SCAN_GAP_S:
+                continue
+            r = lidar.ranges[i].astype(float)
+            k = np.arange(r.size)
+            ok = np.isfinite(r) & (r >= lidar.range_min) & (r <= lidar.range_max)
+            r, k = r[ok], k[ok]
+            if self.deskew == "first":
+                t = float(lidar.stamps[i]) + k * lidar.time_increment
+            else:
+                n = lidar.ranges.shape[1]
+                t = float(lidar.stamps[i]) - (n - 1 - k) * lidar.time_increment
+            a = lidar.angle_min + k * lidar.angle_increment
+            sp = lidar.sensor_pose
+            bx = sp.x + r * np.cos(a + sp.theta)
+            by = sp.y + r * np.sin(a + sp.theta)
+            pose = self._odom_at(t)
+            # World (odom) position of each return, then into the frame at ``stamp``.
+            cw, sw = np.cos(pose[:, 2]), np.sin(pose[:, 2])
+            wx = pose[:, 0] + cw * bx - sw * by - ref[0]
+            wy = pose[:, 1] + sw * bx + cw * by - ref[1]
+            points.append(np.column_stack([c0 * wx + s0 * wy, -s0 * wx + c0 * wy]))
+        if not points:
+            return None
+        return conv.points_to_scan(
+            np.vstack(points),
+            angle_min=-math.pi,
+            angle_max=math.pi,
+            num_bins=720,
+            range_min=0.05,
+            range_max=25.0,
+        )
 
     def odometry(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Wheel odometry: stamps, ``(N, 3)`` x/y/yaw in the odom frame, ``(N, 3)`` vx/vy/wz.

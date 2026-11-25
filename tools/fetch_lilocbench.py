@@ -41,6 +41,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 BASE_URL = "https://www.ipb.uni-bonn.de/html/projects/localization_benchmark/data"
+# The challenge's example submission: AMCL with default parameters, run on the
+# public sequences from each of the challenge's start times.
+CHALLENGE_URL = (
+    "https://www.ipb.uni-bonn.de/html/projects/localization_benchmark/data_codabench"
+)
 # Sequences whose ground truth is public.
 PUBLIC_SEQUENCES = (
     "mapping",
@@ -354,6 +359,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--rate-hz", type=float, default=2.0)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--list", action="store_true", help="print zip contents and exit")
+    ap.add_argument(
+        "--challenge-example",
+        action="store_true",
+        help="also fetch the challenge's AMCL example submission, to score against",
+    )
     args = ap.parse_args(argv)
 
     out_root = Path(args.out).expanduser()
@@ -375,6 +385,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             with zipfile.ZipFile(map_zip) as zf:
                 zf.extractall(out_root / "map_office")
             print(f"reference occupancy map -> {out_root / 'map_office'}")
+    if args.challenge_example:
+        dest = out_root / "challenge" / "amcl_example"
+        if not dest.is_dir():
+            zip_path = out_root / "challenge" / "amcl_example_submission_public.zip"
+            zip_path.parent.mkdir(parents=True, exist_ok=True)
+            _download_plain(
+                f"{CHALLENGE_URL}/amcl_example_submission_public.zip", zip_path
+            )
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(dest)
+        print(f"challenge AMCL example submission -> {dest}")
     return 0
 
 
