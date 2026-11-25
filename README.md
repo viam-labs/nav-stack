@@ -933,11 +933,29 @@ recording's clock. It needs `lt_changes_dynamics_0` too:
 `challenge` runs the benchmark's public challenge protocol: from several
 start times into each run, with no initial pose, scored in bands from 2 cm /
 1° (100) to 20 cm / 10° (10). Fetching with `--challenge-example` adds the
-challenge's own AMCL entry, which is scored alongside. `--lost-filter` adds a
-particle filter over the whole map that finds the robot when it has no pose
-and hands over to the tracker. For comparison, `--localizer emcl2` runs an
-expansion-resetting particle filter instead of the tracker, and
-`--deskew last` removes the robot's motion during each lidar sweep.
+challenge's own AMCL entry, which is scored alongside. `--lost-filter` turns
+on the SLAM service's lost filter (a particle filter over the whole map that
+finds the robot when it has no pose and hands over to the tracker; on by
+default on a robot), and `--lost-filter-camera` lets it ask the camera before
+a hand-over. For comparison, `--localizer emcl2` runs an expansion-resetting
+particle filter instead of the tracker, and `--deskew last` removes the
+robot's motion during each lidar sweep.
+
+Before a SLAM change, run the regression check. It maps `mapping`,
+`static_0` and `dynamics_0` (people walking) from scratch, and runs
+`tracking` and `challenge` (with the lost filter) on `static_0`,
+`dynamics_0`, `lt_changes_0` and `lt_changes_dynamics_0` (furniture moved),
+in parallel in a few minutes, and exits 1 when a result got worse than the
+stored baselines (an error up by more than 0.5 cm and 5%, a run's challenge
+score down by more than 2):
+
+```bash
+python tools/regress_lilocbench.py            # compare with the baselines
+python tools/regress_lilocbench.py --update   # store these results as the baselines
+```
+
+The baselines are kept next to the dataset, not in this repo. A replay is
+deterministic on one machine, so a change in a number is a change in the code.
 
 Off the robot, install the CPU runtime first with `pip install onnxruntime`;
 `requirements-vision.txt` lists only the OpenVINO build. The weights are
