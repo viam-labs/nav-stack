@@ -272,6 +272,9 @@ class BuiltinSlamEngine:
         self._loop_event = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
         self._loop_last_attempt_at = 0.0
+        # What the last check searched: graph revision, keyframe count, newest
+        # keyframe's travel, and the reference map and oldest usable keyframe.
+        self._loop_last_checked: tuple = ()
         # (revision, node, corr, edge, started_at, tries) or None.
         self._loop_pending: Optional[tuple] = None
         self._loop_full_logged = False
@@ -1970,6 +1973,22 @@ class BuiltinSlamEngine:
                 revision = self._graph_revision
             if self._graph_frozen and len(snap) <= self._graph_frozen:
                 return {"status": "no_nodes"}
+            # A check matches only the newest keyframe, and a closure needs a
+            # different keyframe to agree. With the same graph, the same newest
+            # keyframe and the same reference map it would find what it found
+            # a second ago, and a repeat could only spend or reset a pending
+            # match; a robot parked in mapping mode used to repeat it every
+            # second.
+            checked = (
+                revision,
+                len(snap),
+                float(snap.travel[-1]) if len(snap) else 0.0,
+                id(base),
+                min_node,
+            )
+            if checked == self._loop_last_checked:
+                return {"status": "no_new_keyframe"}
+            self._loop_last_checked = checked
             match, reason = loop_closure.detect(
                 snap, self._loop_params, resolution=res, base=base, min_node=min_node
             )
