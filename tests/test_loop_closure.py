@@ -561,6 +561,66 @@ def test_large_shift_loop_needs_three_agreeing_detections(monkeypatch):
     assert engine.diagnostics()["loop_closure"]["closures"] == 1
 
 
+def test_a_parked_robot_does_not_search_the_same_keyframe_again(monkeypatch):
+    """No new keyframe since the last check: nothing to search, and a pending match keeps."""
+    cfg = SlamConfig.from_dict(
+        {
+            "base": "b",
+            "lidar": "front",
+            "maps_dir": "/tmp",
+            "mode": "mapping",
+            "builtin_loop_closure": True,
+            "builtin_loop_pending_max_tries": 2,
+            "builtin_loop_pending_max_s": 60.0,
+        }
+    )
+    engine = BuiltinSlamEngine(cfg, _Sensors(), MapStore("/tmp"), rate_hz=5.0)  # type: ignore[arg-type]
+    scan = conv.LaserScan2D(np.full(180, 2.0), -math.pi, 2 * math.pi / 180, 0.05, 8.0)
+    for i in range(20):
+        engine._graph.add_scan(conv.Pose2D(0.5 * i, 0.0, 0.0), scan)  # noqa: SLF001
+    engine._pose = conv.Pose2D(9.5, 0.0, 0.0)  # noqa: SLF001
+    searched = []
+
+    def fake_detect(snap, params, resolution=0.05, base=None, **_kw):
+        cur = len(snap) - 1
+        searched.append(cur)
+        prior = snap.pose(cur)
+        return (
+            loop_closure.LoopMatch(
+                pose=conv.Pose2D(prior.x + 0.05, prior.y, prior.theta),
+                fit=0.8,
+                overlap=0.8,
+                prior_fit=0.4,
+                cov=np.diag([0.05**2, 0.05**2, math.radians(1.0) ** 2]),
+                points=100,
+                anchor=0,
+                gap_m=10.0,
+            ),
+            "ok",
+        )
+
+    monkeypatch.setattr(loop_closure, "detect", fake_detect)
+    monkeypatch.setattr(
+        engine,
+        "_optimize_and_render",
+        lambda *a, **k: {"status": "rebuilt", "optimize_ms": 0, "render_ms": 0},
+    )
+
+    first = engine.run_loop_closure().get("status")
+    parked = [engine.run_loop_closure().get("status") for _ in range(5)]
+    assert first == "pending"
+    assert parked == ["no_new_keyframe"] * 5
+    assert searched == [19]
+    # The match waiting for a second keyframe to agree is still there.
+    assert engine.diagnostics()["loop_closure"]["pending"]
+
+    # A new keyframe is searched, agrees with the pending match, and closes.
+    engine._graph.add_scan(conv.Pose2D(10.0, 0.0, 0.0), scan)  # noqa: SLF001
+    engine.run_loop_closure()
+    assert searched == [19, 20]
+    assert engine.diagnostics()["loop_closure"]["closures"] == 1
+
+
 def _mapping_engine():
     cfg = SlamConfig.from_dict(
         {
