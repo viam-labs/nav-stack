@@ -387,6 +387,7 @@ from tools.vision_eval.challenge import (  # noqa: E402
     load_tum,
     pose_scores,
     run_errors,
+    score_submission,
     write_tum,
 )
 
@@ -421,6 +422,18 @@ def test_run_errors_hold_the_localizer_before_its_first_pose_and_score_from_the_
     # Before its first pose the localizer is held there: 2 m off at t = 2.
     assert pos[0] == pytest.approx(2.0) and pos[-1] == pytest.approx(0.0)
     assert yaw.max() == pytest.approx(0.0)
+
+
+def test_a_submission_is_scored_on_the_runs_whose_ground_truth_is_here(tmp_path):
+    """A data folder holding one run scores that run, not a missing-file error."""
+    gt_t = np.arange(0.0, 300.0, 0.5)
+    gt_p = np.column_stack([gt_t * 0.01, np.zeros_like(gt_t), np.zeros_like(gt_t)])
+    write_tum(tmp_path / "data" / "static_0" / "gt_poses.txt", gt_t, gt_p)
+    for k in (1, 2, 3):
+        write_tum(tmp_path / "sub" / "static_0" / f"run_{k}.txt", gt_t, gt_p)
+    scores = score_submission(tmp_path / "sub", tmp_path / "data")
+    assert list(scores["sequences"]) == ["static_0"]
+    assert scores["overall"] == pytest.approx(100.0)
 
 
 def test_the_lost_filter_does_not_commit_in_a_room_that_looks_the_same_both_ways():

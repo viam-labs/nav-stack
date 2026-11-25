@@ -113,7 +113,10 @@ def score_submission(submission: Path, gt_dir: Path) -> Dict:
     out: Dict = {"sequences": {}, "groups": {}}
     group_tot: Dict[str, List[float]] = {}
     for seq, starts in START_TIMES.items():
-        gt_t, gt_p = load_tum(Path(gt_dir) / seq / "gt_poses.txt")
+        gt_file = Path(gt_dir) / seq / "gt_poses.txt"
+        if not gt_file.is_file():
+            continue
+        gt_t, gt_p = load_tum(gt_file)
         runs = {}
         total = size = 0.0
         for k, start in enumerate(starts, 1):

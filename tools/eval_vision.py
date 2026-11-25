@@ -362,6 +362,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report[name] = _run_mapping(seq, feats, cache, args.variants)
             _print_mapping(name, report[name])
         out = cache / "results_mapping.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(report, indent=2))
         print(f"\n{time.monotonic() - t0:.0f} s; results written to {out}")
         return 0
